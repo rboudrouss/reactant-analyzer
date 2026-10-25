@@ -1,0 +1,1931 @@
+% ---------------------------------------------------------------------------
+% Chapitre 10 — Le produit StateValue et la stabilité référentielle
+% Sources : notes/04-domains-lattices.md (§3.6–§3.9, §4.1, §4.5–§4.7,
+% §5, §6.2–§6.8, §7, §8), src/domains/impls/{state_value,stability}.rs,
+% src/domains/context.rs, src/domains/transfer/state_value.rs
+% (eval_state_value, recompute_memo, as_arith, eval_field_access),
+% src/rules/api/query.rs (StabilityVerdict), src/engine/written.rs
+% (value_freshness) ; ADR-002, ADR-007, ADR-008, ADR-015, ADR-017, ADR-020.
+% Sorties observées au commit e67b10a avec target/debug/reactant sur les
+% fichiers /tmp/ch10/*.tsx ; valeurs abstraites relevées avec la sonde
+% temporaire du dossier 04 (/tmp/dom04/target/debug/probe, hors dépôt).
+% ---------------------------------------------------------------------------
+\chapter{Le produit \code{StateValue} et la stabilité référentielle}
+\label{chap:statevalue-stabilite}
+
+\begin{objectifs}
+  \item Comprendre pourquoi la valeur abstraite de \reactant{} est un \emph{produit} indexé par les sortes de JavaScript (ADR-015), et savoir calculer à la main son ordre, son join, son widening et sa concrétisation.
+  \item Connaître le treillis \code{Stability} de l'ADR-017 : la trace de changement qu'il abstrait, les bornes may et must, les points \code{Stable}, \code{Versioned}, \code{VersionedTop}, \code{PerRender}, et savoir prouver la soundness de son join.
+  \item Comprendre la double vue de l'état (le store range les valeurs écrites, la lecture rend une stabilité versionnée) et le traitement des littéraux, de \code{useRef}, \code{useMemo} et \code{useCallback}.
+  \item Savoir quelle projection une règle doit employer (\code{to_stability}, \code{is_unstable_reference_only}, \code{is_unbounded}, \code{StabilityVerdict}), et pourquoi \code{PerRender} n'y a pas toujours le même sens.
+  \item Connaître les contextes \code{AnalysisCtx}, \code{QueryContext}, \code{InterCtx} qui relient les domaines au moteur, et les défauts observés au commit \snapshotCommit.
+\end{objectifs}
+
+\prerequis{\cref{chap:treillis-simples} (les quatre treillis de base, le widening à seuils) ; \cref{chap:interpretation-abstraite} (\cref{def:treillis}, \cref{def:concretisation}, \cref{def:must-may}, \cref{def:soundness}) ; \cref{chap:react-modele} (\code{Object.is}, deps, bail-out) ; \cref{chap:ir} (\cref{def:slot}, \code{Expr::StateVal}).}
+
+Le \cref{chap:treillis-simples} a décrit quatre petits domaines : intervalles,
+booléens, ensembles bornés de chaînes, setters. Aucun ne suffit seul, parce
+qu'une variable JavaScript n'a pas de type fixe : \code{useState(null)} rend
+une valeur qui sera \code{null} au premier rendu et un nombre au suivant. Ce
+chapitre assemble ces domaines en une seule valeur abstraite,
+\code{StateValue}, et lui ajoute la pièce la plus propre à React : la
+\emph{stabilité référentielle}, c'est-à-dire la réponse à la question
+\og cette valeur sera-t-elle \code{Object.is}-égale à celle du rendu
+précédent ?\fg{}.
+
+Deux questions guident tout le chapitre. La première porte sur les
+\emph{valeurs} : dans le compteur \code{setN(n + 1)} amorcé à \code{null},
+l'analyseur voit-il que \code{n} grandit sans borne ? Elle mène au produit
+ponctuel (\cref{sec:statevalue-stabilite-enum,sec:statevalue-stabilite-produit}).
+La seconde porte sur l'\emph{identité} au fil des rendus : une dep qui lit un
+état objet change-t-elle à chaque rendu ? Elle mène au treillis de stabilité
+versionnée (\cref{sec:statevalue-stabilite-naif,sec:statevalue-stabilite-traces})
+et à la double vue de l'état (\cref{sec:statevalue-stabilite-lecture}). Les
+sections suivantes montrent comment les mémos, les règles et le moteur lisent
+ces valeurs, puis recensent les limites observées.
+
+% ===========================================================================
+\section{Un enum plat perd \code{null} $\cup$ \code{number}}
+\label{sec:statevalue-stabilite-enum}
+
+\subsection{Le problème}
+
+Voici un compteur sans garde, amorcé à \code{null} au lieu de \code{0} :
+
+\begin{lstlisting}[language=TypeScript,caption={Un compteur nullable (\file{/tmp/ch10/nullable.tsx}, extrait)},label={lst:statevalue-stabilite-nullcounter}]
+export function NullCounter() {
+  const [n, setN] = useState(null);
+  useEffect(() => {
+    setN(n + 1);
+  }, [n]);
+  return <div>{n}</div>;
+}
+\end{lstlisting}
+
+Concrètement, React monte le composant avec \code{n = null}, puis exécute
+l'effet : \code{null + 1} vaut \code{1} en JavaScript (\code{ToNumber(null)}
+vaut $0$). La dep \code{n} passe de \code{null} à \code{1}, l'effet se
+ré-exécute, écrit \code{2}, puis \code{3}, et ainsi de suite : une boucle de
+rendu infinie. Pour la détecter, l'analyseur doit voir la valeur de
+\code{n} \emph{grandir}, c'est-à-dire garder l'intervalle numérique précis
+même quand \code{null} fait aussi partie des valeurs possibles.
+
+Le motif n'a rien d'exotique : \code{useState(null)} est la manière
+idiomatique d'écrire \og pas encore chargé\fg{}. Un domaine qui ne sait pas
+représenter \og \code{null} ou un nombre\fg{} laisse passer toute une famille
+de boucles.
+
+\subsection{Le domaine d'ADR-008 : une somme plate}
+
+La première version du domaine des valeurs (\adr{8}, juin 2026) était une
+somme : une valeur abstraite était \emph{exactement une} sorte JavaScript.
+
+\begin{lstlisting}[language=Rust,caption={L'ancien \code{StateValue} (\file{docs/adr/ADR-008-value-domain.md}, élagué des commentaires)},label={lst:statevalue-stabilite-adr8}]
+pub enum StateValue {
+    Bottom,
+    Null,
+    Undefined,
+    Number(Interval),
+    Boolean(BoolVal),
+    StrConst(Arc<BTreeSet<String>>),
+    Str,
+    Reference(Stability),
+    Top,
+}
+\end{lstlisting}
+
+Dans une somme, le join de deux sortes différentes n'a qu'un majorant
+commun : $\Top$. L'ADR le dit en une ligne de son tableau :
+\code{Null} $\join$ \code{Number(i)} $=$ \code{Top}
+(\cref{fig:statevalue-stabilite-somme-produit}, à gauche). Sur
+\code{NullCounter}, le premier tour écrit $[1,1]$ dans un slot qui vaut
+\code{Null} ; le join donne $\Top$, et $\Top$ est un point fixe. Le store ne
+s'élargit jamais, aucun widening n'a lieu, et le bras \og point fixe\fg{}
+d'\regle{infinite-loop} (qui cherche un slot élargi,
+\cref{chap:infinite-loop}) ne voit rien : un faux négatif (FN).
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[treillis,node distance=8mm and 4mm]
+  % somme plate
+  \node (top) at (0,2.2) {$\Top$};
+  \node[font=\scriptsize] (num) at (-3.3,1.1) {\code{Number}};
+  \node[font=\scriptsize] (bool) at (-2,1.1) {\code{Boolean}};
+  \node[font=\scriptsize] (str) at (-0.7,1.1) {\code{Str}\dots};
+  \node[font=\scriptsize] (ref) at (0.7,1.1) {\code{Reference}};
+  \node[font=\scriptsize,text=ra-blue] (null) at (2,1.1) {\code{Null}};
+  \node[font=\scriptsize] (undef) at (3.3,1.1) {\code{Undefined}};
+  \node (bot) at (0,0) {$\Bot$};
+  \foreach \x in {num,bool,str,ref,null,undef} {\draw (top) -- (\x.north); \draw (\x.south) -- (bot);}
+  \node[etiquette,align=center] at (0,-0.8) {somme (ADR-008) :\\ \code{Null} $\join$ \code{Number([1,1])} $=\Top$};
+  % produit
+  \begin{scope}[xshift=7.2cm]
+    \node[cfgbloc] (a) at (-1.2,1.9) {num : $\Bot$\\ null : vrai};
+    \node[cfgbloc] (b) at (1.2,1.9) {num : $[1,1]$\\ null : faux};
+    \node[cfgbloc] (j) at (0,0.3) {num : $[1,1]$\\ null : vrai};
+    \draw[fleche] (a) -- (j); \draw[fleche] (b) -- (j);
+    \node[etiquette,align=center] at (0,-0.8) {produit (ADR-015) :\\ \code{number[1, 1]|null}};
+  \end{scope}
+\end{tikzpicture}
+\caption{Le même join dans les deux domaines. À gauche, la somme plate
+d'ADR-008 : deux sortes différentes n'ont que $\Top$ pour majorant commun
+(les sous-treillis de chaque sorte sont repliés en un nœud). À droite, le
+produit d'ADR-015 : chaque sorte garde sa composante, le join se fait
+composante par composante (seules deux composantes sont montrées).}
+\label{fig:statevalue-stabilite-somme-produit}
+\end{figure}
+
+\subsection{Trois rustines, et un FN qui résiste}
+
+L'ADR-008 a compensé la perte par trois mécanismes empilés
+(\adr{15}, section \og Context\fg{}) :
+\begin{enumerate}
+  \item un \code{TypedStateStore} à cinq sous-stores (nombres, booléens,
+    chaînes, références, inconnus), choisis label par label ;
+  \item une inférence \code{infer_state_type} qui devinait la sorte d'un
+    slot à partir de son initialiseur ;
+  \item la lecture de l'annotation TypeScript \code{useState<number>(null)} :
+    le lowering la capturait dans \code{HookEntry::State.type_hint}, et le
+    point fixe remplaçait l'amorçage \code{Null} par \code{Number([0,0])}.
+\end{enumerate}
+Même avec les trois, \code{useState(null)} \emph{sans} annotation restait un
+FN documenté, et un code JavaScript pur qui mélange nombres et chaînes
+(\code{let a = 10; if (c) a = "s";}) perdait toute précision. Les rustines
+traitaient le symptôme (une sorte par slot) sans toucher à la cause (une
+sorte par valeur).
+
+\begin{decision}[ADR-008 --- domaine des valeurs en somme plate]
+\textbf{Décidait} : un \code{StateValue} en \code{enum} plat, tout join
+inter-sortes vaut $\Top$ ; précision regagnée par un store typé et par les
+annotations TypeScript. \textbf{Statut} : remplacée par \adr{15}
+(14 juillet 2026). \textbf{Ce qui survit} : les sous-domaines
+\code{Interval}, \code{BoolVal}, \code{StrConst} (seuil 4), la machinerie de
+widening et de raffinement, et le signal \og le store s'élargit, donc boucle
+possible\fg{}. \textbf{À ne pas croire} : la ligne du tableau d'ADR-008
+\og Boolean : oscillation true$\leftrightarrow$false détectée\fg{} ne
+correspond pas au comportement actuel (\cref{sec:statevalue-stabilite-limites}).
+\end{decision}
+
+% ===========================================================================
+\section{Sortes disjointes : le produit \code{StateValue}}
+\label{sec:statevalue-stabilite-produit}
+
+\subsection{L'observation}
+
+Une valeur JavaScript n'est jamais à la fois un nombre et une chaîne, ni à
+la fois \code{null} et un objet : les sortes sont \emph{disjointes}. Or ce
+que l'on veut abstraire, c'est un \emph{ensemble} de valeurs possibles
+$V$. Un tel ensemble se découpe de manière unique selon les sortes :
+\[
+  V \;=\; (V \cap \mathit{Num}) \uplus (V \cap \mathit{Bool}) \uplus
+  (V \cap \mathit{Str}) \uplus \dots
+\]
+Chaque morceau s'abstrait dans le treillis de sa sorte, indépendamment des
+autres. Le domaine idéal (la \terme{complétion disjonctive} de la somme, qui
+représente des disjonctions de valeurs abstraites) dégénère donc, pour une
+somme de sortes disjointes, en un \terme{produit ponctuel} : une composante
+par sorte, chacune à $\Bot$ quand la sorte est impossible. C'est
+l'observation d'ADR-015, et elle tient en une phrase, conformément au
+principe du paragraphe unique de \file{CLAUDE.md}.
+
+\begin{remarque}
+Dans une somme non disjointe (par exemple \og entier\fg{} et \og entier
+pair\fg{}), une même valeur pourrait relever de deux composantes, et un
+produit perdrait la corrélation entre elles. C'est précisément la
+disjonction des sortes qui rend le produit exact, sans opérateur de
+réduction entre composantes.
+\end{remarque}
+
+\subsection{Le code}
+
+\rustsnippet[label={lst:statevalue-stabilite-struct}]{src/domains/impls/state_value.rs}{16}{44}{le produit ponctuel des sortes JavaScript}
+
+Les huit composantes, champ par champ :
+\begin{itemize}
+  \item \code{num} : un \code{Interval} (\cref{sec:treillis-simples-intervalles}) ;
+    $\Bot$ signifie \og ne peut pas être un nombre\fg{}.
+  \item \code{boolean} : le treillis plat \code{BoolVal}
+    (\cref{sec:treillis-simples-plats}).
+  \item \code{str} : l'ensemble borné \code{StrConst}, élargi à $\Top$ au-delà de
+    quatre constantes (\cref{sec:treillis-simples-strconst}).
+  \item \code{reference} : la sorte \og objet, tableau ou fonction\fg{}. Sa
+    composante n'est pas un ensemble de valeurs mais une
+    \emph{stabilité} (\cref{sec:statevalue-stabilite-traces}) ; $\Bot$
+    signifie \og ne peut pas être une référence\fg{}.
+  \item \code{null}, \code{undef} : deux booléens Rust, \code{true} voulant
+    dire \og cette valeur est possible\fg{}. L'ordre de \code{bool}
+    (\code{false < true}) est exactement le treillis à deux points
+    $\Bot \lleq \Top$.
+  \item \code{setter} : le treillis plat \code{SetterVal} des setters
+    d'état identifiés par \code{(ComponentId, HookLabel)}.
+  \item \code{other} : le \terme{résidu}, \og tout le reste\fg{} (symbol,
+    bigint, et toute sorte non modélisée).
+\end{itemize}
+
+\begin{definition}{Le produit \code{StateValue}}{statevalue}
+  Une valeur abstraite est un octuplet
+  \[
+  v = (v.\mathit{num}, v.\mathit{boolean}, v.\mathit{str},
+  v.\mathit{reference}, v.\mathit{null}, v.\mathit{undef},
+  v.\mathit{setter}, v.\mathit{other}),
+  \]
+  élément du produit des huit treillis ci-dessus. L'ordre, le join, le meet et le widening sont
+  \emph{ponctuels} (composante par composante). La concrétisation est
+  l'union disjointe des concrétisations des composantes :
+  \[
+  \begin{array}{rl}
+    \gam(v) \;=& \gam_{\mathit{num}}(v.\mathit{num}) \;\cup\;
+                 \gam_{\mathit{bool}}(v.\mathit{boolean}) \;\cup\;
+                 \gam_{\mathit{str}}(v.\mathit{str})\\[2pt]
+       \cup& \{\, o \text{ objet, tableau ou fonction} \mid
+                 \text{la trace de changement de } o \in
+                 \gam_{\Stab}(v.\mathit{reference}) \,\}\\[2pt]
+       \cup& \{\code{null} \mid v.\mathit{null}\} \;\cup\;
+                 \{\code{undefined} \mid v.\mathit{undef}\} \;\cup\;
+                 \gam_{\mathit{setter}}(v.\mathit{setter})\\[2pt]
+       \cup& \{\, \text{toute autre valeur (symbol, bigint, \dots)} \mid
+                 v.\mathit{other} \,\}
+  \end{array}
+  \]
+  où $\gam_{\Stab}$ est la concrétisation de la stabilité
+  (\cref{def:stabilite}).
+\end{definition}
+
+\begin{exemple}{Lire une valeur du produit}{statevalue-stabilite-lire}
+  La valeur affichée \code{number[1, inf]|null} a
+  $\mathit{num} = [1, +\infty]$, $\mathit{null} = \code{true}$, et toutes
+  les autres composantes à $\Bot$. Sa concrétisation est
+  $\{x \in \mathbb{R} \mid x \ge 1\} \cup \{\code{null}\}$ (avec le bit
+  \code{is_int}, les seuls entiers). Elle ne contient ni \code{undefined}, ni
+  chaîne, ni objet. L'affichage (\code{Debug}, écrit à la main,
+  \src{src/domains/impls/state_value.rs}{422}{476}) juxtapose les sortes
+  peuplées séparées par \texttt{|}.
+\end{exemple}
+
+\begin{piege}
+  La composante \code{reference} ne ressemble pas aux autres. Pour
+  \code{num} ou \code{str}, $\gam$ décrit des \emph{valeurs} ; pour
+  \code{reference}, elle décrit la \emph{stabilité} des références possibles,
+  sans rien dire de leur contenu. Le contenu des objets relève du tas par
+  site d'allocation (\cref{chap:transfert-stores}). Une \code{StateValue}
+  \code{ref(Stable)} dit \og une référence qui ne change pas d'un rendu à
+  l'autre\fg{}, pas \og l'objet \code{{a: 1}}\fg{}.
+\end{piege}
+
+Et \code{NaN} ? Aucune composante n'en parle. Toute opération qui pourrait le
+produire (division, reste par un diviseur qui peut être nul, puissance,
+\code{undefined} en arithmétique) rend $\Top$, dont le résidu \code{other}
+est vrai : c'est par là que \code{NaN} est couvert
+(\cref{sec:treillis-simples-arith}). Le code le dit explicitement pour
+\code{\%} et \code{**} : \og where the result may be \code{NaN}, which no
+interval holds, they are $\Top$ like \code{/}\fg{}
+(\srcline{src/domains/transfer/state_value.rs}{781}).
+
+\subsection{$\Bot$, $\Top$ et les constructeurs}
+
+\rustsnippet[label={lst:statevalue-stabilite-bottom}]{src/domains/impls/state_value.rs}{190}{206}{$\Bot$ : toutes les composantes à $\Bot$}
+
+\code{bottom_value} est une \code{const fn} pour pouvoir servir dans la
+syntaxe de mise à jour de structure (\code{..Self::bottom_value()}) de
+chaque constructeur. L'intervalle vide y est écrit à la main avec ses
+bornes sentinelles $[+\infty, -\infty]$ : tout prédicat qui lit
+\code{num.lo} ou \code{num.hi} doit donc d'abord tester \code{is_bottom()}
+(\cref{sec:statevalue-stabilite-projections}). $\Top$ met toutes les
+composantes à leur $\Top$, \emph{y compris} le résidu :
+
+\rustsnippet[label={lst:statevalue-stabilite-top}]{src/domains/impls/state_value.rs}{512}{523}{$\Top$ : toutes les composantes à $\Top$, résidu compris}
+
+Les constructeurs \code{number}, \code{boolean}, \code{str_set},
+\code{str_singleton}, \code{str_top}, \code{reference}, \code{null},
+\code{undefined} et \code{component_setter}
+(\src{src/domains/impls/state_value.rs}{125}{188}) peuplent une seule
+composante et laissent les autres à $\Bot$ :
+
+\rustsnippet{src/domains/impls/state_value.rs}{125}{130}{la forme commune des constructeurs}
+
+Deux exceptions : \code{str_set} passe par \code{StrConst::from_set}, donc
+un ensemble vide donne $\Bot$ et plus de quatre chaînes donnent
+\code{str: Top} ; \code{component_setter(c, l)} pose
+\code{SetterVal::One(c, l)}.
+
+\subsection{\code{KindMask} : une seule énumération des sortes}
+
+Beaucoup de questions sur une valeur portent sur \emph{quelles} sortes sont
+peuplées : la valeur est-elle $\Bot$ ? n'est-elle qu'un setter ? combien de
+sortes mêle-t-elle ? Si chaque prédicat ré-énumérait les huit champs,
+l'ajout d'un neuvième champ serait silencieusement oublié quelque part, et
+un prédicat comme \og la valeur n'est qu'une référence fraîche\fg{}
+deviendrait vrai à tort : un faux négatif latent. Le code centralise donc
+l'énumération dans un masque de bits.
+
+\rustsnippet[label={lst:statevalue-stabilite-kindmask}]{src/domains/impls/state_value.rs}{46}{78}{le masque des sortes peuplées}
+
+\rustsnippet[label={lst:statevalue-stabilite-populated}]{src/domains/impls/state_value.rs}{80}{121}{l'unique énumération des sortes}
+
+\begin{invariant}{Une seule énumération des sortes}{statevalue-stabilite-kindmask}
+  Tout prédicat de la forme \og quelles sortes sont peuplées\fg{} se dérive
+  de \code{populated_kinds}, dont la déstructuration n'a pas de \code{..}.
+  Ajouter une composante à \code{StateValue} est donc une erreur de
+  compilation dans \code{populated_kinds} (et dans \code{is_top_value}, qui
+  utilise la même astuce pour la saturation à $\Top$), pas un oubli
+  silencieux.
+\end{invariant}
+
+Les consommateurs du masque sont \code{is_bottom_value} (\code{is_empty}),
+\code{typeof_name} (une seule sorte), \code{as_setter} et
+\code{is_unstable_reference_only} (\code{only}), et \code{to_stability}
+(\code{count() >= 2}). La protection vient d'ADR-020 (\adr{20}, décision D4,
+commit \code{c887c52}).
+
+\rustsnippet[label={lst:statevalue-stabilite-as-setter}]{src/domains/impls/state_value.rs}{270}{287}{deux prédicats dérivés du masque}
+
+\begin{piege}
+  \code{only(bit)} est \emph{vrai} sur $\Bot$ : aucun bit n'est peuplé, donc
+  tous les bits peuplés sont bien dans \code{{bit}}. Chaque consommateur
+  doit écarter $\Bot$ lui-même s'il le faut. \code{is_unstable_reference_only}
+  le fait en exigeant en plus \code{reference == PerRender} ;
+  \code{as_setter} le fait parce que \code{SetterVal::as_one} rend
+  \code{None} sur $\Bot$ et $\Top$.
+\end{piege}
+
+\begin{piege}
+  La protection est partielle. Les fonctions de transfert \code{as_arith},
+  \code{as_str_only} (\src{src/domains/transfer/state_value.rs}{708}{750})
+  et la négation \code{!} (\src{src/domains/transfer/state_value.rs}{947}{965}) ré-énumèrent les
+  composantes à la main, sans passer par \code{KindMask} : une composante
+  ajoutée ne les ferait pas échouer à la compilation (constat de lecture,
+  dossier 04 §3.7).
+\end{piege}
+
+\code{typeof_name} illustre la sémantique JavaScript encodée dans le
+masque : \code{typeof null} vaut \code{"object"}, un setter est une
+\code{"function"}, et la composante \code{reference} ne donne \emph{pas} de
+réponse, parce qu'elle couvre à la fois les objets (\code{"object"}) et les
+fonctions (\code{"function"})
+(\src{src/domains/impls/state_value.rs}{240}{268}).
+
+\subsection{L'arithmétique : \code{as_arith} et \code{ToNumber(null)}}
+
+Le produit ne sert que si l'évaluateur sait calculer \code{n + 1} quand
+\code{n} vaut \code{number[1, 1]|null}. La règle est celle de JavaScript :
+\code{ToNumber(null)} vaut $0$. L'évaluateur demande donc une \emph{vue
+numérique} de chaque opérande :
+
+\rustsnippet[label={lst:statevalue-stabilite-as-arith}]{src/domains/transfer/state_value.rs}{708}{732}{la vue numérique d'un opérande}
+
+\code{as_arith} rend un intervalle si les seules sortes peuplées sont
+\og nombre\fg{} et \og \code{null}\fg{} ; la contribution de \code{null} est
+le point $[0,0]$, joint à l'intervalle par \code{hull}. Toute autre sorte
+(\code{undefined}, qui donnerait \code{NaN} ; booléen ; chaîne ; référence ;
+setter ; résidu) rend \code{None}, et l'opération arithmétique vaut alors
+$\Top$ (\cref{sec:treillis-simples-arith}).
+
+\begin{proposition}{Soundness de la vue numérique}{statevalue-stabilite-as-arith}
+  Si \code{as_arith(v)} $= \mathit{Some}(I)$, alors pour toute valeur
+  concrète $x \in \gam(v)$, $\code{ToNumber}(x) \in \gam(I)$.
+\end{proposition}
+\begin{proof}
+  $\mathit{Some}$ n'est rendu que si toutes les composantes autres que
+  \code{num} et \code{null} sont à $\Bot$ ; donc $\gam(v) \subseteq
+  \gam(v.\mathit{num}) \cup \{\code{null}\}$. Un nombre est son propre
+  \code{ToNumber} et appartient à $\gam(v.\mathit{num}) \subseteq
+  \gam(I)$ ; \code{null} donne $0 \in \gam([0,0]) \subseteq \gam(I)$
+  lorsque $v.\mathit{null}$ est vrai, puisque \code{hull} est un majorant.
+\end{proof}
+
+Le commentaire \og a $\Bot$ interval stays \code{Some(}$\Bot$\code{)}\fg{} n'est pas un
+détail. Sur une branche morte, le raffinement de garde met \code{num} à
+$\Bot$ ; l'addition rend alors $\Bot$, et l'écriture de $\Bot$ dans un
+store se joint sans effet. Si \code{as_arith} rendait \code{None}, la même
+écriture vaudrait $\Top$ et polluerait le slot.
+
+\begin{exemple}{\code{NullCounter}, tour par tour}{statevalue-stabilite-nullcounter}
+  Amorçage : $n \mapsto \{\code{null}\}$. Premier tour : l'effet évalue
+  \code{n + 1} ; \code{as_arith({null})} $= [0,0]$, donc l'écriture vaut
+  $[1,1]$ ; le store fait le join ponctuel et contient
+  \code{number[1, 1]|null}. Deuxième tour : \code{as_arith} rend
+  $[0,1]$, l'écriture $[1,2]$, le store \code{number[1, 2]|null}. Au
+  troisième tour, la boucle externe applique \code{widen_to}
+  (\cref{sec:treillis-simples-widening}), qui n'agit que sur \code{num} ;
+  la borne haute saute à $+\infty$, \code{null} reste vrai. La sonde relève
+  la valeur convergée :
+\begin{sortie}
+-- NullCounter
+   state[0] = number[1, inf]|null   widened=true  num=Interval { lo: 1.0, hi: inf, is_int: true }
+\end{sortie}
+  et la ligne de commande signale la boucle :
+\begin{sortie}
+$ reactant check /tmp/ch10/nullable.tsx --trace
+  NullCounter  (2 hooks)  /tmp/ch10/nullable.tsx
+    warn   infinite-loop  [hook:0]  (line 5:2)  this effect keeps pushing state `n` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop
+       → state `n` is written here [hook:1] (line 5:2)
+       → the abstract value of state `n` kept growing and was widened at iteration 3
+\end{sortie}
+  Le FN d'ADR-008 est devenu une détection, épinglée par le test
+  \code{tests/narrowing.rs::null_init_without_hint_unbounded_is_flagged}.
+\end{exemple}
+
+La \og sonde\fg{} citée ici et dans la suite du chapitre est un petit
+programme temporaire, hors du dépôt, qui appelle \code{lower_program} puis
+\code{analyze_component} sur un fichier et imprime les valeurs convergées
+des stores (\code{state[l]} pour le slot de label $l$, \code{memo[l]} pour
+un mémo), avec le drapeau \code{widened} (le slot est-il dans
+\code{widen_trace} ?). Les identités de composant y apparaissent comme
+\code{ComponentId(4294967295)}, c'est-à-dire \code{ComponentId::SYNTHETIC}
+d'une analyse isolée.
+
+Deux variantes du même fichier montrent les bords du mécanisme. Remplacer
+\code{useState(null)} par \code{useState(undefined)} (composant
+\code{UndefCounter}) fait échouer \code{as_arith} : \code{undefined + 1}
+vaut \code{NaN}, que l'intervalle ne sait pas représenter, donc l'écriture
+vaut $\Top$ et le store aussi (la sonde affiche \code{state[0] =} $\Top$). L'analyseur
+émet alors un \Warning{} plus vague :
+\begin{sortie}
+  UndefCounter  (2 hooks)  /tmp/ch10/nullable.tsx
+    warn   infinite-loop  [hook:0]  (line 21:2)  this effect may store a fresh reference into state `n` which its deps react to: possible infinite render loop
+       → a fresh value is written to state `n` here [hook:1] (line 22:4)
+\end{sortie}
+C'est un faux positif (FP) toléré : concrètement, \code{n} passe de
+\code{undefined} à \code{NaN}, puis \code{NaN + 1} vaut \code{NaN}, et
+\code{Object.is(NaN, NaN)} est vrai, donc React abandonne le rendu suivant.
+La valeur $\Top$ a une composante \code{reference} à \code{Unknown}, que le
+graphe de churn lit comme \og peut-être fraîche\fg{}
+(\cref{sec:statevalue-stabilite-lecture}). Le motif \og chargement
+unique\fg{} \code{if (!user) setUser({ name: "guest" })}, lui, converge
+sans bruit (le composant \code{FetchOnce} est propre) : la branche
+\code{!user} applique \code{narrow_falsy}, qui tue la composante
+\code{reference} (\cref{sec:treillis-simples-gardes}), et l'écriture n'a
+lieu qu'une fois ; le store se stabilise sur \code{ref(PerRender)|null}.
+
+\subsection{Ordre, join, meet et widening ponctuels}
+
+\rustsnippet[label={lst:statevalue-stabilite-ord}]{src/domains/impls/state_value.rs}{479}{501}{l'ordre produit}
+
+\code{merge_ord} combine les comparaisons des composantes : \code{Equal} est
+neutre, deux \code{Less} (ou deux \code{Greater}) restent dans leur sens,
+et deux sens opposés, ou une composante incomparable (\code{None}, propagé
+par l'opérateur \code{?}), rendent tout le produit incomparable. On a donc
+$a \lleq b$ si et seulement si chaque composante de $a$ est sous celle de
+$b$ : c'est l'ordre produit (test \code{mixed_direction_slots_are_incomparable}).
+
+\rustsnippet[label={lst:statevalue-stabilite-join}]{src/domains/impls/state_value.rs}{631}{676}{join, meet, widen et widen\_to ponctuels}
+
+Trois remarques de lecture :
+\begin{itemize}
+  \item le join de \code{num} est \code{hull}, celui des trois booléens est
+    le \og ou\fg{}, celui des autres composantes est le join de leur
+    treillis ;
+  \item le widening n'élargit que les composantes de hauteur infinie ou
+    grande : \code{num} (\code{Interval::widen}) et \code{str}
+    (\code{StrConst::widen}) ; les autres se contentent du join ;
+  \item \code{widen_to} ne passe les seuils qu'à \code{num} et hérite du
+    reste par la syntaxe \code{..self.widen(other)}.
+\end{itemize}
+
+\begin{theoreme}{Soundness du join et du widening du produit}{statevalue-stabilite-join}
+  Pour toutes valeurs $a, b$ : $\gam(a) \cup \gam(b) \subseteq \gam(a
+  \join b)$ et $\gam(a) \cup \gam(b) \subseteq \gam(a \widen b)$. De plus,
+  toute suite $x_0, x_1 = x_0 \widen y_1, x_2 = x_1 \widen y_2, \dots$ est
+  stationnaire.
+\end{theoreme}
+\begin{proof}
+  $\gam$ est une union, composante par composante, de concrétisations
+  disjointes (\cref{def:statevalue}). Il suffit donc que chaque composante
+  soit sound : $\gam_k(a_k) \cup \gam_k(b_k) \subseteq \gam_k(a_k \join
+  b_k)$. C'est vrai pour \code{hull}, \code{BoolVal}, \code{StrConst},
+  \code{SetterVal} (\cref{sec:treillis-simples-soundness}), pour les trois
+  booléens (le \og ou\fg{} est l'union de $\emptyset$ et du singleton) et
+  pour \code{Stability} (\cref{thm:statevalue-stabilite-join-stab}). Le
+  widening de chaque composante majore son join, d'où la seconde inclusion.
+  Terminaison : une suite de widenings est stationnaire composante par
+  composante, parce que \code{num} a un vrai widening (le
+  \cref{chap:treillis-simples} le montre), que \code{str} saute à $\Top$
+  au-delà de quatre constantes, et que les six autres composantes sont de
+  hauteur finie (au plus 8 pour \code{Stability}). Un produit fini de suites
+  stationnaires est stationnaire.
+\end{proof}
+
+Le meet est lui aussi ponctuel ; il n'est employé par aucun code de
+production (\cref{sec:treillis-simples-contrat}), ce qui compte pour la
+stabilité (\cref{sec:statevalue-stabilite-traces}).
+
+\begin{decision}[ADR-015 --- produit ponctuel sur les sortes disjointes]
+\textbf{Décide} : \code{StateValue} devient le produit de huit composantes ;
+\code{join}, \code{meet}, \code{widen}, \code{widen_to} et
+\code{partial_cmp} sont ponctuels ; \code{ComponentSetter} devient une
+composante (\code{SetterVal}) ; l'arithmétique applique
+\code{ToNumber(null) = 0}. \textbf{Supprime} : \code{TypedStateStore},
+\code{StateType}, \code{infer_state_type}, \code{HookEntry::State.type_hint} ;
+\code{useState<T>(...)} devient décoratif. \textbf{Refuse} : un opérateur de
+réduction ou un \og query pool\fg{} à la MOPSA \emph{à l'intérieur} du
+produit, puisque des sortes disjointes n'ont aucune information à
+échanger ; un futur produit réduit (valeur $\times$ relationnel) se fera au
+niveau de l'analyse, avec \code{QueryContext} comme canal de lecture
+(\cref{sec:statevalue-stabilite-contextes}). \textbf{Épingle} :
+\code{null_init_without_hint_unbounded_is_flagged},
+\code{nullable_fetch_pattern_no_false_positive}.
+\end{decision}
+
+\subsection{\code{from_init} : un nom trompeur}
+
+\rustsnippet[label={lst:statevalue-stabilite-from-init}]{src/domains/impls/state_value.rs}{289}{306}{la valeur syntaxique d'un initialiseur}
+
+\begin{piege}
+  Malgré son nom et sa documentation, \code{from_init} n'est \emph{pas} la
+  fonction qui amorce les slots \code{useState}. L'amorçage évalue
+  l'initialiseur avec l'évaluateur complet (\code{transfer.eval_expr}), et
+  exécute le corps d'un initialiseur paresseux \code{useState(() => expr)}
+  au lieu d'abstraire la fermeture en référence fraîche
+  (\src{src/engine/fixpoint.rs}{314}{353}, \cref{chap:point-fixe-composant}).
+  Le seul appelant hors tests de \code{from_init} est
+  \code{returns_value} (\src{src/engine/written.rs}{108}{121}), qui calcule
+  sans environnement la valeur qu'un updater \code{setX(prev => ...)} rend
+  sur ses \code{return}. Pour cet usage purement syntaxique, un
+  \code{FnLit} rendu vaut bien \code{PerRender} : un updater qui rend une
+  fonction stocke une nouvelle fonction.
+\end{piege}
+
+% ===========================================================================
+\section{La stabilité référentielle : un premier treillis, et son impasse}
+\label{sec:statevalue-stabilite-naif}
+
+\subsection{Ce que React compare}
+
+\begin{react}[Identité des valeurs d'un rendu à l'autre]
+  React compare chaque entrée d'un tableau de deps à celle du rendu
+  précédent avec \code{Object.is} (comme \code{===}, sauf
+  \code{Object.is(NaN, NaN)} vrai et \code{Object.is(0, -0)} faux). Un effet,
+  un \code{useMemo} ou un \code{useCallback} est ré-exécuté si \emph{au moins
+  une} dep diffère. Or :
+  \begin{itemize}
+    \item \code{{}}, \code{[]}, \code{() => {}}, \code{new X()},
+      \code{arr.map(f)} écrits dans le corps du composant allouent une
+      nouvelle référence à chaque évaluation, donc à chaque rendu ;
+    \item un état garde son identité d'un rendu au suivant tant que son
+      setter n'est pas appelé avec une valeur différente ;
+    \item la fonction setter d'un \code{useState} et le conteneur rendu par
+      \code{useRef} sont les mêmes à chaque rendu (garantie de React) ;
+    \item \code{useMemo} et \code{useCallback} rendent la même référence tant
+      que leurs deps sont \code{Object.is}-égales.
+  \end{itemize}
+  Une primitive, elle, est comparée par valeur : \code{1} est toujours
+  \code{Object.is}-égal à \code{1}, quelle que soit la façon dont on l'a
+  calculé (\cref{chap:react-modele}).
+\end{react}
+
+La \terme{stabilité référentielle} d'une expression est la réponse
+abstraite à la question \og sa valeur est-elle la même, au sens de
+\code{Object.is}, que celle du rendu précédent ?\fg{}. C'est le domaine
+qu'\adr{2} plaçait au centre de l'analyse, dès la première semaine du
+projet.
+
+\subsection{Le treillis d'ADR-002}
+
+L'ADR-002 proposait un treillis plat à quatre points, de la forme étudiée au
+\cref{sec:treillis-simples-plats} : $\Bot \lleq \{\code{Stable},
+\code{Unstable}\} \lleq \code{Unknown}$, avec $\code{Stable} \join
+\code{Unstable} = \code{Unknown}$. Une table de transfert statique en
+donnait la valeur : un littéral primitif, un setter et \code{useRef()}
+étaient \code{Stable} ; un littéral objet, tableau ou fonction était
+\code{Unstable} ; la valeur d'un \code{useState} était le join des
+arguments de ses setters ; \code{useMemo} et \code{useCallback}, le join de
+leurs deps.
+
+\begin{decision}[ADR-002 --- treillis de stabilité et trois stores]
+\textbf{Décidait} : le domaine central est la stabilité (\code{Object.is}),
+treillis à quatre points ; trois stores séparés (état soumis au point fixe,
+mémos fonctions de leurs deps, refs triviales) parce que les trois familles
+de hooks n'ont pas la même sémantique vis-à-vis du cycle de rendu ; widening
+après un seuil configurable. \textbf{Alternative refusée} : un store unifié,
+qui aurait forcé tous les hooks dans le même point fixe. \textbf{Ce qui a
+changé depuis}, sans que le fichier porte la mention \og Superseded\fg{} :
+\code{Unstable} est devenu \code{PerRender} et le treillis a gagné
+\code{Versioned} et \code{VersionedTop} (\adr{17}) ; il n'existe pas de
+\code{RefStore} (\code{useRef} rend \code{reference(Stable)}) ; les fichiers
+\file{src/domains/stability.rs} et \file{src/domains/product.rs} annoncés
+n'existent pas ; le seuil de widening par défaut est 3 et non 2.
+\end{decision}
+
+\subsection{Le faux positif F5}
+
+Le premier banc d'essai sur un vrai corpus (\og memos\fg{}, 15 juillet 2026)
+a laissé cinq \Warning{} \regle{always-unstable-deps} de la même forme, un
+fournisseur de contexte qui tient un état objet :
+
+\begin{lstlisting}[language=TypeScript,caption={Un état objet en dep (\file{/tmp/ch10/stability.tsx}, extrait)},label={lst:statevalue-stabilite-objstate}]
+export function ObjectStateDep() {
+  const [ctx, setCtx] = useState({ locale: "en" });
+  useEffect(() => { console.log(ctx); }, [ctx]);
+  return <button onClick={() => setCtx({ locale: "fr" })}>fr</button>;
+}
+\end{lstlisting}
+
+L'initialiseur est un littéral objet, donc \code{Unstable} ; le handler écrit
+un autre littéral, \code{Unstable} aussi ; le store du slot contient
+\code{Unstable}, et chaque lecture de \code{ctx} rendait cette valeur. La
+règle concluait \og \code{ctx} est une nouvelle référence à chaque
+rendu\fg{}. C'est faux : \code{ctx} ne change que lorsqu'on clique. Le
+domaine confondait deux faits différents :
+\begin{itemize}
+  \item la \emph{fraîcheur à l'allocation}, un fait sur un événement : la
+    valeur \emph{écrite} par \code{setCtx({...})} est un objet neuf ;
+  \item la \emph{fraîcheur par rendu}, un fait entre deux rendus : la valeur
+    \emph{lue} par \code{ctx} change à chaque rendu.
+\end{itemize}
+La première est vraie, la seconde non, et l'ancien \code{Unstable} disait
+les deux à la fois.
+
+\subsection{Le faux négatif caché dessous}
+
+Corriger le FP \og naïvement\fg{}, en rendant \og plutôt stable\fg{} toute
+lecture d'état, aurait ouvert un faux négatif réel. L'ADR-017 le montre
+avec ce composant :
+
+\begin{lstlisting}[language=TypeScript,caption={Une boucle de churn d'objet (\file{/tmp/ch10/stability.tsx}, extrait)},label={lst:statevalue-stabilite-objchurn}]
+export function ObjChurn() {
+  const [obj, setObj] = useState({ a: 1 });
+  useEffect(() => { setObj({ ...obj, b: 2 }); }, [obj]);
+  return <div />;
+}
+\end{lstlisting}
+
+L'effet écrit à chaque exécution un objet neuf dans \code{obj} ; la dep
+\code{obj} change donc, l'effet se ré-exécute, et ainsi de suite : une vraie
+boucle infinie. Or le bras point fixe d'\regle{infinite-loop} ne la voyait
+pas, parce que le store ne grandit pas : $\code{Unstable} \join
+\code{Unstable} = \code{Unstable}$, rien à élargir, contrairement à un
+intervalle. Le \emph{seul} signal sur ce bug était le même \Warning{}
+\regle{always-unstable-deps} qui était un FP sur \code{ObjectStateDep}.
+Faire taire l'un sans remplacer le signal faisait disparaître l'autre, et
+un FN est interdit (\cref{def:soundness}). La correction F5 devait donc être
+double : scinder le treillis, \emph{et} ajouter une détection du churn qui
+ne repose pas sur la divergence du store.
+
+% ===========================================================================
+\section{Traces de changement, bornes may et must}
+\label{sec:statevalue-stabilite-traces}
+
+\subsection{L'objet concret : la trace de changement}
+
+Pour dire proprement ce que \og stable\fg{} veut dire, il faut fixer ce que
+l'on abstrait. Ce n'est pas une valeur, mais le comportement d'une
+expression au fil des rendus.
+
+\begin{definition}{Trace de changement}{statevalue-stabilite-trace}
+  Soit une expression d'un composant (une dep, une variable) évaluée aux
+  rendus successifs $r_0, r_1, \dots, r_n$, avec les valeurs $v_0, \dots,
+  v_n$. Sa \terme{trace de changement} est l'ensemble des rendus où
+  \code{Object.is} échoue :
+  \[
+    C \;=\; \{\, i \in \{1,\dots,n\} \mid \neg\,\code{Object.is}(v_i, v_{i-1}) \,\}.
+  \]
+  Pour un ensemble $S$ de slots d'état, on note $\mathit{Set}(S)$ l'ensemble
+  des rendus $r_i$ ($i \ge 1$) précédés, depuis $r_{i-1}$, d'au moins un
+  appel au setter d'un slot de $S$.
+\end{definition}
+
+La trace de changement est exactement ce que React observe : les deps d'un
+effet, l'invalidation d'un mémo et la propagation d'un contexte ne dépendent
+que d'elle.
+
+\begin{exemple}{Quatre traces}{statevalue-stabilite-traces}
+  \begin{itemize}
+    \item \code{const r = useRef()} : $C = \emptyset$ (même conteneur à
+      chaque rendu).
+    \item \code{const o = { a: 1 }} dans le corps : $C = \{1, \dots, n\}$
+      (un objet neuf à chaque rendu).
+    \item \code{ctx} lu depuis \code{useState({ locale: "en" })} dans
+      \code{ObjectStateDep} : $C \subseteq \mathit{Set}(\{\code{ctx}\})$ ; il
+      ne change qu'aux clics.
+    \item \code{const v = flag ? { a: 2 } : obj}, avec \code{obj} un état :
+      tantôt neuf à chaque rendu, tantôt versionné ; on ne peut rien borner.
+  \end{itemize}
+\end{exemple}
+
+\subsection{Deux bornes, deux usages}
+
+Sur l'ensemble $C$, deux informations utiles coexistent. Elles ne sont pas
+opposées : ce sont deux \emph{bornes} de nature différente, au sens de la
+\cref{def:must-may}.
+\begin{itemize}
+  \item Une borne \terme{may} (sur-approximation) : \og $C \subseteq X$\fg{},
+    par exemple \og ne change \emph{qu'aux} sets de $S$\fg{}. C'est un fait
+    de sûreté. Les règles s'en servent pour \emph{se taire} à bon droit : une
+    dep versionnée ne ré-exécute pas l'effet à chaque rendu.
+  \item Une borne \terme{must} (sous-approximation) : \og $C \supseteq
+    Y$\fg{}, ici \og change \emph{à chaque} rendu\fg{}. C'est un fait de
+    certitude. Les règles s'en servent pour \emph{tirer}, jusqu'au niveau
+    \Error{}.
+\end{itemize}
+Chaque borne prend trois valeurs, ordonnées : \code{Never} ($C = \emptyset$),
+\code{OnSet} ($\mathit{Set}(S)$), \code{Every} (tous les rendus). Une paire
+(may, must) cohérente vérifie must $\le$ may. Le \cref{fig:statevalue-stabilite-maymust}
+place les six paires possibles.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[x=34mm,y=17mm]
+  % axes
+  \draw[fleche] (-0.62,-0.5) -- (2.6,-0.5);
+  \node[etiquette] at (1,-1.0) {borne may : $C \subseteq \dots$};
+  \draw[fleche] (-0.62,-0.5) -- (-0.62,2.5);
+  \node[etiquette] at (-0.62,2.75) {borne must : $C \supseteq \dots$};
+  \foreach \x/\n in {0/\code{Never},1/\code{OnSet},2/\code{Every}} \node[etiquette,below] at (\x,-0.52) {\n};
+  \foreach \y/\n in {0/\code{Never},1/\code{OnSet},2/\code{Every}} \node[etiquette,left] at (-0.64,\y) {\n};
+  % points retenus
+  \node[bloc,align=center] (s) at (0,0) {\code{Stable}\\{\scriptsize \code{useRef}, setter, littéral}};
+  \node[bloc,align=center] (v) at (1,0) {\code{Versioned(S)}\\{\scriptsize lecture d'un état objet}};
+  \node[bloc,align=center] (u) at (2,0) {\code{Unknown}\\{\scriptsize \code{c ? {} : obj}}};
+  \node[bloc,align=center] (p) at (2,2) {\code{PerRender}\\{\scriptsize \code{{}} dans le rendu}};
+  % points écartés
+  \node[cfgbloc,dashed,align=center,text=ra-gray] (oo) at (1,1) {(OnSet, OnSet)\\{\scriptsize change exactement aux sets}};
+  \node[cfgbloc,dashed,align=center,text=ra-gray] (eo) at (2,1) {(Every, OnSet)\\{\scriptsize aux sets, peut-être plus}};
+  \node[etiquette,align=center] at (0.35,1.75) {must $>$ may :\\incohérent};
+\end{tikzpicture}
+\caption{Le carré may/must de l'ADR-017. Chaque point est une paire (borne
+may, borne must) sur la trace de changement $C$ ; seules les paires avec
+must $\le$ may ont un sens. Les quatre points encadrés en bleu sont retenus
+(avec $\Bot$, non figuré) ; les deux points en pointillés, \og doit changer
+aux sets\fg{}, sont écartés. Le join affaiblit les deux bornes : il va vers
+la droite et vers le bas.}
+\label{fig:statevalue-stabilite-maymust}
+\end{figure}
+
+Les deux points écartés n'avaient qu'un consommateur prospectif, la
+détection du churn. Or celle-ci a de toute façon besoin d'une analyse
+d'atteignabilité du corps de l'effet (le set a-t-il lieu sur tous les
+chemins ?), qui n'est pas une propriété de valeur. Elle vit donc dans la
+règle (\cref{chap:infinite-loop}) et le graphe de churn
+(\cref{chap:churn}), pas dans le treillis. L'ADR-017 garde le produit
+complet comme cadre d'extension si un second consommateur apparaît.
+
+\subsection{Le treillis \code{Stability}}
+
+\begin{definition}{Treillis de stabilité versionnée}{stabilite}
+  Le treillis \code{Stability} a pour éléments $\Bot$, \code{Stable},
+  $\code{Versioned}(S)$ pour tout ensemble $S$ de slots qualifiés avec
+  $1 \le |S| \le 4$, \code{VersionedTop}, \code{PerRender} et
+  \code{Unknown} ($\Top$). Sa concrétisation, en termes de traces de
+  changement (\cref{def:statevalue-stabilite-trace}) :
+  \[
+  \begin{array}{rcl}
+    \gam(\Bot) &=& \emptyset\\
+    \gam(\code{Stable}) &=& \{\, \text{traces avec } C = \emptyset \,\}\\
+    \gam(\code{Versioned}(S)) &=& \{\, \text{traces avec } C \subseteq \mathit{Set}(S) \,\}\\
+    \gam(\code{VersionedTop}) &=& \{\, \text{traces avec } C \subseteq \mathit{Set}(S) \text{ pour un certain ensemble } S \,\}\\
+    \gam(\code{PerRender}) &=& \{\, \text{traces avec } C = \{1, \dots, n\} \,\}\\
+    \gam(\code{Unknown}) &=& \text{toutes les traces}
+  \end{array}
+  \]
+  L'ordre est $\Bot \lleq \code{Stable} \lleq \code{Versioned}(S) \lleq
+  \code{Versioned}(T) \lleq \code{VersionedTop} \lleq \code{Unknown}$ pour
+  $S \subseteq T$, et $\Bot \lleq \code{PerRender} \lleq \code{Unknown}$ ;
+  \code{PerRender} est incomparable avec \code{Stable}, les
+  \code{Versioned} et \code{VersionedTop}.
+\end{definition}
+
+Les quatre noms se lisent sur le carré : \code{Stable} est (Never, Never),
+\code{Versioned} est (OnSet, Never), \code{PerRender} est (Every, Every),
+\code{Unknown} est (Every, Never). \code{Versioned} est une borne may ;
+\code{PerRender} est une borne must. Le code transcrit la définition, avec un
+commentaire qui reproduit le diagramme de Hasse :
+
+\rustsnippet[label={lst:statevalue-stabilite-enum}]{src/domains/impls/stability.rs}{9}{52}{le treillis de stabilité versionnée}
+
+Un slot qualifié \code{QualifiedSlot} est un couple \code{(ComponentId,
+HookLabel)} (\src{src/ir/types.rs}{6}{9}) : le label d'un hook n'est unique
+qu'au sein de son composant, et un \code{Versioned} peut traverser les
+frontières de composants par les props. L'ADR-017 écrit encore
+\code{(Symbol, HookLabel)} ; le passage à \code{ComponentId} date de
+\issue{7}. Le \cref{fig:statevalue-stabilite-hasse} redessine le diagramme.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[treillis,x=15mm,y=12mm]
+  \node (top) at (1.5,5) {\code{Unknown} ($\Top$)};
+  \node (vtop) at (0,4) {\code{VersionedTop}};
+  \node (v4) at (0,3.1) {\code{Versioned({a,b,c,d})}};
+  \node (vdots) at (0,2.45) {$\vdots$};
+  \node (vab) at (-1,1.8) {\code{Versioned({a,b})}};
+  \node (vac) at (1,1.8) {\code{Versioned({a,c})}};
+  \node (va) at (-1,0.9) {\code{Versioned({a})}};
+  \node (vb) at (0.2,0.9) {\code{{b}}};
+  \node (vc) at (1.2,0.9) {\code{{c}}};
+  \node (st) at (0,0) {\code{Stable}};
+  \node (per) at (3.3,2.2) {\code{PerRender}};
+  \node (bot) at (1.5,-1) {$\Bot$};
+  \draw (top) -- (vtop); \draw (top) -- (per);
+  \draw (vtop) -- (v4); \draw (v4) -- (vdots);
+  \draw (vdots) -- (vab); \draw (vdots) -- (vac);
+  \draw (vab) -- (va); \draw (vab) -- (vb.north); \draw (vac) -- (va); \draw (vac) -- (vc);
+  \draw (va) -- (st); \draw (vb) -- (st); \draw (vc) -- (st);
+  \draw (st) -- (bot); \draw (per) -- (bot);
+  \node[etiquette,align=left] at (-2.6,2.3) {borne may :\\ chaîne $\subseteq$,\\ $|S| \le 4$};
+  \node[etiquette,align=left] at (4.3,2.2) {borne\\ must};
+\end{tikzpicture}
+\caption{Diagramme de Hasse de \code{Stability} (d'après le commentaire de
+\src{src/domains/impls/stability.rs}{20}{30}). À gauche, la chaîne may
+ordonnée par inclusion des ensembles de slots, bornée par
+\code{VERSIONED_LABELS_THRESHOLD = 4} ; à droite, le fait must
+\code{PerRender}. Les deux branches ne se rejoignent qu'en $\Top$ et en
+$\Bot$. Les étiquettes \code{{b}} et \code{{c}} abrègent
+\code{Versioned({b})} et \code{Versioned({c})}.}
+\label{fig:statevalue-stabilite-hasse}
+\end{figure}
+
+\subsection{Canonisation}
+
+\rustsnippet[label={lst:statevalue-stabilite-versioned}]{src/domains/impls/stability.rs}{54}{70}{les constructeurs canonisants}
+
+\begin{invariant}{Forme canonique de \code{Versioned}}{statevalue-stabilite-versioned}
+  Un \code{Versioned(S)} a toujours $1 \le |S| \le 4$. \og Versionné par
+  rien\fg{} veut dire \og ne change jamais\fg{} : $\code{Versioned}(\emptyset)
+  \equiv \code{Stable}$ ; au-delà de quatre slots, la valeur est élargie à
+  \code{VersionedTop}. L'invariant est garanti par \code{versioned} (qu'emploient
+  \code{join} et \code{meet}) et par \code{versioned_by} (un singleton). Le
+  variant étant public, rien n'empêche un appelant de construire
+  \code{Versioned} à la main ; aucune assertion ne le vérifie.
+\end{invariant}
+
+Le seuil reprend le motif de \code{StrConst} (\cref{sec:treillis-simples-strconst}) :
+un ensemble borné, élargi à son $\Top$ propre au-delà de quatre éléments.
+
+\subsection{Ordre, join, meet, widen}
+
+\rustsnippet[label={lst:statevalue-stabilite-ord-stab}]{src/domains/impls/stability.rs}{72}{101}{l'ordre de \code{Stability}}
+
+L'ordre se lit de haut en bas : l'égalité d'abord, puis $\Bot$ et
+\code{Unknown} aux extrémités, puis la chaîne may (\code{Stable} sous tout
+\code{Versioned}, inclusion stricte des ensembles, tout \code{Versioned} sous
+\code{VersionedTop}) ; tout le reste, c'est-à-dire \code{PerRender} face à
+la chaîne may, et deux ensembles non inclus l'un dans l'autre, est
+incomparable (\code{None}).
+
+\rustsnippet[label={lst:statevalue-stabilite-join-stab}]{src/domains/impls/stability.rs}{108}{146}{join, meet et widen de \code{Stability}}
+
+Ces méthodes sont \emph{inhérentes} ; l'implémentation du trait
+\code{AbstractDomain} leur délègue
+(\src{src/domains/impls/stability.rs}{149}{168}). Comme Rust préfère la méthode inhérente à la méthode de trait
+à la résolution de \code{self.join(other)}, il n'y a pas de récursion.
+
+\begin{theoreme}{Soundness du join de \code{Stability}}{statevalue-stabilite-join-stab}
+  Pour tous $a, b$ : $\gam(a) \cup \gam(b) \subseteq \gam(a \join b)$.
+\end{theoreme}
+\begin{proof}
+  Par cas, dans l'ordre des bras du code.
+  \emph{Égalité} : $a \join a = a$. \emph{$\Bot$} : $\gam(\Bot) =
+  \emptyset$, donc $\gam(\Bot) \cup \gam(x) = \gam(x)$.
+  \emph{\code{Unknown}} : $\gam(\code{Unknown})$ contient toutes les traces.
+  \emph{\code{Stable} et \code{Versioned}(S)} : une trace avec $C =
+  \emptyset$ vérifie $C \subseteq \mathit{Set}(S)$ ; même argument avec
+  \code{VersionedTop}. \emph{\code{Versioned}(S) et \code{Versioned}(T)} :
+  $\mathit{Set}$ est croissant, donc $C \subseteq \mathit{Set}(S)$ ou $C
+  \subseteq \mathit{Set}(T)$ entraîne $C \subseteq \mathit{Set}(S \cup T)$ ;
+  si $|S \cup T| > 4$, \code{versioned} rend \code{VersionedTop}, dont la
+  concrétisation contient celle de $\code{Versioned}(S \cup T)$ ; et
+  $S \cup T$ n'est jamais vide. \emph{\code{VersionedTop} et
+  \code{Versioned}} : immédiat. \emph{Dernier bras} (\code{PerRender} face à
+  la chaîne may) : le résultat est \code{Unknown}, qui contient tout.
+\end{proof}
+
+\begin{proposition}{Borne supérieure, hauteur et terminaison}{statevalue-stabilite-lub}
+  Sous l'\cref{inv:statevalue-stabilite-versioned}, $a \join b$ est la plus
+  petite borne supérieure de $a$ et $b$ dans l'ordre de
+  \cref{lst:statevalue-stabilite-ord-stab}. Toute chaîne strictement
+  croissante a au plus 8 éléments ($\Bot \sqsubset \code{Stable} \sqsubset$
+  quatre \code{Versioned} de tailles 1 à 4 $\sqsubset \code{VersionedTop}
+  \sqsubset \code{Unknown}$), donc \code{widen = join} termine.
+\end{proposition}
+\begin{proof}
+  Seuls deux cas ne sont pas évidents. $\code{Stable} \join
+  \code{PerRender}$ : le seul majorant commun est \code{Unknown}, puisque
+  \code{PerRender} n'est sous rien d'autre. $\code{Versioned}(S) \join
+  \code{Versioned}(T)$ avec $|S \cup T| > 4$ : un majorant
+  $\code{Versioned}(U)$ exigerait $U \supseteq S \cup T$, donc $|U| > 4$, ce
+  que l'invariant interdit ; restent \code{VersionedTop} et \code{Unknown},
+  et le plus petit est \code{VersionedTop}.
+\end{proof}
+
+\begin{piege}
+  $\code{Versioned}(S) \meet \code{PerRender} = \Bot$ est bien la borne
+  inférieure \emph{dans l'ordre abstrait}, mais les concrétisations
+  s'intersectent : une trace où chaque rendu est précédé d'un set d'un slot
+  de $S$ change à chaque rendu \emph{et} seulement aux sets. Le meet est
+  donc strictement plus petit que l'intersection des concrétisations ;
+  l'utiliser pour raffiner une valeur ferait disparaître des comportements
+  réels, un FN. Il n'est appelé par aucun code de production au commit
+  \snapshotCommit{} ; ne pas s'en servir sans revoir ce point.
+\end{piege}
+
+\begin{decision}[ADR-017 --- stabilité versionnée, bornes may et must]
+\textbf{Contexte} : les cinq FP F5 sur des états objets, et le FN
+\code{ObjChurn} que leur correction naïve aurait ouvert.
+\textbf{Décide} : (1) le treillis ci-dessus ; (2) une conversion \og côté
+lecture\fg{} en un seul point, la lecture d'un slot
+(\cref{sec:statevalue-stabilite-lecture}) ; (3) un bras churn dans
+\regle{infinite-loop} (\Error{} si la dep \emph{est} le slot, que le set a
+lieu sur tous les chemins et que la valeur écrite est \code{PerRender} ;
+\Warning{} si la dep est \code{Versioned(S)} avec le slot dans $S$) ; (4) le
+recâblage des consommateurs (\regle{always-unstable-deps} ne tire plus que
+sur \code{PerRender}). \textbf{Alternatives refusées} : encoder un compteur
+d'événements dans le store pour faire tirer le widening (\og non-standard
+hack\fg{}) ; un nouveau nom de diagnostic (même classe de panne) ; garder les
+deux points \og doit changer aux sets\fg{} (un seul consommateur, qui a de
+toute façon besoin d'atteignabilité). \textbf{Coût accepté} :
+\code{Stability} n'est plus \code{Copy} (il possède un \code{BTreeSet}) ; les
+erreurs de compilation ont forcé l'audit de tous les consommateurs.
+\end{decision}
+
+% ===========================================================================
+\section{Deux vues d'un même état : la conversion côté lecture}
+\label{sec:statevalue-stabilite-lecture}
+
+\subsection{Le problème}
+
+Le treillis sait maintenant dire \og ne change qu'aux sets de
+\code{ctx}\fg{}. Reste à savoir \emph{où} ce fait apparaît. Dans
+\code{ObjectStateDep}, le store du slot reçoit deux écritures : le
+littéral d'initialisation et celui du handler, deux objets neufs. Son contenu
+convergé est donc, à juste titre, \code{ref(PerRender)} : chaque valeur
+\emph{écrite} est une allocation fraîche. La sonde le confirme :
+\begin{sortie}
+-- ObjectStateDep
+   state[0] = ref(PerRender)   widened=false  num=Interval { lo: inf, hi: -inf, is_int: true }
+\end{sortie}
+Si la lecture \code{ctx} rendait cette valeur telle quelle, on retomberait
+sur le FP F5. Il faut que ce qu'un rendu \emph{lit} dise autre chose que ce
+que les événements \emph{écrivent}.
+
+\subsection{Le code : un seul point de conversion}
+
+Le fait React qui tranche est celui-ci : un slot d'état ne change \emph{que}
+par son setter. Toute lecture de \code{StateVal(l)} a donc la borne may
+\og ne change qu'aux sets de $l$\fg{}, quelles que soient les valeurs écrites.
+L'évaluateur le traduit à un seul endroit :
+
+\rustsnippet[label={lst:statevalue-stabilite-stateval}]{src/domains/transfer/state_value.rs}{122}{135}{la conversion côté lecture (ADR-017)}
+
+Si la composante \code{reference} de la valeur stockée est peuplée, elle est
+remplacée par \code{Versioned({(composant, l)})} ; les autres composantes
+passent inchangées. Le champ \code{ctx.component} de l'\code{AnalysisCtx}
+(\cref{sec:statevalue-stabilite-contextes}) fournit le propriétaire du slot.
+Une lecture dont la composante \code{reference} est $\Bot$ (un état
+purement numérique, par exemple) n'est pas convertie : elle ne porte aucune
+étiquette de version, ce qui aura une conséquence au
+\cref{sec:statevalue-stabilite-limites}. Tout ce qui est en aval hérite de
+la conversion gratuitement : liaisons d'environnement
+(\code{const o = obj}), évaluation des deps, props passées à un enfant.
+
+Le \cref{chap:react-modele} a énoncé l'invariant qui en découle, la
+\emph{double vue de l'état} (\cref{inv:react-modele-double-vue}) ; le
+\cref{fig:statevalue-stabilite-double-vue} le met en image.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=7mm and 9mm]
+  \node[bloc,align=center] (w1) {\code{useState({ locale: "en" })}\\{\scriptsize amorçage}};
+  \node[bloc,align=center,below=of w1] (w2) {\code{setCtx({ locale: "fr" })}\\{\scriptsize handler}};
+  \coordinate (mid) at ($(w1.east)!0.5!(w2.east)$);
+  \node[bloc,align=center,right=12mm of mid,minimum height=16mm] (store) {\textbf{store} (vue événement)\\ join des valeurs écrites\\ \code{ref(PerRender)}};
+  \node[bloc,align=center,right=18mm of store,minimum height=16mm] (read) {\textbf{lecture} \code{StateVal(l)}\\ (vue inter-rendus)\\ \code{ref(Versioned({(C,l)}))}};
+  \draw[fleche] (w1) -- (store); \draw[fleche] (w2) -- (store);
+  \draw[flechemust] (store) -- node[etiquette,above]{conversion} node[etiquette,below]{\code{versioned_by}} (read);
+  \node[cfgbloc,align=left,below=12mm of store] (r1) {\regle{redundant-set-state}\\ \code{value_freshness} (churn)};
+  \node[cfgbloc,align=left,below=12mm of read] (r2) {deps : \regle{always-unstable-deps},\\ \regle{infinite-loop}, \regle{missing-deps},\\ mémos, props};
+  \draw[flechemay] (store) -- node[etiquette,left]{lit} (r1);
+  \draw[flechemay] (read) -- node[etiquette,right]{lit} (r2);
+\end{tikzpicture}
+\caption{La double vue de l'état sur \code{ObjectStateDep}. Le store range
+le join des valeurs \emph{écrites}, deux allocations fraîches ; toute
+lecture du slot rend la vue \emph{inter-rendus}, ce que \code{Object.is}
+compare d'un rendu à l'autre. Les consommateurs qui comparent des valeurs
+écrites lisent le store ; ceux qui raisonnent sur les deps lisent
+l'évaluation.}
+\label{fig:statevalue-stabilite-double-vue}
+\end{figure}
+
+\begin{proposition}{Soundness de la conversion côté lecture}{statevalue-stabilite-lecture}
+  Sous l'hypothèse (H1) \og aucun setter n'est appelé pendant le rendu\fg{},
+  la trace de changement de toute lecture du slot $l$ vérifie $C \subseteq
+  \mathit{Set}(\{l\})$ : la composante $\code{Versioned}(\{l\})$ est une
+  borne may correcte.
+\end{proposition}
+\begin{proof}
+  La valeur d'un état au rendu $r_i$ est la valeur de son slot, que seuls
+  les appels à son setter modifient (en file d'attente, traités au rendu
+  suivant). Si $r_i$ n'est précédé, depuis $r_{i-1}$, d'aucun appel au setter
+  de $l$, et qu'aucun appel n'a eu lieu pendant $r_{i-1}$ lui-même (H1), la
+  valeur est la même référence, et \code{Object.is} réussit : $i \notin C$.
+\end{proof}
+
+L'ADR-017 nomme les deux hypothèses dont dépend cette conversion, et elles
+sont couvertes chacune à part :
+\begin{enumerate}
+  \item \emph{H1, les sets ont lieu hors rendu.} Un setter appelé pendant le
+    rendu avec une référence fraîche fait vraiment changer le slot à chaque
+    rendu, ce que \code{Versioned} sous-estime. Cette violation a son propre
+    diagnostic, \regle{setter-in-render}, de niveau \Error{} : c'est la
+    soundness en couches du \cref{chap:react-modele}
+    (\cref{def:soundness-couches}).
+  \item \emph{H2, le couplage avec le bras churn.} \regle{infinite-loop}
+    accepte une dep \code{Versioned} comme \og garde\fg{} qui empêche
+    l'effet de tourner à chaque rendu. C'est sound \emph{seulement} parce
+    que le bras churn traite le cas où l'effet écrit lui-même une référence
+    fraîche dans le slot qui le versionne. Retirer l'un sans l'autre rouvre
+    le FN \code{ObjChurn}.
+\end{enumerate}
+
+\begin{exemple}{Les cinq composants de \file{stability.tsx}}{statevalue-stabilite-cinq}
+Le fichier \file{/tmp/ch10/stability.tsx} réunit \code{ObjectStateDep},
+\code{ObjChurn} et trois composants de la \cref{sec:statevalue-stabilite-memo}
+(\code{InlineObjectDep}, \code{MemoizedDep}, \code{CallbackDep}) :
+\begin{sortie}
+$ reactant check /tmp/ch10/stability.tsx --show-clean
+  CallbackDep  (4 hooks)  /tmp/ch10/stability.tsx  ✓
+  InlineObjectDep  (1 hooks)  /tmp/ch10/stability.tsx
+    warn   always-unstable-deps  [hook:0]  (line 5:2)  this effect depends on `opts`, a new reference every render, so `Object.is` always differs and the effect re-runs on every render regardless of the other deps
+       (1 trace step(s), rerun with --trace)
+  MemoizedDep  (2 hooks)  /tmp/ch10/stability.tsx  ✓
+  ObjChurn  (2 hooks)  /tmp/ch10/stability.tsx
+    error  infinite-loop  [hook:0]  (line 30:2)  this effect recreates object state `obj` it depends on. Every run stores a fresh reference (`Object.is` always fails) and re-triggers itself: infinite render loop
+       (1 trace step(s), rerun with --trace)
+  ObjectStateDep  (3 hooks)  /tmp/ch10/stability.tsx  ✓
+
+⚠  1 error(s), 1 warning(s) across 1 file(s).
+\end{sortie}
+\code{ObjectStateDep} est propre : sa dep lit \code{Versioned}, et
+\regle{always-unstable-deps} exige \code{PerRender}. Le FP F5 est mort, et
+\code{ObjChurn} est passé d'un \Warning{} noyé dans les FP à une \Error{}.
+\end{exemple}
+
+\subsection{Le churn d'objet, certifié par la structure}
+
+Sur \code{ObjChurn}, le store vaut aussi \code{ref(PerRender)}, et la lecture
+\code{obj} vaut \code{Versioned({(C,0)})}. Rien ne s'élargit (sonde :
+\code{widened=false}), donc le bras point fixe d'\regle{infinite-loop} ne peut
+rien voir. La certitude ne vient pas non plus de \code{Versioned} : c'est une
+borne may (\og ne change \emph{qu'aux} sets\fg{}), pas \og change à chaque
+set\fg{}. Elle vient de la \emph{structure} :
+\begin{itemize}
+  \item la dep \code{obj} \emph{est} le slot, sans accès de champ
+    (must-change dès que la valeur écrite est fraîche) ;
+  \item la valeur écrite \code{{...obj, b: 2}} est un \code{ObjectLit}, donc
+    \code{PerRender} au sens must, et l'écriture a lieu sur tous les chemins du
+    corps de l'effet (must-reach) ;
+  \item React ré-exécute un effet dont une dep a changé (must-rerun).
+\end{itemize}
+Trois faits must, aucun fait may : une \Error{} (\cref{chap:infinite-loop}).
+Côté moteur, c'est \code{value_freshness} qui classe la valeur écrite pour
+le graphe de churn (\cref{chap:churn}) ; elle lit la vue événement :
+
+\rustsnippet[label={lst:statevalue-stabilite-freshness}]{src/engine/written.rs}{173}{200}{la fraîcheur d'une valeur écrite, lue sur la composante référence}
+
+Le commentaire d'en-tête dit l'essentiel : le churn ne concerne que la
+sorte référence, parce qu'une valeur numérique élargie (\code{count + 1})
+change mais n'échoue jamais \code{Object.is} \og par fraîcheur\fg{}. Une
+valeur versionnée par le slot cible seul est son propre contenu : la
+réécrire n'est pas un changement (\issue{155}).
+
+\begin{piege}
+  L'inverse n'est pas vrai : une valeur versionnée par le slot cible mais
+  \emph{dérivée} de lui (un mémo \code{useMemo(() => ({ n: s.n + 1 }), [s])} réécrit dans \code{s}) est lue \og non fraîche\fg{}, alors qu'elle
+  change exactement quand le cycle tourne. C'est un FN connu, ouvert sous
+  l'étiquette \code{soundness-bug} (\issue{157}) ; sa correction demande un
+  point \og exactement le contenu du slot $q$\fg{} \emph{sous}
+  $\code{Versioned}(\{q\})$ dans le treillis, dégradé en \code{Versioned}
+  par toute transformation. En attendant, la lecture d'ADR-017 tient.
+\end{piege}
+
+\subsection{Lire un champ d'un objet versionné}
+
+Un accès \code{obj.field} commence par le tas : si le récepteur désigne des
+objets alloués connus, la valeur est le join des champs lus
+(\cref{chap:transfert-stores}). Sinon, l'évaluateur garde les étiquettes de
+version du récepteur plutôt que de tomber à $\Top$ :
+
+\rustsnippet[label={lst:statevalue-stabilite-field}]{src/domains/transfer/state_value.rs}{617}{628}{un champ d'objet versionné garde les étiquettes}
+
+La \emph{sorte} du champ reste inconnue (toutes les autres composantes sont à
+$\Top$), mais sa borne may survit : un champ d'un état objet ne peut changer
+qu'aux sets de cet état, sous la même hypothèse \og pas de mutation pendant
+le rendu\fg{} que la lecture d'un slot (les mutations en place ont leur
+diagnostic, \regle{state-mutation}). Une dep \code{obj.field} ne peut
+toutefois donner qu'un \Warning{} dans le bras churn :
+\code{setObj({...obj, other: 2})} préserve la référence du champ, donc la
+dep peut ne pas changer.
+
+% ===========================================================================
+\section{Littéraux, \code{useRef}, \code{useMemo}, \code{useCallback}}
+\label{sec:statevalue-stabilite-memo}
+
+\subsection{Où naît une référence}
+
+La composante \code{reference} n'est peuplée que par un petit nombre de
+formes, toutes dans l'évaluateur :
+
+\rustsnippet{src/domains/transfer/state_value.rs}{153}{156}{les littéraux alloués et les éléments natifs}
+
+\rustsnippet{src/domains/transfer/state_value.rs}{176}{181}{appels et \code{new}}
+
+Le \cref{tab:statevalue-stabilite-sources} rassemble ces sources.
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{p{47mm}p{33mm}p{62mm}}
+\hline
+\textbf{Expression} & \textbf{Valeur} & \textbf{Raison} \\ \hline
+\code{{...}}, \code{[...]}, \code{() => ...} & \code{ref(PerRender)} & allocation à chaque évaluation (fait must) \\
+\code{new X(...)} & \code{ref(PerRender)} & idem, depuis \code{e67b10a} (\issue{158}) \\
+\code{arr.map(f)}, \code{filter}, \code{flat}, \code{split}, \code{structuredClone(x)}, \code{JSON.parse}\dots & \code{ref(PerRender)} & \code{returns_fresh_reference} (\src{src/domains/transfer/state_value.rs}{238}{259}) \\
+\code{s.slice(...)}, \code{concat} & $\Top$ & peut rendre une chaîne, donc une primitive (\issue{22}) \\
+autre appel & $\Top$ & rien n'est connu du résultat \\
+élément JSX natif & \code{ref(Stable)} & non documenté, un FN
+(\cref{sec:statevalue-stabilite-nativeelem}) \\
+\code{useRef()} & \code{ref(Stable)} & même conteneur à chaque rendu \\
+\code{setX} (setter) & \code{setter(...)} & identité garantie par React \\
+lecture \code{StateVal(l)} & \code{Versioned({l})} sur \code{reference} & conversion côté lecture \\
+\code{useMemo} / \code{useCallback} & \code{ref(...)} & \code{recompute_memo}, ci-dessous \\
+\hline
+\end{tabular}
+\caption{Les sources de la composante \code{reference}.}
+\label{tab:statevalue-stabilite-sources}
+\end{table}
+
+\code{useRef} passe par un marqueur de hook dont le commentaire explique
+pourquoi il est une référence et pas \code{undefined} :
+
+\rustsnippet{src/domains/transfer/state_value.rs}{142}{147}{les marqueurs de hooks}
+
+Le commentaire qui précède (\src{src/domains/transfer/state_value.rs}{137}{141})
+mérite d'être retenu : lire le résultat
+d'un hook personnalisé non résolu comme \code{undefined} le rendait
+\emph{prouvablement stable} (\code{to_stability} joint \code{Stable} pour
+\code{undef}) et faisait taire toutes les règles de stabilité, un FN. Il vaut
+donc $\Top$.
+
+\subsection{La valeur d'un mémo : \code{recompute_memo}}
+
+\code{useMemo(f, deps)} et \code{useCallback(f, deps)} rendent la même
+référence tant que leurs deps ne changent pas. Leur stabilité est donc le
+join des stabilités de leurs deps. Le moteur la recalcule par la méthode
+\code{recompute_memo} du trait \code{Transfer} :
+
+\rustsnippet[label={lst:statevalue-stabilite-memo}]{src/domains/transfer/state_value.rs}{56}{101}{la valeur d'un mémo, stabilité de ses deps}
+
+Étape par étape :
+\begin{enumerate}
+  \item pas de tableau lisible (\code{deps.list()} vaut \code{None}) :
+    \code{Unknown}. \code{Stable} serait une affirmation must sur une liste
+    que l'IR n'a jamais vue ;
+  \item un tableau \emph{connu} vide (\code{Arity::Exact(0)},
+    \cref{sec:ir-deps}) : \code{Stable}, le mémo est calculé une fois ;
+  \item un tableau dont toutes les entrées sont des spreads illisibles :
+    \code{Unknown} ;
+  \item sinon, un pli (fold) par join sur les deps, depuis $\Bot$ : une dep
+    qui \emph{est} syntaxiquement \code{StateVal(l)} donne
+    \code{versioned_by(component, l)} quelle que soit la sorte du slot ;
+    toute autre dep est évaluée normalement, et contribue sa composante
+    versionnée si elle en a une, sa projection \code{to_stability} sinon.
+\end{enumerate}
+Le résultat est rangé dans la composante \code{reference} d'une valeur dont
+tout le reste est $\Bot$.
+
+\begin{exemple}{Trois mémos}{statevalue-stabilite-memos}
+  Sur \file{stability.tsx}, \code{MemoizedDep} écrit
+  \code{useMemo(() => ({ a: 1 }), [])} ; \code{CallbackDep} écrit
+  \code{useCallback(() => console.log(q), [q])} avec \code{q} un état objet
+  mis à jour par un handler ; et sur \file{memo.tsx}, \code{MemoOverObjState}
+  écrit \code{useMemo(() => ({ v: o.a }), [o])}. La sonde :
+\begin{sortie}
+-- MemoizedDep
+   memo[0] (Memo) = ref(Stable)
+-- CallbackDep
+   state[0] = ref(PerRender)   widened=false  num=Interval { lo: inf, hi: -inf, is_int: true }
+   memo[1] (Callback) = ref(Versioned({(ComponentId(4294967295), 0)}))
+-- MemoOverObjState
+   state[0] = ref(PerRender)   widened=false  num=Interval { lo: inf, hi: -inf, is_int: true }
+   memo[1] (Memo) = ref(Versioned({(ComponentId(4294967295), 0)}))
+\end{sortie}
+  Les deux derniers illustrent la double vue : le store de l'état objet
+  vaut \code{ref(PerRender)}, mais la dep lue est versionnée, et le mémo
+  hérite de l'étiquette. Un effet qui dépend de \code{onLoad} ou de \code{a}
+  est donc \og ne change qu'aux sets du slot 0\fg{}, et les trois composants
+  sont propres.
+\end{exemple}
+
+La propagation des étiquettes le long d'une chaîne de mémos est gratuite :
+$\code{Versioned}(\{X\}) \join \code{Stable} = \code{Versioned}(\{X\})$.
+L'ADR-017 exige seulement que \code{to_stability} reste hors de ce chemin,
+parce qu'il effacerait les étiquettes dès qu'une autre composante est
+$\Top$ : c'est le rôle de \code{versioned_reference}
+(\cref{sec:statevalue-stabilite-projections}).
+
+\begin{piege}
+  La valeur d'un mémo n'est \emph{que} sa stabilité, logée dans la
+  composante \code{reference}. La sorte réelle du résultat (un nombre, un
+  objet) est perdue : \code{useMemo(() => 1, [])} vaut \code{ref(Stable)} et
+  non le nombre $1$. Avec une dep fraîche, la perte devient visible :
+\begin{lstlisting}[language=TypeScript,caption={Un mémo primitif sur une dep fraîche (\file{/tmp/ch10/memo.tsx}, extrait)},label={lst:statevalue-stabilite-memoprim}]
+export function MemoPrimitiveOverFreshDep() {
+  const cfg = { k: 1 };
+  const one = useMemo(() => 1, [cfg]);
+  useEffect(() => { console.log(one); }, [one]);
+  return <div>{one}</div>;
+}
+\end{lstlisting}
+\begin{sortie}
+  MemoPrimitiveOverFreshDep  (2 hooks)  /tmp/ch10/memo.tsx
+    warn   always-unstable-deps  [hook:0]  (line 19:8)  this memo depends on `cfg`, a new reference every render, so `Object.is` always differs and the memo re-runs on every render regardless of the other deps
+       → the value flows through `cfg`, bound here (line 18:8)
+    warn   always-unstable-deps  [hook:1]  (line 20:2)  this effect depends on `one`, a new reference every render, so `Object.is` always differs and the effect re-runs on every render regardless of the other deps
+       → the value flows through `one`, bound here (line 19:8)
+\end{sortie}
+  Le premier \Warning{} est juste : le mémo est recalculé à chaque rendu.
+  Le second est un FP : \code{one} vaut toujours \code{1}, comparé par
+  valeur, et l'effet ne tourne qu'une fois. La sonde donne
+  \code{memo[0] (Memo) = ref(PerRender)}.
+\end{piege}
+
+% ===========================================================================
+\section{Projections vers les règles}
+\label{sec:statevalue-stabilite-projections}
+
+\subsection{Quatre questions différentes}
+
+Les règles ne lisent pas une \code{StateValue} en entier ; elles lui posent
+des questions fermées, et chaque question a sa polarité :
+\begin{itemize}
+  \item \og cette dep est-elle, à coup sûr, une référence neuve à chaque
+    rendu ?\fg{} (must ; \regle{always-unstable-deps}) ;
+  \item \og cette valeur est-elle prouvablement stable, donc omissible des
+    deps ?\fg{} (une preuve de sûreté ; \regle{missing-deps}) ;
+  \item \og cette écriture peut-elle croître sans borne ?\fg{} (may ; le bras
+    point fixe d'\regle{infinite-loop}) ;
+  \item \og cet état ne prend-il que quelques valeurs primitives ?\fg{}
+    (\regle{wasted-subtree-render}).
+\end{itemize}
+Le code fournit une projection par question. La plus ancienne, et la plus
+délicate, est \code{to_stability}.
+
+\subsection{\code{to_stability} : la règle \og motion-wins\fg{}}
+
+\rustsnippet[label={lst:statevalue-stabilite-to-stab}]{src/domains/impls/state_value.rs}{320}{369}{la projection vers la stabilité}
+
+L'algorithme :
+\begin{enumerate}
+  \item le résidu \code{other} force \code{Unknown} : une valeur opaque ne
+    revendique jamais une (in)stabilité définie ;
+  \item chaque composante peuplée contribue : un point numérique, un booléen
+    exact, une chaîne singleton, \code{null}, \code{undefined}, un setter
+    contribuent \code{Stable} ; un booléen $\Top$ ou plusieurs chaînes
+    contribuent \code{Unknown} ; la référence contribue sa propre stabilité,
+    sauf \code{PerRender}, qui lève le drapeau \og en mouvement\fg{} ;
+  \item deux sortes peuplées ou plus donnent \code{Unknown} : deux sortes
+    sont deux valeurs \code{Object.is}-distinctes, et la valeur peut passer
+    de l'une à l'autre ;
+  \item \terme{motion-wins} : un intervalle non ponctuel ou une référence
+    \code{PerRender} rend \code{PerRender}, même si une autre composante a
+    dit \code{Unknown}.
+\end{enumerate}
+
+La sonde, sur des valeurs construites à la main :
+\begin{sortie}
+null ⊔ 1 = number[1, 1]|null; to_stability = Unknown
+widen -> number[1, inf]|null; to_stability = PerRender; is_unbounded=true
+boolean ⊔ [0,5] to_stability = PerRender (motion wins over Unknown)
+setter: setter(#4294967295#1) to_stability=Stable typeof=Some("function")
+Versioned ⊔ Stable = Versioned({(ComponentId(4294967295), 0)})
+Versioned ⊔ PerRender = Unknown
+top-with-versioned-ref to_stability = Unknown; versioned_reference = Some(Versioned({(ComponentId(4294967295), 0)}))
+\end{sortie}
+La première ligne est la règle des sortes (deux points, deux sortes :
+\code{Unknown}) ; la deuxième et la troisième sont motion-wins ; la dernière
+montre pourquoi \code{versioned_reference} existe : sur une valeur dont
+toutes les composantes sont $\Top$ sauf une référence versionnée,
+\code{to_stability} rend \code{Unknown} et efface l'étiquette.
+
+\begin{piege}
+  \code{PerRender} n'a pas le même sens selon sa provenance. Dans la
+  composante \code{reference}, c'est une borne \emph{must} : une nouvelle
+  référence à chaque rendu, garantie. Rendu par \code{to_stability} pour un
+  intervalle non ponctuel, c'est seulement \og \emph{peut} changer à chaque
+  rendu\fg{} : l'ADR-017 l'assume (\og the name reads oddly for a number but
+  means `may change every render', kind-agnostic\fg{}). Un consommateur qui
+  a besoin du fait must doit lire la composante, pas la projection. Le
+  message de \regle{missing-deps} montre la confusion au grand jour :
+\begin{lstlisting}[language=TypeScript,caption={Un nombre à deux valeurs (\file{/tmp/ch10/limits.tsx}, extrait)},label={lst:statevalue-stabilite-branchy}]
+export function Branchy({ flag }: { flag: boolean }) {
+  const x = flag ? 1 : 2;
+  useEffect(() => { console.log(x); }, []);
+  return <div>{x}</div>;
+}
+\end{lstlisting}
+\begin{sortie}
+    warn   missing-deps  [hook:0]  var:x  (line 13:2)  `x` is used in this effect but not in its deps array, and it is recreated on every render
+\end{sortie}
+  L'avertissement est fondé (\code{x} change si \code{flag} change), mais
+  \og recreated on every render\fg{} est faux : \code{x} vaut $[1,2]$, que
+  \code{to_stability} projette sur \code{PerRender}, et
+  \code{describe_value} (\src{src/rules/helpers/mod.rs}{36}{52}) traduit
+  \code{PerRender} par cette phrase.
+\end{piege}
+
+\subsection{Les prédicats}
+
+Le fait must a son propre prédicat, déjà rencontré
+(\cref{lst:statevalue-stabilite-as-setter}) :
+\code{is_unstable_reference_only} est vrai si la composante \code{reference}
+vaut \code{PerRender} \emph{et} qu'aucune autre sorte n'est peuplée. C'est
+celui qu'appellent \regle{always-unstable-deps}
+(\srcline{src/rules/impls/always_unstable_deps.rs}{164}), le classement de
+fraîcheur du churn (\srcline{src/engine/written.rs}{188}) et
+\code{returns_verdict_of} (\srcline{src/rules/api/query.rs}{214}). Les
+prédicats de croissance et de finitude :
+
+\rustsnippet[label={lst:statevalue-stabilite-unbounded}]{src/domains/impls/state_value.rs}{371}{401}{croissance non bornée et finitude}
+
+\code{is_unbounded} est la garde n°2 du bras point fixe
+d'\regle{infinite-loop} : une borne numérique infinie, une référence
+\code{PerRender} ou le résidu. Le test \code{!self.num.is_bottom()} n'est
+pas décoratif : l'intervalle $\Bot$ a des bornes sentinelles infinies
+(\cref{lst:statevalue-stabilite-bottom}), et sans ce test toute valeur non
+numérique serait \og non bornée\fg{} (test
+\code{is_unbounded_requires_active_num_slot}). \code{is_finitely_valued}
+sert à \regle{wasted-subtree-render}
+(\srcline{src/rules/impls/wasted_subtree_render.rs}{167}) : un état qui ne
+prend que quelques primitives ne provoque un rendu qu'à ses
+\emph{transitions}, puisque React abandonne une écriture
+\code{Object.is}-égale. C'est le seul prédicat qui lise le bit
+\code{is_int} hors raffinement.
+
+\rustsnippet[label={lst:statevalue-stabilite-versioned-ref}]{src/domains/impls/state_value.rs}{403}{417}{garder les étiquettes, tester la stabilité}
+
+\code{is_stable} est \og \code{to_stability} vaut \code{Stable}\fg{} ; il
+sert de preuve de sûreté à \regle{missing-deps}
+(\srcline{src/rules/impls/missing_deps.rs}{88}), \regle{redundant-set-state}
+et \regle{unnecessary-rerender}.
+
+\begin{exemple}{Deux sortes, une seule sorte}{statevalue-stabilite-crosskind}
+\begin{lstlisting}[language=TypeScript,caption={Deux états optionnels (\file{/tmp/ch10/kinds.tsx}, extrait)},label={lst:statevalue-stabilite-crosskind}]
+export function CrossKind() {
+  const [x, setX] = useState<string>();
+  useEffect(() => { console.log(x); }, []);
+  return <button onClick={() => setX("data")}>{x}</button>;
+}
+
+export function NeverWritten() {
+  const [x] = useState<string>();
+  useEffect(() => { console.log(x); }, []);
+  return <div>{x}</div>;
+}
+\end{lstlisting}
+  La sonde donne \code{string{"data"}|undefined} pour le premier état et
+  \code{undefined} pour le second. Le premier mêle deux sortes, chacune un
+  point : \code{to_stability} rend \code{Unknown}, \code{is_stable} est faux,
+  et \regle{missing-deps} tire à raison (\code{x} passe de \code{undefined} à
+  \code{"data"}) :
+\begin{sortie}
+  CrossKind  (3 hooks)  /tmp/ch10/kinds.tsx
+    warn   missing-deps  [hook:1]  var:x  (line 5:2)  `x` is used in this effect but not in its deps array, and its value may change between renders
+\end{sortie}
+  Le second n'a qu'une sorte, un point : \code{Stable}, et \code{NeverWritten}
+  est propre. Aucune conversion \code{Versioned} n'a lieu, puisque la
+  composante \code{reference} est $\Bot$.
+\end{exemple}
+
+\subsection{Côté règles : \code{StabilityVerdict}}
+
+La couche règles (\cref{chap:api-regles}) n'expose pas \code{Stability}
+directement, mais une projection totale qui replie $\Bot$ et $\Top$ sur le
+côté may :
+
+\rustsnippet[label={lst:statevalue-stabilite-verdict}]{src/rules/api/query.rs}{137}{179}{le verdict de stabilité côté règles}
+
+Trois points de lecture. \code{Bottom} ne vaut pas \code{Stable} : un
+$\Bot$ n'est pas une preuve de stabilité, il part avec \code{Unknown}.
+\code{VersionedTop} devient un \code{Versioned} d'ensemble vide
+(\og change à un slot inconnu\fg{}). Et la documentation de \code{PerRender}
+répète la mise en garde du piège ci-dessus. Deux fonctions libres
+s'appuient dessus : \code{stability_verdict_of}
+(\srcline{src/rules/api/query.rs}{185}) et \code{may_change_of}
+(\srcline{src/rules/api/query.rs}{225}), l'unique sonde \og peut
+changer\fg{} sûre face à $\Top$ (\adr{21}).
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{p{40mm}p{22mm}p{76mm}}
+\hline
+\textbf{Projection} & \textbf{Polarité} & \textbf{Consommateurs principaux} \\ \hline
+\code{is_unstable_reference_only} & must & \regle{always-unstable-deps}, \code{value_freshness}, \code{returns_verdict_of}, \file{helpers/jsx.rs}, \file{engine/fixpoint.rs} \\
+\code{is_stable} & sûreté & \regle{missing-deps}, \regle{redundant-set-state}, \regle{unnecessary-rerender} \\
+\code{is_unbounded} & may & \regle{infinite-loop} (bras point fixe) \\
+\code{is_finitely_valued} & sûreté & \regle{wasted-subtree-render} \\
+\code{to_stability} & mixte & \code{StabilityVerdict}, \code{describe_value}, \code{recompute_memo} \\
+\code{versioned_reference} & may & \code{recompute_memo}, \code{eval_field_access} \\
+\code{as_setter} & exacte & transfert des setters, \file{engine/setters.rs} \\
+\hline
+\end{tabular}
+\caption{Les projections de \code{StateValue} et leurs consommateurs
+(relevé \code{grep} au commit \snapshotCommit, dossier 04 §4.7).}
+\label{tab:statevalue-stabilite-projections}
+\end{table}
+
+\begin{decision}[ADR-020 --- ne pas supprimer \code{to_stability}]
+Lors de la campagne de dette technique, la suppression de
+\code{to_stability} au profit de prédicats de première classe a été
+proposée puis refusée (\adr{20}, non-changement n°4) : c'est une projection
+légitime, documentée et testée (motion-wins, union de sortes vers
+\code{Unknown}, setter stable), et aucun couplage avec perte d'information
+démontré n'y cause de FN ou de FP. La supprimer serait du remaniement ou un
+risque de soundness, pas une correction. La même campagne a refusé
+d'extraire un combinateur \code{BoundedPowerset<T,N>} commun à
+\code{StrConst} et \code{Stability} (non-changement n°5) : \code{Stability}
+est un treillis plus riche que l'ensemble borné.
+\end{decision}
+
+% ===========================================================================
+\section{Les contextes : la passerelle vers le moteur}
+\label{sec:statevalue-stabilite-contextes}
+
+\subsection{Ce dont une fonction de transfert a besoin}
+
+Les fonctions de transfert ne manipulent pas seulement des
+\code{StateValue} isolées. Pour évaluer \code{StateVal(l)}, il leur faut le
+store d'état \emph{et} l'identité du composant, sans laquelle l'étiquette
+\code{Versioned({(C, l)})} ne peut pas être fabriquée. Pour \code{MemoVal},
+le store des mémos ; pour \code{obj.field}, le tas ; pour un appel à travers
+une variable liée par \code{useCallback}, le CFG du corps ; pour
+\code{<Child />}, toute la machinerie inter-composants. Le fichier
+\file{src/domains/context.rs} regroupe ces besoins en quelques types, seule
+flèche de dépendance \code{domains} $\to$ \code{engine} du périmètre.
+
+\subsection{\code{AnalysisCtx} : le paquet d'état mutable}
+
+\rustsnippet[label={lst:statevalue-stabilite-analysisctx}]{src/domains/context.rs}{105}{125}{le paquet d'état passé à chaque fonction de transfert}
+
+L'environnement local n'y figure pas : il est passé à part, parce que
+\code{eval_expr} le lit (\code{&}) alors que \code{exec_stmt} le modifie
+(\code{&mut}). Le champ \code{component} n'est pas une \code{Option}, et son
+commentaire dit pourquoi : une analyse est toujours l'analyse d'\emph{un}
+composant, donc la provenance d'un slot (\code{Versioned}, \code{SetterVal})
+porte toujours le vrai propriétaire ; une IR construite à la main et
+analysée seule porte \code{ComponentId::SYNTHETIC}, l'identité
+\code{4294967295} des sorties de la sonde. \code{analyze_cfg} construit un
+\code{AnalysisCtx} par bloc (\cref{chap:cfg-analyzer-dominance}).
+
+\rustsnippet{src/domains/context.rs}{127}{145}{un contexte sans requête ni inter-composants}
+
+Le \code{static NULL} donne une référence \code{&'static dyn QueryContext}
+sans allocation, \code{NullCtx} étant une structure unitaire. Le moteur
+l'emploie avec des stores d'amorçage vides pour évaluer les constantes
+de module, les arguments de hooks personnalisés et les initialiseurs de
+\code{useState} (\srcline{src/engine/fixpoint.rs}{168},
+\srcline{src/engine/fixpoint.rs}{245}, \srcline{src/engine/fixpoint.rs}{327}).
+
+\subsection{\code{QueryContext} et ses deux implémentations}
+
+\rustsnippet[label={lst:statevalue-stabilite-query}]{src/domains/context.rs}{27}{49}{le canal de requête entre domaines}
+
+Le trait n'a plus qu'une requête, \code{callback_body} : le CFG du corps
+d'un \code{useCallback}, que la réécriture en \code{CallbackVal(label)} a
+sorti de l'arbre d'expressions et qui n'est donc pas atteignable par le tas
+comme un \code{FnLit} ordinaire. Sans réponse (\code{None}), l'interpréteur
+n'exécute pas le corps de l'appel
+(\srcline{src/domains/interp/interpreter.rs}{579}). \code{NullCtx} répond
+toujours \code{None} ; son commentaire \og returns \code{Top} for every
+query\fg{} est daté. Pendant le point fixe, c'est \code{FixpointCtx} qui
+répond :
+
+\rustsnippet[label={lst:statevalue-stabilite-fixpointctx}]{src/domains/context.rs}{147}{171}{le contexte de requête du point fixe}
+
+\begin{piege}
+  \code{NullCtx} sert aussi aux trois amorçages du
+  \cref{sec:statevalue-stabilite-contextes} qui précèdent la boucle de point
+  fixe (constantes de module, retours d'arguments de hooks personnalisés,
+  initialiseur paresseux d'un \code{useState}) : un appel à travers une
+  variable liée par \code{useCallback}, rencontré pendant l'un de ces
+  amorçages, n'y exécute donc pas son corps. Cela ne fuit dans aucun état
+  retenu : le store et le tas passés à \code{AnalysisCtx::null} pour ces
+  amorçages sont des copies jetables (\src{src/engine/fixpoint.rs}{164}{168},
+  \src{src/engine/fixpoint.rs}{240}{244}, \src{src/engine/fixpoint.rs}{317}{320}),
+  distinctes du store du point fixe et jamais fusionnées dedans. Ce qui reste
+  ouvert est une question d'exécution de l'interpréteur, pas de domaine :
+  est-ce qu'un effet de bord perdu de cette façon (un \code{useCallback} qui
+  écrirait un \emph{autre} slot depuis un initialiseur paresseux) pourrait
+  échapper au point fixe par un autre chemin ; le \cref{chap:transfert-stores}
+  tranche.
+\end{piege}
+
+Seul \code{callbacks} est lu (le clonage est celui d'un \code{Arc}, en temps
+constant) ; les champs \code{state} et \code{memo} ne sont lus par aucune
+méthode du trait, et la phrase \og Local variables return \code{Bottom}\fg{}
+décrit un comportement disparu.
+
+\begin{decision}[ADR-007 --- requêtes entre domaines par un trait]
+\textbf{Décide} (\og Decision A\fg{}, solution B3) : un trait
+\code{QueryContext} passé en \code{&dyn} à chaque méthode de
+\code{Transfer}, ce qui garde le trait utilisable en objet (object-safe).
+\textbf{Écarte} : le \code{ask} générique de MOPSA, qui demande des GADT
+absents de Rust stable (et la spécialisation, instable). \textbf{Prévoit}
+(\og Decision B\fg{}, B1) : une migration vers un \og Manager\fg{} générique à
+types marqueurs si le nombre de domaines dépassait cinq environ ; elle n'a
+pas eu lieu. \textbf{Daté} : l'ADR décrit une requête \code{state_value_of}
+et un troisième contexte \code{AnalysisQueryCtx} qui n'existent plus. L'ADR-015
+a confirmé le rôle futur du trait : canal de lecture d'un éventuel produit
+réduit au niveau de l'analyse.
+\end{decision}
+
+\subsection{\code{InterCtx} et \code{AnalyzeChildFn}}
+
+Quand l'évaluateur rencontre un élément \code{<Child />} dont le composant
+est connu, il analyse l'enfant avec les props de l'appelant
+(\cref{chap:inter-composants}). Cela crée un cycle de modules : le transfert
+(\code{domains}) doit appeler le point fixe (\code{engine}), qui appelle le
+transfert. Le cycle est cassé par un pointeur de fonction fourni par le
+moteur :
+
+\rustsnippet{src/domains/context.rs}{15}{25}{le pointeur qui casse le cycle transfert--point fixe}
+
+\rustsnippet[label={lst:statevalue-stabilite-interctx}]{src/domains/context.rs}{51}{103}{le contexte inter-composants}
+
+Tout l'état partagé (cache des analyses d'enfants, store d'état partagé
+entre composants, graphe d'appels, statistiques, résultats) passe par des
+\code{RefCell}, pour que \code{InterCtx} circule en référence partagée sans
+\code{&mut} imbriqués. \code{child} copie toutes les références et ne crée
+qu'une pile neuve, où il empile le composant \emph{courant}.
+
+\begin{invariant}{La pile d'appel contient les ancêtres}{statevalue-stabilite-callstack}
+  La \code{call_stack} d'un \code{InterCtx} contient les ancêtres du
+  composant courant, pas le composant lui-même : il n'y est poussé qu'en
+  descendant, par \code{child}. D'où le second disjoint
+  \code{self.component == id} de \code{is_recursive}.
+\end{invariant}
+
+L'évaluateur appelle \code{is_recursive} avant \code{child}
+(\srcline{src/domains/transfer/state_value.rs}{521},
+\srcline{src/domains/transfer/state_value.rs}{578}) : un composant récursif
+n'est pas ré-analysé, son élément vaut \code{ref(Stable)} et la coupure est
+comptée dans les statistiques. Les contextes racines sont construits par
+\code{analyze_program} avec une pile vide
+(\src{src/engine/fixpoint.rs}{729}{741}).
+
+% ===========================================================================
+\section{Limites et défauts observés}
+\label{sec:statevalue-stabilite-limites}
+
+Les défauts qui suivent ont été observés au commit \snapshotCommit{} sur
+les fichiers de \file{/tmp/ch10/}. Ils sont présentés comme des constats ;
+ceux qui n'ont pas d'issue sont signalés comme tels.
+
+\subsection{Un mémo sur un état numérique : un FP de projection}
+
+\begin{lstlisting}[language=TypeScript,caption={Deux mémos sur un état (\file{/tmp/ch10/memo.tsx}, extrait)},label={lst:statevalue-stabilite-memonum}]
+export function MemoOverNumState() {
+  const [n, setN] = useState(0);
+  const doubled = useMemo(() => n * 2, [n]);
+  useEffect(() => { console.log(doubled); }, [doubled]);
+  return <button onClick={() => setN(5)}>{doubled}</button>;
+}
+
+export function MemoOverObjState() {
+  const [o, setO] = useState({ a: 1 });
+  const a = useMemo(() => ({ v: o.a }), [o]);
+  useEffect(() => { console.log(a); }, [a]);
+  return <button onClick={() => setO({ a: 2 })}>{a.v}</button>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+  MemoOverNumState  (4 hooks)  /tmp/ch10/memo.tsx
+    warn   always-unstable-deps  [hook:2]  (line 6:2)  this effect depends on `doubled`, a new reference every render, so `Object.is` always differs and the effect re-runs on every render regardless of the other deps
+       → the value flows through `doubled`, bound here (line 5:8)
+  MemoOverObjState  (4 hooks)  /tmp/ch10/memo.tsx  ✓
+\end{sortie}
+
+Le \Warning{} est faux : \code{doubled} est un nombre, recalculé seulement
+quand \code{n} change. La sonde donne \code{state[0] = number[0, 5]} et
+\code{memo[1] (Memo) = ref(PerRender)}. La chaîne causale se lit dans le code :
+\begin{enumerate}
+  \item la dep \code{n} n'est pas syntaxiquement \code{StateVal(0)} : le
+    lowering lie \code{let n = StateVal(0)} (\srcline{src/lowering/hook_extractor.rs}{783})
+    et la dep est la variable \code{n} ; la projection structurelle de
+    \code{recompute_memo} ne s'applique donc pas ;
+  \item la valeur de \code{n} est \code{number[0, 5]}, sans composante
+    \code{reference} : la conversion côté lecture ne l'a pas étiquetée, et
+    \code{versioned_reference} rend \code{None} ;
+  \item \code{to_stability} projette l'intervalle non ponctuel sur
+    \code{PerRender}, au sens \emph{may} de motion-wins ;
+  \item \code{recompute_memo} range ce \code{PerRender} dans la composante
+    \code{reference} du mémo, où \code{is_unstable_reference_only} le lit
+    comme un fait \emph{must}.
+\end{enumerate}
+Le glissement de sens de \code{PerRender} passe ainsi d'une projection may à
+un fait must. Avec un état objet, la lecture porte déjà \code{Versioned} dans
+sa composante référence, et le problème ne se pose pas. Aucune issue
+correspondante n'a été trouvée au commit \snapshotCommit{} ; la même cause
+produit le FP de \cref{lst:statevalue-stabilite-memoprim}.
+
+\subsection{Les cycles finis}
+
+\begin{lstlisting}[language=TypeScript,caption={Un booléen qui bascule (\file{/tmp/ch10/kinds.tsx}, extrait)},label={lst:statevalue-stabilite-toggle}]
+export function Toggle() {
+  const [on, setOn] = useState(false);
+  useEffect(() => {
+    setOn(!on);
+  }, [on]);
+  return <div>{on ? 1 : 0}</div>;
+}
+\end{lstlisting}
+
+C'est une vraie boucle infinie : chaque écriture change la valeur, la dep
+change, l'effet se ré-exécute. L'analyseur déclare pourtant le composant
+propre (la ligne \code{Toggle (2 hooks)} de la sortie de \code{--show-clean}
+porte la coche des composants sans diagnostic). Le store converge sans widening sur \code{boolean}
+($\Top$ de \code{BoolVal}) ; le bras point fixe d'\regle{infinite-loop} exige
+un slot élargi, et le churn ne concerne que la sorte référence. Le produit
+est un domaine d'\emph{ensembles de valeurs atteignables} : un cycle à
+travers un nombre fini de valeurs a un point fixe abstrait fini, et
+l'information \og la valeur change à chaque exécution\fg{}, une propriété de
+\emph{transition}, n'y est pas représentable. Pour une référence, au
+contraire, le domaine conserve un fait de transition (\code{PerRender},
+\og neuve à chaque écriture\fg{}), ce qui permet l'\Error{} sur
+\code{ObjChurn}. Le \cref{sec:treillis-simples-limites} décrit la même
+famille pour \texttt{(i + 1) \% 3} et les chaînes ; ce FN n'est ni dans une
+issue ni dans \file{docs/limitations.md}, et l'ADR-008 affirmait l'inverse.
+
+\subsection{Une chaîne qui grandit : \code{is_unbounded} ignore \code{str}}
+
+Le composant \code{StrGrow} de \file{/tmp/ch10/limits.tsx} écrit
+\code{setS(s + "x")} dans un effet de deps \code{[s]}. Le store passe de
+\code{{"a"}} à \code{{"a", "ax"}}, etc., jusqu'à dépasser quatre
+constantes : \code{StrConst::Top} (sonde : \code{state[0] = string
+widened=true}). Mais \code{is_unbounded}
+(\cref{lst:statevalue-stabilite-unbounded}) ne regarde que \code{num}, la
+référence et le résidu, et la garde n°2 du bras point fixe coupe :
+\begin{sortie}
+  StrGrow  (2 hooks)  /tmp/ch10/limits.tsx
+    info   widening-info  (line 5:2)  state `s` kept changing during analysis and was approximated to converge, so findings that depend on it may be imprecise
+    ...
+    verified  infinite-loop  no effect diverges into an infinite render loop
+\end{sortie}
+(sortie de \code{--show-clean --trace --info}, élaguée). \og verified\fg{}
+sur une vraie boucle infinie : un FN. Parmi les composantes qu'ignore
+\code{is_unbounded}, \code{str} est la seule dont l'ensemble concret soit
+infini, donc la seule qui puisse grandir sans borne. Aucune issue ni
+mention dans \file{docs/limitations.md} n'a été trouvée.
+
+\subsection{Un élément JSX natif classé \code{Stable} : un FN sans trace}
+\label{sec:statevalue-stabilite-nativeelem}
+
+La ligne \og élément JSX natif\fg{} du \cref{tab:statevalue-stabilite-sources}
+range la même valeur que \code{useRef()} : \code{ref(Stable)}. C'est pourtant
+la seule des huit lignes de ce tableau dont la colonne \og Raison\fg{} ne
+renvoie à rien : ni fait must sur une allocation, ni garantie de React, ni
+commentaire dans le code (\src{src/domains/transfer/state_value.rs}{153}{156}).
+Or un élément JSX natif est une valeur allouée : \code{<div/>} désucre en un
+appel (\code{React.createElement} ou \code{jsx}), qui rend un objet neuf à
+chaque évaluation, exactement comme \code{{}} ou \code{() => {}} deux
+lignes au-dessus du même tableau.
+
+\begin{lstlisting}[language=TypeScript,caption={Un élément natif en dep (\file{/tmp/ch10/limits.tsx}, extrait)},label={lst:statevalue-stabilite-elemdep}]
+export function ElemDep() {
+  const el = <div />;
+  useEffect(() => { console.log(el); }, [el]);
+  return el;
+}
+\end{lstlisting}
+
+\begin{sortie}
+  ElemDep  (1 hooks)  /tmp/ch10/limits.tsx  ✓
+\end{sortie}
+
+Composant propre, alors que \code{el} est \code{Object.is}-différent à
+chaque rendu et que l'effet devrait donc se ré-exécuter systématiquement.
+Comparer avec le même programme où \code{el} vaut \code{{}} au lieu de
+\code{<div/>} : \regle{always-unstable-deps} tire, sans surprise
+(\cref{lst:statevalue-stabilite-objstate} donne le mécanisme). La cause est
+locale à la ligne citée plus haut : \code{Expr::ObjectLit}, \code{ArrayLit}
+et \code{FnLit} rendent \code{ref(PerRender)}, mais \code{Expr::NativeElem}
+juste en dessous rend \code{ref(Stable)}, sans qu'aucune des trois autres
+sources du produit (le tableau, un ADR, un test dédié) ne justifie l'écart.
+\code{missing-deps} hérite du même trou : omettre \code{el} des deps ne
+déclenche rien non plus, puisque \code{is_stable} le couvre.
+
+\begin{piege}
+  Une dep qui est elle-même un élément JSX natif est un motif rare en
+  pratique (on ne compare pas des arbres React par identité dans une
+  application normale), ce qui explique sans doute que le défaut n'ait
+  jamais atteint un corpus de test. Cela n'en fait pas moins un faux
+  négatif au sens strict de la \cref{def:soundness} : rien dans le code ne
+  borne le domaine de \code{ElemDep} à des programmes \og improbables\fg{}.
+  Aucune issue ne suit ce défaut au commit \snapshotCommit{}.
+\end{piege}
+
+\subsection{Limites connues et suivies}
+
+\begin{itemize}
+  \item \textbf{Slot jamais écrit} (\issue{41}, \code{precision-fp}) : un
+    \code{useState({...})} dont aucun setter n'est appelé lit
+    \code{Versioned}, pas \code{Stable}, et la dep ne peut pas être omise.
+    Le raffinement demanderait un bit \og slot jamais écrit\fg{} après le
+    point fixe ; l'ADR-020 (non-changement n°3) garde
+    \code{may_written_slots} syntaxique, parce qu'un bit observé pourrait
+    sous-compter sur un chemin élagué.
+  \item \textbf{Constantes de module opaques} (\issue{34}) : \code{const X =
+    f()} vaut $\Top$ ; le produit n'a pas d'encodage \og sorte inconnue,
+    identité stable\fg{}.
+  \item \textbf{Méthodes ambiguës} (\issue{22}) : \code{slice} et
+    \code{concat} restent $\Top$ ; lever la limite demanderait la sorte du
+    récepteur.
+  \item \textbf{Écriture dérivée du slot écrit} (\issue{157}), vue au
+    \cref{sec:statevalue-stabilite-lecture}.
+  \item \textbf{Silence sur $\Top$} : \code{const v = flag ? { a: 2 } : obj} vaut \code{Unknown} (join de \code{PerRender} et de
+    \code{Versioned}), et \regle{always-unstable-deps} se tait sur une dep
+    \code{v} (composant \code{MixedRef} de \file{kinds.tsx}, propre). C'est
+    le choix documenté de la règle (\og \code{Top} (precision lost) stays
+    silent to avoid FPs\fg{},
+    \src{src/rules/impls/always_unstable_deps.rs}{161}{163}) : elle
+    n'affirme que des faits must.
+\end{itemize}
+
+\begin{piege}
+  Plusieurs commentaires et ADR du périmètre sont datés, et il ne faut pas
+  s'y fier sans relire le code : la documentation de \code{NullCtx}
+  (\og returns \code{Top}\fg{}) et de \code{FixpointCtx} (\og Local variables
+  return \code{Bottom}\fg{}) ; ADR-007 (\code{state_value_of},
+  \code{AnalysisQueryCtx}) ; ADR-015 et ADR-017 (\code{Symbol} au lieu de
+  \code{ComponentId}) ; ADR-002 (fichiers inexistants, seuil 2) ; ADR-008
+  (oscillation booléenne détectée) ; et le nom de \code{from_init}.
+\end{piege}
+
+% ===========================================================================
+\begin{resume}
+\begin{itemize}
+  \item Une valeur abstraite est un \textbf{produit ponctuel} sur les huit
+    sortes disjointes de JavaScript (\code{StateValue},
+    \file{src/domains/impls/state_value.rs}) : les sortes étant disjointes,
+    la complétion disjonctive dégénère en produit, sans opérateur de
+    réduction (ADR-015, qui remplace la somme plate d'ADR-008). Join, meet,
+    widening et ordre sont composante par composante ; $\gam$ est l'union des
+    concrétisations (\cref{def:statevalue}).
+  \item \code{as_arith} applique \code{ToNumber(null) = 0}, ce qui fait
+    détecter le compteur \code{useState(null)} ; \code{undefined}, les
+    booléens et les chaînes rendent $\Top$ en arithmétique.
+    \code{KindMask} et \code{populated_kinds} sont l'unique énumération des
+    sortes.
+  \item La composante \code{reference} porte une \textbf{stabilité},
+    borne sur la \emph{trace de changement} d'une valeur au fil des rendus.
+    Le treillis \code{Stability} d'ADR-017 (\cref{def:stabilite}) combine une
+    borne may (\code{Stable} $\lleq$ \code{Versioned(S)} $\lleq$
+    \code{VersionedTop}, $|S| \le 4$) et une borne must (\code{PerRender}),
+    incomparables, jointes en \code{Unknown}. Son join est sound et de
+    hauteur 8 ; son meet sous-estime l'intersection des $\gam$ et n'est pas
+    utilisé.
+  \item \textbf{Double vue} : le store range le join des valeurs écrites
+    (\code{ref(PerRender)} pour un état objet) ; la lecture de
+    \code{StateVal(l)} convertit la référence en \code{Versioned({l})}, en un
+    seul point de l'évaluateur. C'est sound sous deux hypothèses couvertes
+    ailleurs : pas de set pendant le rendu (\regle{setter-in-render}) et le
+    bras churn d'\regle{infinite-loop}, qui certifie \code{ObjChurn}.
+  \item Les littéraux, \code{new} et les allocateurs connus sont
+    \code{PerRender} (must) ; \code{useRef} et le setter sont stables ; un
+    mémo vaut le join des stabilités de ses deps (\code{recompute_memo}),
+    rangé dans la composante \code{reference} : sa sorte réelle est perdue.
+  \item Les règles lisent des \textbf{projections} :
+    \code{is_unstable_reference_only} (must), \code{is_stable} (sûreté),
+    \code{is_unbounded} (may), \code{is_finitely_valued},
+    \code{to_stability} (motion-wins, où \code{PerRender} ne veut dire que
+    \og peut changer à chaque rendu\fg{}) et \code{StabilityVerdict}.
+  \item \code{AnalysisCtx}, \code{QueryContext}, \code{FixpointCtx},
+    \code{InterCtx} et \code{AnalyzeChildFn} (\file{src/domains/context.rs})
+    relient les domaines au moteur.
+  \item Défauts observés : FP des mémos sur un état numérique, FN des cycles
+    finis, des chaînes qui grandissent et de l'élément JSX natif classé
+    \code{Stable} ; limites suivies \issue{41}, \issue{34}, \issue{22},
+    \issue{157}.
+\end{itemize}
+Le \cref{chap:transfert-stores} décrit l'évaluateur complet qui fabrique ces
+valeurs, et les stores (\cref{def:store}) qui les rangent.
+\end{resume}
+
+\section*{Exercices}
+\addcontentsline{toc}{section}{Exercices}
+
+\begin{exercice}{Calculer dans le produit}{statevalue-stabilite-produit}
+  Soit $a = \code{number[0, 2]|null}$ et $b = \code{string{"a"}}$.
+  (a) Calculer $a \join b$ et sa concrétisation. (b) Que valent
+  \code{to_stability}, \code{is_unbounded} et \code{as_arith} sur
+  $a \join b$ ? (c) Les valeurs $c = \code{number[0, 1]|null}$ et
+  $d = \code{number[0, 2]}$ sont-elles comparables ?
+\end{exercice}
+\begin{solution}
+  (a) Composante par composante : \code{number[0, 2]|string{"a"}|null}, de
+  concrétisation $[0,2] \cup \{\code{"a"}\} \cup \{\code{null}\}$.
+  (b) \code{to_stability} : l'intervalle n'est pas un point, donc le drapeau
+  \og en mouvement\fg{} est levé ; trois sortes sont peuplées, ce qui joint
+  \code{Unknown} ; motion-wins rend \code{PerRender}. \code{is_unbounded} :
+  faux (bornes finies, pas de référence \code{PerRender}, pas de résidu).
+  \code{as_arith} : \code{None} (la chaîne est peuplée), donc \code{n + 1}
+  vaudrait $\Top$. (c) Non : sur \code{num}, $c \sqsubset d$ ; sur
+  \code{null}, $c \sqsupset d$ ; \code{merge_ord} rend \code{None}.
+\end{solution}
+
+\begin{exercice}{Le meet trop petit}{statevalue-stabilite-meet}
+  Exhiber un programme React dont une expression a une trace de changement
+  à la fois dans $\gam(\code{Versioned}(\{l\}))$ et dans
+  $\gam(\code{PerRender})$. Qu'en conclure sur \code{meet} ?
+\end{exercice}
+\begin{solution}
+  La lecture \code{obj} dans \code{ObjChurn} (\cref{lst:statevalue-stabilite-objchurn}) :
+  chaque rendu $r_i$ ($i \ge 1$) est précédé d'un \code{setObj} avec un objet
+  neuf, donc $C = \{1,\dots,n\} = \mathit{Set}(\{\code{obj}\})$. La trace
+  appartient aux deux concrétisations, alors que $\code{Versioned}(\{l\})
+  \meet \code{PerRender} = \Bot$. Le meet du code est une borne inférieure
+  dans l'ordre abstrait mais pas une sur-approximation de l'intersection des
+  $\gam$ : s'en servir pour raffiner éliminerait ce comportement réel, un FN.
+\end{solution}
+
+\begin{exercice}{Casser l'invariant}{statevalue-stabilite-invariant}
+  Un contributeur construit à la main \code{Stability::Versioned(S5)} avec
+  $|S_5| = 5$. (a) Le join reste-t-il sound ? (b) Quelle propriété de la
+  \cref{prop:statevalue-stabilite-lub} est perdue ?
+\end{exercice}
+\begin{solution}
+  (a) Oui : la preuve du \cref{thm:statevalue-stabilite-join-stab} n'utilise
+  pas la borne sur $|S|$ ; $\code{Versioned}(S_5)$ a simplement la
+  concrétisation attendue. (b) La forme canonique : $\code{Versioned}(S_5)
+  \join \code{Versioned}(S_5)$ rend $\code{Versioned}(S_5)$ par le bras
+  d'égalité, alors que la même information s'écrirait canoniquement
+  \code{VersionedTop}. La plus petite borne supérieure n'est plus garantie
+  (un $\code{Versioned}(S_5)$ s'intercale entre les \code{Versioned} de
+  taille 4 et \code{VersionedTop}), et la borne de hauteur 8 ne vaut plus
+  pour les chaînes qui passent par des éléments non canoniques. La
+  terminaison tient encore, parce que tout join de deux ensembles distincts
+  repasse par \code{versioned}. C'est pourquoi les constructeurs \code{versioned} et \code{versioned_by}
+  sont le seul chemin recommandé.
+\end{solution}
+
+\begin{exercice}{Projeter à la main}{statevalue-stabilite-projeter}
+  Donner \code{to_stability} de : $[3,3]$ ;
+  \code{number[3, 3]|null} ; \code{boolean} ($\Top$ de \code{BoolVal}) ;
+  \code{ref(Versioned({a}))|undefined} ; \code{setter(...)} ; $\Top$ ;
+  \code{number[0, inf]|ref(Stable)}.
+\end{exercice}
+\begin{solution}
+  \code{Stable} (un point) ; \code{Unknown} (deux sortes) ; \code{Unknown}
+  (booléen $\Top$) ; \code{Unknown} (le join partiel vaut
+  \code{Versioned({a})}, mais deux sortes sont peuplées) ; \code{Stable}
+  (identité garantie par React) ; \code{Unknown} (résidu) ; \code{PerRender}
+  (motion-wins, l'intervalle n'est pas un point).
+\end{solution}
+
+\begin{exercice}{Corriger au bon niveau}{statevalue-stabilite-memonum}
+  Expliquer pourquoi \code{MemoOverObjState} est propre et
+  \code{MemoOverNumState} ne l'est pas
+  (\cref{lst:statevalue-stabilite-memonum}). Pourquoi ajouter, dans
+  \regle{always-unstable-deps}, un cas \og ignorer les deps qui sont des
+  mémos\fg{} serait-il contraire aux principes du projet ? Où chercher une
+  correction ?
+\end{exercice}
+\begin{solution}
+  La lecture de \code{o} porte \code{Versioned({o})} dans sa composante
+  référence, que \code{versioned_reference} transmet au mémo ; la lecture de
+  \code{n} n'a pas de composante référence, donc aucune étiquette, et
+  \code{to_stability} projette $[0,5]$ sur \code{PerRender} (sens may), que
+  le mémo range comme un fait must. Un cas spécial dans la règle
+  contournerait un défaut de la couche domaine (principe \og pas de
+  workarounds\fg{}) et masquerait des vrais positifs (un mémo sur une dep
+  réellement fraîche). La correction doit se placer là où le sens glisse :
+  soit dans \code{recompute_memo}, qui ne devrait pas convertir une
+  projection may en fait must, soit dans le domaine, qui n'a pas d'endroit
+  où loger une étiquette de version pour une sorte non référence. Au commit
+  \snapshotCommit{}, aucune issue ne suit ce défaut.
+\end{solution}
+
+\begin{exercice}{\code{is_unbounded} et les chaînes}{statevalue-stabilite-strgrow}
+  Écrire une version de \code{is_unbounded} qui ferme le FN \code{StrGrow}.
+  Change-t-elle quelque chose pour \code{StrToggle}
+  (\code{setMode(mode === "a" ? "b" : "a")}) ? Et pour un état écrit par des
+  handlers avec cinq constantes distinctes ?
+\end{exercice}
+\begin{solution}
+  Ajouter le disjoint \code{self.str == StrConst::Top} (une chaîne de
+  contenu inconnu peut grandir sans borne). \code{StrToggle} converge sur
+  \code{string{"a", "b"}}, sous le seuil : inchangé (le FN des cycles finis
+  demeure). Cinq constantes donnent aussi \code{StrConst::Top} : le prédicat
+  deviendrait vrai alors que l'ensemble concret est fini. Qu'un diagnostic en
+  résulte dépend des autres portes du bras point fixe
+  (\cref{chap:infinite-loop}) ; le seuil de \code{StrConst} confond
+  \og beaucoup de constantes\fg{} et \og croissance\fg{}, et c'est le prix
+  de la hauteur finie.
+\end{solution}
+
+\begin{exercice}{Détecter \code{Toggle}}{statevalue-stabilite-toggle}
+  Pourquoi aucun domaine d'\emph{ensembles de valeurs} ne peut-il détecter
+  la boucle de \cref{lst:statevalue-stabilite-toggle} ? Quelle information
+  faudrait-il ajouter ?
+\end{exercice}
+\begin{solution}
+  L'ensemble des valeurs atteignables de \code{on} est $\{\code{false},
+  \code{true}\}$, qui est aussi celui d'un composant qui écrit une seule
+  fois \code{true} puis s'arrête ; les deux programmes ont le même point fixe
+  abstrait. Ce qui les distingue est une propriété de \emph{transition} :
+  \og la valeur écrite diffère toujours de la valeur lue\fg{}
+  ($\code{!on} \ne \code{on}$). Il faudrait un fait relationnel entre la
+  lecture et l'écriture d'un même slot, analogue pour les primitives à ce
+  que \code{PerRender} fournit pour les références.
+\end{solution}

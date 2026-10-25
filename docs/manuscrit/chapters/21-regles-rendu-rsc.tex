@@ -1,0 +1,1249 @@
+% Chapitre 21 — Rendu et Server Components : wasted-subtree-render, server-component-hook
+% Sources : notes/11 (§4.6, §4.7, §6 ex. 6, 9, 10, 16, §8), notes/08 (§3.9-3.10, §4.8-4.10, §6.3, §8.1),
+% notes/01 (§3.5, §4.9), notes/13 (§5.3, §6.8). Commit photographié : e67b10a.
+% Exemples rejoués sous /tmp/ch21/ avec target/debug/reactant construit depuis e67b10a.
+
+\chapter{Rendu et Server Components : wasted-subtree-render, server-component-hook}
+\label{chap:regles-rendu-rsc}
+
+\begin{objectifs}
+  \item Comprendre pourquoi deux règles du catalogue ne lisent presque rien du domaine des valeurs.
+  \item Suivre \regle{wasted-subtree-render} de bout en bout : déclencheurs, fréquence, arbre d'éléments, compte des rendus, options.
+  \item Savoir lire une affirmation d'\emph{absence} (\og aucune entrée ne dépend de l'état\fg{}) et la règle de soundness qui l'accompagne : tout inconnu est un usage.
+  \item Suivre \regle{server-component-hook} : faits de module, graphe serveur de Next.js, frontière \code{"use client"}, preuves de hook client.
+  \item Savoir expliquer pourquoi ces deux règles plafonnent à \Warning{}, et ce que chacune refuse de conclure.
+\end{objectifs}
+
+\prerequis{la dépendance de rendu et l'arbre d'éléments (\cref{chap:inter-composants}, \cref{def:render-dep}) ;
+la surface typée des règles et le sceau de sévérité (\cref{chap:api-regles}, \cref{def:certified}) ;
+la détection et les faits de module (\cref{chap:frontend-detection}) ; les projets Next.js vus par le driver
+(\cref{chap:projet-cli-driver}). Les relations \relation{slot_writers} et \relation{registrations}
+(\cref{chap:relations}) servent à la première règle.}
+
+% ---------------------------------------------------------------------------
+\section{Deux règles à côté du domaine des valeurs}
+\label{sec:regles-rendu-rsc-apercu}
+
+Les règles des chapitres précédents interrogent toutes, d'une façon ou d'une autre, le résultat du
+point fixe : la valeur abstraite d'un slot, la stabilité d'une référence, les lignes
+\code{SlotWriter} d'un setter. Les deux règles de ce chapitre sont différentes. Elles posent des
+questions que le domaine des valeurs ne sait pas trancher, et elles s'appuient sur des faits
+\emph{calculés à côté} de lui.
+
+\begin{itemize}
+  \item \regle{wasted-subtree-render} demande : \og quand cet état change, quels sous-arbres
+        re-rendent alors qu'aucune de leurs entrées n'en dépend ?\fg{} La réponse vient d'une
+        analyse de flot séparée, la \emph{dépendance de rendu} (\adr{41}), composée sur l'arbre
+        d'éléments du programme.
+  \item \regle{server-component-hook} demande : \og ce hook est-il appelé dans un module que
+        Next.js rend côté serveur ?\fg{} La réponse vient de deux faits qui ne sont pas du tout
+        abstraits : une convention de noms de fichiers et le graphe des imports (\adr{26}).
+\end{itemize}
+
+Le \cref{tab:regles-rendu-rsc-apercu} résume ce qui les rapproche et ce qui les oppose. Le point
+commun le plus important est le niveau : aucune des deux ne peut émettre une \Error{}. Le point
+de divergence le plus instructif est la \emph{forme} de l'affirmation. La première affirme une
+\emph{absence} (\og aucune entrée ne dépend de l'état\fg{}) ; la seconde affirme une
+\emph{présence} (\og ce module est serveur, et il appelle un hook client\fg{}). Nous verrons que
+ces deux formes n'imposent pas la même discipline de soundness.
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{3.1cm}XX}
+\toprule
+ & \regle{wasted-subtree-render} & \regle{server-component-hook} \\
+\midrule
+Bug visé & rendus répétés de sous-arbres dont la sortie ne change pas & hook appelé dans un Server Component : le rendu lève une erreur \\
+Faits consommés & \code{render_deps} (par composant), \code{RenderIndex}, \relation{slot_writers}, \relation{registrations}, \code{state_store} & \code{ModuleTable} (directives, arêtes d'import), \code{HookEntry}, \code{HookProvenance} \\
+Forme de l'affirmation & absence d'usage & présence d'un fait de convention \\
+Règle de prudence & tout inconnu est un usage & rien n'est serveur sans \code{"use client"} dans le programme ; seuls les hooks prouvés client comptent \\
+Niveau & \Warning{} (rendus certains, coût incertain) & \Warning{} (faits hors du domaine) \\
+Options & \code{minWastedRenders}, \code{continuousOnly} & aucune \\
+\code{safe_check} & aucun & sur les Server Components seulement \\
+Fichier & \file{src/rules/impls/wasted_subtree_render.rs} (333 l.) & \file{src/rules/impls/server_component_hook.rs} (308 l.) \\
+Aides & \file{src/rules/helpers/render_tree.rs}, \file{src/engine/render_deps.rs} & \file{src/project/nextjs.rs}, \file{src/ir/module.rs} \\
+Tests & \file{tests/wasted_subtree_render.rs} (13) & 5 tests unitaires, \file{tests/nextjs_project.rs} \\
+\bottomrule
+\end{tabularx}
+\caption{Les deux règles du chapitre en un coup d'œil.}
+\label{tab:regles-rendu-rsc-apercu}
+\end{table}
+
+Le chapitre suit l'ordre de difficulté croissante pour la première règle (le problème, les faits,
+l'algorithme, les options, les cas limites, la soundness), puis traite la seconde, plus courte
+mais plus délicate à justifier : c'est l'exemple type d'une règle qui \emph{sait} quelque chose
+de vrai sans pouvoir le prouver dans le domaine abstrait.
+
+% ===========================================================================
+\section{Le rendu gaspillé : le problème}
+\label{sec:regles-rendu-rsc-cascade}
+
+\begin{react}[re-rendu en cascade]
+Quand un état change, React re-rend le composant qui le possède, puis \emph{tous les éléments de
+composant que ce rendu construit}, récursivement, que leurs props aient changé ou non. La
+cascade ne s'arrête qu'à trois endroits :
+\begin{enumerate}
+  \item un élément qui n'a pas été reconstruit par ce rendu : un \code{children} reçu d'un parent
+        garde son identité d'objet, React le reconnaît et saute son rendu ;
+  \item un composant enveloppé dans \code{memo} dont toutes les props sont
+        \code{Object.is}-égales aux précédentes ;
+  \item la frontière du composant propriétaire : si l'état et les éléments qui le lisent vivent
+        dans un composant plus petit, le reste de l'arbre n'est pas re-rendu du tout.
+\end{enumerate}
+Les écritures faites par un même handler sont regroupées en un seul rendu (batching), et une
+écriture d'une valeur \code{Object.is}-égale à la valeur courante est abandonnée sans rendu
+(bail-out). Voir \cref{chap:react-modele} pour le modèle complet.
+\end{react}
+
+Le cas qui coûte cher est celui d'un état écrit \emph{très souvent} : à chaque frappe dans un
+champ texte, à chaque mouvement de souris, à chaque pas de défilement, à chaque tick de minuterie.
+Si le composant qui le possède construit aussi un sous-arbre lourd qui n'en dépend pas, ce
+sous-arbre produit la même sortie des dizaines de fois par seconde.
+
+\begin{exemple}{Un champ de recherche à côté d'une barre latérale}{rendu-recherche}
+Le fichier \file{/tmp/ch21/search.tsx} :
+\begin{lstlisting}[language=TypeScript,caption={Un état de saisie au-dessus d'un sous-arbre qui ne le lit pas},label={lst:rendu-recherche}]
+import { useState } from "react";
+
+function Results({ query }: { query: string }) {
+  return <p>results for {query}</p>;
+}
+function Sidebar() {
+  return <nav>{["a", "b", "c"].map((k) => <Link key={k} to={k} />)}</nav>;
+}
+function Link({ to }: { to: string }) { return <a href={to}>{to}</a>; }
+
+export default function SearchPage() {
+  const [query, setQuery] = useState("");
+  return (
+    <main>
+      <input value={query} onChange={(e) => setQuery(e.target.value)} />
+      <Results query={query} />
+      <Sidebar />
+    </main>
+  );
+}
+\end{lstlisting}
+Chaque frappe écrit \code{query}. \code{SearchPage} re-rend ; \code{<Results>} re-rend à juste
+titre, sa prop \code{query} a changé ; \code{<Sidebar>} et ses trois \code{<Link>} re-rendent pour
+rien. La commande
+\code{cargo run -q -- check /tmp/ch21/search.tsx --rule wasted-subtree-render --trace} donne :
+\begin{sortie}
+  SearchPage  (2 hooks)  /tmp/ch21/search.tsx
+    warn   wasted-subtree-render  [hook:0]  (line 15:27)  each `change` event writes state `query`
+      and re-renders `<Sidebar>` (at least 2 component renders, including a list) although none of
+      its inputs depends on it. Move `query` and the elements that use it into their own component,
+      or build the unrelated elements higher up and pass them in as `children`
+       → `<Sidebar>` re-renders (at least 2 component renders, including a list) although none of
+         its props depends on it (line 17:6)
+\end{sortie}
+(Les lignes longues sont repliées ici ; l'analyseur les imprime sur une seule ligne.) Le finding
+pointe le handler \code{onChange} (ligne 15, colonne 27), désigne l'élément gaspillé
+(\code{<Sidebar>}, ligne 17) et donne un coût : \emph{au moins} deux rendus de composant,
+\code{Sidebar} et un \code{Link} compté une fois pour toute la liste.
+\end{exemple}
+
+Trois difficultés se cachent derrière ce diagnostic d'apparence simple.
+
+\paragraph{Le domaine des valeurs ne répond pas à la question.} La question est \og la sortie de
+\code{<Sidebar>} peut-elle dépendre de \code{query} ?\fg{}. Le fait le plus proche dans le
+domaine est la stabilité versionnée d'\adr{17} (\code{Versioned(S)}, \cref{def:stabilite}) : il
+dit de quelles écritures d'état une \emph{référence} peut provenir. Mais il ne vit que dans la
+composante \code{reference} du produit \code{StateValue} : un booléen \code{open}, un nombre
+\code{text.length} n'y portent rien, et un objet alloué (\code{\{ a: text \}}) est
+\code{PerRender} quelle que soit son origine (\adr{41}, contexte). La dépendance est un fait
+différent de la valeur ; \adr{41} §1 en tire une analyse séparée
+(\cref{sec:regles-rendu-rsc-deps}).
+
+\paragraph{La question est inter-composants.} Savoir que \code{SearchPage} passe \code{query} à
+\code{<Results>} ne suffit pas : il faut savoir que \code{Results} l'\emph{utilise}, que
+\code{Sidebar} ne reçoit rien, et que rien, sous \code{Sidebar}, ne lit \code{query} par un autre
+canal (un contexte, une variable de module). Il faut donc composer des résumés par composant le
+long de l'arbre d'éléments.
+
+\paragraph{L'affirmation est une absence.} Un finding dit \og aucune entrée de \code{<Sidebar>}
+ne dépend de \code{query}\fg{}. Une dépendance oubliée par l'analyse produirait donc un
+\emph{faux positif}, pas un faux négatif. C'est l'inverse de la plupart des règles, où une
+sur-approximation fait tirer davantage. Toute la conception de la règle découle de ce
+renversement de polarité (\cref{sec:regles-rendu-rsc-soundness}).
+
+\section{Ce que la règle consomme : dépendance de rendu et arbre d'éléments}
+\label{sec:regles-rendu-rsc-deps}
+
+La règle ne calcule presque rien elle-même : elle interroge un index programme, le
+\code{RenderIndex}, bâti sur les résumés de dépendance de rendu de chaque composant. Ces deux
+objets sont exposés en détail au \cref{chap:inter-composants} (\cref{def:render-dep}) ; on en
+rappelle ici ce que la règle lit, dans l'ordre où elle le lit.
+
+\subsection{Le résumé d'un composant}
+
+\file{src/engine/render_deps.rs} exécute, sur le CFG convergé d'un composant (hooks personnalisés
+et utilitaires déjà greffés), une analyse avant qui associe à chaque variable un
+\emph{may-ensemble} de sources. Une \code{Source} (\src{src/engine/render_deps.rs}{53}{84}) est
+une entrée du rendu \emph{dans le repère du composant} : \code{Slot(l)} (la valeur d'un slot),
+\code{Setter(l)} (son setter, une capacité d'écriture qui ne change jamais),
+\code{Prop(name)} et \code{AllProps}, \code{Ref(l)}, \code{Hook(l)} (le résultat d'un hook non
+modélisé), \code{Context(id)} (un contexte prouvé) et \code{Module(var)} (un nom non lié ici que
+quelque fonction du programme écrit). Seules les deux dernières sont indépendantes du repère :
+elles traversent l'arbre d'éléments sans traduction.
+
+Les ensembles se joignent par union ; le treillis est fini, donc pas de widening, et le plafond
+de 64 tours dégrade le résumé en top, jamais en plus petit (\adr{41} §1). Une \code{Deps}
+(\src{src/engine/render_deps.rs}{119}{131}) porte l'ensemble \code{set}, un drapeau \code{top},
+une partie \code{gated} (les sources qu'une valeur fonction n'atteint que derrière un test de ses
+propres arguments, fait \emph{must}) et \code{writes} (les noms de module qu'appeler la valeur
+peut écrire). La question que pose une règle se formule comme une \code{Relevance}
+(\src{src/engine/render_deps.rs}{207}{214}) : un ensemble de sources dans le repère d'un
+composant, plus un drapeau \code{any_prop} (\og n'importe quelle prop\fg{}, après un spread). La
+réponse élémentaire est \code{Deps::touches} (\src{src/engine/render_deps.rs}{182}{205}, détaillée
+au \cref{chap:inter-composants}) : une dépendance top touche toute question non vide ;
+\code{AllProps} (l'objet props pris en entier) touche toute prop nommée ; une question
+\code{any_prop} touche toute prop ; sinon il faut une source commune.
+
+Le résumé d'un composant, \code{RenderDeps}, sépare deux choses que tout le reste du chapitre
+distingue :
+
+\rustsnippet{src/engine/render_deps.rs}{301}{322}{le résumé : ce qui est utilisé, ce qui est construit}
+
+\begin{itemize}
+  \item \code{genuine} rassemble ce que le composant \emph{utilise} : sa sortie hôte (y compris
+        les closures de handlers et les éléments hôtes qu'il passe en \code{children}), ses effets,
+        ses appels en position d'instruction, ses écritures de membres, les arguments de ses hooks
+        opaques, et les conditions et \emph{types} des éléments qu'il rend.
+  \item \code{sites} liste chaque élément de composant qu'il construit, avec, prop par prop, ce
+        dont la valeur peut dépendre. Une prop est \emph{transmise}, pas utilisée : c'est pourquoi un
+        élément de composant s'évalue à l'ensemble vide (\code{CompApp} $\mapsto \emptyset$,
+        \cref{chap:inter-composants}).
+  \item \code{handlers} liste les props d'événement des éléments hôtes (\code{onChange} sur un
+        \code{<input>}\dots) avec la balise, l'attribut \code{type} littéral et les dépendances de
+        la closure : c'est là qu'un setter \og atterrit\fg{}.
+  \item \code{effect_writes} donne, par effet, les noms de module que son corps peut écrire.
+\end{itemize}
+
+Chaque élément de composant est un \code{ElementSite} :
+
+\rustsnippet{src/engine/render_deps.rs}{252}{277}{un élément de composant construit par le rendu}
+
+Quatre champs comptent pour la règle : \code{guard} (les conditions sous lesquelles l'élément est
+construit), \code{props} et \code{spread} (ce que ses entrées peuvent porter), \code{in_list}
+(construit dans un callback passé à un appel, typiquement \code{.map} : zéro, une ou plusieurs
+instances) et \code{parent} (l'élément de composant dans lequel celui-ci est imbriqué comme prop
+ou enfant, ce qui permet de suivre un provider de contexte jusqu'aux éléments qu'il enveloppe).
+
+\subsection{L'index programme}
+
+\code{RenderIndex::build} (\src{src/rules/helpers/render_tree.rs}{117}{137}) calcule d'abord
+l'ensemble programme des noms écrits (un nom libre n'est un canal que si quelque chose l'écrit),
+puis un résumé \code{render_deps} par composant, puis le nombre de sites qui nomment chaque
+composant. L'index est construit une seule fois par exécution, à la première demande
+(\code{ProgramCache::render}, \src{src/rules/api/cache.rs}{70}{76}, un \code{OnceLock}) et partagé
+par \regle{wasted-subtree-render} et \regle{state-lifted-too-high} (\cref{chap:infinite-loop}).
+
+Passer d'un site à un composant se fait par \code{resolve}, qui n'accepte qu'une origine prouvée :
+
+\rustsnippet[label={lst:rendu-resolve}]{src/rules/helpers/render_tree.rs}{766}{777}{un élément ne se résout que par son origine prouvée}
+
+Le moteur de valeurs, lui, accepte aussi un nom unique (\code{resolve_child}, \adr{40}). Les deux
+choix sont prudents, chacun dans sa polarité : l'inliner qui retrouverait un enfant par son seul
+nom analyserait un corps de plus (au pire du travail inutile) ; la règle de cascade qui se
+tromperait d'enfant \emph{cacherait} les usages du vrai.
+
+\subsection{L'arbre d'éléments de \code{typing.tsx}}
+
+La fixture de référence de la règle est \file{tests/fixtures/wasted_subtree_render/typing.tsx},
+mesurée à l'exécution par l'oracle \file{scripts/rerender-bench/} (React 19, jsdom, en-tête de
+\file{tests/wasted_subtree_render.rs}) :
+
+\tsxsnippet[label={lst:rendu-typing}]{tests/fixtures/wasted_subtree_render/typing.tsx}{5}{20}{un champ texte à côté d'un sous-arbre coûteux}
+
+Le résumé de \code{App} (relevé par le dossier de notes 08, §6.3, sur une sonde de débogage) a
+\code{genuine = \{Slot(0), Setter(0)\}} (l'\code{<input>} lit \code{text} et sa closure capture
+\code{setText}), un handler \code{change} sur \code{<input>} sans \code{type} dont les dépendances
+sont \code{\{Setter(0)\}}, et deux sites : \code{<Preview>} avec \code{text = \{Slot(0)\}}, et
+\code{<ExpensiveTree>} sans prop ni garde. Le résumé d'\code{ExpensiveTree} a un seul site,
+\code{<Row>}, marqué \code{in_list}. La \cref{fig:rendu-arbre-typing} montre comment la question
+\code{Relevance \{Slot(0)\}} se propage sur cet arbre.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[
+    level distance=17mm, sibling distance=38mm,
+    comp/.style={bloc,minimum width=26mm},
+    touche/.style={comp,draw=ra-amber,fill=white,very thick},
+    gaspi/.style={comp,draw=ra-blue,fill=ra-blue!12,very thick},
+    hote/.style={cfgbloc,minimum width=24mm},
+    edge from parent/.style={draw=ra-gray,thick}]
+  \node[comp] (app) {\code{App}\\[-1pt]{\scriptsize possède \code{text} = \code{Slot(0)}}}
+    child { node[hote] (in) {\code{<input onChange>}\\ deps \code{\{Setter(0)\}}} }
+    child { node[touche] (pre) {\code{<Preview>}\\[-1pt]{\scriptsize\code{text} : \code{\{Slot(0)\}}}} }
+    child { node[gaspi] (exp) {\code{<ExpensiveTree>}\\[-1pt]{\scriptsize props $\emptyset$, garde $\emptyset$}}
+      child { node[gaspi] (row) {\code{<Row>} \code{in_list}\\[-1pt]{\scriptsize compté une fois}} } };
+  \node[etiquette,below=2mm of in,align=center] {landing \code{change}\\ \code{<input>} texte : continu};
+  \node[etiquette,below=2mm of pre,align=center,text=ra-amber] {touché : une prop\\ porte \code{Slot(0)}};
+  \node[etiquette,right=2mm of exp,align=left,text=ra-blue] {non touché,\\ résolu : gaspillé};
+  \node[etiquette,right=2mm of row,align=left] {\code{renders} = 2,\\ \code{list} = vrai};
+  \draw[flechemay] (in.north west) to[bend left=35] node[etiquette,left,pos=.5] {écrit} (app.west);
+\end{tikzpicture}
+\caption{L'arbre d'éléments de \code{typing.tsx} et la question \code{Relevance \{Slot(0)\}}.
+Le handler de l'\code{<input>} écrit le slot (flèche pointillée) ; \code{<Preview>} est touché
+(bord orangé) ; \code{<ExpensiveTree>} ne l'est pas, se résout, et coûte son propre rendu plus un
+\code{<Row>} compté une fois pour toute la liste (bleu).}
+\label{fig:rendu-arbre-typing}
+\end{figure}
+
+La propagation s'arrête dès qu'un élément est touché : \code{<Preview>} n'est pas un candidat, et
+ce qui serait imbriqué dans lui ne le serait pas davantage (\code{parent}). Elle s'arrête aussi,
+dans l'autre sens, dès qu'un élément est \emph{inconnu}. C'est l'invariant qui gouverne tout le
+fichier \file{render_tree.rs}, énoncé dès son en-tête (\src{src/rules/helpers/render_tree.rs}{11}{13}) :
+
+\begin{invariant}{Tout inconnu est un usage}{tout-inconnu-usage}
+Dans les règles de cascade, l'absence d'usage est une preuve. Donc tout ce que l'analyse ne voit
+pas compte comme un usage : un élément dont le composant ne se résout pas (bibliothèque, enveloppe
+\code{memo} ou \code{forwardRef}, import non résolu, nom ambigu), un composant ré-entré par
+récursion, la profondeur au-delà de \code{MAX_DEPTH = 64}, un résumé plafonné à top, un contexte
+que l'analyse ne sait pas nommer (\code{any_context}), un écrivain dont la racine écrite est top
+(\adr{41} §2).
+\end{invariant}
+
+\section{L'algorithme de wasted-subtree-render pas à pas}
+\label{sec:regles-rendu-rsc-algo}
+
+La méthode \code{check} de \file{src/rules/impls/wasted_subtree_render.rs} tient en deux cents
+lignes (\src{src/rules/impls/wasted_subtree_render.rs}{60}{260}). Elle s'exécute une fois par
+composant, qui joue le rôle de \emph{propriétaire} (\code{owner}) des états qu'il déclare. Son
+squelette est donné par l'\cref{alg:rendu-wasted} ; on en suit les étapes dans l'ordre.
+
+\begin{algorithm}[htbp]
+\caption{\code{WastedSubtreeRender::check}, schématisé}\label{alg:rendu-wasted}
+\KwIn{un composant propriétaire $o$, l'index \code{RenderIndex}, les options $m$ (\code{minWastedRenders}) et $c$ (\code{continuousOnly})}
+\KwOut{au plus un \Warning{} par déclencheur}
+$T \leftarrow \emptyset$ \tcp*{déclencheurs, groupés par clé}
+\ForEach{slot $l$ d'un \code{HookEntry::State} de $o$}{
+  \ForEach{\code{Landing} $h$ de \code{index.landings}$(o, l)$}{ ajouter $l$ au déclencheur \code{Handler}$(h)$ de $T$ }
+}
+\ForEach{écrivain local $w$ de \relation{slot_writers} dans un effet $e$}{
+  ajouter $w.\mathit{slot}$ au déclencheur \code{Effect}$(e)$, avec les enregistrements de $e$ qui peuvent appeler le setter
+}
+\ForEach{déclencheur $t \in T$}{
+  \lIf{$t.\mathit{writes}$ est top}{passer au suivant}
+  \lIf{aucun événement, ou $c$ et aucun événement continu d'un slot à valeurs nombreuses}{passer}
+  $\mathit{rel} \leftarrow \{\code{Slot}(l) \mid l \in t.\mathit{slots}\} \cup \{\code{Module}(x) \mid x \in t.\mathit{writes}\}$\;
+  $W \leftarrow \code{index.wasted_siblings}(o, \mathit{rel})$\;
+  \lIf{$W = \emptyset$, ou $\sum_{w\in W} w.\mathit{renders} < m$ sans liste}{passer}
+  émettre un \Warning{} avec une note \code{Step::Rerender} par élément de $W$\;
+}
+\end{algorithm}
+
+\subsection{Étape 1 : collecter les déclencheurs}
+
+\begin{react}[batching]
+Toutes les écritures d'état faites pendant un même handler d'événement, ou pendant un même
+callback de minuterie, sont regroupées par React en \emph{un seul} rendu. Deux setters appelés
+l'un après l'autre dans un \code{onChange} ne coûtent qu'un rendu du propriétaire.
+\end{react}
+
+La règle ne raisonne donc pas slot par slot mais \terme{déclencheur} par déclencheur : un handler
+d'événement, ou l'ensemble des listeners et minuteries qu'un effet enregistre. Un déclencheur
+écrit un \emph{ensemble} de slots, qui re-rendent ensemble. La clé qui décide que deux écritures
+appartiennent au même lot est \code{TriggerKey}, et ce qu'on accumule pour chaque clé est un
+\code{Trigger} :
+
+\rustsnippet[label={lst:rendu-trigger}]{src/rules/impls/wasted_subtree_render.rs}{263}{292}{ce qui fait de deux écritures un seul lot}
+
+Un déclencheur \code{Handler} est identifié par quatre choses : l'élément du propriétaire par
+lequel le setter sort (\code{via}), le composant qui construit l'élément hôte portant le handler,
+le span de la prop de handler et le nom de l'événement. Deux instances d'un même enfant sont donc
+deux déclencheurs, parce que leurs \code{via} diffèrent. Un déclencheur \code{Effect} est
+identifié par le label de l'effet.
+
+\paragraph{Les handlers : où le setter atterrit.} Un setter n'est pas forcément appelé dans le
+propriétaire : il peut être passé en prop, traverser plusieurs composants, et n'être appelé que
+par un \code{<input>} trois niveaux plus bas. \code{RenderIndex::landings} répond à la question
+\og où ce setter peut-il être appelé par un événement ?\fg{} en posant la question
+\code{Relevance \{Setter(l)\}} et en descendant l'arbre d'éléments. Chaque réponse est un
+\code{Landing} :
+
+\rustsnippet{src/rules/helpers/render_tree.rs}{77}{97}{l'endroit où une capacité d'écriture est appelée}
+
+La descente (\code{land}, \src{src/rules/helpers/render_tree.rs}{406}{512}) examine d'abord les
+handlers hôtes du composant courant dont les dépendances touchent la question : chacun donne un
+atterrissage, avec la balise et l'attribut \code{type}. Elle suit ensuite chaque prop d'un
+élément de composant qui porte la capacité, en traduisant la question dans le repère de l'enfant
+(\code{Setter(0)} du parent devient \code{Prop(onChange)} de l'enfant). Si une prop
+d'événement (\code{onX}) entre dans un composant sans atterrir plus bas (composant opaque, enfant
+qui ne l'appelle que dans un effet), l'atterrissage est posé sur l'élément lui-même, avec une
+cible \code{HandlerTarget::Component}. Au passage, la descente accumule \code{keyed} (un saut
+n'appelle la capacité que derrière un test de l'argument d'événement) et \code{writes} (les noms
+de module que les closures traversées peuvent écrire).
+
+\begin{exemple}{Un setter passé à un enfant}{rendu-child-setter}
+La fixture \file{tests/fixtures/wasted_subtree_render/child_setter.tsx} :
+\tsxsnippet{tests/fixtures/wasted_subtree_render/child_setter.tsx}{5}{22}{le setter descend dans \code{<Field>}}
+\begin{sortie}
+  Form  (1 hooks)  tests/fixtures/wasted_subtree_render/child_setter.tsx
+    warn   wasted-subtree-render  [hook:0]  (line 18:6)  each `change` event in `<Field>` writes
+      state `v` and re-renders `<Field>` and `<Heavy>` (at least 3 component renders, including a
+      list) although none of their inputs depends on it. […]
+       → `<Field>` re-renders (1 component render) although none of its props depends on it (line 18:6)
+       → `<Heavy>` re-renders (at least 2 component renders, including a list) although none of its
+         props depends on it (line 19:6)
+\end{sortie}
+(Sortie repliée, conseil final élidé en \og[…]\fg{}.) L'atterrissage est dans \code{Field}, donc
+le finding pointe l'élément \code{<Field>} du propriétaire (ligne 18) et le message dit
+\og in \code{<Field>}\fg{} (champ \code{place} du \code{Trigger},
+\src{src/rules/impls/wasted_subtree_render.rs}{101}{123}). Plus surprenant : \code{<Field>}
+lui-même est déclaré gaspillé. C'est exact. Sa seule prop, \code{onChange}, porte
+\code{\{Setter(0)\}}, et la question est \code{\{Slot(0)\}} : un setter ne change jamais
+d'identité, donc \code{Field} re-rend à chaque frappe pour produire la même sortie.
+\end{exemple}
+
+\paragraph{Les effets : listeners et minuteries.} La seconde boucle parcourt la relation
+\relation{slot_writers} du composant (\cref{def:slot-writer} ;
+\src{src/rules/impls/wasted_subtree_render.rs}{124}{146}). Elle ne garde que les écrivains
+\emph{locaux} (\code{w.owner} vide : une écriture à travers le setter d'un autre composant est
+comptée chez cet autre), qui écrivent un slot d'état du composant, depuis une région
+\code{WriterRegion::Effect(e)}. Pour chacun, elle retient les lignes de la relation
+\relation{registrations} (\adr{34}) de l'effet \code{e} dont le callback peut appeler le setter.
+Deux prédicats syntaxiques en décident :
+
+\rustsnippet{src/rules/impls/wasted_subtree_render.rs}{315}{333}{peut-il appeler le setter ? derrière un test ?}
+
+\code{may_call} penche vers \og oui\fg{} : un callback qui n'est pas une fonction littérale (un
+listener nommé que ce parcours ne suit pas) est supposé écrire. \code{keyed_call} penche vers
+\og non gardé\fg{}. Les deux erreurs possibles vont donc dans le même sens : plus de déclencheurs,
+et des déclencheurs plus fréquents. Le nom de l'événement est celui de l'enregistrement
+(\code{"resize"} dans \code{addEventListener("resize", f)}), à défaut le nom du registrar
+(\code{setInterval}).
+
+\begin{exemple}{Une minuterie qui écrit deux slots}{rendu-clock}
+Le fichier \file{/tmp/ch21/clock.tsx} :
+\begin{lstlisting}[language=TypeScript,caption={Deux écritures dans un même tick},label={lst:rendu-clock}]
+function Row({ i }: { i: number }) { return <li>{i}</li>; }
+function Agenda() { return <ul>{[1, 2, 3].map((i) => <Row key={i} i={i} />)}</ul>; }
+
+export default function Dashboard() {
+  const [now, setNow] = useState(Date.now());
+  const [ticks, setTicks] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => { setNow(Date.now()); setTicks((t) => t + 1); }, 1000);
+    return () => clearInterval(id);
+  }, []);
+  return (<main><time>{now}</time><Agenda /></main>);
+}
+\end{lstlisting}
+\begin{sortie}
+  Dashboard  (3 hooks)  clock.tsx
+    warn   wasted-subtree-render  [hook:0]  (line 9:2)  each `setinterval` event writes states `now`
+      and `ticks` and re-renders `<Agenda>` (at least 2 component renders, including a list)
+      although none of its inputs depends on them. Move `now` and `ticks` and the elements that use
+      them into their own component, or build the unrelated elements higher up and pass them in as
+      `children`
+       → `<Agenda>` re-renders (at least 2 component renders, including a list) although none of its
+         props depends on it (line 16:6)
+\end{sortie}
+Les deux écritures appartiennent au déclencheur \code{Effect(1)} : un seul finding, qui nomme les
+deux slots (\og states \code{now} and \code{ticks}\fg{}), positionné sur l'effet (ligne 9).
+L'événement s'appelle \code{setinterval} : c'est le nom du registrar, mis en minuscules.
+\end{exemple}
+
+Quand un effet vient d'un hook personnalisé greffé dans le composant, le correctif n'appartient
+pas au composant : tous les appelants du hook paient le même prix. \code{region_hook}
+(\src{src/rules/impls/wasted_subtree_render.rs}{294}{313}) retrouve le nom du hook par la
+provenance (\code{hook_provenance}) de l'effet greffé, et le message change de conseil. Sur la
+fixture \file{tests/fixtures/wasted_subtree_render/hook_trigger/}, où \code{useWindowSize} écrit
+un objet frais à chaque \code{resize} :
+\begin{sortie}
+  Page  (1 hooks)  tests/fixtures/wasted_subtree_render/hook_trigger/Page.tsx
+    warn   wasted-subtree-render  [hook:1]  (tests/fixtures/wasted_subtree_render/hook_trigger/use-size.ts:5:2)
+      each `resize` event writes state `size` and re-renders `<List>` (at least 2 component renders,
+      including a list) although none of its inputs depends on it. The writes come from
+      `useWindowSize`, which does this to every component that calls it: write only when a value its
+      callers read changes, or call it from a smaller component
+       → `<List>` re-renders (at least 2 component renders, including a list) although none of its
+         props depends on it (line 9:48)
+\end{sortie}
+La position est dans l'autre fichier (\file{use-size.ts}, ligne 5) : c'est celle de l'effet
+greffé.
+
+\subsection{Étape 2 : la fréquence, un classement et non une preuve}
+
+Un clic qui ouvre une boîte de dialogue re-rend la page une fois. Une frappe dans un champ la
+re-rend à chaque caractère. Par défaut, la règle ne parle que du second cas. La fréquence d'un
+événement est calculée par \code{event_frequency} :
+
+\rustsnippet[label={lst:rendu-frequency}]{src/rules/helpers/render_tree.rs}{720}{751}{la fréquence d'un événement sur une cible}
+
+Elle s'appuie sur quatre tables (\src{src/rules/helpers/render_tree.rs}{677}{713}) résumées dans
+la \cref{tab:rendu-frequence}. L'arbre de décision est le suivant.
+\begin{enumerate}
+  \item Un événement de mouvement (\code{mousemove}, \code{scroll}, \code{resize}, \code{drag}\dots)
+        ou \code{setinterval} est continu, quelle que soit la cible.
+  \item Un événement qui n'est pas de frappe (\code{click}, \code{mouseover}, \code{select}\dots)
+        est discret ; un événement clavier (\code{keydown}, \code{keyup}, \code{keypress}) dont
+        l'écriture est gardée par un test de l'événement (\code{keyed}) aussi.
+  \item Reste un événement de frappe ; la cible tranche. Un \code{<textarea>} est continu ; un
+        \code{<input>} l'est si son \code{type} est absent ou textuel (\code{number} et
+        \code{range} compris) ; un autre hôte (\code{contenteditable}) l'est pour \code{input} et
+        \code{beforeinput}. Un élément de composant l'est si son nom contient un indice
+        (\code{Input}, \code{Search}, \code{Editor}, \code{Slider}\dots). Un listener d'effet, sans
+        cible, l'est pour \code{input}, \code{keydown} et \code{keyup}.
+\end{enumerate}
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{3.4cm}X}
+\toprule
+Table & Contenu \\
+\midrule
+\code{MOTION_EVENTS} & \code{mousemove}, \code{pointermove}, \code{touchmove}, \code{scroll}, \code{wheel}, \code{drag}, \code{dragover}, \code{resize}, \code{selectionchange} \\
+\code{TYPING_EVENTS} & \code{change}, \code{input}, \code{keydown}, \code{keyup}, \code{keypress}, \code{beforeinput} \\
+\code{TEXT_INPUT_TYPES} & \code{text}, \code{search}, \code{email}, \code{password}, \code{url}, \code{tel}, \code{number}, \code{range} \\
+\code{TEXT_COMPONENT_HINTS} & \code{Input}, \code{TextArea}, \code{Textarea}, \code{Search}, \code{Editor}, \code{Slider} \\
+\code{KEY_EVENTS} & \code{keydown}, \code{keyup}, \code{keypress} \\
+\bottomrule
+\end{tabularx}
+\caption{Les tables de classement de \file{render_tree.rs}.}
+\label{tab:rendu-frequence}
+\end{table}
+
+Un événement continu ne suffit pas. Un \code{scroll} qui écrit \code{window.scrollY > 50} écrit à
+chaque pas, mais React abandonne toute écriture \code{Object.is}-égale à la valeur courante : le
+booléen ne re-rend qu'à ses basculements. La règle exige donc qu'au moins un des slots du
+déclencheur ait des valeurs \emph{nombreuses}, au sens du domaine des valeurs :
+
+\rustsnippet{src/domains/impls/state_value.rs}{384}{401}{un slot à peu de valeurs re-rend au rythme de ses transitions}
+
+Un slot est \og à valeurs finies\fg{} s'il ne contient que des booléens, \code{null} ou
+\code{undefined}, un ensemble fini de chaînes constantes ou un intervalle entier de largeur au
+plus 16, et aucune référence ni setter. C'est la seule lecture du domaine des valeurs que fait
+la règle, et elle porte sur le store d'état convergé (\code{result.state_store}). La
+fixture \file{scroll_flag.tsx} (un \code{scroll} qui écrit un booléen) est muette par défaut, et
+tire avec \code{continuousOnly=false}.
+
+\begin{remarque}
+Le texte de \code{keyed} vient du fait \code{gated} de la dépendance de rendu : la part de
+l'ensemble qu'une valeur fonction n'atteint que derrière un test de ses propres arguments
+(\code{Deps::gated_for}, \src{src/engine/render_deps.rs}{189}{198}). C'est un fait must : un seul
+contributeur non gardé retire la source. Sur \file{keyed.tsx}, les trois handlers qui n'écrivent
+que sur \code{Enter} ou \code{Escape} sont discrets (muets par défaut) ; seul \code{KeyLog}, qui
+écrit \code{e.key} à chaque touche, tire.
+\end{remarque}
+
+Le point important est ailleurs : \emph{la fréquence ne prouve rien}. Elle ne décide que de ce qui
+est montré par défaut. Classer un événement continu comme discret masque un finding que
+\code{continuousOnly=false} rendrait visible ; l'inverse montre un finding par défaut. Aucune des
+deux erreurs ne change l'affirmation du finding, qui porte sur les entrées des éléments, pas sur
+la fréquence (\adr{41}, conséquences).
+
+\subsection{Étape 3 : les frères gaspillés}
+
+Pour un déclencheur retenu, la question est
+$\mathit{rel} = \{\code{Slot}(l)\}_l \cup \{\code{Module}(x)\}_x$ : les slots du lot, et les noms
+de module que le lot écrit à côté d'eux (un handler qui fait \code{cache.x = v; setV(v)} change
+aussi ce que lisent les lecteurs de \code{cache}). \code{wasted_siblings} y répond :
+
+\rustsnippet[label={lst:rendu-wasted-siblings}]{src/rules/helpers/render_tree.rs}{266}{326}{les éléments que le lot ne peut pas changer}
+
+On la lit en quatre temps.
+\begin{enumerate}
+  \item \textbf{Touché.} Un site est touché si sa garde, l'une de ses props ou son spread dépend
+        de la question. Pour un provider de contexte (\code{provides}), seule la garde compte :
+        sa \code{value} ne va pas à ses enfants par les props, elle est suivie autrement.
+  \item \textbf{Atteint.} Un site est écarté s'il est touché \emph{ou} si l'un des éléments dans
+        lesquels il est imbriqué (la chaîne des \code{parent}) l'est. Un
+        \code{<Panel value=\{text\}><Heavy /></Panel>} ne rend pas \code{<Heavy>} candidat :
+        \code{Panel} pourrait lui transmettre la valeur, par contexte ou par \code{cloneElement}.
+  \item \textbf{Résolu.} Seul un site dont \code{resolve} trouve le composant
+        (\cref{lst:rendu-resolve}) est candidat. Un élément opaque n'est jamais déclaré gaspillé.
+  \item \textbf{Non utilisateur.} La question transportée (\code{carried}) rassemble les
+        contextes qui portent la valeur jusqu'à ce site (\code{contexts_at}) et les noms de
+        module écrits. Si l'enfant \emph{utilise} l'un d'eux, ou s'il n'a pas de résumé, il est
+        écarté : un consommateur du contexte re-rend de toute façon, à bon droit.
+\end{enumerate}
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=5mm and 7mm,
+    q/.style={bloc,minimum width=30mm,align=center},
+    refus/.style={draw=ra-gray,rounded corners,align=center,font=\small,inner sep=3pt}]
+  \node[q] (t) {site $i$ de $o$};
+  \node[q,below=of t] (r) {touché, ou un \code{parent}\\ touché ?};
+  \node[q,below=of r] (s) {\code{resolve} trouve\\ un composant ?};
+  \node[q,below=of s] (u) {l'enfant utilise\\ \code{carried} ?};
+  \node[q,below=of u,draw=ra-blue,very thick] (w) {gaspillé :\\ \code{subtree_renders}};
+  \node[refus,right=12mm of r] (r1) {écarté : l'élément\\ dépend du lot};
+  \node[refus,right=12mm of s] (s1) {écarté : inconnu\\ = usage};
+  \node[refus,right=12mm of u] (u1) {écarté : consommateur\\ (ou pas de résumé)};
+  \draw[fleche] (t) -- (r);
+  \draw[fleche] (r) -- node[etiquette,left] {non} (s);
+  \draw[fleche] (s) -- node[etiquette,left] {oui} (u);
+  \draw[fleche] (u) -- node[etiquette,left] {non} (w);
+  \draw[fleche] (r) -- node[etiquette,above] {oui} (r1);
+  \draw[fleche] (s) -- node[etiquette,above] {non} (s1);
+  \draw[fleche] (u) -- node[etiquette,above] {oui} (u1);
+\end{tikzpicture}
+\caption{Le filtre de \code{wasted_siblings} sur un site du propriétaire. Toute sortie à droite
+est un refus de conclure ; seule la sortie du bas produit une affirmation.}
+\label{fig:rendu-filtre}
+\end{figure}
+
+La \cref{fig:rendu-filtre} résume ce filtre. Chaque question y a deux issues, et l'issue
+prudente est toujours celle qui écarte le site. C'est l'\cref{inv:tout-inconnu-usage}, écrit en
+code.
+
+\subsection{Étape 4 : compter les rendus}
+
+Pour un candidat, \code{subtree_renders} compte les rendus de composant qu'il coûte :
+
+\rustsnippet[label={lst:rendu-subtree}]{src/rules/helpers/render_tree.rs}{328}{372}{le coût d'un sous-arbre gaspillé}
+
+Le candidat compte pour un. Chaque élément de composant qu'il construit ajoute le coût de son
+propre sous-arbre, sauf s'il consomme ce que le lot change (il re-rend à bon droit, et ce qui est
+sous lui aussi) et sauf s'il est un provider (qui n'est pas un rendu de composant). Un site
+\code{in_list} ne compte \emph{qu'une fois} et allume le drapeau \code{list} : le vrai nombre
+d'instances est inconnu, peut-être grand, peut-être nul. La récursion et la profondeur
+(\code{MAX_DEPTH}) arrêtent la descente en comptant le composant pour un. Le compte est donc
+présenté comme une borne inférieure (\og at least N component renders, including a list\fg{}),
+avec une exception discutée à la \cref{sec:regles-rendu-rsc-limites}.
+
+\subsection{Étape 5 : seuil et message}
+
+Le seuil est appliqué en \src{src/rules/impls/wasted_subtree_render.rs}{185}{190} : le
+déclencheur produit un finding si au moins un élément est gaspillé et si le total atteint
+\code{minWastedRenders}, \emph{ou} si l'un des sous-arbres contient une liste. Le message assemble le déclencheur
+(premier événement continu, sinon le premier), les éléments gaspillés, le coût, puis l'un des deux
+correctifs structurels : déplacer l'état et ses usagers dans leur propre composant, ou construire
+les éléments indépendants plus haut et les passer en \code{children}. Chaque élément gaspillé
+reçoit une note \code{Step::Rerender}, visible avec \code{--trace}. Le finding est porté par le
+label du premier slot et par le span du handler (ou de l'élément \code{via}, ou de l'effet).
+
+\section{Des options sur une règle native}
+\label{sec:regles-rendu-rsc-options}
+
+Jusqu'à \adr{41}, aucune règle native n'acceptait de paramètre (\adr{22} §4). Une règle
+classée par coût change la donne : savoir à partir de combien de rendus inutiles un sous-arbre
+mérite d'être signalé, ou si un clic compte, est un choix d'équipe, pas un fait que l'analyseur
+peut établir. La règle déclare donc deux options typées :
+
+\rustsnippet{src/rules/impls/wasted_subtree_render.rs}{33}{48}{les deux options de la règle}
+
+Le type \code{OptionSpec} (\src{src/rules/api/query.rs}{272}{288}) ne connaît que deux formes,
+un entier non signé borné et un booléen. Le registre valide chaque valeur configurée
+\emph{avant} l'analyse, et bruyamment : une clé inconnue ou une valeur hors bornes est une erreur
+d'usage, jamais un réglage ignoré. Les accesseurs \code{RuleConfig::uint} et \code{flag}
+(\src{src/rules/api/query.rs}{247}{269}) peuvent alors rendre la valeur ou le défaut sans
+revérifier.
+
+\begin{shell}
+reactant check typing.tsx --rule wasted-subtree-render \
+  --rule-option wasted-subtree-render:minWastedRenders=0
+\end{shell}
+\begin{sortie}
+[error] option `minWastedRenders` of rule `wasted-subtree-render` must be an integer between 1 and 1000
+\end{sortie}
+Le code de sortie est 2 (erreur d'usage). Les options se donnent aussi dans le fichier de
+configuration ; \code{--rule-option} l'emporte sur la valeur de même clé (\adr{41} §4). Avec,
+dans \file{/tmp/ch21/cfg/reactant.config.json} :
+\begin{lstlisting}[language=JSON]
+{ "rules": { "wasted-subtree-render":
+    { "options": { "continuousOnly": false, "minWastedRenders": 1 } } } }
+\end{lstlisting}
+le composant \code{HoverCard} suivant, muet par défaut, produit deux findings :
+\begin{lstlisting}[language=TypeScript,caption={Un survol à côté d'un sous-arbre (\file{/tmp/ch21/cfg/hover_inline.tsx})},label={lst:rendu-hover}]
+function Heavy() { return <section>{[0, 1, 2].map((i) => <span key={i}>{i}</span>)}</section>; }
+export default function HoverCard() {
+  const [hover, setHover] = useState(false);
+  return (
+    <div className={hover ? "on" : "off"}
+         onMouseOver={() => setHover(true)} onMouseOut={() => setHover(false)}>
+      <Heavy />
+    </div>
+  );
+}
+\end{lstlisting}
+\begin{sortie}
+  HoverCard  (3 hooks)  hover_inline.tsx
+    warn   wasted-subtree-render  [hook:0]  (line 8:9)  each `mouseover` event writes state `hover`
+      and re-renders `<Heavy>` (1 component renders) although none of its inputs depends on it. […]
+    warn   wasted-subtree-render  [hook:0]  (line 8:44)  each `mouseout` event writes state `hover`
+      and re-renders `<Heavy>` (1 component renders) although none of its inputs depends on it. […]
+\end{sortie}
+Il fallait les deux options. \code{mouseover} n'est pas un événement continu et \code{hover} est
+un booléen : \code{continuousOnly=false} est nécessaire. Le \code{.map} de \code{Heavy} ne
+construit que des éléments hôtes (\code{<span>}), donc aucun site \code{in_list}, et le coût est
+d'un seul rendu : \code{minWastedRenders=1} est nécessaire aussi. Les deux handlers sont deux
+déclencheurs distincts, donc deux findings.
+
+\begin{decision}[ADR-041 §4]
+\textbf{Décision.} Une règle native peut déclarer des options typées (\code{Rule::options}), que
+le registre valide ; \code{--rule-option <rule>:<key>=<value>} bat la configuration. Les défauts
+(2 et \code{true}) viennent d'un balayage du corpus.
+\textbf{Ce qui est amendé.} \adr{22} §4 (\og natives declare no params in v1\fg{}) : les seuils
+d'une règle classée par coût sont l'affaire de l'équipe. Une règle native qui ne déclare rien
+continue de refuser toute option.
+\end{decision}
+
+\begin{piege}
+Une option ne peut qu'ajuster \emph{ce qui est montré}, jamais ce qui est affirmé. Baisser
+\code{minWastedRenders} ou couper \code{continuousOnly} fait apparaître des findings dont
+l'affirmation (\og aucune entrée ne dépend de l'état\fg{}) est calculée de la même façon. Aucune
+option ne relâche l'\cref{inv:tout-inconnu-usage}.
+\end{piege}
+
+\section{Cas limites : ce que les fixtures épinglent}
+\label{sec:regles-rendu-rsc-cas}
+
+Les fixtures de \file{tests/fixtures/wasted_subtree_render/} sont le contrat de la règle. Cinq
+d'entre elles (\file{typing}, \file{composer}, \file{dropzone}, \file{click}, \file{children})
+viennent de \file{scripts/rerender-bench/}, où leur nombre de rendus a été mesuré sous React~19
+(en-tête de \file{tests/wasted_subtree_render.rs}). On en retient quatre familles.
+
+\paragraph{Le correctif \og children\fg{}.} C'est le cas limite le plus instructif, parce qu'il
+illustre le premier point d'arrêt de la cascade (encadré du début du chapitre) :
+
+\tsxsnippet[label={lst:rendu-children}]{tests/fixtures/wasted_subtree_render/children.tsx}{3}{16}{l'élément lourd est construit plus haut}
+
+\code{<Heavy />} est construit dans le rendu d'\code{App}, qui ne se ré-exécute pas quand
+\code{hover} change ; \code{HoverCard} reçoit l'objet élément par sa prop \code{children} et le
+renvoie tel quel, et React saute son rendu. Côté analyse, c'est immédiat : le résumé de
+\code{HoverCard} n'a \emph{aucun} site (l'élément est un site d'\code{App}), donc
+\code{wasted_siblings} n'a rien à examiner. La fixture est muette même avec
+\code{continuousOnly=false} et \code{minWastedRenders=1} (sortie observée : \og ✓ 1 file(s) no issues found.\fg{}), alors que
+la variante où \code{HoverCard} construit lui-même \code{<Heavy />}
+(\cref{lst:rendu-hover}) tire. La dépendance de rendu distingue ainsi, sans règle spéciale,
+\og construire\fg{} et \og transmettre\fg{} un élément.
+
+\paragraph{Le provider.} Dans \file{provider.tsx}, \code{App} rend
+\code{<Ctx.Provider value=\{text\}>} autour de \code{<Panel><Reader /></Panel>}, et
+\code{Reader} lit le contexte. Le provider n'est pas touché (seule sa garde compterait), mais
+\code{contexts_at} ajoute \code{Context(Ctx)} à la question transportée pour tout site imbriqué
+dans lui. \code{<Reader>}, site d'\code{App} imbriqué dans \code{<Panel>}, lui-même imbriqué dans
+le provider, utilise ce contexte : il est écarté, rien n'est affirmé sur lui. \code{<Panel>}, en
+revanche, ne lit rien : il \emph{est} gaspillé, pour un rendu. La fixture n'est muette par défaut
+qu'à cause du seuil ; avec \code{minWastedRenders=1} et \code{continuousOnly=false}, on observe
+\og re-renders \code{<Panel>} (1 component renders)\fg{}. Le nom du test qui l'épingle,
+\code{children_from_above_and_provider_subtrees_are_not_claimed}, décrit donc le sort de
+\code{<Reader>}, pas celui de \code{<Panel>}. La fixture
+\file{context.tsx} montre l'autre face (\adr{41}, \issue{145}) : les éléments qu'un provider
+enveloppe \emph{peuvent} être gaspillés quand ils ne consomment pas le contexte, et le test
+\code{a_provider_is_followed_to_its_consumers} vérifie qu'un consommateur, direct ou à travers un
+hook, n'est jamais compté.
+
+\paragraph{La garde.} Dans \file{click.tsx}, \code{\{open \&\& <Dialog onClose=\{…\} />\}} a une
+garde \code{\{Slot(0)\}} : l'élément existe ou non selon l'état, il est touché, jamais candidat.
+Seul \code{<BigList>} est déclaré gaspillé, et seulement avec \code{continuousOnly=false} :
+\begin{sortie}
+  Page  (3 hooks)  tests/fixtures/wasted_subtree_render/click.tsx
+    warn   wasted-subtree-render  [hook:0]  (line 14:24)  each `click` event writes state `open` and
+      re-renders `<BigList>` (at least 2 component renders, including a list) […]
+    warn   wasted-subtree-render  [hook:0]  (line 15:15)  each `click` event in `<Dialog>` writes
+      state `open` and re-renders `<BigList>` (at least 2 component renders, including a list) […]
+\end{sortie}
+Deux déclencheurs : le bouton d'ouverture du propriétaire, et le bouton de fermeture de
+\code{Dialog}, où le setter a atterri à travers la closure \code{onClose}.
+
+\paragraph{L'élément opaque.} Enveloppons \code{Sidebar} de la \cref{lst:rendu-recherche} dans
+\code{memo} (\file{/tmp/ch21/memo.tsx}) : la règle devient muette. Ce n'est pas qu'elle
+reconnaisse la barrière \code{memo} ; c'est que \code{memo(function Sidebar() \{…\})} ne se résout
+vers aucun composant enregistré (\issue{64}), et qu'un élément opaque n'est jamais candidat. Le
+résultat est juste ici, mais pour une raison qui vaut aussi pour une bibliothèque \emph{sans}
+\code{memo} : un sous-arbre lourd importé d'un paquet, à côté d'un champ rapide, n'est pas signalé
+(\file{docs/limitations.md}, \og Render cascades stop at what the analysis cannot see
+into\fg{}).
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{3.2cm}X>{\raggedright\arraybackslash}p{3.3cm}}
+\toprule
+Fixture & Ce qu'elle épingle & Verdict par défaut \\
+\midrule
+\file{typing.tsx} & frappe à côté d'un sous-arbre avec liste & \Warning{} \\
+\file{typing_fixed.tsx} & état déplacé dans \code{<Editor>} & muet \\
+\file{child_setter.tsx} & setter passé à un enfant (\issue{146}) & \Warning{}, \code{<Field>} compris \\
+\file{keyed.tsx} & écriture derrière \code{e.key} : discret (\issue{148}) & \Warning{} sur \code{KeyLog} seul \\
+\file{click.tsx} & clic discret, garde & muet ; 2 \Warning{} sans \code{continuousOnly} \\
+\file{scroll_flag.tsx} & booléen écrit par \code{scroll} & muet ; \Warning{} sans \code{continuousOnly} \\
+\file{children.tsx} & élément reçu en \code{children} & muet dans tous les cas \\
+\file{provider.tsx} & consommateur sous un provider & muet (seuil : \code{<Panel>} coûte 1) \\
+\file{context.tsx} & provider suivi jusqu'aux consommateurs (\issue{145}) & 2 \Warning{} \\
+\file{hook_trigger/} & effet venu d'un hook personnalisé & \Warning{} nommant le hook \\
+\file{module_write.tsx} & nom de module écrit à côté de l'état (\issue{147}) & 3 \Warning{} ; 4 sans \code{continuousOnly} \\
+\bottomrule
+\end{tabularx}
+\caption{Quelques fixtures de la règle et leur verdict, rejoués au commit photographié.}
+\label{tab:rendu-fixtures}
+\end{table}
+% Note : composer, dropzone, pointer, spread_input, wrapped_input, checkbox ne figurent pas dans la table (non rejoués).
+
+\section{Niveau et soundness d'une affirmation d'absence}
+\label{sec:regles-rendu-rsc-soundness}
+
+\paragraph{Ce que dit un finding.} Un finding de \regle{wasted-subtree-render} est la conjonction
+de trois affirmations : (a) le déclencheur écrit les slots nommés ; (b) chaque écriture re-rend le
+propriétaire, donc chaque élément gaspillé ; (c) aucune entrée de ces éléments (props, spread,
+garde, éléments englobants, contextes portés, noms de module écrits) ne dépend de ce que le lot
+change. La première vient des relations du moteur ; la deuxième est la sémantique de React
+(\cref{chap:react-modele}) ; la troisième est l'affirmation d'absence.
+
+\paragraph{Polarité renversée.} Pour une affirmation d'absence, sur-approximer les
+\emph{dépendances} est la direction prudente : une dépendance de trop fait taire la règle (un
+finding de moins), une dépendance oubliée fabriquerait une affirmation fausse. C'est exactement ce
+que garantit l'analyse avant de \file{render_deps.rs} : un may-ensemble, joint par union, dégradé
+en top au plafond, jamais en plus petit. Et c'est ce que prolonge l'\cref{inv:tout-inconnu-usage}
+au niveau de l'arbre : tout ce qui n'est pas vu compte comme un usage.
+
+\begin{theoreme}{Correction de l'affirmation d'absence}{rendu-absence}
+Supposons que, pour chaque composant $C$, le résumé \code{render_deps}$(C)$ sur-approxime les
+sources dont dépendent la sortie, les effets et les éléments de $C$ (hypothèse de
+\cref{def:render-dep}), et qu'aucun appel opaque ne lise ni n'écrive un binding de module
+(\adr{41} §2). Alors tout élément $e$ rapporté par \code{wasted_siblings}$(o, \mathit{rel})$ a
+des props, un spread et une garde indépendants de $\mathit{rel}$, n'est imbriqué dans aucun élément
+qui en dépend, se résout vers un composant $C$ qui n'utilise pas ce qui est porté jusqu'à lui, et
+tout sous-arbre qu'il compte est fait d'éléments résolus non consommateurs.
+\end{theoreme}
+
+\noindent\textit{Esquisse.} Chaque exclusion de la \cref{fig:rendu-filtre} teste \code{touches}
+sur un ensemble qui contient les vraies dépendances ; un test négatif sur un sur-ensemble est
+négatif sur l'ensemble. Les cas où l'ensemble n'est pas connu (non résolu, top, récursion,
+profondeur, contexte innommable) sont tous rangés du côté \og usage\fg{}.
+
+\paragraph{Ce qui fuit.} Deux hypothèses restent, toutes deux écrites dans \adr{41}. La première
+est l'appel opaque : une fonction que l'analyse ne voit pas est supposée ne lire ni écrire aucun
+binding de module (\issue{51}, \issue{52}). La seconde est la correspondance par orthographe des
+noms de module entre fichiers : une collision donne \emph{moins} de findings, jamais un faux. Si
+la première est violée, la règle peut affirmer à tort qu'un élément est gaspillé : c'est un faux
+positif, toléré au niveau \Warning{}, et c'est la seule direction où elle peut se tromper sur
+l'affirmation.
+
+\paragraph{Et les faux négatifs ?} Le prix de la prudence est une sous-déclaration : un sous-arbre
+\code{memo} ou de bibliothèque, un élément de nom ambigu, une cascade à travers un contexte
+importé d'un paquet ne sont jamais signalés. Le projet les classe comme limites de précision
+(\issue{64} porte l'étiquette \code{precision-fn}, \og sound but incomplete\fg{}) et non comme
+bogues de soundness : l'invariant \og faux négatifs interdits\fg{} (\cref{def:soundness}) porte
+sur les défauts que l'analyse \emph{prétend} exclure, et cette règle ne prétend rien sur un
+élément qu'elle n'a pas pu résoudre.
+
+\begin{decision}[ADR-041 §1–§3]
+\textbf{Décision.} La dépendance de rendu est une analyse avant séparée, pas un champ de
+\code{StateValue}. \textbf{Alternatives refusées.} (1) Réutiliser \code{Versioned(S)}
+(\adr{17}) : ce fait ne vit que sur la composante \code{reference}, un booléen ou
+\code{text.length} n'y portent rien, et une allocation est \code{PerRender} quelle que soit son
+origine. (2) Ajouter la dépendance comme composante du produit : toutes les comparaisons de
+valeurs existantes en seraient changées (\regle{unnecessary-rerender} compare \code{arg == init},
+la clé du \code{ComponentCache} compare les props). \textbf{Niveau.} \Warning{} : les rendus
+supplémentaires sont certains, leur coût ne l'est pas (définition du \Warning{} dans
+\file{CLAUDE.md}).
+\end{decision}
+
+\begin{remarque}
+Pourquoi pas \Error{} quand le sous-arbre est énorme ? Parce que le niveau \Error{} exige un
+\emph{défaut} certain (\cref{def:certified}). Un rendu inutile n'est pas un défaut : c'est un
+coût, et la règle n'a aucun moyen de le chiffrer (un composant peut être trivial à rendre). La
+règle n'a d'ailleurs pas de \code{safe_check} : une assurance \og aucun rendu gaspillé\fg{}
+reposerait sur la même borne inférieure, et n'aurait pas de sens pour un élément non résolu.
+\end{remarque}
+
+% ===========================================================================
+\section{Server Components : le graphe serveur de Next.js}
+\label{sec:regles-rendu-rsc-graphe}
+
+\begin{react}[Server Components et \code{"use client"}]
+Sous l'App Router de Next.js, les fichiers réservés d'un dossier \file{app/} (\file{page.tsx},
+\file{layout.tsx}\dots) sont des \emph{Server Components} : React les rend une fois, côté
+serveur, et envoie le résultat. Il n'y a ni état, ni commit, ni effets ; React n'a aucun hook à
+leur fournir, et un \code{useState} y fait échouer le rendu. Une directive \code{"use client"},
+écrite dans le \emph{prologue} d'un module (avant toute instruction), ouvre une frontière :
+ce module, et tout ce qu'il importe, est compilé pour le client. La propriété \og être serveur\fg{}
+n'est donc pas celle d'un fichier isolé, mais de \emph{la façon dont on l'atteint} par les
+imports. Un module importé des deux côtés est compilé deux fois, et sa copie serveur doit
+pouvoir s'exécuter. Voir \cref{chap:react-modele}.
+\end{react}
+
+\regle{server-component-hook} répond à une question que le domaine abstrait ignore
+complètement : dans quel environnement ce module s'exécute-t-il ? Elle s'appuie sur deux faits
+de nature différente. Le premier est une \emph{convention de nommage} : quels fichiers sont des
+entrées serveur. Le second est un \emph{graphe} : les arêtes d'import résolues, que le front-end
+enregistre dans les \code{ModuleFacts} de chaque fichier (\cref{chap:frontend-detection},
+\cref{lst:frontend-modulefacts}) : le prologue de directives, verbatim, et les fichiers importés
+que le résolveur a pu associer à un vrai fichier, \code{import type} exclu.
+
+\subsection{Les entrées : une convention de noms}
+
+\rustsnippet{src/project/nextjs.rs}{13}{38}{les entrées App Router}
+
+Il faut les deux moitiés de la convention : un nom réservé \emph{et} un ancêtre nommé
+\file{app}. Le nom seul désignerait n'importe quel \file{components/page.tsx}. \code{error} et
+\code{global-error} sont absents à dessein : Next.js exige qu'ils soient des Client Components.
+Les groupes de routes entre parenthèses passent sans traitement particulier : le test
+\code{entry_kinds_need_stem_and_app_dir} accepte \file{/r/src/app/(marketing)/x/layout.tsx}.
+
+\subsection{Le graphe serveur : une atteignabilité avec frontière}
+
+\rustsnippet[label={lst:rendu-server-modules}]{src/project/nextjs.rs}{40}{55}{les modules du graphe serveur}
+
+\code{server_modules} part de toutes les entrées (les \code{seeds} du parcours), puis appelle le mécanisme unique
+de la table, \code{ModuleTable::reachable_from(seeds, Some("use client"))}
+(\cref{lst:frontend-reachable}, \src{src/ir/module.rs}{91}{126}). C'est un parcours en largeur
+sur les arêtes d'import ; un module qui déclare la frontière n'est ni visité ni traversé, qu'il
+soit un point de départ ou non. Une page qui porte elle-même \code{"use client"} n'est donc pas serveur,
+et un module que seul un module client importe ne l'est pas non plus. Le coût est
+$O(V + E)$ sur le graphe de modules.
+
+\begin{definition}{Module serveur}{module-serveur}
+Un module $m$ est \terme{module serveur} s'il existe un chemin d'arêtes d'import résolues
+$e = m_0 \to m_1 \to \dots \to m_k = m$ tel que $e$ est une entrée App Router
+(\code{server_entry_kind}$(e) \neq$ \code{None}) et qu'aucun $m_i$ ($0 \le i \le k$) ne déclare
+\code{"use client"} dans son prologue.
+\end{definition}
+
+\begin{exemple}{Un module partagé et une frontière}{rsc-partage}
+Le projet \file{/tmp/ch21/nx/} (un \file{next.config.js}, un \file{tsconfig.json}) contient
+cinq modules :
+\begin{lstlisting}[language=TypeScript,caption={Le projet \file{/tmp/ch21/nx/} (fichiers concaténés)},label={lst:rsc-nx}]
+// app/page.tsx
+import { Search } from "../components/search";
+import { Price } from "../components/price";
+export default function Home() { return <main><Search /><Price value={3} /></main>; }
+
+// app/shop/page.tsx
+import { useSession } from "next-auth/react";
+import { useFormat } from "../../lib/format";
+export default function Shop() {
+  const session = useSession();
+  const total = useFormat(10);
+  return <p>{total}{String(session)}</p>;
+}
+
+// components/search.tsx
+"use client";
+import { useState } from "react";
+import { Price } from "./price";
+export function Search() {
+  const [q, setQ] = useState("");
+  return <div><input value={q} onChange={(e) => setQ(e.target.value)} /><Price value={q.length} /></div>;
+}
+
+// components/price.tsx
+import { useId } from "react";
+import { useFormat } from "../lib/format";
+export function Price({ value }: { value: number }) {
+  const id = useId();
+  const text = useFormat(value);
+  return <span id={id}>{text}</span>;
+}
+
+// lib/format.ts
+export function useFormat(n: number) { return n.toFixed(2); }
+\end{lstlisting}
+La \cref{fig:rsc-graphe} montre le graphe et la frontière. Les points de départ sont les
+deux \file{page.tsx}. Depuis \file{app/page.tsx}, le parcours atteint \file{price.tsx}, mais s'arrête
+à \file{search.tsx}, qui déclare la frontière. \file{price.tsx} est importé des deux côtés : il
+est serveur (par \file{app/page.tsx}), quoique \file{search.tsx} l'importe aussi.
+\end{exemple}
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=9mm and 14mm,
+    mod/.style={bloc,minimum width=30mm,font=\small},
+    seed/.style={mod,very thick,draw=ra-blue},
+    cli/.style={mod,fill=white}]
+  \node[seed] (home) {\file{app/page.tsx}\\[-2pt]{\scriptsize entrée \code{page}}};
+  \node[seed,right=36mm of home] (shop) {\file{app/shop/page.tsx}\\[-2pt]{\scriptsize entrée \code{page}}};
+  \node[cli,below left=14mm and -4mm of home] (search) {\file{components/search.tsx}\\[-2pt]{\scriptsize\code{"use client"}}};
+  \node[mod,below right=14mm and -4mm of home] (price) {\file{components/price.tsx}\\[-2pt]{\scriptsize serveur (partagé)}};
+  \node[mod,below=14mm of shop] (fmt) {\file{lib/format.ts}\\[-2pt]{\scriptsize serveur}};
+  \draw[fleche] (home) -- (price);
+  \draw[fleche] (home) -- (search);
+  \draw[fleche] (shop) -- (fmt);
+  \draw[fleche] (price) -- (fmt);
+  \draw[flechemay] (search) -- (price);
+  \begin{scope}[on background layer]
+    \node[draw=ra-amber,thick,dashed,rounded corners,inner sep=3mm,fit=(search),
+          label={[etiquette,text=ra-amber]below:frontière client}] {};
+    \node[fill=ra-blue!8,rounded corners,inner sep=2.5mm,fit=(home)(shop)(price)(fmt)] {};
+  \end{scope}
+\end{tikzpicture}
+\caption{Le graphe de modules de \file{/tmp/ch21/nx/}. Fond bleu : \code{server_modules}. La
+frontière \code{"use client"} (pointillés orangés) arrête le parcours : \file{search.tsx} n'est
+pas visité. L'arête pointillée de \file{search.tsx} vers \file{price.tsx} n'est jamais suivie
+depuis le serveur ; \file{price.tsx} est serveur par l'arête directe de la page.}
+\label{fig:rsc-graphe}
+\end{figure}
+
+\begin{piege}
+Une directive n'en est une que dans le prologue. Dans \file{/tmp/ch21/nx3/components/toggle.tsx},
+\begin{lstlisting}[language=TypeScript]
+import { useState as useLocal } from "react";
+"use client";
+export function Toggle() { const [on, setOn] = useLocal(false); /* … */ }
+\end{lstlisting}
+la chaîne \code{"use client"} suit une instruction d'import : oxc ne la range pas dans
+\code{Program::directives}, et Next.js ne la lit pas davantage. Le module est serveur (il est
+importé par \file{app/page.tsx}) et la règle tire, en nommant le hook par son origine malgré
+l'alias :
+\begin{sortie}
+  Toggle  (2 hooks)  nx3/components/toggle.tsx
+    warn   server-component-hook  [hook:0]  (line 5:8)  `useState` is called in a Server Component.
+      this module is imported into the App Router's server graph and no `"use client"` directive
+      covers it, […]
+\end{sortie}
+\end{piege}
+
+\section{L'algorithme de server-component-hook}
+\label{sec:regles-rendu-rsc-sch}
+
+La règle tient en trois portes et un message (\src{src/rules/impls/server_component_hook.rs}{129}{193}).
+
+\paragraph{Porte 1 : le programme utilise-t-il la directive ?} Sans un seul \code{"use client"}
+dans les modules abaissés (\code{ModuleTable::any_declares}), la règle se tait. Un code qui
+n'écrit jamais la directive n'est pas un code Server Components, et qualifier ses modules de
+\og serveur\fg{} serait une fiction (\src{src/ir/module.rs}{82}{89}). Le projet
+\file{/tmp/ch21/nx2/} est la copie de \file{nx/} sans la directive de \file{search.tsx} : aucun
+finding (\og ✓ 6 file(s) no issues found.\fg{}), alors que sous Next.js tous ses hooks seraient
+fautifs.
+
+\paragraph{Porte 2 : le fichier du composant est-il serveur ?} \code{server_modules(table)} doit
+contenir \code{comp.file}. Dans \file{nx/}, \code{Search} est client, il n'est pas examiné.
+
+\paragraph{Porte 3 : quels hooks sont des preuves ?} Chaque \code{HookEntry} du composant passe
+par \code{client_only_hook}, avec sa ligne de provenance (\code{HookProvenance}) :
+
+\rustsnippet[label={lst:rsc-client-only}]{src/rules/impls/server_component_hook.rs}{67}{111}{qu'est-ce qui prouve un hook client ?}
+
+Les cinq hooks modélisés (\code{State}, \code{Effect}, \code{Memo}, \code{Callback}, \code{Ref})
+sont des preuves par leur \emph{genre} : un \code{useReducer}, rangé en \code{State}, en est une,
+et il est nommé par son origine (\code{origin_hook}), pas par l'alias local ni par le genre. Un
+hook \code{Custom} n'est une preuve que si son origine figure dans l'une de deux listes fermées :
+
+\rustsnippet{src/rules/impls/server_component_hook.rs}{10}{47}{les hooks documentés comme client}
+
+La liste des paquets est indexée par le spécificateur d'import : un \code{useRouter} du projet ne
+prouve rien, celui de \code{next/navigation} si (test \code{the_package_scope_is_load_bearing}).
+Un \code{HookEntry::Handler} (un \code{onClick} sur un élément hôte) n'est pas un hook ; c'est une
+autre erreur de Next.js, que la règle ne traite pas.
+
+\begin{exemple}{Ce qui n'est pas une preuve}{rsc-preuves}
+Reprenons \file{/tmp/ch21/nx/} (\cref{lst:rsc-nx}) :
+\begin{sortie}
+  Price  (2 hooks)  nx/components/price.tsx
+    warn   server-component-hook  [hook:0]  (line 5:8)  `useId` is called in a Server Component. this
+      module is imported into the App Router's server graph and no `"use client"` directive covers
+      it, so React renders it on the server, where hooks do not exist; add `"use client"` at the
+      top of the file, or move the stateful part into a child component that declares it
+  Search  (2 hooks)  nx/components/search.tsx  ✓
+  Shop  (2 hooks)  nx/app/shop/page.tsx  ✓
+\end{sortie}
+(Commande : \code{check nx --rule server-component-hook --show-clean} ; les lignes
+\code{suspended analysis-limit} de \code{--info} sont omises.) \code{useId} est dans
+\code{REACT_CLIENT_HOOKS} : \code{Price}, module partagé, est signalé. \code{Shop} ne l'est pas :
+\code{useSession} vient de \code{next-auth/react}, paquet absent de la liste, et
+\code{useFormat} est un utilitaire au nom en \code{use} qui n'appelle aucun hook. Le premier cas
+est un faux négatif réel (\code{useSession} est un hook client) ; le second est exactement le
+faux positif que la liste fermée évite.
+\end{exemple}
+
+\paragraph{Le message.} Les noms sont dédoublonnés dans l'ordre de première apparition : trois
+\code{useState} sont une seule directive manquante. Il y a \emph{un} finding par composant, qui
+nomme au plus trois hooks puis \og and N more\fg{}, et qui distingue une entrée
+(\og this file is an App Router \code{page}\fg{}) d'un module atteint transitivement. Sur la
+fixture \file{tests/fixtures/next_project/} :
+\begin{sortie}
+  HomePage  (2 hooks)  tests/fixtures/next_project/src/app/page.tsx
+    warn   server-component-hook  [hook:0]  (line 7:8)  `useState` is called in a Server Component.
+      this file is an App Router `page` and no `"use client"` directive covers it, […]
+  Sidebar  (2 hooks)  tests/fixtures/next_project/src/components/sidebar.tsx
+    warn   server-component-hook  [hook:0]  (line 8:8)  `usePathname`, `useState`, `useMemo` are
+      called in a Server Component. this module is imported into the App Router's server graph
+      and no `"use client"` directive covers it, […]
+\end{sortie}
+\code{Sidebar} n'a que deux hooks à la surface (\code{usePathname}, \code{useNavItems}) ;
+\code{useState} et \code{useMemo} viennent de \code{useNavItems}, greffé par inlining. Le
+\code{Counter} client de la même fixture garde son finding \regle{infinite-loop} : les autres
+règles ne sont pas supprimées dans un projet Next (test \code{a_client_component_is_not_reported}).
+
+\paragraph{L'assurance.} \code{safe_check} (\src{src/rules/impls/server_component_hook.rs}{118}{127})
+ne publie \og this Server Component calls no client-only hook\fg{} que pour un composant qui passe
+les portes 1 et 2. Sur un composant client, l'assurance serait vide : il n'y avait rien à
+vérifier.
+
+\section{Pourquoi Warning et pas Error}
+\label{sec:regles-rendu-rsc-niveau}
+
+Un \code{useState} dans une page sans directive fait échouer le rendu à coup sûr. Pourquoi la
+règle ne produit-elle pas une \Error{} ? Parce qu'une \Error{} doit être prouvée dans le domaine,
+par un jeton \code{Certified} que seules les primitives must savent frapper
+(\cref{def:certified}), et que les deux faits dont dépend la conclusion n'appartiennent pas au
+domaine.
+\begin{itemize}
+  \item \textbf{L'ensemble des entrées} vient d'une convention de noms de fichiers. Un projet peut
+        être configuré autrement ; un dossier \file{app/} peut ne pas être celui du routeur.
+  \item \textbf{Le graphe} vient des arêtes que le résolveur a trouvées. Une arête manquante
+        (alias non résolu) laisse son sous-graphe non classé ; une arête de trop (un import
+        \code{\{ type T \}} au niveau du spécificateur, compté comme arête de valeur,
+        \cref{chap:frontend-detection}) pourrait rattacher au serveur un module qui n'y est pas.
+\end{itemize}
+Le projet appelle \og incertain\fg{} un fait qui ne repose pas sur le domaine ; c'est la
+définition du \Warning{}. On remarquera que les deux règles du chapitre plafonnent au même niveau
+pour des raisons opposées : \regle{wasted-subtree-render} a la preuve mais pas le défaut (un coût
+n'est pas un bogue) ; \regle{server-component-hook} a le défaut mais pas la preuve.
+
+\begin{decision}[ADR-026 §4]
+\textbf{Décision.} Les modules serveur sont \emph{analysés}, comme tout composant. La règle est un
+\Warning{}, gardée par l'usage de la directive, alimentée par les seuls hooks prouvés client, un
+finding par composant.
+\textbf{Alternatives refusées.} (1) \emph{Sauter} les Server Components : la qualité de serveur
+dépend d'arêtes peut-être manquantes, et sauter un module à tort efface ses bogues, un faux négatif.
+Les analyser ne coûte rien en soundness : sans état, un Server Component est sur-approximé comme
+tout composant aux props top. (2) Une primitive must qui frapperait un \code{Certified} :
+\og it would dress a path convention as a domain proof\fg{}. (3) Supprimer les findings des autres
+règles dans un module serveur : toute erreur de classement deviendrait un faux négatif. (4)
+Accepter tout \code{useX} comme preuve : nombre d'utilitaires nommés \code{use…} n'appellent
+aucun hook.
+\textbf{Résultat.} Zéro finding sur les corpus Next.js (qui compilent), et un finding correct sous
+mutation (directive retirée d'une page de \code{ai-chatbot}).
+\end{decision}
+
+La direction de l'erreur est la bonne. Une arête manquante \emph{retire} des modules du graphe
+serveur, donc des findings : la règle sous-déclare (\issue{29}), elle ne sur-déclare pas. Et comme
+aucun module n'est sauté, cette sous-déclaration ne cache rien aux autres règles.
+
+\section{Pièges et limites connues}
+\label{sec:regles-rendu-rsc-limites}
+
+\begin{piege}
+\textbf{Le compte des rendus n'est pas toujours une borne inférieure.} \code{subtree_renders}
+compte \emph{un} rendu pour un élément non résolu \emph{sous} un candidat
+(\code{None => renders += 1}, \cref{lst:rendu-subtree}). Dans \file{/tmp/ch21/unres.tsx},
+\code{function Tree() \{ return <div><Lib /></div>; \}} avec \code{Lib} importé de
+\code{some-lib} donne \og re-renders \code{<Tree>} (2 component renders)\fg{}. Si \code{Lib} est
+un \code{memo}, React ne le re-rend pas, et le vrai compte est 1. L'affirmation d'absence n'est
+pas en cause (\code{Lib} ne reçoit rien) ; seul le seuil \code{minWastedRenders} peut être franchi
+à tort. Au premier niveau, en revanche, le \code{<Lib />} du même fichier n'est jamais candidat.
+\end{piege}
+
+\begin{piege}
+\textbf{Un \code{.map} ne fait pas toujours une liste.} Seul un site de \emph{composant} construit
+dans un callback est \code{in_list}. Un \code{.map} qui ne produit que des éléments hôtes
+(\code{<span>}, \code{<tr>}) ne rend pas le sous-arbre \og liste\fg{}, et son coût reste d'un
+rendu (\cref{lst:rendu-hover}).
+\end{piege}
+
+\paragraph{Écarts de texte observés.} Trois défauts de gabarit, sans effet sur les décisions :
+\og (1 component renders)\fg{} au pluriel dans le message principal
+(\src{src/rules/impls/wasted_subtree_render.rs}{212}{216}), alors que la note \code{Step::Rerender}
+dit \og 1 component render\fg{} ; \og each \code{setinterval} event\fg{} pour une minuterie ;
+\og Server Component. this file…\fg{} en minuscule après un point
+(\src{src/rules/impls/server_component_hook.rs}{179}{187}). Le commentaire de
+\code{REACT_CLIENT_HOOKS} (\og The engine models the first five as dedicated \code{HookEntry}
+kinds\fg{}) est ambigu : les cinq premiers de la liste (\code{useContext}\dots) n'ont pas de genre
+dédié ; il faut lire \og les cinq hooks modélisés, traités par les bras dédiés de
+\code{client_only_hook}\fg{}.
+
+\paragraph{Limites connues de \regle{server-component-hook}.}
+\begin{itemize}
+  \item \textbf{Imports non résolus} (\issue{29}, \code{precision-fn}) : un sous-graphe atteint par
+        un alias non résolu n'est pas classé.
+  \item \textbf{Run rétréci} : \code{reactant check tests/fixtures/next_project/src/app} n'abaisse
+        pas \file{counter.tsx}, seul porteur de \code{"use client"}. La porte 1 ferme la règle :
+        aucun finding, mais le blind spot \og 3 imported file(s) resolved outside the analysed set
+        and were never read\fg{} retient le \og clean bill\fg{} (\cref{chap:projet-cli-driver}).
+  \item \textbf{Listes fermées} : un hook client d'un paquet non listé (\code{next-auth/react},
+        \cref{ex:rsc-preuves}) n'est pas une preuve.
+  \item \textbf{Hook en position \code{return}} : un hook personnalisé réduit à
+        \code{return useMemo(…)} est vu, mais le finding sort sans numéro de ligne (\issue{140}).
+  \item \textbf{Coût} : \code{server_modules} est recalculé à chaque appel, dans \code{check} et
+        dans \code{safe_check}, pour chaque composant : $O(C \cdot (V+E))$ par exécution, là où
+        le \code{RenderIndex} est mis en cache dans \code{ProgramCache}. Observation de coût, pas
+        de justesse.
+\end{itemize}
+
+\paragraph{Limites connues de \regle{wasted-subtree-render}.} \code{memo} et \code{forwardRef}
+opaques (\issue{64}) ; appel opaque supposé sans lecture ni écriture de module (\issue{51},
+\issue{52}) ; une cascade à travers un contexte importé d'un paquet n'est pas suivie
+(\file{docs/limitations.md}).
+
+% ---------------------------------------------------------------------------
+\begin{resume}
+\begin{itemize}
+  \item Les deux règles du chapitre lisent des faits calculés \emph{à côté} du domaine des
+        valeurs : la dépendance de rendu (\adr{41}) pour l'une, les faits de module et une
+        convention de noms (\adr{26}) pour l'autre. Toutes deux plafonnent à \Warning{}, l'une
+        faute de défaut (un coût), l'autre faute de preuve dans le domaine.
+  \item \regle{wasted-subtree-render} groupe les écritures par déclencheur (handler, ou
+        enregistrements d'un effet), classe la fréquence (classement, jamais preuve), puis demande
+        à \code{RenderIndex::wasted_siblings} quels éléments résolus aucune écriture du lot
+        n'atteint, et compte leurs rendus (\code{subtree_renders}, liste comptée une fois).
+  \item Son affirmation est une absence ; d'où l'\cref{inv:tout-inconnu-usage} : non résolu,
+        récursion, profondeur, top, contexte innommable comptent comme usage. Le prix est une
+        sous-déclaration assumée (\issue{64}).
+  \item Deux options typées (\code{minWastedRenders}, \code{continuousOnly}) ajustent ce qui est
+        montré, jamais ce qui est affirmé.
+  \item \regle{server-component-hook} : porte \code{any_declares("use client")}, graphe
+        \code{server_modules} (entrées App Router, atteignabilité arrêtée à la frontière), preuves
+        de hook client en listes fermées, un finding par composant. Les modules serveur restent
+        analysés par toutes les règles.
+  \item Types : \code{RenderDeps}, \code{ElementSite}, \code{Relevance}, \code{Landing},
+        \code{Wasted}, \code{TriggerKey}, \code{OptionSpec}, \code{ModuleFacts},
+        \code{ModuleTable}. Fichiers :\\
+        \file{src/rules/impls/wasted_subtree_render.rs},\\
+        \file{src/rules/helpers/render_tree.rs}, \file{src/engine/render_deps.rs},\\
+        \file{src/rules/impls/server_component_hook.rs}, \file{src/project/nextjs.rs}.
+  \item Le chapitre suivant (\cref{chap:regles-declaratives}) quitte les règles natives pour les
+        règles déclaratives des packs.
+\end{itemize}
+\end{resume}
+
+\section{Exercices}
+\label{sec:regles-rendu-rsc-exercices}
+
+\begin{exercice}{Construire ou transmettre}{rendu-construire}
+Dans \cref{lst:rendu-recherche}, proposez deux réécritures de \code{SearchPage} qui font taire
+\regle{wasted-subtree-render}, l'une par extraction d'état, l'autre par \code{children}. Pour
+chacune, dites quel résumé \code{RenderDeps} change et pourquoi \code{wasted_siblings} n'a plus
+de candidat.
+\end{exercice}
+\begin{solution}
+(1) Un composant \code{SearchBox} possède \code{query}, rend l'\code{<input>} et
+\code{<Results>} ; \code{SearchPage} rend \code{<SearchBox />} et \code{<Sidebar />}. Le slot
+appartient désormais à \code{SearchBox}, dont le seul site (\code{<Results>}) est touché.
+\code{SearchPage} n'a plus d'état : aucun déclencheur. (2) \code{SearchPage(\{ sidebar \})} rend
+\code{\{sidebar\}} et reçoit \code{<Sidebar />} de son parent : l'élément devient un site du
+parent, et le résumé de \code{SearchPage} n'a plus de site \code{Sidebar} (comme
+\file{children.tsx}).
+\end{solution}
+
+\begin{exercice}{Deux setters, un lot}{rendu-lot}
+Un \code{onChange} appelle \code{setA(e.target.value)} puis \code{setB(true)}. Le composant rend
+\code{<X a=\{a\} />} et \code{<Y b=\{b\} />}, plus \code{<Z />}. Combien de findings, et quels
+éléments sont nommés ? Même question si \code{setB} est appelé depuis un \code{onBlur}.
+\end{exercice}
+\begin{solution}
+Un seul déclencheur (même handler) : question \code{\{Slot(a), Slot(b)\}}, \code{X} et \code{Y}
+touchés, seul \code{<Z>} est candidat ; le finding tire si \code{Z} coûte au moins
+\code{minWastedRenders} rendus ou contient une liste. Avec \code{onBlur}, il y a deux
+déclencheurs ; celui de \code{onBlur} est discret (\code{blur} n'est pas un événement de frappe)
+et \code{b} est un booléen : muet par défaut. Celui du \code{onChange} a pour question
+\code{\{Slot(a)\}} : \code{<Y>} et \code{<Z>} sont candidats. Rejoué (\file{/tmp/ch21/lot.tsx},
+\code{Z} construisant deux \code{<Row>}) : \og each \code{change} event writes states \code{a}
+and \code{b} and re-renders \code{<Z>} (at least 2 component renders, including a list)\fg{}
+pour la première version, \og each \code{change} event writes state \code{a} and re-renders
+\code{<Y>} and \code{<Z>} (at least 3 component renders, including a list)\fg{} pour la seconde.
+\end{solution}
+
+\begin{exercice}{La frontière}{rsc-frontiere}
+Dans \cref{fig:rsc-graphe}, on ajoute \code{"use client"} en tête de \file{price.tsx}. Quels
+modules restent serveur ? Que devient le finding sur \code{Price} ? Et si l'on retire la directive
+de \file{search.tsx} au lieu d'en ajouter une ?
+\end{exercice}
+\begin{solution}
+\file{price.tsx} devient une frontière : il n'est plus visité, et \code{server_modules} vaut
+\{\file{app/page.tsx}, \file{app/shop/page.tsx}, \file{lib/format.ts}\}. Plus de finding sur
+\code{Price} (rejoué : \og ✓ 6 file(s) no issues found.\fg{}). Sans directive dans \file{search.tsx}, le programme n'en contient plus aucune : la
+porte 1 ferme la règle, aucun finding (c'est \file{/tmp/ch21/nx2/}).
+\end{solution}
+
+\begin{exercice}{Pourquoi pas une Error ?}{rsc-error}
+Un contributeur propose une primitive must \code{proven_server_module(file)} qui rendrait un
+\code{Certified} quand le fichier est une entrée \code{page} sans directive et sans aucun import.
+Le cas semble certain. Qu'en dit \adr{26} ? Quel fait reste hors du domaine ?
+\end{exercice}
+\begin{solution}
+Même sans import, le fait \og ce fichier est une entrée serveur\fg{} reste une convention de
+chemin (\code{server_entry_kind}) : le routeur peut être configuré autrement, et le dossier
+\file{app/} n'être pas celui de Next.js. \adr{26} §4 refuse précisément cette primitive, qui
+\og habillerait une convention de chemin en preuve de domaine\fg{}.
+\end{solution}

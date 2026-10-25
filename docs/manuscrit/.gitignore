@@ -1,0 +1,13 @@
+build/
+*.aux
+*.log
+*.out
+*.toc
+*.lof
+*.lol
+*.idx
+*.ind
+*.ilg
+*.bbl
+*.blg
+*.synctex.gz

@@ -1,0 +1,1038 @@
+% ---------------------------------------------------------------------------
+% Chapitre 25 — Tests, corpus et campagnes : la méthode de mesure
+% Source : notes/14-tests-corpus-methodo.md (intégralement) ; tests/*.rs,
+% src/test_support.rs, scripts/{corpus-baseline.py,corpus-diff.py,
+% setup-test-repo.sh}, scripts/rerender-bench/, docs/corpus-baseline.json,
+% docs/precision-log.md, docs/limitations.md, docs/campaign/*.md,
+% .github/workflows/corpus.yml, skills/reactant-triage/.
+% Sorties observées avec target/debug/reactant (commit e67b10a), NO_COLOR=1,
+% depuis la racine du dépôt ou depuis /tmp/ch25. Les scripts Python ont été
+% lancés en mode comparaison seulement (jamais --generate). Node.js est absent
+% de la machine de rédaction : le banc scripts/rerender-bench n'a pas été
+% relancé, ses chiffres viennent de docs/campaign/rerender-cascade-plan.md.
+% Les runs CI cités viennent de `gh run list --workflow corpus.yml`.
+% ---------------------------------------------------------------------------
+\chapter{Tests, corpus et campagnes : la méthode de mesure}
+\label{chap:tests-corpus}
+
+\begin{objectifs}
+  \item Comprendre pourquoi la promesse \og faux négatifs interdits\fg{} impose une manière particulière d'écrire les tests : on teste le silence \emph{et} le témoin qui prouve que le silence n'est pas une panne.
+  \item Connaître les six altitudes de mesure du projet, des tests unitaires à l'oracle runtime, et le point d'entrée exact de chacune.
+  \item Savoir écrire un test par paires \og tire encore\fg{} / \og ne tire plus\fg{}, et lire un test de graduation de sévérité.
+  \item Connaître le corpus de quatorze dépôts épinglés, la métrique en localisations distinctes, le digest, l'empreinte, et la porte \file{scripts/corpus-baseline.py} avec ses trois codes de sortie.
+  \item Savoir suivre le cycle de vie d'un chiffre, du push rouge au commit \code{chore(corpus)}, et comprendre l'erreur de comptage du 3 septembre 2026 qui a fait naître cette procédure.
+  \item Connaître les deux types de campagnes (FP classique, wish-list à l'aveugle), le banc de rendu jsdom, et la manière dont le projet classe ce qu'il ne corrige pas.
+\end{objectifs}
+
+\prerequis{\cref{chap:interpretation-abstraite} (soundness, must/may) ; \cref{chap:api-regles} (sévérité certifiée, \code{Certified}, témoins) ; \cref{chap:projet-cli-driver} (CLI, rapport JSON, blind spots, localisations). Les chapitres de la partie~V (règles) fournissent les exemples mais ne sont pas indispensables. La livraison (CI de chaque changement, parité WASM, Action GitHub) est au \cref{chap:distribution}.}
+
+Les chapitres précédents décrivent une chaîne de production : un fichier \file{.tsx} entre, oxc le parse, le lowering en fait un CFG, le moteur calcule un point fixe et des relations, les règles émettent des diagnostics, le driver les trie et les imprime. Ce chapitre ne décrit aucune étape de plus. Il décrit l'\emph{instrument} qui observe cette chaîne et qui dit si elle tient sa promesse.
+
+Cette promesse est inhabituelle. La plupart des linters s'évaluent au taux de faux positifs : un outil qui crie trop est désinstallé. \reactant{} accepte des faux positifs (FP) et s'interdit les faux négatifs (FN) (\cref{def:soundness}). Or un FN est un silence. On ne \og voit\fg{} pas un silence dans une sortie, et un test qui vérifie qu'une règle se tait passe aussi bien quand la règle est juste que quand elle est cassée. Toute la méthode de ce chapitre découle de cette asymétrie. Elle tient en une phrase, écrite en tête du workflow corpus :
+
+\begin{quote}\itshape
+The unit tests guard mechanisms; the corpus guards outcomes.
+\end{quote}
+\noindent(\srcline{.github/workflows/corpus.yml}{5}.) On procède du plus petit au plus grand : pourquoi mesurer (\cref{sec:tests-corpus-pourquoi}), la sévérité comme contrat (\cref{sec:tests-corpus-severite}), la pyramide des tests (\cref{sec:tests-corpus-pyramide}), la discipline des paires (\cref{sec:tests-corpus-paires}), les angles morts (\cref{sec:tests-corpus-angles-morts}), le corpus (\cref{sec:tests-corpus-corpus}), sa métrique (\cref{sec:tests-corpus-metrique}), une erreur de comptage devenue étude de cas (\cref{sec:tests-corpus-erreur}), le cycle de vie d'un chiffre (\cref{sec:tests-corpus-cycle}), les campagnes (\cref{sec:tests-corpus-campagnes}), l'oracle runtime (\cref{sec:tests-corpus-oracle}) et enfin la façon de classer ce que l'on ne corrige pas (\cref{sec:tests-corpus-classer}).
+
+% ===========================================================================
+\section{Pourquoi mesurer : le silence et son témoin}
+\label{sec:tests-corpus-pourquoi}
+
+\subsection{Un test qui passe pour de mauvaises raisons}
+
+Voici le premier composant de la fixture \file{tests/fixtures/clean.tsx}, un compteur sans défaut :
+
+\tsxsnippet{tests/fixtures/clean.tsx}{7}{20}{un compteur correct}
+
+Lancé sur ce fichier, l'analyseur ne dit rien et affiche la coche verte :
+
+\begin{shell}
+$ reactant check tests/fixtures/clean.tsx ; echo exit=$?
+\end{shell}
+\begin{sortie}
+   4 clean component(s) hidden, rerun with --show-clean
+
+✓  1 file(s) no issues found.
+exit=0
+\end{sortie}
+
+Supposons maintenant qu'une modification du lowering fasse disparaître \emph{tous} les \code{useEffect} du CFG. La sortie serait la même, au caractère près : aucun effet, donc aucune dépendance manquante, donc \og no issues found\fg{}. Un test qui se contenterait de vérifier le silence sur \file{clean.tsx} passerait. Il y a pire : c'est exactement la forme de plusieurs défauts réels du projet. Avant \issue{2}, un composant dont le \code{try} contenait un \code{return} voyait son \code{catch} entier disparaître du CFG, et il était déclaré \og 1 hook, \code{✓}\fg{} (\cref{sec:tests-corpus-paires}). Avant \issue{9}, un projet Vite dont les alias n'étaient pas chargés finissait sur \og \code{✓ N file(s) no issues found.}\fg{} sans avoir lu une seule cible d'import (\cref{sec:tests-corpus-angles-morts}).
+
+\begin{definition}{Silence témoigné}{tests-corpus-silence-temoigne}
+Un test de silence est \terme{témoigné} lorsqu'il est accompagné d'un test voisin, sur un programme qui ne diffère que par le défaut, qui vérifie que la même règle \emph{tire}. Le témoin établit que l'information nécessaire à la règle atteint bien la règle ; le silence n'a alors plus qu'une explication, la bonne.
+\end{definition}
+
+Le projet écrit ce témoin partout où il vérifie un silence : c'est la \og discipline des paires\fg{} (\cref{sec:tests-corpus-paires}). À l'échelle du corpus, le même principe devient : on ne se réjouit pas d'une baisse du nombre de findings tant que chaque localisation retirée n'a pas été relue à la source.
+
+\subsection{Six altitudes, six portes d'entrée}
+
+La méthodologie observe la chaîne à six altitudes, de la plus fine à la plus large. Chacune a sa porte d'entrée dans le code, résumée dans le \cref{tab:tests-corpus-altitudes}.
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}p{0.2\linewidth}p{0.3\linewidth}p{0.42\linewidth}@{}}
+\toprule
+Altitude & Ce qui est observé & Point d'entrée \\
+\midrule
+1. unitaire & un domaine, un transfert, une fonction & \code{\#[cfg(test)] mod tests} et \code{crate::test_support} \\
+2. intégration lib & source $\to$ règles, sans CLI & \code{Parser} $\to$ \code{lower_program} $\to$ \code{analyze_component_as} ou \code{analyze_program} $\to$ \code{RuleCtx::new} $\to$ \code{Rule::check} \\
+3. intégration binaire & le comportement visible (texte, code de sortie) & \code{env!("CARGO_BIN_EXE_reactant")} $\to$ \code{cli} $\to$ \code{driver::run_check} \\
+4. parité & deux hôtes, une seule sortie & \code{run_check} sur \code{OsFileSystem} et sur \code{MemFileSystem} ; \file{npm/test/smoke.sh} (WASM contre natif) \\
+5. corpus & les résultats sur 14 applications réelles & \code{reactant --format json test-repo} $\to$ \file{scripts/corpus-baseline.py} \\
+6. oracle runtime & la vérité concrète (rendus comptés) & \file{scripts/rerender-bench/run.mjs} (React 19 et jsdom) \\
+\bottomrule
+\end{tabular}
+\caption{Les six altitudes de mesure et leur point d'entrée (d'après \file{notes/14-tests-corpus-methodo.md}, §1.1).}\label{tab:tests-corpus-altitudes}
+\end{table}
+
+À côté de ces mesures automatiques, il y a des \emph{mesures humaines} : les campagnes (\file{docs/campaign/}), le journal de précision (\file{docs/precision-log.md}), la page des limites (\file{docs/limitations.md}), la procédure de triage publiée (\file{skills/reactant-triage/}) et le tracker GitHub. Elles produisent des documents datés et des issues étiquetées, pas des verdicts verts ou rouges, et c'est leur articulation avec les mesures automatiques que ce chapitre veut rendre claire.
+
+Quelques ordres de grandeur, mesurés au commit \snapshotCommit{} : \code{cargo test --workspace} exécute 1\,529 tests en 73 suites, dont 632 tests unitaires sous \file{src/} et 897 tests d'intégration répartis dans 70 fichiers \file{tests/*.rs} (26\,212 lignes) ; le corpus compte 40\,164 fichiers source ; la baseline commitée vaut 1\,498 localisations.
+
+% ===========================================================================
+\section{La sévérité comme contrat}
+\label{sec:tests-corpus-severite}
+
+Avant de tester quoi que ce soit, il faut savoir \emph{ce qu'un test peut affirmer}. Dans \reactant{}, un diagnostic ne dit pas seulement \og il y a peut-être un problème ici\fg{} : son niveau est une affirmation logique, et les tests vérifient cette affirmation autant que la présence du diagnostic.
+
+\subsection{Trois niveaux, une définition chacun}
+
+\rustsnippet{src/rules/api/diagnostic.rs}{24}{39}{les trois niveaux et leur contrat}
+
+Le commentaire est la spécification. Une \Error{} dit \og le défaut est certain dès que ce code s'exécute\fg{}, et elle doit être construite à partir d'une preuve de \emph{toute} l'affirmation, pas d'un de ses conjoints (\issue{142}). Un \Warning{} dit \og défaut possible\fg{}, ou \og fait certain au coût incertain\fg{}. Un \Info{} marque une limite de l'analyse ou un motif qui a l'air voulu. Le \cref{chap:api-regles} a montré comment cette hiérarchie est rendue infalsifiable : une \Error{} ne se fabrique qu'à partir d'un \code{Certified} (\cref{def:certified}), jeton dont le constructeur est privé au module des primitives must, et la seule transformation de sévérité exposée aux consommateurs, \code{clamp}, ne peut que descendre :
+
+\rustsnippet{src/rules/api/diagnostic.rs}{104}{114}{le seul changement de niveau exposé descend}
+
+\begin{invariant}{Un faux positif ne porte jamais d'Error}{tests-corpus-fp-pas-error}
+Puisqu'une \Error{} n'existe qu'adossée à une preuve must de toute l'affirmation, un diagnostic de niveau \Error{} ne peut être faux que si le moteur lui-même est faux (un \code{soundness-bug}). Tout faux positif \og ordinaire\fg{}, dû à une sur-approximation, est de niveau \Warning{} ou moins. \file{docs/limitations.md} l'écrit en tête de sa liste de FP : \og Every entry here is Warning or below by construction. A false positive never carries an Error.\fg{} (\src{docs/limitations.md}{110}{113}).
+\end{invariant}
+
+Cet invariant a une conséquence directe sur l'écriture des tests. Un test qui vérifie une \Error{} vérifie une \emph{preuve}. Un test qui vérifie qu'une \Error{} est devenue un \Warning{} vérifie qu'une preuve indue a été \emph{retirée}. Un test qui vérifie un \Warning{} vérifie une possibilité. Les trois sont des tests différents, et un test qui se contente de \og la règle tire\fg{} n'en est aucun.
+
+\subsection{Un exemple gradué : trois formes, trois verdicts}
+
+Les tests \code{f5_object_churn_unconditional_is_error}, \code{f5_object_churn_conditional_is_warning} et \code{f5_fetch_once_guard_converges} de \file{tests/corpus_fp_fixes.rs} fixent trois formes voisines d'un même programme. On les réunit dans un fichier :
+
+\begin{lstlisting}[language=TypeScript,caption={Trois formes de churn d'objet (\file{/tmp/ch25/churn.tsx}, construit d'après \src{tests/corpus_fp_fixes.rs}{472}{521})},label={lst:tests-corpus-churn}]
+import { useEffect, useState } from "react";
+
+export function Unconditional() {
+  const [obj, setObj] = useState({ a: 1 });
+  useEffect(() => {
+    setObj({ ...obj, b: 2 });
+  }, [obj]);
+  return <div>{obj.a}</div>;
+}
+
+export function Conditional({ cond }) {
+  const [obj, setObj] = useState({ a: 1 });
+  useEffect(() => {
+    if (cond()) {
+      setObj({ ...obj, b: 2 });
+    }
+  }, [obj]);
+  return <div>{obj.a}</div>;
+}
+
+export function FetchOnce() {
+  const [user, setUser] = useState(null);
+  useEffect(() => {
+    if (user === null) {
+      setUser({ name: "guest" });
+    }
+  }, [user]);
+  return <div>{user}</div>;
+}
+\end{lstlisting}
+
+\begin{react}[\code{Object.is} sur les deps et sur les écritures]
+Après chaque commit, React compare chaque entrée du tableau de deps d'un effet à sa valeur précédente avec \code{Object.is}. Un objet littéral est une référence neuve à chaque évaluation : \code{\{ ...obj, b: 2 \}} n'est jamais \code{Object.is}-égal à \code{obj}. Symétriquement, un \code{setState} dont l'argument est \code{Object.is}-égal à la valeur courante est abandonné sans rendu. Un effet qui écrit un objet neuf dans le slot dont il dépend se relance donc à chaque commit, sans fin.
+\end{react}
+
+La sortie observée, élaguée des lignes \code{verified} sauf une :
+
+\begin{shell}
+$ reactant check churn.tsx --all-roots --info --show-clean --trace
+\end{shell}
+\begin{sortie}
+  Conditional  (2 hooks)  churn.tsx
+    warn   infinite-loop  [hook:0]  (line 13:2)  this effect may store a fresh reference into state `obj` which its deps react to: possible infinite render loop
+       → a fresh value is written to state `obj` here [hook:1] (line 15:6)
+    warn   missing-deps  [hook:1]  var:cond  (line 13:2)  `cond` is used in this effect but not in its deps array, and its value may change between renders
+       → `cond` is read here [hook:1] (line 13:2)
+  FetchOnce  (2 hooks)  churn.tsx  ✓
+    verified  infinite-loop  no effect diverges into an infinite render loop
+  Unconditional  (2 hooks)  churn.tsx
+    error  infinite-loop  [hook:0]  (line 5:2)  this effect recreates object state `obj` it depends on. Every run stores a fresh reference (`Object.is` always fails) and re-triggers itself: infinite render loop
+       → a fresh value is written to state `obj` here [hook:1] (line 6:4)
+
+⚠  1 error(s), 2 warning(s) across 1 file(s).
+exit=1
+\end{sortie}
+
+Les trois verdicts forment une échelle. \code{Unconditional} est une \Error{} : l'écriture est sur tous les chemins de l'effet, la valeur écrite est fraîche à coup sûr, et le slot écrit est dans les deps ; le commentaire du test résume \og Triple must → Error\fg{}. \code{Conditional} est un \Warning{} : la garde \code{cond()} peut devenir fausse, la boucle n'est que possible. \code{FetchOnce} est \emph{prouvé} convergent : l'écriture rend la garde \code{user === null} fausse au rendu suivant, et l'analyseur délivre l'assurance \code{verified} sous \code{--info}. Le test \code{f5_object_churn_conditional_is_warning} vérifie les deux côtés de sa cellule : il exige un \Warning{} \emph{et} l'absence d'\Error{} (\src{tests/corpus_fp_fixes.rs}{494}{521}).
+
+\begin{remarque}
+Le commentaire de \code{f5_object_churn_unconditional_is_error} note que ce FN, découvert en concevant la correction F5, \og never widens (references converge), only catchable through dep structure\fg{} (\src{tests/corpus_fp_fixes.rs}{474}{475}). Le point fixe des valeurs converge, puisqu'une référence fraîche reste une référence fraîche ; c'est la structure des deps, via le graphe de churn (\cref{chap:churn}), qui voit la boucle. Un test de graduation fixe donc aussi \emph{quel mécanisme} doit porter le verdict.
+\end{remarque}
+
+% ===========================================================================
+\section{La pyramide des tests}
+\label{sec:tests-corpus-pyramide}
+
+\Cref{fig:tests-corpus-pyramide} dispose les six altitudes en pyramide. La base est large et rapide, le sommet est étroit, lent et manuel. Les quatre étages du bas tournent à chaque changement (job \code{test} de la CI, \cref{chap:distribution}) ; le corpus tourne à chaque push sur \code{main} qui touche l'analyseur ; l'oracle runtime n'est lancé qu'à la main.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[x=0.78cm,y=0.9cm]
+  % six bandes d'un triangle de base 11 et de hauteur 7.2
+  \foreach \i/\col in {0/ra-bg,1/ra-bg,2/ra-bg,3/ra-bg,4/white,5/white} {
+    \pgfmathsetmacro{\yb}{1.2*\i}
+    \pgfmathsetmacro{\yt}{1.2*(\i+1)}
+    \pgfmathsetmacro{\xbl}{5.5*\yb/7.2}
+    \pgfmathsetmacro{\xtl}{5.5*\yt/7.2}
+    \filldraw[draw=ra-blue,thick,fill=\col] (\xbl,\yb) -- (11-\xbl,\yb) -- (11-\xtl,\yt) -- (\xtl,\yt) -- cycle;
+  }
+  \node[font=\scriptsize,align=center] at (5.5,0.6) {1. unitaire\\ 632 \code{\#[test]} sous \file{src/}};
+  \node[font=\scriptsize,align=center] at (5.5,1.8) {2. intégration lib\\ source $\to$ règles, sans CLI};
+  \node[font=\scriptsize,align=center] at (5.5,3.0) {3. binaire\\ texte, code de sortie};
+  \node[font=\scriptsize,align=center] at (5.5,4.2) {4. parité};
+  \node[font=\scriptsize,align=center] at (5.5,5.4) {5. corpus};
+  \node[font=\scriptsize,align=center] at (5.5,6.55) {6.};
+  \node[etiquette,anchor=west] at (11.1,0.6) {chaque changement, secondes};
+  \node[etiquette,anchor=west] at (11.1,1.8) {897 tests dans \file{tests/}};
+  \node[etiquette,anchor=west] at (11.1,3.0) {dont \file{cli.rs}, \file{blind_spots.rs}};
+  \node[etiquette,anchor=west] at (11.1,4.2) {\file{memfs_parity.rs}, job \code{wasm-parity}};
+  \node[etiquette,anchor=west] at (11.1,5.4) {push sur \code{main}, $\approx$ 13 min};
+  \node[etiquette,anchor=west] at (11.1,6.55) {banc jsdom, à la main};
+  \draw[fleche] (-0.6,0) -- node[etiquette,left,align=right] {coût,\\ réalisme} (-0.6,7.2);
+\end{tikzpicture}
+\caption{La pyramide des mesures. Les quatre étages grisés tournent dans \code{cargo test} ; les deux du haut mesurent des résultats plutôt que des mécanismes.}\label{fig:tests-corpus-pyramide}
+\end{figure}
+
+\subsection{Étage 1 : les tests unitaires et \file{src/test_support.rs}}
+
+Les 632 tests unitaires vivent dans des modules \code{\#[cfg(test)]} à côté du code qu'ils testent ; les plus fournis sont \file{src/domains/impls/state_value.rs} (54 tests) et \file{src/domains/transfer/state_value.rs} (44). Pour construire un CFG ou un résultat d'analyse à la main, ils partagent un petit module de constructeurs :
+
+\rustsnippet{src/test_support.rs}{26}{52}{les constructeurs de CFG et d'identités}
+
+\code{single_block_cfg} fabrique le corps trivial d'un composant : un seul bloc, d'identifiant~0, terminé par \code{return unit}, sans arête. Il est utilisé 49 fois sous \file{src/}. La constante \code{C} est l'identité \code{ComponentId::SYNTHETIC}, qui vaut \code{ComponentId(u32::MAX)} (\srcline{src/ir/component_id.rs}{38}) : c'est celle qu'estampille \code{analyze_component}, et donc celle qu'un test doit passer à \code{RuleCtx::new}. \code{cid(i)} fournit une deuxième, une troisième identité quand un test en a besoin sans construire de table. Le reste du module (\src{src/test_support.rs}{54}{142}) ajoute \code{named}, qui interne un nom dans une table globale au binaire de test (\og Process-wide and monotone: one name is one id for the life of the test binary\fg{}), \code{prog}, qui enregistre un résultat sous l'identité \emph{qu'il porte déjà}, et \code{analysis_result}, un \code{AnalysisResult} à valeurs par défaut destiné à la syntaxe \code{AnalysisResult \{ hooks, ..analysis_result(cfg) \}}.
+
+\begin{piege}
+Le module est déclaré \code{\#[cfg(test)] mod test_support;} dans \file{src/lib.rs} : il n'existe que pour les tests \emph{de la bibliothèque} et reste invisible depuis \file{tests/}, qui voit la crate comme un utilisateur externe. C'est pourquoi le harnais de l'étage~2 est recopié dans une trentaine de fichiers (issue ouverte \issue{14}).
+\end{piege}
+
+\subsection{Étage 2 : le harnais \og source $\to$ règles\fg{}}
+
+L'essentiel des tests d'intégration suit un même motif : parser un programme TSX écrit en ligne, l'abaisser, analyser chaque composant, lancer toutes les règles natives, et renvoyer la liste des couples (règle, message). Sa version canonique ouvre \file{tests/corpus_fp_fixes.rs} :
+
+\rustsnippet{tests/corpus_fp_fixes.rs}{14}{69}{le harnais source $\to$ règles}
+
+L'ordre est celui du pipeline. Une erreur de parse fait échouer le test (l.~19--23) : un programme de test mal écrit ne doit jamais passer pour un programme silencieux. De même, un programme où aucun composant n'est détecté fait échouer le test (l.~30). Chaque composant reçoit une identité internée (l.~35--41), puis est analysé seul par \code{analyze_component_as} avec \code{Config::default()} (l.~43--48). Un \code{ProgramAnalysisResult} est assemblé à la main (l.~54--58), et chaque règle de \code{all_rules()} est appliquée à chaque composant (l.~60--67). Quand le défaut vit dans l'analyse inter-composants, le fichier offre une variante, \code{program_rules_fired}, qui remplace la boucle intra par \code{analyze_program(…, RootStrategy::AllComponents, …)} (\src{tests/corpus_fp_fixes.rs}{391}{422}).
+
+\begin{piege}
+\code{Config::default()} n'est pas la configuration d'un utilisateur. Le driver construit son registre de résumés par \code{SummaryRegistry::new_with_common()} (\srcline{src/driver/mod.rs}{371}), qui connaît les contrats de bibliothèques courantes ; \code{Config::default()} a un registre vide. Au commit étudié, 47 fichiers de \file{tests/} écrivent \code{Config::default()} ; l'issue \issue{14} en tire la conclusion : \og most of the integration suite validates a degraded engine\fg{}. Les tests de l'étage~3, qui passent par le binaire, ne sont pas concernés.
+\end{piege}
+
+\subsection{Étage 3 : le binaire, et le déterminisme}
+
+Certains comportements n'existent que dans la sortie : la ligne de résumé, le groupage des localisations, le code de sortie. Les tests de cet étage lancent le binaire compilé, que Cargo expose par \code{env!("CARGO_BIN_EXE_reactant")}, avec \code{NO_COLOR=1} et le répertoire du manifeste comme répertoire courant (\src{tests/blind_spots.rs}{14}{21}). Parmi eux, deux tests ont un rôle méthodologique particulier, parce que la mesure corpus repose sur eux :
+
+\rustsnippet{tests/cli.rs}{360}{398}{la sortie doit être identique octet pour octet d'un run à l'autre}
+
+La commande de référence est \code{check tests/fixtures --all-roots --info --fail-on never} : \emph{toutes} les fixtures du dépôt, y compris huit fichiers de démonstration qu'aucun autre test ne cite nommément (\file{bugs.tsx}, \file{dashboard.tsx}, \file{search.tsx}\ldots). Elle est exécutée quatre fois (une, puis trois comparaisons). La variante \code{--trace} existe parce que l'ordre total du rapport couvre les diagnostics mais pas les notes \emph{à l'intérieur} d'un diagnostic : une chaîne de témoins construite en itérant une \code{HashMap} se réordonnerait là et nulle part ailleurs. Le journal de précision étend l'affirmation au corpus : \og Four runs of a frozen binary on one repository, and two on the whole corpus, produce \emph{bit-identical} JSON files\fg{} (\src{docs/precision-log.md}{33}{35}).
+
+\begin{proposition}{Un écart est toujours un signal}{tests-corpus-determinisme}
+Si l'analyse est déterministe au niveau de l'octet, alors deux mesures différentes du même corpus par deux binaires ne peuvent différer que par un changement de comportement du binaire, ou par une erreur de comptage de celui qui mesure. Il n'y a pas de bruit.
+\end{proposition}
+
+Ce n'est pas un détail. La \cref{sec:tests-corpus-erreur} raconte comment, un jour où les chiffres ne se reproduisaient pas, c'est cette proposition qui a permis de conclure à une erreur humaine plutôt qu'à une dérive.
+
+\subsection{Étage 4 : la parité, et les méta-tests}
+
+La parité vérifie qu'un même programme donne la même sortie sur deux hôtes. \file{tests/memfs_parity.rs} lance \code{driver::run_check} une fois sur le système de fichiers réel, une fois sur un \code{MemFileSystem} chargé des mêmes fichiers (y compris \file{tsconfig.json} et \file{vite.config}), et compare \code{stdout}, \code{stderr} et \code{exit_code} (\src{tests/memfs_parity.rs}{44}{117}). La parité entre le binaire natif et le module WASM publié est vérifiée hors de \code{cargo test}, par \file{npm/test/smoke.sh} ; elle est décrite au \cref{chap:distribution}.
+
+À côté, une famille de \emph{méta-tests} ne teste aucune règle : ils testent la mesure elle-même, ou une frontière d'architecture. Ils transforment un nombre ou une liste en invariant compilé, de sorte qu'on ne puisse pas \og éditer un nombre\fg{} pour faire avancer une courbe.
+
+\begin{itemize}
+  \item \file{tests/corpus_baseline.rs} vérifie la cohérence interne de la baseline du corpus (\cref{sec:tests-corpus-metrique}).
+  \item \file{tests/catalogue.rs} fige la mesure d'expressivité du vocabulaire déclaratif : 22 entrées, dont \code{EXPRESSIBLE_NOW = 21} (\src{tests/catalogue.rs}{1093}{1094}). Chaque entrée exprimable doit tirer sur sa fixture \code{fires_on} et se taire sur \code{silent_on} : pour faire passer la constante à 22, il faut écrire la règle et ses deux fixtures.
+  \item \file{tests/community_packs.rs} vérifie que les packs issus de la campagne à l'aveugle chargent, gardent leur nombre de règles et n'émettent jamais d'\Error{} (\cref{sec:tests-corpus-campagnes}).
+  \item \file{tests/layer_boundary.rs} tient la frontière moteur/règles de l'\adr{42} par un \emph{ratchet}, une liste d'exceptions qui ne peut que rétrécir.
+  \item \file{tests/docs_drift.rs} et \file{tests/schemas.rs} vérifient que la documentation du vocabulaire et les JSON Schemas publiés ne dérivent pas du code.
+\end{itemize}
+
+Le ratchet mérite un regard, parce que sa technique est réutilisable :
+
+\rustsnippet{tests/layer_boundary.rs}{19}{41}{la liste qui ne peut que rétrécir, et ce qui compte comme parcourir la syntaxe}
+\rustsnippet{tests/layer_boundary.rs}{54}{59}{la détection, purement textuelle}
+
+Deux tests l'exploitent : \code{no_rule_file_outside_the_list_walks_syntax} (aucun nouveau contrevenant) et \code{the_list_only_shrinks} (un fichier assaini doit quitter la liste). La détection est textuelle et ignore tout ce qui suit le premier \code{\#[cfg(test)]}. Elle peut signaler à tort un fichier qui cite \code{Stmt::} dans un commentaire, jamais laisser passer un parcours écrit avec l'un des motifs ; un parcours écrit autrement, par un helper renommé par exemple, lui échapperait. C'est un garde-fou contre la dérive ordinaire, pas une preuve.
+
+\begin{decision}[ADR-042 §1 — une frontière tenue par un test]
+Une règle lit des lignes de relation et appelle des primitives must ; elle ne parcourt aucun CFG. L'\adr{42} en donne la raison : \og a fact computed in two places is two facts that drift\fg{}. L'alternative, laisser chaque règle recalculer ses faits localement, est refusée ; la migration étant progressive, le ratchet fige l'état atteint au lieu d'exiger une migration d'un bloc.
+\end{decision}
+
+% ===========================================================================
+\section{La discipline des paires}
+\label{sec:tests-corpus-paires}
+
+\subsection{Le problème : une correction de précision retire des findings}
+
+Une correction de précision \emph{retire} des diagnostics. C'est son but, et c'est aussi son danger : la façon la plus simple de retirer un FP est de faire taire la règle sur une forme trop large, qui englobe aussi de vrais défauts. Le test qui vérifie \og ne tire plus\fg{} sur la forme corrigée passe dans les deux cas. Pour distinguer la correction juste de la correction trop large, il faut un second test, sur la forme voisine qui \emph{est} un défaut.
+
+\begin{definition}{Paire fires / silent}{tests-corpus-paire}
+Une \terme{paire fires / silent} est un couple de programmes qui ne diffèrent que par ce qui fait le défaut : l'un doit faire tirer une règle (\emph{fires}), l'autre, un quasi-voisin volontairement difficile, doit la laisser muette (\emph{silent}). Une correction de précision est accompagnée d'au moins un test \og tire encore\fg{} sur la forme voisine qui reste un vrai positif.
+\end{definition}
+
+Les noms des tests l'annoncent : \code{…_still_warns}, \code{…_still_loops}, \code{…_still_fires}, \code{…_still_error}, ou le commentaire \og TP preservation: the widening arm must survive the churn addition\fg{} (\srcline{tests/corpus_fp_fixes.rs}{693}). Le fichier \file{tests/corpus_fp_fixes.rs}, 1\,973 lignes et 79 tests, est le registre de ces paires : chaque cas y est un reproducteur minimal extrait d'un dépôt réel du corpus.
+
+\subsection{Un exemple : une écriture qui règle sa propre garde (\#91)}
+
+React documente un idiome, \og ajuster l'état pendant le rendu\fg{} : un composant compare un slot à une valeur dérivée des props et, s'ils diffèrent, écrit la valeur dans le slot. L'écriture a lieu pendant le rendu, mais elle ne boucle pas, parce qu'au rendu suivant la comparaison est fausse. Le corpus en contenait une occurrence dans \code{CurrencyInput} de twenty, signalée à tort par \regle{setter-in-render}. Le test qui fixe la correction :
+
+\rustsnippet{tests/corpus_fp_fixes.rs}{1694}{1713}{la forme corrigée : la garde est réglée par l'écriture}
+
+L'affirmation relationnelle qui fonde la correction est que \og \code{x < y} after \code{x := y} is false for \emph{all} x and y\fg{} (\file{docs/precision-log.md}, entrée \og a write that settles its own guard\fg{}). Elle est vraie à une condition : que l'expression écrite et l'expression comparée dénotent la même valeur au rendu suivant, ce que le moteur n'admet que pour deux orthographes identiques sans appel. Où passe alors la frontière ? Les deux tests témoins la dessinent :
+
+\rustsnippet{tests/corpus_fp_fixes.rs}{1760}{1800}{les deux formes voisines qui doivent tirer encore}
+
+Dans \code{a_write_derived_from_the_slot_still_loops}, la valeur écrite \emph{lit} le slot : chaque écriture réarme la garde, et la boucle est réelle (quatre composants de dub, et l'analyseur a raison sur les quatre). Dans \code{a_write_of_something_else_still_fires}, la garde compare \code{a} et l'écriture stocke \code{b} : rien ne dit que la garde devient fausse. Réunies dans un fichier, les trois formes donnent :
+
+\begin{lstlisting}[language=TypeScript,caption={La paire \#91 et ses deux témoins (\file{/tmp/ch25/settle.tsx}, d'après \src{tests/corpus_fp_fixes.rs}{1698}{1800})},label={lst:tests-corpus-settle}]
+export function Settles({ value, decimals }) {
+  const [scale, setScale] = useState(0);
+  const scaleForCurrentValue = getSafeScale(value, decimals);
+  if (scale < scaleForCurrentValue) { setScale(scaleForCurrentValue); }
+  return <div>{scale}</div>;
+}
+
+export function Oscillates({ groups }) {
+  const [useAsync, setUseAsync] = useState(false);
+  useEffect(() => {
+    setUseAsync(Boolean(groups && !useAsync));
+  }, [groups, useAsync]);
+  return <div>{String(useAsync)}</div>;
+}
+
+export function Elsewhere({ a, b }) {
+  const [slot, setSlot] = useState(null);
+  useEffect(() => {
+    if (slot !== a) { setSlot(b); }
+  }, [slot, a, b]);
+  return <div>{slot}</div>;
+}
+\end{lstlisting}
+\begin{sortie}
+  Elsewhere  (2 hooks)  settle.tsx
+    warn   infinite-loop  [hook:0]  (line 20:2)  this effect may store a fresh reference into state `slot` which its deps react to: possible infinite render loop
+       → a fresh value is written to state `slot` here [hook:1] (line 21:22)
+  Oscillates  (2 hooks)  settle.tsx
+    warn   infinite-loop  [hook:0]  (line 12:2)  this effect may store a fresh reference into state `useAsync` which its deps react to: possible infinite render loop
+       → a fresh value is written to state `useAsync` here [hook:1] (line 13:4)
+   1 clean component(s) hidden, rerun with --show-clean
+
+⚠  2 warning(s) across 1 file(s).
+exit=1
+\end{sortie}
+
+\code{Settles} est le composant propre caché ; les deux témoins tirent, en \Warning{}, parce que leurs gardes pourraient converger dans des cas que l'analyse ne tranche pas. Le journal a mesuré l'effet de la correction sur le corpus de l'époque : 1\,359 $\to$ 1\,343, seize localisations retirées et aucune ajoutée. Cette ligne est antérieure à l'épinglage du corpus et ne peut plus être vérifiée (\cref{sec:tests-corpus-erreur}).
+
+\subsection{Retirer une preuve indue : \code{try}/\code{catch}/\code{finally} (\#2)}
+
+La paire peut porter sur le \emph{niveau} plutôt que sur la présence. Le lowering de \code{try}/\code{catch}/\code{finally} avait deux défauts dans une même branche : un \code{try} qui retourne scellait le bloc, de sorte que le \code{catch} et le \code{finally} n'étaient pas abaissés du tout ; et quand ils l'étaient, ils étaient séquencés \emph{inconditionnellement} après le corps du \code{try}, ce qui faisait croire au raisonnement \og sur tous les chemins\fg{} qu'une écriture présente seulement dans le \code{catch} avait lieu à chaque rendu. La fixture \file{tests/fixtures/try_catch_finally/App.tsx} contient une forme par cellule :
+
+\tsxsnippet{tests/fixtures/try_catch_finally/App.tsx}{29}{49}{la rétrogradation et son témoin}
+
+\begin{sortie}
+  AlwaysWrite  (1 hooks)  tests/fixtures/try_catch_finally/App.tsx
+    error  setter-in-render  [hook:0]  (line 47:2)  setter `setN` called directly in the render body, move this call into a useEffect or an event handler
+  CatchOnlyWrite  (1 hooks)  tests/fixtures/try_catch_finally/App.tsx
+    warn   setter-in-render  [hook:0]  (line 38:4)  setter `setN` called directly in the render body, move this call into a useEffect or an event handler
+  FinallyAfterReturn  (1 hooks)  tests/fixtures/try_catch_finally/App.tsx
+    warn   setter-in-render  [hook:0]  (line 25:4)  setter `setN` called directly in the render body, move this call into a useEffect or an event handler
+  ReturnInTry  (2 hooks)  tests/fixtures/try_catch_finally/App.tsx
+    error  conditional-hook  [hook:1]  (line 13:4)  this hook is called conditionally (not on every render path)
+    warn   infinite-loop  [hook:0]  (line 13:4)  this effect keeps pushing state `n` to new values on every run. Potential infinite render loop
+
+⚠  2 error(s), 3 warning(s) across 1 file(s).
+\end{sortie}
+\noindent(Sortie de \code{check tests/fixtures/try_catch_finally --all-roots}, lignes \og trace step(s)\fg{} élaguées.)
+
+Avant \issue{2}, \code{CatchOnlyWrite} était une \Error{} \og claimed all-paths\fg{}, et \code{ReturnInTry} était invisible (\og 1 hook, \code{✓}\fg{}). Le test \code{a_catch_only_write_is_not_certain} exige désormais \code{"warning"} pour \code{CatchOnlyWrite} ; son témoin, \code{a_write_on_every_path_is_still_certain}, exige \code{"error"} pour \code{AlwaysWrite}, avec ce commentaire : \og the demotion must be caused by the \code{try}, not by breaking the Error tier\fg{} (\src{tests/try_catch_finally.rs}{94}{103}). Sans ce témoin, une modification qui aurait rétrogradé \emph{toutes} les \Error{} de \regle{setter-in-render} aurait fait passer le test de rétrogradation.
+
+\begin{remarque}
+\code{FinallyAfterReturn} est un \Warning{} alors que JavaScript exécute toujours le \code{finally}. C'est une divergence acceptée et documentée : le \code{return} du \code{try} scelle son bloc, le chemin qui retourne n'atteint donc pas le \code{finally} dans le CFG ; celui-ci reste atteint par le bras qui lève une exception, si bien que ses hooks et ses écritures sont trouvés. \og What is lost is its presence on the returning path, which costs \code{must} strength (an Error demoted to a Warning) and never a finding\fg{} (\src{docs/precision-log.md}{840}{846}). La perte est dans le sens toléré.
+\end{remarque}
+
+\subsection{Le test par retrait (\emph{gate-by-removal})}
+
+Le journal de précision emploie une seconde vérification, manuelle : désactiver le correctif et constater que \emph{exactement} le test attendu devient rouge. \og The false negative is real (unit test plus \emph{gate-by-removal}: putting \code{Heap::new()} back turns exactly the member-dep test red)\fg{} (\src{docs/precision-log.md}{560}{562}). La procédure établit deux choses que le test seul n'établit pas : le test dépend bien du correctif (il n'est pas vert par accident) et le correctif n'a pas d'autre effet observable dans la suite (aucun autre test ne rougit). Elle n'est pas automatisée ; elle est consignée dans l'entrée du journal.
+
+\begin{piege}
+Écrire le test \og ne tire plus\fg{} \emph{après} le correctif, sur le programme que l'on vient de corriger, ne prouve rien : on observe ce que l'on a construit. L'ordre sain est celui du journal : écrire la paire, constater que la moitié \emph{silent} est rouge sans le correctif et que la moitié \emph{fires} est verte, appliquer le correctif, constater que les deux sont vertes, puis retirer le correctif pour vérifier que seul le test attendu rougit.
+\end{piege}
+
+% ===========================================================================
+\section{Le silence n'est une preuve que si l'on a regardé}
+\label{sec:tests-corpus-angles-morts}
+
+\subsection{Un défaut que la sortie cachait}
+
+La fixture \file{tests/fixtures/blind_spots/outside_root/} contient un répertoire \file{app/} et un répertoire \file{shared/}. Le composant \code{App} de \file{app/App.tsx} appelle \code{useThing}, défini dans \file{shared/useThing.ts} :
+
+\tsxsnippet{tests/fixtures/blind_spots/outside_root/shared/useThing.ts}{1}{10}{une boucle infinie que personne ne voit quand on analyse \file{app/} seul}
+
+Le fichier \file{app/Broken.tsx} contient la même boucle, écrite directement. Analysons \file{app/} seul :
+
+\begin{sortie}
+  Broken  (2 hooks)  tests/fixtures/blind_spots/outside_root/app/Broken.tsx
+    warn   infinite-loop  [hook:0]  (line 7:2)  this effect keeps pushing state `n` to new values on every run. Potential infinite render loop
+       (2 trace step(s), rerun with --trace)
+   1 clean component(s) hidden, rerun with --show-clean
+
+⚠  1 warning(s) across 2 file(s).
+   not analyzed:
+     • 1 imported file(s) resolved outside the analysed set and were never read. Pass them on the command line to analyse them (tests/fixtures/blind_spots/outside_root/shared/useThing.ts)
+exit=1
+\end{sortie}
+
+\code{App} est déclaré propre (\og 1 clean component(s) hidden\fg{}), mais la ligne \og not analyzed\fg{} dit pourquoi ce silence ne vaut rien : l'import de \code{useThing} a été résolu vers un vrai fichier que le run n'a pas lu. C'est un \emph{blind spot} (\cref{def:projet-cli-driver-blind-spot}), et le JSON le porte dans un tableau dédié : \code{"blind_spots": [\{"kind": "unread-imports", "count": 1, …\}]}. Sur le répertoire parent, le finding apparaît, attribué à \code{App} mais localisé dans le fichier du hook :
+
+\begin{sortie}
+  App  (1 hooks)  tests/fixtures/blind_spots/outside_root/app/App.tsx
+    warn   infinite-loop  [hook:1]  (tests/fixtures/blind_spots/outside_root/shared/useThing.ts:6:2)  this effect keeps pushing state `n` to new values on every run. Potential infinite render loop
+\end{sortie}
+
+\subsection{Trois propriétés tenues ensemble}
+
+\file{tests/blind_spots.rs} pilote le binaire, parce que \og the summary line \emph{is} the behaviour under test\fg{} (\srcline{tests/blind_spots.rs}{10}). Ses tests tiennent trois propriétés, et c'est leur conjonction qui a du sens :
+
+\rustsnippet{tests/blind_spots.rs}{31}{51}{le témoin et le retrait de la coche}
+
+\begin{enumerate}
+  \item Un run qui a tout lu garde sa coche (\code{a_run_that_read_everything_keeps_its_clean_bill}). Le commentaire donne la raison : sans ce témoin, le correctif \og passerait\fg{} en ne certifiant plus jamais rien.
+  \item Un angle mort retire la coche \emph{et nomme} ce qui n'a pas été lu. Tests :\\ \code{unloadable_aliases_withhold_the_clean_bill} et\\ \code{an_import_resolved_outside_the_run_is_named}.
+  \item Un angle mort n'est pas un finding et ne change pas le code de sortie. Test :\\ \code{a_blind_spot_is_not_a_finding}.
+\end{enumerate}
+
+Le dernier test du groupe prouve que l'angle mort n'est pas décoratif :
+
+\rustsnippet{tests/blind_spots.rs}{63}{80}{ce que l'angle mort cachait, et ce qu'il ne change pas}
+
+La troisième variante de la fixture, \file{vite_no_paths}, déclare ses alias \code{@/} seulement dans \file{vite.config.ts}. Le run n'émet aucun finding et sort avec 0, mais il refuse la coche :
+
+\begin{sortie}
+⚠  1 file(s), no findings, but parts of this run were not analyzed, so this is not a clean bill.
+   not analyzed:
+     • no tsconfig `paths` found, so aliased imports (e.g. `@/...`) stay unresolved and their targets are NOT analyzed (possible false negatives). Aliases declared only in vite.config are not read.
+exit=0
+\end{sortie}
+
+\begin{decision}[\#9, \#47 — un angle mort n'est pas un finding]
+Deux politiques étaient possibles : faire échouer un run incomplet (code de sortie non nul), ou le laisser réussir en retirant l'assurance. Le projet choisit la seconde, parce que le code de sortie signifie \og des findings ont été rapportés\fg{} et qu'en changer le sens casserait en silence le contrat des pipelines CI. L'Action GitHub expose le nombre d'angles morts dans une sortie séparée, \code{blind-spots}, en précisant qu'il \og never affects the exit code — gate on it yourself\fg{} (\src{action.yml}{53}{60}).
+\end{decision}
+
+\subsection{L'angle mort vu par la mesure}
+
+Ces deux runs sont aussi la plus petite démonstration de l'outil de comparaison du corpus, \file{scripts/corpus-diff.py}, que la \cref{sec:tests-corpus-metrique} détaille. On enregistre les deux runs en JSON, puis on les compare :
+
+\begin{shell}
+$ reactant check tests/fixtures/blind_spots/outside_root/app --format json --fail-on never > /tmp/ch25/before.json
+$ reactant check tests/fixtures/blind_spots/outside_root --format json --fail-on never > /tmp/ch25/after.json
+$ scripts/corpus-diff.py /tmp/ch25/before.json /tmp/ch25/after.json --show 5
+\end{shell}
+\begin{sortie}
+before: 1
+after:  2
+delta:  +1  (0 removed, 1 added)
+
+ADDED (1):
+      1  infinite-loop
+    tests/fixtures/blind_spots/outside_root/shared/useThing.ts:6:2  this effect keeps pushing state `n` to new values on every run. Potential infinite render loop
+\end{sortie}
+
+Un ajout qui n'est la suppression d'aucun défaut préexistant a une signature reconnaissable : c'est celle d'une correction de \emph{soundness}. Le journal de précision l'énonce en tête : \og A precision correction only removes locations; a \emph{soundness} correction adds some, and those additions are findings a bug had been silencing\fg{} (\src{docs/precision-log.md}{13}{16}).
+
+% ===========================================================================
+\section{Le corpus : quatorze dépôts épinglés}
+\label{sec:tests-corpus-corpus}
+
+\subsection{Pourquoi un corpus}
+
+Les fixtures sont écrites par ceux qui écrivent les règles. Elles contiennent les formes auxquelles on a pensé. Le corpus contient les autres : quatorze applications et bibliothèques React réelles, 40\,164 fichiers \file{.ts}, \file{.tsx}, \file{.js} et \file{.jsx} hors \file{node_modules}, 1,1~Go. Le répertoire \file{test-repo/} est ignoré par Git et reconstruit par \file{scripts/setup-test-repo.sh}.
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}lrl@{}}
+\toprule
+Dépôt & Fichiers source & Pourquoi il est là \\
+\midrule
+\code{twenty} & 25\,033 & monorepo (CRM) \\
+\code{mantine} & 5\,490 & monorepo (bibliothèque UI) \\
+\code{dub} & 4\,327 & monorepo (Next.js) \\
+\code{chakra-ui} & 2\,758 & bibliothèque UI \\
+\code{excalidraw} & 664 & application Vite, alias dans \file{vite.config} \\
+\code{memos} & 569 & application \\
+\code{bulletproof-react} & 425 & gabarit d'architecture \\
+\code{next-shadcn-dashboard-starter} & 300 & Next, \file{src/app/}, \code{@/*} $\to$ \file{./src/*} \\
+\code{shadcn-admin} & 235 & application \\
+\code{ai-chatbot} & 154 & Next, \file{app/} à la racine, \code{@/*} $\to$ \file{./*} \\
+\code{commerce} & 65 & Next, \code{baseUrl} sans \code{paths} \\
+\code{novel} & 61 & éditeur \\
+\code{zustand} & 48 & bibliothèque d'état \\
+\code{precedent} & 35 & Next, alias multiples \\
+\bottomrule
+\end{tabular}
+\caption{Les quatorze dépôts du corpus et leur nombre de fichiers source (recompté au commit \snapshotCommit{}).}\label{tab:tests-corpus-depots}
+\end{table}
+
+Le choix n'est pas le volume. Le script le dit pour chaque groupe : les trois monorepos sont \og the ones that actually exercise the scaling paths — they are where the utility-inlining budget is exhausted and where the \code{infinite-loop} O(C²) hang (\#86) shows up\fg{} (\src{scripts/setup-test-repo.sh}{33}{35}) ; les quatre projets Next sont \og chosen to cover the four layouts that change how the analyzer resolves a project, not just to add volume\fg{} (\src{scripts/setup-test-repo.sh}{40}{46}).
+
+\subsection{Épingler : une mesure sur des sources fixes}
+
+\rustsnippet[language=bash]{scripts/setup-test-repo.sh}{8}{17}{pourquoi chaque entrée est épinglée}
+
+Chaque entrée du manifeste est un triplet \og source GitHub, nom local, SHA\fg{}, et le clonage récupère exactement ce commit, en profondeur~1 :
+
+\rustsnippet[language=bash]{scripts/setup-test-repo.sh}{102}{107}{un clone superficiel sur un SHA}
+
+Le mode \code{--verify} ne clone rien : pour chaque dépôt, il imprime \code{ok}, \code{missing}, \code{unpinned} (un ancien clone sans \file{.git}) ou \code{DRIFT have=… want=…}, et sort avec~1 au moindre écart (\src{scripts/setup-test-repo.sh}{65}{84}). Sur la machine de rédaction, les quatorze lignes sont \code{ok}.
+
+\begin{decision}[\#15 — épingler le corpus]
+Avant le 4 septembre 2026, le script clonait la branche par défaut de chaque dépôt avec \code{degit}, qui jette \file{.git}. Le corpus suivait donc les pushes d'autrui, et deux mesures prises à deux dates ne portaient pas sur les mêmes sources ; pire, on ne pouvait même pas vérifier après coup sur quoi une mesure avait porté. L'épinglage par SHA avec un clone superficiel coûte un peu de temps de clonage et garde l'identité. Le prix a été une rupture de série (\cref{sec:tests-corpus-erreur}) : re-cloner a fait passer le corpus de 34\,747 à 40\,164 fichiers.
+\end{decision}
+
+\subsection{Un seul arbre, et ce que cela coûte}
+
+La mesure officielle lance l'analyseur sur \file{test-repo} \emph{comme un seul arbre} : \code{reactant --format json --fail-on never test-repo}. Ce choix a deux conséquences qu'il faut connaître avant de lire un chiffre du corpus. D'abord, le répertoire racine n'est pas un projet : aucun des quatorze \file{tsconfig.json} n'est traité comme racine de projet et \emph{aucun alias n'est chargé} (\issue{139} : \og fourteen projects do not run as one\fg{}). Ensuite, des composants homonymes de dépôts différents se rencontrent ; lors de \issue{7}, 84~\% des références ambiguës venaient de collisions de noms \emph{entre} dépôts (\og Eighty-four per cent of it is the instrument\fg{}). La baseline mesure donc une configuration qu'aucun utilisateur ne lance. Les mesures \og par projet\fg{} existent, mais elles ne sont pas comparables à la baseline : pour le même binaire, 1\,318 localisations projet par projet contre 1\,346 en arbre unique (\src{docs/campaign/rerender-cascade-plan.md}{300}{303}).
+
+\begin{piege}
+Le run corpus complet demande plus de 8~Go de mémoire : \og twenty alone peaks at 6.6 GB\fg{} (\src{docs/campaign/rerender-cascade-plan.md}{295}{296}). Sur une machine de développement, il peut être tué par le système avant d'écrire son JSON. C'est une des raisons pour lesquelles la baseline est normalement régénérée depuis l'artefact de la CI, et non depuis un run local (\cref{sec:tests-corpus-cycle}).
+\end{piege}
+
+\Cref{fig:tests-corpus-flot} résume le chemin d'une mesure, du manifeste épinglé au verdict. La section suivante en détaille l'unité de compte et la porte.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=6mm and 8mm]
+  \node[bloc] (setup) {\file{setup-test-repo.sh}\\ \scriptsize 14 SHA épinglés};
+  \node[bloc,right=of setup] (repo) {\file{test-repo/}\\ \scriptsize 40\,164 fichiers};
+  \node[bloc,right=of repo] (bin) {\code{reactant --format json}\\ \code{--fail-on never test-repo}};
+  \node[bloc,below=12mm of bin] (json) {\file{corpus-run.json}\\ \scriptsize rangées \code{diagnostics}};
+  \node[bloc,left=of json] (gate) {\file{corpus-baseline.py}\\ \scriptsize localisations, digest};
+  \node[bloc,left=of gate] (verify) {\code{--verify}\\ \scriptsize empreinte};
+  \node[bloc,below=10mm of gate] (base) {\file{docs/corpus-baseline.json}\\ \scriptsize total, digest, \code{by_rule}, \code{by_repo}, \code{corpus}};
+  \draw[fleche] (setup) -- node[etiquette,above] {clone} (repo);
+  \draw[fleche] (repo) -- (bin);
+  \draw[fleche] (bin) -- (json);
+  \draw[fleche] (json) -- (gate);
+  \draw[fleche] (setup) -- (verify);
+  \draw[fleche] (verify) -- (gate);
+  \draw[fleche,<->] (gate) -- node[etiquette,right] {compare} (base);
+  \node[etiquette,align=left,anchor=north west] at ([xshift=4mm]base.north east) {0 : digest identique\\ 1 : le corpus a bougé\\ 2 : pas de baseline,\\ \quad ou autre corpus};
+  \node[etiquette,anchor=south] at ([yshift=1mm]json.north east) {artefact CI, 30 jours};
+\end{tikzpicture}
+\caption{Le flot de la mesure corpus : un manifeste épinglé, un run JSON, une porte à trois codes de sortie. L'empreinte du corpus est vérifiée \emph{avant} le digest.}\label{fig:tests-corpus-flot}
+\end{figure}
+
+% ===========================================================================
+\section{La métrique : rangées, localisations, digest}
+\label{sec:tests-corpus-metrique}
+
+\subsection{Une rangée n'est pas un défaut}
+
+Un hook partagé défectueux, inliné dans trois composants, produit trois diagnostics : un par composant qui le consomme (\adr{24}). La fixture \file{tests/fixtures/shared_hook_repeat/} en est l'illustration :
+
+\begin{sortie}
+  Alpha  (1 hooks)  tests/fixtures/shared_hook_repeat/App.tsx
+    warn   infinite-loop  [hook:1]  (tests/fixtures/shared_hook_repeat/hooks/useShared.ts:8:2)  this effect keeps pushing state `value` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop  [in 3 components]
+       (2 trace step(s), rerun with --trace)
+   2 component(s) hidden. Every finding in them is a source line already reported above
+
+⚠  1 warning(s) across 2 file(s), 3 component attribution(s).
+\end{sortie}
+
+La sortie humaine groupe (\cref{def:projet-cli-driver-localisation}) ; le JSON, lui, garde \emph{trois} rangées dans \code{diagnostics}, chacune avec son \code{component}. Compter les rangées reviendrait à compter trois fois le même défaut, et à faire bouger le compteur chaque fois qu'un composant de plus consomme le hook. À l'échelle du corpus, l'écart est énorme : \og 6,322 produced findings resolve to 1,170 distinct source locations\fg{} (\src{docs/limitations.md}{235}{236}), soit 81~\% de répétition.
+
+\begin{definition}{Localisation distincte (corpus)}{tests-corpus-localisation}
+Une \terme{localisation distincte} est un quadruplet \code{(file, line, col, message)} pris sur les rangées du tableau \code{diagnostics} d'un rapport JSON. Le total d'un run est le cardinal de l'ensemble de ses localisations distinctes.
+\end{definition}
+
+\rustsnippet[language=Python]{scripts/corpus-baseline.py}{36}{40}{l'unité comparable, dupliquée à l'identique dans \file{corpus-diff.py}}
+
+Chaque composante a un rôle. \code{file}, \code{line} et \code{col} localisent ; \code{message} distingue deux findings au même endroit. La \emph{valeur} du dictionnaire, la règle, ne sert qu'aux ventilations. Ce qui n'entre pas dans la clef est aussi important : \code{component} (c'est voulu, la métrique compte des défauts, pas des attributions), \code{severity} et \code{notes}.
+
+\begin{remarque}
+La clef du corpus n'est pas tout à fait celle du groupage du driver, qui inclut la règle : \code{(rule, (fichier, ligne, colonne), message)} (\cref{def:projet-cli-driver-localisation}). Deux règles qui émettraient le même message au même endroit feraient deux groupes à l'affichage et une seule localisation au corpus. Le cas est théorique, les messages étant propres à chaque règle, mais il vaut d'être su si l'on compare le résumé humain et le chiffre du corpus.
+\end{remarque}
+
+Sur la fixture, \code{scripts/corpus-diff.py /tmp/ch25/shr.json} répond \og 1 distinct locations\fg{}, pour un JSON de trois rangées.
+
+\subsection{La baseline commitée}
+
+Le chiffre du corpus vit dans un fichier, \file{docs/corpus-baseline.json}, produit par l'outil et jamais tapé :
+
+\rustsnippet[language=JSON]{docs/corpus-baseline.json}{1}{23}{le total, le digest et la ventilation par règle}
+
+Suivent \code{by_repo} (de 1 pour \code{precedent} à 535 pour \code{dub}) et, à la dernière ligne, l'empreinte \code{00e5fa79fa000c85}. Les cinq champs sont calculés par les fonctions \code{summarize} et \code{fingerprint} de \file{scripts/corpus-baseline.py} (l.~65--88) :
+
+\begin{itemize}
+  \item \code{total} est le nombre de localisations distinctes ;
+  \item \code{digest} est un SHA-256 de la liste \emph{triée} des localisations ;
+  \item \code{by_rule} et \code{by_repo} sont des ventilations, qui disent \emph{où} une dérive s'est produite ; un fichier hors de \file{test-repo/} est rangé dans \code{(other)}, une localisation sans fichier dans \code{(unlocated)} ;
+  \item \code{corpus} est l'empreinte du corpus mesuré, ou \code{"unverified"}.
+\end{itemize}
+
+\rustsnippet[language=Python]{scripts/corpus-baseline.py}{53}{79}{le digest et l'empreinte}
+
+Le \emph{digest} existe parce que les totaux ne suffisent pas : un run qui retire trois localisations et en ajoute trois autres garde le même total et les mêmes ventilations si les règles et les dépôts coïncident. Le tri utilise \code{k[1] or 0} parce qu'un finding sans position porte \code{line: null}, et que \code{None < int} lèverait une exception en Python. L'\emph{empreinte} est le SHA-256, tronqué à seize chiffres hexadécimaux, des lignes que \code{setup-test-repo.sh --verify} imprime ; une seule ligne qui n'est pas \code{ok} la rend \code{None}.
+
+\begin{definition}{Baseline, empreinte}{tests-corpus-baseline}
+La \terme{baseline} est le fichier \file{docs/corpus-baseline.json} : total, digest, ventilations et \terme{empreinte} du corpus sur lequel ils ont été mesurés. Deux runs sont \emph{comparables} si et seulement s'ils ont la même empreinte ; ils sont \emph{égaux} si et seulement s'ils ont de plus le même digest.
+\end{definition}
+
+\subsection{La porte : comparer, ou refuser de comparer}
+
+Le mode par défaut de \file{scripts/corpus-baseline.py} compare un run à la baseline. L'ordre des vérifications compte :
+
+\rustsnippet[language=Python]{scripts/corpus-baseline.py}{114}{130}{l'identité du corpus avant le digest}
+
+L'empreinte est vérifiée \emph{avant} le digest : une mesure sur d'autres sources n'est jamais présentée comme un delta, elle est refusée avec le code~2. Si le digest est identique, le script imprime \og corpus unchanged\fg{} et sort avec~0. Sinon, il imprime le total, le delta et les ventilations des écarts, puis sort avec~1 (\src{scripts/corpus-baseline.py}{132}{159}). Voici la porte lancée, en mode comparaison seulement, sur le petit run \file{/tmp/ch25/after.json} de la \cref{sec:tests-corpus-angles-morts} ; le corpus local est bien le corpus épinglé, l'empreinte concorde, le digest diffère :
+
+\begin{sortie}
+baseline: 1498
+run:      2
+delta:    -1496
+
+by rule:
+   -476  missing-deps
+   -381  always-unstable-deps
+   -222  lazy-init
+   …
+by repo:
+   -535  dub
+   -426  twenty
+   …
+     +2  (other)
+     -1  precedent
+
+Digest changed. For the moved locations themselves, keep the previous
+run and use: scripts/corpus-diff.py before.json /tmp/ch25/after.json --show 3
+
+The corpus moved. If that is the point of the change, regenerate with
+  scripts/corpus-baseline.py <run.json> --generate
+and say in the commit message what moved and why.
+exit=1
+\end{sortie}
+\noindent(Sortie élaguée aux \og …\fg{}. Les deux localisations du petit run tombent dans \code{(other)} parce que leur chemin ne commence pas par \file{test-repo/}. Sans \code{--generate}, le script n'écrit rien : \code{git status docs/corpus-baseline.json} est resté vide.)
+
+La baseline ne contient que le \emph{hachage} de la liste des localisations, pas la liste. Pour nommer ce qui a bougé, il faut deux runs complets et le second script.
+
+\subsection{\file{corpus-diff.py} : compter les deux côtés}
+
+\rustsnippet[language=Python]{scripts/corpus-diff.py}{84}{97}{deux ensembles, trois nombres, une réconciliation}
+
+Le script calcule les deux différences ensemblistes, imprime \emph{trois} nombres, \code{before}, \code{after} et \code{delta} avec \code{(removed, added)}, puis ventile chaque côté par règle et, avec \code{--show N}, liste les premières localisations. Le commentaire de la l.~93 est la règle de méthode : \og The endpoint is \code{after}, counted. Never \code{before} minus removals.\fg{}
+
+\begin{proposition}{La réconciliation est une tautologie}{tests-corpus-reconciliation}
+Pour deux ensembles finis $A$ et $B$, $|A| - |A \setminus B| + |B \setminus A| = |B|$.
+\end{proposition}
+\begin{proof}
+$A$ est l'union disjointe de $A \cap B$ et de $A \setminus B$, donc $|A| - |A\setminus B| = |A \cap B|$. De même $B$ est l'union disjointe de $A \cap B$ et de $B \setminus A$, donc $|A\cap B| + |B \setminus A| = |B|$.
+\end{proof}
+
+La vérification des l.~94--96 ne peut donc jamais échouer tant que \code{before} et \code{after} sont des ensembles (les clefs d'un dictionnaire). Elle protège le script contre une réécriture future qui manipulerait des listes avec doublons, pas contre des données incohérentes. La vraie protection contre l'erreur qui a fait naître le script est ailleurs : \emph{imprimer les deux côtés}, et ne jamais écrire un point d'arrivée à la main. C'est l'objet de la section suivante.
+
+\subsection{Ce que la métrique ne voit pas}
+
+\begin{piege}
+\begin{itemize}
+  \item \textbf{La sévérité n'est pas dans le digest.} Une \Error{} rétrogradée en \Warning{} à message constant, comme \code{CatchOnlyWrite} en \cref{sec:tests-corpus-paires}, laisse \og corpus unchanged\fg{}. Les commits qui changent des niveaux le vérifient à part ; celui de \code{a7387ba} l'écrit : \og The JSON has the same 9,332 rows and the same severities before and after\fg{}.
+  \item \textbf{Un changement de libellé est un retrait plus un ajout.} Le PR de \code{e67b10a} : trois retraits, deux ajouts, dont deux sont \og one line reworded\fg{}. Toujours lire le diff, jamais seulement le delta.
+  \item \textbf{Les positions nulles comptent} (\code{line or 0}) : les 25 findings sans position apparus avec \issue{4} et \issue{5} sont des localisations comme les autres (défaut ouvert \issue{140}).
+  \item \textbf{Le corpus en arbre unique n'est pas quatorze projets} (\cref{sec:tests-corpus-corpus}).
+\end{itemize}
+\end{piege}
+
+Enfin, les totaux sont eux-mêmes gardés par un méta-test qui ne lance pas l'analyseur :
+
+\rustsnippet{tests/corpus_baseline.rs}{33}{67}{la baseline doit être cohérente avec elle-même}
+
+Le raisonnement est dans les commentaires. Qui voudrait faire verdir un build rouge en éditant le total à la main devrait aussi éditer \code{by_rule} et \code{by_repo}, deux ventilations indépendantes qui doivent chacune sommer au total (au commit étudié, les deux somment à 1\,498) ; et le digest de 64 caractères, qu'on ne peut pas recalculer sans la liste des localisations, doit être présent. Le test ne prouve pas que le chiffre est juste ; il rend coûteuse la seule falsification facile.
+
+% ===========================================================================
+\section{Étude de cas : l'erreur de comptage du 3 septembre 2026}
+\label{sec:tests-corpus-erreur}
+
+Les outils des deux sections précédentes ne sont pas nés d'une réflexion abstraite. Ils sont nés d'une erreur, que le journal de précision raconte en détail sous le titre \og Table correction (2026-09-03)\fg{} (\src{docs/precision-log.md}{664}{752}). Elle mérite d'être lue comme une étude de cas de méthode.
+
+\subsection{Les faits}
+
+Le 3 septembre 2026, plusieurs corrections de précision sont consignées dans le journal, chacune avec son delta et son point d'arrivée, dans une colonne cumulative : chaque ligne part du point d'arrivée de la précédente. Quand on relance les binaires figés de chaque étape, les chiffres ne se reproduisent pas :
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}p{0.36\linewidth}p{0.27\linewidth}p{0.3\linewidth}@{}}
+\toprule
+Étape & Enregistré & Mesuré \\
+\midrule
+avant \issue{90} & 1\,343 & \textbf{1\,348} \\
+\issue{90}, a member is not the slot & 1\,340 ($-3$) & \textbf{1\,345 ($-3$)}, delta correct \\
+\issue{134}, the identity of an allocation site & 1\,348 ($+8$ : 6 retirées, 14 ajoutées) & \textbf{1\,334 ($-11$ : 26 retirées, 15 ajoutées)} \\
+\issue{94}, moitié valeurs & 1\,332 ($-16$) & \textbf{1\,326 ($-8$)} \\
+\issue{94}, moitié timing & 1\,314 ($-18$) & \textbf{1\,325 ($-1$)} \\
+\bottomrule
+\end{tabular}
+\caption{Enregistré contre mesuré, d'après \src{docs/precision-log.md}{686}{694}.}\label{tab:tests-corpus-correction}
+\end{table}
+
+\subsection{Le raisonnement}
+
+La première question est : dérive ou erreur ? La \cref{prop:tests-corpus-determinisme} y répond. Quatre runs d'un binaire figé sur un dépôt, deux sur le corpus entier, donnent des JSON identiques bit pour bit ; les huit runs de la correction voient le même corpus (34\,747 fichiers, 14\,016 composants). Il n'y a pas de bruit, donc l'écart est humain. Un détail de procédure a son importance : le binaire de chaque étape a été identifié par une \emph{sonde comportementale} (un cas \code{handleSubmit} pour la moitié timing, un cas \code{const \{ setValue \} = useForm()} pour la moitié valeurs), pas par sa date ; un premier étiquetage par horodatage s'était trompé.
+
+La seconde question est : où est l'erreur ? Le journal écarte d'abord l'hypothèse naturelle (retraits comptés en rangées, bornes en localisations) : testée, elle ne tient pas. Puis il dégage un motif. Le delta de \issue{90} est exact, mais la colonne porte déjà un écart de $+5$ hérité du 2 septembre. Pour \issue{134}, les ajouts sont presque justes (15 contre 14) mais les retraits sont faux (26 contre 6), et l'entrée nomme précisément une famille, les \code{\$errors.<member>} de mantine : l'explication qui colle est que la famille relue à la main a été prise pour le total. Le signe du delta s'est inversé. Pour \issue{94}, les deux moitiés valent ensemble $-9$ localisations, pas $-34$.
+
+\begin{quote}\itshape
+Counting what you re-read is not counting what changed. It is the same mistake as the subtracted endpoint, at the other end of the calculation.
+\end{quote}
+
+\subsection{Deux erreurs symétriques}
+
+L'erreur a deux faces. À une extrémité, les \emph{retraits} ont été comptés en relisant une famille, au lieu de comparer deux runs. À l'autre, le \emph{point d'arrivée} a été déduit (départ moins retraits) au lieu d'être compté. Et parce que la colonne est cumulative, une seule ligne fausse décale toutes les suivantes. Ce qui n'est pas remis en cause, le journal le dit aussi : \emph{le sens} de chaque correction, tenu par un test à retrait et par la relecture de chaque localisation retirée. C'est la \emph{taille} annoncée qui était fausse.
+
+\begin{invariant}{Un point d'arrivée est compté, jamais déduit}{tests-corpus-point-arrivee}
+Tout chiffre du corpus qui figure dans le dépôt est produit par un outil à partir d'un run complet : \code{corpus-diff.py} imprime \code{before}, \code{after}, \code{removed} et \code{added} ; \code{corpus-baseline.py --generate} écrit la baseline. Aucun total n'est obtenu par soustraction, et ce qui a été relu à la source est énoncé séparément de ce qui a changé.
+\end{invariant}
+
+\begin{decision}[\#15 — le nombre est produit, pas tapé]
+Après l'erreur, la règle aurait pu rester une consigne. Le commit \code{386e285} (\og infra: the corpus number is produced, not typed\fg{}) en fait un mécanisme : la baseline commitée avec son digest et l'empreinte du corpus, la porte \file{corpus-baseline.py}, le méta-test \file{tests/corpus_baseline.rs} et le workflow \code{corpus} qui rejoue la mesure à chaque push sur \code{main}. L'alternative, une consigne dans le journal, est exactement ce qui avait échoué.
+\end{decision}
+
+\subsection{Les ruptures de série}
+
+L'épinglage du lendemain (4 septembre) a coupé la colonne une seconde fois : même binaire \code{3a068ed}, 1\,344 sur l'ancien corpus, 1\,358 sur le nouveau. Le journal l'écrit sans ambiguïté : \og Do not extend the column across this break\fg{} (\src{docs/precision-log.md}{876}{877}). Les lignes du 2 septembre, dont aucun binaire n'a survécu, sont laissées telles quelles et marquées non vérifiables, \og rather than presented as checked\fg{}. Et la section de correction garde côte à côte l'enregistré et le mesuré, parce que \og erasing the gap by rewriting the column would do exactly what this log exists to prevent\fg{}.
+
+\begin{piege}
+Le tableau récapitulatif du journal saute de \issue{7} (1\,317 $\to$ 1\,348, 5 septembre) à \issue{151} (1\,493 $\to$ 1\,494, 27 septembre). Les mouvements intermédiaires (1\,348 $\to$ 1\,346 $\to$ 1\,500 $\to$ 1\,493 $\to$ 1\,494) sont consignés dans les commits \code{chore(corpus)} et dans \file{docs/campaign/rerender-cascade-plan.md}, pas dans le journal. Lire la colonne du journal seule donne une série à trous.
+
+Le \issue{151} lui-même part de 1\,493, une unité sous la baseline commitée de 1\,494 : ce n'est pas une coquille du journal. Le job \code{corpus} ne tournant pas sur les pull requests (\cref{sec:tests-corpus-cycle}), le changement de \code{e257bcc} n'a été mesuré pour la première fois qu'après la fusion sur \code{main}, et le run a échoué (\og \code{run: 1493} / \code{baseline: 1494} / \code{delta: -1}\fg{}, \code{-1 state-lifted-too-high} sur \code{twenty}, run \code{36263786207}). La baseline commitée, elle, est restée figée à 1\,494 — la valeur du dernier \code{chore(corpus)} avant \code{e257bcc}, jamais corrigée pour ce delta de $-1$ — jusqu'à sa régénération par \code{0f576bb} (\cref{sec:tests-corpus-cycle}) : le \issue{151} part donc à bon droit du 1\,493 mesuré, pas du 1\,494 resté écrit dans le dépôt.
+\end{piege}
+
+% ===========================================================================
+\section{Le cycle de vie d'un chiffre}
+\label{sec:tests-corpus-cycle}
+
+\subsection{Le workflow corpus}
+
+Le workflow \file{.github/workflows/corpus.yml} a un seul job, \code{measure}. Il tourne sur les pushes vers \code{main} qui touchent \file{src/**}, \file{crates/**}, \file{packs/**}, \file{Cargo.lock}, la baseline, le manifeste du corpus ou le workflow lui-même, et à la demande ; ni sur les pull requests, ni la nuit, pour la raison écrite en tête : \og a full run is \textasciitilde 13 minutes over \textasciitilde 40k files […] The corpus is pinned commit by commit, so it cannot drift on its own between those pushes; a nightly would re-measure an unchanged input\fg{} (\src{.github/workflows/corpus.yml}{11}{15}).
+
+\rustsnippet[language={}]{.github/workflows/corpus.yml}{60}{86}{vérifier le corpus, mesurer, comparer, garder l'artefact}
+
+Trois choix se lisent dans les commentaires. L'analyseur tourne avec \code{--fail-on never}, parce qu'un corpus de quatorze applications réelles a toujours des findings et que \og exit 1 means findings were reported\fg{} : ce pas ne doit échouer que si l'analyseur n'a pas pu tourner. C'est la porte, au pas suivant, qui juge le nombre. Enfin, le JSON est téléversé \code{if: always()} et gardé trente jours : en cas d'échec, c'est le \og avant\fg{} dont un humain aura besoin pour \file{corpus-diff.py}. Le cache du corpus a pour clef le hachage du manifeste (\src{.github/workflows/corpus.yml}{47}{54}) : puisque chaque dépôt est épinglé, le corpus n'est re-cloné que si quelqu'un le déplace délibérément.
+
+\subsection{Rouge, puis vert : une séquence réelle}
+
+Un changement qui fait bouger le corpus rend donc \code{main} rouge, \emph{à dessein}. La baseline n'est régénérée qu'ensuite, par un commit séparé qui dit ce qui a bougé et pourquoi. \Cref{fig:tests-corpus-sequence} reconstitue la séquence du 27 septembre 2026 à partir de \code{gh run list --workflow corpus.yml} et des messages de commit.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[x=1cm,y=-0.62cm,font=\scriptsize]
+  \foreach \x/\n in {0/push sur \code{main},4/job \code{corpus},8/humain,11.5/\file{docs/corpus-baseline.json}} {
+    \node[bloc,font=\scriptsize] at (\x,0) {\n};
+    \draw[ra-gray,dashed] (\x,0.7) -- (\x,15.2);
+  }
+  % 05d3573
+  \draw[fleche] (0,1.5) -- node[above] {\code{05d3573} (ADR-042)} (4,1.5);
+  \node[anchor=west,text=red!70!black] at (4.1,2.2) {échec, run 36327039320};
+  % 548f922
+  \draw[fleche] (0,3.5) -- node[above] {\code{548f922} (domaine)} (4,3.5);
+  \node[anchor=west,text=red!70!black] at (4.1,4.2) {échec, run 36329437512};
+  \draw[fleche,dashed] (4,5.2) -- node[above] {artefact \file{corpus-run.json}} (8,5.2);
+  \node[anchor=west,align=left] at (8.1,6.7) {\code{gh run download}\\ \code{corpus-diff.py}\\ relecture des 6 ajouts, journal};
+  \draw[fleche] (8,8.2) -- node[above] {\code{--generate} : 1\,494 $\to$ 1\,499} (11.5,8.2);
+  \draw[fleche] (8,9.4) -- node[above,pos=0.3] {\code{0f576bb} \code{chore(corpus)}} (0,9.4);
+  \draw[fleche] (0,10.4) -- (4,10.4);
+  \node[anchor=west,text=green!40!black] at (4.1,11.1) {succès, run 36342477491};
+  % e67b10a
+  \draw[fleche] (0,12.6) -- node[above] {\code{e67b10a} (PR \#163)} (4,12.6);
+  \node[anchor=west,text=green!40!black] at (4.1,13.3) {succès, run 36343941481};
+  \draw[fleche,dashed] (8,11.9) -- node[above] {run local : 1\,499 $\to$ 1\,498} (11.5,11.9);
+\end{tikzpicture}
+\caption{Le cycle de vie d'un chiffre, avec les runs réels du 27 septembre 2026. Deux pushes rouges, un \code{chore(corpus)} régénéré depuis l'artefact de \code{548f922}, puis un vert ; la PR \#163 régénère sa baseline elle-même, faute d'artefact avant fusion.}\label{fig:tests-corpus-sequence}
+\end{figure}
+
+Le message de \code{0f576bb} dit exactement ce qui s'est passé : \og Regenerated from the CI artifact of 548f922 (run 36329437512): the count main has produced since ADR-042 (\#152) landed, six additions all attributed in docs/precision-log.md. The corpus job on main compared against the 1,494 of 432277e and failed on that delta alone.\fg{} La PR \issue{163}, fusionnée dans \code{e67b10a}, montre la variante : le job corpus ne tournant pas sur les PR, il n'existe pas d'artefact avant la fusion, et la baseline a été régénérée \emph{dans la PR} depuis un run local du binaire final (\og the analysis is byte-deterministic, and the run on main after the merge is the check\fg{}). Le run sur \code{main} après fusion est vert : la prédiction locale était juste.
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+Commit & Date & Transition & Motif (message de commit) \\
+\midrule
+\code{386e285} & 2026-09-04 & création (1\,317) & the corpus number is produced, not typed (\#15) \\
+\code{806d114} & 2026-09-05 & 1\,317 $\to$ 1\,348 & a JSX callee is resolved by the file that writes it (\#7) \\
+\code{a7387ba} & 2026-09-24 & 1\,348 $\to$ 1\,346 & a naming merge, not a finding lost \\
+\code{ba09a62} & 2026-09-24 & 1\,346 $\to$ 1\,500 & the two render-cascade rules \\
+\code{61610ad} & 2026-09-24 & 1\,500 $\to$ 1\,493 & keyed handlers are discrete \\
+\code{432277e} & 2026-09-24 & 1\,493 $\to$ 1\,494 & context values \\
+\code{0f576bb} & 2026-09-27 & 1\,494 $\to$ 1\,499 & the relations engine and the multi-site proof \\
+\code{e67b10a} & 2026-09-27 & 1\,499 $\to$ 1\,498 & the convergence sites (\#162, \#160, \#158, \#161) \\
+\bottomrule
+\end{tabular}
+\caption{L'historique de la baseline (\code{git log -- docs/corpus-baseline.json}).}\label{tab:tests-corpus-historique}
+\end{table}
+
+\subsection{Ce que fait l'humain entre le rouge et le vert}
+
+Le rouge n'est pas une faute ; c'est une demande de justification. Entre le rouge et le \code{chore(corpus)}, la procédure est toujours la même : télécharger l'artefact ; comparer avec \file{corpus-diff.py} le run d'avant et celui d'après, localisation par localisation ; relire à la source \emph{chaque} localisation déplacée ; classer chaque retrait (FP retiré, ou vrai positif perdu, ce qui serait un FN) et chaque ajout (défaut qu'un bug faisait taire, ou nouveau FP) ; rédiger l'entrée du journal ; régénérer.
+
+\begin{piege}
+\begin{itemize}
+  \item \textbf{Un delta positif n'est pas une régression.} Les corrections de soundness font monter le compteur : \issue{4}/\issue{5} ($+26$), \issue{2} ($+4$), \issue{7} ($+31$).
+  \item \textbf{Un delta négatif n'est pas un progrès} tant que chaque retrait n'a pas été relu : un retrait peut être un vrai positif perdu, c'est-à-dire un FN, la direction interdite.
+  \item \textbf{Un delta nul n'est pas une correction inutile.} \issue{135} ne bouge rien sur le corpus (0 retiré, 0 ajouté), et pourtant le FN qu'il corrige est réel : \og a soundness correction is justified by what it makes impossible, not by what it moves today\fg{} (\src{docs/precision-log.md}{564}{565}).
+\end{itemize}
+\end{piege}
+
+% ===========================================================================
+\section{Les campagnes}
+\label{sec:tests-corpus-campagnes}
+
+Le workflow corpus dit \emph{si} le chiffre a bougé. Il ne dit pas ce qu'il faudrait corriger, ni ce qui manque. Ce travail est celui des \emph{campagnes}, des mesures humaines datées. Le projet en pratique deux sortes : la campagne FP classique, qui part du corpus, et la campagne \og wish-list à l'aveugle\fg{}, qui part de la demande.
+
+\subsection{La campagne FP classique}
+
+Elle suit sept étapes, que chaque entrée du journal de précision reprend.
+
+\begin{enumerate}
+  \item \textbf{Mesurer.} Un run corpus, puis un audit de ce qui tire. L'audit du 2 septembre 2026 (\file{docs/campaign/AUDIT.md}) compte 6\,322 findings, dont \og three rules are 92\% of them\fg{} (\regle{missing-deps}, \regle{always-unstable-deps}, \regle{lazy-init}), et découvre que 81~\% de la sortie est une même ligne répétée par composant consommateur, ce qui a donné \issue{129} et la métrique de la \cref{sec:tests-corpus-metrique}.
+  \item \textbf{Échantillonner et relire à la source.} Un cluster par règle, un verdict par localisation : vrai positif, FP, ou \og not worth fixing\fg{}. La passe du 3 septembre sur deux clusters jamais triés a trouvé \regle{unstable-context-value} à 53 vrais positifs sur 53, et \regle{frozen-initial-state} à 12 FP sur 79, tous d'une même famille (\issue{136}).
+  \item \textbf{Nommer la forme.} Une famille de FP a une cause dans le moteur ; elle devient une issue étiquetée (\cref{sec:tests-corpus-classer}).
+  \item \textbf{Corriger à la racine.} Pas de cas spécial dans une règle : c'est le premier principe de \file{CLAUDE.md}. L'entrée de \issue{135} le dit en une phrase : \og The fix is central, not per rule\fg{}.
+  \item \textbf{Encoder en paires}, dans \file{tests/corpus_fp_fixes.rs} ou dans le fichier de la règle, avec test par retrait (\cref{sec:tests-corpus-paires}).
+  \item \textbf{Re-mesurer} avec \file{corpus-diff.py}, relire chaque retrait à la source, caractériser les ajouts, ou les déclarer non triés : \og They lie in the direction the project's invariant tolerates, not in the forbidden one\fg{}, et ils \og deserve a triage pass\fg{}.
+  \item \textbf{Consigner} : une entrée datée du journal (la forme, l'affirmation en une phrase, le delta \code{before → after (N removed, M added)}, ce qui tire encore et pourquoi, ce qui n'est pas prouvé), une ligne dans \file{docs/limitations.md} si une limite subsiste, et le commit \code{chore(corpus)}.
+\end{enumerate}
+
+\begin{decision}[\code{87f87b5} — une ADR décide, le journal mesure]
+Sept ADR de l'époque avaient la même forme : une règle était imprécise sur une forme, voici le mécanisme, N localisations retirées. \og That is a measurement, not a decision.\fg{} Elles sont devenues des entrées du journal, qui le rappelle en tête : une ADR enregistre ce que le reste du système doit respecter (un domaine, une relation, un invariant, une alternative refusée), une correction de précision enregistre une \emph{mesure} (\src{docs/precision-log.md}{6}{11}).
+\end{decision}
+
+La même grille de lecture est publiée pour les utilisateurs. La procédure de triage \file{skills/reactant-triage/SKILL.md} demande, pour chaque \Warning{}, de tenter de \emph{falsifier} la chaîne de témoins (\cref{def:witness}) étape par étape : \og Every step true means a true positive, even when the code looks fine at a glance. One step false means a false positive, and that step names the cause.\fg{} (l.~60--61 du même fichier). Et deux interdits : \og Silence a finding to make the run green\fg{}, \og Call a component clean when it also carries \code{analysis-limit} or \code{suspended}\fg{}.
+
+\subsection{La campagne \og wish-list à l'aveugle\fg{}}
+
+\file{tests/catalogue.rs} prouve que 21 des 22 entrées du catalogue sont exprimables dans le vocabulaire déclaratif (\cref{chap:regles-declaratives}). La question est juste, mais circulaire : on mesure le vocabulaire contre les règles pour lesquelles on l'a conçu. La campagne du 2 septembre 2026 (\issue{128}, \file{docs/campaign/README.md}) pose l'autre question : \og can it express what someone who has never seen it would ask for?\fg{}
+
+Quatre agents, présentés comme ingénieurs React confirmés, reçoivent une description sommaire de la cible et l'\emph{interdiction de lire le dépôt}. Chacun écrit quinze scénarios dans un domaine (état, effets, rendu, asynchrone), dans un format fixe : \emph{What it flags}, \emph{Why it matters}, \emph{Severity intent}, \emph{Fires on} (la fixture qui doit tirer), \emph{Silent on} (le quasi-voisin difficile qui doit rester muet), \emph{Semantic facts required}. On reconnaît la paire fires/silent de la \cref{def:tests-corpus-paire}, écrite cette fois par quelqu'un qui ignore ce que l'outil sait faire. Quatre autres agents trient les soixante scénarios contre le vocabulaire livré, écrivent des règles de pack pour ce qu'ils déclarent exprimable, et \emph{exécutent chaque règle sur sa paire} : \og A rule that could not be demonstrated firing was downgraded on the spot\fg{} (\src{docs/campaign/README.md}{23}{26}).
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=5mm]
+  \node[bloc,minimum width=11cm] (s) {60 scénarios écrits à l'aveugle (4 domaines $\times$ 15), chacun avec sa paire \emph{Fires on} / \emph{Silent on}};
+  \node[bloc,minimum width=9.5cm,below=of s] (t1) {premier triage : NATIVE 16 · EXPRESSIBLE 1 · PARTIAL 16 · INEXPRESSIBLE 27};
+  \node[bloc,minimum width=8cm,below=of t1] (g) {listes de manques $\to$ issues $\to$ ADR (\issue{126} $\to$ \code{calls}, \issue{127} $\to$ \code{reads})};
+  \node[bloc,minimum width=6.5cm,below=of g] (t2) {re-triage : 16 · \textbf{9} · \textbf{17} · \textbf{18}};
+  \node[bloc,minimum width=5cm,below=of t2] (p) {8 règles dans \file{packs/community/wave2.json}\\ 8 paires dans \file{tests/fixtures/community_wave2/}};
+  \node[bloc,minimum width=3.5cm,below=of p] (c) {passées sur le corpus\\ une classe de FP corrigée};
+  \foreach \a/\b in {s/t1,t1/g,g/t2,t2/p,p/c} \draw[fleche] (\a) -- (\b);
+\end{tikzpicture}
+\caption{L'entonnoir de la campagne à l'aveugle (\file{docs/campaign/README.md}, \file{triage-2026-09-02-wave2.md}). Chaque étage est une mesure datée ; les triages ne sont pas réécrits quand le vocabulaire change.}\label{fig:tests-corpus-entonnoir}
+\end{figure}
+
+\Cref{fig:tests-corpus-entonnoir} en montre le déroulé. Le premier passage donne 16 scénarios déjà couverts par une règle native, 1 exprimable par un pack démontré, 16 partiels (un proxy utile, avec un manque nommé) et 27 inexprimables. Chaque fichier de triage finit par une liste de manques \og phrased as an issue a maintainer could open\fg{}. Deux d'entre eux deviennent des issues puis des ADR : \issue{126} ajoute la relation \relation{calls} (\adr{36}), \issue{127} la relation \relation{reads} (\adr{37}). Le re-triage donne 16 / 9 / 17 / 18 : huit scénarios basculent vers \og exprimable\fg{}, soit 25 sur 60 atteignables par une règle que quelqu'un peut écrire (\src{docs/campaign/triage-2026-09-02-wave2.md}{14}{23}).
+
+Les huit règles nouvelles sont commitées avec leurs paires, et un test les garde exécutables. Voici la paire du scénario S-STATE-7 :
+
+\tsxsnippet{tests/fixtures/community_wave2/state7.tsx}{1}{21}{un slot écrit mais jamais lu au rendu, et son quasi-voisin}
+
+On copie la paire sous \file{/tmp/ch25/wave2/}, à côté d'un fichier de configuration \file{reactant.config.json} qui charge le pack \file{packs/community/wave2.json}. Le run donne :
+
+\begin{sortie}
+  State7Fires  (2 hooks)  wave2/state7.tsx
+    warn   community-wave2/state-never-read-during-render  [hook:0]  (line 4:8)  state `scrollY` is written but no render-phase read of it is visible — every write costs a render that changes nothing
+   1 clean component(s) hidden, rerun with --show-clean
+
+⚠  1 warning(s) across 1 file(s).
+exit=1
+\end{sortie}
+
+La règle est un verdict d'\emph{absence} (aucune lecture en phase de rendu n'est visible), et sa propre documentation avoue que \og this over-reports and never certifies\fg{} : d'où un \Warning{}, jamais une \Error{}. C'est exactement ce que vérifie \file{tests/community_packs.rs}, dont le test \code{every_wave2_rule_discriminates_its_fixture_pair} exige que chaque règle de la vague~2 tire sur au moins un composant \code{…Fires} et sur aucun \code{…Silent} (\src{tests/community_packs.rs}{66}{141}).
+
+\begin{decision}[\#128 — des triages datés, jamais réécrits]
+\og The triages are dated evidence and are \textbf{not} updated as the vocabulary changes — a gap list rewritten after the fact stops being a measurement\fg{} (\src{docs/campaign/README.md}{80}{82}). Ce qui a bougé depuis est ajouté dans une section \og What has moved since\fg{} ou dans un re-triage daté. L'alternative, tenir les triages à jour, rendrait impossible de mesurer le progrès : on comparerait un document à lui-même.
+\end{decision}
+
+% ===========================================================================
+\section{L'oracle runtime}
+\label{sec:tests-corpus-oracle}
+
+\subsection{Une vérité concrète, comptée}
+
+Pour certaines règles, le coût d'un défaut est un nombre : combien de rendus inutiles une interaction provoque. Les règles de \emph{render cascade}, \regle{state-lifted-too-high} et \regle{wasted-subtree-render} (\cref{chap:regles-rendu-rsc}), ont été conçues contre un oracle qui compte ces rendus dans un vrai React.
+
+\begin{react}[Le rendu en cascade]
+Un changement d'état re-rend le composant propriétaire et tous les éléments qu'il construit, sauf les éléments créés plus haut (reçus en \code{children}) et les composants \code{memo} dont les props sont égales. Un état possédé trop haut dans l'arbre fait donc re-rendre des composants qui ne font que le transmettre.
+\end{react}
+
+\file{scripts/rerender-bench/run.mjs} compile chaque scénario avec esbuild et, au passage, injecte un compteur au début de chaque fonction dont le nom commence par une majuscule :
+
+\tsxsnippet{scripts/rerender-bench/run.mjs}{13}{31}{le compteur est injecté au build, les scénarios restent du React pur}
+
+L'injection au build est le point important : les fichiers de scénario restent du React ordinaire, que \reactant{} peut lire tel quel. Le banc monte ensuite le composant racine dans jsdom sous \code{React.act}, copie les compteurs de montage, les remet à zéro, exécute l'interaction exportée par le scénario (\code{mod.interact(ui)}, avec les helpers \code{type}, \code{click}, \code{fire}, \code{fireWindow}) et imprime \code{mount=… after=…} par composant (\src{scripts/rerender-bench/run.mjs}{55}{109}).
+
+\subsection{Une paire, mesurée puis analysée}
+
+\tsxsnippet{scripts/rerender-bench/scenarios/02-drill-before.tsx}{1}{21}{prop drilling : un état possédé trois niveaux trop haut}
+
+Le banc a mesuré, pour cinq caractères tapés : \og App, Layout, Sidebar, Content x5 each\fg{} de rendus gaspillés avant, \og Field only\fg{} après (\srcline{docs/campaign/rerender-cascade-plan.md}{47} ; non relancé ici, Node.js étant absent de la machine de rédaction). L'analyse statique du même fichier :
+
+\begin{sortie}
+  App  (1 hooks)  scripts/rerender-bench/scenarios/02-drill-before.tsx
+    warn   state-lifted-too-high  [hook:0]  (line 17:8)  state `value` is only used inside `<Field>`, 3 levels below `App`. Every write re-renders `App`, `Layout`, `Sidebar` and 1 other component they render only to pass it down; move the state into `Field`
+       → `App` passes it to `<Layout>` as `value`, `onChange` without using it itself (line 18:9)
+       → `Layout` passes it to `<Sidebar>` as `value`, `onChange` without using it itself (line 14:15)
+       → `Sidebar` passes it to `<Field>` as `value`, `onChange` without using it itself (line 11:32)
+   1 clean component(s) hidden, rerun with --show-clean
+
+⚠  1 warning(s) across 1 file(s).
+exit=1
+\end{sortie}
+
+Sur \file{02-drill-after.tsx}, l'analyseur répond \og \code{✓ 1 file(s) no issues found.}\fg{}. Le runtime (quatre composants gaspillés, cinq fois chacun) et le statique (\og \code{App}, \code{Layout}, \code{Sidebar} and 1 other\fg{}) disent la même chose : c'est en ce sens que le banc est un oracle. Le banc reste un outil manuel, lancé ni par \code{cargo test} ni par la CI ; ses mesures sont figées dans les fixtures \file{tests/fixtures/state_lifted_too_high/} et \file{tests/fixtures/wasted_subtree_render/}, dont les tests annoncent qu'elles encodent des comptes \og measured at runtime (React 19, jsdom)\fg{}.
+
+\subsection{Les onze paires au commit étudié}
+
+Le banc contient onze paires \code{-before}/\code{-after}. On a relancé l'analyseur sur les vingt-deux fichiers (options par défaut) ; aucun fichier \code{-after} ne produit de finding. Côté \code{-before} :
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}lp{0.38\linewidth}p{0.36\linewidth}@{}}
+\toprule
+Scénario & Gaspillage mesuré au runtime & Findings statiques (défaut) \\
+\midrule
+01 colocate & ExpensiveTree ×5, Row ×15 & \regle{wasted-subtree-render} \\
+02 drill & App, Layout, Sidebar, Content ×5 & \regle{state-lifted-too-high} \\
+03 children & Heavy ×6 & aucun \\
+04 toggle & BigList ×2, Item ×8 & aucun \\
+05 context & Header ×5 & aucun (3 \Info{} \code{analysis-limit} sous \code{--info}) \\
+06 memo & List ×5, Row ×15 & aucun (1 \Info{} sous \code{--info}) \\
+07 plane & KanBan ×4, Column ×12, Card ×20 & aucun \\
+08 dub & Table ×3, TableRow ×9 & \regle{state-lifted-too-high}, \regle{wasted-subtree-render} \\
+09 Expensify & 3 frères ×5 & \regle{wasted-subtree-render} \\
+10 gutenberg & ListViewBlock (memo) ×8 & aucun (3 \Info{} sous \code{--info}) \\
+11 outline & SortableTable, Table (memo) ×2 & \regle{unstable-context-value} seulement \\
+\bottomrule
+\end{tabular}
+\caption{Le banc de rendu face à l'analyseur. Colonne du milieu : \src{docs/campaign/rerender-cascade-plan.md}{46}{56} ; colonne de droite : runs de \code{target/debug/reactant} au commit \snapshotCommit{}, options par défaut ; les \Info{} ont été observés avec \code{--all-roots --info}.}\label{tab:tests-corpus-banc}
+\end{table}
+
+La lecture du \cref{tab:tests-corpus-banc} demande de la prudence : un silence de l'analyseur face à un gaspillage mesuré n'est pas forcément un FN au sens de la soundness, puisque ces règles ne certifient jamais l'absence de gaspillage. Plusieurs silences sont des choix documentés. \regle{wasted-subtree-render} ne considère par défaut que les déclencheurs \emph{continus} (frappe, déplacement de souris) ; les déclencheurs discrets exigent l'option \code{continuousOnly=false}, ce que fixe le test \code{discrete_triggers_need_the_option} (\src{tests/wasted_subtree_render.rs}{138}{151}). Avec cette option, 04 et 07 tirent bien \regle{wasted-subtree-render} (observé). Le scénario 03 reste muet même avec \code{continuousOnly=false} (observé) : l'unique composant gaspillé, \code{Heavy}, n'atteint pas le second seuil de la règle, \code{minWastedRenders} (\src{src/rules/impls/wasted_subtree_render.rs}{32}{40}), qui n'accepte par défaut que les cas où chaque écriture gaspille \emph{au moins deux} rendus de composant. Avec \code{minWastedRenders=1} en plus de \code{continuousOnly=false}, la règle tire deux fois sur \code{HoverCard} (observé), une fois par handler (\code{mouseover}, \code{mouseout}) : le silence par défaut de 03 est donc le seuil, choisi pour ignorer un gaspillage d'un seul composant, pas un défaut lié à la nature booléenne de l'état. Les scénarios 06 et 10 reposent sur \code{memo}, que le lowering ne détecte pas encore (\issue{64}, \cref{sec:tests-corpus-classer}), et 05 sur une séparation des fréquences de mise à jour d'un contexte que le plan de campagne classe parmi les règles non écrites.
+
+\begin{decision}[ADR-001 — deux oracles concrets, dont un seul a produit des nombres]
+L'\adr{1} adopte la sémantique de React-tRace \cite{LeeAhnYi2025} comme sémantique concrète de référence, et annonce des tests de régression vérifiant que l'analyseur sur-approxime les traces de son interpréteur. Au commit étudié, aucun fichier de \file{tests/} ni de \file{src/} ne mentionne React-tRace, et le document \file{docs/semantics.md} que l'ADR annonce n'existe pas. L'oracle effectivement utilisé, et qui a produit des nombres versionnés, est le banc jsdom : React 19 réel, mais sur des scénarios choisis, sans prétention de couverture.
+\end{decision}
+
+% ===========================================================================
+\section{Classer ce que l'on ne corrige pas}
+\label{sec:tests-corpus-classer}
+
+Toutes les mesures précédentes produisent des constats. Une partie devient une correction ; le reste doit être \emph{classé}, de façon à rester citable et à ne pas être rediscuté à chaque fois.
+
+\subsection{Défaut ou compromis}
+
+\file{docs/limitations.md} commence par distinguer deux registres qui ne doivent pas être confondus :
+
+\begin{definition}{Défaut, compromis}{tests-corpus-defaut-compromis}
+Un \terme{défaut} (\emph{defect}) est une analyse qui renvoie une sous-approximation ou qui affirme quelque chose de faux : \og Those get fixed.\fg{} Un \terme{compromis} (\emph{trade-off}) est une analyse qui reste saine et n'est qu'imprécise : \og Those get decided.\fg{} (\src{docs/limitations.md}{16}{22}).
+\end{definition}
+
+Le tracker traduit ce partage en labels. \code{soundness-bug} (\og the analysis is wrong, not imprecise\fg{}) est un défaut ; \code{precision-fp} (\og known false positive — sound but imprecise\fg{}) et \code{precision-fn} (\og known false negative — sound but incomplete\fg{}) sont des compromis. S'y ajoutent \code{infra} (tests, CI, mesure du corpus), \code{rule-proposal}, \code{ux}, \code{blocked}, les tailles \code{size/S} (quelques heures), \code{size/M} (un ou deux jours), \code{size/L} (plusieurs jours, avec un passage de conception), et les zones \code{area/*}.
+
+\begin{piege}
+\og precision-fn\fg{} semble contredire \og faux négatifs interdits\fg{}. Il n'en est rien, parce que le FN d'un \code{precision-fn} est relatif à l'\emph{intention} de la règle, et que le silence correspondant ne revendique rien : la règle ne certifie pas l'absence, ou l'absence est signalée comme \code{analysis-limit} ou comme angle mort. Un FN qui produit une assurance fausse, une coche ou un \code{verified} injustifiés, une \Error{} manquante là où la preuve existait, est un \code{soundness-bug}. Le journal le dit de \issue{5} : \og An honest "I don't know" turned into four unearned guarantees: the forbidden direction\fg{}.
+\end{piege}
+
+\subsection{Les issues fermées \code{wontfix}}
+
+Une limite tranchée \og on ne corrige pas\fg{} est une issue \emph{fermée} avec le label \code{wontfix}, \og so the reasoning stays citable and nobody proposes the fix again\fg{} (\src{docs/TODO.md}{15}{17}). Au commit étudié, il y en a six :
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}lp{0.38\linewidth}p{0.45\linewidth}@{}}
+\toprule
+\# & Titre & Raison et condition de réouverture \\
+\midrule
+\issue{101} & \code{nullable-return-unguarded} exclu du catalogue & l'ancre serait un site de déréférencement, entité syntaxique interdite ; plafond honnête 21/22 ; aucune réouverture \\
+\issue{65} & exports par défaut anonymes & nom générique cosmétique, identité gérée par (fichier, nom) \\
+\issue{63} & composants dynamiques (\code{cond ? A : B}) & aucun \code{CompApp} généré ; rouvrir avec un design de résolution à travers un join \\
+\issue{51} & \file{node_modules} jamais abaissé & périmètre voulu, le \code{SummaryRegistry} est le point d'extension \\
+\issue{42} & heuristique de nom d'émetteur de \regle{stale-closure} & FP par décision, plafond \Warning{} ; rouvrir si le corpus montre du bruit \\
+\issue{40} & lecture de tout l'objet par une garde ou \code{??} & FP par décision, aligné sur eslint ; rouvrir avec un suivi du mode de consommation \\
+\bottomrule
+\end{tabular}
+\caption{Les six issues fermées \code{wontfix} (\code{gh issue list --state closed --label wontfix}).}\label{tab:tests-corpus-wontfix}
+\end{table}
+
+Chaque fermeture porte, sauf \issue{101} et \issue{65}, une \emph{condition de réouverture} : ce qu'il faudrait apporter pour que la décision soit reprise. Ce n'est pas une formule de politesse, comme le montre l'exemple suivant.
+
+\begin{exemple}{La réouverture de \#64}{tests-corpus-reouverture-64}
+L'issue \issue{64} (\og \code{React.memo} / \code{forwardRef} wrappers\fg{}) avait été fermée \code{wontfix} le 27 août 2026, avec la condition \og Reopen with a corpus count of how many components are missed this way\fg{}. La campagne render cascade a produit ce chiffre : \og 201 hook-bearing components across the corpus are invisible, and a \code{memo} barrier cannot be seen\fg{} (\src{docs/campaign/rerender-cascade-plan.md}{112}{114}). L'issue a été rouverte le 6 septembre 2026 et le label \code{wontfix} retiré ; elle est aujourd'hui ouverte, étiquetée \code{precision-fn} et \code{area/lowering}. Les documents datés antérieurs, comme \file{triage-2026-09-02-wave2.md}, disent encore \og wontfix \#64\fg{} : ce sont des preuves datées, pas l'état courant.
+\end{exemple}
+
+\begin{decision}[ADR-020 — les non-changements délibérés]
+L'\adr{20} consigne onze refactorisations \og évidentes\fg{} qu'il ne faut pas tenter, parce que la déduplication introduirait un FN ; sa règle transverse est \og never introduce a false negative to remove a duplication\fg{}. Elle doit cependant être lue à la lumière du journal : son item~8 recommandait de garder le tas initial (le seed) de \code{eval_in} comme argument par appelant, et \issue{135} a ensuite supprimé ce paramètre (\og \code{eval_in} now seeds \code{self.heap.clone()}\fg{}), parce que quatre des six appelants passaient un tas vide, ce qui produisait un FN. L'ADR n'a pas été réécrite : \og an ADR is a historical record that does not get rewritten\fg{} (\src{docs/TODO.md}{19}{20}).
+\end{decision}
+
+\subsection{La dette du sous-système lui-même}
+
+La méthodologie a ses propres issues \code{infra} ouvertes. \issue{14} : 36 des 42 fichiers d'intégration de l'époque construisent \code{Config::default()}, qu'aucun utilisateur ne lance, et le harnais réel (avec \code{new_with_common}) devrait être exposé aux tests par une feature ou un \file{tests/common/mod.rs}. \issue{17} : six fichiers sans tests ; au commit étudié, \file{src/engine/component_registry.rs} en porte désormais six, les cinq autres (\file{src/registry/keyed.rs}, \file{src/domains/stores/heap.rs}, \file{src/ir/source_range.rs}, \file{src/lowering/import_resolution.rs}, \file{crates/reactant-wasm/src/lib.rs}) n'en ont toujours aucun, le dernier étant couvert indirectement par \file{npm/test/smoke.sh}. \issue{18} : une liste de tests à écrire en priorité, dont l'un, le déterminisme sous \code{--trace}, existe maintenant (\code{consecutive_traced_runs_are_byte_identical}). Les limites de l'analyse elle-même sont l'objet du \cref{chap:limites-perspectives}, et la façon dont cette discipline s'est formée celui du \cref{chap:histoire-doctrine}.
+
+% ===========================================================================
+\begin{resume}
+\begin{itemize}
+  \item La promesse \og faux négatifs interdits\fg{} rend le silence suspect : tout test de silence a un témoin qui tire (\cref{def:tests-corpus-silence-temoigne}), toute correction de précision une paire fires/silent (\cref{def:tests-corpus-paire}), et une coche n'est délivrée que si tout a été lu.
+  \item Le niveau d'un diagnostic est une affirmation : \Error{} = preuve de toute l'affirmation. Un FP ne porte jamais d'\Error{} (\cref{inv:tests-corpus-fp-pas-error}) ; les tests fixent le niveau, pas seulement la présence.
+  \item Six altitudes de mesure : unitaire (\file{src/test_support.rs}), harnais source $\to$ règles (\file{tests/corpus_fp_fixes.rs}), binaire (\file{tests/blind_spots.rs}, \file{tests/cli.rs}), parité, corpus, oracle runtime. Le déterminisme octet pour octet fait de tout écart un signal.
+  \item Le corpus : quatorze dépôts épinglés par SHA (\file{scripts/setup-test-repo.sh}), lancés comme un seul arbre. L'unité est la localisation distincte \code{(file, line, col, message)} (\cref{def:tests-corpus-localisation}), pas la rangée JSON.
+  \item La baseline \file{docs/corpus-baseline.json} porte total, digest, ventilations et empreinte ; \file{scripts/corpus-baseline.py} refuse de comparer deux corpus différents (code 2), valide un digest identique (0), signale tout mouvement (1). \file{scripts/corpus-diff.py} nomme ce qui a bougé et imprime toujours les deux côtés.
+  \item L'erreur du 3 septembre 2026 (retraits comptés en relisant une famille, point d'arrivée déduit) a donné l'invariant \og un point d'arrivée est compté, jamais déduit\fg{} (\cref{inv:tests-corpus-point-arrivee}) et le mécanisme de \issue{15}.
+  \item Un chiffre vit ainsi : push rouge, artefact, diff, relecture, journal, \code{chore(corpus)}, vert. Les campagnes (FP classique, wish-list à l'aveugle) et le banc jsdom fournissent ce que le chiffre ne dit pas ; ce qui n'est pas corrigé est classé (défaut ou compromis, \code{wontfix} avec condition de réouverture).
+\end{itemize}
+Le chapitre suivant (\cref{chap:histoire-doctrine}) retrace comment ces règles de méthode se sont formées au fil de l'histoire du projet.
+\end{resume}
+
+% ===========================================================================
+\section{Exercices}
+\label{sec:tests-corpus-exercices}
+
+\begin{exercice}{Retrouver le témoin}{tests-corpus-temoin}
+Dans \file{tests/corpus_fp_fixes.rs}, choisissez trois tests dont le nom dit qu'une règle ne tire plus. Pour chacun, retrouvez le test \og tire encore\fg{} qui l'accompagne, et énoncez en une phrase la différence de programme qui sépare les deux.
+\end{exercice}
+\begin{solution}
+Pour \#91 : \code{a_write_that_settles_its_own_guard_is_not_a_render_setter} est témoigné par \code{a_write_derived_from_the_slot_still_loops} (la valeur écrite lit le slot) et par \code{a_write_of_something_else_still_fires} (la garde compare \code{a}, l'écriture stocke \code{b}). Les autres se trouvent de la même façon, en cherchant \code{still} dans les noms et \og TP preservation\fg{} dans les commentaires.
+\end{solution}
+
+\begin{exercice}{Même total, digest différent}{tests-corpus-digest}
+Construisez deux petits programmes, et donc deux runs JSON, qui ont le même nombre de localisations distinctes, les mêmes ventilations par règle et par dépôt, et des digests différents. Que répondrait \file{corpus-baseline.py} si l'un était la baseline ? Qu'aurait répondu une porte fondée sur les seuls totaux ?
+\end{exercice}
+\begin{solution}
+Il suffit de déplacer un finding d'une ligne dans le même fichier (par exemple insérer une ligne vide au-dessus d'un effet qui boucle) : le total et les ventilations sont inchangés, la clef \code{(file, line, col, message)} change, donc le digest aussi. La porte sortirait avec~1 et des ventilations vides ; une porte aux totaux seuls aurait conclu \og inchangé\fg{}, ce qui est la forme de l'erreur du 3 septembre.
+\end{solution}
+
+\begin{exercice}{Une vérification qui peut échouer}{tests-corpus-reconciliation}
+La \cref{prop:tests-corpus-reconciliation} montre que la réconciliation de \file{corpus-diff.py} ne peut pas échouer. Proposez une vérification qui, elle, pourrait échouer sur des données incohérentes, et dites ce qu'elle détecterait.
+\end{exercice}
+\begin{solution}
+Par exemple : vérifier que \code{summary.errors + summary.warnings + summary.infos} du JSON égale le nombre de rangées de \code{diagnostics} ; ou vérifier que le nombre de rangées est au moins le nombre de localisations. Le driver filtre les \Info{} une seule fois, avant de compter \emph{et} avant de peupler les diagnostics du composant (\src{src/driver/mod.rs}{438}{438}) : l'égalité est donc exacte, avec ou sans \code{--info} (observé sur \code{tests/fixtures --all-roots} : $23+111+0=134$ rangées sans \code{--info}, $23+111+69=203$ avec). La première vérification détecterait plutôt un rapport tronqué ou un résumé incohérent avec son contenu — un compteur mis à jour sans que la liste le soit, par exemple.
+\end{solution}
+
+\begin{exercice}{Un quatrième consommateur}{tests-corpus-quatrieme}
+Sur \file{tests/fixtures/shared_hook_repeat}, prédisez le nombre de rangées JSON et de localisations distinctes si l'on ajoute un quatrième composant qui appelle le même hook. Vérifiez sur une copie sous \file{/tmp}.
+\end{exercice}
+\begin{solution}
+Quatre rangées, une localisation : la clef ne contient pas le composant. La sortie humaine dirait \og [in 4 components]\fg{} et \og 4 component attribution(s)\fg{}.
+\end{solution}
+
+\begin{exercice}{Rendre la sévérité visible}{tests-corpus-severite-digest}
+Proposez une extension du digest qui rende visibles les changements de sévérité. Argumentez : cela changerait-il la politique de régénération de la baseline ? Qu'aurait montré la correction \#2 (\cref{sec:tests-corpus-paires}) ?
+\end{exercice}
+\begin{solution}
+Hacher \code{(file, line, col, message, severity)}. La correction \#2 aurait alors fait bouger le digest (une \Error{} devenue \Warning{}), et le workflow aurait exigé un \code{chore(corpus)} justifiant la rétrogradation, ce qui est souhaitable puisqu'une rétrogradation est une affirmation de moins. Le coût : des régénérations plus fréquentes, et une série où une même localisation peut \og bouger\fg{} sans changer de place.
+\end{solution}
+
+\begin{exercice}{Écrire un scénario à l'aveugle}{tests-corpus-scenario}
+Écrivez, au format des scénarios de campagne (\emph{What it flags}, \emph{Why it matters}, \emph{Severity intent}, \emph{Fires on}, \emph{Silent on}, \emph{Semantic facts required}), un scénario pour un défaut React qu'aucune règle du catalogue ne couvre. Puis triez-le : NATIVE, EXPRESSIBLE, PARTIAL ou INEXPRESSIBLE, en vous appuyant sur les relations du \cref{chap:relations}.
+\end{exercice}

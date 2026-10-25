@@ -1,0 +1,1583 @@
+% ---------------------------------------------------------------------------
+% Chapitre 12 — Interpréter un CFG : worklist, arcs arrière, dominance
+% Sources : notes/06-engine-fixpoint.md (§3.5, §3.8, §3.10, §3.11, §4.4,
+% §4.9, §4.10, §6.4, §6.16, §8.9–§8.13, §8.17), src/engine/cfg_analyzer.rs,
+% src/engine/dominance.rs, src/engine/eval.rs, src/engine/fixpoint.rs
+% (appelants, exit_env, collect_thresholds), src/rules/api/query.rs
+% (ExitDominance) ; ADR-014, ADR-025, ADR-042 §6.
+% Sorties CLI observées au commit e67b10a avec target/debug/reactant sur
+% /tmp/ch12/*.tsx. Déroulés pas à pas et ensembles de dominateurs relevés
+% avec une sonde temporaire hors dépôt (/tmp/ch12/probe) : une réplique
+% instrumentée de la boucle d'analyze_cfg, dont le résultat final a été
+% comparé à celui d'analyze_cfg lui-même (identique), et des appels directs
+% à compute_dominators, rpo et on_all_paths.
+% ---------------------------------------------------------------------------
+\chapter{Interpréter un CFG : worklist, arcs arrière, dominance}
+\label{chap:cfg-analyzer-dominance}
+
+\begin{objectifs}
+  \item Savoir ce que calcule \code{analyze_cfg} sur un CFG : un environnement abstrait à la sortie de chaque bloc atteint et un store d'état enrichi de toutes les écritures de la passe. Savoir le dérouler à la main sur un bloc, un diamant et une boucle.
+  \item Comprendre les trois opérateurs de fusion (première arrivée, join, \emph{widening} à seuils), le compteur d'arcs arrière tenu par en-tête de boucle, et pourquoi l'analyse d'un CFG termine.
+  \item Connaître le raffinement de garde (\code{narrow_env_for_branch}) : les motifs reconnus, ce qu'ils ne reconnaissent pas, et pourquoi une garde réfutée n'élimine pas sa branche.
+  \item Savoir relire une passe terminée (\code{exit_env}, \code{entry_env_of}) et sonder une expression après convergence (\code{eval_in_stores}, \code{ConvergedEval}).
+  \item Connaître les questions \og sur tous les chemins\fg{} du moteur (\code{compute_dominators}, \code{DominatorTree}, \code{on_all_paths}, \code{ExitDominance}) et leurs conventions sur les sorties, les \code{throw} et les blocs inatteignables.
+\end{objectifs}
+
+\prerequis{\cref{chap:interpretation-abstraite} (\cref{def:treillis}, \cref{def:point-fixe}, \cref{def:widening}, \cref{def:must-may}, \cref{def:dominance}, \cref{alg:interpretation-abstraite-worklist}) ; \cref{chap:ir} (\cref{def:cfg}) ; \cref{chap:lowering-cfg} (\cref{def:lowering-back}, blocs de jonction) ; \cref{chap:treillis-simples} (intervalles, \code{widen_to}, raffinements) ; \cref{chap:transfert-stores} (\cref{def:environnement}, \cref{def:store}, \code{exec_stmt}).}
+
+Le \cref{chap:transfert-stores} a donné la sémantique d'un \emph{pas} : que
+vaut une expression, que fait une instruction. Le \cref{chap:point-fixe-composant}
+donnera la boucle externe, celle qui enchaîne rendu, mémos, effets et handlers
+jusqu'à ce que l'état React ne bouge plus. Entre les deux, il manque une pièce
+de taille moyenne : exécuter abstraitement \emph{un corps entier}, c'est-à-dire
+un CFG avec ses branchements et ses boucles. C'est le rôle de
+\code{analyze_cfg}, dans \file{src/engine/cfg_analyzer.rs}. Le rendu d'un
+composant, chacun de ses effets et chacun de ses handlers passent par elle, à
+chaque tour de la boucle externe.
+
+Le \cref{chap:interpretation-abstraite} en a donné l'idée
+(\cref{alg:interpretation-abstraite-worklist}) et un premier déroulé. Ce
+chapitre la reprend à la taille réelle du code, avec ses conventions : ce qui
+est suivi bloc par bloc et ce qui ne l'est pas, où l'on joint, où l'on
+accélère, ce que la condition d'un \code{if} apprend à l'analyse. Il présente
+ensuite trois services que le moteur et les règles construisent sur le même
+CFG une fois l'analyse finie : relire l'environnement d'un point du programme,
+évaluer une expression contre les stores convergés, et répondre aux questions
+de dominance (\og ce bloc s'exécute-t-il à chaque rendu ?\fg).
+
+% ===========================================================================
+\section{Le problème : un corps, plusieurs chemins}
+\label{sec:cfg-analyzer-dominance-probleme}
+
+Considérons un effet qui calcule une valeur par une boucle locale avant de
+l'écrire dans l'état. C'est le composant \code{BoundedLocalLoop} de
+\file{tests/fixtures/widening.tsx}, recopié sous un autre nom :
+
+\begin{lstlisting}[language=TypeScript,caption={Un effet avec une boucle locale (\file{/tmp/ch12/loop.tsx})},label={lst:cfg-analyzer-dominance-loop}]
+import { useState, useEffect } from "react";
+
+export function LocalLoop() {
+  const [total, setTotal] = useState(0);
+  useEffect(() => {
+    let i = 0;
+    while (i < 5) {
+      i = i + 1;
+    }
+    setTotal(i);
+  }, []);
+  return <div>{total}</div>;
+}
+\end{lstlisting}
+
+Concrètement, l'effet s'exécute une fois (deps vides), la boucle fait cinq tours
+et \code{setTotal} écrit 5. L'analyseur ne dit rien de ce composant :
+
+\begin{sortie}
+$ reactant check --verbose --info --no-color --project plain loop.tsx
+[verbose] 1 components analyzed
+[verbose] cache hits: 0, misses: 0
+  [verbose] LocalLoop: 1 iteration(s), widened: []
+   1 clean component(s) hidden, rerun with --show-clean
+\end{sortie}
+
+Pour arriver à ce silence, l'analyseur a dû répondre à une question qui n'a
+rien de spécifique à React : \emph{quelles valeurs \code{i} peut-il avoir à
+chaque point du corps de l'effet ?} Il ne peut pas exécuter la boucle (en
+général, il ne connaît ni le nombre de tours ni les valeurs d'entrée). Il
+calcule donc, pour chaque bloc du CFG, un environnement abstrait qui
+sur-approxime toutes les valeurs concrètes possibles en ce point, sur tous les
+chemins qui y mènent. Trois formes de graphe suffisent à tout expliquer :
+\begin{itemize}
+  \item la \emph{séquence} : un bloc passe son environnement de sortie au
+    suivant, sans perte ;
+  \item le \emph{diamant} : deux chemins se rejoignent, il faut un join ;
+  \item la \emph{boucle} : un chemin revient sur lui-même, la suite des
+    environnements peut croître sans fin, il faut un widening.
+\end{itemize}
+Les \cref{sec:cfg-analyzer-dominance-bloc,sec:cfg-analyzer-dominance-diamant,sec:cfg-analyzer-dominance-boucle}
+les traitent dans cet ordre.
+
+\subsection{Qui appelle \code{analyze_cfg}}
+
+\code{analyze_cfg} n'est pas appelée par les règles : c'est une brique du
+point fixe d'un composant. Ses cinq appelants sont tous dans
+\code{analyze_component_impl} (\file{src/engine/fixpoint.rs}) :
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+passe & CFG & environnement d'entrée & ligne \\
+\midrule
+rendu (chaque tour) & \code{render_cfg} & \code{initial_env} (props liées) & 366 \\
+effets (chaque tour) & corps de chaque effet & \code{env_exit} du rendu & 429 \\
+handlers (chaque tour) & corps de chaque handler & \code{env_exit} du rendu & 466 \\
+rafraîchissement & \code{render_cfg} & \code{initial_env} & 548 \\
+écritures pures & corps de chaque effet & \code{env_exit}, état $\Bot$ & 579 \\
+\bottomrule
+\end{tabular}
+\caption{Les cinq appels d'\code{analyze_cfg} dans \file{src/engine/fixpoint.rs}.
+Les deux derniers ont lieu après convergence ; ils sont décrits au
+\cref{chap:point-fixe-composant}.}
+\label{tab:cfg-analyzer-dominance-appelants}
+\end{table}
+
+Voici la signature :
+
+\rustsnippet[label={lst:cfg-analyzer-dominance-sig}]{src/engine/cfg_analyzer.rs}{34}{46}{signature d'\code{analyze_cfg}}
+
+Paramètre par paramètre :
+\begin{itemize}
+  \item \code{component} : l'identité du composant analysé. Elle ne sert
+    qu'à construire l'\code{AnalysisCtx} de chaque bloc (la provenance des
+    slots, \cref{chap:statevalue-stabilite}).
+  \item \code{cfg} : le graphe à interpréter (\cref{def:cfg}).
+  \item \code{entry_env} : l'environnement au début du bloc d'entrée.
+  \item \code{state}, \code{memo} : les stores d'état et de mémos du tour
+    courant de la boucle externe (\cref{def:store}), lus et non modifiés :
+    la fonction en fait des copies.
+  \item \code{transfer} : l'implémentation du trait \code{Transfer} ; en
+    production c'est toujours \code{StateValueTransfer}.
+  \item \code{widen_threshold}, \code{thresholds} : le nombre de passages par
+    un arc arrière avant d'accélérer, et l'ensemble de seuils du widening
+    (\cref{sec:cfg-analyzer-dominance-boucle}).
+  \item \code{heap} : le tas abstrait, emprunté mutablement et partagé avec
+    les autres passes du composant.
+  \item \code{ctx}, \code{inter} : l'accès en lecture aux entrées de hooks
+    (\code{QueryContext}) et le contexte inter-composants (\code{None} en
+    analyse isolée).
+\end{itemize}
+Le résultat est un couple : une table bloc $\mapsto$ environnement, et le store
+d'état enrichi des écritures de la passe.
+
+% ===========================================================================
+\section{Un bloc, puis une séquence}
+\label{sec:cfg-analyzer-dominance-bloc}
+
+\subsection{Deux tables, un store}
+
+La fonction commence par préparer son état de travail :
+
+\rustsnippet[label={lst:cfg-analyzer-dominance-init}]{src/engine/cfg_analyzer.rs}{47}{58}{initialisation}
+
+\begin{definition}{Passe, environnement d'entrée, environnement de sortie}{cfg-analyzer-dominance-passe}
+  Une \terme{passe} est une exécution d'\code{analyze_cfg} sur un CFG.
+  Pendant une passe, chaque bloc $b$ atteint porte un \terme{environnement
+  d'entrée} $\mathit{In}[b]$ (table \code{entry_envs}), valeur abstraite des
+  variables avant sa première instruction, et un \terme{environnement de
+  sortie} $\mathit{Out}[b]$ (table \code{exit_envs}), valeur après son
+  dernier transfert. Seul $\mathit{Out}$ est rendu à l'appelant.
+\end{definition}
+
+Trois choix se lisent déjà dans ces douze lignes.
+\begin{itemize}
+  \item Seul le bloc d'entrée reçoit un environnement. Un bloc que rien
+    n'atteint n'est jamais enfilé, donc jamais visité, et n'a pas de ligne
+    dans \code{exit_envs} : l'absence de ligne joue le rôle de $\Bot$
+    (\og aucun état concret n'arrive ici\fg).
+  \item \code{state_out} est \emph{une seule} copie du store d'état pour toute
+    la passe. L'état React n'est pas suivi bloc par bloc ; la
+    \cref{sec:cfg-analyzer-dominance-etat} en tire les conséquences.
+  \item La worklist est une file FIFO (\code{VecDeque}) dédupliquée par
+    \code{in_worklist}. Ce n'est pas un parcours en ordre postfixe inverse :
+    l'ordre de visite est l'ordre de découverte.
+\end{itemize}
+
+\begin{piege}
+  Le type de retour s'appelle \code{BlockEnvs}, et sa documentation dit
+  \og Per-block \emph{entry} environments\fg{}
+  (\src{src/engine/cfg_analyzer.rs}{16}{17}). C'est faux : la fonction rend
+  \code{exit_envs} (\srcline{src/engine/cfg_analyzer.rs}{123}), et sa propre
+  documentation (\src{src/engine/cfg_analyzer.rs}{21}{22}) le dit
+  correctement. Tout consommateur de \code{block_states} lit des
+  environnements de \emph{sortie} ; celui qui veut l'entrée d'un bloc doit la
+  reconstruire (\cref{sec:cfg-analyzer-dominance-relire}).
+\end{piege}
+
+\subsection{Le transfert d'un bloc}
+
+La boucle principale défile un bloc, applique ses instructions et range le
+résultat :
+
+\rustsnippet[label={lst:cfg-analyzer-dominance-body}]{src/engine/cfg_analyzer.rs}{60}{89}{visite d'un bloc}
+
+Étape par étape :
+\begin{enumerate}
+  \item \code{env_out} part d'une copie de $\mathit{In}[b]$.
+  \item Le store de mémos est \emph{recopié à chaque bloc} (ligne 66) et la
+    copie est jetée après le bloc : pendant une passe, les mémos sont figés.
+    Ils ne sont recalculés qu'entre deux passes, par la boucle externe.
+  \item Un \code{AnalysisCtx} est construit pour le bloc. Il emprunte
+    mutablement \code{state_out} et le tas : ce sont les deux canaux par
+    lesquels un bloc communique avec les autres \emph{sans} passer par les
+    arêtes.
+  \item Chaque instruction passe par \code{exec_stmt}
+    (\cref{chap:transfert-stores}).
+  \item Si le bloc se termine par \code{Return(e)}, les \emph{effets de bord}
+    de \code{e} sont exécutés (paragraphe suivant).
+  \item L'environnement obtenu devient $\mathit{Out}[b]$ ; une visite
+    ultérieure du même bloc l'écrase.
+\end{enumerate}
+
+Les tests unitaires du fichier épinglent les cas les plus simples. Sur un CFG
+d'un bloc vide, l'environnement d'entrée est rendu tel quel et l'état ne bouge
+pas (\code{empty_cfg_entry_env_preserved},
+\src{src/engine/cfg_analyzer.rs}{317}{336}). Un \code{let x = 42} donne
+$\mathit{Out}[0](x) = [42,42]$ (\code{let_literal_extends_env},
+\src{src/engine/cfg_analyzer.rs}{338}{363}). Une séquence de deux blocs,
+\code{let x = {}} puis \code{return}, propage la valeur sans perte :
+$\mathit{Out}[1](x)$ est une référence \code{PerRender}
+(\code{two_block_exit_env_propagates},
+\src{src/engine/cfg_analyzer.rs}{592}{649}). Sur un arc \code{Jump}, la
+fonction de passage est l'identité.
+
+\subsection{Les effets de bord d'un \code{Return}}
+\label{sec:cfg-analyzer-dominance-return}
+
+Un effet écrit avec une flèche concise n'a pas d'instruction :
+
+\begin{lstlisting}[language=TypeScript,caption={Une flèche concise (\file{/tmp/ch12/concise.tsx})},label={lst:cfg-analyzer-dominance-concise}]
+import { useState, useEffect } from "react";
+
+export function Concise() {
+  const [n, setN] = useState(0);
+  useEffect(() => setN(n + 1));
+  return <div>{n}</div>;
+}
+\end{lstlisting}
+
+Le lowering abaisse le corps \code{() => setN(n + 1)} en un seul bloc sans
+instruction, terminé par \code{Return(Call(setN, [n + 1]))}. Si
+\code{analyze_cfg} n'exécutait que les instructions, l'appel du setter serait
+invisible et cette boucle infinie passerait inaperçue : un faux négatif. D'où
+les lignes 80 à 86 de \cref{lst:cfg-analyzer-dominance-body}, qui confient
+l'expression du \code{Return} à \code{exec_expr_effects}, le même chemin que
+celui d'une instruction-expression \code{e;}. Ce chemin
+(\src{src/domains/interp/interpreter.rs}{114}{126}) fait trois choses : la
+pré-passe des callbacks, l'appel de setter (mise à jour faible), et
+l'évaluation d'une application de composant. La \emph{valeur} de retour n'est
+pas calculée ici. Le diagnostic est bien produit :
+
+\begin{sortie}
+$ reactant check --verbose --no-color --project plain concise.tsx
+  [verbose] Concise: 3 iteration(s), widened: [0]
+  Concise  (2 hooks)  concise.tsx
+    warn   infinite-loop  [hook:0]  (line 5:2)  this effect keeps pushing state `n` to new values on every run. Potential infinite render loop
+\end{sortie}
+
+Trois tests de \file{src/engine/cfg_analyzer.rs} fixent le comportement :
+\begin{itemize}
+  \item un setter dans un \code{Return} écrit (l.~850--893,\\
+    \code{setter_in_return_terminator_updates_state}) ;
+  \item un \code{Return(Lit(Unit))} ne fait rien (l.~896--937,
+    \code{unit_return_terminator_is_noop}) ;
+  \item un \emph{functional updater} passé dans un \code{Return} est exécuté
+    (l.~940--1018,\\ \code{functional_updater_in_return_terminator_fires}).
+\end{itemize}
+Le deuxième cas est le plus fréquent : depuis l'\adr{25}, la fin d'un corps
+sans \code{return} est scellée \code{Return(Lit(Unit))}.
+
+\begin{remarque}
+  Le commentaire des lignes 80 à 83 rappelle une correction : l'ancien code
+  fabriquait une instruction \code{Stmt::ExprStmt} jetable pour réutiliser le
+  chemin des instructions. Le trait \code{Transfer} expose désormais
+  \code{exec_expr_effects} comme la définition unique de \og exécuter une
+  expression pour ses effets\fg{} (\src{src/domains/mod.rs}{133}{144}).
+\end{remarque}
+
+\subsection{L'environnement de fin d'un corps}
+
+Les passes d'effets et de handlers partent de \code{env_exit}, l'environnement
+de fin du rendu. Il est calculé à partir des sorties de la passe de rendu :
+
+\rustsnippet[label={lst:cfg-analyzer-dominance-exit-env}]{src/engine/fixpoint.rs}{1226}{1237}{l'environnement de sortie d'un CFG}
+
+C'est le join des $\mathit{Out}[b]$ des blocs terminés par un \code{Return}.
+Un \code{Return} inatteignable n'a pas de ligne dans \code{block_states} et le
+\code{filter_map} l'écarte. La réduction se fait par \code{reduce}, pas par un
+\code{fold} partant de \code{AbstractEnv::bottom()}, et c'est voulu : le
+paragraphe suivant montre que la table vide n'est pas neutre pour le join. La
+même fonction existe en méthode publique sur \code{AnalysisResult}
+(\src{src/engine/analysis_result.rs}{279}{288}) pour les règles.
+
+% ===========================================================================
+\section{Le diamant : joindre aux points de jonction}
+\label{sec:cfg-analyzer-dominance-diamant}
+
+\subsection{Ce que reçoit chaque successeur}
+
+Après la visite d'un bloc, \code{analyze_cfg} demande à \code{outgoing} la
+liste de ses successeurs, chacun avec l'environnement qu'il reçoit :
+
+\rustsnippet[label={lst:cfg-analyzer-dominance-outgoing}]{src/engine/cfg_analyzer.rs}{126}{150}{l'environnement passé à chaque successeur}
+
+\code{outgoing} lit le \emph{terminateur} du bloc, pas la liste
+\code{cfg.edges}. Un \code{Jump} passe l'environnement tel quel ; un
+\code{Branch} le raffine selon sa condition, vers \code{then_} avec
+\code{taken = true} et vers \code{else_} avec \code{taken = false}
+(\cref{sec:cfg-analyzer-dominance-gardes}) ; \code{Return} et
+\code{Unreachable} n'ont pas de successeur. La branche finale, qui lit
+\code{cfg.successors}, ne sert que pour un identifiant de bloc absent de
+\code{cfg.blocks}. Sur un CFG bien formé, les deux lectures coïncident :
+\code{CFG::validate} exige que toute cible de terminateur ait son arête
+(\src{src/ir/cfg.rs}{181}{227}).
+
+\subsection{Un diamant, pas à pas}
+
+Le test \code{diamond_joins_at_merge_point}
+(\src{src/engine/cfg_analyzer.rs}{651}{753}) construit à la main l'IR de ce
+fragment :
+
+\begin{lstlisting}[language=TypeScript,caption={Le diamant du test, en source équivalent},label={lst:cfg-analyzer-dominance-diamant}]
+let x;
+if (true) { x = 1; } else { x = {}; }
+// ici : x vaut 1 ou un objet frais
+\end{lstlisting}
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=9mm and 14mm]
+  \node[cfgbloc] (b0) {B0 (entrée)\\branch true};
+  \node[cfgbloc,below left=of b0] (b1) {B1\\let x = 1\\jump B3};
+  \node[cfgbloc,below right=of b0] (b2) {B2\\let x = \{\}\\jump B3};
+  \node[cfgbloc,below=28mm of b0] (b3) {B3\\return};
+  \draw[fleche] (b0) -- node[etiquette,left]{IfTrue} (b1);
+  \draw[fleche] (b0) -- node[etiquette,right]{IfFalse} (b2);
+  \draw[fleche] (b1) -- (b3);
+  \draw[fleche] (b2) -- (b3);
+  \node[etiquette,left=2mm of b1,align=right] {$\mathit{Out}$ : $x \mapsto$ num $[1,1]$};
+  \node[etiquette,right=2mm of b2,align=left] {$\mathit{Out}$ : $x \mapsto$ ref \code{PerRender}};
+  \node[etiquette,below=2mm of b3,align=center] {$\mathit{In} = \mathit{Out}$ : $x \mapsto$ num $[1,1]$ \emph{et} ref \code{PerRender}\\(join du produit, pas $\Top$)};
+  \node[etiquette,right=2mm of b0,align=left] {$\mathit{Out}$ : $\{\}$ (table vide)};
+\end{tikzpicture}
+\caption{Le diamant de \code{diamond_joins_at_merge_point}, annoté des
+environnements calculés par \code{analyze_cfg}.}
+\label{fig:cfg-analyzer-dominance-diamant}
+\end{figure}
+
+La \cref{fig:cfg-analyzer-dominance-diamant} montre le déroulé. La condition
+est le littéral \code{true} : \code{narrow_env_for_branch} ne reconnaît pas ce
+motif (\cref{sec:cfg-analyzer-dominance-gardes}), les deux branches reçoivent
+la table vide inchangée et sont visitées. La branche \code{else} est pourtant
+concrètement morte ; l'analyse l'explore quand même, ce qui est sound. B1 est
+visité en premier et installe $\mathit{In}[B3]$ par \og première
+arrivée\fg{} (\code{None => outgoing_env}, ligne 98). B2 arrive ensuite et
+provoque le join (ligne 109). Le test vérifie que le join du produit
+\code{StateValue} garde \emph{les deux} sortes : la composante numérique vaut
+$[1,1]$, la composante référence \code{PerRender}, et la valeur n'est pas
+$\Top$ (\cref{def:statevalue}). Un domaine plat aurait perdu toute information
+ici, c'était la motivation de l'ADR-015.
+
+\subsection{Le join des environnements, et pourquoi $\Bot$ n'y est pas neutre}
+
+Le join de deux \code{AbstractEnv} est point à point, avec une règle
+particulière pour une variable présente d'un seul côté :
+
+\rustsnippet[label={lst:cfg-analyzer-dominance-env-join}]{src/domains/stores/abstract_env.rs}{130}{142}{join des valeurs : une variable d'un seul côté vaut $\Top$}
+
+La règle suit l'\cref{inv:env-top} : une variable absente d'un environnement
+s'y lit $\Top$, donc son join avec n'importe quoi vaut $\Top$. Dans le diamant
+ci-dessus, si seule la branche \code{then} liait \code{x}, B3 lirait
+\code{x} à $\Top$. C'est sound : sur le chemin \code{else}, \code{x} a la
+valeur qu'il avait avant le \code{if}, que la table ne connaît pas.
+
+\begin{piege}
+  La conséquence est que \code{AbstractEnv::bottom()}, la table vide, n'est
+  \emph{pas} un élément neutre du join : $\Bot \join \rho$ rend toutes les
+  variables de $\rho$ à $\Top$. Écrire \code{fold(AbstractEnv::bottom(), join)}
+  sur une liste d'environnements détruit toute l'information ; c'est pourquoi
+  \code{exit_env} utilise \code{reduce}. De même, la première arrivée sur un
+  bloc \emph{installe} l'environnement reçu au lieu de le joindre à une
+  entrée vide. En revanche l'ordre \code{leq} de la table lit une variable
+  absente comme $\Bot$ (\src{src/domains/stores/abstract_env.rs}{216}{239}) :
+  les deux conventions ne sont pas duales, et \code{analyze_cfg} ne se sert
+  d'ailleurs pas de \code{leq}.
+\end{piege}
+
+\subsection{Détecter un changement}
+
+Une fois la nouvelle entrée calculée, le successeur n'est ré-enfilé que si elle
+diffère de l'ancienne (ligne 114, \cref{lst:cfg-analyzer-dominance-propag}
+plus bas). Le test est une égalité structurelle \code{!=}, pas
+$\neg(\mathit{new} \lleq \mathit{old})$. Les deux sont équivalents ici, parce
+que la nouvelle entrée est toujours au-dessus de l'ancienne (un join ou un
+widening de l'ancienne) : pour $\mathit{new} \lgeq \mathit{old}$, on a
+$\mathit{new} \lleq \mathit{old} \iff \mathit{new} = \mathit{old}$ dans un
+ordre partiel.
+
+\begin{remarque}
+  L'égalité structurelle voit parfois un changement là où il n'y en a pas.
+  Un intervalle vide n'a pas de représentation canonique : \code{Interval}
+  compare ses bornes (\src{src/domains/impls/interval.rs}{23}{27}), et
+  \code{narrow_geq(5)} appliqué à $[0,0]$ rend l'intervalle $\{lo = 5, hi =
+  0\}$, vide, tandis que le même raffinement de $[0,1]$ rend $\{lo = 5, hi =
+  1\}$, vide aussi, mais différent pour \code{==}. La sonde du chapitre
+  l'observe sur la boucle de la section suivante : la sortie de boucle, dont
+  l'entrée reste $\Bot$, est ré-enfilée et revisitée à chaque tour de la
+  boucle (pas 7 et 10 du \cref{tab:cfg-analyzer-dominance-iterations}). C'est
+  un surcoût, borné par le nombre de changements de l'en-tête, sans effet
+  sur le résultat.
+\end{remarque}
+
+% ===========================================================================
+\section{La boucle : arcs arrière, compteur par en-tête, widening à seuils}
+\label{sec:cfg-analyzer-dominance-boucle}
+
+\subsection{La propagation}
+
+Voici la fin de la boucle principale, qui traite chaque successeur :
+
+\rustsnippet[label={lst:cfg-analyzer-dominance-propag}]{src/engine/cfg_analyzer.rs}{91}{121}{fusion et propagation vers les successeurs}
+
+Trois cas pour la nouvelle entrée $\nu$ d'un successeur $s$ recevant $\rho$ :
+\begin{itemize}
+  \item $s$ n'a pas encore d'entrée : $\nu = \rho$ ;
+  \item l'arc $b \to s$ est de nature \code{EdgeKind::Back} : on incrémente le
+    compteur de $s$ ; tant qu'il est sous \code{widen_threshold},
+    $\nu = \mathit{In}[s] \join \rho$, ensuite
+    $\nu = \mathit{In}[s] \widen_T \rho$ (\code{widen_to} avec les seuils $T$) ;
+  \item sinon : $\nu = \mathit{In}[s] \join \rho$.
+\end{itemize}
+
+Le compteur \code{back_edge_counts} est indexé par le bloc \emph{cible},
+c'est-à-dire l'en-tête de la boucle, et non par l'arc. Deux arcs arrière vers
+le même en-tête (la fin du corps et un \code{continue}) incrémentent le même
+compteur : une boucle qui contient un \code{continue} peut atteindre le seuil
+en moins de tours. Le compteur compte les \emph{arrivées}, qu'elles changent
+l'entrée ou non. Il est local à la passe : chaque appel à \code{analyze_cfg}
+repart de zéro. Enfin, sa valeur de déclenchement \code{widen_threshold} est
+le même paramètre que celui de la boucle externe, 3 par défaut
+(\src{src/engine/fixpoint.rs}{51}{60}).
+
+La nature de l'arc est retrouvée en parcourant \code{cfg.edges} (lignes 92 à
+95) : c'est le lowering qui décide où l'on accélère, en marquant \code{Back}
+les arêtes qui reviennent vers un en-tête (\cref{def:lowering-back}).
+
+\subsection{L'ensemble des seuils}
+
+Les seuils viennent du programme lui-même. Ils sont récoltés une fois par
+composant, avant la boucle externe :
+
+\rustsnippet[label={lst:cfg-analyzer-dominance-thresholds}]{src/engine/fixpoint.rs}{1185}{1206}{récolte des seuils du widening}
+
+Tous les littéraux numériques du rendu, des corps d'effets et de handlers
+(y compris ceux des fonctions imbriquées, \src{src/engine/fixpoint.rs}{1212}{1224})
+et des initialiseurs de \code{useState} entrent dans $T$, triés et dédupliqués.
+Le commentaire donne la justification : récolter trop est sans danger,
+l'ensemble reste fini et un seuil de plus n'ajoute qu'une borne candidate. Le
+même $T$ est passé à toutes les passes du composant, donc aussi aux boucles
+locales. L'opérateur \code{widen_to} lui-même est présenté au
+\cref{chap:treillis-simples} (\cref{thm:treillis-simples-widen-to}) : une
+borne qui croît saute au plus proche seuil qui l'englobe, ou à $\pm\infty$
+s'il n'y en a pas. Sur \code{StateValue}, seul le composant numérique utilise
+les seuils ; les autres composantes prennent le widening ordinaire
+(\src{src/domains/impls/state_value.rs}{670}{676}).
+
+\subsection{Le compteur de boucle, pas à pas}
+
+Deux tests de \file{src/engine/cfg_analyzer.rs} (l.~450--509),
+\begin{itemize}
+  \item \code{loop_counter_unbounded_without_thresholds},
+  \item \code{loop_counter_bounded_by_threshold},
+\end{itemize}
+analysent le même CFG, \code{counting_loop_cfg} (l.~365--448), l'IR de
+\code{let i = 0; while (i < 5) { i = i + 1; }}. Le premier passe
+$T = \emptyset$, le second $T = \{5\}$ (la constante de la garde, comme la
+récolterait \code{collect_thresholds}).
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=10mm and 16mm]
+  \node[cfgbloc] (b0) {B0 (entrée)\\let i = 0\\jump B1};
+  \node[cfgbloc,below=of b0] (b1) {B1 (en-tête)\\branch i < 5};
+  \node[cfgbloc,below left=of b1] (b2) {B2 (corps)\\i = i + 1\\jump B1};
+  \node[cfgbloc,below right=of b1] (b3) {B3 (sortie)\\return undefined};
+  \draw[fleche] (b0) -- node[etiquette,right]{Unconditional} (b1);
+  \draw[fleche] (b1) -- node[etiquette,above left]{IfTrue} (b2);
+  \draw[fleche] (b1) -- node[etiquette,above right]{IfFalse} (b3);
+  \draw[flechemay] (b2.west) to[bend left=50] node[etiquette,left]{Back} (b1.west);
+  \node[etiquette,right=2mm of b0,align=left] {$\mathit{Out}$ : $i = [0,0]$};
+  \node[etiquette,right=2mm of b1,align=left] {$\mathit{Out}$ : $[0,+\infty]$ ($T=\emptyset$)\\\phantom{$\mathit{Out}$ : }$[0,5]$ ($T=\{5\}$)};
+  \node[etiquette,below=2mm of b2,align=center] {$\mathit{In}$ : $[0,4]$, $\mathit{Out}$ : $[1,5]$};
+  \node[etiquette,below=2mm of b3,align=center] {$\mathit{Out}$ : $[5,+\infty]$ ($T=\emptyset$)\\$[5,5]$ ($T=\{5\}$)};
+\end{tikzpicture}
+\caption{\code{counting_loop_cfg} et ses environnements finaux (composante
+numérique de \code{i}). L'arc arrière est en pointillé.}
+\label{fig:cfg-analyzer-dominance-boucle}
+\end{figure}
+
+Le \cref{tab:cfg-analyzer-dominance-iterations} donne chaque visite. Il a été
+relevé avec la réplique instrumentée de la sonde ; les environnements finaux
+qu'elle trouve sont identiques à ceux d'\code{analyze_cfg} et à ceux que les
+deux tests vérifient.
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}rlll@{}}
+\toprule
+pas & bloc & $\mathit{In} \to \mathit{Out}$ (valeur de \code{i}) & mises à jour des successeurs \\
+\midrule
+\multicolumn{4}{@{}l}{\emph{pas communs aux deux variantes}} \\
+1 & B0 & $\Top \to [0,0]$ & $\mathit{In}[B1] := [0,0]$ (première arrivée) \\
+2 & B1 & $[0,0]$ & $\mathit{In}[B2] := [0,0]$ ; $\mathit{In}[B3] := \Bot$ \\
+3 & B2 & $[0,0] \to [1,1]$ & arrière n\textsuperscript{o}\,1, join : $\mathit{In}[B1] := [0,1]$ \\
+4 & B3 & $\Bot$ & -- \\
+5 & B1 & $[0,1]$ & $\mathit{In}[B2] := [0,1]$ ; $\mathit{In}[B3]$ reste vide (ré-enfilé) \\
+6 & B2 & $[0,1] \to [1,2]$ & arrière n\textsuperscript{o}\,2, join : $\mathit{In}[B1] := [0,2]$ \\
+7 & B3 & $\Bot$ & -- \\
+8 & B1 & $[0,2]$ & $\mathit{In}[B2] := [0,2]$ ; $\mathit{In}[B3]$ reste vide (ré-enfilé) \\
+\midrule
+\multicolumn{4}{@{}l}{\emph{sans seuil, $T = \emptyset$}} \\
+9 & B2 & $[0,2] \to [1,3]$ & arrière n\textsuperscript{o}\,3, widening : $[0,2] \widen [1,3] = [0,+\infty]$ \\
+10 & B3 & $\Bot$ & -- \\
+11 & B1 & $[0,+\infty]$ & $\mathit{In}[B2] := [0,4]$ ; $\mathit{In}[B3] := [5,+\infty]$ \\
+12 & B2 & $[0,4] \to [1,5]$ & arrière n\textsuperscript{o}\,4 : $[0,+\infty] \widen [1,5]$ inchangé \\
+13 & B3 & $[5,+\infty]$ & -- (file vide) \\
+\midrule
+\multicolumn{4}{@{}l}{\emph{avec seuil, $T = \{5\}$}} \\
+9 & B2 & $[0,2] \to [1,3]$ & arrière n\textsuperscript{o}\,3, widening : $[0,2] \widen_T [1,3] = [0,5]$ \\
+10 & B3 & $\Bot$ & -- \\
+11 & B1 & $[0,5]$ & $\mathit{In}[B2] := [0,4]$ ; $\mathit{In}[B3] := [5,5]$ \\
+12 & B2 & $[0,4] \to [1,5]$ & arrière n\textsuperscript{o}\,4 : $[0,5] \widen_T [1,5]$ inchangé \\
+13 & B3 & $[5,5]$ & -- (file vide) \\
+\bottomrule
+\end{tabular}
+\caption{Les treize visites d'\code{analyze_cfg} sur \code{counting_loop_cfg}
+(\code{widen_threshold = 3}). Seule la composante numérique de \code{i} est
+montrée ; $\Bot$ désigne un intervalle vide.}
+\label{tab:cfg-analyzer-dominance-iterations}
+\end{table}
+
+Quelques points méritent d'être soulignés.
+\begin{itemize}
+  \item Au pas 1, \code{i} n'est pas lié dans la table d'entrée : sa lecture
+    vaut $\Top$ (\cref{inv:env-top}). Le \code{let} l'écrase.
+  \item Au pas 2, la branche \og faux\fg{} raffine $[0,0]$ par
+    \code{i >= 5} et obtient un intervalle vide. Le bloc B3 est quand même
+    enfilé et visité (pas 4) : un raffinement vers $\Bot$ ne rend pas un
+    bloc inatteignable (\cref{sec:cfg-analyzer-dominance-gardes}). Ici c'est
+    sans conséquence, B3 ne fait rien.
+  \item Les deux premiers retours par l'arc arrière joignent : l'en-tête voit
+    $[0,1]$ puis $[0,2]$, exactement les valeurs concrètes des deux premiers
+    tours. Le troisième retour déclenche le widening.
+  \item Sans seuil, la borne supérieure saute à $+\infty$. Le raffinement de
+    la garde rattrape une partie de la perte \emph{sur les arcs sortants} :
+    le corps reçoit $[0,4]$ (\code{i} est entier, \code{i < 5} donne
+    \code{i <= 4}), la sortie $[5,+\infty]$. Mais l'en-tête garde
+    $[0,+\infty]$, et c'est ce que lit l'assertion du premier test.
+  \item Avec le seuil 5, la borne saute à 5 au lieu de $+\infty$ ; la sortie
+    de boucle reçoit alors exactement $[5,5]$, la valeur concrète. C'est ce
+    que vérifie le second test, et ce qui permet à \code{LocalLoop}
+    d'écrire $[5,5]$ dans \code{total}.
+  \item Au pas 12, le corps renvoie $[1,5]$, contenu dans l'entrée de
+    l'en-tête : \code{widen_to} ne touche pas une borne qui ne croît pas, la
+    nouvelle entrée est égale à l'ancienne, rien n'est enfilé. La passe se
+    termine dès que la file est vide.
+\end{itemize}
+
+\begin{decision}[ADR-014]
+  L'ADR-014 prévoyait deux mécanismes : le widening à seuils (partie 1) et un
+  \emph{narrowing} classique, c'est-à-dire une phase descendante après
+  convergence (partie 2). La révision du 28 juin 2026 abandonne la partie 2.
+  Constat : sur le compteur gardé, le raffinement de garde pendant la phase
+  ascendante suffit ; sur la boucle locale ci-dessus, ce qui manquait était
+  le widening à seuils \emph{sur l'arc arrière interne} d'\code{analyze_cfg},
+  qui donne $[0,5]$ en tête et $[5,5]$ en sortie sans phase descendante. Les
+  deux techniques ne récupèrent que des bornes littérales, et le widening à
+  seuils les récupère déjà en montant ; une descente ne pourrait de toute
+  façon pas faire redescendre le store d'état, alimenté par des joins
+  monotones. Alternatives refusées : la phase descendante bornée
+  (\code{narrow_iterations}), la séparation \code{WidenOutcome} dans les
+  résultats et la suppression des écritures pures (\code{effect_setter_writes})
+  ; aucune n'est implémentée au commit \snapshotCommit. L'opérateur
+  \code{narrow} reste une infrastructure différée, à reprendre seulement si
+  l'on voulait récupérer des bornes symboliques.
+\end{decision}
+
+\begin{piege}
+  Le mot \og narrowing\fg{} désigne deux choses dans le projet. Les méthodes
+  \code{narrow_lt}, \code{narrow_truthy}, etc. et \code{narrow_env_for_branch}
+  sont du \emph{raffinement de garde} : elles restreignent une variable sous
+  la condition d'une branche. Le narrowing de l'ADR-014 est une phase
+  descendante du point fixe ; il n'existe pas dans le code. Le texte de
+  l'ADR fait lui-même la distinction.
+\end{piege}
+
+\subsection{L'algorithme complet}
+
+L'\cref{alg:cfg-analyzer-dominance-worklist} récapitule \code{analyze_cfg}
+avec tous ses détails. Il raffine
+l'\cref{alg:interpretation-abstraite-worklist} sur trois points : le store
+d'état partagé, les effets de bord du \code{Return}, et le compteur par
+en-tête.
+
+\begin{algorithm}[htbp]
+\KwIn{CFG d'entrée $e$, environnement $\rho_0$, stores $S$ (état) et $M$ (mémos), tas $H$, seuil $k$, seuils $T$}
+\KwOut{$\mathit{Out}$ (bloc $\mapsto$ environnement de sortie), $S'$}
+$\mathit{In} \gets \{e \mapsto \rho_0\}$ ; $\mathit{Out} \gets \emptyset$ ; $S' \gets S$ ; $C \gets \emptyset$ (compteurs)\;
+$W \gets [e]$\;
+\While{$W$ non vide}{
+  $b \gets$ défiler($W$)\;
+  $\rho \gets \mathit{In}[b]$ ; $M_b \gets$ copie de $M$\;
+  \ForEach{instruction $i$ de $b$}{$\rho \gets \mathtt{exec\_stmt}(i, \rho)$ \tcp*{lit et écrit $S'$, $H$, $M_b$}}
+  \lIf{$b$ se termine par $\mathtt{Return}(x)$}{$\mathtt{exec\_expr\_effects}(x, \rho)$}
+  $\mathit{Out}[b] \gets \rho$\;
+  \ForEach{$(s, \rho_s) \in \mathtt{outgoing}(b, \rho)$ \tcp*{garde raffinée sur un Branch}}{
+    \uIf{$s \notin \mathrm{dom}(\mathit{In})$}{$\nu \gets \rho_s$\;}
+    \uElseIf{$b \to s$ est un arc \texttt{Back}}{
+      $C[s] \gets C[s] + 1$\;
+      \leIf{$C[s] \ge k$}{$\nu \gets \mathit{In}[s] \widen_T \rho_s$}{$\nu \gets \mathit{In}[s] \join \rho_s$}
+    }
+    \lElse{$\nu \gets \mathit{In}[s] \join \rho_s$}
+    \lIf{$\nu \neq \mathit{In}[s]$}{$\mathit{In}[s] \gets \nu$ ; enfiler $s$ s'il n'est pas dans $W$}
+  }
+}
+\Return{$(\mathit{Out}, S')$}
+\caption{\code{analyze_cfg} (\src{src/engine/cfg_analyzer.rs}{34}{124})}
+\label{alg:cfg-analyzer-dominance-worklist}
+\end{algorithm}
+
+% ===========================================================================
+\section{Raffiner par les gardes}
+\label{sec:cfg-analyzer-dominance-gardes}
+
+\subsection{Le problème}
+
+Reprenons le compteur gardé de l'ADR-014 :
+
+\begin{lstlisting}[language=TypeScript,caption={Un compteur gardé (\file{/tmp/ch12/guarded.tsx})},label={lst:cfg-analyzer-dominance-guarded}]
+import { useState, useEffect } from "react";
+
+export function Guarded() {
+  const [count, setCount] = useState(0);
+  useEffect(() => {
+    if (count < 10) setCount(count + 1);
+  }, [count]);
+  return <div>{count}</div>;
+}
+\end{lstlisting}
+
+L'effet s'exécute, incrémente, se ré-exécute, jusqu'à \code{count = 10}, puis
+s'arrête. Pour le prouver, l'analyse doit utiliser la condition du \code{if} :
+dans la branche \code{then}, \code{count} est strictement inférieur à 10, donc
+\code{setCount} écrit au plus 10. Sans cette information, la valeur écrite
+suivrait la valeur lue et croîtrait sans fin. Le moteur l'utilise :
+
+\begin{sortie}
+$ reactant check --verbose --info --no-color --project plain guarded.tsx
+  [verbose] Guarded: 3 iteration(s), widened: [0]
+  Guarded  (2 hooks)  guarded.tsx
+    info   widening-info  (line 5:2)  state `count` kept changing during analysis and was approximated to converge, so findings that depend on it may be imprecise
+    ...
+    verified  infinite-loop  no effect diverges into an infinite render loop
+\end{sortie}
+\noindent(sortie élaguée : les autres lignes \code{verified} sont omises.)
+
+La boucle externe a dû accélérer (\code{widened: [0]}), mais le widening à
+seuils s'arrête sur le seuil 10 et le raffinement borne l'écriture ;
+\regle{infinite-loop} se déclare vérifiée. Le déroulé tour par tour appartient
+au \cref{chap:point-fixe-composant}. Il suffit de changer la forme de la garde
+pour perdre cette preuve :
+
+\begin{lstlisting}[language=TypeScript,caption={La même garde, écrite \code{limit > count} (\file{/tmp/ch12/unguarded.tsx})},label={lst:cfg-analyzer-dominance-unguarded}]
+import { useState, useEffect } from "react";
+
+export function Unguarded({ limit }: { limit: number }) {
+  const [count, setCount] = useState(0);
+  useEffect(() => {
+    if (limit > count) setCount(count + 1);
+  }, [count, limit]);
+  return <div>{count}</div>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+  Unguarded  (2 hooks)  unguarded.tsx
+    warn   infinite-loop  [hook:0]  (line 5:2)  this effect keeps pushing state `count` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop
+\end{sortie}
+
+La condition compare deux variables. Aucun motif ne la reconnaît, aucun seuil
+ne vaut \code{limit} : \code{count} est widené jusqu'à $+\infty$. Le
+\Warning{} est un défaut \emph{possible} (une prop \code{limit} valant
+\code{Infinity} bouclerait vraiment), mais pour toute limite finie c'est un
+faux positif, toléré par l'invariant de soundness ; le corriger demanderait un
+domaine relationnel.
+
+\subsection{Ce que fait le code}
+
+\begin{definition}{Raffinement de garde}{cfg-analyzer-dominance-raffinement}
+  Le \terme{raffinement de garde} d'un environnement $\rho$ par une condition
+  $c$ sur la branche $t \in \{\mathit{vrai}, \mathit{faux}\}$ est un
+  environnement $\rho'$ qui ne diffère de $\rho$ qu'en une variable $x$
+  testée par $c$, avec $\rho'(x) \lleq \rho(x)$ et
+  $\gam(\rho'(x)) \supseteq \{ v \in \gam(\rho(x)) \mid c[x \mapsto v]
+  \text{ peut s'évaluer à } t \}$. C'est \code{narrow_env_for_branch}.
+\end{definition}
+
+La fonction commence par un utilitaire qui remplace une seule variable :
+
+\rustsnippet[label={lst:cfg-analyzer-dominance-narrow-head}]{src/engine/cfg_analyzer.rs}{201}{217}{\code{narrow_env_for_branch} : une variable à gauche, sinon rien}
+
+Puis elle distingue la forme du membre droit. La comparaison numérique à un
+littéral a été montrée au \cref{chap:treillis-simples}
+(\cref{lst:treillis-simples-narrow-env}) ; voici la suite, les comparaisons à
+\code{null} et \code{undefined} et les tests de vérité :
+
+\rustsnippet[label={lst:cfg-analyzer-dominance-narrow-null}]{src/engine/cfg_analyzer.rs}{242}{293}{raffinements de nullité et de vérité}
+
+Le \cref{tab:cfg-analyzer-dominance-motifs} résume la fonction ; il complète
+le \cref{tab:treillis-simples-motifs} par la colonne \og ce qui est
+touché\fg{} et par les formes non reconnues.
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}p{3.6cm}p{3.1cm}p{3.1cm}p{4.2cm}@{}}
+\toprule
+condition & branche vraie & branche fausse & composantes de \code{StateValue} touchées \\
+\midrule
+\code{x < c}, \code{x <= c}, \code{x > c}, \code{x >= c} ($c$ littéral entier ou flottant) & \code{narrow_lt}, \code{_leq}, \code{_gt}, \code{_geq} & la négation : \code{_geq}, \code{_gt}, \code{_leq}, \code{_lt} & \code{num} seul \\
+\code{x == c}, \code{x != c} ($c$ numérique) & \code{narrow_eq} / \code{narrow_neq} & \code{narrow_neq} / \code{narrow_eq} & \code{num} seul \\
+\code{x == null}, \code{x != null} & \code{narrow_keep_nullish_only} / \code{narrow_drop_null} & \code{narrow_drop_null} / \code{narrow_keep_nullish_only} & tout (\code{keep}) ou \code{null} (\code{drop}) \\
+\code{x == undefined}, \code{x != undefined} & \code{narrow_keep_nullish_only} / \code{narrow_drop_undef} & \code{narrow_drop_undef} / \code{narrow_keep_nullish_only} & tout ou \code{undef} \\
+\code{x} & \code{narrow_truthy} & \code{narrow_falsy} & toutes sauf \code{other} \\
+\code{!x} & \code{narrow_falsy} & \code{narrow_truthy} & toutes sauf \code{other} \\
+\midrule
+\code{c < x}, \code{x < y}, \code{x.f < c}, \code{x === "a"}, \code{a && b}, \code{true}, appel… & \multicolumn{2}{l}{environnement inchangé} & aucune \\
+\bottomrule
+\end{tabular}
+\caption{Motifs de \code{narrow_env_for_branch}
+(\src{src/engine/cfg_analyzer.rs}{201}{294}). \code{==} et \code{===} sont
+confondus par l'IR.}
+\label{tab:cfg-analyzer-dominance-motifs}
+\end{table}
+
+\subsection{Pourquoi ces raffinements sont sound}
+
+Trois précautions rendent ce tableau sound ; toutes sont écrites dans le
+code.
+\begin{itemize}
+  \item \emph{Le raffinement numérique ne touche que \code{num}.} Une
+    comparaison JavaScript convertit ses opérandes : \code{null < 5} est
+    vrai. Retirer \code{null} ou les chaînes de la branche \og vrai\fg{}
+    serait donc faux ; le commentaire de
+    \src{src/domains/impls/state_value.rs}{604}{605} le dit.
+  \item \emph{L'IR confond \code{==} et \code{===}.} Le raffinement doit donc
+    être correct pour les deux sémantiques à la fois
+    (\src{src/engine/cfg_analyzer.rs}{193}{196}). La branche où
+    \code{x == null} est vrai garde \code{null} \emph{et} \code{undefined}
+    (vrai de \code{==}, sur-approximation de \code{===}) ; la branche où
+    \code{x != null} est vrai ne retire que \code{null} (vrai de
+    \code{!==} ; pour \code{!=}, qui retirerait aussi \code{undefined},
+    c'est une sur-approximation). \code{narrow_keep_nullish_only} réactive en
+    outre \code{null} et \code{undefined} si la composante \code{other} est
+    présente, car elle peut les cacher
+    (\src{src/domains/impls/state_value.rs}{551}{558}).
+  \item \emph{Un raffinement entier n'est appliqué qu'aux entiers.} Le
+    passage de \code{i < 5} à \code{i <= 4} suppose que \code{i} est
+    entier, ce que garantit le bit \code{is_int} ; sur un flottant la borne
+    reste 5 (\cref{thm:treillis-simples-narrow}).
+\end{itemize}
+Enfin, tout motif non reconnu rend l'environnement inchangé, ce qui est
+toujours sound : ne rien apprendre ne perd aucune valeur.
+
+\subsection{Une garde réfutée n'élimine pas sa branche}
+
+Que se passe-t-il quand le raffinement rend $\Bot$ ? Le composant suivant est
+sain : \code{k} vaut 3, la condition \code{k > 10} est toujours fausse,
+l'effet n'écrit jamais.
+
+\begin{lstlisting}[language=TypeScript,caption={Une branche morte (\file{/tmp/ch12/dead.tsx})},label={lst:cfg-analyzer-dominance-dead}]
+import { useState, useEffect } from "react";
+
+export function Dead() {
+  const [n, setN] = useState(0);
+  const k = 3;
+  useEffect(() => {
+    if (k > 10) {
+      setN(n + 1);
+    }
+  });
+  return <div>{n}</div>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+$ reactant check --verbose --no-color --project plain dead.tsx
+  [verbose] Dead: 5 iteration(s), widened: [0]
+  Dead  (2 hooks)  dead.tsx
+    warn   infinite-loop  [hook:0]  (line 6:2)  this effect keeps pushing state `n` to new values on every run. Potential infinite render loop
+\end{sortie}
+
+Sur la branche vraie, \code{narrow_gt(10)} appliqué à $k = [3,3]$ donne bien
+un intervalle vide. Mais \code{outgoing} rend \emph{toujours} les deux
+successeurs d'un \code{Branch} (lignes 135 à 140), le successeur est enfilé
+dès que son entrée change (lignes 114 à 118), et ni \code{analyze_cfg} ni le
+transfert ne testent \og une variable vaut $\Bot$, donc le bloc est
+inatteignable\fg. Le bloc est exécuté ; seule \code{k} y vaut $\Bot$ ;
+\code{n} garde sa valeur et \code{setN(n + 1)} écrit une vraie valeur. Le
+\Warning{} est un faux positif : imprécis, sound.
+
+\begin{piege}
+  Il serait tentant de \og corriger\fg{} en ne propageant pas vers un
+  successeur dont l'environnement raffiné contient une variable $\Bot$. Ce
+  correctif central n'est pas fait, et sa soundness n'est pas évidente : il
+  faut que $\Bot$ signifie \og aucune valeur concrète\fg{} pour \emph{tout}
+  le produit \code{StateValue}, y compris quand la composante \code{other}
+  ou le raffinement de vérité (qui laisse \code{other} intact) interviennent.
+  Aucune issue ne suit ce point au commit \snapshotCommit{} (recherche faite
+  par le dossier 06, \code{gh issue list} sans résultat sur ce sujet).
+\end{piege}
+
+\subsection{Les autres utilisateurs du raffinement}
+
+\code{narrow_env_for_branch} est \code{pub(crate)} parce que deux preuves du
+moteur la réutilisent hors de toute passe : les preuves de convergence des
+gardes du graphe de churn (\srcline{src/engine/guards.rs}{235} et
+\srcline{src/engine/guards.rs}{771}) appliquent les gardes d'un site
+d'écriture à l'environnement de sortie du rendu. Ce partage est la règle 3
+du projet appliquée : une seule définition de ce qu'une garde apprend, au
+niveau central (\cref{chap:churn}).
+
+% ===========================================================================
+\section{L'état dans une passe : un store insensible au flot}
+\label{sec:cfg-analyzer-dominance-etat}
+
+Les environnements sont suivis bloc par bloc ; l'état React, le tas et les
+mémos ne le sont pas. Il faut comprendre pourquoi ce mélange est correct.
+
+\paragraph{Le store d'état.} \code{state_out} est créé par
+\code{state.clone()} (ligne 49), prêté à chaque bloc, et chaque setter y fait
+une mise à jour faible (un join, \cref{chap:transfert-stores}). Une lecture
+\code{StateVal(l)} dans un bloc voit donc les écritures de \emph{tous} les
+blocs déjà visités pendant la passe, sur n'importe quel chemin. Le store est
+\emph{insensible au flot} à l'intérieur d'un CFG.
+
+\begin{react}[l'état ne change pas au milieu d'un rendu]
+  Pendant un rendu, \code{count} est une constante : un \code{setCount}
+  n'agit que sur la file de mises à jour, et la nouvelle valeur n'est vue
+  qu'au rendu suivant. Dans un effet ou un handler, la variable \code{count}
+  est de même la valeur capturée par la closure. Seul un \emph{functional
+  updater} (\code{setCount(c => c + 1)}) lit l'état courant de la file. Un
+  store unique, sans position, est donc proche de la sémantique de React :
+  ce qui compte est l'ensemble des valeurs écrites, pas l'endroit du corps où
+  on les écrit.
+\end{react}
+
+\begin{invariant}{Une passe ne fait que monter l'état}{cfg-analyzer-dominance-state-monotone}
+  À tout moment d'une passe, \code{state_out} $\lgeq$ \code{state}, et
+  \code{state_out} ne fait que croître. Le store rendu contient donc l'état
+  d'entrée et toutes les valeurs écrites pendant la passe.
+\end{invariant}
+
+L'ordre de visite a une conséquence : un bloc visité \emph{avant} un bloc qui
+écrit ne voit pas cette écriture pendant la passe. Ce n'est pas un défaut de
+soundness, grâce à la boucle externe : le tour suivant repart d'un état qui
+inclut l'écriture, et le point fixe n'est atteint que lorsqu'aucune passe
+n'ajoute plus rien. À ce moment, \code{state_out} reste égal à \code{state}
+pendant toute la passe (il part de \code{state}, ne fait que croître, et finit
+$\lleq$ \code{state}), et chaque bloc a vu l'état final.
+
+\paragraph{Le tas.} Le tas est emprunté mutablement et n'est jamais recopié :
+il est partagé par toutes les passes d'un tour, et d'un tour à l'autre. C'est
+voulu : une closure allouée pendant le rendu doit être visible quand un effet
+l'appelle par une variable (le motif B5, commentaire
+\src{src/engine/cfg_analyzer.rs}{25}{28}). Le test
+\code{heap_persists_across_render_and_effect_passes} du point fixe l'épingle
+(\src{src/engine/fixpoint.rs}{2157}{2232}).
+
+\paragraph{Les mémos.} À l'inverse, le store de mémos est recopié par bloc et
+les écritures locales sont jetées : une passe lit les mémos du tour, elle ne
+les modifie pas. Leur recalcul est l'affaire de la boucle externe
+(\cref{chap:point-fixe-composant}).
+
+% ===========================================================================
+\section{Relire une passe terminée}
+\label{sec:cfg-analyzer-dominance-relire}
+
+\subsection{Ce que garantit une passe}
+
+Quand la file est vide, que sait-on ?
+
+\begin{proposition}{Une passe calcule un post-point fixe des équations de blocs}{cfg-analyzer-dominance-post-point-fixe}
+  Supposons que \code{state_out} ne change pas pendant la passe (c'est le cas
+  au point fixe de la boucle externe). À la fin d'\code{analyze_cfg}, pour
+  tout bloc visité $b$ : $\mathit{Out}[b] = f_b(\mathit{In}[b])$, où $f_b$
+  est le transfert du bloc ; et pour tout successeur $(s, \rho_s)$ rendu par
+  \code{outgoing} depuis $\mathit{Out}[b]$ : $\rho_s \lleq \mathit{In}[s]$.
+  Si les transferts et les raffinements sont corrects, $\gam(\mathit{Out}[b])$
+  contient tous les environnements concrets à la sortie de $b$.
+\end{proposition}
+
+\noindent\emph{Preuve.} Toute modification de $\mathit{In}[b]$ enfile $b$ ;
+la dernière visite de $b$ a donc lieu avec l'entrée finale, et
+$\mathit{Out}[b]$ est le transfert de cette entrée. Lors de cette visite,
+chaque successeur a reçu $\nu \lgeq \rho_s$ (première arrivée, join ou
+widening, tous au-dessus de $\rho_s$), et les entrées ne font ensuite que
+croître. Le système d'équations $\mathit{In}[s] \lgeq
+\bigsqcup_{p} \rho_{p \to s}$, $\mathit{Out}[b] = f_b(\mathit{In}[b])$ est
+donc satisfait en post-point fixe, et le \cref{thm:post-point-fixe} donne la
+sur-approximation. \qed
+
+L'hypothèse sur \code{state_out} n'est pas décorative : pendant un tour qui
+n'est pas le dernier, un bloc peut avoir été évalué contre un état plus petit
+que l'état final de la passe (\cref{sec:cfg-analyzer-dominance-etat}). Seule
+la boucle externe rend le résultat final sound.
+
+\subsection{\code{entry_env_of} : reconstruire l'entrée d'un bloc}
+
+Les règles et les relations ont parfois besoin de l'environnement
+\emph{au milieu} d'un bloc, par exemple à l'instruction d'un appel de setter.
+La table $\mathit{In}$ n'est pas publiée ; \code{entry_env_of} la reconstitue
+à partir des sorties :
+
+\rustsnippet[label={lst:cfg-analyzer-dominance-entry-env-of}]{src/engine/cfg_analyzer.rs}{152}{185}{relire l'environnement d'entrée d'un bloc}
+
+Pour le bloc d'entrée, c'est l'environnement initial. Pour un autre bloc, on
+rejoue \code{outgoing} depuis la sortie de chaque prédécesseur (le raffinement
+de garde est donc inclus) et l'on joint. Un prédécesseur sans sortie n'a pas
+été atteint et ne contribue rien. Le commentaire (lignes 156 à 159) donne
+l'argument de soundness : chaque sortie sur-approxime les sorties concrètes de
+son bloc, donc leur join sur-approxime l'entrée concrète. Ce join n'est jamais
+widené ; il est en général \emph{plus précis} que l'entrée sur laquelle la
+passe a convergé (qui peut avoir sauté à un seuil), jamais moins sûr.
+
+L'unique consommateur est la colonne \code{written} de la relation des
+écrivains, dans \src{src/engine/written.rs}{255}{274} : l'argument d'une écriture
+y est évalué dans l'environnement d'entrée de son bloc, puis on rejoue les
+instructions qui précèdent l'appel (\cref{chap:relations}).
+
+\begin{exemple}{Relire l'en-tête de la boucle}{cfg-analyzer-dominance-relire}
+  Sur \code{counting_loop_cfg}, les prédécesseurs de l'en-tête B1 sont B0,
+  qui lui passe $[0,0]$, et B2, dont la dernière sortie vaut $[1,5]$ dans
+  les deux variantes (\cref{tab:cfg-analyzer-dominance-iterations}).
+  \code{entry_env_of} rend donc $[0,0] \join [1,5] = [0,5]$ pour B1, avec ou
+  sans seuil. Avec $T = \{5\}$, c'est l'entrée finale de la passe. Sans
+  seuil, l'entrée finale était $[0,+\infty]$ : la relecture est strictement
+  plus précise que l'entrée widenée, et reste sound (\code{i} vaut
+  concrètement 0 à 5 en tête). Pour B2, elle rejoue la branche vraie depuis
+  $\mathit{Out}[B1]$ et rend $[0,4]$ dans les deux cas : \code{join} est le
+  \code{hull} des bornes (\src{src/domains/impls/interval.rs}{71}{78}), et
+  \code{narrow_lt} plafonne un entier à $v - 1$
+  (\src{src/domains/impls/interval.rs}{262}{268}), ce qui rend ce calcul
+  vérifiable directement sur ces deux définitions, sans exécuter
+  \code{entry_env_of} elle-même.
+\end{exemple}
+
+% ===========================================================================
+\section{Dominance : ce qui s'exécute sur tous les chemins}
+\label{sec:cfg-analyzer-dominance-dominance}
+
+\subsection{Le problème}
+
+Tout ce qui précède calcule des \emph{valeurs}. Certaines règles posent une
+question de \emph{structure} : ce bloc s'exécute-t-il à chaque passage dans le
+corps ? Trois composants la rendent concrète :
+
+\begin{lstlisting}[language=TypeScript,caption={Trois questions de dominance (\file{/tmp/ch12/early.tsx})},label={lst:cfg-analyzer-dominance-early}]
+import { useState } from "react";
+
+export function Panel({ ready }: { ready: boolean }) {
+  if (!ready) {
+    return null;
+  }
+  const [open, setOpen] = useState(false);
+  return <div onClick={() => setOpen(!open)}>{String(open)}</div>;
+}
+
+export function Tabs({ tab }: { tab: number }) {
+  const [seen, setSeen] = useState(0);
+  if (tab > 0) {
+    setSeen(tab);
+  }
+  return <div>{seen}</div>;
+}
+
+export function Always({ tab }: { tab: number }) {
+  const [seen, setSeen] = useState(0);
+  setSeen(tab);
+  return <div>{seen}</div>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+$ reactant check --no-color --project plain early.tsx
+  Always  (1 hooks)  early.tsx
+    error  setter-in-render  [hook:0]  (line 21:2)  setter `setSeen` called directly in the render body, move this call into a useEffect or an event handler
+  Panel  (2 hooks)  early.tsx
+    error  conditional-hook  [hook:0]  (line 7:8)  this hook is called conditionally (not on every render path)
+  Tabs  (1 hooks)  early.tsx
+    warn   setter-in-render  [hook:0]  (line 14:4)  setter `setSeen` called directly in the render body, move this call into a useEffect or an event handler
+\end{sortie}
+
+Dans \code{Panel}, le bloc du \code{useState} ne domine pas la sortie du
+\code{return null} : le hook est sauté sur un chemin, \Error{}. Dans
+\code{Tabs} et \code{Always}, la même écriture pendant le rendu reçoit deux
+niveaux différents : dans \code{Always}, le bloc de l'appel domine toutes les
+sorties, l'appel a lieu à chaque rendu et le défaut est certain (\Error) ;
+dans \code{Tabs}, il ne les domine pas, le défaut n'est que possible
+(\Warning). La règle le dit en commentaire
+(\src{src/rules/impls/setter_in_render.rs}{104}{107}). La dominance est donc
+l'un des outils qui \emph{certifient} un niveau \Error{}
+(\cref{chap:api-regles}).
+
+\subsection{\code{compute_dominators}}
+
+La \cref{def:dominance} caractérise $\mathrm{Dom}(b)$ comme la plus grande
+solution de $\mathrm{Dom}(e) = \{e\}$, $\mathrm{Dom}(b) = \{b\} \cup
+\bigcap_{p \in \pred(b)} \mathrm{Dom}(p)$. Le code est l'algorithme itératif
+classique :
+
+\rustsnippet[label={lst:cfg-analyzer-dominance-dominators}]{src/engine/dominance.rs}{6}{58}{le plus grand point fixe de la dominance}
+
+\begin{itemize}
+  \item L'entrée est initialisée à $\{e\}$, tout autre bloc à l'ensemble de
+    \emph{tous} les blocs (lignes 10 à 20) : on part du haut du treillis
+    $(\powerset(\mathit{Blocs}), \supseteq)$ et l'on descend.
+  \item Les blocs sont parcourus en ordre postfixe inverse (RPO), jusqu'à ce
+    qu'un tour complet ne change rien (\code{changed}).
+  \item Le nouvel ensemble d'un bloc est l'intersection des ensembles de ses
+    prédécesseurs, plus lui-même (lignes 36 à 48). Un bloc sans
+    prédécesseur autre que l'entrée est sauté (ligne 32).
+  \item Les prédécesseurs sont lus dans \code{cfg.edges} par
+    \code{cfg.predecessors} (\src{src/ir/cfg.rs}{173}{179}), un parcours
+    linéaire des arêtes.
+\end{itemize}
+
+L'ordre RPO vient d'un parcours en profondeur récursif depuis l'entrée :
+
+\rustsnippet[label={lst:cfg-analyzer-dominance-rpo}]{src/engine/dominance.rs}{113}{135}{ordre postfixe inverse}
+
+Un bloc inatteignable n'est pas dans le RPO. Il n'est jamais recalculé et garde
+\og tous les blocs\fg{} : \code{dominates(a, b)} est vrai pour tout $a$. C'est
+neutre pour un fait must (le bloc ne s'exécute jamais), mais piégeux pour qui
+énumère les blocs sans test d'atteignabilité (plus bas). Quand un prédécesseur
+inatteignable participe à une intersection, son ensemble complet est l'élément
+neutre de l'intersection : il ne retire rien.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=9mm and 12mm]
+  \node[cfgbloc] (b0) {B0 (entrée)\\branch};
+  \node[cfgbloc,below left=of b0] (b1) {B1\\jump B3};
+  \node[cfgbloc,below right=of b0] (b2) {B2\\jump B3};
+  \node[cfgbloc,below=27mm of b0] (b3) {B3 (en-tête)\\branch};
+  \node[cfgbloc,below left=of b3] (b4) {B4 (corps)\\jump B3};
+  \node[cfgbloc,below right=of b3] (b5) {B5\\return};
+  \node[cfgbloc,right=22mm of b2,draw=ra-amber] (b6) {B6 (orphelin)\\return};
+  \draw[fleche] (b0) -- (b1);
+  \draw[fleche] (b0) -- (b2);
+  \draw[fleche] (b1) -- (b3);
+  \draw[fleche] (b2) -- (b3);
+  \draw[fleche] (b3) -- (b4);
+  \draw[fleche] (b3) -- (b5);
+  \draw[flechemay] (b4.west) to[bend left=45] node[etiquette,left]{Back} (b3.west);
+  \node[etiquette,above=1mm of b0] {$\{0\}$};
+  \node[etiquette,left=1mm of b1] {$\{0,1\}$};
+  \node[etiquette,right=1mm of b2] {$\{0,2\}$};
+  \node[etiquette,right=2mm of b3] {$\{0,3\}$};
+  \node[etiquette,below=1mm of b4] {$\{0,3,4\}$};
+  \node[etiquette,below=1mm of b5] {$\{0,3,5\}$};
+  \node[etiquette,below=1mm of b6,align=center] {$\{0,\dots,6\}$\\(jamais recalculé)};
+\end{tikzpicture}
+\caption{Un losange suivi d'une boucle, et un bloc orphelin. Sous chaque bloc,
+son ensemble de dominateurs, tel que \code{compute_dominators} le rend (relevé
+à la sonde). RPO : $[0, 2, 1, 3, 5, 4]$.}
+\label{fig:cfg-analyzer-dominance-dom}
+\end{figure}
+
+\begin{exemple}{Dominateurs d'un losange suivi d'une boucle}{cfg-analyzer-dominance-dom}
+  Sur la \cref{fig:cfg-analyzer-dominance-dom} (un rendu schématique du type
+  \code{if (fast) {...} else {...} while (delay > 10) {...} return ...}, plus un
+  \code{return} orphelin comme en laisse un \code{if}/\code{else} dont les
+  deux branches retournent), la sonde donne le RPO $[0,2,1,3,5,4]$. Premier
+  tour : $\mathrm{Dom}(2) = \{0,2\}$, $\mathrm{Dom}(1) = \{0,1\}$ ;
+  $\mathrm{Dom}(3) = \{3\} \cup (\{0,1\} \cap \{0,2\} \cap \mathit{Tous}) =
+  \{0,3\}$ (B4, visité plus tard, vaut encore \og tous\fg{} et ne retire
+  rien) ; $\mathrm{Dom}(5) = \{0,3,5\}$ ; $\mathrm{Dom}(4) = \{0,3,4\}$.
+  Second tour : $\mathrm{Dom}(3) = \{3\} \cup (\{0,1\} \cap \{0,2\} \cap
+  \{0,3,4\}) = \{0,3\}$, inchangé ; rien ne bouge, l'algorithme s'arrête.
+  B6, inatteignable, garde $\{0,\dots,6\}$.
+\end{exemple}
+
+\subsection{\code{DominatorTree} et \code{dominates}}
+
+Recalculer la dominance à chaque question coûte un point fixe par question.
+\code{DominatorTree} mémorise le résultat :
+
+\rustsnippet[label={lst:cfg-analyzer-dominance-domtree}]{src/engine/dominance.rs}{94}{111}{la relation précalculée}
+
+Malgré son nom, la structure ne contient pas un arbre de dominateurs
+immédiats mais la table complète des ensembles. La question
+\code{dominates(a, b)} est un test d'appartenance ; un bloc $b$ absent de la
+table (identifiant inconnu) répond faux. La fonction libre
+\code{dominates(cfg, a, b)} (\src{src/engine/dominance.rs}{60}{67}) reconstruit
+tout à chaque appel, et sa documentation met en garde : \og otherwise this is
+O(queries × fixpoint)\fg.
+
+\subsection{Les sorties atteignables : \code{ExitDominance}}
+
+\og S'exécute à chaque rendu\fg{} signifie \og domine toutes les sorties\fg.
+Encore faut-il savoir ce qu'est une sortie. La couche règles en a un
+propriétaire unique :
+
+\rustsnippet[label={lst:cfg-analyzer-dominance-exitdom}]{src/rules/api/query.rs}{647}{671}{les sorties sont les \code{Return} atteignables}
+
+Deux conventions s'y lisent. Une sortie est un bloc terminé par
+\code{Return} ; un \code{throw} (terminateur \code{Unreachable}) n'en est pas
+une. Et un \code{Return} que rien n'atteint n'est pas une sortie : le filtre
+passe par \code{CFG::reachable_blocks} (\src{src/ir/cfg.rs}{153}{163}). Les
+méthodes \code{certify} et \code{may_be_skipped} qui suivent ont été
+présentées au \cref{chap:interpretation-abstraite}
+(\cref{lst:interpretation-abstraite-exitdom}).
+
+\begin{decision}[ADR-025]
+  Avant l'ADR-025, la fin d'un corps sans \code{return} était scellée
+  \code{Unreachable}, comme un \code{throw}. Une greffe (\cref{chap:splice-inlining})
+  ne raccordait donc pas un appelé sans \code{return} à la suite de
+  l'appelant : le \code{Return} de l'appelant n'avait plus de prédécesseur,
+  \code{block_states} n'en avait pas de sortie, et \code{exit_env} joignait
+  \emph{moins de chemins que le programme n'en a} (208 composants touchés sur
+  le corpus, dans la direction interdite). Décision : (1) une fin de corps
+  est scellée \code{Return(Lit(Unit))} ; (2) \code{throw} garde
+  \code{Unreachable} et la greffe continue de l'ignorer ; (3) un
+  \code{Return} inatteignable n'est pas une sortie. Alternative refusée pour
+  (2) : relier chaque \code{Unreachable} de l'appelé à la jonction. Elle
+  invente un chemin qui contourne les hooks de l'appelé et produisait un
+  \regle{conditional-hook} \Error{} sur l'idiome conforme
+  \code{if (ctx === undefined) throw ...; useState(...)}. Le point (3) est la
+  conséquence du point (1) : un \code{if}/\code{else} dont les deux
+  branches retournent laisse désormais une queue \code{Return} orpheline, et
+  la compter rendrait \og conditionnel\fg{} tout hook placé avant.
+\end{decision}
+
+\begin{piege}
+  B6, dans la \cref{fig:cfg-analyzer-dominance-dom}, est un \code{Return}
+  que rien n'atteint. La table le déclare dominé par \emph{tous} les blocs,
+  B4 compris, alors qu'aucun chemin ne passe par B4 avant B6 : ce n'est pas
+  un fait sur le programme, c'est un artefact de l'initialisation. Toute
+  réponse de \code{dominates(_, 6)} est donc vide de sens, et un
+  consommateur qui énumère \og tous les \code{Return}\fg{} sans
+  \code{reachable_blocks} fait dépendre son verdict de cet artefact.
+  \code{ExitDominance} ne pose jamais la question sur une sortie
+  inatteignable ; c'est la seule façon correcte d'interroger la dominance
+  des sorties.
+
+  Ce constat rend d'ailleurs difficile à rejouer, avec le code actuel, le
+  mécanisme que décrit le point (3) de l'\adr{25} : une queue \code{Return}
+  orpheline comptée parmi les sorties ferait \emph{échouer} tout hook placé
+  avant la branche à \og dominer toutes les sorties\fg. Or, avec
+  \code{compute_dominators} tel qu'il est écrit au commit \snapshotCommit,
+  c'est l'inverse qui se lit sur B6 : un bloc inatteignable est dominé par
+  \emph{tous} les blocs, donc \code{dominates(a, b)} vaut vrai pour tout $a$
+  quand $b$ est l'orphelin, et compter l'orphelin parmi les sorties ferait
+  dominer \emph{trivialement} cette sortie fantôme par tout hook, sans faire
+  échouer \code{certify}. L'\adr{25} ne précise pas si
+  \code{compute_dominators} avait, à sa date (29 juillet 2026), la même
+  convention d'initialisation qu'au commit \snapshotCommit{} ; le mécanisme
+  exact qui aurait produit le \regle{conditional-hook} \Error{} qu'elle
+  décrit n'est pas reconstituable depuis le seul code présent. Le point ne
+  change rien à la décision retenue : filtrer les sorties par
+  \code{reachable_blocks} est correct indépendamment de ce mécanisme.
+\end{piege}
+
+\subsection{\code{on_all_paths} : un ensemble sur tous les chemins}
+
+La seconde question porte sur un \emph{ensemble} de blocs : tout chemin de
+l'entrée à une sortie passe-t-il par l'un d'eux ? C'est ce que demande
+\regle{infinite-loop} quand elle veut certifier qu'un effet écrit une valeur
+fraîche à chaque exécution, quelle que soit la branche prise
+(\srcline{src/rules/impls/infinite_loop.rs}{454}), ou le graphe de churn pour
+ses arêtes \code{Must} (\srcline{src/engine/churn.rs}{538}).
+
+\rustsnippet[label={lst:cfg-analyzer-dominance-on-all-paths}]{src/engine/dominance.rs}{69}{92}{l'ensemble post-domine-t-il l'entrée ?}
+
+L'idée est de chercher un contre-exemple : un chemin qui part de l'entrée,
+évite l'ensemble et atteint une feuille (un bloc sans successeur). S'il en
+existe un, la réponse est non ; sinon oui. Plusieurs détails comptent :
+\begin{itemize}
+  \item \emph{Toute feuille compte.} Un \code{Return} comme un
+    \code{Unreachable} (\code{throw}) : \code{cfg.successors} est vide dans
+    les deux cas. Un chemin d'exception qui évite l'ensemble suffit à dire
+    non. C'est le choix prudent pour un fait must.
+  \item \emph{Le parcours est un DFS.} Le commentaire dit \og BFS\fg, mais
+    \code{Vec::pop} dépile le dernier élément. Le résultat est le même,
+    seul l'ordre de visite change.
+  \item \emph{Un cycle qui évite l'ensemble ne dit pas non.} Un chemin infini
+    n'atteint aucune feuille. En particulier, sur un CFG qui ne contient
+    aucune feuille atteignable (une boucle \code{while (true)} sans
+    \code{break}), la fonction rend \emph{vrai pour tout ensemble} ; la
+    sonde l'a vérifié avec un ensemble réduit à un bloc inexistant.
+\end{itemize}
+
+\begin{remarque}
+  Cette vacuité contraste avec \code{ExitDominance}, dont la documentation
+  dit qu'\og a CFG with no reachable exit proves nothing in either
+  direction\fg{} et qui rend \code{None}. Les deux quantificateurs n'ont pas
+  la même convention sur un corps qui ne termine jamais, ni sur
+  \code{throw} (une feuille pour \code{on_all_paths}, pas une sortie pour
+  \code{ExitDominance}). Chacune est défendable pour son usage ; il faut le
+  savoir avant de remplacer l'une par l'autre.
+
+  \regle{infinite-loop} appelle \code{must_on_all_paths} sur le CFG d'un
+  effet réel, jamais sur un CFG construit à la main : la question est donc
+  de savoir si un tel corps peut n'avoir aucune feuille atteignable. La
+  réponse est non. \code{lower_while}
+  (\src{src/lowering/cfg_builder.rs}{603}{632}) ajoute
+  \emph{inconditionnellement} l'arête \code{IfFalse} vers le bloc de sortie
+  de la boucle, que la condition soit ou non un littéral \code{true} ; la
+  \cref{sec:cfg-analyzer-dominance-gardes} a montré que le raffinement de
+  garde n'élague jamais une arête. Un \code{while (true)} lowé garde donc
+  toujours une sortie structurellement atteignable, et le corps entier finit
+  par un \code{Return} scellé par l'\adr{25}. La vacuité de
+  \code{on_all_paths} n'a donc pas d'incidence connue sur
+  \regle{infinite-loop} au commit \snapshotCommit{} : elle reste une
+  possibilité théorique du treillis, pas un cas observé, et un CFG où elle
+  se manifesterait devrait être construit à la main comme celui de la sonde.
+\end{remarque}
+
+Sur la \cref{fig:cfg-analyzer-dominance-dom}, la sonde donne :
+$\{1\}$ non (le chemin par B2 l'évite), $\{1, 2\}$ oui, $\{3\}$ oui,
+$\{4\}$ non (on peut sortir sans entrer dans la boucle), $\{5\}$ oui. Sur le
+diamant seul (\src{src/engine/dominance.rs}{192}{258}), $\{1\}$ non,
+$\{1,2\}$ oui, $\{3\}$ oui. On voit la différence avec la dominance : aucun
+bloc de $\{1, 2\}$ ne domine B3, mais l'ensemble est sur tous les chemins.
+
+\code{on_all_paths} n'est pas la seule implémentation du quantificateur
+\og sur tous les chemins\fg. \code{must_setter_on_all_paths}
+(\src{src/rules/api/query.rs}{527}{622}) porte sa propre analyse must en
+avant sur des booléens, et teste tous les blocs \code{Return} et
+\code{Unreachable}. La couche règles et sa façade typée
+\code{must_on_all_paths} (\src{src/rules/api/query.rs}{624}{640}) sont
+présentées au \cref{chap:api-regles}. L'ADR-042 (§6) a déplacé
+\code{on_all_paths} des règles vers \file{src/engine/dominance.rs} : c'est une
+propriété du CFG, et le graphe de churn, qui est un produit du moteur, en a
+besoin.
+
+% ===========================================================================
+\section{Sonder après convergence : \code{eval_in_stores} et \code{ConvergedEval}}
+\label{sec:cfg-analyzer-dominance-sondes}
+
+\subsection{Le problème}
+
+Après le point fixe, les relations du moteur et les règles ont besoin de
+\emph{valeurs} : que vaut la dep \code{options} de cet effet ? l'argument de
+ce setter est-il un objet frais ? Elles ne relancent pas \code{analyze_cfg} :
+elles évaluent une expression dans un environnement donné (souvent
+\code{exit_env}), contre les stores du composant.
+
+\begin{definition}{Sonde post-convergence}{cfg-analyzer-dominance-sonde}
+  Une \terme{sonde} est l'évaluation d'une expression de l'IR, dans un
+  environnement donné, contre une \emph{copie} des stores d'un composant,
+  après son point fixe. Elle ne modifie ni les stores ni le tas du résultat.
+\end{definition}
+
+\subsection{Le cœur : \code{eval_in_stores}}
+
+\rustsnippet[label={lst:cfg-analyzer-dominance-eval-in-stores}]{src/engine/eval.rs}{31}{46}{le cœur mécanique de toute sonde}
+
+La fonction clone l'état et les mémos, construit un \code{AnalysisCtx} nul
+(\code{NullCtx}, pas d'inter-composants) et appelle \code{eval_expr}. Le tas,
+lui, est emprunté mutablement : l'appelant passe un tas jetable, parce que
+l'évaluation \emph{écrit} dans le tas (un \code{ObjectLit} sondé y crée une
+entrée). Le choix des stores est laissé à l'appelant, et la documentation
+(\src{src/engine/eval.rs}{19}{30}) insiste : les stores convergés et un tas
+convergé, ou des stores vides pour une évaluation \og au montage\fg, ne sont
+pas interchangeables.
+
+\subsection{La couche commune : \code{ConvergedEval}}
+
+\rustsnippet[label={lst:cfg-analyzer-dominance-converged}]{src/engine/eval.rs}{61}{80}{le cas commun : stores et tas convergés}
+
+\rustsnippet[label={lst:cfg-analyzer-dominance-eval-struct}]{src/engine/eval.rs}{89}{105}{un évaluateur réutilisable}
+
+\code{result.evaluator()} rend un \code{Eval} qui possède \emph{une} copie du
+tas convergé ; \code{at} évalue une expression contre l'état, les mémos et ce
+tas. \code{eval_in} est la version à un coup. Réutiliser le même
+\code{Eval} pour plusieurs sondes (toutes les deps d'un effet, par exemple
+\srcline{src/rules/impls/missing_deps.rs}{155}) évite un clone du tas par
+expression ; c'est sûr parce qu'un \code{ExprId} nomme un seul site
+d'allocation (\cref{def:site}, \issue{134}) : sonder deux fois le même site
+réécrit sa propre entrée, deux sites ne se télescopent pas.
+
+\begin{piege}
+  L'histoire de cette couche est celle d'un faux négatif (\issue{135}).
+  Le tas était un argument de l'appelant, au motif qu'un tas vide et un tas
+  convergé étaient deux choix légitimes. Quatre sites sur six avaient choisi
+  le tas vide, à tort : une lecture de membre (\code{obj.f},
+  \code{form.onSubmit}) ne se résout que par le tas, un tas vide répond
+  $\Top$, et $\Top$ est le côté \emph{silencieux} de presque tous les
+  prédicats des règles (\og je ne sais pas si c'est frais, je ne dis
+  rien\fg). Le correctif a été central et non site par site : figer le cas
+  commun dans \code{ConvergedEval} (\src{src/engine/eval.rs}{48}{60}). Un
+  site qui veut réellement des stores vides appelle \code{eval_in_stores}
+  directement.
+\end{piege}
+
+\code{eval_in_stores} vivait dans \file{rules/helpers} ; l'ADR-042 (§6) l'a
+descendue dans le moteur, parce que les relations dérivées après convergence
+(fraîcheur des écrivains, déclencheurs d'effets, graphe de churn) en ont
+besoin et ne peuvent dépendre de la couche règles. Le point fixe l'utilise
+lui-même pour \relation{effect_triggers} (\src{src/engine/fixpoint.rs}{647}{667}).
+
+% ===========================================================================
+\section{Terminaison et complexité}
+\label{sec:cfg-analyzer-dominance-terminaison}
+
+\subsection{Pourquoi une passe termine}
+
+\begin{invariant}{Tout cycle porte un arc arrière}{cfg-analyzer-dominance-back}
+  Dans un CFG produit par le lowering, tout cycle contient au moins une arête
+  \code{EdgeKind::Back}. Le lowering marque ainsi la fin du corps d'un
+  \code{while}, d'un \code{for}, d'un \code{for...of}, le retour d'un
+  \code{do...while} et tout \code{continue}
+  (\cref{def:lowering-back} ; \srcline{src/lowering/cfg_builder.rs}{350},
+  \srcline{src/lowering/cfg_builder.rs}{396}, \srcline{src/lowering/cfg_builder.rs}{629},
+  \srcline{src/lowering/cfg_builder.rs}{699}, \srcline{src/lowering/cfg_builder.rs}{768}).
+\end{invariant}
+
+\begin{theoreme}{Terminaison d'une passe}{cfg-analyzer-dominance-terminaison}
+  Sous l'\cref{inv:cfg-analyzer-dominance-back}, \code{analyze_cfg} termine
+  sur tout CFG fini.
+\end{theoreme}
+
+\noindent\emph{Esquisse.} Chaque entrée $\mathit{In}[s]$ ne fait que croître :
+elle est remplacée par un join ou un widening d'elle-même, tous deux
+au-dessus d'elle (\code{widen_to} $\lgeq$ join,
+\cref{thm:treillis-simples-widen-to}). Un bloc n'est enfilé que si son entrée
+change strictement. Il suffit donc de montrer que chaque entrée ne change
+qu'un nombre fini de fois.
+\begin{itemize}
+  \item Dans une valeur \code{StateValue}, seule la composante numérique est
+    de hauteur infinie : booléens, nullité, stabilité, setters et
+    \code{StrConst} sont de hauteur finie
+    (\cref{chap:treillis-simples,chap:statevalue-stabilite}). Une variable
+    qui apparaît ou disparaît d'un côté passe à $\Top$, qui est le sommet.
+    Le nombre de variables est borné par le CFG.
+  \item Sur l'entrée d'un en-tête, à partir de la
+    \code{widen_threshold}-ième arrivée par un arc arrière, la composante
+    numérique passe par \code{widen_to}, qui ne peut changer une borne
+    qu'un nombre fini de fois ($T$ est fini, puis $\pm\infty$).
+  \item Un bloc qui n'est pas un en-tête reçoit un join d'un nombre fini de
+    prédécesseurs. Retirer les arcs arrière rend le graphe acyclique
+    (invariant) : par récurrence dans l'ordre topologique de ce graphe
+    acyclique, une fois que les en-têtes ne changent plus, chaque bloc ne
+    reçoit plus qu'un nombre fini de valeurs différentes.
+\end{itemize}
+Le nombre total de changements est donc fini, et la file finit par se vider.
+\qed
+
+Il faut remarquer que les arrivées par un arc \emph{non} arrière sur un
+en-tête (depuis le pré-en-tête) sont jointes, jamais widenées. C'est suffisant,
+parce que le pré-en-tête est hors de la boucle : dans une boucle imbriquée,
+l'entrée qu'il transmet ne croît qu'autant que la boucle extérieure, elle-même
+bornée par son propre arc arrière.
+
+\begin{piege}
+  L'invariant est fragile, et sa violation ne se voit pas : un cycle dont
+  aucune arête n'est marquée \code{Back} n'est jamais widené. Le cas s'est
+  produit : un \code{continue} émis avec une arête \code{Unconditional}.
+  Le commentaire de la fixture qui l'épingle le raconte :
+  \og Marked \code{Unconditional}, the join grew \code{i} by one per pass
+  and the fixpoint never terminated\fg{}
+  (\src{tests/fixtures/widening.tsx}{51}{54}). Toute modification du lowering
+  qui crée un cycle doit marquer son arête de retour ; toute greffe
+  (\cref{chap:splice-inlining}) doit conserver la nature des arêtes.
+\end{piege}
+
+\subsection{Complexité}
+
+Soient $N$ le nombre de blocs, $E$ le nombre d'arêtes, $h$ le nombre maximal
+de changements d'une entrée (borné par la hauteur des domaines après
+widening). Le \cref{tab:cfg-analyzer-dominance-complexite} résume les coûts,
+tels qu'ils se lisent dans le code.
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}p{3.3cm}p{5.2cm}p{5.4cm}@{}}
+\toprule
+fonction & coût & d'où il vient \\
+\midrule
+\code{analyze_cfg} & $O(h \cdot N)$ visites ; chaque visite : transfert, clone de l'entrée et des mémos, $O(E)$ par successeur & \code{is_back} parcourt \code{cfg.edges} pour chaque successeur (lignes 92 à 95) \\
+\code{compute_dominators} & $O(R \cdot N \cdot (E + N))$ pour $R$ tours & \code{predecessors} en $O(E)$, intersections d'ensembles en $O(N)$ \\
+\code{dominates} (méthode) & $O(1)$ attendu & test d'appartenance dans un \code{HashSet} \\
+\code{dominates} (libre) & un \code{compute_dominators} par appel & à éviter en boucle \\
+\code{on_all_paths} & $O(N \cdot E)$ & chaque bloc visité appelle \code{successors} en $O(E)$ \\
+\code{entry_env_of} & $O(E)$ + un \code{outgoing} par prédécesseur & filtre des arêtes entrantes \\
+\bottomrule
+\end{tabular}
+\caption{Coûts des fonctions du chapitre.}
+\label{tab:cfg-analyzer-dominance-complexite}
+\end{table}
+
+Aucun de ces coûts ne pose problème sur des corps de composants, qui ont
+typiquement quelques dizaines de blocs ; le seul piège documenté est la
+reconstruction de la dominance par question, qui a motivé
+\code{DominatorTree} (\og the fix for \code{dominates()} driving per-rule
+quadratic recomputation\fg, \src{src/engine/dominance.rs}{94}{95}). Pour le
+nombre de tours $R$ de \code{compute_dominators}, le parcours en RPO fait que,
+sur un CFG réductible, quelques tours suffisent ; l'exemple de la
+\cref{fig:cfg-analyzer-dominance-dom} en fait deux.
+
+\subsection{Deux interpréteurs de CFG}
+
+\begin{remarque}
+  \code{analyze_cfg} n'est pas le seul interpréteur de CFG du projet.
+  \code{exec_body_impl} (\file{src/domains/interp/interpreter.rs},
+  \cref{chap:transfert-stores}) exécute les corps de fonctions imbriquées
+  (callbacks, \code{.then}, updaters, initialiseurs) en une seule passe
+  topologique, arcs arrière ignorés et sans widening : une valeur portée par
+  une boucle n'y est vue qu'à sa première itération. Les deux issues ouvertes
+  \issue{12} (\og Two CFG interpreters of different strength, and nothing
+  says which ran\fg) et \issue{21} (faux négatif sur les valeurs portées par
+  une boucle dans un callback) suivent cette asymétrie. Le handler de
+  \code{onClick} passe par \code{analyze_cfg} ; la flèche passée à
+  \code{setTimeout} dans un effet passe par \code{exec_body_impl}.
+\end{remarque}
+
+% ===========================================================================
+\begin{resume}
+\begin{itemize}
+  \item \code{analyze_cfg} (\file{src/engine/cfg_analyzer.rs}) interprète un
+    CFG par worklist FIFO : environnements d'entrée et de sortie par bloc,
+    un seul store d'état pour toute la passe (insensible au flot, mis à jour
+    faiblement), un tas partagé entre passes, des mémos figés. Elle rend les
+    environnements de \emph{sortie} (malgré la documentation de
+    \code{BlockEnvs}) et le store enrichi.
+  \item Fusion : première arrivée, join, et \code{widen_to} à seuils sur un
+    arc \code{Back} dès la \code{widen_threshold}-ième arrivée (3), compteur
+    par en-tête local à la passe. Les seuils sont les littéraux numériques du
+    composant. Le narrowing descendant de l'ADR-014 n'existe pas : le
+    widening à seuils sur l'arc interne suffit (\code{[0,5]} en tête,
+    \code{[5,5]} en sortie de la boucle \code{i < 5}).
+  \item Les effets de bord d'un \code{Return} sont exécutés
+    (\code{exec_expr_effects}) : une flèche concise écrit.
+  \item \code{narrow_env_for_branch} raffine une variable comparée à un
+    littéral, à \code{null}/\code{undefined}, ou testée pour sa vérité ;
+    tout autre motif ne raffine rien. Une garde réfutée n'élimine pas sa
+    branche (FP de \code{Dead}).
+  \item Une passe finie est un post-point fixe des équations de blocs ;
+    \code{entry_env_of} relit l'entrée d'un bloc par un join jamais widené ;
+    \code{exit_env} joint les sorties des \code{Return} atteints (par
+    \code{reduce} : la table vide n'est pas neutre).
+  \item \code{compute_dominators} calcule les ensembles de dominateurs en
+    RPO ; \code{DominatorTree} les mémorise ; \code{ExitDominance} ne compte
+    que les \code{Return} atteignables (ADR-025) ; \code{on_all_paths}
+    cherche un chemin qui évite un ensemble et atteint une feuille, \code{throw}
+    compris.
+  \item \code{eval_in_stores} est le cœur de toute sonde post-convergence ;
+    \code{ConvergedEval}/\code{Eval} en figent le cas commun avec le tas
+    convergé (\issue{135}).
+  \item Fichiers : \file{src/engine/cfg_analyzer.rs},
+    \file{src/engine/dominance.rs}, \file{src/engine/eval.rs}, et dans
+    \file{src/engine/fixpoint.rs} \code{exit_env} et
+    \code{collect_thresholds}.
+\end{itemize}
+Le \cref{chap:point-fixe-composant} enchaîne ces passes : rendu, mémos, effets,
+handlers, test de convergence et widening de l'état, puis les passes d'après
+convergence.
+\end{resume}
+
+% ===========================================================================
+\section*{Exercices}
+\addcontentsline{toc}{section}{Exercices}
+\label{sec:cfg-analyzer-dominance-exercices}
+
+\begin{exercice}{Dominateurs d'un losange}{cfg-analyzer-dominance-losange}
+  Soit le losange du test \code{diamond_cfg}
+  (\src{src/engine/dominance.rs}{192}{258}) : B0 se branche vers B1 et B2,
+  qui sautent tous deux vers B3, terminé par \code{return}.
+  \begin{enumerate}
+    \item Donner un RPO possible, puis dérouler \code{compute_dominators}
+      tour par tour.
+    \item Que rendent \code{dominates(1, 3)}, \code{on_all_paths} sur
+      $\{1\}$ et \code{on_all_paths} sur $\{1, 2\}$ ?
+    \item On ajoute un bloc B4 terminé par \code{return}, sans arête
+      entrante. Que devient $\mathrm{Dom}(4)$ ? \code{ExitDominance}
+      compte-t-il B4 parmi les sorties ?
+  \end{enumerate}
+\end{exercice}
+\begin{solution}
+  (1) Le DFS visite B1 puis B3, puis B2 : post-ordre $[3,1,2,0]$, RPO
+  $[0,2,1,3]$. Premier tour : $\mathrm{Dom}(2) = \{0,2\}$, $\mathrm{Dom}(1)
+  = \{0,1\}$, $\mathrm{Dom}(3) = \{3\} \cup (\{0,1\} \cap \{0,2\}) =
+  \{0,3\}$. Second tour : rien ne change. (2) Faux (test
+  \code{diamond_branch_does_not_dominate_join}) ; faux ; vrai (valeurs
+  relevées à la sonde). (3) B4 n'est pas dans le RPO et garde tous les
+  blocs, $\{0,1,2,3,4\}$ ; \code{ExitDominance} l'écarte car il n'est pas
+  dans \code{reachable_blocks}.
+\end{solution}
+
+\begin{exercice}{Une boucle avec des seuils}{cfg-analyzer-dominance-seuils}
+  Dérouler \code{analyze_cfg} sur l'IR de \code{let i = 0; while (i < 3) { i = i + 2; }} avec \code{widen_threshold = 3} et $T = \{0, 2, 3\}$ (les
+  littéraux du programme). Quelles sont les valeurs finales de \code{i} en
+  tête et en sortie de boucle ? Comparer à la valeur concrète.
+\end{exercice}
+\begin{solution}
+  B0 installe $\mathit{In}[B1] = [0,0]$. B1 passe $[0,0]$ au corps et un
+  intervalle vide à la sortie. Le corps renvoie $[2,2]$ ; premier retour,
+  join : $\mathit{In}[B1] = [0,2]$. B1 passe au corps $[0,2]$ (raffiné par
+  \code{i < 3}, soit \code{i <= 2}) ; le corps renvoie $[2,4]$ ; deuxième
+  retour, join : $\mathit{In}[B1] = [0,4]$. B1 raffine $[0,4]$ en $[0,2]$
+  pour le corps, \emph{égal} à son entrée : le corps n'est pas ré-enfilé, et
+  il n'y aura pas de troisième retour. La sortie reçoit $[3,4]$. Résultat :
+  $[0,4]$ en tête, $[3,4]$ en sortie, sans aucun widening (le compteur de B1
+  s'arrête à 2). La valeur concrète en sortie est 4, contenue dans $[3,4]$.
+  Ce déroulé n'a pas été exécuté ; il se relit directement sur \code{add}
+  (\src{src/domains/impls/interval.rs}{148}{156}), \code{hull}
+  (\src{src/domains/impls/interval.rs}{71}{78}) et
+  \code{narrow_lt}/\code{narrow_geq}
+  (\src{src/domains/impls/interval.rs}{262}{292}).
+\end{solution}
+
+\begin{exercice}{Lire un raffinement}{cfg-analyzer-dominance-raffinement}
+  Pour chaque condition, dire ce que reçoivent les deux branches si
+  \code{x} vaut \og nombre $[0,10]$ ou \code{null}\fg{} : \code{x < 5},
+  \code{5 > x}, \code{x != null}, \code{!x}, \code{x === 0}.
+\end{exercice}
+\begin{solution}
+  \code{x < 5} : vrai $[0,4]$ ou \code{null} (entier ; \code{null} gardé car
+  la comparaison le convertit), faux $[5,10]$ ou \code{null}. \code{5 > x} :
+  motif non reconnu, les deux branches reçoivent l'environnement inchangé.
+  \code{x != null} : vrai $[0,10]$ (\code{null} retiré), faux :
+  \code{narrow_keep_nullish_only}, \code{null} seul. \code{!x} : vrai
+  \code{narrow_falsy}, $[0,0]$ ou \code{null} ; faux \code{narrow_truthy},
+  \code{null} retiré et \code{narrow_neq(0)} sur $[0,10]$, qui ne rend $\Bot$
+  que sur le point $[0,0]$ et laisse tout autre intervalle intact
+  (\src{src/domains/impls/interval.rs}{303}{309}) : $[0,10]$. \code{x === 0} :
+  \code{narrow_eq(0)}, $[0,0]$ ou \code{null} ; faux \code{narrow_neq(0)},
+  $[0,10]$ ou \code{null}.
+\end{solution}
+
+\begin{exercice}{Pourquoi \code{!=} suffit}{cfg-analyzer-dominance-egalite}
+  Montrer que, dans \code{analyze_cfg}, la nouvelle entrée $\nu$ d'un bloc
+  vérifie toujours $\nu \lgeq \mathit{In}[s]$, et en déduire que le test
+  \code{!=} (ligne 114) équivaut à $\nu \not\lleq \mathit{In}[s]$. Quelle
+  hypothèse sur l'égalité de \code{AbstractEnv} ce raisonnement demande-t-il,
+  et la remarque sur les intervalles vides de la
+  \cref{sec:cfg-analyzer-dominance-diamant} la contredit-elle ?
+\end{exercice}
+\begin{solution}
+  $\nu$ est $\mathit{In}[s] \join \rho$ ou $\mathit{In}[s] \widen_T \rho$,
+  tous deux $\lgeq \mathit{In}[s]$ ; pour $\nu \lgeq \mathit{In}[s]$,
+  $\nu \lleq \mathit{In}[s]$ équivaut à l'égalité \emph{dans l'ordre}. Le
+  raisonnement demande que l'égalité structurelle coïncide avec l'égalité
+  d'ordre. Les intervalles vides la contredisent : deux représentations de
+  $\Bot$ sont égales pour l'ordre et différentes pour \code{==}. La
+  conséquence n'est qu'un ré-enfilage superflu (le test voit un changement
+  qui n'en est pas un), jamais un changement manqué : la terminaison n'est
+  pas menacée, car ces représentations suivent l'entrée de l'en-tête, qui se
+  stabilise.
+\end{solution}
+
+\begin{exercice}{Une garde morte}{cfg-analyzer-dominance-dead}
+  Sur \cref{lst:cfg-analyzer-dominance-dead}, expliquer pourquoi le
+  raffinement $k := \Bot$ n'empêche pas l'écriture. Proposer un test qui
+  ferait de la branche une branche morte, dire où le placer pour qu'il
+  profite à toutes les passes et à \code{entry_env_of}, et énumérer les
+  composantes de \code{StateValue} pour lesquelles il faut vérifier que
+  $\Bot$ signifie \og aucune valeur concrète\fg.
+\end{exercice}
+\begin{solution}
+  Le raffinement ne porte que sur \code{k} ; \code{n} garde sa valeur et
+  \code{setN(n + 1)} écrit. Un test naturel serait dans \code{outgoing} :
+  ne pas rendre un successeur dont l'environnement raffiné lie une variable
+  à une valeur entièrement $\Bot$, ce qui profite à \code{analyze_cfg} et à
+  \code{entry_env_of}, qui partagent \code{outgoing}. Il faut vérifier toutes
+  les composantes du produit (\code{num}, \code{boolean}, \code{str},
+  \code{reference}, \code{null}, \code{undef}, \code{setter}, \code{other}),
+  et en particulier que \code{other}, jamais retiré par les raffinements,
+  soit faux. Ce n'est pas fait au commit \snapshotCommit{}.
+\end{solution}

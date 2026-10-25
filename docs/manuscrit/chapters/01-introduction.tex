@@ -1,0 +1,1575 @@
+% ---------------------------------------------------------------------------
+% Chapitre 01 — Introduction : pourquoi analyser statiquement React ?
+% Sources : notes/16 (§1, §6), notes/10 et 11 (bug React visé), notes/13 (§6.1),
+% notes/15 (§5.1), README.md, docs/usage.md. Sorties observées au commit e67b10a
+% (binaire target/debug/reactant), fichiers d'exemple sous /tmp/ch01/.
+% ---------------------------------------------------------------------------
+\chapter{Introduction : pourquoi analyser statiquement React ?}
+\label{chap:introduction}
+
+\begin{objectifs}
+  \item Reconnaître trois défauts React typiques et ce qui se passe réellement à l'exécution.
+  \item Comprendre pourquoi un linter syntaxique ne suffit pas.
+  \item Saisir l'idée directrice : interpréter abstraitement un composant.
+  \item Connaître la promesse de l'outil : trois niveaux de diagnostic et la soundness.
+  \item Lancer \reactant{} et lire ses sorties humaine et JSON.
+  \item Situer le projet (taille, règles, décisions) et choisir un parcours de lecture.
+\end{objectifs}
+
+\prerequis{aucun. Il suffit de savoir écrire un composant React avec \code{useState} et \code{useEffect}, et de lire du Rust.}
+
+Un composant React est une fonction courte. On la lit en quelques secondes, on
+la teste en quelques minutes, et pourtant les défauts qu'elle contient sont
+parmi les plus coûteux d'une application web : un onglet qui gèle, un écran qui
+affiche les données d'un autre utilisateur, un chronomètre qui reste bloqué.
+Ces défauts ont un point commun : ils ne se voient pas dans le texte du
+composant, mais dans la \emph{suite de ses exécutions}. Ce chapitre explique
+pourquoi il faut, pour les trouver, raisonner sur toutes ces exécutions à la
+fois, et comment \reactant{} s'y prend. Il reste volontairement informel : les
+chapitres suivants reprennent chaque idée avec sa définition exacte et le code
+qui l'incarne.
+
+\section{Trois programmes React fautifs}
+\label{sec:introduction-trois-bugs}
+
+Commençons par trois composants très simples. Chacun compile, s'affiche, et
+passe un test qui vérifie le premier rendu. Chacun est pourtant faux. Pour
+comprendre en quoi, il faut d'abord rappeler dans quel ordre React exécute un
+composant.
+
+\begin{react}[le cycle rendu, commit, effets]
+  React exécute un composant en trois temps~\cite{ReactRenderCommit}.
+  \begin{enumerate}
+    \item \textbf{Déclenchement.} Un rendu est demandé soit parce que le
+      composant apparaît pour la première fois (le \emph{montage}), soit parce
+      qu'un état a été mis à jour par un setter (\code{setN(...)}) dans ce
+      composant ou dans l'un de ses ancêtres.
+    \item \textbf{Rendu.} React \emph{appelle} la fonction du composant. Elle
+      lit l'état courant, calcule le JSX et ne doit rien faire d'autre : le
+      rendu est un calcul pur.
+    \item \textbf{Commit.} React reporte dans le DOM les différences entre
+      l'ancien et le nouveau JSX.
+  \end{enumerate}
+  Viennent ensuite les \textbf{effets} : après le commit, React exécute les
+  fonctions passées à \code{useEffect}. Sans tableau de deps, un effet
+  s'exécute après \emph{chaque} commit ; avec \code{[]}, une seule fois après
+  le montage ; avec \code{[a, b]}, seulement si l'un des deps a changé depuis
+  le rendu précédent, la comparaison se faisant par \code{Object.is}. Enfin,
+  un setter ne modifie pas la variable du rendu en cours : il \emph{planifie}
+  un nouveau rendu, dans lequel \code{useState} renverra la nouvelle valeur.
+  Si cette valeur est identique à l'ancienne (encore au sens de
+  \code{Object.is}), React peut s'épargner le re-rendu.
+\end{react}
+
+\Cref{fig:introduction-cycle-react} résume ce cycle. La flèche qui remonte des
+effets vers le rendu est la source de tous les ennuis de ce chapitre : un effet
+qui appelle un setter relance le cycle.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=9mm and 11mm]
+  \node[bloc] (trig) {déclenchement\\{\scriptsize montage ou setter}};
+  \node[bloc,right=of trig] (render) {rendu\\{\scriptsize appel du composant}};
+  \node[bloc,right=of render] (commit) {commit\\{\scriptsize mise à jour du DOM}};
+  \node[bloc,right=of commit] (eff) {effets\\{\scriptsize \texttt{useEffect}}};
+  \draw[fleche] (trig) -- (render);
+  \draw[fleche] (render) -- (commit);
+  \draw[fleche] (commit) -- (eff);
+  \draw[flechemay] (eff.south) -- ++(0,-8mm) -| node[etiquette,pos=0.25,below]{un effet appelle un setter : nouveau rendu planifié} (render.south);
+  \draw[flechemay] (eff.north) -- ++(0,7mm) -| node[etiquette,pos=0.25,above]{un handler (clic, frappe\dots) appelle un setter} (trig.north);
+\end{tikzpicture}
+\caption{Le cycle d'exécution d'un composant React. Les flèches pointillées
+sont les retours possibles : un effet ou un handler qui appelle un setter
+planifie un nouveau rendu.}
+\label{fig:introduction-cycle-react}
+\end{figure}
+
+\subsection{Premier défaut : la boucle infinie}
+
+\begin{lstlisting}[language=TypeScript,caption={\code{Counter} : un effet sans deps qui écrit l'état qu'il lit (\file{/tmp/ch01/loop.tsx})},label={lst:introduction-loop}]
+import { useEffect, useState } from "react";
+
+export function Counter() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    setN(n + 1);
+  });
+  return <p>{n}</p>;
+}
+\end{lstlisting}
+
+Déroulons la \cref{lst:introduction-loop} à la main. Au montage, \code{n} vaut
+\code{0} ; le rendu produit \code{<p>0</p>}, React le commit, puis exécute
+l'effet, qui appelle \code{setN(1)}. Un rendu est planifié : \code{n} vaut
+\code{1}, commit, et comme l'effet n'a pas de tableau de deps, il s'exécute de
+nouveau et appelle \code{setN(2)}. Et ainsi de suite : \code{n} prend les
+valeurs $0, 1, 2, 3, \dots$ sans fin, chaque valeur étant différente de la
+précédente, si bien que React ne peut jamais s'épargner le re-rendu. Le
+navigateur passe son temps à rendre ce composant ; en développement, React
+finit par se plaindre dans la console d'un nombre excessif de mises à jour
+imbriquées.
+
+Ce défaut est \emph{certain} : aucune entrée, aucun clic, aucune prop ne
+l'empêche. Il n'apparaît pourtant pas dans un test qui ne regarde que le premier
+rendu, puisque celui-ci est correct.
+
+\subsection{Deuxième défaut : la dépendance oubliée}
+
+\begin{lstlisting}[language=TypeScript,caption={\code{Profile} : l'effet lit \code{userId} mais ne le déclare pas (\file{/tmp/ch01/deps.tsx})},label={lst:introduction-deps}]
+import { useEffect, useState } from "react";
+
+export function Profile({ userId }: { userId: string }) {
+  const [user, setUser] = useState(null);
+  useEffect(() => {
+    fetch(`/api/users/${userId}`)
+      .then((r) => r.json())
+      .then(setUser);
+  }, []);
+  return <p>{user ? user.name : "..."}</p>;
+}
+\end{lstlisting}
+
+Ici, pas de boucle. Au montage, l'effet charge l'utilisateur \code{userId} et
+l'affiche. Mais le tableau de deps est vide : l'effet ne s'exécutera \emph{plus
+jamais}. Si le parent rend ensuite \code{<Profile userId="bob" />} à la place
+de \code{<Profile userId="alice" />}, le composant est re-rendu avec la
+nouvelle prop, mais l'effet ne tourne pas, et l'écran continue d'afficher
+Alice. Rien ne plante ; l'interface ment, en silence.
+
+Ce défaut-là n'est pas certain au même sens que le premier : il ne se manifeste
+que si \code{userId} change effectivement pendant la vie du composant, ce que le
+composant seul ne permet pas de savoir.
+
+\subsection{Troisième défaut : la fermeture figée}
+
+\begin{lstlisting}[language=TypeScript,caption={\code{Timer} : le callback de \code{setInterval} lit une valeur figée au montage (\file{/tmp/ch01/timer.tsx})},label={lst:introduction-timer}]
+import { useEffect, useState } from "react";
+
+export function Timer() {
+  const [seconds, setSeconds] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => {
+      setSeconds(seconds + 1);
+    }, 1000);
+    return () => clearInterval(id);
+  }, []);
+  return <p>{seconds} s</p>;
+}
+\end{lstlisting}
+
+L'effet de la \cref{lst:introduction-timer} s'exécute une fois, au montage, et
+installe un intervalle. Le callback passé à \code{setInterval} est une
+fermeture (\emph{closure}) : il capture la variable \code{seconds}
+\emph{du rendu de montage}, qui vaut \code{0}, et la gardera toute sa vie. À la
+première seconde, il appelle \code{setSeconds(0 + 1)} : l'écran affiche
+\og 1 s\fg{}. À la deuxième, il appelle encore \code{setSeconds(0 + 1)}, car
+sa variable \code{seconds} vaut toujours \code{0}. L'état reste à \code{1},
+React constate par \code{Object.is} que rien n'a changé, et le chronomètre
+reste bloqué à \og 1 s\fg{} pour toujours. On parle de \terme{stale closure}
+(fermeture périmée).
+
+La correction consiste à ne plus lire la variable capturée, mais à passer au
+setter une \emph{fonction de mise à jour} (un \emph{updater}) :
+\code{setSeconds((s) => s + 1)}. React appelle cette fonction avec la valeur
+courante de l'état, et non celle du montage.
+
+\subsection{Ce que ces trois exemples ont en commun}
+
+\Cref{tab:introduction-trois-bugs} met les trois défauts côte à côte. Aucun
+n'est visible au premier rendu ; tous dépendent de la \emph{succession} des
+rendus, commits et effets ; et chacun demande de savoir quelque chose sur
+\emph{toutes} les exécutions possibles du composant : que \code{n} ne se
+stabilise jamais, que \code{userId} peut changer, que \code{seconds} lu par le
+callback est toujours la valeur du montage.
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}lXXl@{}}
+  \toprule
+  Composant & Symptôme à l'exécution & Condition d'apparition & Nature \\
+  \midrule
+  \code{Counter} & rendus sans fin, onglet saturé & toujours, dès le montage & certain \\
+  \code{Profile} & données d'un autre utilisateur & si la prop \code{userId} change & possible \\
+  \code{Timer}   & affichage bloqué à \og 1 s\fg{} & toujours, dès la deuxième seconde & certain \\
+  \bottomrule
+\end{tabularx}
+\caption{Les trois défauts d'ouverture. La dernière colonne annonce la
+distinction entre défaut certain et défaut possible, qui structure les niveaux
+de diagnostic (\cref{sec:introduction-promesse}).}
+\label{tab:introduction-trois-bugs}
+\end{table}
+
+\section{Ce qu'un linter syntaxique voit, et ce qu'il ne voit pas}
+\label{sec:introduction-linter}
+
+L'outil que tout projet React installe d'abord est un \emph{linter} :
+\code{eslint-plugin-react-hooks}, avec ses deux règles historiques
+\code{rules-of-hooks} et \code{exhaustive-deps}~\cite{ReactRulesOfHooks}. Il
+est rapide, il tourne dans l'éditeur, et il attrape une partie des défauts
+précédents. Pour comprendre ce qu'il ne peut pas attraper, il faut préciser ce
+qu'il regarde.
+
+\begin{definition}{Analyse syntaxique d'un composant}{introduction-syntaxique}
+  Une \terme{analyse syntaxique} (ou \emph{lexicale}) décide à partir de la
+  \emph{forme} du texte : elle parcourt l'arbre de syntaxe d'une fonction, dans
+  un fichier, et reconnaît des motifs (un appel \code{useX} sous un \code{if},
+  un identifiant lu dans un effet et absent du tableau de deps). Elle ne
+  calcule pas les \emph{valeurs} que prennent les variables quand le programme
+  s'exécute.
+\end{definition}
+
+\subsection{Ce que la forme suffit à voir}
+
+Deux des défauts de la \cref{sec:introduction-trois-bugs} sont écrits \og en
+toutes lettres\fg{}. Dans \code{Profile} (\cref{lst:introduction-deps}),
+l'identifiant \code{userId} apparaît dans le corps de l'effet et pas dans
+\code{[]} : il suffit de comparer deux listes de noms, et c'est exactement ce
+que fait \code{exhaustive-deps}. De même, un hook appelé après un retour
+anticipé est reconnaissable sur l'arbre de syntaxe :
+
+\begin{lstlisting}[language=TypeScript,caption={\code{Panel} : un \code{useState} après un retour anticipé (\file{/tmp/ch01/cond.tsx})},label={lst:introduction-cond}]
+import { useState } from "react";
+
+export function Panel({ open }: { open: boolean }) {
+  if (!open) return null;
+  const [tab, setTab] = useState(0);
+  return <button onClick={() => setTab(tab + 1)}>{tab}</button>;
+}
+\end{lstlisting}
+
+\begin{react}[les hooks sont identifiés par leur rang]
+  React ne connaît pas le \emph{nom} des variables d'état : il range les hooks
+  d'un composant dans une liste, dans l'ordre où ils sont appelés, et les
+  retrouve au rendu suivant par leur \emph{position}~\cite{ReactRulesOfHooks}.
+  Si un rendu appelle un hook de moins (ici, quand \code{open} vaut
+  \code{false}), tous les hooks suivants sont décalés d'un cran. D'où la règle :
+  les hooks s'appellent au premier niveau du composant, jamais sous une
+  condition, une boucle ou après un \code{return} conditionnel.
+\end{react}
+
+\reactant{} signale ces deux composants, comme le ferait le linter :
+
+\begin{sortie}
+  Panel  (2 hooks)  /tmp/ch01/cond.tsx
+    error  conditional-hook  [hook:0]  (line 5:8)  this hook is called conditionally (not on every render path)
+       (1 trace step(s), rerun with --trace)
+
+  Profile  (2 hooks)  /tmp/ch01/deps.tsx
+    warn   missing-deps  [hook:1]  var:userId  (line 5:2)  `userId` is used in this effect but not in its deps array, and its value may change between renders
+       (1 trace step(s), rerun with --trace)
+\end{sortie}
+
+(Sorties de deux exécutions séparées, \code{check --no-color} sur chacun des
+fichiers, juxtaposées ; les lignes de bilan sont omises.) On lira ces lignes en
+détail à la \cref{sec:introduction-prise-en-main}. Remarquons seulement que les
+deux diagnostics n'ont pas le même niveau : \code{error} pour le hook
+conditionnel, \code{warn} pour la dépendance oubliée. Ce n'est pas un hasard,
+et la \cref{sec:introduction-promesse} en donne la raison.
+
+\subsection{Ce que la forme ne voit pas}
+
+Reprenons maintenant la boucle infinie de \code{Counter}, mais écrite
+\og proprement\fg{}, avec un tableau de deps complet :
+
+\begin{lstlisting}[language=TypeScript,caption={\code{Counter} avec des deps complètes (\file{/tmp/ch01/deps_ok.tsx})},label={lst:introduction-deps-ok}]
+import { useEffect, useState } from "react";
+
+export function Counter() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    setN(n + 1);
+  }, [n]);
+  return <p>{n}</p>;
+}
+\end{lstlisting}
+
+Pour \code{exhaustive-deps}, tout va bien : l'effet lit \code{n}, et \code{n}
+est dans ses deps. Et pourtant le composant boucle exactement comme la
+\cref{lst:introduction-loop} : à chaque exécution, l'effet écrit une valeur
+différente de \code{n}, donc le dep \code{n} change, donc l'effet se
+ré-exécute. La règle a vérifié une propriété de la \emph{forme} (\og la liste
+est complète\fg{}) ; le défaut est une propriété de la \emph{suite des valeurs}
+(\og \code{n} ne se stabilise jamais\fg{}). Aucun motif syntaxique ne peut
+trancher ce second point en général : il faudrait savoir que \code{n + 1} n'est
+jamais égal à \code{n}, et que rien ne vient arrêter la progression.
+Comparez avec la variante bornée \code{if (n < 3) setN(n + 1)}, syntaxiquement
+presque identique, qui s'arrête d'elle-même à \code{3}.
+
+Même si l'on acceptait une règle approximative, du genre \og un effet qui
+appelle le setter d'un état figurant dans ses deps\fg{}, il suffit d'une
+indirection pour que le motif ne corresponde plus. Voici les trois indirections
+que le plan de ce chapitre annonçait, chacune sur un programme de quelques
+lignes.
+
+\paragraph{Un alias de setter.} Le setter est rangé dans une autre variable
+avant d'être appelé :
+
+\begin{lstlisting}[language=TypeScript,caption={Alias de setter (\file{/tmp/ch01/alias.tsx})},label={lst:introduction-alias}]
+import { useEffect, useState } from "react";
+
+export function Counter() {
+  const [n, setN] = useState(0);
+  const bump = setN;
+  useEffect(() => {
+    bump(n + 1);
+  }, [n]);
+  return <p>{n}</p>;
+}
+\end{lstlisting}
+
+Syntaxiquement, \code{bump} est une variable locale quelconque. Pour savoir
+qu'appeler \code{bump} écrit l'état \code{n}, il faut suivre la \emph{valeur}
+de \code{bump} depuis sa définition.
+
+\paragraph{Un hook personnalisé.} L'état et l'effet vivent dans un hook
+\code{useTicker}, que le composant se contente d'appeler :
+
+\begin{lstlisting}[language=TypeScript,caption={Boucle cachée dans un hook personnalisé (\file{/tmp/ch01/custom_hook.tsx})},label={lst:introduction-custom-hook}]
+import { useEffect, useState } from "react";
+
+function useTicker() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    setN(n + 1);
+  }, [n]);
+  return n;
+}
+
+export function Clock() {
+  const n = useTicker();
+  return <p>{n}</p>;
+}
+\end{lstlisting}
+
+Le défaut est dans \code{useTicker}, mais c'est \code{Clock} qui boucle : un
+hook n'a pas de cycle de vie propre, il s'exécute \emph{dans} le composant qui
+l'appelle. Si \code{useTicker} est dans un autre fichier, une règle qui
+travaille fichier par fichier ne voit plus du tout l'effet depuis \code{Clock}.
+
+\paragraph{Un setter passé en prop.} Le parent possède l'état et donne son
+setter à un enfant, qui l'appelle dans un effet :
+
+\begin{lstlisting}[language=TypeScript,caption={Setter du parent appelé par l'enfant (\file{/tmp/ch01/prop_setter.tsx})},label={lst:introduction-prop-setter}]
+import { useEffect, useState } from "react";
+
+function Child({ value, onChange }: { value: number; onChange: (v: number) => void }) {
+  useEffect(() => {
+    onChange(value + 1);
+  }, [value, onChange]);
+  return <p>{value}</p>;
+}
+
+export function Parent() {
+  const [n, setN] = useState(0);
+  return <Child value={n} onChange={setN} />;
+}
+\end{lstlisting}
+
+Ici, aucun des deux composants n'est fautif isolément. \code{Parent} ne fait
+que transmettre ; \code{Child} appelle une fonction \code{onChange} qu'il
+reçoit, et ses deps sont complètes. La boucle n'existe que dans la
+\emph{composition} : l'effet de \code{Child} écrit l'état de \code{Parent},
+\code{Parent} se re-rend et re-rend \code{Child} avec une nouvelle
+\code{value}, l'effet se ré-exécute.
+
+\reactant{} signale les trois (une seule invocation sur les trois fichiers,
+avec \code{--trace}) :
+
+\begin{sortie}
+  Child  (1 hooks)  prop_setter.tsx
+    warn   cross-component-infinite-loop  [hook:0]  (line 4:2)  this effect calls `onChange`, a state setter of parent `Parent` (its deps do not provably gate it, so the effect can re-run every render). Parent re-renders → child re-renders → effect fires again: infinite loop
+  Clock  (1 hooks)  custom_hook.tsx
+    warn   infinite-loop  [hook:1]  (line 5:2)  this effect keeps pushing state `n` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop
+       → state `n` is written here [hook:2] (line 5:2)
+       → the abstract value of state `n` kept growing and was widened at iteration 3
+  Counter  (2 hooks)  alias.tsx
+    warn   infinite-loop  [hook:0]  (line 6:2)  this effect keeps pushing state `n` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop
+       → state `n` is written here [hook:1] (line 6:2)
+       → the abstract value of state `n` kept growing and was widened at iteration 3
+   1 clean component(s) hidden, rerun with --show-clean
+
+⚠  3 warning(s) across 3 file(s).
+\end{sortie}
+
+Trois détails de cette sortie annoncent la suite du manuscrit. Le finding de
+\code{useTicker} est rapporté sur le composant \code{Clock}, qui est celui qui
+boucle : le hook a été \emph{inliné} dans son appelant
+(\cref{chap:splice-inlining}). Celui de \code{Child} nomme le parent
+\code{Parent} dont il écrit l'état : l'analyse a suivi le setter à travers la
+prop (\cref{chap:inter-composants}). Enfin, deux lignes parlent de la
+\og valeur abstraite\fg{} de \code{n}, qui \og a grandi\fg{} puis a été
+\og élargie à l'itération 3\fg{} : c'est le vocabulaire de l'interprétation
+abstraite, que la \cref{sec:introduction-pari} présente.
+
+Le hook personnalisé placé dans un autre fichier se comporte de même. Avec
+\code{useTicker} déplacé dans \file{/tmp/ch01/xfile/useTicker.ts} et
+\code{Clock} dans \file{/tmp/ch01/xfile/Clock.tsx}, l'analyse du dossier
+entier donne :
+
+\begin{sortie}
+  Clock  (1 hooks)  Clock.tsx
+    warn   infinite-loop  [hook:1]  (useTicker.ts:5:2)  this effect keeps pushing state `n` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop
+       → state `n` is written here [hook:2] (useTicker.ts:5:2)
+       → the abstract value of state `n` kept growing and was widened at iteration 3
+
+⚠  1 warning(s) across 2 file(s).
+\end{sortie}
+
+La position \code{(useTicker.ts:5:2)} désigne un autre fichier que celui du
+composant : le finding est ancré dans le hook, mais porté par le composant qui
+le subit (\adr{24}).
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}lXX@{}}
+  \toprule
+  Programme & Ce que la forme montre & Ce qu'il faut calculer \\
+  \midrule
+  \code{Panel} (\cref{lst:introduction-cond}) & hook après un \code{return} conditionnel & rien de plus \\
+  \code{Profile} (\cref{lst:introduction-deps}) & \code{userId} lu, absent des deps & que \code{userId} peut changer \\
+  \code{Counter} (\cref{lst:introduction-deps-ok}) & deps complètes & la suite des valeurs de \code{n} \\
+  alias (\cref{lst:introduction-alias}) & appel d'une variable locale & que \code{bump} \emph{est} le setter \\
+  \code{Clock} (\cref{lst:introduction-custom-hook}) & appel d'un hook & le corps du hook, dans son appelant \\
+  \code{Child}/\code{Parent} (\cref{lst:introduction-prop-setter}) & appel d'une prop & que la prop est le setter du parent \\
+  \bottomrule
+\end{tabularx}
+\caption{Ce que la syntaxe montre et ce qu'il faut calculer pour conclure.}
+\label{tab:introduction-syntaxe}
+\end{table}
+
+\Cref{tab:introduction-syntaxe} résume la leçon : dès qu'on quitte les deux
+premières lignes, conclure demande de connaître des \emph{valeurs} (ce que
+contient \code{n}, ce que désigne \code{bump} ou \code{onChange}) sur
+\emph{toutes} les exécutions possibles.
+
+\begin{remarque}
+  Le \file{README.md} du dépôt situe \reactant{} par rapport à
+  \code{eslint-plugin-react-hooks} et au React Compiler : le linter reste
+  l'outil juste pour les règles lexicales des hooks, dans l'éditeur ; le
+  compilateur mémoïse automatiquement et fait disparaître certains symptômes de
+  références instables, sans corriger les défauts de logique. \reactant{} ne
+  remplace ni l'un ni l'autre : il est plus lent (il calcule un point fixe sur
+  tout le programme) et vise les défauts que la forme ne montre pas. Le README
+  annonce par exemple 528 fichiers analysés en 1,8~s sur \code{excalidraw} et
+  4\,195 fichiers en 76~s sur \code{dub} (\file{README.md}, l.~121--122 ;
+  chiffres du README, non re-mesurés pour ce manuscrit).
+\end{remarque}
+
+\begin{piege}
+  \og Le linter ne dit rien\fg{} signifie au mieux \og les deps sont
+  complètes\fg{}, jamais \og l'effet se stabilise\fg{} : la
+  \cref{lst:introduction-deps-ok} a un tableau de deps irréprochable et boucle.
+  Inversement, compléter les deps pour faire taire le linter peut
+  \emph{créer} la boucle. Partons de \code{useEffect(() => \{ setN(n + 1);
+  \}, [])}, qui s'exécute une fois : \code{exhaustive-deps}, comme
+  \regle{missing-deps}, réclame \code{n} (exercice~\ref{exo:introduction-once}) ;
+  l'ajouter donne exactement la \cref{lst:introduction-deps-ok}.
+\end{piege}
+
+\section{Le pari : interpréter abstraitement le composant}
+\label{sec:introduction-pari}
+
+Si la forme ne suffit pas, que reste-t-il ? Exécuter le composant. Mais une
+exécution ne prouve rien sur les autres : elle choisit une valeur de prop, un
+ordre d'événements, un nombre de clics. Et on ne peut pas les essayer toutes :
+une prop \code{number} a des milliards de valeurs, et une boucle de rendus peut
+ne jamais s'arrêter. Le pari de \reactant{} est celui de l'\terme{interprétation
+abstraite}~\cite{CousotCousot77} : exécuter le composant \emph{une fois}, mais
+sur des \emph{descriptions d'ensembles de valeurs} plutôt que sur des valeurs.
+
+\subsection{Exécuter sur des ensembles}
+
+Revenons à \code{Counter} (\cref{lst:introduction-deps-ok}) et à sa variante
+bornée :
+
+\begin{lstlisting}[language=TypeScript,caption={\code{Bounded} : la même boucle, gardée (\file{/tmp/ch01/bounded.tsx})},label={lst:introduction-bounded}]
+import { useEffect, useState } from "react";
+
+export function Bounded() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    if (n < 3) setN(n + 1);
+  }, [n]);
+  return <p>{n}</p>;
+}
+\end{lstlisting}
+
+Au lieu de dire \og \code{n} vaut \code{0}\fg{}, l'analyseur dit \og \code{n}
+est un nombre entier compris entre \code{0} et \code{0}\fg{}, ce qu'on note par
+l'intervalle $[0,0]$. Il rejoue alors un \emph{tour} de React : il interprète le
+corps du composant (le rendu), puis le corps de l'effet. Dans \code{Counter},
+l'effet écrit \code{n + 1}, soit un nombre de $[1,1]$. L'état \code{n} peut
+donc valoir, à l'entrée du tour suivant, soit l'ancienne valeur, soit la
+nouvelle : on réunit les deux en $[0,1]$. Au tour suivant l'effet écrit
+$[1,2]$ et l'état devient $[0,2]$, puis $[0,3]$\dots{} La suite ne se stabilise
+pas, et l'analyseur ne peut pas attendre. Il applique alors une opération
+d'accélération, le \terme{widening} : la borne qui grandit est projetée d'un
+coup vers une borne sûre. Pour \code{Counter}, cette borne est $+\infty$ ;
+l'intervalle $[0,+\infty)$ est stable (l'effet y écrit $[1,+\infty)$, déjà
+inclus), l'analyse s'arrête. Pour \code{Bounded}, la borne est le seuil
+\code{3} lu dans la garde \code{n < 3} ; dans $[0,3]$, l'effet n'écrit que
+lorsque $n<3$, donc des valeurs de $[1,3]$, et l'intervalle $[0,3]$ est lui
+aussi stable.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=5mm and 7mm,
+    v/.style={bloc,minimum width=15mm,font=\small}]
+  \node[etiquette,anchor=east] (lc) at (-0.4,0) {\code{Counter}};
+  \node[v] (c0) at (0.6,0) {$[0,0]$};
+  \node[v,right=of c0] (c1) {$[0,1]$};
+  \node[v,right=of c1] (c2) {$[0,2]$};
+  \node[v,right=17mm of c2,draw=ra-amber] (c3) {$[0,+\infty)$};
+  \draw[fleche] (c0) -- node[etiquette,above]{tour} (c1);
+  \draw[fleche] (c1) -- node[etiquette,above]{tour} (c2);
+  \draw[flechemay] (c2) -- node[etiquette,above]{widening} (c3);
+  \node[etiquette,right=3mm of c3,align=left] {stable, non borné\\$\Rightarrow$ \regle{infinite-loop}};
+  \node[etiquette,anchor=east] (lb) at (-0.4,-1.3) {\code{Bounded}};
+  \node[v] (b0) at (0.6,-1.3) {$[0,0]$};
+  \node[v,right=of b0] (b1) {$[0,1]$};
+  \node[v,right=of b1] (b2) {$[0,2]$};
+  \node[v,right=17mm of b2] (b3) {$[0,3]$};
+  \draw[fleche] (b0) -- node[etiquette,above]{tour} (b1);
+  \draw[fleche] (b1) -- node[etiquette,above]{tour} (b2);
+  \draw[flechemay] (b2) -- node[etiquette,above]{widening} (b3);
+  \node[etiquette,right=3mm of b3,align=left] {stable, borné par\\la garde $\Rightarrow$ silence};
+\end{tikzpicture}
+\caption{Valeur abstraite de l'état \code{n} au fil des tours abstraits (déroulé
+simplifié ; le détail des itérations et le seuil du widening sont au
+\cref{chap:point-fixe-composant}). Les valeurs finales $[0,+\infty)$ et
+$[0,3]$ sont celles que le moteur calcule effectivement au commit
+\snapshotCommit{}.}
+\label{fig:introduction-intervalles}
+\end{figure}
+% Valeurs finales vérifiées par une sonde hors dépôt (/tmp/ch01probe, appelle
+% analyze_program sur /tmp/ch01/{deps_ok,bounded}.tsx) : Counter state[0] =
+% number[0, inf], Bounded state[0] = number[0, 3], 3 itérations, slot 0 élargi
+% dans les deux cas. Les états intermédiaires [0,1], [0,2] sont un déroulé à la
+% main (cf. notes/16 Ex. 4), non tracés pas à pas.
+
+\Cref{fig:introduction-intervalles} résume ces deux déroulés. Ils ont un point
+commun essentiel : le résultat final \emph{contient} toutes les valeurs que
+\code{n} peut réellement prendre. Dans \code{Counter}, \code{n} prend les
+valeurs $0,1,2,\dots$, toutes dans $[0,+\infty)$ ; dans \code{Bounded}, les
+valeurs $0,1,2,3$, toutes dans $[0,3]$. C'est cette inclusion qui rend le
+raisonnement valable : l'analyse \emph{sur-approxime}, elle peut se tromper en
+imaginant des valeurs impossibles, jamais en oubliant des valeurs possibles.
+
+\begin{definition}{Valeur abstraite, point fixe (informel)}{introduction-abstraction}
+  Une \terme{valeur abstraite} décrit un ensemble de valeurs concrètes (un
+  intervalle décrit les nombres qu'il contient). L'analyse d'un composant
+  répète des tours abstraits (rendu, effets, handlers), en réunissant à chaque
+  tour ce que l'état pouvait valoir et ce qui vient d'y être écrit, jusqu'à ce
+  qu'un tour n'ajoute plus rien : c'est le \terme{point fixe}. Le widening
+  garantit qu'on l'atteint en un nombre fini de tours. Les définitions exactes
+  (treillis, join, concrétisation, widening) sont au
+  \cref{chap:interpretation-abstraite}.
+\end{definition}
+
+Le point fixe atteint, les règles n'ont plus qu'à \emph{lire} le résultat.
+Pour \code{Counter}, l'état a dû être élargi et l'effet y écrit sans borne :
+c'est la signature d'une boucle de rendus, et \regle{infinite-loop} la
+signale. Pour \code{Bounded}, l'état a aussi été élargi (le widening est une
+approximation, l'analyseur le dit sous \code{--info}), mais l'écriture reste
+bornée par la garde : pas de boucle, et la règle l'atteste.
+
+\begin{sortie}
+  Bounded  (2 hooks)  fixed.tsx
+    info   widening-info  (line 26:2)  state `n` kept changing during analysis and was approximated to converge, so findings that depend on it may be imprecise
+       (2 trace step(s), rerun with --trace)
+    verified  always-unstable-deps  no deps array is defeated by an always-fresh reference
+    verified  conditional-hook  all hooks run unconditionally, in a stable order
+    verified  derived-state  no effect merely mirrors other state
+    verified  infinite-loop  no effect diverges into an infinite render loop
+    ...
+\end{sortie}
+
+(Extrait de \code{check --no-color --info --show-clean} sur
+\file{/tmp/ch01/fixed.tsx}, qui regroupe les versions corrigées des exemples
+du chapitre ; les six autres lignes \code{verified} sont élaguées.)
+
+\subsection{Pas seulement des nombres}
+
+Les intervalles ne suffisent pas pour React. Les trois défauts de la
+\cref{sec:introduction-trois-bugs} demandent chacun une information différente
+sur les valeurs, et \reactant{} les abstrait toutes à la fois.
+
+\begin{itemize}
+  \item \textbf{La valeur.} \code{n + 1} diffère-t-il de \code{n} ? Le domaine
+    des valeurs combine un intervalle pour les nombres, des ensembles bornés de
+    chaînes, des booléens, \code{null}, \code{undefined}, dans un produit
+    (\cref{chap:treillis-simples,chap:statevalue-stabilite}).
+  \item \textbf{L'identité.} React compare les deps et les états avec
+    \code{Object.is}, qui teste l'identité des objets et non leur contenu. Un
+    objet littéral \code{\{\ldots\}} est une référence \emph{neuve} à chaque
+    évaluation. Le domaine suit donc aussi la \emph{stabilité} d'une valeur :
+    stable, changeant seulement quand un état change, ou neuve à chaque rendu
+    (\cref{chap:statevalue-stabilite}).
+  \item \textbf{Le moment.} Qui écrit quel état, pendant le rendu, dans un
+    effet, ou plus tard dans un callback (\code{setInterval}, \code{.then}) ?
+    Avec quelle valeur capturée ? Ces faits sont calculés une fois par le moteur
+    sous forme de \emph{relations} (\cref{chap:relations}).
+\end{itemize}
+
+\begin{exemple}{L'identité, pas la valeur}{introduction-churn}
+  L'effet suivant ne \og change\fg{} rien au contenu de \code{query} dès le
+  deuxième passage (\code{trim} d'une chaîne déjà nettoyée), et pourtant il
+  boucle :
+\begin{lstlisting}[language=TypeScript,caption={Un objet recréé à chaque exécution de l'effet (\file{/tmp/ch01/churn.tsx})},label={lst:introduction-churn}]
+import { useEffect, useState } from "react";
+
+export function Filters() {
+  const [query, setQuery] = useState({ term: "" });
+  useEffect(() => {
+    setQuery({ ...query, term: query.term.trim() });
+  }, [query]);
+  return <input value={query.term} />;
+}
+\end{lstlisting}
+  Le littéral \code{\{ ...query, term: ... \}} est un objet neuf : pour
+  \code{Object.is}, le dep \code{query} a changé, l'effet repart. L'analyse le
+  sait sans rien connaître du contenu des chaînes :
+\begin{sortie}
+  Filters  (2 hooks)  /tmp/ch01/churn.tsx
+    error  infinite-loop  [hook:0]  (line 5:2)  this effect recreates object state `query` it depends on. Every run stores a fresh reference (`Object.is` always fails) and re-triggers itself: infinite render loop
+       (1 trace step(s), rerun with --trace)
+\end{sortie}
+  Notons le niveau : \code{error}, alors que la boucle de \code{Counter}
+  n'était qu'un \code{warn}. La \cref{sec:introduction-promesse} explique cette
+  différence.
+\end{exemple}
+
+\subsection{Quel React on abstrait}
+
+Pour que \og sur-approximer\fg{} ait un sens, il faut savoir ce qu'on
+sur-approxime : une \emph{sémantique concrète} de React, qui dit précisément
+ce qu'une exécution peut faire. React n'en publie pas ; sa documentation décrit
+le comportement en prose~\cite{ReactDocs}. \reactant{} a fait le choix
+d'adosser son modèle à une sémantique formelle publiée.
+
+\begin{decision}[ADR-001]
+  \textbf{Problème.} Sans sémantique concrète explicite, on ne peut ni établir
+  la soundness de l'analyseur ni écrire ses fonctions de transfert autrement
+  qu'à l'intuition. \textbf{Décision.} Adopter comme sémantique concrète
+  React-tRace (Lee, Ahn et Yi, OOPSLA 2025), dont les étapes \emph{init},
+  \emph{effect} et \emph{check} correspondent à une itération du point fixe.
+  \textbf{Limite acceptée.} React-tRace ne couvre qu'un noyau
+  (\code{useState}, \code{useEffect}) ; les extensions du projet (deps,
+  mémos, contexte, props\dots) n'ont pas de garantie formelle équivalente.
+  Le \cref{chap:react-modele} présente cette sémantique et ce que le projet
+  en garde (\adr{1}).
+\end{decision}
+% BIB: React-tRace — clé LeeAhnYi2025 proposée au chapitre 02
+% (@article{LeeAhnYi2025, ..., doi={10.1145/3763067}, note={arXiv:2507.05234}}).
+
+Concrètement, le tour abstrait que rejoue le moteur est celui de la
+\cref{fig:introduction-cycle-react}, légèrement grossi pour rester sûr : à
+chaque tour, il interprète le rendu, les mémos, \emph{tous} les effets (qu'ils
+soient ou non re-déclenchés, ce qui couvre toutes les combinaisons de deps) et
+les handlers (qu'un utilisateur pourrait déclencher à tout moment), puis réunit
+les états écrits avec les états précédents. Le \cref{chap:point-fixe-composant}
+décrit cette boucle, et en quoi chaque grossissement préserve la
+sur-approximation.
+
+\subsection{Le pipeline}
+
+Interpréter un composant demande d'abord de le lire. \reactant{} n'interprète
+pas directement le texte source : il le traduit en une représentation
+intermédiaire (IR) conçue pour l'analyse, un graphe de flot de contrôle par
+composant, où les hooks sont des objets de première classe. La
+\cref{fig:introduction-pipeline} montre les étapes d'une invocation, avec le
+module Rust qui porte chacune et le type qui passe à l'étape suivante.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=6mm and 13mm,
+    etape/.style={bloc,text width=20mm,minimum height=13mm},
+    type/.style={etiquette,font=\scriptsize\ttfamily,text=ra-gray}]
+  \node[bloc,text width=13mm] (src) {fichiers\\\code{.tsx}};
+  \node[etape,right=9mm of src] (parse) {parse (oxc)\\{\scriptsize\file{src/resolver}}};
+  \node[etape,right=of parse] (lower) {lowering\\{\scriptsize\file{src/lowering}}};
+  \node[etape,right=of lower] (ir) {IR\\{\scriptsize\file{src/ir}}};
+  \node[etape,below=18mm of ir] (engine) {moteur\\{\scriptsize\file{src/engine}}\\{\scriptsize\file{src/domains}}};
+  \node[etape,left=of engine] (rel) {relations\\{\scriptsize\file{src/engine}}};
+  \node[etape,left=of rel] (rules) {règles\\{\scriptsize\file{src/rules}}};
+  \node[etape,left=of rules] (driver) {driver\\{\scriptsize\file{src/driver}}\\{\scriptsize\file{src/cli}}};
+  \node[bloc,below=12mm of driver,text width=22mm] (out) {sortie humaine\\ou JSON};
+  \draw[fleche] (src) -- (parse);
+  \draw[fleche] (parse) -- node[type,above]{AST} (lower);
+  \draw[fleche] (lower) -- node[type,above]{} (ir);
+  \draw[fleche] (ir) -- node[type,right]{ComponentIR} (engine);
+  \draw[fleche] (engine) -- node[type,below,align=center,yshift=-1mm]{Analysis-\\Result} (rel);
+  \draw[fleche] (rel) -- node[type,below,align=center,yshift=-1mm]{Program-\\Relations} (rules);
+  \draw[fleche] (rules) -- node[type,below,yshift=-1mm]{Diagnostic} (driver);
+  \draw[fleche] (driver) -- node[type,right]{CheckReport} (out);
+\end{tikzpicture}
+\caption{Le pipeline d'une invocation \code{reactant check}. Chaque boîte est
+une couche du code ; sur les flèches, le type principal qui passe d'une couche
+à la suivante. Le \cref{chap:tour-architecture} détaille chaque étape et ses
+frontières.}
+\label{fig:introduction-pipeline}
+\end{figure}
+
+On y lit trois décisions qui structurent tout le projet.
+\begin{enumerate}
+  \item \textbf{Après le lowering, plus aucun AST.} Le front-end utilise le
+    parseur \code{oxc}~\cite{oxc}, détecte les composants, hooks et
+    utilitaires, et produit un \code{ComponentIR} par composant ; le moteur ne
+    voit jamais la syntaxe d'origine (\adr{3},
+    \cref{chap:frontend-detection,chap:ir,chap:lowering-cfg}).
+  \item \textbf{Le moteur calcule, les règles lisent.} Le moteur exécute le
+    point fixe de chaque composant et dérive des relations (qui écrit quel
+    état, quand, avec quelle valeur ; quels effets se re-déclenchent) ; les
+    règles ne parcourent pas l'IR, elles interrogent ces résultats (\adr{42},
+    \cref{chap:relations,chap:api-regles}).
+  \item \textbf{L'analyse est de programme.} Un parent est analysé avec ses
+    enfants, les hooks personnalisés et utilitaires sont inlinés dans leurs
+    appelants, à travers les fichiers (\cref{chap:splice-inlining,chap:inter-composants}).
+    C'est ce qui a permis de voir les trois indirections de la
+    \cref{sec:introduction-linter}.
+\end{enumerate}
+
+\section{La promesse : trois niveaux de diagnostic et la soundness}
+\label{sec:introduction-promesse}
+
+Rassemblons les niveaux observés jusqu'ici :
+\begin{center}\small
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  Programme & Diagnostic & Niveau \\
+  \midrule
+  \code{Panel} (\cref{lst:introduction-cond}) & \regle{conditional-hook} & \Error \\
+  \code{Filters} (\cref{lst:introduction-churn}) & \regle{infinite-loop} & \Error \\
+  \code{Timer} (\cref{lst:introduction-timer}) & \regle{stale-closure} & \Error \\
+  \code{Timer} (\cref{lst:introduction-timer}) & \regle{missing-deps} & \Warning \\
+  \code{Profile} (\cref{lst:introduction-deps}) & \regle{missing-deps} & \Warning \\
+  \code{Counter} (\cref{lst:introduction-loop,lst:introduction-deps-ok}) & \regle{infinite-loop} & \Warning \\
+  \code{Bounded} (\cref{lst:introduction-bounded}) & \regle{widening-info} & \Info \\
+  \bottomrule
+\end{tabular}
+\end{center}
+(La sortie de \code{Timer} est commentée à la \cref{sec:introduction-prise-en-main}.)
+Le niveau n'est pas une impression de gravité : c'est une promesse sur la
+\emph{nature} de ce que l'outil sait.
+
+\subsection{Trois niveaux, trois promesses}
+
+\begin{definition}{Niveaux de diagnostic}{introduction-niveaux}
+  \begin{itemize}
+    \item \Error{} : le défaut est \emph{certain} dès que le code signalé
+      s'exécute. L'outil détient une preuve de \emph{toute} la conclusion,
+      pas seulement d'une de ses conditions.
+    \item \Warning{} : le défaut est \emph{possible} (il dépend d'un chemin,
+      d'une entrée, ou l'analyse a sur-approximé), ou bien un fait est certain
+      mais son coût ne l'est pas (une référence neuve à chaque rendu, un rendu
+      gaspillé).
+    \item \Info{} : une limite de l'analyse (un widening, un hook qu'elle n'a
+      pas pu lire) ou un motif qui a l'air voulu. Masqué par défaut, affiché
+      avec \code{--info}.
+  \end{itemize}
+\end{definition}
+
+Cette définition n'est pas seulement une convention de documentation : elle
+est écrite dans le type qui porte le niveau, et c'est la même que celle des
+invariants du projet dans \file{CLAUDE.md}.
+
+\rustsnippet[label={lst:introduction-severity}]{src/rules/api/diagnostic.rs}{23}{38}{les trois niveaux et leur contrat}
+
+Relisons nos exemples avec cette grille.
+\begin{itemize}
+  \item \code{Profile} : le défaut n'existe que si \code{userId} change
+    pendant la vie du composant ; rien, dans le programme analysé, ne dit
+    qu'il change ni qu'il ne change pas. Défaut possible : \Warning.
+  \item \code{Panel} : le \code{useState} n'est pas sur tous les chemins du
+    rendu (le retour anticipé l'évite). C'est un fait de structure, prouvable
+    en regardant le graphe de flot : aucun chemin de l'entrée à la sortie ne
+    peut être oublié. \Error.
+  \item \code{Filters} : trois faits certains se composent. L'effet écrit
+    \code{query} sur tous ses chemins ; il y écrit toujours un objet neuf ;
+    \code{query} est exactement l'un de ses deps. La conclusion \og il se
+    re-déclenche lui-même à chaque exécution\fg{} est entièrement prouvée.
+    \Error.
+  \item \code{Counter} : la boucle est pourtant tout aussi certaine. Mais ce
+    que l'analyse sait, c'est que l'intervalle de \code{n} a dû être élargi et
+    que l'effet y écrit sans borne. Un widening peut aussi venir d'une simple
+    imprécision sur une boucle qui converge ; il ne constitue pas une preuve.
+    L'outil ne dispose pas, au commit \snapshotCommit{}, d'une primitive qui
+    prouverait \og la valeur écrite diffère toujours de la valeur
+    courante\fg{} : il s'en tient à \Warning{} (\issue{144}).
+\end{itemize}
+
+Le cas \code{Counter} enseigne l'asymétrie essentielle : un niveau trop
+\emph{bas} est permis, un niveau trop \emph{haut} ne l'est pas. Un \Warning{}
+sur un défaut certain est une perte de précision ; une \Error{} sur un défaut
+seulement possible est une promesse rompue.
+
+\subsection{Une Error se construit à partir d'une preuve}
+
+Comment le code empêche-t-il une règle de promettre trop ? Par le typage. Le
+constructeur d'une \Error{} exige un argument de type \code{Certified<E>},
+un \og jeton de preuve\fg{} que seules les primitives de preuve du moteur
+savent fabriquer (\cref{chap:api-regles}) ; un \Warning{} ou une \Info{} se
+construisent librement.
+
+\rustsnippet[label={lst:introduction-error-ctor}]{src/rules/api/diagnostic.rs}{157}{191}{le constructeur d'une \Error{}, contre les constructeurs libres d'un \Warning{} et d'une \Info{}}
+
+Une règle qui n'a qu'un fait may (vrai sur certains chemins seulement) n'a
+pas de \code{Certified} à passer : écrire une \Error{} à partir de lui est une
+erreur de compilation, pas une faute de relecture.
+
+\begin{decision}[ADR-021]
+  \textbf{Problème.} Un faux négatif réel s'était glissé dans un utilitaire
+  partagé des règles, et n'importe quel booléen pouvait devenir une
+  \code{Severity::Error}. \textbf{Décision.} Faire de la \emph{polarité}
+  d'un fait (vrai sur tous les chemins, sur certains, ou inconnu) un type :
+  \code{MustResult}, \code{May}, et un jeton \code{Certified} que seules les
+  primitives \code{must_*} produisent ; \code{Diagnostic::error} n'accepte que
+  ce jeton. Les règles existantes ont été migrées d'un bloc plutôt que
+  progressivement, pour ne pas laisser de fenêtre ouverte aux faux négatifs.
+  \textbf{Précision ultérieure (\issue{142}).} La preuve doit couvrir
+  \emph{toute} la conclusion : une Error de \regle{stale-closure} avait été
+  produite à partir d'une preuve ne couvrant qu'une de ses trois conditions,
+  ce qui a conduit à resserrer la règle et la doctrine des niveaux
+  (\adr{21}, \cref{chap:api-regles,chap:histoire-doctrine}).
+\end{decision}
+
+\subsection{La soundness : pas de faux négatif}
+
+Reste la promesse la plus forte, qui porte sur le \emph{silence}. Parlons
+d'abord vocabulaire.
+
+\begin{definition}{Faux positif, faux négatif, soundness (informel)}{introduction-soundness}
+  Un \terme{faux positif} (FP) est un diagnostic sur un défaut qui n'existe
+  pas ; un \terme{faux négatif} (FN) est un défaut réel que l'outil ne signale
+  pas. Une analyse est \terme{sound} (on parle de sa \emph{soundness}) si elle
+  calcule un sur-ensemble des comportements possibles du programme : tout ce
+  qui peut arriver est dans ce qu'elle a calculé. Conséquence : ses FN sont
+  exclus, ses FP tolérés. La définition exacte est au
+  \cref{chap:interpretation-abstraite}.
+\end{definition}
+
+La soundness est l'invariant numéro un du projet (\file{CLAUDE.md}) : \og faux
+positifs tolérés, faux négatifs INTERDITS\fg{}. Elle se lit à plusieurs
+endroits de la sortie.
+\begin{itemize}
+  \item \textbf{Le silence est une affirmation.} Quand une règle applicable
+    n'a rien trouvé, \code{--info} l'écrit : \code{verified infinite-loop
+    no effect diverges into an infinite render loop}. Cette ligne n'est
+    publiée que si l'analyse du composant n'a pas été tronquée.
+  \item \textbf{Ce qui n'a pas été lu est dit.} Si l'on analyse
+    \file{/tmp/ch01/xfile/Clock.tsx} seul, sans le fichier du hook qu'il
+    importe, l'outil ne conclut pas \og aucun problème\fg{} :
+\begin{sortie}
+   1 clean component(s) hidden, rerun with --show-clean
+
+⚠  1 file(s), no findings, but parts of this run were not analyzed, so this is not a clean bill.
+   not analyzed:
+     • 1 imported file(s) resolved outside the analysed set and were never read. Pass them on the command line to analyse them (useTicker.ts)
+\end{sortie}
+    Le code de sortie reste \code{0} (aucun diagnostic), mais la phrase finale
+    refuse le \og ✓ no issues found\fg{} : on ne délivre pas de certificat de
+    propreté pour du code qu'on n'a pas lu (\cref{chap:projet-cli-driver}).
+  \item \textbf{L'inconnu est ⊤, pas \og rien\fg{}.} Un hook de bibliothèque
+    que l'outil ne sait pas modéliser renvoie une valeur \emph{inconnue} (le
+    top du treillis, ⊤), qui peut être n'importe quoi. Les règles qui la lisent
+    doivent alors supposer le pire, et une \Info{} \regle{analysis-limit}
+    indique la limite (\cref{chap:regles-effets}).
+\end{itemize}
+
+\begin{piege}
+  La soundness est un \emph{invariant visé}, pas un théorème démontré sur le
+  code. La page \file{docs/limitations.md} du dépôt recense des
+  limites connues, et le tracker du projet porte des issues étiquetées
+  \code{soundness-bug} ouvertes au commit \snapshotCommit{} (par exemple
+  \issue{157}, \issue{143}, \issue{7}). La rédaction de ce manuscrit a aussi
+  mis au jour des faux négatifs. Le plus simple tient en six lignes :
+\begin{lstlisting}[language=TypeScript,caption={Une boucle certaine que la CLI ne signale pas (\file{/tmp/ch01/updater_dep.tsx})},label={lst:introduction-fn-updater}]
+import { useEffect, useState } from "react";
+
+export function D() {
+  const [count, setCount] = useState(0);
+  useEffect(() => {
+    setCount((c) => c + 1);
+  }, [count]);
+  return <p>{count}</p>;
+}
+\end{lstlisting}
+  L'updater fait croître \code{count} à chaque exécution, \code{count} est un
+  dep, l'effet boucle. Pourtant :
+\begin{sortie}
+   1 clean component(s) hidden, rerun with --show-clean
+
+✓  1 file(s) no issues found.
+\end{sortie}
+  La cause (le chemin \og programme\fg{} du moteur écrit la fonction
+  \code{(c) => c + 1} elle-même dans l'état, au lieu d'appliquer l'updater)
+  est analysée au \cref{chap:limites-perspectives}. Le lecteur doit donc
+  retenir deux choses à la fois : la conception entière vise l'absence de FN,
+  et les écarts à cette visée sont des défauts à corriger à la racine, pas des
+  comportements acceptés.
+\end{piege}
+% Défaut documenté dans notes/16 §8.1 (sonde : PROGRAM state[0] = ⊤, aucun
+% widening ; les tests intra de tests/functional_updater.rs passent). Pas
+% d'issue ouverte au moment de la rédaction (gh issue list, 2026-09-28).
+
+\section{Première prise en main}
+\label{sec:introduction-prise-en-main}
+
+Il est temps de lancer l'outil soi-même. Toutes les sorties de ce manuscrit
+ont été produites au commit \snapshotCommit{}, depuis la racine du dépôt, par
+le binaire de développement.
+
+\subsection{Construire et lancer}
+
+\begin{shell}
+cargo build --release          # binaire : target/release/reactant
+cargo run -q -- check /tmp/ch01/timer.tsx
+cargo run -q -- check src/     # un dossier : parcours récursif des .ts/.tsx/.js/.jsx
+\end{shell}
+
+\code{check} est la sous-commande par défaut (\code{reactant src/} équivaut à
+\code{reactant check src/}). Sans chemin, c'est le dossier courant qui est
+analysé. Les autres sous-commandes sont \code{rules} (le catalogue),
+\code{explain <rule>} (la documentation d'un diagnostic, avec un exemple et
+une correction), \code{schemas} (les schémas JSON de la configuration et des
+packs). Côté JavaScript, le même analyseur est distribué sur npm, compilé en
+WebAssembly : \code{npx reactant-analyzer} (\cref{chap:distribution}).
+
+\subsection{Lire la sortie humaine}
+
+Lançons l'analyse sur \code{Timer} (\cref{lst:introduction-timer}), en
+demandant les chaînes causales avec \code{--trace}. On se place dans
+\file{/tmp/ch01} pour que les chemins affichés soient courts.
+
+\begin{sortie}
+  Timer  (2 hooks)  timer.tsx
+    warn   missing-deps  [hook:1]  var:seconds  (line 5:2)  `seconds` is used in this effect but not in its deps array, and it is recreated on every render
+       → `seconds` is read here [hook:1] (line 5:2)
+    error  stale-closure  [hook:1]  var:seconds  (line 6:10)  the `setInterval` callback registered by this mount-only effect reads `seconds` and writes it back. `seconds` was captured once at mount, so every firing recomputes from the same frozen value and the state can never advance past its first update
+       → `setInterval` has side effects (subscriptions/requests/timers re-fire on every call) [hook:1] (line 6:10)
+       → `seconds` is captured at registration time, so the callback keeps this value, not the latest one [hook:0] (line 6:10)
+       → state `seconds` is written here [hook:0] (line 7:6)
+
+⚠  1 error(s), 1 warning(s) across 1 file(s).
+\end{sortie}
+
+Décomposons.
+\begin{itemize}
+  \item \textbf{L'en-tête} \code{Timer (2 hooks) timer.tsx} nomme le composant,
+    le nombre de hooks que l'IR lui connaît et son fichier. Les hooks sont
+    numérotés dans l'ordre d'appel, à partir de 0 : \code{[hook:0]} est le
+    \code{useState}, \code{[hook:1]} le \code{useEffect}. Ce numéro est le
+    \emph{label} du hook, celui qui identifie un slot d'état pour React comme
+    pour l'analyseur (\cref{chap:ir}).
+  \item \textbf{Chaque diagnostic} donne son niveau (\code{error},
+    \code{warn}, \code{info}), le nom de la règle, le hook concerné, la
+    variable en cause (\code{var:seconds}), la position \code{(line L:C)}
+    --- ligne comptée à partir de 1, colonne à partir de 0 --- et un message.
+    Ici, \code{(line 6:10)} pointe sur l'appel \code{setInterval(...)}.
+  \item \textbf{Les lignes \og →\fg{}} sont la \emph{chaîne de témoins} du
+    diagnostic : les faits, typés et localisés, qui ont conduit à la
+    conclusion (\adr{19}, \cref{chap:api-regles}). Pour
+    \regle{stale-closure}, ce sont exactement les trois ingrédients du défaut
+    raconté à la \cref{sec:introduction-trois-bugs} : \code{setInterval}
+    rappellera le callback ; le callback a capturé \code{seconds} au moment
+    de l'enregistrement ; il réécrit l'état \code{seconds}. Sans
+    \code{--trace}, ces lignes sont remplacées par un rappel
+    \code{(3 trace step(s), rerun with --trace)}.
+  \item \textbf{La dernière ligne} fait le bilan. Le code de sortie est
+    \code{1} : par défaut (\code{--fail-on warning}), une \Error{} ou un
+    \Warning{} fait échouer la commande, ce qui la rend utilisable telle quelle
+    en intégration continue.
+\end{itemize}
+
+Les deux diagnostics racontent le même défaut à deux niveaux de preuve.
+\regle{missing-deps} constate une propriété locale (\code{seconds} est lu
+et n'est pas déclaré), en parité avec \code{exhaustive-deps} : défaut
+possible, \Warning. \regle{stale-closure} prouve la \emph{conséquence} : avec
+des deps \code{[]} et un callback répétitif qui réécrit ce qu'il lit, l'état
+ne peut jamais dépasser sa première mise à jour. C'est ce que l'on a constaté
+à la main (l'affichage bloqué à \og 1 s\fg{}), et la preuve couvre toute la
+conclusion : \Error{} (\cref{chap:regles-effets}).
+
+\begin{piege}
+  La formulation du motif ajouté par \regle{missing-deps} (\og and it is
+  recreated on every render\fg{}, \og and its value may change between
+  renders\fg{}) n'est pas un jugement de l'auteur de la règle : elle traduit
+  en anglais courant la valeur abstraite que le moteur a calculée pour la
+  variable (\code{describe_value}, \srcline{src/rules/helpers/mod.rs}{42}).
+  Elle peut donc surprendre, comme ici pour un nombre : \code{seconds} n'a
+  pas la forme d'une référence, mais son intervalle ne s'est jamais réduit à
+  un point pendant l'analyse (\cref{sec:introduction-pari}), ce qui suffit à
+  le classer \og recreated on every render\fg{} au même titre qu'un objet
+  neuf. Les \cref{chap:statevalue-stabilite,chap:regles-effets}
+  expliquent cette traduction.
+\end{piege}
+
+La correction est celle de la \cref{sec:introduction-trois-bugs} : un updater,
+\code{setSeconds((s) => s + 1)}. Le fichier \file{/tmp/ch01/fixed.tsx}
+rassemble les versions corrigées de \code{Timer}, de \code{Profile} (avec
+\code{[userId]}) et de \code{Bounded}. Sans option, la sortie est :
+
+\begin{sortie}
+   3 clean component(s) hidden, rerun with --show-clean
+
+✓  1 file(s) no issues found.
+\end{sortie}
+
+Avec \code{--info --show-clean}, chaque composant affiche aussi les
+vérifications applicables qui sont passées ; pour \code{Timer}, on lit entre
+autres :
+
+\begin{sortie}
+  Timer  (2 hooks)  fixed.tsx  ✓
+    verified  conditional-hook  all hooks run unconditionally, in a stable order
+    ...
+    verified  stale-closure  no long-lived callback captures a stale state value
+    ...
+\end{sortie}
+
+Le signe ✓ après le fichier marque un composant sans diagnostic.
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}lX@{}}
+  \toprule
+  Option & Effet \\
+  \midrule
+  \code{--trace} & affiche la chaîne de témoins de chaque diagnostic \\
+  \code{--info} & affiche les \Info{} et les lignes \code{verified} / \code{suspended} \\
+  \code{--show-clean} & affiche aussi les composants sans diagnostic \\
+  \code{--format json} & un unique document JSON sur la sortie standard \\
+  \code{--fail-on error|warning|never} & seuil du code de sortie \code{1} (défaut \code{warning}) \\
+  \code{--rule}, \code{--ignore-rule} & ne garder / retirer qu'un nom de diagnostic \\
+  \code{--follow-imports} & lire aussi les fichiers importés, transitivement \\
+  \code{--verbose} & statistiques du moteur sur la sortie d'erreur \\
+  \code{--no-color} & sortie sans couleurs ANSI \\
+  \bottomrule
+\end{tabularx}
+\caption{Les options de \code{check} utilisées dans ce manuscrit (extrait de
+\file{docs/usage.md} ; la liste complète et la configuration sont au
+\cref{chap:projet-cli-driver}).}
+\label{tab:introduction-options}
+\end{table}
+
+\Cref{tab:introduction-options} rassemble les options les plus utiles.
+\code{--verbose} est une fenêtre sur le moteur : sur la boucle de la
+\cref{lst:introduction-loop}, elle affiche, en plus du diagnostic,
+\begin{sortie}
+[verbose] symbol graph: 1 nodes, topo order = [Counter@loop.tsx]
+[verbose] 1 components analyzed
+[verbose] cache hits: 0, misses: 0
+  [verbose] Counter: 3 iteration(s), widened: [0]
+\end{sortie}
+c'est-à-dire trois tours abstraits, et le slot de label 0 (\code{n}) élargi,
+comme sur la \cref{fig:introduction-intervalles}.
+
+\subsection{Lire la sortie JSON}
+
+Pour une machine (intégration continue, éditeur, agent), \code{--format json}
+écrit un document unique au schéma versionné. Voici celui de \code{Timer},
+où le premier diagnostic (\regle{missing-deps}) a été élagué :
+
+\begin{lstlisting}[language=JSON,caption={Sortie \code{check --format json timer.tsx} (élaguée : le diagnostic \regle{missing-deps} est remplacé par \code{...})},label={lst:introduction-json}]
+{
+  "version": 2,
+  "files_analyzed": 1,
+  "parse_errors": [],
+  "diagnostics": [
+    ...,
+    {
+      "rule": "stale-closure",
+      "severity": "error",
+      "component": "Timer",
+      "file": "timer.tsx",
+      "component_file": "timer.tsx",
+      "line": 6,
+      "col": 10,
+      "hook_label": 1,
+      "var": "seconds",
+      "message": "the `setInterval` callback registered by this mount-only effect reads `seconds` and writes it back. `seconds` was captured once at mount, so every firing recomputes from the same frozen value and the state can never advance past its first update",
+      "notes": [
+        {
+          "message": "`setInterval` has side effects (subscriptions/requests/timers re-fire on every call)",
+          "kind": "call",
+          "hook_label": 1,
+          "file": "timer.tsx",
+          "line": 6,
+          "col": 10,
+          "callee": "setInterval",
+          "effect_class": "effectful"
+        },
+        {
+          "message": "`seconds` is captured at registration time, so the callback keeps this value, not the latest one",
+          "kind": "capture",
+          "hook_label": 0,
+          "file": "timer.tsx",
+          "line": 6,
+          "col": 10,
+          "what": "seconds"
+        },
+        {
+          "message": "state `seconds` is written here",
+          "kind": "write",
+          "hook_label": 0,
+          "file": "timer.tsx",
+          "line": 7,
+          "col": 6,
+          "slot": 0,
+          "value_class": "unknown"
+        }
+      ]
+    }
+  ],
+  "blind_spots": [],
+  "summary": {
+    "errors": 1,
+    "warnings": 1,
+    "infos": 0,
+    "components_analyzed": 1,
+    "exit_code": 1
+  }
+}
+\end{lstlisting}
+
+On retrouve champ pour champ la sortie humaine, plus quelques informations
+structurées.
+\begin{itemize}
+  \item \code{version} est la version du schéma (2) ; \code{files_analyzed}
+    et \code{parse_errors} disent ce qui a été lu, et si le parseur a dû
+    récupérer d'erreurs de syntaxe.
+  \item Dans chaque diagnostic, \code{file} est le fichier où pointe la
+    position, \code{component_file} celui où le composant est défini ; les
+    deux diffèrent quand le finding est ancré dans un hook inliné depuis un
+    autre fichier (\cref{sec:introduction-linter}, exemple \code{Clock}).
+    \code{line} commence à 1, \code{col} à 0.
+  \item \code{notes} est la chaîne de témoins ; chaque étape porte un
+    \code{kind} pris dans un vocabulaire fermé (\code{call}, \code{capture},
+    \code{write}, \code{read}, \code{widen}\dots) et les champs propres à ce
+    genre (\code{callee}, \code{what}, \code{slot}\dots).
+  \item \code{blind_spots} liste ce que l'exécution sait ne pas avoir lu. Non
+    vide, il signifie que les compteurs du \code{summary} sont une borne
+    inférieure, pas un verdict ; c'est la version machine de la phrase
+    \og this is not a clean bill\fg{} vue plus haut.
+  \item \code{summary.exit_code} reproduit le code de sortie du processus.
+\end{itemize}
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}cl@{}}
+  \toprule
+  Code & Signification \\
+  \midrule
+  \code{0} & aucun diagnostic au niveau du seuil \code{--fail-on} ou au-dessus \\
+  \code{1} & au moins un diagnostic au niveau du seuil ou au-dessus \\
+  \code{2} & erreur d'usage ou d'entrée : aucun fichier, chemin inexistant, règle inconnue \\
+  \bottomrule
+\end{tabular}
+\caption{Codes de sortie de \code{reactant check} (\file{docs/usage.md}). Les
+\Info{} et les \code{blind_spots} ne changent jamais le code de sortie.}
+\label{tab:introduction-exit}
+\end{table}
+
+\Cref{tab:introduction-exit} donne les codes de sortie. Enfin,
+\code{reactant explain <rule>} affiche la documentation d'un diagnostic. Pour
+\regle{stale-closure}, son premier paragraphe reprend ce que nous avons
+constaté, et la correction proposée est celle que nous avons appliquée :
+
+\begin{sortie}
+stale-closure
+  long-lived callback keeps a state value frozen at registration time
+
+A callback handed to `setInterval`, `addEventListener`, `subscribe`, `setTimeout` or a promise `.then` inside an effect closes over the variable values from the render that last ran the effect. [...]
+
+Example:
+  const [n, setN] = useState(0);
+  useEffect(() => { setInterval(() => setN(n + 1), 1000); }, []);
+
+Fix:
+  Use the functional updater (`setN(n => n + 1)`) so the callback never reads the captured value; mirror the latest value into a `useRef` and read `ref.current`; or add the value to the deps array and return a cleanup so the callback is re-registered with a fresh capture.
+\end{sortie}
+(Sortie élaguée : la suite de l'explication, marquée \code{[...]}, détaille
+la condition de l'\Error.)
+
+\section{Le projet en chiffres}
+\label{sec:introduction-chiffres}
+
+Avant d'entrer dans le code, prenons la mesure de ce qu'il y a à lire. Tous les
+chiffres de cette section sont comptés sur le dépôt au commit
+\snapshotCommit{} (\code{find}, \code{wc -l}, \code{git rev-list}).
+
+\subsection{Le code}
+
+La bibliothèque \code{reactant} (\file{src/}) compte 142 fichiers Rust et
+59\,757 lignes, commentaires et tests unitaires compris.
+\Cref{tab:introduction-modules} les répartit par module. Deux modules pèsent à
+eux seuls plus de la moitié du total : \file{src/rules} (les règles, leur API
+typée, le front-end des règles déclaratives) et \file{src/engine} (le point
+fixe, les relations, l'analyse de programme).
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}lrrX@{}}
+  \toprule
+  Module & Fichiers & Lignes & Rôle (chapitres) \\
+  \midrule
+  \file{src/lowering} & 13 & 6\,692 & détection et lowering AST → IR (\ref{chap:frontend-detection}, \ref{chap:lowering-cfg}) \\
+  \file{src/ir}       & 16 & 4\,423 & représentation intermédiaire, splice (\ref{chap:ir}, \ref{chap:splice-inlining}) \\
+  \file{src/domains}  & 21 & 7\,393 & domaines abstraits, transfert, stores (\ref{chap:treillis-simples}--\ref{chap:transfert-stores}) \\
+  \file{src/engine}   & 22 & 13\,913 & point fixe, relations, churn, programme (\ref{chap:cfg-analyzer-dominance}--\ref{chap:inter-composants}) \\
+  \file{src/rules}    & 41 & 20\,432 & API des règles, règles natives, packs (\ref{chap:api-regles}--\ref{chap:regles-declaratives}) \\
+  \file{src/resolver} & 4 & 1\,930 & découverte, parse, résolution d'imports (\ref{chap:projet-cli-driver}) \\
+  \file{src/project}  & 4 & 1\,432 & projets Vite, Next.js, tsconfig (\ref{chap:projet-cli-driver}) \\
+  \file{src/driver}   & 7 & 1\,666 & \code{run_check}, rendus humain et JSON (\ref{chap:projet-cli-driver}) \\
+  \file{src/registry} & 3 & 691 & résumés de hooks de bibliothèques (\ref{chap:splice-inlining}) \\
+  \file{src/cli}      & 7 & 570 & sous-commandes, chargement de la configuration (\ref{chap:projet-cli-driver}) \\
+  racine de \file{src/} & 4 & 615 & \file{config.rs}, \file{lib.rs}, \file{main.rs}, \file{test_support.rs} \\
+  \midrule
+  total \file{src/}   & 142 & 59\,757 & \\
+  \bottomrule
+\end{tabularx}
+\caption{Répartition du code de \file{src/} par module au commit
+\snapshotCommit{} (fichiers \code{.rs}, lignes brutes).}
+\label{tab:introduction-modules}
+\end{table}
+
+Autour de la bibliothèque :
+\begin{itemize}
+  \item \file{tests/} : 69 fichiers Rust de tests d'intégration
+    (26\,212 lignes) et 131 fixtures (programmes React d'exemple, projets
+    miniatures). Au total, le dépôt déclare 1\,529 fonctions \code{\#[test]}
+    (632 dans \file{src/}, 897 dans \file{tests/}).
+  \item \file{crates/reactant-wasm} : le point d'entrée WebAssembly
+    (323 lignes), et \file{npm/} : le paquet \code{reactant-analyzer}
+    (\cref{chap:distribution}).
+  \item \file{docs/} : l'usage (\file{usage.md}), la page des limites
+    (\file{limitations.md}), les règles personnalisées
+    (\file{custom-rules.md}), le journal de précision, et surtout
+    \file{docs/adr/} : \textbf{42 ADR} (\emph{Architecture Decision
+    Records}), numérotées de \code{ADR-001} (\og concrete semantics\fg{}) à
+    \code{ADR-042} (\og relations are engine products\fg{}). Chacune fait l'objet
+    d'une fiche en annexe (\cref{chap:fiches-adr}).
+\end{itemize}
+
+L'historique compte 322 commits, du 8 mai au 27 septembre 2026, et six
+versions publiées (\code{v0.1.0} à \code{v0.6.0}, la version de
+\file{Cargo.toml}). Le \cref{chap:histoire-doctrine} raconte cette histoire ;
+retenons-en qu'elle commence par une réécriture complète, décidée par la
+conception (\adr{3} : une IR dédiée plutôt que des fonctions de transfert sur
+l'AST), et que le pipeline actuel a été posé en une journée, le 1\textsuperscript{er}
+juin, dans l'ordre même où ce manuscrit le présente.
+
+\subsection{Les règles}
+
+\reactant{} enregistre 19 règles natives (la fonction \code{all_rules},
+\srcline{src/rules/mod.rs}{109}), qui émettent 21 \emph{noms de diagnostic} :
+\regle{infinite-loop} émet aussi \regle{cross-component-infinite-loop}, et
+\regle{setter-in-render} émet aussi \regle{cross-setter-in-render}.
+\Cref{tab:introduction-catalogue} les liste tous, avec le résumé que donne
+\code{reactant rules} et le niveau le plus haut que chaque nom peut atteindre
+au commit \snapshotCommit{} (lu dans les constructeurs de diagnostic de
+chaque règle, \file{src/rules/impls/}). Une configuration peut abaisser ces
+niveaux, jamais les relever. L'annexe \ref{chap:catalogue-regles} donne une
+fiche par règle.
+
+\begin{table}[htbp]\centering\footnotesize
+\begin{tabularx}{\linewidth}{@{}llX@{}}
+  \toprule
+  Diagnostic & Max & Résumé (\code{reactant rules}, verbatim) \\
+  \midrule
+  \regle{always-unstable-deps} & \Warning & a dep is a fresh reference every render, so the deps array never matches \\
+  \regle{analysis-limit} & \Info & the analyzer deliberately truncated analysis here (potential false negatives) \\
+  \regle{conditional-hook} & \Error & hook called inside a conditional branch \\
+  \regle{cross-component-infinite-loop} & \Warning & child effect sets parent state, parent re-renders child, effect refires \\
+  \regle{cross-setter-in-render} & \Error & parent's setter (received as prop) called during render \\
+  \regle{derived-state} & \Warning & effect only mirrors another state, so compute it during render \\
+  \regle{frozen-initial-state} & \Error & useState seeded from a prop that changes, so the state freezes at the first value \\
+  \regle{infinite-loop} & \Error & effect sets state that re-triggers the effect, and the state diverges \\
+  \regle{lazy-init} & \Error & useState initializer calls a function on every render \\
+  \regle{missing-cleanup} & \Warning & effect starts something long-lived and returns no teardown \\
+  \regle{missing-deps} & \Warning & effect body captures a variable not listed in its deps array \\
+  \regle{redundant-set-state} & \Warning & setState called with the value the state already holds \\
+  \regle{server-component-hook} & \Warning & a hook is called in a Next.js Server Component \\
+  \regle{setter-in-render} & \Error & setState called during the render body \\
+  \regle{stale-closure} & \Error & long-lived callback keeps a state value frozen at registration time \\
+  \regle{state-lifted-too-high} & \Warning & state is used only deep in one child subtree; the components above re-render to pass it down \\
+  \regle{state-mutation} & \Error & state or prop object mutated in place, same reference, no re-render \\
+  \regle{unnecessary-rerender} & \Warning & mount-only effect immediately overwrites the initial state \\
+  \regle{unstable-context-value} & \Warning & context provider hands consumers a new object every render \\
+  \regle{wasted-subtree-render} & \Warning & a state written on every keystroke or pointer move re-renders subtrees that do not depend on it \\
+  \regle{widening-info} & \Info & state slot required widening to converge (precision lost here) \\
+  \bottomrule
+\end{tabularx}
+\caption{Le catalogue des diagnostics natifs au commit \snapshotCommit{}. La
+colonne \og Max\fg{} est le niveau le plus haut atteignable ; pour
+\regle{cross-component-infinite-loop}, le plafond \Warning{} est expliqué dans
+le code (\src{src/rules/impls/infinite_loop.rs}{281}{283}).}
+\label{tab:introduction-catalogue}
+\end{table}
+
+\begin{remarque}
+  Un niveau maximal \Error{} ne veut pas dire que la règle émet souvent des
+  \Error{} : c'est seulement le cas où une primitive de preuve a fourni son
+  jeton. \regle{infinite-loop}, par exemple, émet un \Warning{} sur
+  \code{Counter} et une \Error{} sur \code{Filters}.
+\end{remarque}
+
+À ces règles natives s'ajoutent des \emph{règles déclaratives} : des règles
+écrites en JSON contre les relations du moteur, sans une ligne de Rust,
+regroupées en \emph{packs} (\file{packs/guardrails.json} et cinq packs sous
+\file{packs/community/}). Le test \file{tests/catalogue.rs} mesure
+l'expressivité de ce langage sur un catalogue figé de 22 classes de règles :
+21 sont exprimables au commit \snapshotCommit{}
+(\code{EXPRESSIBLE_NOW = 21}, \srcline{tests/catalogue.rs}{1094} ;
+\cref{chap:regles-declaratives}).
+
+\subsection{Le corpus}
+
+\begin{sloppypar}
+Les tests unitaires vérifient des mécanismes ; ils ne disent pas ce que
+l'outil produit sur du vrai code. Pour cela, le projet épingle un
+\emph{corpus} de 14 dépôts open source (\code{ai-chatbot},
+\code{bulletproof-react}, \code{chakra-ui}, \code{commerce}, \code{dub},
+\code{excalidraw}, \code{mantine}, \code{memos},
+\code{next-shadcn-dashboard-starter}, \code{novel}, \code{precedent},
+\code{shadcn-admin}, \code{twenty}, \code{zustand}), clonés à des commits
+fixés par \file{scripts/setup-test-repo.sh}. Le nombre de diagnostics
+distincts produits sur ce corpus est commité dans
+\file{docs/corpus-baseline.json} : \textbf{1\,498} localisations au commit
+\snapshotCommit{}, dont 476 \regle{missing-deps}, 381
+\regle{always-unstable-deps}, 222 \regle{lazy-init} et 35
+\regle{infinite-loop}. Un job d'intégration continue compare chaque
+exécution à ce chiffre ; toute variation doit être expliquée, et consignée
+dans \file{docs/precision-log.md}. Le \cref{chap:tests-corpus} décrit cette
+méthode, et pourquoi un chiffre qui \emph{baisse} n'est pas forcément une
+bonne nouvelle : pour un outil sound, un diagnostic qui disparaît peut être un
+faux positif corrigé, ou un faux négatif introduit.
+\end{sloppypar}
+
+\section{Plan du manuscrit et conseils de lecture}
+\label{sec:introduction-plan}
+
+Le manuscrit suit le trajet d'un fichier source dans le pipeline de la
+\cref{fig:introduction-pipeline}, précédé du contexte nécessaire et suivi de
+l'outil et de sa méthode. Il est organisé en six parties et quatre annexes
+(\cref{tab:introduction-parties}) ; la difficulté croît d'une partie à
+l'autre, et à l'intérieur de chaque chapitre.
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}lXc@{}}
+  \toprule
+  Partie & Contenu & Difficulté \\
+  \midrule
+  I. Le problème et son contexte & ce chapitre ; le modèle d'exécution de React (\ref{chap:react-modele}) ; rappels d'interprétation abstraite (\ref{chap:interpretation-abstraite}) ; tour d'architecture (\ref{chap:tour-architecture}) & 1--2 \\
+  II. Du source à l'IR & oxc et détection (\ref{chap:frontend-detection}), IR (\ref{chap:ir}), lowering (\ref{chap:lowering-cfg}), splice et inlining (\ref{chap:splice-inlining}) & 2--3 \\
+  III. Les domaines abstraits & treillis simples (\ref{chap:treillis-simples}), produit \code{StateValue} et stabilité (\ref{chap:statevalue-stabilite}), transfert et stores (\ref{chap:transfert-stores}) & 2--4 \\
+  IV. Le moteur & CFG et dominance (\ref{chap:cfg-analyzer-dominance}), point fixe d'un composant (\ref{chap:point-fixe-composant}), relations (\ref{chap:relations}), churn (\ref{chap:churn}), inter-composants (\ref{chap:inter-composants}) & 3--5 \\
+  V. Les règles & API typée (\ref{chap:api-regles}), règles d'état (\ref{chap:regles-etat}), \regle{infinite-loop} (\ref{chap:infinite-loop}), effets (\ref{chap:regles-effets}), rendu et RSC (\ref{chap:regles-rendu-rsc}), règles déclaratives (\ref{chap:regles-declaratives}) & 3--5 \\
+  VI. L'outil et sa méthode & CLI et driver (\ref{chap:projet-cli-driver}), distribution (\ref{chap:distribution}), tests et corpus (\ref{chap:tests-corpus}), histoire et doctrine (\ref{chap:histoire-doctrine}), limites (\ref{chap:limites-perspectives}) & 2--3 \\
+  Annexes & fiches ADR (\ref{chap:fiches-adr}), glossaire (\ref{chap:glossaire}), catalogue des règles (\ref{chap:catalogue-regles}) & --- \\
+  \bottomrule
+\end{tabularx}
+\caption{Les parties du manuscrit ; les numéros entre parenthèses renvoient aux chapitres.}
+\label{tab:introduction-parties}
+\end{table}
+
+\subsection{Parcours de lecture}
+
+Le manuscrit se lit dans l'ordre, mais tous les lecteurs n'ont pas les mêmes
+besoins. Quelques parcours :
+
+\begin{description}
+  \item[Vous utilisez l'outil et voulez comprendre ses diagnostics.] Ce
+    chapitre, puis le \cref{chap:react-modele} ; ensuite, pour chaque
+    diagnostic rencontré, sa fiche dans l'annexe \ref{chap:catalogue-regles}
+    et sa section dans les \cref{chap:regles-etat,chap:infinite-loop,chap:regles-effets,chap:regles-rendu-rsc} ;
+    enfin le \cref{chap:projet-cli-driver} (configuration, projets) et le
+    \cref{chap:limites-perspectives} (ce que l'outil rate).
+  \item[Vous voulez écrire une règle.] La partie~I, puis le
+    \cref{chap:api-regles} (l'API typée et le jeton de preuve), le
+    \cref{chap:relations} (les faits disponibles), une ou deux règles de la
+    partie~V comme modèles, et le \cref{chap:regles-declaratives} si une règle
+    déclarative suffit. Le \cref{chap:tests-corpus} dit comment mesurer
+    l'effet d'une nouvelle règle.
+  \item[Vous voulez modifier le moteur.] Tout, dans l'ordre, avec une
+    attention particulière aux \cref{chap:point-fixe-composant,chap:relations,chap:churn}
+    et aux encadrés \og piège\fg{} qui signalent les trous de soundness
+    connus.
+  \item[Vous connaissez l'analyse statique, pas React.] Le
+    \cref{chap:react-modele} est indispensable ; le
+    \cref{chap:interpretation-abstraite} peut être survolé pour la notation.
+    Les chapitres propres au projet sont ensuite les
+    \cref{chap:statevalue-stabilite,chap:point-fixe-composant,chap:churn,chap:inter-composants}.
+  \item[Vous connaissez React, pas l'analyse statique.] Le
+    \cref{chap:interpretation-abstraite} est indispensable : il pose le
+    vocabulaire (treillis, join, widening, must/may, soundness) que tout le
+    reste emploie.
+  \item[Vous vous intéressez aux choix de conception.] Le
+    \cref{chap:histoire-doctrine} et les fiches ADR (\cref{chap:fiches-adr}),
+    puis les encadrés \og décision\fg{} des chapitres.
+\end{description}
+
+\subsection{Conventions}
+
+\begin{itemize}
+  \item \textbf{Code cité.} Les extraits pris dans le dépôt portent en légende
+    leur fichier et leurs vrais numéros de ligne au commit
+    \snapshotCommit{} (par exemple \cref{lst:introduction-severity}). Les
+    programmes React d'exemple sont écrits pour le manuscrit ; leur chemin
+    sous \file{/tmp} est indiqué pour pouvoir les réanalyser. Un extrait
+    élagué le dit dans sa légende.
+  \item \textbf{Sorties.} Toute sortie de l'analyseur a été observée
+    réellement sur ce commit ; les élisions sont signalées. Elles sont
+    reproduites en anglais, telles que l'outil les écrit.
+  \item \textbf{Encadrés.} \og React\fg{} rappelle un comportement de React
+    nécessaire à la suite ; \og Décision\fg{} résume une ADR et les
+    alternatives écartées ; \og Piège\fg{} signale une erreur naturelle ou une
+    subtilité, y compris les écarts observés entre la visée et le code.
+  \item \textbf{Vocabulaire.} Les noms du code restent en anglais
+    (\code{StateValue}, \code{SlotWriter}) ; les concepts ont un nom
+    français fixé, recensé dans le glossaire (\cref{chap:glossaire}). Quelques
+    mots anglais sont gardés tels quels parce qu'ils sont d'usage :
+    \emph{widening}, \emph{join}, \emph{meet}, \emph{soundness}, \emph{slot},
+    \emph{handler}, \emph{deps}.
+\end{itemize}
+
+\begin{resume}
+  \begin{itemize}
+    \item Les défauts React les plus coûteux --- boucle de rendus, dépendance
+      oubliée, fermeture figée --- ne se voient pas au premier rendu : ils
+      sont des propriétés de la \emph{suite} des rendus, commits et effets
+      (\cref{tab:introduction-trois-bugs}).
+    \item Un linter syntaxique juge la forme d'une fonction, dans un fichier.
+      Il voit un hook conditionnel ou un dep absent ; il ne voit ni la suite
+      des valeurs d'un état, ni un alias de setter, ni un hook personnalisé
+      dans son appelant, ni un setter passé en prop
+      (\cref{tab:introduction-syntaxe}).
+    \item \reactant{} interprète abstraitement chaque composant : il rejoue
+      les tours de React sur des \emph{ensembles} de valeurs (intervalles,
+      stabilité des références, écrivains de chaque état) jusqu'à un point
+      fixe, que le widening garantit fini ; les règles lisent ce résultat.
+    \item Pipeline : parse (\code{oxc}) → lowering → IR (\code{ComponentIR})
+      → moteur (\code{AnalysisResult}) → relations → règles
+      (\code{Diagnostic}) → driver (sortie humaine ou JSON)
+      (\cref{fig:introduction-pipeline}).
+    \item Trois niveaux : \Error{} = défaut certain, prouvé en entier (seul
+      \code{Diagnostic::error}, qui exige un \code{Certified}, en produit) ;
+      \Warning{} = défaut possible ou coût incertain ; \Info{} = limite de
+      l'analyse. Sous-déclarer est permis (\code{Counter}, \issue{144}),
+      sur-déclarer ne l'est pas.
+    \item Soundness : l'analyse sur-approxime ; FP tolérés, FN interdits. Le
+      silence est une affirmation (\code{verified}), et l'outil refuse le
+      \og no issues found\fg{} sur du code qu'il n'a pas lu. C'est une visée
+      du code, avec des écarts connus et documentés
+      (\cref{lst:introduction-fn-updater}).
+    \item \sloppy Fichiers rencontrés :
+      \file{src/rules/api/diagnostic.rs} (\code{Severity},
+      \code{Diagnostic::error}) ; \file{src/rules/mod.rs}
+      (\code{all_rules}) ; \file{src/driver/mod.rs} (\code{run_check}) ;
+      \file{docs/usage.md} ; \file{docs/adr/}.
+    \item Chiffres au commit \snapshotCommit{} : 142 fichiers et
+      59\,757 lignes dans \file{src/}, 1\,529 tests, 19 règles natives et
+      21 noms de diagnostic, 42 ADR, 14 dépôts de corpus, 1\,498
+      localisations de référence.
+  \end{itemize}
+  Le \cref{chap:react-modele} précise le modèle d'exécution de React que
+  l'analyse abstrait ; le \cref{chap:interpretation-abstraite} donne les
+  définitions exactes de ce que ce chapitre a présenté en mots.
+\end{resume}
+
+\section{Exercices}
+\label{sec:introduction-exercices}
+
+Les sorties citées dans les solutions ont été observées avec
+\code{check --no-color --info --trace} sur les fichiers indiqués.
+
+\begin{exercice}{Un seuil plus lointain}{introduction-hundred}
+  On remplace la garde de \code{Bounded} (\cref{lst:introduction-bounded})
+  par \code{if (n < 100) setN(n + 1)} (\file{/tmp/ch01/exo_hundred.tsx}).
+  (a) Que fait React ? (b) En raisonnant comme sur la
+  \cref{fig:introduction-intervalles}, quel intervalle final attendez-vous
+  pour \code{n} ? (c) \regle{infinite-loop} doit-elle se déclencher ?
+\end{exercice}
+\begin{solution}
+  (a) Cent rendus supplémentaires après le montage, puis l'effet cesse
+  d'écrire : \code{n} s'arrête à \code{100}. (b) Le widening projette la
+  borne qui grandit sur le plus petit seuil qui l'englobe ; les littéraux du
+  composant fournissent \code{100}, d'où $[0,100]$, stable parce que l'effet
+  n'écrit que sous $n<100$. Le moteur calcule bien \code{number[0, 100]}
+  (sonde hors dépôt). (c) Non : la sortie contient l'\Info{}
+  \regle{widening-info} (l'état a été élargi) et la ligne \code{verified
+  infinite-loop no effect diverges into an infinite render loop}. Le
+  widening seul n'est pas un diagnostic de boucle.
+\end{solution}
+
+\begin{exercice}{Élargi, et pourtant sans boucle}{introduction-once}
+  Soit l'effet \code{useEffect(() => \{ setN(n + 1); \}, [])} dans un
+  composant \code{Once} dont l'état vaut initialement \code{0}
+  (\file{/tmp/ch01/exo_once.tsx}). (a) Combien de rendus React fait-il ?
+  (b) L'analyseur élargit l'état \code{n} à $[0,+\infty)$ : pourquoi, alors
+  que l'effet ne s'exécute qu'une fois ? (c) Quels diagnostics attendez-vous ?
+\end{exercice}
+\begin{solution}
+  (a) Deux : le montage (\code{n = 0}), puis le rendu provoqué par
+  \code{setN(1)} ; les deps \code{[]} n'ayant pas changé, l'effet ne repart
+  pas. (b) Le tour abstrait exécute \emph{tous} les effets à chaque tour,
+  qu'ils soient re-déclenchés ou non (\cref{sec:introduction-pari}) : c'est
+  une sur-approximation, qui fait croître \code{n} à chaque tour abstrait. La
+  règle \regle{infinite-loop}, elle, tient compte des deps et ne conclut pas à
+  une boucle. (c) La sortie observée contient un \Warning{}
+  \regle{missing-deps} sur \code{n} (lu, non déclaré), l'\Info{}
+  \regle{widening-info}, et \code{verified infinite-loop}. Le code de sortie
+  est \code{1}, à cause du \Warning.
+\end{solution}
+
+\begin{exercice}{Setter dans le corps du rendu}{introduction-eager}
+  Quel niveau \reactant{} doit-il donner au composant suivant
+  (\file{/tmp/ch01/exo_render.tsx}, ligne d'import omise), et pourquoi ?
+\begin{lstlisting}[language=TypeScript]
+export function Eager() {
+  const [n, setN] = useState(0);
+  setN(n + 1);
+  return <p>{n}</p>;
+}
+\end{lstlisting}
+\end{exercice}
+\begin{solution}
+  Un setter appelé pendant le rendu planifie un nouveau rendu avant même le
+  commit ; appelé inconditionnellement, il relance le rendu à chaque fois, et
+  React interrompt la boucle par une erreur (\cref{chap:react-modele}). Le
+  défaut est certain dès que le composant est rendu, et la preuve est
+  structurelle : l'appel est dans le bloc d'entrée du rendu, qui est sur tous
+  les chemins. \reactant{} donne \code{error setter-in-render [hook:0]
+  (line 5:2) setter `setN` called directly in the render body, move this
+  call into a useEffect or an event handler} (\cref{chap:regles-etat}).
+\end{solution}
+
+\begin{exercice}{Une constante de module}{introduction-const}
+  Dans \file{/tmp/ch01/exo_const.tsx}, un effet de deps \code{[page]} lit une
+  prop \code{page} et une constante de module \code{const LIMIT = 10}.
+  \regle{missing-deps} doit-elle signaler \code{LIMIT} ? Que répond l'outil ?
+\end{exercice}
+\begin{solution}
+  Non : une constante de module ne change jamais entre deux rendus, l'omettre
+  des deps ne peut pas figer une valeur périmée. L'analyse le sait parce
+  qu'elle évalue les constantes de module (\cref{chap:frontend-detection}).
+  Sortie observée : \code{1 clean component(s) hidden} puis
+  ✓~\code{1 file(s) no issues found.}
+\end{solution}
+
+\begin{exercice}{Classer des énoncés}{introduction-classer}
+  Pour chacun des énoncés suivants, dites s'il peut justifier une \Error, un
+  \Warning{} ou seulement une \Info{} : (a) \og cet effet n'a pas de
+  tableau de deps et écrit, sur tous ses chemins, un objet littéral neuf dans
+  un état\fg{} ; (b) \og cet état a dû être élargi pendant l'analyse\fg{} ;
+  (c) \og cette variable, lue dans l'effet, peut changer entre deux
+  rendus\fg{} ; (d) \og ce hook importé n'a pas pu être lu\fg{}.
+\end{exercice}
+\begin{solution}
+  (a) \Error{} possible : chaque conjoint est un fait certain (écriture sur
+  tous les chemins, référence toujours neuve, re-déclenchement à chaque
+  commit sans deps), la conclusion est prouvée en entier. Sur la variante de
+  \code{Filters} (\cref{ex:introduction-churn}) sans tableau de deps
+  (\file{/tmp/ch01/exo_nodeps_churn.tsx}), l'outil répond \code{error
+  infinite-loop [hook:1] (line 5:2) this effect has no dependency array and
+  stores a fresh reference into state `query`, so it re-runs after every
+  render and re-triggers itself: infinite render loop}. (b) \Info{} seulement : un
+  widening peut venir d'une imprécision, c'est l'\Info{}
+  \regle{widening-info}. (c) \Warning{} : défaut possible, qui dépend de
+  l'évolution réelle de la variable (\regle{missing-deps}). (d) \Info{} :
+  c'est une limite de l'analyse (\regle{analysis-limit}), qui suspend aussi
+  les lignes \code{verified} du composant.
+\end{solution}
+

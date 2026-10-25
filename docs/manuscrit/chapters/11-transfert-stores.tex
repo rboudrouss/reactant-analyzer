@@ -1,0 +1,2414 @@
+% ---------------------------------------------------------------------------
+% Chapitre 11 — Fonctions de transfert, interpréteur d'expressions et stores
+% Sources : notes/05-domains-transfer-stores.md (intégralement),
+% src/domains/transfer/state_value.rs, src/domains/interp/{interpreter,
+% callbacks,cfg}.rs, src/domains/stores/*.rs, src/domains/mod.rs (trait
+% Transfer), src/engine/{fixpoint,cfg_analyzer}.rs (appelants) ;
+% ADR-002, 009, 010, 012, 015, 017, 020.
+% Sorties observées au commit e67b10a avec target/debug/reactant sur les
+% fichiers /tmp/ch11/*.tsx (copies des exemples du dossier 05 et exemples
+% propres au chapitre). Valeurs abstraites relevées avec la sonde temporaire
+% du dossier 05 (/tmp/dom05/target/debug/probe05, hors dépôt : modes
+% « intra » = analyze_component, « prog » = analyze_program) ; IR imprimé
+% avec la sonde d'impression du chapitre 7 (~/.cache/irdump-target/debug/irdump).
+% ---------------------------------------------------------------------------
+\chapter{Fonctions de transfert, interpréteur d'expressions et stores}
+\label{chap:transfert-stores}
+
+\begin{objectifs}
+  \item Savoir ce que calcule l'interpréteur abstrait d'un pas : la valeur d'une expression de l'IR (\code{eval_state_value}) et l'effet d'une instruction sur l'état abstrait (\code{exec_stmt}), et connaître le chemin exact des appels, du moteur jusqu'à l'évaluateur.
+  \item Connaître l'environnement \code{AbstractEnv} et les quatre stores (\code{StateStore}, \code{MemoStore}, \code{SharedStateStore}, \code{Heap}) : leur clé, leur valeur par défaut ($\Top$ ou $\Bot$), leur mode de mise à jour (forte ou faible), leur portée.
+  \item Savoir évaluer à la main, opération par opération, n'importe quelle expression de l'IR, et savoir ce que le lowering a déjà réécrit avant que l'évaluateur ne la voie.
+  \item Comprendre comment un appel de setter, un \emph{functional updater}, un callback \code{.then} ou \code{setTimeout}, une fonction locale ou un composant enfant font bouger l'état (ADR-009, ADR-010, ADR-012).
+  \item Savoir où la soundness est garantie par construction, où elle est abandonnée par décision, et reconnaître les quatorze défauts observés au commit \snapshotCommit{} (D1 à D14).
+\end{objectifs}
+
+\prerequis{\cref{chap:interpretation-abstraite} (\cref{def:treillis}, \cref{def:point-fixe}, \cref{def:widening}, \cref{def:soundness}, mises à jour fortes et faibles) ; \cref{chap:ir} (\cref{def:slot}, \cref{def:site}, \cref{def:cfg}) ; \cref{chap:lowering-cfg} (diamants, extraction des hooks, handlers) ; \cref{chap:treillis-simples} (intervalles, \code{StrConst}, opérateurs) ; \cref{chap:statevalue-stabilite} (\cref{def:statevalue}, \cref{def:stabilite}, conversion côté lecture, \code{AnalysisCtx}).}
+
+Les trois chapitres précédents ont construit des \emph{valeurs} abstraites :
+des intervalles, des ensembles de chaînes, un produit \code{StateValue} dont
+chaque composante suit une sorte de JavaScript, et un treillis de stabilité
+qui dit si une référence change d'un rendu à l'autre. Il manque la pièce qui
+les met en mouvement : la fonction qui, devant une expression \code{n + 1} ou
+une instruction \code{setN(n + 1)}, calcule la valeur abstraite ou fait
+évoluer l'état. C'est l'objet de ce chapitre, la \og sémantique d'un
+pas\fg{} de l'analyse. Le \cref{chap:cfg-analyzer-dominance} et le
+\cref{chap:point-fixe-composant} décriront \og l'itération des pas\fg{} :
+dans quel ordre on visite les blocs, quand on joint, quand on applique le \emph{widening}, quand
+on s'arrête.
+
+Le sous-système vit dans trois répertoires de \file{src/domains/}, qui
+correspondent à trois questions :
+\begin{itemize}
+  \item \file{transfer/} : que \emph{vaut} une expression ? C'est
+    l'évaluateur \code{eval_state_value}, propre au domaine
+    \code{StateValue}, avec le calcul des mémos et l'inlining des
+    composants enfants ;
+  \item \file{interp/} : que \emph{fait} une instruction ? C'est
+    l'interpréteur générique en \code{T: Transfer} : liaisons, écritures de
+    champ, appels de setter, callbacks, corps de fonctions ;
+  \item \file{stores/} : \emph{où} range-t-on ce que l'on sait ?
+    L'environnement local, l'état React, les mémos, le tas, l'état partagé
+    entre composants.
+\end{itemize}
+La progression suit la difficulté : on part d'un compteur, on apprend à
+évaluer ses expressions, puis à exécuter ses instructions, puis à descendre
+dans ses callbacks, son tas et ses enfants ; on termine par une étude de cas
+des défauts de soundness observés, qui mobilise tout le reste.
+
+% ===========================================================================
+\section{Le problème : évaluer \code{n + 1} sans exécuter le programme}
+\label{sec:transfert-stores-probleme}
+
+\subsection{Deux compteurs}
+
+Voici deux composants presque identiques.
+
+\begin{lstlisting}[language=TypeScript,caption={Deux compteurs (\file{/tmp/ch11/counter.tsx})},label={lst:transfert-stores-counter}]
+import { useState, useEffect } from "react";
+
+export function Counter() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    setN(n + 1);
+  });
+  return <div>{n}</div>;
+}
+
+export function Settle() {
+  const [m, setM] = useState(0);
+  useEffect(() => {
+    setM(5);
+  });
+  return <div>{m}</div>;
+}
+\end{lstlisting}
+
+Tous deux ont un effet sans tableau de deps, donc exécuté après chaque
+rendu, et cet effet appelle le setter de l'état. \code{Counter} boucle : chaque
+effet écrit une valeur neuve, React refait un rendu, l'effet se relance,
+indéfiniment. \code{Settle} ne boucle pas : le premier effet écrit \code{5},
+le rendu suivant relance l'effet, qui écrit encore \code{5}, et React
+abandonne ce second rendu parce que \code{Object.is(5, 5)} est vrai
+(\cref{chap:react-modele}). L'analyseur fait bien la différence :
+
+\begin{sortie}
+$ reactant check counter.tsx --trace --show-clean
+  Counter  (2 hooks)  counter.tsx
+    warn   infinite-loop  [hook:0]  (line 5:2)  this effect keeps pushing state `n` to new values on every run. Potential infinite render loop
+       → state `n` is written here [hook:1] (line 5:2)
+       → the abstract value of state `n` kept growing and was widened at iteration 3
+  Settle  (2 hooks)  counter.tsx  ✓
+
+⚠  1 warning(s) across 1 file(s).
+\end{sortie}
+
+La règle \regle{infinite-loop} (\cref{chap:infinite-loop}) ne fait que lire
+un fait établi plus tôt : \og la valeur abstraite de \code{n} a continué de
+croître et a subi un widening\fg{}. Ce chapitre explique comment ce fait est
+calculé. Pour cela, l'analyseur doit répondre à quatre questions, sans jamais
+exécuter le programme :
+\begin{enumerate}
+  \item dans l'effet, que vaut \code{n} ? C'est une affaire
+    d'\emph{environnement} (\cref{sec:transfert-stores-env}) ;
+  \item que vaut \code{n + 1} ? C'est l'\emph{évaluateur d'expressions}
+    (\cref{sec:transfert-stores-eval}) ;
+  \item où va la valeur passée à \code{setN}, et comment se combine-t-elle
+    avec les précédentes ? Ce sont les \emph{stores} et la \emph{mise à jour
+    faible} (\cref{sec:transfert-stores-stores,sec:transfert-stores-instruction}) ;
+  \item quand le corps de l'effet est-il exécuté, et que se passe-t-il s'il
+    appelle un callback, une fonction locale ou un composant enfant ? Ce sont
+    les \emph{points d'entrée}, la \emph{pré-passe} des callbacks, le
+    \emph{tas} et l'\emph{inter-composants}
+    (\cref{sec:transfert-stores-callbacks,sec:transfert-stores-tas,sec:transfert-stores-inter}).
+\end{enumerate}
+
+\subsection{Ce que voit l'interpréteur}
+
+L'interpréteur ne voit jamais le TSX : il voit l'IR produite par le lowering
+(\cref{chap:lowering-cfg}). Voici celle de \code{Counter}, imprimée par la
+sonde d'impression du \cref{chap:lowering-cfg} :
+
+\begin{sortie}
+=== component Counter (param props) ===
+render_cfg:
+  B0:
+      let n = StateVal(0)  @4:9
+      let setN = StateSetter(0)  @4:12
+      expr HookMarker(1, Undefined)  @5:2
+      => return Native<div>({#1 })[n]
+hooks:
+  #0 State init=0  @4:8
+  #1 Effect deps=Absent  @5:2
+    B0:
+        expr setN((n Add 1))  @6:4
+        => return undefined
+\end{sortie}
+
+Le rendu est un bloc unique de trois instructions et un terminateur
+\code{Return}. La déstructuration de \code{useState} a déjà été réécrite :
+\code{n} est lié à la lecture du slot $0$ (\code{StateVal(0)}), \code{setN}
+à son setter (\code{StateSetter(0)}) ; l'appel \code{useEffect} n'a laissé
+qu'un marqueur de site d'appel (\code{HookMarker}). Le corps de l'effet est
+un CFG à part, rangé dans la table des hooks. L'IR ne connaît que quatre
+instructions, définies dans \file{src/ir/stmt.rs} : \code{Let} et
+\code{Assign} (lier une variable), \code{MemberWrite} (écrire un champ,
+\code{obj.f = v}) et \code{ExprStmt} (une expression évaluée pour ses
+effets, \code{expr e} dans l'impression). Il n'y a pas d'instruction
+\code{return} : le retour est le terminateur du bloc.
+
+\subsection{Le calcul, à la main}
+
+Donnons-nous, pour l'instant sans justification, trois règles :
+(i) la lecture \code{StateVal(0)} rend le contenu courant du store d'état ;
+(ii) \code{n + 1} se calcule sur les intervalles, $[a,b] + [1,1] = [a+1,b+1]$ ;
+(iii) un appel \code{setN(v)} \emph{joint} $v$ au contenu du slot, il ne
+l'écrase pas. Le store est amorcé par la valeur initiale, $[0,0]$. Le moteur
+enchaîne alors des passes \og rendu puis effets\fg{} jusqu'à ce que l'état ne
+bouge plus (\cref{tab:transfert-stores-iterations}).
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{lllll}
+\toprule
+passe & store au début & \code{n} lu & \code{n + 1} & store après la passe \\
+\midrule
+amorçage & --- & --- & --- & $[0,0]$ \\
+1 & $[0,0]$ & $[0,0]$ & $[1,1]$ & $[0,0] \join [1,1] = [0,1]$ \\
+2 & $[0,1]$ & $[0,1]$ & $[1,2]$ & $[0,2]$ \\
+3 & $[0,2]$ & $[0,2]$ & $[1,3]$ & $[0,3]$, puis widening : $[0,+\infty]$ \\
+4 & $[0,+\infty]$ & $[0,+\infty]$ & $[1,+\infty]$ & $[0,+\infty]$ : stable, arrêt \\
+\bottomrule
+\end{tabular}
+\caption{Le point fixe de \code{Counter}, calculé à la main. Le widening
+(\cref{def:widening}) intervient à la troisième itération, c'est-à-dire au
+seuil par défaut \code{widen_threshold = 3} du moteur.}
+\label{tab:transfert-stores-iterations}
+\end{table}
+
+Pour \code{Settle}, la première passe donne $[0,0] \join [5,5] = [0,5]$ et la
+deuxième n'ajoute rien : le moteur s'arrête après une itération. La sonde
+temporaire du dossier de notes, qui appelle directement
+\code{analyze_component} et imprime les stores convergés, le confirme :
+
+\begin{sortie}
+-- Counter (intra, iterations=3)
+   state[0] = number[0, inf]   widened=true
+   env[n] = Val(number[0, inf])
+-- Settle (intra, iterations=1)
+   state[0] = number[0, 5]   widened=false
+   env[m] = Val(number[0, 5])
+\end{sortie}
+
+\begin{react}[Le bail-out de \code{setState}]
+  React compare la nouvelle valeur d'un état à l'ancienne par
+  \code{Object.is} et n'ordonne pas de nouveau rendu si elles sont égales.
+  C'est ce qui rend terminante la boucle de \code{Settle} : après le premier
+  \code{setM(5)}, les suivants ne changent plus rien. Dans l'analyse, le
+  point fixe abstrait est l'image de ce bail-out : une écriture qui
+  n'ajoute rien au join ne relance pas la boucle.
+\end{react}
+
+Les règles (i) à (iii) sont exactement celles du code, avec des nuances que
+le chapitre va détailler. Retenons dès maintenant la troisième, parce
+qu'elle structure tout le reste : le store d'état contient le \emph{join de
+toutes les valeurs écrites}, initialiseur compris. Il ne dit pas \og ce que
+vaut l'état maintenant\fg{} mais \og ce que l'état peut valoir à un moment
+quelconque\fg{}. Un appel de setter \emph{peut} avoir lieu ; il ajoute un
+comportement possible, il n'en retire aucun.
+
+\subsection{Le contrat : le trait \code{Transfer}}
+
+Le moteur ne connaît pas \code{StateValue} : il est générique en un
+paramètre \code{T: Transfer} (\srcline{src/engine/cfg_analyzer.rs}{34}). Le
+trait fixe les quatre opérations dont il a besoin :
+
+\rustsnippet[label={lst:transfert-stores-trait}]{src/domains/mod.rs}{114}{144}{le contrat entre le moteur et un domaine (la quatrième méthode, \code{recompute_memo}, suit jusqu'à la ligne 161)}
+
+\begin{itemize}
+  \item \code{eval_expr} : la valeur abstraite d'une expression. L'environnement
+    est pris en lecture seule (\code{&}), l'\code{AnalysisCtx} en écriture
+    (\code{&mut}) ; le \cref{chap:statevalue-stabilite} a décrit ce paquet
+    (\code{component}, \code{state}, \code{memo}, \code{heap}, \code{query},
+    \code{inter}) et pourquoi l'environnement en est séparé : sa mutabilité
+    diffère d'une opération à l'autre.
+  \item \code{exec_stmt} : l'effet d'une instruction, en place, sur
+    l'environnement et les stores.
+  \item \code{exec_expr_effects} : les effets d'une expression évaluée
+    \og pour ses effets\fg{}, soit une instruction \code{expr;}, soit le
+    corps d'une flèche concise (\code{() => setN(1)}), que le lowering range
+    dans un terminateur \code{Return}. Le moteur l'appelle sur chaque
+    terminateur \code{Return} qu'il rencontre
+    (\src{src/engine/cfg_analyzer.rs}{84}{86}).
+  \item \code{recompute_memo} : la valeur d'un \code{useMemo} ou d'un
+    \code{useCallback}, recalculée après chaque passe de rendu
+    (\cref{sec:transfert-stores-memo}).
+\end{itemize}
+
+Il n'existe qu'une implémentation, \code{StateValueTransfer}, une structure
+vide : toute la variation vient du contexte.
+
+\rustsnippet[label={lst:transfert-stores-svt}]{src/domains/transfer/state_value.rs}{24}{54}{l'unique implémentation du trait}
+
+Le partage des rôles est net : l'évaluation des expressions est
+\emph{propre au domaine} (\code{eval_state_value}, dans \file{transfer/}),
+l'exécution des instructions est \emph{entièrement déléguée} à
+l'interpréteur générique de \file{interp/}
+(\code{exec_stmt_with_callbacks}, \code{exec_expr_effects}). Cet
+interpréteur n'est pourtant complet que pour \code{StateValue} : le tas et le
+store partagé rangent des \code{StateValue} quel que soit le domaine, et
+passent par les ponts \code{as_state_value} / \code{from_state_value} du
+trait \code{AbstractDomain} (\cref{chap:treillis-simples}), qui rendent
+\code{None} et $\Bot$ pour tout autre domaine
+(\srcline{src/domains/interp/interpreter.rs}{168}). Un second domaine perdrait
+silencieusement les captures de fermetures et les écritures de champ.
+
+\subsection{Le chemin des appels}
+
+La \cref{fig:transfert-stores-flot} donne le chemin complet, du moteur à
+l'évaluateur. Il servira de carte pour tout le chapitre.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[font=\scriptsize,
+    b/.style={bloc,font=\scriptsize,inner sep=3pt},
+    m/.style={bloc,font=\scriptsize,inner sep=3pt,fill=white,draw=ra-gray}]
+  \node[m] (acfg) at (0,0) {\code{analyze_cfg} (moteur)\\ \file{engine/cfg_analyzer.rs}};
+  \node[b] (xs) at (-3.6,-1.4) {\code{Transfer::exec_stmt}\\ \code{exec_stmt_with_callbacks} (prof.~0)};
+  \node[b] (full) at (-3.6,-2.9) {\code{exec_full_stmt}(prof.~$d$)};
+  \node[b] (eff) at (3.2,-2.9) {\code{exec_expr_effects}(prof.~$d$)};
+  \node[b] (core) at (-5.4,-4.4) {\code{exec_stmt_core}};
+  \node[b] (pre) at (-1.2,-4.4) {\code{exec_callbacks_depth}\\ (pré-passe)};
+  \node[b] (set) at (3.2,-4.4) {\code{exec_setter_call}};
+  \node[b] (bind) at (-5.4,-5.9) {\code{bind_rhs}\\ \code{MemberWrite}};
+  \node[b] (body) at (1.2,-5.9) {\code{exec_body_depth}($d+1$)\\ \code{exec_body_impl}};
+  \node[b] (eval) at (-1.2,-7.4) {\code{eval_expr} = \code{eval_state_value}};
+  \node[b] (binop) at (-5.6,-8.9) {\code{eval_binop}\\ \code{eval_unary}};
+  \node[b] (field) at (-2.6,-8.9) {\code{eval_field_access}\\ \code{eval_index_access}};
+  \node[b] (comp) at (0.8,-8.9) {\code{eval_comp_app}};
+  \node[m] (child) at (4.4,-8.9) {\code{analyze_child}\\ (moteur, enfant)};
+  \draw[fleche] (acfg) -- node[etiquette,left]{chaque instruction} (xs);
+  \draw[fleche] (acfg) -- node[etiquette,right]{terminateur \code{Return}} (eff);
+  \draw[fleche] (xs) -- (full);
+  \draw[fleche] (full) -- node[etiquette,above]{\code{ExprStmt}} (eff);
+  \draw[fleche] (full) -- node[etiquette,left]{\code{Let}, \code{Assign}, \code{MemberWrite}} (core);
+  \draw[fleche] (full) -- (pre);
+  \draw[fleche] (eff) -- (pre);
+  \draw[fleche] (eff) -- (set);
+  \draw[fleche] (core) -- (bind);
+  \draw[fleche] (pre) -- node[etiquette,left]{callback} (body);
+  \draw[fleche] (set) -- node[etiquette,right]{updater} (body);
+  \draw[flechemay] (body.north west) to[out=150,in=-20] node[etiquette,right,pos=0.2]{récursion} (full.south east);
+  \draw[fleche] (bind) -- (eval);
+  \draw[fleche] (set) -- (eval);
+  \draw[fleche] (body) -- node[etiquette,right]{\code{Return}} (eval);
+  \draw[fleche] (eval) -- (binop);
+  \draw[fleche] (eval) -- (field);
+  \draw[fleche] (eval) -- (comp);
+  \draw[fleche] (comp) -- node[etiquette,above]{point fixe} (child);
+\end{tikzpicture}
+\caption{Du moteur à l'évaluateur. Les boîtes blanches appartiennent au moteur
+(\cref{chap:cfg-analyzer-dominance,chap:inter-composants}), les bleues à ce
+chapitre. La flèche tiretée est la récursion des corps imbriqués : un corps
+de callback ou de \emph{functional updater} est exécuté instruction par
+instruction par le même \code{exec_full_stmt}, à la profondeur $d+1$,
+plafonnée à \code{MAX_INLINE_DEPTH = 3}.}
+\label{fig:transfert-stores-flot}
+\end{figure}
+
+\begin{invariant}{L'évaluation est pure vis-à-vis de l'état React}{eval-pure}
+  \code{eval_state_value} ne met jamais à jour le store d'état. Les effets de
+  bord (appel de setter, exécution d'un callback) sont tirés par
+  l'interpréteur d'instructions, dans des positions syntaxiques précises
+  (\cref{sec:transfert-stores-instruction}). Deux exceptions assumées :
+  \code{havoc_setter_props}, qui joint $\Top$ dans un slot dont le setter
+  part vers un enfant inanalysable, et \code{eval_comp_app}, qui lance
+  l'analyse d'un enfant, laquelle écrit dans le store partagé
+  (\cref{sec:transfert-stores-inter}).
+\end{invariant}
+
+Cet invariant vient de l'ADR-009 (\og la pré-passe tire les effets,
+\code{eval} reste pur\fg{}). Il est commode : une même expression peut être
+évaluée plusieurs fois (par la pré-passe, puis par la liaison) sans que
+l'état n'enregistre deux écritures. Il a aussi un coût, que la
+\cref{sec:transfert-stores-soundness} chiffrera : un setter appelé ailleurs
+qu'en position d'effet n'écrit rien (défaut D2).
+
+% ===========================================================================
+\section{L'environnement abstrait}
+\label{sec:transfert-stores-env}
+
+\subsection{Un exemple : ce qu'on sait d'une variable}
+
+L'environnement répond à la question \og que vaut la variable \code{x} en ce
+point du programme ?\fg{}. Prenons un composant qui mélange les cas
+courants : une prop, un appel à une fonction importée, une variable affectée
+sur deux branches, une autre sur une seule.
+
+\begin{lstlisting}[language=TypeScript,caption={Ce qu'on sait d'une variable (\file{/tmp/ch11/env.tsx})},label={lst:transfert-stores-env}]
+import { useState } from "react";
+import { format } from "./fmt";
+
+export function Label({ flag }: { flag: boolean }) {
+  const [n] = useState(0);
+  const a = format(n);
+  let b;
+  if (flag) {
+    b = 1;
+  } else {
+    b = 2;
+  }
+  let c;
+  if (flag) {
+    c = 3;
+  }
+  return <div>{a}{b}{c}{n}</div>;
+}
+\end{lstlisting}
+
+La sonde imprime l'environnement de sortie du rendu :
+
+\begin{sortie}
+-- Label (intra, iterations=0)
+   state[0] = number[0, 0]   widened=false
+   env[flag] = Val(⊤)
+   env[n] = Val(number[0, 0])
+   env[a] = Val(⊤)
+   env[b] = Val(number[1, 2])
+   env[c] = Val(number[3, 3]|undefined)
+\end{sortie}
+
+Chaque ligne illustre une règle. \code{flag} est lu sur le paramètre de
+props, qui n'est lié à rien quand le composant est analysé seul : il vaut
+$\Top$. \code{a} est le résultat d'un appel, que l'évaluateur n'exécute
+jamais : $\Top$ aussi (\cref{sec:transfert-stores-eval}). \code{b} reçoit
+$[1,1]$ sur une branche, $[2,2]$ sur l'autre ; le bloc de jonction joint les
+deux environnements, d'où $[1,2]$. \code{c} vaut \code{undefined} (le
+\code{let c;} s'abaisse en \code{let c = undefined}) sur la branche qui ne
+l'affecte pas et $[3,3]$ sur l'autre : le join garde les deux sortes, ce que
+permet le produit (\cref{def:statevalue}).
+
+\subsection{Quatre tables}
+
+\rustsnippet[label={lst:transfert-stores-absenv}]{src/domains/stores/abstract_env.rs}{46}{60}{l'environnement abstrait}
+
+L'environnement n'est pas une seule table mais quatre, toutes privées
+(\cref{tab:transfert-stores-env}). Le nom \code{stabs} est un vestige de
+l'ADR-002, quand la seule valeur abstraite était une stabilité.
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{p{27mm}p{45mm}p{30mm}p{36mm}}
+\toprule
+table & contenu & écrite par & lue par \\
+\midrule
+\code{stabs} & valeur abstraite de chaque variable & \code{extend} & \code{lookup}, \code{lookup_env_val} \\
+\code{locs} & sites d'allocation que la variable peut désigner (\cref{sec:transfert-stores-tas}) & \code{extend_loc} (union) & \code{lookup_env_val} \\
+\code{setter_bindings} & variable $\mapsto$ label du \code{useState} dont elle est le setter & \code{bind_setter} & \code{setter_label} \\
+\code{callback_bindings} & variable $\mapsto$ label du \code{useCallback} qu'elle désigne & \code{bind_callback} & \code{callback_label} \\
+\bottomrule
+\end{tabular}
+\caption{Les quatre tables de \code{AbstractEnv}.}
+\label{tab:transfert-stores-env}
+\end{table}
+
+Les deux dernières sont des \emph{canaux latéraux} propres à React : savoir
+qu'une variable est \emph{le} setter du slot $3$, ou \emph{le} callback du
+hook $5$, permet d'exécuter ses appels (\cref{sec:transfert-stores-instruction,sec:transfert-stores-callbacks}).
+La lecture principale est conservative :
+
+\rustsnippet[label={lst:transfert-stores-lookup}]{src/domains/stores/abstract_env.rs}{78}{93}{la lecture d'une variable}
+
+\code{lookup} rend $\Top$ pour toute variable absente. \code{lookup_env_val}
+rend une \emph{vue} \code{EnvVal}, qui porte la valeur et, si la variable a
+des sites, l'ensemble de ses sites ; cette vue sera détaillée avec le tas.
+L'écriture \code{extend} écrase la valeur et \emph{préserve} les sites ;
+\code{extend_loc} \emph{ajoute} un site, sans jamais en retirer
+(\src{src/domains/stores/abstract_env.rs}{100}{108}).
+
+\begin{definition}{Environnement abstrait}{environnement}
+  Un \terme{environnement abstrait} $\rho$ associe à chaque variable $x$ une
+  valeur $\rho(x) \in \code{StateValue}$, avec $\rho(x) = \Top$ pour toute
+  variable non liée. Sa concrétisation est l'ensemble des environnements
+  concrets $\sigma$ tels que $\sigma(x) \in \gam(\rho(x))$ pour tout $x$.
+  L'ordre, le join et le widening sont ponctuels.
+\end{definition}
+
+\begin{invariant}{Une variable inconnue vaut $\Top$}{env-top}
+  Les paramètres, les imports, les globales (\code{fetch}, \code{window}),
+  toute liaison perdue se lisent $\Top$. Perdre une liaison de \emph{valeur}
+  est donc sound. Les trois autres tables ne suivent pas cette règle : elles
+  se lisent \og rien par défaut\fg{}. Perdre une liaison de setter, de
+  callback ou de site n'est \emph{pas} sound, car ce qui n'est pas trouvé
+  n'est pas exécuté.
+\end{invariant}
+
+Cette asymétrie est la racine de plusieurs défauts de la
+\cref{sec:transfert-stores-soundness} (D1, D10) : partout où une liaison se
+perd, la valeur retombe prudemment à $\Top$ mais l'écriture de setter qui en
+dépendait disparaît.
+
+\subsection{Le join}
+
+\rustsnippet[label={lst:transfert-stores-envjoin}]{src/domains/stores/abstract_env.rs}{130}{173}{le join de deux environnements}
+
+Variable par variable :
+\begin{itemize}
+  \item présente des deux côtés : join de \code{StateValue} ;
+  \item présente d'un seul côté : $\Top$, ce qui est cohérent avec
+    \og absente vaut $\Top$\fg{} ;
+  \item sites : union ensembliste ;
+  \item liaisons de setter et de callback : union \emph{à priorité gauche}
+    (\code{entry(k).or_insert(v)}). Si une même variable désigne le setter
+    de \code{a} sur un chemin et celui de \code{b} sur l'autre, le second
+    est oublié (défaut D10).
+\end{itemize}
+Le widening \code{widen_to} (\src{src/domains/stores/abstract_env.rs}{175}{208})
+suit le même schéma, avec \code{widen_to} ponctuel sur les valeurs et les
+seuils de l'ADR-014 ; \code{analyze_cfg} l'emploie sur les arcs retour
+(\src{src/engine/cfg_analyzer.rs}{97}{111}).
+
+\begin{decision}[ADR-010 --- deux tables plutôt qu'une]
+  La tentation était une seule table \code{Var} $\to$ \code{EnvVal}, où
+  \code{EnvVal} vaut soit une valeur, soit un site. L'ADR-010 la refuse :
+  \og a single map \code{EnvVal = Val | Loc} was tempting but
+  \code{env.extend(var, val)} overwrote the \code{Loc} previously placed by
+  \code{env.extend_loc(var, id)}\fg{}. La liaison \code{const f = () => ...}
+  pose d'abord le site, puis la valeur ; avec une seule table, la seconde
+  écriture efface la première et \code{f()} n'est plus exécutable. Deux
+  tables indépendantes suppriment le conflit. \code{EnvVal} subsiste comme
+  \emph{vue} de lecture, et comme type des champs d'un objet du tas.
+\end{decision}
+
+\begin{piege}
+  \code{AbstractEnv::bottom()} est l'environnement vide. C'est bien le plus
+  petit élément pour \code{leq}, mais ce n'est \emph{pas} l'élément neutre du
+  join : comme une clé présente d'un seul côté donne $\Top$,
+  \code{bottom().join(&e)} rend un environnement où toutes les variables de
+  \code{e} valent $\Top$. En lecture, l'environnement vide se comporte comme
+  \og tout $\Top$\fg{}. Les appelants évitent le piège en ne joignant que des
+  environnements calculés : \code{analyze_cfg} insère le premier
+  environnement reçu sans join (\srcline{src/engine/cfg_analyzer.rs}{98}),
+  \code{exec_body_impl} filtre les prédécesseurs non encore visités.
+  Symétriquement, \code{leq} lit une clé absente de droite comme $\Bot$ et
+  non $\Top$ : l'asymétrie est sans conséquence aujourd'hui, car
+  \code{AbstractEnv::leq} n'est appelé qu'en tests ; le moteur compare les
+  environnements par égalité structurelle
+  (\srcline{src/engine/cfg_analyzer.rs}{114}).
+\end{piege}
+
+% ===========================================================================
+\section{L'évaluateur d'expressions}
+\label{sec:transfert-stores-eval}
+
+\subsection{Un banc d'essai}
+
+Avant de lire le code, observons ce qu'il calcule sur une série
+d'expressions courtes.
+
+\begin{lstlisting}[language=TypeScript,caption={Des opérateurs (\file{/tmp/ch11/ex1.tsx})},label={lst:transfert-stores-ops}]
+import { useState, useEffect } from "react";
+
+export function Ops() {
+  const [n, setN] = useState(0);
+  const [label, setLabel] = useState("a");
+  const masked = n & 7;
+  const kind = typeof n;
+  const text = `n=${n}`;
+  const neg = ~5;
+  const plus = +"5";
+  const both = label + "b";
+  const cmp = n < 3;
+  const notTrue = !true;
+  const notNum = !n;
+  const nul = null + 1;
+  useEffect(() => {
+    setLabel(both);
+  }, [both]);
+  return <div>{masked}{kind}{text}{neg}{plus}{cmp}{notTrue}{notNum}{nul}</div>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+-- Ops (intra, iterations=4)
+   state[0] = number[0, 0]   widened=false
+   state[1] = string   widened=true
+   env[n] = Val(number[0, 0])
+   env[label] = Val(string)
+   env[masked] = Val(number[0, 7])
+   env[kind] = Val(string{"number"})
+   env[text] = Val(⊤)
+   env[neg] = Val(number[-6, -6])
+   env[plus] = Val(number[5, 5])
+   env[both] = Val(string)
+   env[cmp] = Val(boolean)
+   env[notTrue] = Val(false)
+   env[notNum] = Val(⊤)
+   env[nul] = Val(number[1, 1])
+\end{sortie}
+
+Plusieurs réponses sont exactes (\code{~5} vaut $-6$, \code{+"5"} vaut $5$,
+\code{null + 1} vaut $1$), d'autres sont des approximations sûres : un masque
+\code{n & 7} tient dans $[0,7]$, une comparaison est \og un booléen\fg{}, et
+trois valent $\Top$ alors que JavaScript saurait dire mieux (\code{text},
+\code{notNum}). L'ensemble de chaînes de \code{label} grandit à chaque
+passe (\code{"a"}, \code{"ab"}, \code{"abb"}, \ldots), dépasse le seuil de
+\code{StrConst} et devient \code{string}, le $\Top$ de la composante
+chaîne (\cref{chap:treillis-simples}). Toutes ces réponses sortent d'une
+seule fonction.
+
+\subsection{La fonction \code{eval_state_value}}
+
+C'est une récursion structurelle sur l'arbre d'expression, un bras par
+variante de \code{Expr} (\cref{chap:ir}). Elle évalue les sous-expressions
+de gauche à droite, chacune une fois ; son coût est linéaire en la taille de
+l'expression, sauf pour une application de composant (une analyse complète
+de l'enfant) et pour la concaténation de deux ensembles de chaînes (un
+produit cartésien, borné par le seuil de \code{StrConst}). Voici le début :
+
+\rustsnippet[label={lst:transfert-stores-eval1}]{src/domains/transfer/state_value.rs}{106}{136}{l'évaluateur : littéraux, variables, hooks}
+
+puis les marqueurs de hooks et les allocations :
+
+\rustsnippet[label={lst:transfert-stores-eval2}]{src/domains/transfer/state_value.rs}{137}{163}{l'évaluateur : marqueurs, allocations, éléments}
+
+La suite (\src{src/domains/transfer/state_value.rs}{165}{190}) évalue les
+opérandes d'un \code{BinOp} ou d'un \code{UnaryOp} puis délègue à
+\code{eval_binop} ou \code{eval_unary}, traite les appels, les \code{new},
+les accès de membres et d'index, et traverse les annotations. La
+\cref{tab:transfert-stores-eval} récapitule tous les bras ; on la détaille
+ensuite par familles.
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{p{42mm}p{42mm}p{62mm}}
+\toprule
+expression de l'IR & valeur abstraite & remarque \\
+\midrule
+\code{Lit(Int(n))}, \code{Lit(Float(f))} & \code{number([n,n])} & intervalle ponctuel \\
+\code{Lit(Bool(b))} & \code{boolean(True|False)} & \\
+\code{Lit(String(s))} & \code{str_singleton(s)} & ensemble $\{s\}$ \\
+\code{Lit(Null)}, \code{Lit(Unit)} & \code{null()}, \code{undefined()} & \code{undefined} s'abaisse en \code{Lit(Unit)} \\
+\code{Var(v)} & \code{env.lookup(v)} & $\Top$ si non liée \\
+\code{StateVal(l)} & \code{ctx.state.get(l)}, référence convertie & \cref{sec:transfert-stores-lecture} \\
+\code{StateSetter(l)} & \code{component_setter}\newline\code{(ctx.component, l)} & le setter porte son propriétaire \\
+\code{MemoVal(l)}, \code{CallbackVal(l)} & \code{ctx.memo.get(l)} & $\Top$ tant que non calculé \\
+\code{HookMarker(_, Undefined)} & \code{undefined()} & hook React sans valeur suivie \\
+\code{HookMarker(_, Unknown)} & $\Top$ & hook custom ni inliné ni résumé \\
+\code{HookMarker(_, StableRef)} & \code{ref(Stable)} & \code{useRef} \\
+\code{HookMarker(_, Summary(s))}, \code{SummaryVal(s)} & \code{summary_value(s)} & table unique des résumés \\
+\code{ObjectLit}, \code{ArrayLit}, \code{FnLit}, \code{New} & \code{ref(PerRender)} & fait must : neuf à chaque rendu \\
+\code{NativeElem}, \code{CompApp} & \code{ref(Stable)} & voir D8 \\
+\code{BinOp}, \code{UnaryOp} & \code{eval_binop}, \code{eval_unary} & opérandes d'abord \\
+\code{Call} & \code{ref(PerRender)} ou $\Top$ & allocateurs connus seulement \\
+\code{FieldAccess}, \code{IndexAccess} & lecture par le tas & \cref{sec:transfert-stores-tas} \\
+\code{TSAnnotated(e)} & valeur de \code{e} & l'annotation est ignorée \\
+\bottomrule
+\end{tabular}
+\caption{Les bras de \code{eval_state_value}, \src{src/domains/transfer/state_value.rs}{106}{190}.}
+\label{tab:transfert-stores-eval}
+\end{table}
+
+\subsection{Littéraux, variables et hooks}
+
+Les littéraux sont exacts. Un entier du source devient \code{Int} quand sa
+valeur est entière et petite, \code{Float} sinon ; les deux donnent un
+intervalle ponctuel. Une variable se lit dans l'environnement, $\Top$ si elle
+n'y est pas.
+
+Trois bras lisent des hooks. \code{StateVal(l)} lit le store d'état ; il
+applique la \emph{conversion côté lecture} de l'ADR-017, que le
+\cref{chap:statevalue-stabilite} a démontrée et que la
+\cref{sec:transfert-stores-lecture} replacera dans l'interpréteur.
+\code{StateSetter(l)} rend un setter \emph{porteur de son propriétaire},
+\code{SetterVal::One(composant, l)}, même en analyse intra-composant : c'est
+ce qui permet de suivre un setter passé en prop jusqu'à l'enfant qui
+l'appelle (\cref{sec:transfert-stores-inter}), et c'est aussi l'origine du
+défaut D3. \code{MemoVal} et \code{CallbackVal} lisent le même
+\code{MemoStore} : un \code{useCallback} n'est qu'un mémo dont la valeur est
+une fonction.
+
+Le marqueur \code{HookMarker} ancre le site d'appel d'un hook dont la
+valeur n'est pas suivie. Ses quatre formes ont chacune une histoire,
+racontée par les commentaires du code : un hook React sans valeur
+(\code{useEffect}) rend vraiment \code{undefined} ; un hook custom non
+résolu rendait autrefois \code{undefined} lui aussi, ce qui le faisait
+passer pour \emph{prouvablement stable} et taisait toutes les règles de
+stabilité (un faux négatif corrigé par \code{b7bc459}) ; il rend désormais
+$\Top$. \code{useRef} rend le même conteneur à chaque rendu : une référence,
+et une référence \code{Stable}. Un hook de bibliothèque résumé se lit comme
+son résumé, par une table unique, \code{summary_value}
+(\src{src/domains/transfer/state_value.rs}{192}{222}), \og so the marker and
+the standalone \code{SummaryVal} can never disagree\fg{} : \code{Top} et
+\code{Held} donnent $\Top$, \code{StableRef} donne \code{ref(Stable)},
+\code{UnstableRef} \code{ref(PerRender)}, un \code{Wrapper} l'une ou l'autre
+selon son drapeau. Deux lignes méritent l'attention. Un résumé \code{Shape}
+(\code{useForm()}, dont seuls certains membres sont promis stables) vaut
+$\Top$ : la promesse porte sur les membres, qui seront lus par le tas
+(\cref{sec:transfert-stores-tas}). Un \code{Navigator} non stable vaut $\Top$
+et non \code{PerRender} : on ne prouve pas sa fraîcheur.
+
+\subsection{Allocations et éléments}
+
+Un littéral d'objet, de tableau ou de fonction évalué pendant un rendu est
+une référence neuve à chaque rendu : \code{ref(PerRender)} est un fait
+\emph{must} (\cref{def:stabilite}). C'est le fait que la règle
+\regle{always-unstable-deps} exploite. \code{new X()} alloue lui aussi
+(ajout du commit \snapshotCommit{}, \issue{158}) ; ses membres restent
+$\Top$. L'évaluation d'un littéral \emph{ne peuple pas} le tas : seule la
+liaison d'une variable (\code{bind_rhs}) ou le passage en prop le fait.
+
+Les éléments JSX, natifs (\code{<span/>}) ou composants (\code{<Child/>}),
+valent \code{ref(Stable)}. C'est juste pour dire \og la valeur d'un élément
+ne porte pas d'information utile\fg{}, mais c'est faux au sens
+d'\code{Object.is} : en JavaScript, chaque rendu alloue un nouvel objet
+élément. Le \cref{chap:statevalue-stabilite} a relevé ce faux négatif ; on
+le retrouvera sous le nom D8.
+
+\subsection{Appels}
+
+Un appel n'est \emph{jamais} exécuté par l'évaluateur : sa valeur est $\Top$,
+sauf pour une liste blanche d'appels qui allouent toujours.
+
+\rustsnippet[label={lst:transfert-stores-fresh}]{src/domains/transfer/state_value.rs}{238}{259}{les appels dont le résultat est toujours neuf}
+
+La liste est volontairement courte. Elle exclut \code{slice} et
+\code{concat}, qui rendent une primitive sur une chaîne
+(\code{id.slice(0, 8)}) : prétendre \code{PerRender} serait une fausse
+preuve (\issue{22}, décision enregistrée). Elle exclut aussi les méthodes en
+place (\code{sort}, \code{reverse}, \code{fill}, \code{Object.assign}), qui
+rendent le receveur, soit le fait inverse. Les allocateurs statiques
+(\code{from}, \code{keys}, \code{parse}\ldots) ne comptent que sur leur
+receveur connu (\code{Array}, \code{Object}, \code{JSON}).
+
+Deux conséquences sont à garder en tête. D'abord, la \emph{valeur de retour}
+d'une fonction locale appelée n'est jamais calculée : même quand
+l'interpréteur exécute son corps pour ses effets
+(\cref{sec:transfert-stores-callbacks}), il jette le retour. Ensuite, les
+\emph{effets} d'un appel (un setter, un callback) ne passent pas par ici :
+ils sont tirés par l'interpréteur d'instructions.
+
+\subsection{Opérateurs}
+
+Le \cref{chap:treillis-simples} a décrit en détail \code{eval_binop} et
+\code{eval_bitwise} (\src{src/domains/transfer/state_value.rs}{752}{929}) ;
+on n'en garde ici que ce qu'il faut pour calculer à la main.
+\begin{itemize}
+  \item \code{+}, \code{-}, \code{*} : arithmétique d'intervalles quand les
+    deux opérandes sont dans $\{$nombre, \code{null}$\}$, avec
+    $\code{ToNumber(null)} = 0$ (vue \code{as_arith},
+    \cref{chap:statevalue-stabilite}) ; pour \code{+}, concaténation exacte
+    si les deux opérandes sont des ensembles finis de chaînes, \og une
+    chaîne\fg{} si ce sont des chaînes mal connues ; $\Top$ dans tous les
+    autres cas, y compris \code{"n=" + n}.
+  \item \code{/} : toujours $\Top$ (un intervalle ne contient ni \code{NaN}
+    ni $\pm$\code{Infinity}) ; \texttt{\%} et \code{**} : exacts quand
+    \code{NaN} est exclu, $\Top$ sinon.
+  \item comparaisons, \code{in}, \code{instanceof} : \code{boolean(Top)}.
+    Rien n'est décidé, mais le résultat \emph{n'est qu'un booléen}, ce qui
+    garde les composantes nombre et chaîne à $\Bot$.
+  \item \code{&&}, \code{||} : $\Top$ ; en pratique ces variantes
+    n'arrivent jamais ici (\cref{sec:transfert-stores-lowering}).
+  \item bit à bit : toujours un nombre de la plage int32 (uint32 pour
+    \code{>>>}), raffiné pour un masque constant (\code{x & 7} dans
+    $[0,7]$) ou un décalage constant. Un opérande $\Bot$ rend $\Bot$ : un
+    chemin tué par un raffinement doit rester mort.
+\end{itemize}
+
+Les opérateurs unaires sont propres à ce fichier :
+
+\rustsnippet[label={lst:transfert-stores-unary}]{src/domains/transfer/state_value.rs}{941}{977}{les opérateurs unaires (début)}
+
+\begin{itemize}
+  \item \code{-x} : négation d'intervalle, $\Top$ hors $\{$nombre,
+    \code{null}$\}$ ;
+  \item \code{!x} : exact sur un booléen pur, $\Top$ sinon ;
+  \item \code{typeof x} : une chaîne, exacte (\code{"number"},
+    \code{"object"} pour \code{null}, \code{"function"} pour un setter\ldots)
+    quand une seule sorte est habitée, \code{string} sinon. Cette exactitude
+    fait de \code{typeof x === "string"} une garde raffinable ;
+  \item \code{~x} : $-(\code{ToInt32}(x) + 1)$, bornes échangées dans int32,
+    plage int32 sinon ;
+  \item \code{+x} : \code{ToNumber}, pas l'identité ; un booléen donne $0$,
+    $1$ ou $[0,1]$, un ensemble de chaînes donne l'enveloppe de leurs
+    valeurs si \emph{toutes} se lisent comme des nombres finis
+    (\code{coerce_to_number}), $\Top$ sinon ;
+  \item \code{UnaryOp::Unknown} : $\Top$.
+\end{itemize}
+La fin de la fonction (\code{~}, \code{+} et le cas inconnu) occupe
+\src{src/domains/transfer/state_value.rs}{978}{1004}, et
+\code{coerce_to_number} \src{src/domains/transfer/state_value.rs}{1006}{1040}.
+
+\begin{piege}
+  Deux imprécisions surprennent à la lecture de la sonde. \code{!n} sur un
+  nombre vaut $\Top$ et non \code{boolean} : la politique \og c'est toujours
+  un booléen\fg{} des comparaisons n'a pas été appliquée à la négation. Un
+  gabarit \code{`n=${n}`} vaut $\Top$ et non \code{string} : le lowering l'a
+  réécrit en \code{"n=" + n}, et \code{+} entre une chaîne et un nombre
+  tombe dans le cas \og tout le reste\fg{}. Les deux sont sound ; ils sont
+  simplement plus lâches que JavaScript. La lecture des chaînes par
+  \code{coerce_to_number} utilise l'analyseur de Rust
+  (\code{s.trim().parse()}), plus strict que \code{ToNumber} : \code{+""}
+  vaut $0$ en JavaScript mais $\Top$ ici. Là encore, c'est sound.
+\end{piege}
+
+\subsection{Membres et annotations}
+
+\code{o.f} et \code{xs[0]} se lisent dans le tas abstrait ; on y reviendra
+en \cref{sec:transfert-stores-tas}, une fois le tas présenté. Un index non
+constant (\code{xs[i]}) vaut $\Top$. Une annotation de type
+(\code{TSAnnotated}) est transparente : l'ADR-020 a explicitement refusé de
+brancher les types TypeScript dans le domaine.
+
+% ===========================================================================
+\section{Ce que le lowering a déjà fait}
+\label{sec:transfert-stores-lowering}
+
+L'évaluateur n'a aucun bras pour les gabarits, les ternaires, \code{&&},
+\code{||}, \code{??}, le chaînage optionnel, les spreads, \code{++},
+\code{void}, \code{delete}, \code{await} ou les séquences. Ces constructions
+n'arrivent jamais jusqu'à lui : le lowering
+(\file{src/lowering/expr_lower.rs}, \cref{chap:lowering-cfg}) les a réécrites
+en constructions déjà traitées. Pour prédire une valeur abstraite, il faut
+donc connaître ces réécritures (\cref{tab:transfert-stores-lowering}).
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{p{30mm}p{52mm}p{64mm}}
+\toprule
+source & IR produite & conséquence pour la valeur \\
+\midrule
+\code{`q${e}r`} & \code{("q" + e) + "r"} & exact si \code{e} est une chaîne connue ; $\Top$ si c'est un nombre \\
+\code{tag`...${e}...`} & \code{Call(tag, [e, ...])} & $\Top$ (appel), les lectures de \code{e} survivent \\
+\code{a ? b : c} & diamant : \code{Branch(a)}, \code{let __tN = b} / \code{let __tN = c}, jonction qui lit \code{__tN} & join des deux branches \emph{par le CFG}, avec raffinement sur \code{a} \\
+\code{a && b}, \code{a || b}, \code{a ?? b} & \code{let __tN = a} ; \code{Branch(__tN)} ; \code{__tN := b} dans le bloc droit & idem ; \code{b} est en position d'\code{Assign} (compte pour D2) \\
+\code{a?.b}, \code{f?.(x)} & comme \code{a.b}, \code{f(x)} & la nullité du receveur n'est pas modélisée (compte pour D5) \\
+\code{{ ...o, k: v }} & membre sous une clé synthétique \code{"...N"} & seuls les membres après le dernier spread sont suivis \\
+\code{[...xs]} & \code{xs} gardé comme élément, arité \code{AtLeast(n)} & aucune influence sur la valeur \\
+\code{f(...args)} & \code{args} émis comme instruction & un setter passé par spread n'est pas un argument (\issue{76}) \\
+\code{{ [k]: v }}, \code{get x()} & clés synthétiques \code{"[computed]N"}, \code{"[accessor]N"} & membre introuvable par son nom \\
+\code{i++}, \code{--i} & \code{i := i + 1} (ou \code{- 1}), valeur \code{Var(i)} & post-écriture pour les deux formes \\
+\code{o.f++}, \code{delete o.f} & \code{MemberWrite} opaque / de \code{undefined} & mise à jour faible du champ \\
+\code{void e}, \code{(a, b, c)} & \code{ExprStmt} pour les effets, puis la valeur & effets conservés \\
+\code{await e} & \code{let __tN = e}, puis coupure de bloc & la suite est dans un bloc successeur \\
+\code{this}, \code{super} & \code{SummaryVal(Top)} & $\Top$ \\
+classe & \code{ObjectLit} de ses membres & référence fraîche \\
+\bottomrule
+\end{tabular}
+\caption{Les réécritures du lowering qui déterminent la valeur calculée
+(d'après \file{src/lowering/expr_lower.rs}).}
+\label{tab:transfert-stores-lowering}
+\end{table}
+
+\begin{exemple}{Un ternaire n'est pas évalué par l'évaluateur}{transfert-stores-ternaire}
+  L'effet \code{setB((x) => (x < 10 ? x + 1 : x))} devient, dans l'IR, un
+  corps de fonction à quatre blocs :
+\begin{sortie}
+        expr setB(fn#8(x) {
+            B0:
+                => branch (x Lt 10) ? B1 : B2
+            B1:
+                let __t0 = (x Add 1)  @22:26
+                => jump B3
+            B2:
+                let __t0 = x  @22:34
+                => jump B3
+            B3:
+                => return __t0
+            edges: 0->1[T] 0->2[F] 1->3[U] 2->3[U]
+        })  @22:4
+\end{sortie}
+  L'évaluateur ne voit que \code{x Lt 10}, \code{x Add 1}, \code{x} et
+  \code{__t0}. Le \og ternaire\fg{} est le join des environnements des blocs
+  \code{B1} et \code{B2} au bloc \code{B3}. C'est à l'interpréteur de corps
+  (\cref{sec:transfert-stores-callbacks}) de le calculer correctement ; on
+  verra qu'il ne le fait pas (défaut D1).
+\end{exemple}
+
+\begin{decision}[ADR-020 n\textsuperscript{o}~1 --- garder le diamant de \code{&&}/\code{||}]
+  On pourrait ajouter à l'IR un nœud plat \code{LogicalOp} évalué par
+  l'évaluateur, comme \code{BinOp}. L'ADR-020 le refuse : le diamant modélise
+  les \emph{effets} d'un court-circuit (dans \code{flag && setA(1)}, l'appel
+  n'a lieu que sur une branche) et permet au moteur de raffiner
+  l'environnement sur la condition. Le coût accepté est une valeur moins
+  précise quand l'expression est lue, et la dispersion du \code{rhs} dans un
+  \code{Assign}, qui a une conséquence imprévue : défaut D2. Le
+  \cref{chap:lowering-cfg} note en outre que la nature des deux arêtes d'un
+  court-circuit encode l'opérateur, pas la valeur de vérité ; le point fixe
+  n'en dépend pas, car il raffine d'après \code{then_}/\code{else_}.
+\end{decision}
+
+% ===========================================================================
+\section{Les stores}
+\label{sec:transfert-stores-stores}
+
+L'environnement décrit un \emph{point} du programme : il change d'un bloc à
+l'autre, et le moteur en garde un par bloc. Ce que React conserve
+\emph{d'un rendu à l'autre} (l'état, les mémos, les objets qui survivent)
+ne peut pas vivre là : il faut des structures dont la portée est le
+composant, voire le programme. Ce sont les \emph{stores}.
+
+\subsection{\code{StateStore} : l'état React, sujet du point fixe}
+
+\rustsnippet[label={lst:transfert-stores-statestore}]{src/domains/stores/state_store.rs}{7}{45}{le store d'état : lecture, mise à jour faible, fusion}
+
+Le store associe à chaque label de \code{useState} (ou de \code{useReducer})
+une \code{StateValue}. Trois propriétés le définissent.
+
+\begin{itemize}
+  \item \textbf{$\Bot$ par défaut.} Un label jamais écrit se lit $\Bot$,
+    \og impossible\fg{}, à l'inverse de l'environnement. C'est correct parce
+    que tout slot est \emph{amorcé} avant la boucle par la valeur de son
+    initialiseur (ci-dessous) : un $\Bot$ ne peut provenir que d'un hook mal
+    extrait.
+  \item \textbf{Mise à jour faible.} \code{update} ne remplace jamais : elle
+    joint. Un appel de setter ajoute un comportement possible (sémantique
+    may). Le store contient donc, à tout instant, le join de toutes les
+    valeurs écrites, initialiseur compris : c'est la \emph{vue événement} de
+    l'ADR-017.
+  \item \textbf{Fusion sur l'union des clés.} \code{join}, \code{widen} et
+    \code{widen_to} ne diffèrent que par le combinateur passé à
+    \code{merge_with}.
+\end{itemize}
+
+L'amorçage se fait dans le moteur, une fois par analyse de composant
+(\src{src/engine/fixpoint.rs}{314}{353}) ; pour chaque \code{HookEntry::State},
+la valeur initiale est calculée ainsi, puis jointe au slot par
+\code{state.update(*label, init_val)} :
+
+\rustsnippet[label={lst:transfert-stores-seed}]{src/engine/fixpoint.rs}{336}{348}{l'amorçage d'un slot par son initialiseur}
+
+Deux cas. Un initialiseur paresseux \code{useState(() => e)} est exécuté
+comme un corps de fonction (\code{exec_body}, \cref{sec:transfert-stores-callbacks})
+et c'est son \emph{retour} qui amorce le slot : React exécute la fonction une
+fois au montage et range son résultat, jamais la fonction elle-même. Tout
+autre initialiseur est simplement évalué. Dans les deux cas, le contexte est
+\code{AnalysisCtx::null} avec un store vide, des mémos vides et un tas neuf :
+l'initialiseur voit l'environnement d'entrée du composant (constantes de
+module, props liées par un parent), mais ni l'état ni le tas du composant.
+
+La boucle du point fixe (\cref{chap:point-fixe-composant}) n'emploie le store
+qu'à travers quelques méthodes : \code{bottom} pour l'état initial et les
+accumulateurs de passe, \code{join} pour combiner rendu, effets, handlers et
+tranche partagée, \code{leq} pour le test d'arrêt \og le nouvel état est-il
+$\lleq$ l'ancien ?\fg{}, \code{widen_to} à partir de
+\code{widen_threshold} itérations, \code{widen} (sans seuils) au garde-fou
+des cent itérations, et \code{changed_labels} pour savoir quels slots ont été
+soumis au widening (\src{src/engine/fixpoint.rs}{486}{530}).
+
+\subsection{\code{MemoStore} : des valeurs dérivées, sans point fixe propre}
+
+\rustsnippet[label={lst:transfert-stores-memostore}]{src/domains/stores/memo_store.rs}{27}{35}{le store des mémos : lecture et écriture}
+
+Le \code{MemoStore} range la valeur de chaque \code{useMemo} et de chaque
+\code{useCallback}. Il est l'opposé du store d'état sur les deux axes :
+\begin{itemize}
+  \item \textbf{$\Top$ par défaut} : un mémo pas encore calculé peut valoir
+    n'importe quoi ;
+  \item \textbf{mise à jour forte} : \code{set} écrase. Le mémo est recalculé
+    en entier après chaque passe de rendu, à partir de l'environnement de
+    sortie du rendu (\src{src/engine/fixpoint.rs}{382}{413}). Ce n'est pas un
+    sujet du point fixe : la convergence du store d'état entraîne celle des
+    mémos, y compris d'une chaîne mémo $\to$ mémo, d'une itération à la
+    suivante.
+\end{itemize}
+Pendant une passe, \code{analyze_cfg} travaille sur une copie jetée à chaque
+bloc (\og Memo is fixed for this pass; local mutations are discarded\fg{},
+\src{src/engine/cfg_analyzer.rs}{65}{66}).
+
+\subsection{\code{SharedStateStore} : l'état vu par tout le programme}
+
+\rustsnippet[label={lst:transfert-stores-shared}]{src/domains/stores/shared_state_store.rs}{10}{17}{le store inter-composants (\code{get} et \code{update} suivent, l.~24--34)}
+
+Quand un enfant appelle un setter reçu en prop, l'écriture concerne un slot
+d'un \emph{autre} composant. Elle ne peut pas aller dans le store d'état de
+l'enfant ; elle va dans ce store-ci, indexé par le couple
+(\code{ComponentId} du propriétaire, label). Il est non générique (fixé à
+\code{StateValue}), $\Bot$ par défaut, mis à jour par join, exactement comme
+un \code{StateStore}. Il en existe \emph{un seul par programme}, créé par
+\code{analyze_program} (\srcline{src/engine/fixpoint.rs}{714}) et partagé par
+toutes les analyses, racines et enfants inlinés à toute profondeur, à toutes
+les itérations. Il n'est jamais remis à zéro : c'est un accumulateur monotone
+global. Chaque composant en importe sa part à chaque test de convergence :
+
+\rustsnippet[label={lst:transfert-stores-slice}]{src/domains/stores/shared_state_store.rs}{57}{66}{la tranche d'un composant}
+
+C'est tout le mécanisme de remontée de l'état : \og No separate
+program-level fixpoint layer\fg{} (ADR-012). Pour le point fixe du parent,
+une écriture faite par un enfant est indiscernable d'une écriture locale.
+
+\subsection{\code{Heap} : le tas abstrait}
+
+Le quatrième store range les objets et les fermetures créés par le
+composant, indexés par leur site d'allocation (\cref{def:site}). Il mérite
+une section à lui seul (\cref{sec:transfert-stores-tas}) ; retenons pour
+l'instant qu'il a une entrée par \code{ExprId}, qu'il est mis à jour par
+écrasement (sauf les champs d'objets, joints), et qu'il n'entre pas dans le
+test de convergence.
+
+\subsection{Synthèse}
+
+\begin{definition}{Store}{store}
+  Un \terme{store} est une table persistante d'une passe à l'autre, dont la
+  clé désigne une entité du programme React plutôt qu'une variable : un slot
+  d'état (\code{StateStore}), un mémo (\code{MemoStore}), un slot d'un
+  composant quelconque (\code{SharedStateStore}) ou un site d'allocation
+  (\code{Heap}). Un store est caractérisé par sa clé, sa valeur par défaut
+  ($\Bot$ si toute clé légitime est amorcée, $\Top$ sinon), son mode de mise
+  à jour (forte, par écrasement, ou faible, par join) et sa portée (un
+  composant ou le programme). L'environnement \code{AbstractEnv}, indexé par
+  variable et attaché à un point du programme, n'est pas un store.
+\end{definition}
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{p{24mm}p{21mm}p{20mm}p{24mm}p{16mm}p{23mm}}
+\toprule
+& clé & défaut & mise à jour & point fixe ? & portée \\
+\midrule
+\code{AbstractEnv} & \code{Var} & $\Top$ (valeur) ; rien (setter, callback, site) & \code{extend} forte ; \code{extend_loc} union & par bloc & un point de programme \\
+\code{StateStore} & \code{HookLabel} & $\Bot$ & \code{update} = join & \textbf{oui} & un composant \\
+\code{MemoStore} & \code{HookLabel} & $\Top$ & \code{set} forte & non, recalculé & un composant \\
+\code{SharedStateStore} & \code{(ComponentId,}\newline\code{HookLabel)} & $\Bot$ & \code{update} = join & via \code{slice} & le programme \\
+\code{Heap} & \code{ExprId} & absent & \code{insert} forte ; champs joints & non & un composant (copie aux enfants) \\
+\bottomrule
+\end{tabular}
+\caption{L'environnement et les quatre stores (\cref{def:store}).}
+\label{tab:transfert-stores-stores}
+\end{table}
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[font=\scriptsize,
+    s/.style={bloc,font=\scriptsize,text width=36mm,minimum height=15mm}]
+  \node[s] (env) at (0,1.2) {\textbf{\code{AbstractEnv}}\\ clé \code{Var} ; défaut $\Top$\\ \code{extend} (forte)\\ \emph{un par bloc}};
+  \node[s] (state) at (-4.6,-2.4) {\textbf{\code{StateStore}}\\ clé label ; défaut $\Bot$\\ \code{update} = $\join$ (faible)\\ \emph{sujet du point fixe}};
+  \node[s] (memo) at (0,-2.4) {\textbf{\code{MemoStore}}\\ clé label ; défaut $\Top$\\ \code{set} (forte)\\ \emph{recalculé après le rendu}};
+  \node[s] (heap) at (4.6,-2.4) {\textbf{\code{Heap}}\\ clé \code{ExprId} ; absent\\ \code{insert} (forte), champs $\join$\\ \emph{insensible au flot}};
+  \node[s] (shared) at (-4.6,-5.6) {\textbf{\code{SharedStateStore}}\\ clé (composant, label) ; $\Bot$\\ \code{update} = $\join$ (faible)\\ \emph{un par programme}};
+  \node[draw=ra-gray,dashed,rounded corners,fit=(state)(memo)(heap),inner sep=5pt] (compo) {};
+  \node[etiquette,anchor=north east] at (compo.south east) {portée : un composant};
+  \draw[fleche] (state.north) |- node[etiquette,below,pos=0.75]{lecture \code{StateVal(l)}} (env.west);
+  \draw[fleche] (heap.north) |- node[etiquette,above,pos=0.75]{lecture \code{o.f}, sites} (env.east);
+  \draw[fleche] ([xshift=-5mm]memo.north) -- node[etiquette,left]{\code{MemoVal(l)}} ([xshift=-5mm]env.south);
+  \draw[fleche] ([xshift=5mm]env.south) -- node[etiquette,right]{recalcul} ([xshift=5mm]memo.north);
+  \draw[fleche] ([xshift=-12mm]env.south) -- node[etiquette,left,pos=0.35]{appel de setter} ([xshift=12mm]state.north);
+  \draw[flechemay] ([yshift=4mm]env.west) -- node[etiquette,above,pos=0.6]{setter d'un autre composant} ++(-5.3,0) |- (shared.west);
+  \draw[fleche] (shared.north) -- node[etiquette,right]{\code{slice}, à chaque test de convergence} (state.south);
+  \node[etiquette,align=left,right=4mm of shared] {l'enfant y écrit les slots de ses ancêtres ;\\ chaque parent en importe sa tranche};
+\end{tikzpicture}
+\caption{La carte des stores. Les flèches vers l'environnement sont des
+lectures faites par l'évaluateur ; la flèche \og appel de setter\fg{} est
+l'écriture faible d'un setter local (\cref{sec:transfert-stores-instruction}),
+la flèche tiretée celle d'un setter reçu d'un ancêtre ; la flèche
+\og recalcul\fg{} est la mise à jour des mémos depuis l'environnement de
+sortie du rendu. Le store partagé est le seul dont la portée dépasse le
+composant.}
+\label{fig:transfert-stores-carte}
+\end{figure}
+
+\begin{decision}[ADR-002 --- trois stores séparés, et ce qu'il en reste]
+  L'ADR-002 a posé le principe : \og A unified store would force all hooks
+  into the same fixpoint\fg{}. L'état est seul sujet du point fixe, parce
+  que seule sa mise à jour déclenche un nouveau rendu ; les mémos sont
+  dérivés de leurs deps ; les refs sont triviales. Le principe tient, mais le
+  détail a changé sans que l'ADR soit marquée remplacée : le domaine est
+  devenu le produit \code{StateValue} (ADR-015) ; le \code{MemoStore} range
+  une valeur et non un couple (deps, valeur), et il est recalculé à
+  \emph{chaque} itération, pas une fois après stabilisation ; le
+  \code{RefStore} n'a jamais existé, \code{useRef} est un marqueur
+  \code{StableRef} ; et deux stores sont apparus, le tas (ADR-010) et le
+  store partagé (ADR-012). L'alternative refusée, un store unifié, aurait
+  obligé les mémos et les refs à converger comme l'état.
+\end{decision}
+
+\begin{piege}
+  Les valeurs par défaut sont inversées d'un store à l'autre :
+  l'environnement et les mémos rendent $\Top$, l'état et le store partagé
+  rendent $\Bot$. La cohérence tient à l'amorçage. Une règle ou un contributeur
+  qui lirait un label d'état jamais amorcé obtiendrait $\Bot$, c'est-à-dire
+  un chemin mort, et en tirerait des conclusions fausses. Autre confusion
+  classique : \code{state_store.get(l)} (la vue événement, le join des
+  écritures) n'est pas ce que lit un rendu ; le rendu lit
+  \code{StateVal(l)}, converti (\cref{sec:transfert-stores-lecture}).
+\end{piege}
+
+% ===========================================================================
+\section{L'instruction : liaisons, écritures de champ, setters}
+\label{sec:transfert-stores-instruction}
+
+\subsection{Le squelette : pré-passe, puis cœur}
+
+\code{Transfer::exec_stmt} délègue à \code{exec_stmt_with_callbacks}, qui
+appelle \code{exec_full_stmt} à la profondeur $0$
+(\src{src/domains/interp/interpreter.rs}{29}{36}). Tout se décide là :
+
+\rustsnippet[label={lst:transfert-stores-fullstmt}]{src/domains/interp/interpreter.rs}{69}{99}{une instruction : pré-passe des callbacks, puis cœur}
+
+Une instruction s'exécute toujours en deux temps. D'abord la
+\emph{pré-passe} \code{exec_callbacks_depth} parcourt les expressions de
+l'instruction et exécute les callbacks \og dans le cycle\fg{} qu'elle y
+trouve (\code{.then}, \code{setTimeout}, \code{map}\ldots,
+\cref{sec:transfert-stores-callbacks}). Ensuite le \emph{cœur} fait ce que
+l'instruction dit : lier, écrire un champ, ou tirer les effets d'une
+expression. Une instruction \code{expr;} passe entièrement par
+\code{exec_expr_effects}, qui contient sa propre pré-passe.
+
+\subsection{Lier une variable : \code{bind_rhs}}
+
+\code{Let} et \code{Assign} partagent une seule séquence. Le commentaire du
+code rappelle pourquoi : \og the arms had drifted, dropping the Assign
+aliases (FN)\fg{} (\src{src/domains/interp/interpreter.rs}{143}{149}) ;
+\code{let s = setX} et \code{s = setX} doivent se comporter à l'identique.
+
+\rustsnippet[label={lst:transfert-stores-bind1}]{src/domains/interp/interpreter.rs}{214}{245}{lier une variable (1/2) : setters, callbacks, allocations}
+
+\rustsnippet[label={lst:transfert-stores-bind2}]{src/domains/interp/interpreter.rs}{246}{292}{lier une variable (2/2) : résumés, alias, chaînes de membres, valeur}
+
+Pas à pas, pour \code{var = rhs} :
+\begin{enumerate}
+  \item si \code{rhs} est un setter (\code{StateSetter(l)}), \code{var} est
+    lié au label \code{l} dans la table des setters ; si c'est un
+    \code{useCallback} (\code{CallbackVal(l)}), dans la table des callbacks ;
+  \item si \code{rhs} est un littéral de fonction, \code{var} reçoit son
+    site, et la fermeture est allouée dans le tas avec ses captures
+    (\code{alloc_fn}, \cref{sec:transfert-stores-tas}) ;
+  \item si \code{rhs} est un littéral d'objet, la carte de ses membres est
+    rangée dans le tas sous son site, et \code{var} reçoit ce site ;
+  \item si \code{rhs} est un résumé \code{Shape} de bibliothèque
+    (\code{const f = useForm()}), même chose avec les membres promis ;
+  \item si \code{rhs} est une autre variable (\code{let y = x}), \code{y}
+    hérite des sites, de la liaison de setter et de la liaison de callback de
+    \code{x} : c'est ainsi qu'un alias de setter reste un setter ;
+  \item si \code{rhs} est une chaîne de membres (\code{let f = props.onClick}),
+    \code{var} reçoit les sites que \code{resolve_locs} trouve au bout de la
+    chaîne ;
+  \item enfin, la valeur est évaluée et rangée (\code{env.extend}).
+\end{enumerate}
+
+L'ordre a une conséquence subtile. Pour un littéral de fonction, le site est
+posé \emph{avant} l'allocation, et \code{alloc_fn} capture l'environnement
+\emph{avant} que \code{var} ne soit liée par valeur : une fonction récursive
+\code{const f = () => f()} capture \code{f} avec sa valeur antérieure, soit
+$\Top$ à la première liaison. Autre conséquence : un tableau littéral n'est
+jamais rangé dans le tas, et un objet littéral n'y est rangé que s'il est
+\emph{directement} lié ; un objet imbriqué (\code{{ inner: { f } }}) n'a
+pas d'entrée propre (défaut D6).
+
+\subsection{Écrire un champ : une mise à jour faible}
+
+\rustsnippet[label={lst:transfert-stores-memberwrite}]{src/domains/interp/interpreter.rs}{155}{200}{l'écriture de champ, mise à jour faible du tas}
+
+\code{obj.f = v} ne change pas l'identité de \code{obj} : c'est ce qui en
+fait une mutation. L'écriture peut n'avoir lieu que sur un chemin, et
+\code{obj} peut désigner plusieurs sites : on \emph{joint}, on ne remplace
+jamais. Les valeurs sont toujours jointes ; les sites ne survivent que si
+l'ancienne et la nouvelle valeur en ont (une valeur simple qui écrase une
+fermeture ne laisse rien à poursuivre). Trois limites : seul
+\code{Var.champ = v} est traité (pas \code{a.b.c = v}, pas
+\code{o[k] = v}) ; un champ \emph{nouveau} (cas \code{(None, new)}) reçoit
+la seule nouvelle valeur, sans \code{undefined} ; et le tas n'étant pas
+sensible au flot, l'écriture faite sur une branche est vue sur l'autre. Les
+deux dernières se combinent dans le défaut D9.
+
+\subsection{Tirer les effets d'une expression}
+
+\rustsnippet[label={lst:transfert-stores-effects}]{src/domains/interp/interpreter.rs}{114}{126}{la définition unique de \og exécuter une expression pour ses effets\fg{}}
+
+Trois effets, dans cet ordre : la pré-passe des callbacks, l'appel de setter
+éventuel, et l'inlining d'un composant enfant si l'expression en est un
+(\code{return <Child/>}). C'est la définition unique de \og exécuter une
+expression pour ses effets\fg{}, partagée par \code{ExprStmt} et par le
+terminateur \code{Return} du moteur. Le cœur est l'appel de setter :
+
+\rustsnippet[label={lst:transfert-stores-setter}]{src/domains/interp/interpreter.rs}{341}{392}{l'appel de setter : slot local, puis slot d'un propriétaire}
+
+\paragraph{Premier bras : un setter lié localement.} Si le callee est une
+variable liée à un setter (\code{env.setter_label(name)}), on calcule la
+valeur écrite et on la joint au slot (\code{ctx.state.update}). La valeur
+écrite dépend de l'argument :
+\begin{itemize}
+  \item un littéral de fonction, le \emph{functional updater}
+    \code{setX(c => ...)} : son premier paramètre est lié à la valeur
+    courante du store (\code{ctx.state.get(label)}), son corps est exécuté
+    par \code{exec_body_depth} à la profondeur $d+1$, et sa \emph{valeur de
+    retour} est la valeur écrite ;
+  \item tout autre argument : sa valeur ;
+  \item aucun argument : $\Top$ (JavaScript écrirait \code{undefined} ;
+    $\Top$ est sound).
+\end{itemize}
+
+\paragraph{Second bras : un setter porteur de propriétaire.} Si la valeur du
+callee est un setter \code{SetterVal::One(c, l)} et qu'une analyse
+inter-composants est en cours (\code{ctx.inter} présent), on joint la valeur
+du premier argument à \code{shared_state[(c, l)]}. C'est ainsi que
+\code{props.onChange(42)}, dans un enfant, écrit l'état du parent. Ce bras
+est \emph{toujours} évalué, que le premier ait tiré ou non. Comme
+\code{StateSetter(l)} s'évalue en \code{SetterVal::One(composant courant, l)}
+(\cref{sec:transfert-stores-eval}), un setter local le tire aussi : pour un
+argument ordinaire, l'écriture dans le store partagé est redondante mais
+inoffensive ; pour un \emph{functional updater}, elle ne l'est pas (défaut
+D3).
+
+\begin{react}[\emph{Functional updater} et file d'attente]
+  \code{setX(prev => f(prev))} reçoit la valeur la plus récente, après les
+  mises à jour déjà en file, alors que \code{setX(x + 1)} lit la valeur
+  capturée par la fermeture au moment du rendu. Plusieurs appels d'un même
+  handler sont regroupés (\emph{batching}). L'analyse lie le paramètre de
+  l'updater au join du store, qui sur-approxime toute valeur en file ; elle
+  ne cherche pas à modéliser l'ordre des mises à jour.
+\end{react}
+
+\begin{exemple}{Dérouler un \emph{functional updater}}{transfert-stores-updater}
+  Le test unitaire \code{functional_updater_increments_state}
+  (\src{src/domains/transfer/state_value.rs}{1480}{1521}) construit à la main
+  l'IR de \code{setN(c => c + 1)} sur un store où le slot $0$ vaut $[5,5]$.
+  Le paramètre \code{c} est lié à $[5,5]$ ; le corps rend $[6,6]$ ; le slot
+  devient $[5,5] \join [6,6] = [5,6]$. L'ancienne valeur reste : la mise à
+  jour est faible. Sur un vrai programme,
+  \code{useEffect(() => { setA((x) => x + 1); })} mène le slot au widening comme le
+  compteur de la \cref{sec:transfert-stores-probleme} ; la sonde, en mode
+  intra-composant, donne \code{state[0] = number[0, inf] widened=true} pour
+  \code{UpdaterNoDeps} (\file{/tmp/ch11/ex7.tsx}). On verra en
+  \cref{sec:transfert-stores-soundness} que le même programme, analysé par
+  le CLI, ne donne pas ce résultat.
+\end{exemple}
+
+\begin{invariant}{Où un setter tire}{setter-positions}
+  Un appel de setter écrit dans le store d'état en trois positions
+  exactement : une instruction \code{expr;} (\code{ExprStmt}), un
+  terminateur \code{Return} de CFG analysé par le moteur, et le terminateur
+  \code{Return} d'un corps exécuté par \code{exec_body_impl}. Nulle part
+  ailleurs : un appel dans le membre droit d'une liaison, en argument d'un
+  autre appel, ou dans le bras droit d'un \code{&&} (qui devient un
+  \code{Assign}) n'écrit rien.
+\end{invariant}
+
+C'est une asymétrie avec le reste du moteur. La relation
+\relation{slot_writers} du \cref{chap:relations} voit un setter appelé dans
+\emph{n'importe quelle} position d'expression depuis \issue{130} ; le store
+d'état, lui, ne le voit qu'aux trois positions de l'invariant. Le défaut D2
+en découle.
+
+\begin{remarque}
+  \code{useReducer} passe par le même chemin : le lowering extrait
+  \code{useReducer(reducer, init)} comme un état ordinaire, en sautant le
+  réducteur, et \code{dispatch} est lié comme un setter. \code{dispatch(a)}
+  écrit donc l'\emph{action} \code{a} dans le slot, pas
+  \code{reducer(s, a)} (défaut D12).
+\end{remarque}
+
+% ===========================================================================
+\section{La conversion côté lecture}
+\label{sec:transfert-stores-lecture}
+
+Le store range la vue \emph{événement} : le join des valeurs écrites. Un
+rendu, lui, lit la vue \emph{inter-rendus} : entre deux rendus, la valeur
+d'un état ne peut changer qu'aux appels de son setter. Le bras
+\code{StateVal(l)} de l'évaluateur passe de l'une à l'autre
+(\src{src/domains/transfer/state_value.rs}{122}{134}) : si la composante
+\code{reference} de la valeur stockée est non-$\Bot$, elle est
+\emph{remplacée} par \code{Versioned({(composant, l)})} ; les autres
+composantes passent intactes. Le \cref{chap:statevalue-stabilite} a
+démontré la soundness de cette conversion sous l'hypothèse \og aucun setter
+n'est appelé pendant le rendu\fg{}, dont la violation a son propre
+diagnostic (\regle{setter-in-render}). Ce qui compte ici est sa
+\emph{position} : c'est le seul point de conversion du projet (\og The
+conversion happens in \textbf{one place}\fg{}, ADR-017), et tout ce qui est
+en aval en hérite gratuitement : liaisons, deps, props, lectures de champs.
+
+\begin{exemple}{Les deux vues sur un même slot}{transfert-stores-deux-vues}
+  Dans \file{/tmp/ch11/ex17.tsx}, un état objet
+  \code{const [obj, setObj] = useState({ a: 1 })} est réécrit par un effet
+  \code{setObj({ a: 2 })}. La sonde imprime le store et la variable :
+\begin{sortie}
+   state[1] = ref(PerRender)   widened=false
+   env[obj] = Val(ref(Versioned({(ComponentId(4294967295), 1)})))
+\end{sortie}
+  Le store dit vrai : on n'y a écrit que des littéraux frais. La variable
+  dit vrai aussi : d'un rendu à l'autre, \code{obj} ne change qu'aux appels
+  de \code{setObj}. Le composant est ici \code{ComponentId::SYNTHETIC}
+  ($2^{32}-1$), l'identité d'un composant analysé seul.
+\end{exemple}
+
+La lecture d'un champ prolonge la conversion : si le receveur est versionné
+et que le tas ne connaît pas le champ, \code{eval_field_access} garde les
+étiquettes de version au lieu de rendre un $\Top$ complet
+(\cref{sec:transfert-stores-tas}). Un champ d'un état objet ne change, lui
+aussi, qu'aux écritures de cet état, sous l'hypothèse qu'on ne mute pas
+l'état en place (la règle \regle{state-mutation} traite la violation).
+
+% ===========================================================================
+\section{Les callbacks : classe de déclenchement, pré-passe, corps}
+\label{sec:transfert-stores-callbacks}
+
+\subsection{Le piège de l'\code{onClick}}
+
+Jusqu'ici, un effet n'écrivait l'état que par un appel direct. Le code réel
+passe par des callbacks :
+
+\begin{lstlisting}[language=TypeScript,caption={Cinq façons d'appeler un setter depuis un effet (\file{/tmp/ch11/ex9.tsx})},label={lst:transfert-stores-callbacks}]
+import { useState, useEffect } from "react";
+import { myHelper } from "./lib";
+
+export function Callbacks() {
+  const [user, setUser] = useState(null);
+  const [n, setN] = useState(0);
+  const [clicks, setClicks] = useState(0);
+  const [h, setH] = useState(0);
+  const [d, setD] = useState(0);
+  useEffect(() => {
+    fetch("/api").then((u) => setUser(u));
+    const tick = () => setN(42);
+    setTimeout(tick, 100);
+    window.addEventListener("click", () => setClicks(7));
+    myHelper(() => setH(9));
+    const f1 = () => setD(1);
+    const f2 = () => f1();
+    const f3 = () => f2();
+    const f4 = () => f3();
+    f4();
+  }, []);
+  return <div>{user}{n}{clicks}{h}{d}</div>;
+}
+\end{lstlisting}
+
+Si l'interpréteur ignore les corps de fonctions, les cinq écritures sont
+invisibles : c'était la situation avant l'ADR-009, où seul le
+\emph{functional updater} était descendu. Si au contraire il descend
+\emph{uniformément} dans tous les callbacks, il exécute le handler de
+\code{click} comme s'il tournait à chaque effet, et un
+\code{addEventListener("click", () => setCount(c => c + 1))} parfaitement
+correct devient une \og boucle infinie\fg{}.
+
+\begin{react}[Quand un callback s'exécute-t-il ?]
+  \code{arr.map(cb)} exécute \code{cb} tout de suite. \code{.then(cb)},
+  \code{setTimeout(cb)}, \code{queueMicrotask(cb)},
+  \code{requestAnimationFrame(cb)} l'exécutent plus tard, mais \emph{en
+  conséquence} de l'effet qui les planifie : ils font partie du cycle
+  automatique rendu, commit, effets. Un \code{addEventListener} ou un
+  \code{onClick} ne l'exécute que sur un événement externe, hors de ce
+  cycle.
+\end{react}
+
+\subsection{La classe de déclenchement}
+
+La réponse de l'ADR-009 est de classer chaque appel par \emph{ce qui
+déclenche} ses arguments fonctions :
+
+\rustsnippet[label={lst:transfert-stores-trigger}]{src/domains/interp/callbacks.rs}{6}{56}{la classe de déclenchement d'un appel}
+
+\begin{itemize}
+  \item \code{Setter} : le callee est un setter lié. Son argument fonction
+    est un \emph{functional updater}, exécuté par \code{exec_setter_call} ;
+    la pré-passe ne doit pas le descendre, sinon il s'exécuterait deux fois.
+  \item \code{InCycle} : fonctions d'ordre supérieur synchrones (\code{map},
+    \code{forEach}, \code{reduce}, \code{Array.from}\ldots) et planifications
+    asynchrones (\code{then}, \code{catch}, \code{finally}, les minuteurs).
+    Leurs arguments fonctions sont exécutés.
+  \item \code{Subscription} : \code{addEventListener},
+    \code{removeEventListener}. Non descendus ici ; le lowering relève
+    \code{addEventListener(nom, fn)} dans un effet comme un
+    \code{HookEntry::Handler}, que le moteur analyse comme un \emph{point
+    d'entrée} séparé, exclu du signal de widening.
+  \item \code{Unknown} : tout le reste, en particulier les helpers et hooks
+    custom. Non descendus.
+\end{itemize}
+
+La reconnaissance est \emph{nominale} : c'est le nom du callee qui décide,
+sans aucune information de type. Un \code{x.map(cb)} dont \code{x} n'est pas
+un tableau est tout de même \og dans le cycle\fg{} : on exécute un corps qui
+ne l'aurait peut-être pas été, ce qui peut produire un faux positif, jamais
+un faux négatif.
+
+\begin{decision}[ADR-009 --- \code{Unknown} n'est pas descendu]
+  Descendre un callee inconnu serait le choix sound : rien ne prouve que
+  \code{myHelper(cb)} n'appelle pas \code{cb} dans le cycle. L'ADR-009 le
+  refuse : \og for a linter, false positives are more costly than false
+  negatives\fg{}, car descendre produirait un FP sur chaque enveloppe de
+  souscription custom (\code{useInterval}, \code{useEventCallback}).
+  \og We accept the FN\fg{} (\issue{19}) ; la table de politique est un
+  bouton réglable. C'est l'un des rares cas documentés où la précision
+  l'emporte sur l'invariant \og faux négatifs interdits\fg{}
+  (\cref{def:soundness}), et il n'est déclaré par aucune Info. Écarts avec
+  l'ADR : elle distinguait \code{InCycleSync} et \code{InCycleDeferred},
+  que le code fusionne (même politique), et le code ajoute \code{Setter}.
+\end{decision}
+
+\subsection{La pré-passe}
+
+\rustsnippet[label={lst:transfert-stores-prepass}]{src/domains/interp/interpreter.rs}{477}{540}{la pré-passe des callbacks}
+
+Pas à pas :
+\begin{enumerate}
+  \item \textbf{Garde de profondeur.} À la profondeur
+    \code{MAX_INLINE_DEPTH = 3}, on s'arrête. En analyse inter-composants,
+    on l'enregistre dans \code{callback_depth_capped}, ce qui donnera une
+    Info \regle{analysis-limit} et suspendra les vérifications du composant ;
+    en analyse intra, le plafond est silencieux.
+  \item \textbf{Appel.} On classe le callee, on descend le receveur (pour
+    les chaînes \code{a.then(x).then(y)}), puis chaque argument :
+    \begin{itemize}
+      \item un littéral de fonction, si l'appel est \code{InCycle} : son corps
+        est exécuté par \code{exec_body_depth} à la profondeur $d+1$, dans
+        l'environnement \emph{vivant} du site d'appel (capture naturelle d'une
+        fermeture en ligne), paramètres à $\Top$ (la valeur résolue d'une
+        promesse, l'élément d'un tableau sont inconnus) ;
+      \item une variable, si l'appel est \code{InCycle} : c'est le cas
+        \emph{B5} de l'ADR-010 (\code{setTimeout(tick)}), résolu par le tas
+        (\code{exec_var_callback}, \cref{sec:transfert-stores-tas}) ;
+      \item un littéral de fonction d'une autre classe : rien ;
+      \item tout autre argument : descente récursive (un appel imbriqué est
+        traité à son tour).
+    \end{itemize}
+  \item \textbf{Appel direct d'une fonction locale.} Si le callee est
+    \code{Unknown} \emph{et} une variable, on tente de l'exécuter par le tas :
+    c'est le cas \emph{B6} (\code{load()}). Une fonction importée n'a pas de
+    site et n'est pas exécutée.
+  \item \textbf{Composant enfant.} Pour un \code{CompApp} rencontré en
+    profondeur (un enfant JSX dans un autre élément), pré-passe sur ses
+    props puis évaluation, ce qui déclenche l'inlining
+    (\cref{sec:transfert-stores-inter}).
+  \item \textbf{Tout le reste} : descente générique dans les
+    sous-expressions, qui ne descend jamais dans un littéral de fonction.
+\end{enumerate}
+
+\begin{invariant}{La pré-passe n'entre jamais dans un corps}{prepass-corps}
+  La pré-passe ne descend pas \emph{dans} un littéral de fonction ; un corps
+  ne s'exécute que par \code{exec_body_depth}. Sinon, comme
+  \code{exec_body_impl} rappelle \code{exec_full_stmt}, qui rappelle la
+  pré-passe, chaque corps serait exécuté deux fois.
+\end{invariant}
+
+\subsection{Exécuter un corps : \code{exec_body_impl}}
+
+\rustsnippet[label={lst:transfert-stores-body}]{src/domains/interp/interpreter.rs}{394}{469}{l'exécution d'un corps de fonction imbriqué}
+
+Tout corps imbriqué passe par là : callbacks, \emph{functional updaters},
+initialiseurs paresseux, arguments de hooks custom, fonctions locales
+inlinées. L'algorithme est volontairement simple :
+\begin{enumerate}
+  \item ordonner les blocs par un tri topologique, post-ordre inversé d'un
+    parcours en profondeur depuis l'entrée (\code{topo_sort},
+    \src{src/domains/interp/cfg.rs}{5}{11}) ; les arcs retour sont ignorés,
+    l'en-tête d'une boucle passe avant son corps, les blocs inatteignables ne
+    sont jamais visités ;
+  \item pour chaque bloc, dans cet ordre, une seule fois : calculer son
+    environnement comme le join de ceux de ses prédécesseurs, exécuter ses
+    instructions par \code{exec_full_stmt} (à la même profondeur), puis
+    traiter le terminateur ;
+  \item un \code{Return} tire les effets de son expression, comme une
+    instruction, puis joint sa valeur à la valeur de retour ; un saut ou un
+    branchement propage l'environnement vers les successeurs ;
+  \item s'il existe un arc retour, la valeur de retour est jointe à $\Top$.
+\end{enumerate}
+
+C'est le \emph{second interpréteur de CFG} du projet. Le premier,
+\code{analyze_cfg} (\cref{chap:cfg-analyzer-dominance}), sert au rendu, aux
+effets et aux handlers : une worklist, avec raffinement sur les gardes et
+widening. Celui-ci n'a ni l'un ni l'autre : une seule passe, les deux
+branches d'un \code{if (true)} jointes, le corps d'une boucle exécuté une
+fois avec l'environnement d'avant la boucle. Les setters d'une boucle tirent
+donc bien, mais la valeur portée par la boucle n'est vue qu'à sa première
+itération (\issue{21}, limite déclarée dans \file{docs/limitations.md}).
+
+\begin{piege}
+  Deux interpréteurs de force inégale (\issue{12}) : une même expression
+  peut être évaluée avec une précision très différente selon qu'elle est
+  écrite dans un effet ou dans le \code{setTimeout} de cet effet. Et le
+  second a un défaut de propagation (D1) : l'étape 2 joint les
+  environnements \emph{d'entrée} des prédécesseurs, pas leurs sorties. On
+  le démontrera en \cref{sec:transfert-stores-soundness}.
+\end{piege}
+
+\subsection{Retour sur l'exemple}
+
+La sonde, en mode programme (le chemin du CLI), donne :
+
+\begin{sortie}
+-- ComponentId(0) (iterations=1)
+   state[0] = ⊤   widened=false   shared=⊤
+   state[1] = number[0, 42]   widened=false   shared=number[42, 42]
+   state[2] = number[0, 7]   widened=false   shared=number[7, 7]
+   state[3] = number[0, 0]   widened=false   shared=⊥
+   state[4] = number[0, 0]   widened=false   shared=⊥
+stats: cache_hits=0 cache_misses=0 depth_capped={ComponentId(0)} unknown_refs={}
+\end{sortie}
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{p{44mm}p{70mm}p{26mm}}
+\toprule
+appel & mécanisme & slot \\
+\midrule
+\code{fetch().then(u => setUser(u))} & \code{then} est \code{InCycle}, le littéral est exécuté, \code{u} vaut $\Top$ & \code{user} = $\Top$ \\
+\code{setTimeout(tick, 100)} & \code{InCycle}, argument variable : B5, le site de \code{tick} est dans le tas & \code{n} = $[0,42]$ \\
+\code{addEventListener("click", ...)} & \code{Subscription}, non descendu ; relevé en handler et analysé comme point d'entrée & \code{clicks} = $[0,7]$ \\
+\code{myHelper(() => setH(9))} & callee importé : \code{Unknown}, pas de site, pas de B6 & \code{h} = $[0,0]$ (FN accepté) \\
+\code{f4()} $\to$ \code{f3} $\to$ \code{f2} $\to$ \code{f1} & B6 à chaque niveau ; profondeurs 1, 2, 3 : plafond & \code{d} = $[0,0]$ \\
+\bottomrule
+\end{tabular}
+\caption{Les cinq appels de \cref{lst:transfert-stores-callbacks}.}
+\label{tab:transfert-stores-callbacks}
+\end{table}
+
+La colonne \code{shared} montre que les écritures locales sont aussi versées
+au store partagé en mode programme (le second bras de
+\code{exec_setter_call}) ; c'est inoffensif ici, aucun argument n'étant un
+updater. Le CLI déclare le plafond et suspend les vérifications ; il ne dit
+rien de \code{myHelper} :
+
+\begin{sortie}
+$ reactant check ex9.tsx --info
+  Callbacks  (7 hooks)  ex9.tsx
+    info   analysis-limit  callback inlining reached the depth cap (3), so deeper HOF chains are not descended (FN possible on nested callbacks)
+    warn   missing-cleanup  [hook:5]  (line 14:4)  this effect calls `window.addEventListener` but returns no cleanup. The registration is repeated every time the effect re-runs (and on every mount, twice under StrictMode) and nothing ever undoes it; return a function that tears it down
+    suspended  analysis-limit  10 passing check(s) withheld: the analysis was truncated in this component, so they are not guaranteed
+\end{sortie}
+
+% ===========================================================================
+\section{Le tas par site d'allocation}
+\label{sec:transfert-stores-tas}
+
+\subsection{Le besoin}
+
+L'environnement dit ce que \emph{vaut} une variable. Deux questions lui
+échappent : \og quel corps exécuter quand on appelle \code{tick} ?\fg{} (B5,
+B6) et \og que vaut le membre \code{onClear} de l'objet \code{bag} ?\fg{}.
+
+\begin{lstlisting}[language=TypeScript,caption={Membres, sites et fermetures (\file{/tmp/ch11/ex10.tsx}, extrait du corps de \code{Heapy})},label={lst:transfert-stores-heapy}]
+  const [q, setQ] = useState("");
+  const onClear = useCallback(() => setQ(""), []);
+  const bag = { onClear, label: "x", n: 1 };
+  const fromBag = bag.onClear;
+  const { label } = bag;
+  const fresh = new Map();
+  const items = [1, 2].map((x) => x * 2);
+  const nested = { inner: { f: () => setQ("n") } };
+  const g = nested.inner.f;
+  useEffect(() => {
+    g();
+  }, [fromBag, items]);
+\end{lstlisting}
+
+\code{bag} est un objet neuf à chaque rendu, mais son membre \code{onClear}
+est \emph{la même} fonction à chaque rendu (un \code{useCallback} aux deps
+vides). Si \code{bag.onClear} héritait de la stabilité du conteneur, la dep
+\code{fromBag} serait signalée à tort ; c'était le faux positif de
+\issue{88}. Il faut donc une mémoire \emph{par membre}.
+
+\subsection{Sites, valeurs du tas, vue \code{EnvVal}}
+
+\rustsnippet[label={lst:transfert-stores-heap}]{src/domains/stores/heap.rs}{17}{34}{le tas abstrait et ses valeurs}
+
+La clé est le \emph{site d'allocation} (\cref{def:site}) : l'\code{ExprId}
+que le lowering attribue à chaque \code{ObjectLit}, \code{ArrayLit},
+\code{FnLit} et \code{New}, stable d'une itération à l'autre et unique dans
+un composant. Les sites synthétiques (l'objet de props d'un enfant) viennent
+de \code{ExprId::fresh()}, un compteur qui démarre à $10^9$. Une valeur du
+tas est soit une fermeture (\code{Fn} : paramètres, CFG du corps partagé par
+\code{Arc}, valeurs capturées de ses variables libres), soit un objet
+(\code{Obj} : une carte membre $\mapsto$ \code{EnvVal}).
+
+\code{EnvVal} (\src{src/domains/stores/abstract_env.rs}{10}{27}) est la vue
+d'une liaison : \code{Val(v)}, une valeur seule, ou \code{Loc { ids, val }},
+un ensemble de sites \emph{et} une valeur. Le commentaire du code insiste :
+un site et une valeur ne sont pas des alternatives. Rendre $\Top$ pour la
+valeur d'un \code{Loc}, comme autrefois, faisait lire une prop fonction comme
+\og inconnue\fg{} dans l'enfant, alors que le parent l'avait prouvée
+\code{PerRender}.
+
+\subsection{Allouer une fermeture : un point unique}
+
+\rustsnippet[label={lst:transfert-stores-allocfn}]{src/domains/stores/heap.rs}{45}{70}{l'allocation d'une fermeture et de ses captures}
+
+\code{alloc_fn} est appelé par les trois bras qui peuvent lier un littéral de
+fonction (\code{Let}/\code{Assign}, membre d'objet, \code{MemberWrite}) et par
+l'évaluation des props d'un enfant. Il calcule les variables libres du corps
+et capture leur \emph{valeur} dans l'environnement courant ; une variable
+libre non liée est capturée comme $\Top$. Ni les sites ni les liaisons de
+setter des variables capturées ne sont capturés ; un setter reste retrouvable
+parce que sa \emph{valeur} est un \code{SetterVal::One(composant, label)}, que
+le second bras de \code{exec_setter_call} sait appeler.
+
+\subsection{Suivre une chaîne de membres : un walker unique}
+
+\rustsnippet[label={lst:transfert-stores-resolve}]{src/domains/stores/heap.rs}{134}{165}{les sites que désigne une expression}
+
+\code{resolve_locs} ne connaît que trois formes : une variable (ses sites),
+une annotation (transparente), et un accès de champ (les sites du membre, sur
+chaque objet que le receveur peut désigner). Un index, un appel, un littéral
+imbriqué rendent \code{None}. C'est le seul walker du projet : l'évaluateur
+de champs, la liaison \code{let} et la carte des membres d'un objet
+l'appellent tous, et le commentaire rappelle que les anciens cas particuliers
+\code{Expr::Var} \og each stopped at the first segment\fg{}.
+
+\subsection{Lire un membre}
+
+\rustsnippet[label={lst:transfert-stores-field}]{src/domains/transfer/state_value.rs}{598}{628}{la lecture d'un membre par le tas}
+
+On résout les sites du receveur ; sur chaque site qui est un objet
+\emph{possédant} le champ, on prend la valeur du membre ; on joint. Si aucun
+site ne répond, on retombe sur $\Top$, en gardant les étiquettes de version
+du receveur (\cref{sec:transfert-stores-lecture}). Un index entier constant
+se lit comme le membre de même nom (\code{xs[0]} comme le membre
+\code{"0"}, \src{src/domains/transfer/state_value.rs}{641}{651}) : c'est ce
+qui permet à un hook résumé qui rend un tuple
+(\code{const [value, setValue] = useAtom(a)}) d'exposer ses positions.
+
+\begin{piege}
+  L'étape \og on joint les objets qui ont le champ\fg{} ignore ceux qui ne
+  l'ont pas, au lieu d'y joindre \code{undefined} ou $\Top$. Si le receveur
+  peut désigner un objet sans ce membre (une autre branche, un objet issu
+  d'un spread, un receveur nullable lu par \code{?.}), la réponse est
+  sous-approximée. La doc de \code{obj_members} affirme le contraire
+  (\og an absent member falls back to the container's own value --- sound,
+  just imprecise\fg{}) ; ce n'est vrai que si \emph{aucun} site n'a le
+  membre. C'est le défaut D5.
+\end{piege}
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[font=\scriptsize,
+    e/.style={cfgbloc,text width=45mm},
+    h/.style={cfgbloc,text width=58mm}]
+  \node[etiquette] at (-2.4,0.9) {environnement de sortie du rendu};
+  \node[etiquette] at (4.6,0.9) {tas du composant};
+  \node[e] (ebag) at (-2.4,0) {bag $\mapsto$ Loc \{2\}, ref(PerRender)};
+  \node[e] (efrom) at (-2.4,-0.8) {fromBag $\mapsto$ Val ref(Stable)};
+  \node[e] (elabel) at (-2.4,-1.6) {label $\mapsto$ Val string\{"x"\}};
+  \node[e] (enested) at (-2.4,-2.6) {nested $\mapsto$ Loc \{6\}, ref(PerRender)};
+  \node[e] (eg) at (-2.4,-3.4) {g $\mapsto$ Val $\Top$};
+  \node[h] (h2) at (4.6,-0.8) {\#2 $\mapsto$ Obj \{\\ \quad onClear $\mapsto$ Val ref(Stable)\\ \quad label $\mapsto$ Val string\{"x"\}\\ \quad n $\mapsto$ Val number[1, 1] \}};
+  \node[h] (h6) at (4.6,-3.0) {\#6 $\mapsto$ Obj \{\\ \quad inner $\mapsto$ Val ref(PerRender) \}\\ (le littéral intérieur n'a pas d'entrée)};
+  \draw[flechemust] (ebag.east) -- (h2.west |- ebag.east);
+  \draw[flechemust] (enested.east) -- (h6.west |- enested.east);
+  \draw[flechemay] (h2.west |- efrom.east) -- node[etiquette,above]{\code{bag.onClear}} (efrom.east);
+  \draw[flechemay] (h2.west |- elabel.east) -- node[etiquette,below]{\code{__obj.label}} (elabel.east);
+  \draw[flechemay] (h6.west |- eg.east) -- node[etiquette,above]{\code{.inner} : pas de site} (eg.east);
+\end{tikzpicture}
+\caption{Le tas de \code{Heapy}, d'après la sonde. Les flèches pleines vont
+d'une variable à ses sites ; les tiretées sont les lectures de membres qui
+ont produit une liaison. \code{bag.onClear} lit la valeur \emph{propre} du
+membre, \code{Stable}, et non celle du conteneur ; \code{nested.inner.f}
+s'arrête faute de site pour le littéral intérieur, et \code{g} vaut
+$\Top$.}
+\label{fig:transfert-stores-tas}
+\end{figure}
+
+La sonde confirme la \cref{fig:transfert-stores-tas} :
+
+\begin{sortie}
+-- Heapy (intra, iterations=0)
+   state[0] = string{""}   widened=false
+   env[bag] = Loc { ids: {ExprId(2)}, val: ref(PerRender) }
+   env[fromBag] = Val(ref(Stable))
+   env[label] = Val(string{"x"})
+   env[fresh] = Val(ref(PerRender))
+   env[items] = Val(ref(PerRender))
+   env[nested] = Loc { ids: {ExprId(6)}, val: ref(PerRender) }
+   env[g] = Val(⊤)
+\end{sortie}
+
+et le CLI en tire deux avertissements justes, et un silence faux :
+
+\begin{sortie}
+$ reactant check ex10.tsx
+  Heapy  (4 hooks)  ex10.tsx
+    warn   always-unstable-deps  [hook:2]  (line 13:2)  this effect depends on `items`, a new reference every render, so `Object.is` always differs and the effect re-runs on every render regardless of the other deps
+       (1 trace step(s), rerun with --trace)
+    warn   missing-deps  [hook:2]  var:g  (line 13:2)  `g` is used in this effect but not in its deps array, and its value may change between renders
+       (1 trace step(s), rerun with --trace)
+\end{sortie}
+
+\code{fromBag} n'est pas signalé (sa stabilité est prouvée), \code{items} l'est
+(sa fraîcheur est certaine), \code{g} l'est parce qu'il vaut $\Top$. Mais
+\code{g()} n'a pas été exécuté dans l'effet : \code{setQ("n")} est manqué,
+\code{q} reste \code{{""}}, et le mémo \code{[q]} du composant est jugé
+stable alors qu'il changera (défaut D6).
+
+\subsection{Exécuter une fonction par son nom : B5 et B6}
+
+\rustsnippet[label={lst:transfert-stores-varcb}]{src/domains/interp/interpreter.rs}{544}{583}{exécuter un callback désigné par une variable}
+
+C'est ici que le tas rejoint la pré-passe. Pour une variable liée à des
+sites, on exécute \emph{tous} les corps possibles (\og All bodies are
+executed and their effects joined --- correct by over-approximation\fg{},
+ADR-010), dans l'environnement vivant, complété par les captures (qui
+l'emportent) et les paramètres à $\Top$. Pour une variable liée à un
+\code{useCallback}, le corps est demandé à \code{QueryContext::callback_body}
+(il vit dans la table des hooks, pas dans le tas). Pour une variable sans
+site ni callback (un import, un paramètre), on ne fait rien.
+
+Trois programmes isolent la frontière (\file{/tmp/ch11/ex11.tsx}) :
+\code{Flat} lie \code{g = o.f} avec \code{o = { f: () => setQ("n") }} ;
+\code{Nested} lie \code{g = o.inner.f} avec un objet imbriqué ;
+\code{MethodCall} appelle directement \code{o.f()}. Seul le premier voit
+l'écriture :
+
+\begin{sortie}
+-- Flat (intra, iterations=1)
+   state[0] = string{"", "n"}   widened=false
+-- Nested (intra, iterations=0)
+   state[0] = string{""}   widened=false
+-- MethodCall (intra, iterations=0)
+   state[0] = string{""}   widened=false
+\end{sortie}
+
+Dans \code{Flat}, \code{resolve_locs(o.f)} trouve le site du littéral, B6
+exécute le corps. Dans \code{Nested}, le littéral intérieur n'a pas de site.
+Dans \code{MethodCall}, le callee est un \code{FieldAccess} : B6 ne traite que
+les callees \code{Var}.
+
+\begin{decision}[ADR-010 --- un tas par site d'allocation]
+  Pour relier un nom à un corps, l'ADR-010 choisit l'abstraction classique
+  par site d'allocation : un \code{ExprId} par nœud qui alloue, une table
+  \code{ExprId} $\to$ valeur du tas, un environnement à deux tables, et
+  \emph{un seul tas} partagé par toutes les passes et itérations d'un
+  composant (sans quoi le \code{tick} alloué dans le rendu serait inconnu de
+  l'effet). Limites déclarées : un callee \code{Unknown} sans site est un FN ;
+  une profondeur au-delà de trois est un FN signalé ; les membres avant un
+  spread et les accesseurs manquent à la carte. Écarts avec le code : les
+  fermetures ont gagné leurs captures (ADR-012), les objets une carte
+  d'\code{EnvVal} (\issue{88}), et la variante \code{HeapValue::Arr},
+  \og reserved --- future array domain\fg{}, n'a jamais été écrite.
+\end{decision}
+
+\begin{piege}
+  Le tas n'est pas un treillis qu'on itère. \code{Heap::join},
+  \code{widen} et \code{leq} existent
+  (\src{src/domains/stores/heap.rs}{80}{131}) mais ne sont appelés nulle part ;
+  le moteur manipule un seul tas mutable par composant, passé à tous les
+  blocs, toutes les passes, toutes les itérations. Trois conséquences.
+  (1) Il est \emph{insensible au flot} : une écriture de champ faite sur une
+  branche est lue sur l'autre. (2) \code{insert} écrase : la ré-exécution de
+  \code{const o = {...}} remplace l'objet et efface les écritures de champ
+  accumulées sur ce site ; une fermeture ré-allouée remplace ses captures.
+  (3) Les sites d'une variable ne sont jamais retirés :
+  \code{let f = () => a(); f = () => b();} fait exécuter les deux corps à
+  \code{f()}, ce qui sur-approxime. Enfin, la doc de \code{Heap}
+  (\og Populated by \code{eval_expr} for \code{FnLit}/\code{ObjectLit}/\code{ArrayLit}
+  nodes\fg{}) est inexacte : c'est l'interpréteur qui peuple le tas, et aucun
+  tableau n'y entre jamais.
+\end{piege}
+
+% ===========================================================================
+\section{La valeur d'un mémo}
+\label{sec:transfert-stores-memo}
+
+\code{useMemo(f, deps)} et \code{useCallback(f, deps)} rendent la même
+référence tant qu'aucune dep ne change au sens d'\code{Object.is}. Leur
+valeur abstraite n'est donc pas celle du corps \code{f}, qui n'est jamais
+évalué : c'est une \emph{référence} dont la stabilité est le join des
+stabilités des deps. Le \cref{chap:statevalue-stabilite} a cité et commenté
+\code{recompute_memo} (\src{src/domains/transfer/state_value.rs}{56}{101}) ;
+on en retient la table de décision, vérifiée sur
+\file{/tmp/ch11/ex17.tsx} (\cref{tab:transfert-stores-memo}).
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{p{48mm}p{24mm}p{36mm}p{26mm}}
+\toprule
+mémo & deps & valeur (sonde) & raison \\
+\midrule
+\code{useMemo(() => ({ k: 1 }), [])} & \code{[]} exact & \code{ref(Stable)} & épinglé au montage \\
+\code{useMemo(() => ({ k: 1 }))} & absentes & \code{ref(Unknown)} & rien n'est borné \\
+\code{useMemo(() => n * 2, [n])} & \code{n} $\in [0,1]$ & \code{ref(PerRender)} & projection \code{to_stability} \\
+\code{useMemo(() => obj.a, [obj])} & état objet & \code{ref(Versioned({1}))} & lecture convertie \\
+\code{useMemo(() => p + 1, [p])} & prop & \code{ref(Unknown)} & \code{p} vaut $\Top$ \\
+\code{useMemo(() => 1, [{}])} & littéral & \code{ref(PerRender)} & allocation \\
+\code{useMemo(() => byObj, [byObj])} & un mémo & \code{ref(Versioned({1}))} & étiquettes propagées \\
+\code{useCallback(() => setN(1), [])} & \code{[]} & \code{ref(Stable)} & même calcul \\
+\bottomrule
+\end{tabular}
+\caption{La valeur de huit mémos de \file{/tmp/ch11/ex17.tsx}. Une dep qui
+est \emph{syntaxiquement} \code{StateVal(l)} donnerait \code{Versioned}
+quelle que soit sa sorte ; dans le code réel, \code{[n]} est un
+\code{Var("n")}, et un intervalle non ponctuel se projette en
+\code{PerRender} : c'est le faux positif de projection relevé au
+\cref{chap:statevalue-stabilite}.}
+\label{tab:transfert-stores-memo}
+\end{table}
+
+Deux décisions encadrent ce calcul. Des deps illisibles (absentes ou
+opaques) donnent \code{ref(Unknown)} et jamais \code{Stable} : le trait
+\code{Transfer} l'exige (\og it must not share an answer with a written
+\code{[]}, which pins the memo forever\fg{}). Et depuis l'ADR-020
+(\og \code{recompute_memo} gets the real stores\fg{}), les deps sont
+évaluées contre les vrais stores du point fixe : un mémo qui dépend d'un
+mémo lit sa valeur courante, et non un $\Bot$ fabriqué.
+
+% ===========================================================================
+\section{L'inter-composants, vu du transfert}
+\label{sec:transfert-stores-inter}
+
+Le \cref{chap:inter-composants} décrira l'analyse inter-composants du point
+de vue du moteur (racines, registre, cache, graphe d'appels). Vue du
+transfert, elle se réduit à deux flux : les props descendent vers l'enfant
+par l'évaluation d'un \code{CompApp}, les écritures remontent vers le
+parent par le store partagé.
+
+\subsection{Un parent, deux enfants}
+
+\begin{lstlisting}[language=TypeScript,caption={Un enfant connu, un enfant inconnu (\file{/tmp/ch11/ex13.tsx})},label={lst:transfert-stores-parent}]
+import { useState, useEffect } from "react";
+import { Sheet } from "./ui";
+
+function Child({ onChange }: { onChange: (n: number) => void }) {
+  useEffect(() => {
+    onChange(42);
+  }, []);
+  return <span />;
+}
+
+export function Parent() {
+  const [count, setCount] = useState(0);
+  const [open, setOpen] = useState(false);
+  return (
+    <div>
+      <Child onChange={setCount} />
+      <Sheet onOpenChange={setOpen} />
+      {count}{String(open)}
+    </div>
+  );
+}
+\end{lstlisting}
+
+\begin{sortie}
+-- ComponentId(0) (iterations=0)
+   env[onChange] = Val(setter(#1#0))
+-- ComponentId(1) (iterations=1)
+   state[0] = number[0, 42]   widened=false   shared=number[42, 42]
+   state[1] = ⊤   widened=false   shared=⊥
+stats: cache_hits=1 cache_misses=1 depth_capped={} unknown_refs={(ComponentId(1), "Sheet")}
+\end{sortie}
+
+\code{ComponentId(0)} est \code{Child}, \code{ComponentId(1)} est
+\code{Parent}. La chaîne causale :
+\begin{enumerate}
+  \item la passe de rendu de \code{Parent} atteint le \code{Return} ;
+    \code{exec_expr_effects} lance la pré-passe, qui rencontre
+    \code{<Child .../>} et l'évalue : \code{eval_comp_app} ;
+  \item la prop \code{onChange} vaut \code{setter(#1#0)}, soit
+    \code{SetterVal::One(Parent, 0)} ;
+  \item \code{Child} est analysé jusqu'à son propre point fixe ; son effet
+    appelle \code{onChange(42)}, dont la valeur est un setter d'un autre
+    composant : le second bras de \code{exec_setter_call} écrit
+    \code{shared_state[(Parent, 0)]} $\join$= $[42,42]$ ;
+  \item au test de convergence, \code{Parent} importe sa tranche : le nouvel
+    état n'est pas $\lleq$ l'ancien, on itère ; à la seconde passe, l'enfant
+    est trouvé dans le cache (\code{cache_hits=1}) ; \code{count} converge
+    sur $[0,42]$ ;
+  \item \code{Sheet} n'est pas dans le registre : son setter est
+    \emph{havoqué}, \code{open} reçoit $\Top$, et une Info le déclare.
+\end{enumerate}
+
+\begin{sortie}
+$ reactant check ex13.tsx --info
+  Parent  (2 hooks)  ex13.tsx
+    info   analysis-limit  component `Sheet` was not found in the analysis registry. Pass its file on the command line to analyse it (FN possible)
+    suspended  analysis-limit  4 passing check(s) withheld: the analysis was truncated in this component, so they are not guaranteed
+\end{sortie}
+
+\subsection{\code{eval_comp_app}, pas à pas}
+
+\begin{enumerate}
+  \item \textbf{Sans contexte inter} (analyse d'un composant seul) : tout
+    enfant est inanalysable ; on havoque les setters de ses props et on rend
+    \code{ref(Stable)} (\src{src/domains/transfer/state_value.rs}{477}{483}).
+  \item \textbf{Résolution} du nom JSX par le registre, en un
+    \code{ComponentId} (ADR-040). Un enfant inconnu ou ambigu est compté dans
+    les statistiques (qui deviendront des Info \regle{analysis-limit}), ses
+    setters sont havoqués, et on rend \code{ref(Stable)}
+    (\src{src/domains/transfer/state_value.rs}{489}{518}).
+  \item \textbf{Récursion} : si l'enfant est déjà sur la pile d'appel, on
+    compte une coupure et on rend \code{ref(Stable)}, \emph{sans} havoc.
+  \item \textbf{Props} : \code{eval_props_map} rend une carte
+    prop $\mapsto$ \code{EnvVal} ; une prop littéral de fonction est allouée
+    dans le tas du parent pour que l'enfant puisse l'exécuter. Le code est
+    en \src{src/domains/transfer/state_value.rs}{653}{689}.
+  \item \textbf{Cache} : les props aplaties en \code{StateValue} servent de
+    clé ; un succès enregistre l'arête du graphe d'appels et rend
+    \code{ref(Stable)}, sans ré-analyser l'enfant.
+  \item \textbf{Contexte de l'enfant}, puis \textbf{analyse} :
+\end{enumerate}
+
+\rustsnippet[label={lst:transfert-stores-child}]{src/domains/transfer/state_value.rs}{559}{580}{le tas et l'environnement initiaux d'un enfant}
+
+L'enfant part d'un environnement vide où son paramètre de props est lié à
+un site synthétique frais ; son tas initial contient un objet sous ce site
+(la carte des props) et une copie des valeurs de tas des props qui ont des
+sites (fermetures, objets). \code{analyze_child} est un pointeur vers
+\code{analyze_component_inter} : une analyse complète, avec son propre
+point fixe, sous un \code{InterCtx} fils dont la pile d'appel contient le
+parent. Le résultat est rangé dans la table \code{results} et dans le
+cache, l'arête dans le graphe d'appels, et \code{eval_comp_app} rend, dans
+tous les cas, \code{ref(Stable)}.
+
+\begin{exemple}{Une boucle croisée}{transfert-stores-croisee}
+  Dans \file{/tmp/ch11/ex15.tsx}, \code{Solo} passe
+  \code{onTick={() => setB(b + 1)}} à un \code{Ticker} dont l'effet sans deps
+  appelle \code{onTick()}. La fermeture est allouée par \code{eval_props_map}
+  (captures : \code{setB}, \code{b}) et copiée dans le tas de l'enfant ; dans
+  \code{Ticker}, \code{onTick} a un site, et \code{onTick()} est un B6 : le
+  corps s'exécute avec ses captures, et \code{setB(b + 1)} tire le second
+  bras de \code{exec_setter_call}, puisque le setter a pour propriétaire
+  \code{Solo}. Le parent importe l'écriture, itère, et le CLI conclut :
+\begin{sortie}
+  Ticker  (1 hooks)  ex15.tsx
+    warn   cross-component-infinite-loop  [hook:0]  (line 4:2)  this effect calls `onTick`, a state setter of parent `Solo`. Parent re-renders → child re-renders → effect fires again: infinite loop
+\end{sortie}
+\end{exemple}
+
+\subsection{Le havoc des setters qui s'échappent}
+
+Un setter remis à un enfant \emph{inanalysable} peut être appelé par lui
+avec n'importe quel argument, n'importe quand. Ne rien faire
+sous-approximerait l'état et fabriquerait des conclusions \og l'état est
+stable\fg{}. D'où :
+
+\rustsnippet[label={lst:transfert-stores-havoc}]{src/domains/transfer/state_value.rs}{265}{297}{joindre $\Top$ dans les slots dont le setter s'échappe}
+
+Un setter nu passé en prop est trouvé par sa valeur, qui porte son
+propriétaire. Les setters cachés (dans un spread, dans une fermeture qui
+appelle un setter, dans une fermeture du tas) sont cherchés par
+\code{collect_escaping_setters}
+(\src{src/domains/transfer/state_value.rs}{299}{367}), qui parcourt les corps
+de fonctions atteignables depuis la valeur de chaque prop. Sa terminaison
+est garantie par \emph{identité}, pas par un budget :
+
+\rustsnippet{src/domains/transfer/state_value.rs}{385}{392}{un corps n'est parcouru qu'une fois par environnement capturé}
+
+La clé est la paire (adresse du CFG, adresse des captures) : le même corps
+atteint sous d'autres captures résout ses callees autrement. Le commentaire
+du code garde la trace de l'ancienne version, un \code{depth > 4} qui était
+\og a budget doing a cycle guard's job\fg{} : un setter caché derrière une
+cinquième fermeture était silencieusement manqué. Le parcours a néanmoins
+une limite, qui est le défaut D13.
+
+\begin{decision}[ADR-012 --- inlining descendant et store partagé]
+  L'ADR-012 choisit l'\emph{inlining descendant} : le parent analyse l'enfant
+  au point d'application, avec les props abstraites, plutôt que de calculer
+  des résumés paramétriques ascendants, jugés \og without justified gain at
+  the current stage\fg{}. La sensibilité au contexte passe par l'égalité
+  abstraite des props (le cache). Le flux est bidirectionnel : props vers le
+  bas, setters vers le haut par un \code{SharedStateStore} passé à toutes les
+  analyses, sans couche de point fixe au niveau du programme. Écarts avec le
+  code : \code{ComponentSetter} est devenu la composante \code{setter} du
+  produit (ADR-015), les clés sont des \code{ComponentId} internés
+  (ADR-040), la récursion rend \code{ref(Stable)} sans havoc. Limites
+  acceptées : imports hors registre ($\Top$ et Info), récursion (Info),
+  composants dynamiques \code{const C = cond ? A : B} non analysés
+  (\issue{63}, fermée \emph{wontfix}).
+\end{decision}
+
+\begin{piege}
+  Trois raccourcis de \code{eval_comp_app} ont des conséquences.
+  (1) La valeur d'un élément est toujours \code{ref(Stable)}, y compris pour
+  un enfant inconnu : elle n'encode pas l'échec. (2) La récursion ne
+  havoque rien : un composant récursif qui passe à son instance intérieure
+  un \emph{autre} setter que celui qu'il a reçu sous-approxime ; l'Info de
+  récursion le déclare (\og recursive component reference \code{Tree} is not
+  followed, so its props are treated as unknown\fg{}), mais son texte ne dit
+  pas ce que fait le code, qui n'évalue ni ne havoque aucune prop.
+  (3) La clé du cache et la table des résultats oublient une partie du
+  contexte (défauts D4 et D7).
+\end{piege}
+
+% ===========================================================================
+\section{La soundness en pratique : garanties et défauts}
+\label{sec:transfert-stores-soundness}
+
+\subsection{Les garanties par construction}
+
+La soundness (\cref{def:soundness}) exige que chaque fonction de transfert
+sur-approxime la sémantique concrète. Le code la garantit par une poignée de
+mécanismes, que l'on peut maintenant récapituler
+(\cref{tab:transfert-stores-garanties}).
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{p{62mm}p{42mm}p{40mm}}
+\toprule
+mécanisme & garantie & où \\
+\midrule
+variable inconnue $\Rightarrow$ $\Top$ ; clé d'un seul côté du join $\Rightarrow$ $\Top$ & valeurs & \code{AbstractEnv::lookup}, \code{join_stabs} \\
+setter $\Rightarrow$ join dans le slot & écritures may & \code{StateStore::update} \\
+setter vers un enfant inconnu $\Rightarrow$ $\Top$ dans le slot & pas de \og stable\fg{} fabriqué & \code{havoc_setter_props} \\
+setters échappés cherchés par identité, pas par budget & pas de setter manqué par profondeur & \code{collect_escaping_setters} \\
+appel $\Rightarrow$ $\Top$, sauf allocateurs certains & valeurs & \code{returns_fresh_reference} \\
+\code{/}, et \texttt{\%} ou \code{**} à \code{NaN} possible $\Rightarrow$ $\Top$ & pas de \code{NaN} dans un intervalle & \code{eval_binop} \\
+opérande $\Bot$ $\Rightarrow$ $\Bot$ & un chemin mort reste mort & \code{eval_bitwise}, \code{as_arith} \\
+paramètres de callbacks $\Rightarrow$ $\Top$ ; retour d'un corps bouclant $\Rightarrow$ $\Top$ & valeurs & \code{exec_callbacks_depth}, \code{exec_body_impl} \\
+écriture de champ $\Rightarrow$ join & mutations may & \code{MemberWrite} \\
+deps illisibles $\Rightarrow$ \code{ref(Unknown)}, jamais \code{Stable} & mémos & \code{recompute_memo} \\
+\bottomrule
+\end{tabular}
+\caption{Où la soundness est garantie par construction.}
+\label{tab:transfert-stores-garanties}
+\end{table}
+
+À côté, des faux négatifs sont \emph{acceptés et déclarés} : un callee
+\code{Unknown} non descendu (ADR-009, \issue{19}), le plafond de profondeur
+(Info), un enfant inconnu (Info), la récursion (Info), la valeur portée par
+une boucle dans un callback (\issue{21}). Le premier est le seul qu'aucune
+Info ne signale.
+
+Reste ce que l'invariant du projet interdit : les faux négatifs
+\emph{non déclarés}. Les quatorze défauts qui suivent ont été reproduits au
+commit \snapshotCommit{} en rédigeant les notes de ce chapitre ; aucun
+n'était décrit dans le tracker à cette date (l'issue fermée \issue{130}
+traitait l'équivalent de D2 pour la relation \relation{slot_writers}, pas
+pour le store). Ce sont des constats, pas des diagnostics confirmés par le
+mainteneur. Chacun est une vraie boucle infinie ou une vraie dep manquante
+en React, que l'analyseur déclare sûre. Pour chacun, l'exercice est
+d'identifier l'hypothèse violée : c'est toujours l'une des garanties
+ci-dessus qui n'est pas tenue jusqu'au bout. Les quatorze cas ont été
+rejoués pour cette relecture, au commit \snapshotCommit{}, sur des copies
+fraîches dans \file{/tmp/ch11/} : chacun reproduit exactement la valeur ou
+le silence du CLI annoncé plus bas. Restent constats, non diagnostics : la
+question de savoir si D8 et D12 relèvent d'une décision de conception
+tacite plutôt que d'un défaut reste au mainteneur.
+
+\subsection{D1 : un corps qui voit l'état d'un bloc en retard}
+
+\begin{lstlisting}[language=TypeScript,caption={Trois callbacks à deux blocs (\file{/tmp/ch11/ex3.tsx}, extrait de l'effet)},label={lst:transfert-stores-d1}]
+    setTimeout(() => {
+      const v = 5;
+      if (flag) {
+        setN(v);
+      }
+    }, 10);
+    setTimeout(() => {
+      const w = 7;
+      setM(w);
+    }, 10);
+    setTimeout(() => {
+      const s = setK;
+      if (flag) {
+        s(3);
+      }
+    }, 10);
+\end{lstlisting}
+
+\begin{sortie}
+-- OneBlockBehind (intra, iterations=1)
+   state[0] = ⊤   widened=false
+   state[1] = number[0, 7]   widened=false
+   state[2] = number[0, 0]   widened=false
+\end{sortie}
+
+Le callback en ligne droite est exact (\code{m} $\in [0,7]$). Les deux
+autres ne le sont pas : \code{n} lit \code{v} comme $\Top$, et l'alias
+\code{s} est perdu, si bien que l'écriture de \code{k} \emph{disparaît}. La
+cause est dans \code{exec_body_impl} (\cref{lst:transfert-stores-body}) :
+chaque terminateur écrit \code{env_at[next]}, qui est donc
+l'environnement \emph{d'entrée} de \code{next} ; mais l'environnement d'un
+bloc non initial est calculé comme le join des \code{env_at[p]} de ses
+prédécesseurs \code{p}, c'est-à-dire de leurs environnements d'\emph{entrée}
+(\cref{fig:transfert-stores-d1}). On attendrait
+\code{env_at.get(&bid)}. Une valeur perdue retombe à $\Top$ (sound) ; un
+alias de setter, un site ou une liaison de \code{useCallback} perdus
+suppriment une écriture (FN). C'est aussi ce qui met \code{UpdaterGuarded}
+de l'\cref{ex:transfert-stores-ternaire} à $\Top$ : le bloc de jonction lit
+\code{__t0} dans l'environnement d'entrée de \code{B1} et \code{B2}, où il
+n'est pas lié. Les tests unitaires ne le voient pas : leurs corps à
+plusieurs blocs ne lisent que des variables de l'environnement initial.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[font=\scriptsize]
+  \node[cfgbloc] (b0) at (0,0) {B0\\ let s = setK\\ => branch flag ? B1 : B2};
+  \node[cfgbloc] (b1) at (-2.2,-2) {B1\\ expr s(3)\\ => jump B3};
+  \node[cfgbloc] (b2) at (2.2,-2) {B2\\ => jump B3};
+  \node[cfgbloc] (b3) at (0,-4) {B3\\ => return undefined};
+  \draw[fleche] (b0) -- (b1); \draw[fleche] (b0) -- (b2);
+  \draw[fleche] (b1) -- (b3); \draw[fleche] (b2) -- (b3);
+  \node[etiquette,align=left,text width=46mm,anchor=west] at (2.3,0) {entrée de B0 : $E$, où \code{s} n'est pas lié ;\\ sortie de B0 : $E$ plus \code{s}, setter de \code{k}};
+  \node[etiquette,align=left,text width=40mm,anchor=east,text=ra-amber] at (-3.4,-2) {B1 lit \code{env_at[B0]}, soit $E$ :\\ \code{s} est inconnu, \code{s(3)} n'écrit rien. Il devrait lire \code{env_at[B1]}, la sortie de B0};
+  \node[etiquette,align=left,text width=40mm,anchor=west] at (3.2,-2) {\code{env_at[B1]} et \code{env_at[B2]} valent la sortie de B0 : écrits par le terminateur de B0, jamais lus par B1 ni B2};
+\end{tikzpicture}
+\caption{Le défaut D1 sur le troisième callback de \cref{lst:transfert-stores-d1}.
+\code{env_at} est indexé par le bloc \emph{destinataire}, mais chaque bloc
+lit la table sous les noms de ses \emph{prédécesseurs} : il voit l'entrée de
+son prédécesseur, soit l'état \og d'un bloc en retard\fg{}.}
+\label{fig:transfert-stores-d1}
+\end{figure}
+
+\subsection{D2 et D3 : où et comment un setter écrit}
+
+\textbf{D2, le setter hors position d'effet.} L'\cref{inv:setter-positions}
+dit où un setter écrit. Trois effets sans deps, identiques au sens de React,
+le mettent à l'épreuve (\file{/tmp/ch11/ex6.tsx}) :
+\code{setA(a + 1);} (\code{StmtPos}), \code{flag && setA(a + 1);}
+(\code{AndPos}), \code{console.log(setA(a + 1));} (\code{ArgPos}).
+
+\begin{sortie}
+-- StmtPos (intra, iterations=3)
+   state[0] = number[0, inf]   widened=true
+-- AndPos (intra, iterations=0)
+   state[0] = number[0, 0]   widened=false
+-- ArgPos (intra, iterations=0)
+   state[0] = number[0, 0]   widened=false
+\end{sortie}
+
+Le CLI signale \code{StmtPos} (\regle{infinite-loop}) et déclare les deux
+autres propres. Dans \code{AndPos}, le lowering a rangé l'appel dans
+\code{__t0 := setA((a Add 1))} (un \code{Assign}) ; dans \code{ArgPos},
+l'appel est un argument. Aucun des deux n'atteint \code{exec_setter_call}.
+Pire : si l'argument est un \emph{functional updater} en position de
+liaison (\code{const r = setB((x) => ...)}), la pré-passe classe le callee
+\code{Setter} et ne descend pas le littéral, en comptant sur
+\code{exec_setter_call}, qui n'est pas appelé : ni l'écriture ni les effets
+du corps ne sont vus. \file{docs/limitations.md} affirme qu'un appel de
+setter \og in any expression position [\ldots] is seen\fg{} : c'est vrai pour
+la relation \relation{slot_writers}, pas pour le store d'état.
+
+\textbf{D3, l'updater en mode programme.} L'\cref{ex:transfert-stores-updater}
+annonçait que le CLI ne retrouve pas le widening de \code{UpdaterNoDeps}.
+La sonde, en mode programme, le montre :
+\begin{sortie}
+-- ComponentId(0) (iterations=1)
+   state[0] = ⊤   widened=false   shared=ref(PerRender)
+\end{sortie}
+Le premier bras de \code{exec_setter_call} exécute l'updater correctement ;
+le second, qui tire aussi pour un setter local dès que \code{ctx.inter} est
+présent, évalue l'argument \code{FnLit} comme une valeur :
+\code{ref(PerRender)}, la fermeture elle-même. Cette fermeture est écrite
+dans \code{shared_state[(composant, 0)]}, ré-importée par \code{slice} dans
+l'état ; le paramètre \code{x} devient \og nombre ou référence\fg{},
+\code{x + 1} vaut $\Top$, et plus aucun widening n'a lieu. Sur la copie du test
+\code{functional_updater_without_deps_is_flagged}
+(\file{/tmp/ch11/ex8.tsx}, \code{useEffect(() => { setCount(c => c + 1); })}),
+le CLI répond ✓ \code{1 file(s) no issues found.} alors que le test
+d'intégration, qui passe par le chemin intra-composant, est vert. C'est un
+défaut d'\emph{interaction} : chaque bras est raisonnable isolément. Une
+correction possible — ne tirer le second bras que si le premier n'a pas
+tiré, ou si le propriétaire n'est pas \code{ctx.component} — reste à
+trancher par le mainteneur : elle touche la sémantique du second bras pour
+tout appel, pas seulement l'updater.
+
+\subsection{D4 et D7 : le contexte d'un enfant, oublié}
+
+Les deux défauts viennent de la même hypothèse : l'analyse d'un enfant ne
+dépendrait que des valeurs aplaties de ses props.
+
+\textbf{D4.} Dans \file{/tmp/ch11/ex14.tsx}, \code{Board} rend deux
+\code{Ticker} (\cref{ex:transfert-stores-croisee}) :
+\code{onTick={() => setA(1)}} puis \code{onTick={() => setB(b + 1)}}. Les
+deux fermetures valent \code{ref(PerRender)} : la clé du cache est la même,
+le second site d'appel touche le cache, et l'enfant n'est jamais analysé
+avec la fermeture qui boucle (\code{cache_hits=15 cache_misses=1} pour tout
+le fichier). Le CLI est muet ; le même fichier où le second enfant est un
+composant \code{Ticker2} identique mais distinct donne
+\regle{cross-component-infinite-loop}. La clé ignore les \emph{corps} des
+fermetures, c'est-à-dire le tas.
+
+\textbf{D7.} \code{Counter({ step })} écrit \code{setN(n + step)} dans un
+effet sans deps. Rendu seul avec \code{step={1}}, il est signalé
+(\regle{infinite-loop}). Rendu deux fois,
+\code{<Counter step={1} /><Counter step={0} />} (\file{/tmp/ch11/ex22.tsx}),
+le CLI répond \code{Counter (2 hooks)} ✓ : la seconde analyse a écrasé la
+première dans la table \code{results}
+(\src{src/domains/transfer/state_value.rs}{583}{586}), et les règles ne lisent
+que la dernière. La table n'a qu'une entrée par \code{ComponentId}, alors
+qu'un composant a autant d'instances que de sites d'appel.
+
+\subsection{D5, D6, D9, D11, D13, D14 : le tas}
+
+Le tas concentre six défauts, tous des cas où un site, un membre ou un
+corps n'est pas suivi jusqu'au bout.
+\begin{itemize}
+  \item \textbf{D5, lecture partielle d'un membre.} Avec
+    \code{const o = flag ? { f: 1 } : { ...p }}, \code{o.f} est annoncé
+    \code{number[1, 1]} alors qu'il peut valoir \code{p.f} ; même chose
+    pour \code{q?.f} avec \code{q} nullable, et pour \code{r.f} quand l'autre
+    branche est \code{{ g: 2 }} (\file{/tmp/ch11/ex18.tsx}). Conséquence
+    observée, dans \file{/tmp/ch11/ex19.tsx} : un
+    \code{useEffect(() => console.log(v), [])} où \code{v} vient d'un tel
+    ternaire (\code{PartialDeps}) n'est pas signalé par
+    \regle{missing-deps}, alors que la variante sans ternaire l'est
+    (\code{SpreadOnlyDeps}, même fichier).
+  \item \textbf{D6, objets imbriqués et appels de méthodes.} B6 ne traite
+    que les callees \code{Var}, et un littéral imbriqué n'a pas de site :
+    \code{o.f()} et \code{o.inner.f} manquent leur setter (vu en
+    \cref{sec:transfert-stores-tas}). Avec
+    \code{o = { f: () => setN(n + 1) }} dans un effet sans deps,
+    \code{g = o.f; g()} mène \code{n} au widening, \code{o.f()} non
+    (\file{/tmp/ch11/ex12.tsx}).
+  \item \textbf{D9, champ nouveau écrit sur une branche.}
+    \code{if (flag) { o.g = 2 } const v = o.g;} donne \code{v = [2, 2]},
+    sans \code{undefined} (\file{/tmp/ch11/mw.tsx}) : le cas
+    \code{(None, new)} de \code{MemberWrite} n'ajoute pas \code{undefined},
+    et le tas insensible au flot fait voir l'écriture au chemin qui ne l'a
+    pas faite. Un champ \emph{existant}, lui, est bien joint
+    (\code{number[1, 1]|string{"x"}}).
+  \item \textbf{D11, fermeture membre d'un objet prop.} Seuls les sites
+    \emph{directs} des props sont copiés dans le tas de l'enfant
+    (\cref{lst:transfert-stores-child}). Avec
+    \code{bag = { run: () => setN(n + 1) }} passé en prop, l'enfant qui
+    appelle \code{bag.run} trouve un site sans valeur de tas et n'exécute
+    rien ; la même fermeture passée directement (\code{run={run}}) donne
+    \regle{cross-component-infinite-loop} (\file{/tmp/ch11/deep.tsx}).
+  \item \textbf{D13, deux sauts de fermeture.} Dans un corps parcouru,
+    \code{collect_escaping_setters} ne suit pas un appel vers une
+    \emph{autre} fermeture : avec
+    \code{inner = (v) => setN(v); outer = (v) => inner(v)} passé dans
+    \code{<Sheet cfg={{ cb: outer }}/>}, \code{n} reste $[0,0]$, alors qu'avec
+    un seul saut il vaut $\Top$ (\file{/tmp/ch11/esc2.tsx}). Ce défaut-là est
+    couvert globalement par l'Info \og component \code{Sheet} was not
+    found\fg{}, qui suspend les vérifications ; la valeur calculée reste
+    fausse.
+  \item \textbf{D14, l'exécuteur de \code{new Promise}.} La pré-passe ne
+    classe que les \code{Call} ; un \code{New} passe par la descente
+    générique, qui n'entre pas dans un littéral de fonction. L'exécuteur de
+    \code{new Promise((resolve) => { setN(n + 1); ... })}, que JavaScript
+    exécute \emph{synchroniquement}, n'est jamais exécuté : \code{n} reste
+    $[0,0]$ et \regle{infinite-loop} se déclare vérifiée
+    (\file{/tmp/ch11/np.tsx}). Le cas fréquent
+    \code{new Promise(r => setTimeout(r, 100)).then(...)} n'est pas touché.
+\end{itemize}
+
+\subsection{D8, D10, D12 : trois modélisations}
+
+\textbf{D8.} \code{const el = <span />} vaut \code{ref(Stable)} ;
+\code{useEffect(..., [el])} n'est pas signalé par
+\regle{always-unstable-deps}, alors que \code{[obj]} avec un littéral
+d'objet l'est (\file{/tmp/ch11/ex24.tsx}). En React, \code{el} est un objet
+neuf à chaque rendu. Ce pourrait être une décision implicite (éviter des FP
+sur \code{children}) ; aucun ADR ni commentaire ne la justifie.
+
+\textbf{D10.} \code{const s = c ? setA : setB; s(1);} n'écrit que
+\code{a} (\file{/tmp/ch11/sj.tsx}) : le join à priorité gauche des liaisons
+de setter garde \code{setA}, et la valeur jointe, \code{SetterVal::Top}, ne
+satisfait pas \code{as_setter()}, si bien que le second bras ne tire pas
+non plus. Le résultat dépend de l'ordre des opérandes du join.
+
+\textbf{D12.} \code{useReducer} ignore le réducteur :
+\begin{sortie}
+-- Red (intra, iterations=1)
+   state[0] = number[0, 1]   widened=false
+   env[dispatch] = Val(setter(#4294967295#0))
+\end{sortie}
+Avec \code{reducer = (s, a) => s + a} et
+\code{useEffect(() => { dispatch(1); })} (\file{/tmp/ch11/red.tsx}), l'action
+$1$ est écrite telle quelle, le store converge sur $[0,1]$ et le CLI répond
+✓. En React, \code{s} vaut $1, 2, 3, \ldots$ et l'effet relance le
+rendu indéfiniment. La cause est au lowering (le réducteur est sauté,
+\cref{chap:lowering-cfg}), l'effet ici.
+
+\subsection{Synthèse}
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{p{9mm}p{52mm}p{56mm}p{22mm}}
+\toprule
+& défaut & hypothèse violée & exemple \\
+\midrule
+D1 & \code{exec_body_impl} lit l'entrée des prédécesseurs & propagation d'un CFG & \file{ex3.tsx} \\
+D2 & setter hors \code{ExprStmt}/\code{Return} & \og tout appel qui peut avoir lieu est vu\fg{} & \file{ex6.tsx} \\
+D3 & second bras sur un updater local & un bras n'annule pas l'autre & \file{ex8.tsx} \\
+D4 & clé de cache aplatie & contexte = props aplaties & \file{ex14.tsx} \\
+D5 & membre joint sur les seuls sites qui l'ont & un site sans le membre compte & \file{ex18.tsx} \\
+D6 & B6 limité aux \code{Var}, littéraux imbriqués sans site & tout corps atteignable est suivi & \file{ex11.tsx} \\
+D7 & \code{results} écrasé par site d'appel & une instance par site & \file{ex22.tsx} \\
+D8 & élément JSX \code{Stable} & fraîcheur d'une allocation & \file{ex24.tsx} \\
+D9 & champ nouveau sans \code{undefined} & écriture may, lecture ailleurs & \file{mw.tsx} \\
+D10 & liaison de setter à priorité gauche & join des liaisons latérales & \file{sj.tsx} \\
+D11 & sites des membres de props non copiés & tas de l'enfant complet & \file{deep.tsx} \\
+D12 & réducteur ignoré & sémantique de \code{dispatch} & \file{red.tsx} \\
+D13 & un seul saut de fermeture & transitivité de l'échappement & \file{esc2.tsx} \\
+D14 & \code{new} jamais classé & exécuteur synchrone & \file{np.tsx} \\
+\bottomrule
+\end{tabular}
+\caption{Les quatorze défauts, tous reproduits sur \file{/tmp/ch11/}. D13
+est couvert par une Info globale ; les autres sont des faux négatifs non
+déclarés.}
+\label{tab:transfert-stores-defauts}
+\end{table}
+
+\begin{remarque}
+  Plusieurs de ces défauts se corrigent par une ligne ou par un déplacement
+  de responsabilité, dans l'esprit du principe \og pas de workaround\fg{} :
+  lire \code{env_at[bid]} dans \code{exec_body_impl} (D1) ; tirer les
+  setters depuis un point central qui voit toute position d'expression,
+  sans double tir (D2) ; faire entrer les sites des props dans la clé du
+  cache (D4). Ils sont proposés en exercice.
+\end{remarque}
+
+% ===========================================================================
+\begin{resume}
+\begin{itemize}
+  \item L'interpréteur abstrait d'un pas tient en deux fonctions. La
+    première, \code{eval_state_value}, est une récursion structurelle qui
+    rend une \code{StateValue} sans jamais écrire l'état ; elle vit dans
+    \file{transfer/state_value.rs}. La seconde, \code{exec_full_stmt}, dans
+    \file{interp/interpreter.rs}, exécute une instruction en deux temps :
+    pré-passe des callbacks, puis cœur. Le moteur les atteint par le trait
+    \code{Transfer}, dont l'unique implémentation est
+    \code{StateValueTransfer}.
+  \item L'environnement \code{AbstractEnv} a quatre tables. Une variable
+    inconnue vaut $\Top$ ; une liaison de setter, de callback ou de site
+    inconnue ne vaut \emph{rien}, et sa perte coûte une écriture.
+  \item Un appel vaut $\Top$ sauf allocateur certain ; un littéral vaut
+    \code{ref(PerRender)} ; un élément JSX \code{ref(Stable)}. Le lowering a
+    déjà transformé ternaires, \code{&&}, \code{||}, \code{??} en diamants et
+    les gabarits en additions.
+  \item Quatre stores (\cref{def:store}) : \code{StateStore} ($\Bot$, join,
+    sujet du point fixe, amorcé par les initialiseurs), \code{MemoStore}
+    ($\Top$, écrasement, recalculé après chaque rendu),
+    \code{SharedStateStore} ($\Bot$, join, un par programme, importé par
+    \code{slice}), \code{Heap} (par site, écrasement, insensible au flot).
+  \item Un setter écrit par mise à jour faible, en trois positions
+    seulement ; un \emph{functional updater} lit le join du store. La lecture
+    d'un état est convertie en \code{Versioned} en un seul point.
+  \item Les callbacks sont classés par ce qui les déclenche
+    (\code{Setter}, \code{InCycle}, \code{Subscription}, \code{Unknown}) ;
+    seuls les \code{InCycle} sont exécutés, par un second interpréteur de CFG
+    en une passe, jusqu'à la profondeur 3. \code{Unknown} non descendu est un
+    FN accepté (ADR-009).
+  \item Le tas relie un nom à un corps (B5, B6) et un objet à ses membres
+    (\issue{88}) ; l'inlining d'un enfant copie les props dans un tas neuf, et
+    les écritures remontent par le store partagé (ADR-012).
+  \item Quatorze défauts (D1 à D14) montrent où ces garanties s'arrêtent :
+    propagation des corps, positions des setters, contexte des enfants,
+    membres et sites non suivis.
+\end{itemize}
+Le \cref{chap:cfg-analyzer-dominance} décrira l'autre interpréteur de CFG,
+\code{analyze_cfg}, avec sa worklist, ses raffinements et ses arcs arrière ;
+le \cref{chap:point-fixe-composant} la boucle qui enchaîne rendu, mémos,
+effets et handlers jusqu'au point fixe.
+\end{resume}
+
+% ===========================================================================
+\section*{Exercices}
+\addcontentsline{toc}{section}{Exercices}
+\label{sec:transfert-stores-exercices}
+
+\begin{exercice}{Calculer à la main}{transfert-stores-calculs}
+  Donner la valeur abstraite de : (a) \code{a + 1} avec
+  $a = \code{number[0, 3]|null}$ ; (b) \code{x & 7} avec $x = \Top$ ;
+  (c) \code{typeof null} ; (d) \code{+s} avec $s = \code{string{"5", "6"}}$ ;
+  (e) \code{!n} avec $n = \code{number[0, 0]}$ ; (f) \code{"a" + 1} ;
+  (g) \code{+""}.
+\end{exercice}
+\begin{solution}
+  (a) \code{as_arith} accepte \code{null}, qui vaut $0$ : l'opérande devient
+  $[0,3] \join [0,0] = [0,3]$, et la somme $[1,4]$. (b) Le masque est une
+  constante positive : $[0,7]$, quel que soit $x$. (c) Une seule sorte
+  habitée, \code{null} : \code{string{"object"}}. (d) Les deux chaînes se
+  lisent comme des nombres finis : \code{number[5, 6]}. (e) L'opérande n'est
+  pas un booléen pur : $\Top$ (et non \code{boolean}). (f) Chaîne plus
+  nombre : $\Top$. (g) \code{"".trim().parse::<f64>()} échoue en Rust :
+  $\Top$, alors que JavaScript donne $0$ ; c'est sound.
+\end{solution}
+
+\begin{exercice}{Un gabarit}{transfert-stores-gabarit}
+  Pour \code{const t = `id-${n}`} avec \code{n} un état numérique, donner
+  l'IR produite et la valeur de \code{t}. Proposer une amélioration sound.
+\end{exercice}
+\begin{solution}
+  La sonde d'impression donne \code{let t = (("id-" Add n) Add "")}, et la
+  sonde de valeurs donne $\Top$ pour \code{t} : \code{"id-" + n} tombe dans le
+  cas \og tout le reste\fg{} de \code{+}. Or en JavaScript, \code{+} dont
+  un opérande est une chaîne rend toujours une chaîne : rendre
+  \code{str_top()} dès qu'un côté est une chaîne pure serait sound et plus
+  précis (la composante nombre resterait $\Bot$).
+\end{solution}
+
+\begin{exercice}{Dérouler un updater}{transfert-stores-updater-main}
+  Le slot $0$ vaut $[0,2]$. On exécute \code{setN(c => c + 1)}. Quelle
+  valeur est écrite, que vaut le slot ensuite, et pourquoi contient-il encore
+  $0$ ?
+\end{exercice}
+\begin{solution}
+  \code{c} est lié à \code{ctx.state.get(0)}, soit $[0,2]$ ; le corps rend
+  $[1,3]$, qui est la valeur écrite ; le slot devient
+  $[0,2] \join [1,3] = [0,3]$. Il contient $0$ parce que la mise à jour est
+  faible : le store range le join de \emph{toutes} les valeurs que l'état a
+  pu prendre, initialiseur compris, pas sa valeur courante.
+\end{solution}
+
+\begin{exercice}{Classer des callees}{transfert-stores-classer}
+  Donner la \code{TriggerClass} de \code{promise.then(f)},
+  \code{arr.forEach(f)}, \code{el.addEventListener("x", f)},
+  \code{myLib.subscribe(f)}, \code{Array.from(xs, f)},
+  \code{router.from(f)}, et dire si \code{f} est exécuté.
+\end{exercice}
+\begin{solution}
+  \code{then} : \code{InCycle}, exécuté. \code{forEach} : \code{InCycle},
+  exécuté. \code{addEventListener} : \code{Subscription}, non exécuté ici,
+  mais relevé comme handler et analysé comme point d'entrée s'il est dans un
+  effet. \code{subscribe} : \code{Unknown}, non exécuté (FN accepté,
+  \issue{19}). \code{Array.from} : \code{InCycle}, le receveur étant
+  \code{Array}. \code{router.from} : \code{Unknown}, car \code{from} n'est
+  reconnu que sur le receveur \code{Array}.
+\end{solution}
+
+\begin{exercice}{Le plafond de profondeur}{transfert-stores-profondeur}
+  Montrer que, dans \cref{lst:transfert-stores-callbacks}, \code{f4()}
+  n'atteint pas \code{setD}. Où l'utilisateur en est-il averti ? Pourquoi
+  ne le serait-il pas si le composant était analysé seul ?
+\end{exercice}
+\begin{solution}
+  L'effet s'exécute à la profondeur $0$ ; \code{f4()} est un B6 qui exécute
+  le corps de \code{f4} à la profondeur $1$, celui de \code{f3} à $2$, celui
+  de \code{f2} à $3$. Dans ce dernier, la pré-passe de l'instruction
+  \code{f1()} trouve $d \geq 3$ et s'arrête : \code{f1} n'est jamais
+  exécuté. En mode programme, l'arrêt est enregistré dans
+  \code{callback_depth_capped}, d'où l'Info \regle{analysis-limit} et la
+  suspension des vérifications. L'enregistrement est gardé par
+  \code{if let Some(inter) = ctx.inter} : une analyse intra-composant (tests,
+  phase 2 d'\code{analyze_program}) subit le plafond en silence.
+\end{solution}
+
+\begin{exercice}{L'environnement vide}{transfert-stores-bottom}
+  Calculer \code{AbstractEnv::bottom().join(&e)} pour
+  $e = \{x \mapsto [1,1]\}$. Pourquoi \code{analyze_cfg} n'est-il pas
+  affecté ?
+\end{exercice}
+\begin{solution}
+  $x$ n'est présent que du côté droit : il vaut $\Top$. Le résultat est
+  $\{x \mapsto \Top\}$, pas $e$ : l'environnement vide n'est pas neutre.
+  \code{analyze_cfg} n'y est pas exposé parce qu'il insère le premier
+  environnement reçu par un bloc sans join (\code{None => outgoing_env}),
+  et ne joint qu'ensuite des environnements effectivement calculés.
+\end{solution}
+
+\begin{exercice}{Corriger D1}{transfert-stores-d1}
+  Localiser dans \cref{lst:transfert-stores-body} la ligne responsable de D1,
+  écrire la correction, et décrire le test unitaire qui l'empêcherait de
+  revenir.
+\end{exercice}
+\begin{solution}
+  Pour un bloc non initial, l'environnement est le join des
+  \code{env_at.get(p)} des prédécesseurs
+  (\src{src/domains/interp/interpreter.rs}{419}{425}). Or les terminateurs
+  écrivent déjà dans \code{env_at[next]} le join des sorties des
+  prédécesseurs de \code{next} : il suffit de lire
+  \code{env_at.get(&bid).cloned().unwrap_or_else(AbstractEnv::bottom)} pour
+  tout bloc. Le test : un corps \code{() => { const s = setK; if (c) { s(3); } }}
+  exécuté par \code{exec_body} doit écrire $[3,3]$ dans le slot de
+  \code{setK} ; aujourd'hui, il n'écrit rien. Un second test sur un
+  updater ternaire (\cref{ex:transfert-stores-ternaire}) doit rendre un
+  intervalle et non $\Top$.
+\end{solution}
+
+\begin{exercice}{Une correction centrale de D2}{transfert-stores-d2}
+  Dans l'esprit du principe \og pas de workaround\fg{} de \file{CLAUDE.md},
+  proposer un endroit unique où tirer les appels de setter pour qu'ils
+  soient vus dans toute position d'expression, sans double tir.
+\end{exercice}
+\begin{solution}
+  Une réponse possible : la pré-passe visite déjà \emph{tous} les appels, en
+  toute position, et classe \code{Setter} les callees liés à un setter. C'est
+  là qu'il faudrait appeler \code{exec_setter_call}, et le retirer de
+  \code{exec_expr_effects} et du \code{Return} d'\code{exec_body_impl}, pour
+  qu'un appel ne soit tiré qu'une fois. Le bras \code{Setter} y exécuterait
+  aussi l'updater, ce qui corrige la variante \og updater en position de
+  liaison\fg{}. Il faut ensuite s'assurer qu'aucun appel n'est visité deux
+  fois par la pré-passe au sein d'une même instruction, et que les rejeux
+  post-convergence du moteur restent cohérents. Ce n'est qu'une piste, non
+  implémentée ni testée ; le mainteneur tranchera.
+\end{solution}
+
+\begin{exercice}{Une clé de cache qui voit D4}{transfert-stores-d4}
+  Sur \file{/tmp/ch11/ex14.tsx}, expliquer pourquoi la boucle n'est pas vue,
+  et proposer une clé de cache qui la verrait.
+\end{exercice}
+\begin{solution}
+  Les deux props \code{onTick} valent \code{ref(PerRender)} une fois
+  aplaties ; la clé est la même, le second site d'appel touche le cache.
+  La carte \code{abstract_props_full} contient pourtant les \emph{sites} des
+  fermetures (\code{EnvVal::Loc}). Une clé qui inclurait, pour chaque prop,
+  l'ensemble de ses sites distinguerait les deux appels. Il faudrait alors
+  que \code{results} soit lui aussi indexé par site d'appel, sans quoi D7
+  masquerait la seconde analyse.
+\end{solution}

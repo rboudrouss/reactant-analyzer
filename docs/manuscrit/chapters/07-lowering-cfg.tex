@@ -1,0 +1,1568 @@
+% Chapitre 07 — Le lowering : de l'AST au CFG
+% Dossier source : notes/02-lowering-cfg.md (intégralement), code src/lowering/{cfg_builder,expr_lower,hook_extractor}.rs
+% et src/lowering/mod.rs au commit e67b10a.
+% Sorties d'analyseur observées avec target/debug/reactant (commit e67b10a), lancé depuis /tmp/ch07/
+% (copies des exemples du dossier 02 et trois fichiers c1_linear, c2_while, c3_throw écrits pour ce chapitre).
+% Les impressions d'IR viennent de la sonde /tmp/irdump (hors dépôt, dossier 02 §6.0), recompilée hors de /tmp
+% (CARGO_TARGET_DIR=~/.cache/irdump-target) ; l'option « --raw » ajoutée pour ce chapitre imprime le CFG
+% d'une fonction déclarée AVANT extract_hooks (build_fn_body_cfg + LowerCtx::empty(), donc sans positions).
+% Mise en forme : les longues lignes « edges: » de certaines sorties sont repliées sur deux lignes pour la
+% largeur de page ; les passages élagués sont marqués « ... » dans les sorties et signalés dans le texte.
+\chapter{Le lowering : de l'AST au CFG}
+\label{chap:lowering-cfg}
+
+\begin{objectifs}
+  \item Savoir où le lowering se place dans le pipeline, quelles fonctions l'appellent et dans quel ordre s'enchaînent ses trois passes (construction du CFG, extraction des hooks, extraction des handlers et subscriptions).
+  \item Maîtriser la machine à blocs \code{BlockBuilder} : réserver, sceller, ouvrir, relier ; savoir pourquoi un corps qui \og tombe du bout\fg{} se termine par \code{Return(undefined)} (\adr{25}).
+  \item Connaître le gabarit de CFG de chaque construction de contrôle : \code{if}, \code{while}, \code{for}, \code{do...while}, \code{for...of}, \code{switch}, \code{try}, ternaire, \code{&&}/\code{||}/\code{??}, \code{await} ; savoir quelle nature d'arête (\code{EdgeKind}) chacune produit, et pourquoi.
+  \item Comprendre le principe qui gouverne l'abaissement des expressions : ne jamais perdre une lecture, une écriture ni un chemin, quitte à sur-approximer.
+  \item Suivre l'extraction des hooks sur un exemple, avant et après : classification par provenance, marqueurs, destructuration d'état, corps de hooks, handlers, subscriptions, hoist de terminateur.
+  \item Connaître les limites vérifiées du lowering au commit \snapshotCommit{}, et les pièges qui attendent qui modifie ce code.
+\end{objectifs}
+
+\prerequis{\cref{chap:ir} (les types \code{CFG}, \code{Stmt}, \code{Expr}, \code{HookEntry} : \cref{def:cfg}, \cref{def:site}, \cref{def:slot}), \cref{chap:frontend-detection} (d'où viennent les fonctions candidates, \cref{def:composant-hook-utilitaire}), \cref{chap:interpretation-abstraite} (soundness, \cref{def:soundness} ; dominance, \cref{def:dominance} ; widening, \cref{def:widening}).}
+
+Le chapitre précédent a décrit le vocabulaire de l'IR ; celui-ci explique comment on l'écrit. Le \terme{lowering} est la traduction de l'AST d'oxc --- du JavaScript ou du TypeScript complet, riche en sucre syntaxique --- vers ce vocabulaire réduit. C'est la couche où la syntaxe disparaît : après elle, ni les domaines abstraits ni le moteur ne voient jamais un nœud d'AST. Toutes les formes équivalentes d'un programme (une déstructuration et ses projections, un ternaire et un \code{if}, un \code{&&} en instruction et un \code{if} sans \code{else}) doivent donc y être ramenées à une forme unique, sans rien perdre de ce que le programme \emph{fait}.
+
+Cette dernière exigence est le fil rouge du chapitre. Le lowering n'est pas une simple traduction : c'est le premier endroit où l'on peut introduire un faux négatif. Oublier une lecture, c'est affirmer qu'une variable n'est pas utilisée ; oublier un chemin, c'est affirmer qu'un hook s'exécute toujours ; oublier une écriture, c'est affirmer qu'une variable garde sa valeur. Chacune de ces affirmations est fausse, et aucune couche en aval ne peut la corriger. Le code en porte la trace : presque chaque commentaire de \file{src/lowering/} justifie un choix par \og ne pas perdre une lecture, un chemin ou une écriture\fg{}.
+
+Nous procéderons du plus simple au plus difficile : la machine à blocs sur un corps linéaire, puis le \code{if}, les expressions, les diamants, les boucles, le \code{switch} et le \code{try}, les motifs, les fonctions imbriquées, l'\code{await}, et enfin la passe qui reconnaît les hooks. Chaque construction est montrée sur un programme court, avec l'IR réellement produite.
+
+\begin{remarque}
+Le dépôt ne fournit aucune option pour imprimer l'IR : \code{--verbose} n'écrit que des lignes de diagnostic (racine de découverte, imports suivis, itérations du point fixe), et les types de l'IR ne dérivent que \code{Debug}. Les impressions de ce chapitre viennent d'une petite sonde hors dépôt qui appelle \code{reactant::lowering::lower_program} et \code{lower_custom_hooks}, puis imprime l'IR dans une notation compacte. \code{B3:} ouvre un bloc ; \code{let v = e}, \code{v := e}, \code{o.f <- e} et \code{expr e} sont respectivement un \code{Let}, un \code{Assign}, un \code{MemberWrite} et un \code{ExprStmt} ; \code{@l:c} est la position (ligne, colonne) ; \code{=> ...} est le terminateur ; \code{edges:} liste les arêtes avec leur nature (\code{T}, \code{F}, \code{U}, \code{Back}, \code{Await} pour \code{IfTrue}, \code{IfFalse}, \code{Unconditional}, \code{Back}, \code{Await}). Un littéral d'objet s'imprime \texttt{\{\#k ...\}} avec son \code{ExprId} $k$, un tableau \texttt{[\#k ...]<Exact(n)>}, une fonction \texttt{fn\#k(p) \{...\}}, et la valeur opaque \code{SummaryVal(Top)} s'imprime ⊤. Une variante \code{--raw} de la sonde imprime le CFG d'une fonction \emph{avant} l'extraction des hooks, sans positions.
+\end{remarque}
+
+% ===========================================================================
+\section{Le lowering dans le pipeline}
+\label{sec:lowering-pipeline}
+
+\subsection{Trois fichiers, trois passes}
+
+Trois fichiers portent le travail, pour environ 4\,700 lignes dont un tiers de tests unitaires (67 tests) :
+
+\begin{itemize}
+  \item \file{src/lowering/cfg_builder.rs} contient le constructeur de blocs (\code{BlockBuilder}) et l'abaissement des \emph{instructions} : contrôle, déclarations, motifs de liaison, préambule des paramètres.
+  \item \file{src/lowering/expr_lower.rs} abaisse les \emph{expressions}, dont celles qui fendent des blocs (\code{?:}, \code{&&}, \code{||}, \code{??}, \code{await}).
+  \item \file{src/lowering/hook_extractor.rs} est une passe \emph{IR vers IR} : elle reconnaît les appels de hooks dans le CFG déjà produit, les remplace par des valeurs marquées (\code{StateVal}$(\ell)$, \code{StateSetter}$(\ell)$, \code{MemoVal}$(\ell)$, \code{CallbackVal}$(\ell)$, \code{HookMarker}$(\ell, \_)$) et fabrique la table des \code{HookEntry}, handlers et subscriptions compris.
+\end{itemize}
+
+Les deux premiers fichiers sont mutuellement dépendants : une instruction contient des expressions, et une expression (une flèche, une classe) contient des instructions. Le troisième ne connaît pas l'AST ; il ne lit que l'IR.
+
+\subsection{La chaîne d'appel}
+
+Le driver lit chaque fichier, le fait analyser par oxc, puis appelle trois points d'entrée :
+\begin{itemize}
+  \item \code{lower_program_with_resolver} pour les composants (\file{src/lowering/mod.rs}) ;
+  \item \code{lower_custom_hooks_with_resolver} pour les hooks custom (même fichier) ;
+  \item \code{lower_utilities_with_resolver} pour les utilitaires (\file{src/lowering/utility_lowerer.rs}).
+\end{itemize}
+La répartition des fonctions entre ces trois classes a été faite avant, par les détecteurs du \cref{chap:frontend-detection}, qui produisent des \code{Candidate}. Pour un composant, la chaîne est exactement celle-ci :
+
+\rustsnippet[label={lst:lowering-chaine}]{src/lowering/mod.rs}{463}{474}{la chaîne de lowering d'un composant}
+
+L'ordre est porteur de sens. \code{extract_handlers} passe \emph{après} \code{extract_hooks}, parce qu'il résout \code{onClick={cb}} quand \code{cb} est lié à un \code{CallbackVal}$(\ell)$, que seul \code{extract_hooks} a produit. \code{extract_subscriptions} passe en dernier, parce qu'il fouille les corps des \code{HookEntry::Effect}. Les labels sont donc contigus : les hooks d'abord ($0..k$), puis les handlers, puis les subscriptions. Le paramètre du composant est le premier nom de paramètre, ou \code{"props"} s'il n'y en a pas (\src{src/lowering/mod.rs}{471}{474}).
+
+La même chaîne de trois passes est appliquée au corps de chaque hook custom (\src{src/lowering/mod.rs}{396}{404}). Les utilitaires, eux, ne passent que par la construction du CFG, sans aucune extraction : un appel \code{useX()} dans un utilitaire reste un \code{Call} ordinaire, ce qui est cohérent avec la définition d'un utilitaire (une fonction qui n'appelle pas de hook).
+
+La construction du CFG elle-même passe par un point de dispatch unique :
+
+\rustsnippet[label={lst:lowering-candidate}]{src/lowering/mod.rs}{146}{160}{le seul endroit qui choisit entre corps-bloc et corps-expression}
+
+Le commentaire rappelle une histoire que nous retrouverons à la \cref{sec:lowering-hoist} : le drapeau \code{expression} d'une flèche concise (\code{x => expr}) a déjà été oublié par un consommateur, et la correction a consisté à ne laisser qu'un endroit où il est lu. Les fonctions imbriquées (flèches, \code{function}, méthodes, blocs \code{static}) ne passent pas par \code{Candidate} : \code{lower_expr} les abaisse récursivement dans leur propre \code{BlockBuilder} et les emballe dans un \code{Expr::FnLit} (\cref{sec:lowering-sites}).
+
+\Cref{fig:lowering-pipeline} résume la position du lowering. La frontière à retenir est verticale : à gauche l'AST, à droite l'IR, et rien ne la franchit en sens inverse.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=6mm and 7mm]
+  \node[bloc] (parse) {oxc\\parse};
+  \node[bloc,right=of parse] (det) {détecteurs\\\code{Candidate}};
+  \node[bloc,right=of det] (build) {\code{build_cfg}\\\file{cfg_builder.rs}\\\file{expr_lower.rs}};
+  \node[bloc,right=14mm of build] (hooks) {\code{extract_hooks}\\\code{extract_handlers}\\\code{extract_subscriptions}};
+  \node[bloc,below=10mm of hooks] (ir) {\code{ComponentIR}\\\code{HookIR}};
+  \node[bloc,below=10mm of build] (fn) {\code{FunctionIR}\\(utilitaires)};
+  \node[bloc,right=of ir] (eng) {moteur\\(splice, point fixe)};
+  \draw[fleche] (parse) -- (det);
+  \draw[fleche] (det) -- (build);
+  \draw[fleche] (build) -- node[etiquette,above] {CFG brut} (hooks);
+  \draw[fleche] (hooks) -- (ir);
+  \draw[fleche] (build) -- (fn);
+  \draw[fleche] (ir) -- (eng);
+  \draw[fleche] (fn) -- (ir.west);
+  \draw[dashed,ra-red,thick] ($(det.east)!0.5!(build.west)+(0,12mm)$) node[above,etiquette] {AST \textbar{} IR} -- ++(0,-22mm);
+\end{tikzpicture}
+\caption{Le lowering dans le pipeline. La construction du CFG est commune aux trois classes de fonctions ; l'extraction des hooks, des handlers et des subscriptions ne s'applique qu'aux composants et aux hooks custom. À droite de la ligne rouge, aucun consommateur ne voit l'AST.}\label{fig:lowering-pipeline}
+\end{figure}
+
+\subsection{Pourquoi un CFG}
+
+\begin{decision}[ADR-3 --- une IR dédiée, en CFG]
+\adr{3} décide une IR propre au projet, inspirée de React-tRace \cite{LeeAhnYi2025} mais représentée comme un graphe de flot de contrôle plutôt que comme un arbre. L'alternative refusée, une IR arborescente, exige une transformation CPS pour les retours anticipés et ne sait pas représenter une boucle sans arc arrière. Le CFG représente nativement retours anticipés, boucles et \code{switch} ; ses en-têtes de boucle sont structurels, ce qui place naturellement le widening ; la dominance, nécessaire pour les hooks conditionnels, y est un algorithme standard.
+
+L'ADR a vieilli sur plusieurs points de détail, qu'il faut connaître pour ne pas la lire comme une spécification : sa table de désucrage annonce \code{a && b} $\to$ \code{If(a, b, Lit(false))} et \code{a ? b : c} $\to$ \code{If(a, b, c)}, alors que le code produit des diamants de blocs (\cref{sec:lowering-diamants}) ; les \og nœuds de hooks\fg{} \code{UseState}, \code{UseEffect} n'existent pas sous ces noms (ce sont des \code{HookEntry} et des marqueurs) ; le terminateur \code{Unreachable} n'y figure pas ; le lowering n'est plus une passe unique, puisque \code{hook_extractor} le suit ; enfin \file{docs/ir.md}, cité comme grammaire complète, n'existe pas dans le dépôt.
+\end{decision}
+
+\begin{decision}[ADR-4 --- un CFG de rendu, des corps d'effets séparés]
+\adr{4} fixe la forme d'un composant : un \code{render_cfg} et une table \code{hooks} dont les entrées d'effets, de memos et de callbacks portent chacune leur propre CFG. L'alternative refusée est un méta-CFG unique rendu $\to$ effets $\to$ vérification, jugé gros, difficile à maintenir et porteur d'un ordre React implicite. C'est ce choix qui explique que \code{extract_hooks} \emph{déplace} le corps d'un \code{useEffect(() => ...)} hors du CFG de rendu (\cref{sec:lowering-hooks}). La structure de données décrite par l'ADR (\code{deps: Option<Vec<Expr>>}) est périmée : c'est aujourd'hui un \code{DepsArg} (\cref{chap:ir}).
+\end{decision}
+
+% ===========================================================================
+\section{La machine à blocs}
+\label{sec:lowering-machine}
+
+\subsection{Un corps linéaire}
+
+Commençons par le cas le plus simple : un corps sans aucun branchement. Le hook custom suivant calcule un titre et l'applique dans un effet.
+
+\begin{lstlisting}[language=TypeScript,caption={Un corps linéaire, sans \code{return} (\file{/tmp/ch07/c1_linear.tsx})},label={lst:lowering-linear}]
+import { useEffect } from "react";
+
+export function useTitle(title: string) {
+  const full = title + " | App";
+  useEffect(() => {
+    document.title = full;
+  }, [full]);
+}
+\end{lstlisting}
+
+\begin{sortie}
+=== custom hook useTitle (params ["title"]) ===
+  B0:
+      let full = (title Add " | App")  @4:8
+      expr HookMarker(0, Undefined)  @5:2
+      => return undefined
+  edges:
+hooks:
+  #0 Effect deps=List[full]<Exact(1)>  @5:2
+    B0:
+        document.title <- full  @6:4
+        expr full  @6:4
+        => return undefined
+    edges:
+\end{sortie}
+
+Trois choses se lisent déjà. Le paramètre simple \code{title} ne produit aucune instruction : il sera lié par l'appelant (\cref{sec:lowering-motifs}). Le corps ne contient pas de \code{return}, et pourtant son unique bloc se termine par \code{return undefined}. Enfin, l'affectation \code{document.title = full} devient deux instructions : l'écriture en place (\code{MemberWrite}) puis la valeur de l'expression, gardée en \code{ExprStmt} (\cref{sec:lowering-expr}).
+
+\subsection{Le constructeur}
+
+Tout CFG est fabriqué par une instance de \code{BlockBuilder}.
+
+\rustsnippet[label={lst:lowering-builder}]{src/lowering/cfg_builder.rs}{78}{100}{l'état du constructeur de blocs}
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}lX@{}}
+\toprule
+Champ & Rôle \\
+\midrule
+\code{blocks}, \code{edges} & le CFG en cours ; un bloc n'entre dans \code{blocks} qu'au moment où il est scellé \\
+\code{current} & identifiant du bloc ouvert \\
+\code{counter} & prochain identifiant libre ; initialisé à 1, car le bloc 0 est l'entrée (\srcline{src/lowering/cfg_builder.rs}{108}) \\
+\code{current_stmts} & instructions du bloc ouvert \\
+\code{terminated} & le bloc courant est scellé ; \code{push_stmt} devient alors sans effet (\src{src/lowering/cfg_builder.rs}{166}{170}) \\
+\code{temp_counter} & suffixe des temporaires \code{__tN} (\code{fresh_temp}), propre à chaque constructeur \\
+\code{loop_stack} & pile des cibles de \code{break}/\code{continue} (\cref{sec:lowering-boucles}) \\
+\code{pending_label} & label posé par une instruction étiquetée, consommé par la boucle suivante \\
+\code{ctx} & le contexte partagé par tous les corps du fichier (\code{LowerCtx}, \cref{sec:lowering-sites}) \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+Deux opérations élémentaires font tout le travail.
+
+\rustsnippet[label={lst:lowering-seal}]{src/lowering/cfg_builder.rs}{172}{203}{sceller, ouvrir, couper à un \code{await}}
+
+\begin{definition}{Sceller, ouvrir, réserver}{lowering-sceller}
+\terme{Réserver} un bloc, c'est tirer un identifiant neuf (\code{new_block}) sans rien créer. \terme{Sceller} le bloc courant, c'est lui donner son terminateur et l'insérer dans \code{blocks} (\code{seal_with}) ; le constructeur est alors dans l'état \og terminé\fg{}. \terme{Ouvrir} un bloc réservé, c'est en faire le bloc courant et quitter l'état terminé (\code{start_block}). Chaque terminateur \code{Jump} ou \code{Branch} scellé doit être accompagné des arêtes correspondantes (\code{add_edge}).
+\end{definition}
+
+Toutes les constructions de contrôle suivent le même protocole, qu'il faut avoir en tête pour lire le fichier :
+
+\begin{enumerate}
+  \item réserver les identifiants des blocs cibles ;
+  \item sceller le bloc courant avec un terminateur et ajouter les arêtes correspondantes ;
+  \item ouvrir chaque cible et y abaisser le sous-arbre ;
+  \item si le sous-arbre n'a pas terminé le bloc, le sceller par un \code{Jump} vers la jonction, sous la garde \code{if !builder.is_terminated()} ;
+  \item ouvrir la jonction et continuer.
+\end{enumerate}
+
+\begin{invariant}{Arêtes et terminateurs}{lowering-aretes}
+Toute cible d'un terminateur \code{Jump} ou \code{Branch} produit par le lowering a une arête dans \code{CFG.edges}. Le lowering le garantit par construction (chaque \code{seal_with(Jump|Branch)} est suivi d'\code{add_edge}), mais \code{CFG::validate}, qui vérifie cette propriété, n'est appelé qu'en \code{debug_assert!} après un splice (\src{src/ir/splice.rs}{251}{255}), jamais directement sur la sortie du lowering.
+\end{invariant}
+
+Cet invariant n'est pas décoratif : les fonctions de navigation (\code{successors}, \code{predecessors}, \code{reachable_blocks}) lisent \code{edges}, pas les terminateurs (\cref{chap:ir}). Un \code{Jump} sans arête rendrait sa cible invisible au point fixe.
+
+\subsection{La boucle des instructions et le code mort}
+
+Une liste d'instructions s'abaisse séquentiellement, avec un arrêt :
+
+\rustsnippet[label={lst:lowering-stmts}]{src/lowering/cfg_builder.rs}{270}{277}{la boucle d'instructions s'arrête au premier terminateur}
+
+Dès qu'une instruction a scellé le bloc (\code{return}, \code{throw}, \code{break}, \code{continue}), le reste de la liste n'est pas abaissé du tout. C'est raisonnable pour du vrai code mort, mais JavaScript hisse les déclarations de fonctions : une fonction déclarée après un \code{return} est bel et bien définie. Nous verrons à la \cref{sec:lowering-limites} ce que cela coûte.
+
+\subsection{La sortie : \code{into_cfg} et la chute en fin de corps}
+
+\rustsnippet[label={lst:lowering-into-cfg}]{src/lowering/cfg_builder.rs}{213}{240}{la sortie du constructeur}
+
+Si le dernier bloc ouvert n'a pas été scellé, c'est que le corps \og tombe du bout\fg{} : \code{into_cfg} le scelle par \code{Return(Lit(Unit))}, c'est-à-dire \code{return undefined}. Le commentaire raconte pourquoi ce n'est pas \code{Unreachable}.
+
+\begin{decision}[ADR-25 --- la chute en fin de corps est un \code{return undefined}]
+Avant \adr{25}, \code{into_cfg} scellait la queue en \code{Unreachable}. Or trois situations produisaient ce terminateur : un corps qui tombe du bout (le contrôle revient, avec \code{undefined}), un \code{throw} (il ne revient pas) et un \code{break} sans cible (JavaScript invalide). Le splice (\cref{chap:splice-inlining}) lit les terminateurs du callé pour décider où le contrôle reprend : chaque \code{Return(e)} devient \code{[let bound = e;] Jump(join)}, et un \code{Unreachable} est laissé tel quel. Un hook custom sans \code{return} produisait donc une jonction sans prédécesseur, et l'appelant était coupé de sa propre sortie : 208 composants du corpus avaient un CFG de rendu sectionné, et toutes les règles qui lisent l'environnement de sortie joignaient sur moins de chemins que le programme n'en a --- la direction interdite.
+
+Décisions : (1) la queue est scellée en \code{Return(undefined)}, et \code{Unreachable} ne veut plus dire que \og le contrôle ne continue pas\fg{} ; (2) \code{throw} garde \code{Unreachable} et le splice continue de le laisser seul. L'alternative tentante --- relier tout \code{Unreachable} du callé à la jonction, puisqu'un chemin de plus n'est \og qu'une\fg{} sur-approximation --- a été implémentée, mesurée et refusée : elle invente un chemin qui atteint la sortie de l'appelant \emph{sans passer par les hooks du callé}, et signalait l'idiome \og garde-\code{throw}\fg{} comme \regle{conditional-hook} au niveau \Error{} sur du code conforme. (3) Un \code{Return} inatteignable n'est pas une sortie : l'ensemble des sorties passe par \code{CFG::reachable_blocks}. Mesure : composants sectionnés 208 $\to$ 3 ; 12 findings révélés, aucun perdu. Tests : \file{tests/cfg_exit_integrity.rs}.
+\end{decision}
+
+\begin{piege}
+\textbf{Un chemin de plus n'est pas toujours gratuit.} Le réflexe \og dans le doute, ajoutons une arête, c'est sound\fg{} est juste pour les faits may et faux pour les faits must : une arête inventée vers la sortie peut faire croire qu'un hook est évitable, et produire un \Error{} faux. Le lowering sur-approxime les \emph{comportements}, pas les \emph{graphes} : une arête n'est ajoutée que si le programme peut réellement la suivre.
+\end{piege}
+
+% ===========================================================================
+\section{Le \code{if} et le retour anticipé}
+\label{sec:lowering-if}
+
+\subsection{La table des instructions}
+
+\code{lower_stmt} (\src{src/lowering/cfg_builder.rs}{279}{466}) est un \code{match} sur les variantes de \code{Statement} d'oxc. \Cref{tab:lowering-stmts} en donne la carte ; les sections suivantes détaillent chaque ligne.
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}lX@{}}
+\toprule
+Instruction & IR produite \\
+\midrule
+\code{const}/\code{let}/\code{var} & pour chaque déclarateur, la valeur (ou \code{Lit(Unit)} sans initialiseur) puis le motif de liaison (\cref{sec:lowering-motifs}) \\
+expression \code{e;} & \code{ExprStmt(lower_expr(e))} ; l'expression a pu émettre ses propres instructions et fendre des blocs \\
+\code{return e} / \code{return} & scelle \code{Return(e)} / \code{Return(Lit(Unit))} \\
+\code{if} & \code{lower_if} : trois blocs réservés, \code{Branch} \\
+\code{{ ... }} & la liste à plat : aucune portée lexicale n'est modélisée \\
+boucles & \code{lower_while}, \code{lower_for}, \code{do...while} en ligne, \code{lower_iter_loop} (\cref{sec:lowering-boucles}) \\
+\code{throw e} & \code{ExprStmt(e)} puis \code{Unreachable} \\
+\code{try}, \code{switch} & \code{lower_try}, \code{lower_switch} (\cref{sec:lowering-switch-try}) \\
+\code{l: boucle} & le label est mis en attente, puis la boucle ; sur tout autre corps, le label est ignoré \\
+\code{break}, \code{continue} & un \code{Jump} vers la cible de la pile (\code{Unconditional} / \code{Back}) ; sans cible, \code{Unreachable} \\
+\code{function f(){}} &\code{Let f = FnLit} à sa position textuelle (pas de hissage) \\
+\code{class X {}} & \code{Let X = lower_class(...)}, ou \code{ExprStmt} si anonyme \\
+\code{with (o) body} & \code{ExprStmt(o)} puis le corps, les noms traités comme des liaisons ordinaires \\
+vide, \code{debugger}, types TS, \code{import}/\code{export} & rien --- mais écrit en extension \\
+\bottomrule
+\end{tabularx}
+\caption{Ce que \code{lower_stmt} produit pour chaque instruction.}\label{tab:lowering-stmts}
+\end{table}
+
+La dernière ligne mérite qu'on s'y arrête. La liste des instructions \og sans code\fg{} est écrite variante par variante, sans bras \code{_} :
+
+\rustsnippet[label={lst:lowering-noop}]{src/lowering/cfg_builder.rs}{445}{464}{les instructions sans code, en extension}
+
+Le commentaire donne la raison : c'est ainsi que les corps de classes ont été perdus (\issue{77}). Une nouvelle variante d'oxc qui porterait du code ne peut pas rejoindre silencieusement ce bras : le compilateur refusera le \code{match} non exhaustif. Une remarque au passage : \code{TSEnumDeclaration} produit un objet à l'exécution en TypeScript, et le lowering le traite comme effacé --- le nom de l'enum n'est jamais lié. Au commit \snapshotCommit{}, un composant qui lit un membre de l'enum (\file{e22_enum.tsx}) est certifié sans réserve par toutes les règles : \code{Status} est une variable libre non liée, que l'environnement lit comme ⊤ (\code{lookup_missing_returns_top}), une sur-approximation sound qui ne coûte donc qu'en précision, jamais en soundness.
+
+Les deux bras les plus fréquents sont courts :
+
+\rustsnippet[label={lst:lowering-expr-return}]{src/lowering/cfg_builder.rs}{286}{297}{instruction-expression et \code{return}}
+
+\subsection{Le gabarit du \code{if}}
+
+\rustsnippet[label={lst:lowering-if}]{src/lowering/cfg_builder.rs}{544}{585}{l'abaissement d'un \code{if}}
+
+Le code suit le protocole à la lettre. La condition est abaissée \emph{avant} la réservation des blocs : si elle contient un \code{&&}, son diamant est construit d'abord, et le \code{Branch} ne porte plus que la variable temporaire du diamant. Trois blocs sont toujours réservés, même sans \code{else} : le bloc \og sinon\fg{} vide contient alors un simple \code{Jump(join)}. Chaque branche qui ne s'est pas terminée d'elle-même saute vers la jonction. \Cref{fig:lowering-if} dessine le gabarit.
+
+\begin{figure}[htbp]\centering
+\begin{subfigure}[b]{0.48\linewidth}\centering
+\begin{tikzpicture}[node distance=7mm and 3mm]
+  \node[cfgbloc] (c) {courant\\… (cond abaissée)\\branch cond ? T : E};
+  \node[cfgbloc,below left=of c] (t) {T\\consequent\\jump J};
+  \node[cfgbloc,below right=of c] (e) {E\\alternate (ou rien)\\jump J};
+  \node[cfgbloc,below=24mm of c] (j) {J (jonction)\\suite …};
+  \draw[fleche] (c) -- node[etiquette,left=1pt] {IfTrue} (t);
+  \draw[fleche] (c) -- node[etiquette,right=1pt] {IfFalse} (e);
+  \draw[fleche] (t) -- node[etiquette,left=1pt] {U} (j);
+  \draw[fleche] (e) -- node[etiquette,right=1pt] {U} (j);
+\end{tikzpicture}
+\caption{\code{if (cond) A else B}}
+\end{subfigure}\hfill
+\begin{subfigure}[b]{0.48\linewidth}\centering
+\begin{tikzpicture}[node distance=7mm and 3mm]
+  \node[cfgbloc] (c) {courant\\branch cond ? T : E};
+  \node[cfgbloc,below left=of c] (t) {T\\return null};
+  \node[cfgbloc,below right=of c] (e) {E\\jump J};
+  \node[cfgbloc,below=24mm of c] (j) {J\\hook, suite …};
+  \draw[fleche] (c) -- node[etiquette,left=1pt] {IfTrue} (t);
+  \draw[fleche] (c) -- node[etiquette,right=1pt] {IfFalse} (e);
+  \draw[fleche] (e) -- node[etiquette,right=1pt] {U} (j);
+\end{tikzpicture}
+\caption{retour anticipé : \code{if (cond) return null;}}
+\end{subfigure}
+\caption{Gabarit du \code{if}. Les trois blocs sont réservés avant d'abaisser les branches ; une branche qui se termine (à droite, \code{return}) n'a pas d'arête vers la jonction.}\label{fig:lowering-if}
+\end{figure}
+
+\subsection{Le retour anticipé et la dominance}
+
+Le retour anticipé est le premier motif où la forme du CFG décide d'un diagnostic. Reprenons le programme du dossier de notes, qui contient aussi une boucle et un ternaire (nous les lirons plus loin) :
+
+\begin{lstlisting}[language=TypeScript,caption={Retour anticipé, \code{for...of}, \code{continue}, ternaire (\file{/tmp/ch07/e2_control.tsx})},label={lst:lowering-gate}]
+import { useState } from "react";
+
+export function Gate({ kind, items }: { kind: string; items: string[] }) {
+  if (kind === "none") {
+    return null;
+  }
+  const [n, setN] = useState(0);
+  let total = 0;
+  for (const it of items) {
+    if (!it) continue;
+    total += 1;
+  }
+  const label = n > 0 ? "some" : "none";
+  return <div title={label}>{total}</div>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+=== component Gate (param __p0) ===
+render_cfg:
+  B0:
+      let __obj_56 = __p0
+      let kind = __obj_56.kind  @3:23
+      let items = __obj_56.items  @3:29
+      => branch (kind Eq "none") ? B1 : B2
+  B1:
+      => return null
+  B2:
+      => jump B3
+  B3:
+      let n = StateVal(0)  @7:9
+      let setN = StateSetter(0)  @7:12
+      let total = 0  @8:6
+      expr items  @9:19
+      => jump B4
+  B4:
+      => branch true ? B5 : B6
+  B5:
+      let it = ⊤  @9:13
+      => branch Not(it) ? B7 : B8
+  B6:
+      => branch (n Gt 0) ? B10 : B11
+  B7:
+      => jump B4
+  B8:
+      => jump B9
+  B9:
+      total := (total Add 1)  @11:4
+      expr total  @11:4
+      => jump B4
+  B10:
+      let __t0 = "some"  @13:24
+      => jump B12
+  B11:
+      let __t0 = "none"  @13:33
+      => jump B12
+  B12:
+      let label = __t0  @13:8
+      => return Native<div>({#0 title: label})[total]
+  edges: 0->1[T] 0->2[F] 2->3[U] 3->4[U] 4->5[T] 4->6[F] 5->7[T] 5->8[F]
+         7->4[Back] 8->9[U] 9->4[Back] 6->10[T] 6->11[F] 10->12[U] 11->12[U]
+\end{sortie}
+
+Le \code{if} sans \code{else} donne les trois blocs \code{B1} (le \code{return null}), \code{B2} (le \og sinon\fg{} vide) et \code{B3} (la jonction). Le \code{useState} atterrit dans \code{B3}, que seule la branche \code{B2} atteint. Il existe donc un chemin de l'entrée vers une sortie (\code{B0} $\to$ \code{B1}) qui ne passe pas par le hook : le bloc du hook ne domine pas toutes les sorties (\cref{def:dominance}), et c'est exactement ce que \regle{conditional-hook} vérifie.
+
+\begin{sortie}
+  Gate  (1 hooks)  e2_control.tsx
+    error  conditional-hook  [hook:0]  (line 7:8)  this hook is called conditionally (not on every render path)
+\end{sortie}
+
+Comparons avec une garde qui lève une exception au lieu de retourner :
+
+\begin{lstlisting}[language=TypeScript,caption={Une garde-\code{throw} (\file{/tmp/ch07/c3_throw.tsx})},label={lst:lowering-throw}]
+import { useState } from "react";
+
+export function Guarded({ id }: { id?: string }) {
+  if (!id) throw new Error("id required");
+  const [v, setV] = useState(id);
+  return <b onClick={() => setV("")}>{v}</b>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+  B0:
+      let __obj_59 = __p0
+      let id = __obj_59.id  @3:26
+      => branch Not(id) ? B1 : B2
+  B1:
+      expr new#0 Error("id required")  @4:11
+      => unreachable
+  B2:
+      => jump B3
+  B3:
+      let v = StateVal(0)  @5:9
+      ...
+  edges: 0->1[T] 0->2[F] 2->3[U]
+\end{sortie}
+
+Le bloc \code{B1} se termine par \code{Unreachable} : ce n'est pas une sortie. La seule sortie atteignable est dans \code{B3}, que le hook domine. L'analyseur le certifie (extrait de la sortie \code{--info --show-clean}) :
+
+\begin{sortie}
+  Guarded  (2 hooks)  c3_throw.tsx
+    warn   frozen-initial-state  [hook:0]  var:id  (line 5:8)  state `v` is seeded from `id` and never re-synced. ...
+    verified  conditional-hook  all hooks run unconditionally, in a stable order
+\end{sortie}
+
+C'est la sémantique de React : un rendu qui lève n'est pas un rendu dans lequel un hook a été sauté, c'est un rendu avorté. Les deux programmes ne diffèrent que par \code{return} contre \code{throw}, et le lowering est le seul endroit où cette différence est traduite.
+
+\begin{definition}{Bloc de jonction, bloc orphelin}{lowering-jonction}
+Le \terme{bloc de jonction} d'une construction est le bloc réservé où convergent ses branches (\code{if}, ternaire, court-circuit, \code{try}). Quand toutes les branches se sont terminées (\code{if (c) return 1; else return 2;}), la jonction est tout de même ouverte puis scellée --- par \code{into_cfg} en \code{Return(undefined)} ou par les instructions qui suivent --- et reste dans \code{blocks} sans aucun prédécesseur : c'est un \terme{bloc orphelin}.
+\end{definition}
+
+\begin{piege}
+\textbf{\og Tous les blocs\fg{} n'est pas \og tous les blocs exécutables\fg{}.} Un bloc orphelin terminé par \code{Return} n'est pas une sortie. Tout consommateur qui quantifie sur les sorties (dominance, environnement de sortie) doit passer par \code{CFG::reachable_blocks}, comme le fixe \adr{25} §3 ; le test \code{reachable_blocks_excludes_an_orphaned_join} (\src{src/lowering/cfg_builder.rs}{1348}{1369}) en garde la trace.
+\end{piege}
+
+\begin{remarque}
+Les identifiants de blocs sont alloués au moment de la réservation, \emph{avant} l'abaissement des sous-structures. Dans \code{Gate}, la sortie de boucle \code{B6} a été réservée avant les blocs du corps \code{B7}--\code{B9}. Les blocs imbriqués d'une branche ont donc des identifiants supérieurs à la jonction qui la suit : l'ordre des identifiants n'est pas l'ordre du texte. Comme \code{CFG.blocks} est une \code{BTreeMap}, cet ordre est au moins déterministe (\cref{chap:ir}).
+\end{remarque}
+
+% ===========================================================================
+\section{Les expressions : garder chaque lecture}
+\label{sec:lowering-expr}
+
+\subsection{Le contrat de \code{lower_expr}}
+
+\code{lower_expr} (\src{src/lowering/expr_lower.rs}{143}{615}) prend une \code{Expression} d'oxc et rend une \code{Expr}. Son commentaire de tête fixe le contrat : \og Branching expressions (ternary, \code{&&}, \code{||}, \code{??}) split \code{builder} into new blocks and return a \code{Var} temp. All other expressions lower structurally.\fg{} Une expression peut donc faire deux choses de plus que rendre une valeur : \emph{émettre} des instructions dans le bloc courant (une écriture, une lecture conservée) et \emph{fendre} le bloc courant (les diamants de la \cref{sec:lowering-diamants}, la coupure d'\code{await} de la \cref{sec:lowering-await}). En revanche, elle ne scelle jamais un bloc en \code{Return} ou \code{Unreachable} : après \code{lower_expr}, un bloc est toujours ouvert. L'ordre d'évaluation est celui de JavaScript --- gauche à droite, callee avant arguments, objet avant clé --- à une exception près pour le JSX (plus bas).
+
+\subsection{Deux outils transverses}
+
+\rustsnippet[label={lst:lowering-opaque}]{src/lowering/expr_lower.rs}{18}{36}{la valeur opaque et la lecture pour effet}
+
+\code{opaque()} est la sentinelle ⊤ : une valeur inconnue, typée (\code{SummaryVal(Top)}) plutôt qu'un nom magique, pour qu'aucune variable de l'utilisateur ne puisse entrer en collision avec elle et qu'elle n'apparaisse jamais comme une capture. \code{lower_for_effect} garde en \code{ExprStmt} une sous-expression que le composite englobant ne sait pas représenter. Son commentaire énonce le principe le plus important du fichier.
+
+\begin{invariant}{Ne perdre aucune lecture}{lowering-lectures}
+Toute sous-expression évaluée à l'exécution est présente dans l'IR, au moins comme \code{ExprStmt}. Jeter une sous-expression n'est pas une sur-approximation : les règles de deps lisent une lecture absente comme \og cette variable n'est pas utilisée\fg{} --- une affirmation, pas une ignorance.
+\end{invariant}
+
+Cet invariant explique une série de formes qui surprennent à la première lecture de l'IR : le défaut d'un motif émis en \code{expr}, la clé calculée d'un objet lue avant sa valeur, l'argument d'un \code{void} gardé, l'expression itérée d'un \code{for...of} lue dans le pré-en-tête, un argument \code{...spread} sorti de la liste d'arguments. Toutes appliquent la même règle. \Cref{sec:lowering-limites} montrera les quelques endroits où elle est encore violée.
+
+\subsection{Tour des formes}
+
+\Cref{tab:lowering-exprs} résume ce que devient chaque famille d'expressions. Les lignes marquées d'une étoile sont détaillées ensuite.
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}lX@{}}
+\toprule
+Source & IR \\
+\midrule
+booléen, \code{null}, nombre, chaîne & \code{Lit} ; entier de magnitude $< 2^{31}-1$ en \code{Int}, sinon \code{Float} \\
+gabarit \code{`q0${e0}q1`} & chaîne d'additions gauche-associée \code{(("q0" Add e0) Add "q1")} \\
+\code{undefined}, identifiant & \code{Lit(Unit)}, \code{Var(nom)} \\
+\code{this}, \code{super} & ⊤ \\
+binaire & \code{BinOp} par \code{lower_binop}, exhaustif ; \code{==}/\code{===} en \code{Eq}, \code{!=}/\code{!==} en \code{Neq} \\
+unaire & \code{Neg}, \code{Not}, \code{BitNot}, \code{TypeOf}, \code{Plus} ; \code{void e} $\to$ \code{ExprStmt(e)} puis \code{Lit(Unit)} ; \code{delete o.f} $\to$ \code{MemberWrite{o, f, Unit}} puis \code{Lit(true)} ; le reste en \code{Unknown} \\
+\code{i++}, \code{--i} $\star$ & \code{Assign i := i + 1} (ou $-$), valeur \code{Var(i)} ; sur un membre, \code{MemberWrite} de ⊤ \\
+appel, \code{new} $\star$ & \code{Call}, \code{New{id}} (nœud allouant depuis \issue{158}) ; argument spread émis pour effet \\
+gabarit étiqueté & \code{Call(tag, [interpolations])} \\
+affectation $\star$ & \code{Assign} / \code{MemberWrite} / motif, puis la valeur \\
+séquence \code{(a, b, c)} & \code{a}, \code{b} en \code{ExprStmt}, valeur \code{c} \\
+\code{a?.b}, \code{f?.(x)} & comme \code{a.b}, \code{f(x)} \\
+\code{x as T} ; \code{x!}, \code{satisfies}, \code{<T>x}, parenthèses & \code{TSAnnotated(x)} ; transparents \\
+objet, tableau $\star$ & \code{ObjectLit{id}}, \code{ArrayLit{id, arity, spread_at}} \\
+flèche, \code{function}, classe & \code{FnLit{id}}, \code{lower_class} (\cref{sec:lowering-sites}) \\
+JSX $\star$ & \code{CompApp} ou \code{NativeElem} \\
+\code{?:}, \code{&&}, \code{||}, \code{??} & diamants (\cref{sec:lowering-diamants}) \\
+\code{await e} & coupure \code{Await} (\cref{sec:lowering-await}) \\
+\code{yield e} & la valeur de \code{e} (générateurs non modélisés) \\
+autre & ⊤ (\code{_ => opaque()}) \\
+\bottomrule
+\end{tabularx}
+\caption{L'abaissement des expressions, famille par famille.}\label{tab:lowering-exprs}
+\end{table}
+
+\paragraph{Incréments.} Le bras de \code{UpdateExpression} émet l'écriture puis rend la variable :
+
+\rustsnippet[label={lst:lowering-update}]{src/lowering/expr_lower.rs}{256}{277}{\code{i++} et \code{--i}}
+
+Préfixe et postfixe rendent tous deux la valeur \emph{après} écriture. Le commentaire parle d'une approximation sound \og pour le domaine numérique\fg{} (\og the rare \code{a = i++} over-counts by one, never under\fg{}). Le domaine numérique (\cref{chap:treillis-simples}) étant un treillis d'intervalles, décaler la valeur de \code{a} de $+1$ ne l'\emph{élargit} pas : cela lui substitue une autre valeur ponctuelle, qui peut se trouver hors de tout intervalle sound pour la vraie valeur. Vérifié au commit \snapshotCommit{} : pour \code{let i = 5; const a = i++; if (a === 5) setX(1);}, \code{a} vaut 5 en JavaScript et l'appel est certain ; le témoin littéral (\code{const a = 5; if (a === 5) ...}) est bien signalé (\code{warn setter-in-render}), mais avec \code{i++} l'analyseur calcule \code{a = 6}, le raffinement d'égalité déclare la branche \code{then} morte, et le composant est \code{verified setter-in-render} --- un faux négatif, au sens strict où l'invariant de soundness du projet l'interdit, provoqué par le lowering et non par le moteur.
+
+\begin{piege}
+\textbf{\og Sound pour le domaine numérique\fg{} n'est pas vrai en général.} Le commentaire de \cref{lst:lowering-update} est optimiste : un test d'égalité sur la valeur \emph{avant} écriture (\code{a === 5} ci-dessus) compare deux valeurs ponctuelles distinctes de l'intervalle, et le décalage de $+1$ peut faire passer une branche certaine pour morte. L'exemple \file{e27_postinc.tsx} en est la preuve : c'est un faux négatif que le lowering introduit, indépendamment de tout ce que le moteur fait ensuite correctement.
+\end{piege}
+
+Sur une cible membre (\code{o.f++}, \code{a[i]--}), la cellule n'est pas suivie : \code{MemberWrite} de ⊤ et valeur ⊤. Toute autre cible tombe dans le bras \code{_ => opaque()} --- nous y reviendrons à la \cref{sec:lowering-limites}.
+
+\paragraph{Arguments.} Un argument \code{...spread} ne peut pas garder de position : au splice, les paramètres se lient par position, et deviner lequel reçoit l'étalement serait une affirmation. Il est donc émis pour effet et retiré de la liste :
+
+\rustsnippet[label={lst:lowering-args}]{src/lowering/expr_lower.rs}{617}{634}{la liste d'arguments}
+
+Un appel à arguments de type explicites (\code{useState<T>(x)}) est enveloppé dans \code{TSAnnotated} (\src{src/lowering/expr_lower.rs}{636}{647}), que l'extracteur de hooks regarde à travers.
+
+\paragraph{Affectations.}
+
+\rustsnippet[label={lst:lowering-assign}]{src/lowering/expr_lower.rs}{493}{518}{affectation à un identifiant}
+
+Une affectation composée \code{x op= e} est reconstruite en \code{x := x op e}, mais seulement quand l'opérateur a une traduction fidèle ; sinon la cible est mise à ⊤. Le commentaire est \emph{périmé} : il ne cite que \code{Add/Sub/Mul/Div}, alors que \code{faithful_compound_binop} (\src{src/lowering/expr_lower.rs}{1161}{1179}) couvre aujourd'hui les quatre opérations, le reste \texttt{\%}, la puissance \texttt{**}, les trois opérateurs bit à bit et les trois décalages. Seuls \code{&&=}, \code{||=} et \code{??=} tombent encore sur ⊤. Une cible membre produit un \code{MemberWrite} (de ⊤ pour un composé, la cellule n'étant pas suivie) ; une cible motif (\code{[a, b] = xs}) passe par \code{lower_assignment_target}, miroir des motifs de liaison (\cref{sec:lowering-motifs}). Dans tous les cas, l'expression rend ensuite sa valeur ; en position d'instruction, cette valeur devient un \code{ExprStmt}, d'où les paires \code{total := (total Add 1)} / \code{expr total} de \code{Gate}.
+
+\paragraph{Chaînage optionnel.} \code{a?.b} et \code{f?.(x)} s'abaissent comme leurs versions non optionnelles (\src{src/lowering/expr_lower.rs}{649}{657}). L'argument du commentaire vaut pour la \emph{valeur} : un receveur non nul est un objet, et tout autre receveur donne déjà ⊤, qui couvre \code{undefined}. Pour les \emph{effets}, \code{f?.(x)} devient un appel inconditionnel ; si \code{f} est nul, l'appel ne s'exécute pas en vrai. Cela ne peut qu'ajouter des comportements (des faux positifs possibles), jamais en retirer.
+
+\subsection{Objets, tableaux, clés synthétiques}
+
+\rustsnippet[label={lst:lowering-object}]{src/lowering/expr_lower.rs}{352}{394}{le littéral d'objet}
+
+L'identifiant d'allocation est tiré \emph{avant} les valeurs des champs. Trois sortes de champs ne peuvent pas être rangées sous leur vrai nom : un accesseur (\code{get x()}), dont la lecture exécute un corps ; une clé calculée (\code{[k]: v}), dont le nom est inconnu ; un spread (\code{...opts}), qui apporte un nombre inconnu de champs. Tous trois sont rangés sous une \terme{clé synthétique} fabriquée par \code{synthetic_key} (\src{src/lowering/expr_lower.rs}{38}{44}) : un préfixe (\code{[accessor]}, \code{[computed]}, \code{...}) suivi d'un \code{ExprId} consommé pour l'occasion. Aucun \code{FieldAccess} réel ne peut atteindre ces clés, mais les parcours qui visitent les champs \emph{par valeur} (variables libres, setters qui s'échappent) les voient. Une clé numérique (\code{{ 1: x }}) passe par le bras \og calculé\fg{}. L'accès à un membre écrit avant un spread est traité à part par le domaine (\code{members_after_last_spread}, \cref{chap:ir}).
+
+Les tableaux (\src{src/lowering/expr_lower.rs}{395}{439}) suivent la même logique : \code{elems} garde les éléments visibles, un spread y figure comme un élément \og conteneur\fg{} dont la position est notée dans \code{spread_at}, une élision compte dans la longueur sans produire d'élément, et \code{arity} vaut \code{Exact(n)} sauf en présence d'un spread (\code{AtLeast(n)}). C'est le dernier endroit où la longueur de la source est connaissable ; elle alimente \code{DepsArg} (\cref{chap:ir}, \issue{104}).
+
+\subsection{JSX}
+
+\rustsnippet[label={lst:lowering-jsx}]{src/lowering/expr_lower.rs}{799}{830}{un élément JSX : composant ou élément hôte}
+
+\begin{react}[composants, éléments hôtes, \code{children}]
+En JSX, un nom qui commence par une majuscule ou qui est pointé (\code{<Ctx.Provider>}, \code{<motion.div>}) désigne un composant ; un nom en minuscule désigne un élément hôte du DOM. Les enfants d'un composant lui sont passés dans \code{props.children}, et c'est lui qui décide de les rendre ; les enfants d'un élément hôte sont rendus par React DOM.
+\end{react}
+
+Le lowering suit cette règle : \code{CompApp} si le nom commence par une majuscule (au sens Unicode) ou contient un point, \code{NativeElem} sinon. Pour un \code{CompApp}, les enfants rejoignent les props sous la clé \code{children}, dans un tableau synthétique d'arité \code{AtLeast} ; les jeter effacerait tout le sous-arbre du CFG, avec les setters qui s'y échappent. L'origine du composant (\code{origin}) est lue dans les imports du fichier au moment du lowering, et nulle part ailleurs (\issue{7}). Les props forment un \code{ObjectLit} ; un attribut sans valeur vaut \code{Lit(true)}, un spread d'attribut prend une clé \code{...N}. Pour un \code{NativeElem}, \code{prop_spans} enregistre la position de chaque prop \code{onX}, que l'extracteur de handlers relira. Un fragment \code{<>...</>} devient un \code{NativeElem} de balise \code{"Fragment"} ; un \code{<React.Fragment>} explicite, pointé, devient un \code{CompApp}.
+
+\begin{piege}
+\textbf{Les enfants sont abaissés avant les props.} \code{lower_jsx_element} abaisse les enfants puis les attributs, alors que JavaScript (\code{jsx(type, props)}) évalue les attributs d'abord. C'est sans effet sur les valeurs, mais visible dans l'ordre des \code{ExprId} et des instructions : un ternaire dans un enfant fend les blocs avant celui d'une prop. Autre détail d'ordre : \code{lower_jsx_props} tire l'identifiant de l'objet de props avant d'abaisser ses valeurs, si bien que dans le compteur (\cref{sec:lowering-hooks}) l'objet a l'identifiant 0 et la flèche de \code{onClick} l'identifiant 1.
+\end{piege}
+
+% ===========================================================================
+\section{Les diamants : ternaire et court-circuits}
+\label{sec:lowering-diamants}
+
+\subsection{Le problème : des effets conditionnels dans une expression}
+
+Un \code{&&} en instruction est un \code{if} déguisé : \code{open && console.log(name)} n'appelle \code{console.log} que si \code{open} est vrai. Une IR qui représenterait \code{a && b} par un nœud d'expression plat perdrait ce fait : il faudrait que l'évaluateur rejoue l'exécution conditionnelle de \code{b}, ou bien il compterait l'appel comme inconditionnel. Le lowering choisit de fendre le bloc.
+
+\begin{lstlisting}[language=TypeScript,caption={\code{?.}, \code{??}, \code{&&} en instruction, \code{useEffect} (\file{/tmp/ch07/e3_logical.tsx})},label={lst:lowering-profile}]
+import { useState, useEffect } from "react";
+
+export function Profile({ user, fallback }: { user?: { name?: string }; fallback: string }) {
+  const [open, setOpen] = useState(false);
+  const name = user?.name ?? fallback;
+  open && console.log(name);
+  useEffect(() => {
+    setOpen(true);
+  }, []);
+  return <span>{name}</span>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+render_cfg:
+  B0:
+      let __obj_70 = __p0
+      let user = __obj_70.user  @3:26
+      let fallback = __obj_70.fallback  @3:32
+      let open = StateVal(0)  @4:9
+      let setOpen = StateSetter(0)  @4:15
+      let __t0 = user.name  @5:15
+      => branch __t0 ? B2 : B1
+  B1:
+      __t0 := fallback  @5:29
+      => jump B2
+  B2:
+      let name = __t0  @5:8
+      let __t1 = open  @6:2
+      => branch __t1 ? B3 : B4
+  B3:
+      __t1 := console.log(name)  @6:10
+      => jump B4
+  B4:
+      expr __t1  @6:2
+      expr HookMarker(1, Undefined)  @7:2
+      => return Native<span>({#2 })[name]
+  edges: 0->2[F] 0->1[F] 1->2[U] 2->3[T] 2->4[T] 3->4[U]
+\end{sortie}
+
+\code{user?.name} est un simple \code{FieldAccess}. Le \code{??} et le \code{&&} ont chacun produit un \terme{diamant} : un temporaire reçoit l'opérande gauche, un \code{Branch} sur ce temporaire choisit entre un bloc qui évalue l'opérande droit (et réécrit le temporaire) et la jonction. L'instruction \code{open && ...} se termine par \code{expr __t1} dans la jonction \code{B4}.
+
+\subsection{Le code}
+
+Le ternaire lie son temporaire par deux \code{Let}, un par bras :
+
+\rustsnippet[label={lst:lowering-ternary}]{src/lowering/expr_lower.rs}{675}{700}{le ternaire (début ; les deux bras suivent le même motif)}
+
+La suite (\src{src/lowering/expr_lower.rs}{701}{724}) ouvre \code{then_id}, abaisse la conséquence, émet \code{Let __tN = cons} avec la position de la conséquence, scelle un \code{Jump(join)} ; fait de même pour l'alternative ; ouvre la jonction et rend \code{Var(__tN)}. Les court-circuits lient le temporaire par un \code{Let} de l'opérande gauche \emph{puis} un \code{Assign} dans le bloc droit :
+
+\rustsnippet[label={lst:lowering-logical}]{src/lowering/expr_lower.rs}{739}{795}{\code{&&}, \code{||} et \code{??}}
+
+\Cref{fig:lowering-diamants} dessine les deux gabarits.
+
+\begin{figure}[htbp]\centering
+\begin{subfigure}[b]{0.46\linewidth}\centering
+\begin{tikzpicture}[node distance=7mm and 2mm]
+  \node[cfgbloc] (c) {courant\\… (test abaissé)\\branch a ? T : E};
+  \node[cfgbloc,below left=of c] (t) {T\\let \_\_tN = b\\jump J};
+  \node[cfgbloc,below right=of c] (e) {E\\let \_\_tN = c\\jump J};
+  \node[cfgbloc,below=24mm of c] (j) {J\\… Var(\_\_tN)};
+  \draw[fleche] (c) -- node[etiquette,left=1pt] {IfTrue} (t);
+  \draw[fleche] (c) -- node[etiquette,right=1pt] {IfFalse} (e);
+  \draw[fleche] (t) -- node[etiquette,left=1pt] {U} (j);
+  \draw[fleche] (e) -- node[etiquette,right=1pt] {U} (j);
+\end{tikzpicture}
+\caption{\code{a ? b : c}}
+\end{subfigure}\hfill
+\begin{subfigure}[b]{0.50\linewidth}\centering
+\begin{tikzpicture}[node distance=7mm and 4mm]
+  \node[cfgbloc] (c) {courant\\let \_\_tN = a\\branch \_\_tN ? R : J};
+  \node[cfgbloc,below right=of c] (r) {R\\\_\_tN := b\\jump J};
+  \node[cfgbloc,below=24mm of c] (j) {J\\… Var(\_\_tN)};
+  \draw[fleche] (c) -- node[etiquette,right=1pt] {IfTrue} (r);
+  \draw[fleche] (c) -- node[etiquette,left=1pt] {IfTrue (!)} (j);
+  \draw[fleche] (r) -- node[etiquette,right=1pt] {U} (j);
+\end{tikzpicture}
+\caption{\code{a && b} ; pour \code{a || b} et \code{a ?? b}, \code{branch __tN ? J : R} et les deux arêtes sont \code{IfFalse}}
+\end{subfigure}
+\caption{Les deux diamants. Le temporaire \code{__tN} est tiré du compteur du constructeur ; la valeur de l'expression est \code{Var(__tN)} dans la jonction.}\label{fig:lowering-diamants}
+\end{figure}
+
+\begin{decision}[ADR-20 §1 --- garder le diamant]
+\adr{20} range le diamant parmi les \og non-changements délibérés\fg{} : ne pas introduire de nœud plat \code{LogicalOp}. Le diamant modélise les \emph{effets} du court-circuit (\code{a && setX()} n'exécute \code{setX()} que sur la branche vraie) ; un nœud plat obligerait l'évaluateur à rejouer cette exécution conditionnelle ou à perdre l'appel, un faux négatif. Il n'achèterait pas de précision : le raffinement relationnel à travers \code{&&}/\code{||} est déjà perdu, puisque le \code{Branch} porte \code{Var(__tN)} et jamais les comparaisons des opérandes. Le coût accepté est que \code{infinite_loop::expand_guard} doit reconstruire la structure des opérandes à partir du diamant.
+\end{decision}
+
+\subsection{Deux subtilités}
+
+\begin{piege}
+\textbf{La polarité des arêtes d'un court-circuit.} Dans \code{Profile}, les deux arêtes sortantes du \code{??} sont \code{IfFalse} (\code{0->2[F] 0->1[F]}) et les deux arêtes du \code{&&} sont \code{IfTrue} (\code{2->3[T] 2->4[T]}). Le code (\src{src/lowering/expr_lower.rs}{763}{780}) calcule la nature des deux arêtes à partir de l'arête vers \code{rhs} : l'arête vers la jonction reçoit la même. La nature de l'arête encode donc l'\emph{opérateur} --- dans quel sens on entre dans l'opérande droit ---, pas la valeur de vérité de la condition sur cette arête. \code{expand_guard} (\src{src/engine/guards.rs}{1018}{1029}) ne lit que l'arête vers \code{rhs}, et \code{site_guards} ne lit les polarités que sur des chaînes à prédécesseur unique, alors que la jonction d'un diamant en a toujours deux : le défaut est latent. Le point fixe, lui, raffine l'environnement d'après \code{then_}/\code{else_} du terminateur, ce qui est correct. Un nouveau consommateur qui lirait \code{IfTrue} comme \og la condition est vraie ici\fg{} se tromperait sur l'arête qui court-circuite.
+\end{piege}
+
+\begin{piege}
+\textbf{\code{??} n'est pas \code{||}.} Le lowering donne à \code{a ?? b} exactement la forme de \code{a || b} : \code{b} est évalué quand \code{a} est \emph{falsy}, alors que JavaScript ne l'évalue que quand \code{a} est \emph{nullish}. Pour le graphe, c'est un chemin de trop, donc sans danger. Mais le point fixe raffine le temporaire sur la branche \code{then_} (qui va à la jonction pour \code{??}) par \og \code{__tN} est truthy\fg{}, ce qui retire \code{0}, \code{""} et \code{false} --- or \code{0 ?? b} vaut \code{0} et arrive à la jonction \emph{sans} passer par le bloc droit. La valeur \code{0} disparaît : c'est une sous-approximation, vérifiée à la \cref{sec:lowering-limites}.
+\end{piege}
+
+\begin{react}[conditions et règles des hooks]
+Un hook appelé dans l'opérande droit d'un court-circuit ou dans un bras de ternaire (\code{flag && useEffect(...)},\code{c ? useState(1) : null}) est un hook conditionnel, interdit par les règles des hooks \cite{ReactRulesOfHooks}. Le diamant place l'appel dans un bloc qui ne domine pas la sortie ; encore faut-il que l'extracteur le reconnaisse comme un hook (\cref{sec:lowering-hooks,sec:lowering-limites}).
+\end{react}
+
+% ===========================================================================
+\section{Les boucles, \code{break} et \code{continue}}
+\label{sec:lowering-boucles}
+
+\subsection{\code{while} : l'arête arrière}
+
+\begin{lstlisting}[language=TypeScript,caption={Une boucle \code{while} (\file{/tmp/ch07/c2_while.tsx})},label={lst:lowering-while-src}]
+export function Digits({ n }: { n: number }) {
+  let k = n;
+  let count = 0;
+  while (k > 9) {
+    k = k / 10;
+    count++;
+  }
+  return <span>{count}</span>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+  B0:
+      let __obj_23 = __p0
+      let n = __obj_23.n  @1:25
+      let k = n  @2:6
+      let count = 0  @3:6
+      => jump B1
+  B1:
+      => branch (k Gt 9) ? B2 : B3
+  B2:
+      k := (k Div 10)  @5:4
+      expr k  @5:4
+      count := (count Add 1)  @6:4
+      expr count  @6:4
+      => jump B1
+  B3:
+      => return Native<span>({#0 })[count]
+  edges: 0->1[U] 1->2[T] 1->3[F] 2->1[Back]
+\end{sortie}
+
+\rustsnippet[label={lst:lowering-while}]{src/lowering/cfg_builder.rs}{603}{633}{la boucle \code{while}}
+
+Trois blocs sont réservés : l'\terme{en-tête} (\code{B1}), qui porte le test ; le corps (\code{B2}) ; la sortie (\code{B3}). Le bloc qui précède l'en-tête --- le \terme{pré-en-tête}, ici \code{B0} --- y saute sans condition. La condition est abaissée \emph{dans} l'en-tête : si elle contient un \code{&&} ou un ternaire, le diamant naît dans l'en-tête, et c'est sa jonction qui porte le \code{Branch} de la boucle ; l'arête de retour du corps vise toujours le premier bloc de l'en-tête, donc le test est bien réévalué à chaque tour. Le corps qui termine normalement revient à l'en-tête par une arête \code{Back}.
+
+\begin{definition}{Arête arrière}{lowering-back}
+Une \terme{arête arrière} (\code{EdgeKind::Back}) est une arête que le lowering émet pour \emph{revenir} vers l'en-tête d'une boucle : fin de corps d'un \code{while} ou d'un \code{for...of}, retour de l'\code{update} d'un \code{for}, branche vraie du test d'un \code{do...while}, et tout \code{continue}. C'est le seul endroit où le point fixe applique le widening (\cref{def:widening}, \cref{chap:cfg-analyzer-dominance}) : le lowering décide donc, par la nature des arêtes qu'il émet, où l'analyse accélère sa convergence.
+\end{definition}
+
+\subsection{Les trois autres boucles}
+
+\paragraph{\code{for (init; test; update)}} (\src{src/lowering/cfg_builder.rs}{635}{702}). \code{init} est abaissé dans le bloc courant ; une déclaration \code{let i = 0} passe par le déclarateur ordinaire et garde sa position, une expression est émise en \code{ExprStmt} sans position. Quatre blocs sont réservés, dans cet ordre : en-tête, corps, \code{update}, sortie. Un test absent vaut \code{Lit(Bool(true))}. Le corps qui termine normalement va à l'\code{update} par une arête \code{Unconditional}, et l'\code{update} revient à l'en-tête par une arête \code{Back}. Le point décisif est la cible d'un \code{continue} : \og \code{continue} in a \code{for} runs the update before the next test\fg{}, d'où le cadre \code{push_loop(exit_block, Some(update_block))}. Aucune portée lexicale n'est modélisée : le \code{i} de \code{for (let i...)} est lié par un \code{Let} dans le pré-en-tête et reste visible après la boucle pour l'analyse.
+
+\paragraph{\code{do...while}} (\src{src/lowering/cfg_builder.rs}{322}{354}). Le test reçoit son propre bloc, parce qu'un \code{continue} l'exécute et qu'il doit donc être une cible de saut ; la sortie a ainsi un vrai prédécesseur même quand le corps sort toujours plus tôt. Le pré-en-tête saute au corps, le corps au test, et le test porte un \code{Branch(cond, corps, sortie)} dont l'arête \og vraie\fg{} est de nature \code{Back}, pas \code{IfTrue} : c'est l'arête de retour.
+
+\paragraph{\code{for...in} / \code{for...of}} (\code{lower_iter_loop}, \src{src/lowering/cfg_builder.rs}{713}{772}). Le nombre d'itérations est inconnu. L'expression itérée est évaluée une fois dans le pré-en-tête, en \code{ExprStmt} (une lecture conservée pour les deps) ; l'en-tête porte un \code{Branch(Lit(true))} sans position, que le point fixe ne raffine pas (il ne raffine que les \code{BinOp}, \code{Var} et \code{Not(Var)}, \src{src/engine/cfg_analyzer.rs}{212}{292}) ; et la variable de boucle est liée à ⊤ en tête de corps, de sorte qu'une variable de boucle qui masque une liaison extérieure n'est pas lue comme une capture de celle-ci. Dans \code{Gate} (\cref{lst:lowering-gate}), on lit \code{expr items} dans \code{B3}, \code{branch true} dans \code{B4} et \code{let it = }⊤ dans \code{B5}.
+
+\Cref{fig:lowering-boucles} rassemble les quatre gabarits.
+
+\begin{figure}[htbp]\centering
+\begin{subfigure}[t]{0.48\linewidth}\centering
+\begin{tikzpicture}[node distance=5mm]
+  \node[cfgbloc] (p) {pré-en-tête\\jump H};
+  \node[cfgbloc,below=of p] (h) {H\\(test abaissé)\\branch test ? C : X};
+  \node[cfgbloc,below left=5mm and -4mm of h] (c) {C\\corps\\jump H};
+  \node[cfgbloc,below right=5mm and -4mm of h] (x) {X (sortie)};
+  \draw[fleche] (p) -- node[etiquette,right] {U} (h);
+  \draw[fleche] (h) -- node[etiquette,left] {IfTrue} (c);
+  \draw[fleche] (h) -- node[etiquette,right] {IfFalse} (x);
+  \draw[fleche,ra-blue] (c.west) to[out=150,in=180] node[etiquette,left] {Back} (h.west);
+\end{tikzpicture}
+\caption{\code{while (test) corps} ; \code{continue} $\to$ H (Back)}
+\end{subfigure}\hfill
+\begin{subfigure}[t]{0.48\linewidth}\centering
+\begin{tikzpicture}[node distance=5mm]
+  \node[cfgbloc] (p) {pré-en-tête\\init\\jump H};
+  \node[cfgbloc,below=of p] (h) {H\\branch test ? C : X};
+  \node[cfgbloc,below left=5mm and -4mm of h] (c) {C\\corps\\jump U};
+  \node[cfgbloc,below right=5mm and -4mm of h] (x) {X (sortie)};
+  \node[cfgbloc,below=of c] (u) {U\\update\\jump H};
+  \draw[fleche] (p) -- (h);
+  \draw[fleche] (h) -- node[etiquette,left] {IfTrue} (c);
+  \draw[fleche] (h) -- node[etiquette,right] {IfFalse} (x);
+  \draw[fleche] (c) -- node[etiquette,right] {U} (u);
+  \draw[fleche,ra-blue] (u.west) to[out=160,in=180] node[etiquette,left] {Back} (h.west);
+\end{tikzpicture}
+\caption{\code{for (init; test; update) corps} ; \code{continue} $\to$ U (Back)}
+\end{subfigure}
+
+\medskip
+\begin{subfigure}[t]{0.48\linewidth}\centering
+\begin{tikzpicture}[node distance=5mm]
+  \node[cfgbloc] (p) {pré-en-tête\\jump C};
+  \node[cfgbloc,below=of p] (c) {C\\corps\\jump T};
+  \node[cfgbloc,below=of c] (t) {T\\(test abaissé)\\branch test ? C : X};
+  \node[cfgbloc,below=of t] (x) {X (sortie)};
+  \draw[fleche] (p) -- (c);
+  \draw[fleche] (c) -- node[etiquette,right] {U} (t);
+  \draw[fleche] (t) -- node[etiquette,right] {IfFalse} (x);
+  \draw[fleche,ra-blue] (t.east) to[out=20,in=0] node[etiquette,right] {Back} (c.east);
+\end{tikzpicture}
+\caption{\code{do corps while (test)} ; \code{continue} $\to$ T (Back)}
+\end{subfigure}\hfill
+\begin{subfigure}[t]{0.48\linewidth}\centering
+\begin{tikzpicture}[node distance=5mm]
+  \node[cfgbloc] (p) {pré-en-tête\\expr source\\jump H};
+  \node[cfgbloc,below=of p] (h) {H\\branch true ? C : X};
+  \node[cfgbloc,below left=5mm and -4mm of h] (c) {C\\let x = ⊤\\corps\\jump H};
+  \node[cfgbloc,below right=5mm and -4mm of h] (x) {X (sortie)};
+  \draw[fleche] (p) -- (h);
+  \draw[fleche] (h) -- node[etiquette,left] {IfTrue} (c);
+  \draw[fleche] (h) -- node[etiquette,right] {IfFalse} (x);
+  \draw[fleche,ra-blue] (c.west) to[out=150,in=180] node[etiquette,left] {Back} (h.west);
+\end{tikzpicture}
+\caption{\code{for (const x of source) corps}}
+\end{subfigure}
+\caption{Les gabarits des quatre boucles. Les arêtes arrière (en bleu) sont les seules où le point fixe applique le widening. Un \code{break} va toujours à X par une arête \code{Unconditional}.}\label{fig:lowering-boucles}
+\end{figure}
+
+\subsection{\code{break}, \code{continue}, labels}
+
+\rustsnippet[label={lst:lowering-break}]{src/lowering/cfg_builder.rs}{381}{397}{\code{break} et \code{continue} sont de vraies arêtes}
+
+Chaque construction \og cassable\fg{} empile un \code{LoopFrame} (\cref{lst:lowering-builder}) : sa cible de \code{break}, sa cible de \code{continue} (\code{None} pour un \code{switch}) et son label éventuel. La résolution (\src{src/lowering/cfg_builder.rs}{132}{149}) remonte la pile : avec un label, le cadre qui porte ce label ; sans label, le cadre le plus proche pour \code{break}, et le cadre le plus proche qui \emph{accepte} un \code{continue} --- on saute donc les \code{switch} --- pour \code{continue}. \code{jump_out} (\src{src/lowering/cfg_builder.rs}{587}{601}) scelle un \code{Jump} vers la cible, ou \code{Unreachable} s'il n'y en a pas (JavaScript invalide : on n'invente pas d'arête).
+
+Le commentaire donne les deux raisons de cette forme. Sceller un \code{break} en \code{Unreachable}, comme le faisait une version antérieure, perdait l'état que le saut emporte hors de la boucle, et laissait une sortie que le CFG déclarait inatteignable pendant que la vraie n'avait pas d'arête : tout raisonnement \og sur tous les chemins\fg{} lisait un ensemble de sorties fantôme. Et un \code{continue} est une arête \code{Back} parce que le widening n'a lieu que sur ces arêtes : une boucle dont le compteur n'avance que sur le chemin du \code{continue} (\code{left += 1; continue;}) ne convergeait pas à travers une arête \code{Unconditional}.
+
+Un label n'est honoré que s'il étiquette directement une boucle (\src{src/lowering/cfg_builder.rs}{364}{380}) : \code{set_pending_label} le met en attente, et le prochain \code{push_loop} le consomme. Un label de bloc (\code{l: { ... break l; }}) ou de \code{switch} est ignoré, et le \code{break l} correspondant, sans cible, devient \code{Unreachable} --- une sous-approximation assumée par le commentaire (\og vanishingly rare in components\fg{}).
+
+\begin{exemple}{Boucles imbriquées étiquetées}{lowering-loops}
+\begin{lstlisting}[language=TypeScript]
+export function Loops({ rows }: any) {
+  let n = 0;
+  outer: for (let i = 0; i < 3; i++) {
+    do {
+      if (rows[i]) continue outer;
+      n++;
+    } while (n < 10);
+  }
+  return <div>{n}</div>;
+}
+\end{lstlisting}
+\begin{sortie}
+  B0:
+      let __obj_22 = __p0
+      let rows = __obj_22.rows  @1:24
+      let n = 0  @2:6
+      let i = 0  @3:18
+      => jump B1
+  B1:
+      => branch (i Lt 3) ? B2 : B4
+  B2:
+      => jump B5
+  B3:
+      i := (i Add 1)  @3:32
+      expr i
+      => jump B1
+  B4:
+      => return Native<div>({#0 })[n]
+  B5:
+      => branch rows[i] ? B8 : B9
+  B6:
+      => branch (n Lt 10) ? B5 : B7
+  B7:
+      => jump B3
+  B8:
+      => jump B3
+  B9:
+      => jump B10
+  B10:
+      n := (n Add 1)  @6:6
+      expr n  @6:6
+      => jump B6
+  edges: 0->1[U] 1->2[T] 1->4[F] 2->5[U] 5->8[T] 5->9[F] 8->3[Back] 9->10[U]
+         10->6[U] 6->5[Back] 6->7[F] 7->3[U] 3->1[Back]
+\end{sortie}
+Le \code{for} a réservé \code{B1} (en-tête), \code{B2} (corps), \code{B3} (\code{update}) et \code{B4} (sortie) avant d'abaisser son corps ; le \code{do...while} a ensuite réservé \code{B5} (corps), \code{B6} (test) et \code{B7} (sortie). Le corps du \code{for} ne contient qu'un \code{jump B5} : \code{do...while} scelle d'abord le bloc courant vers son propre corps. \code{continue outer} vise l'\code{update} \code{B3} du \code{for}, par une arête \code{Back} (\code{8->3}) ; un \code{continue} non étiqueté aurait visé le test \code{B6}. On compte trois arêtes arrière (\code{8->3}, \code{6->5}, \code{3->1}), donc trois points de widening potentiels. Enfin, \code{i++} donne \code{i := (i Add 1)} avec position, puis \code{expr i} sans position : l'\code{ExprStmt} de l'\code{update} est émis avec \code{None} (\srcline{src/lowering/cfg_builder.rs}{696}). L'analyseur ne signale rien sur ce composant.
+\end{exemple}
+
+\begin{remarque}
+Dans un \code{for}, un chemin \code{continue} traverse \emph{deux} arêtes arrière : \code{continue} $\to$ \code{update}, puis \code{update} $\to$ en-tête. C'est sans conséquence pour la correction (le widening est idempotent sur un point fixe atteint), mais utile à savoir quand on compte les arêtes \code{Back} d'un CFG.
+\end{remarque}
+
+% ===========================================================================
+\section{\code{switch} et \code{try} : deux sous-approximations corrigées}
+\label{sec:lowering-switch-try}
+
+Ces deux constructions ont une histoire commune : leur premier lowering était une ligne droite, et dans les deux cas cette ligne droite affirmait des choses fausses. Leur forme actuelle vient de \issue{1} et \issue{2}.
+
+\subsection{Le \code{switch} : une chaîne de dispatchs opaques}
+
+\begin{lstlisting}[language=TypeScript,caption={\code{switch} avec fall-through, puis \code{try/catch/finally} (\file{/tmp/ch07/e4_switch_try.tsx})},label={lst:lowering-status}]
+import { useState } from "react";
+
+export function Status({ code }: { code: number }) {
+  const [msg, setMsg] = useState("");
+  switch (code) {
+    case 1:
+      setMsg("one");
+      break;
+    case 2:
+      setMsg("two");
+    default:
+      setMsg("other");
+  }
+  try {
+    risky();
+  } catch (e) {
+    report(e);
+  } finally {
+    done();
+  }
+  return <p>{msg}</p>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+  B0:
+      let __obj_58 = __p0
+      let code = __obj_58.code  @3:25
+      let msg = StateVal(0)  @4:9
+      let setMsg = StateSetter(0)  @4:14
+      expr code
+      => branch true ? B2 : B5
+  B1:
+      => branch ⊤ ? B7 : B8
+  B2:
+      expr setMsg("one")  @7:6
+      => jump B1
+  B3:
+      expr setMsg("two")  @10:6
+      => jump B4
+  B4:
+      expr setMsg("other")  @12:6
+      => jump B1
+  B5:
+      => branch true ? B3 : B6
+  B6:
+      => branch true ? B4 : B1
+  B7:
+      expr risky()  @15:4
+      => jump B9
+  B8:
+      let e = ⊤  @16:11
+      expr report(e)  @17:4
+      => jump B9
+  B9:
+      expr done()  @19:4
+      => return Native<p>({#0 })[msg]
+  edges: 0->2[T] 0->5[F] 5->3[T] 5->6[F] 6->4[T] 6->1[F] 2->1[U] 3->4[U] 4->1[U]
+         1->7[T] 1->8[F] 7->9[U] 8->9[U]
+\end{sortie}
+
+\rustsnippet[label={lst:lowering-switch}]{src/lowering/cfg_builder.rs}{786}{838}{la chaîne de dispatchs du \code{switch}}
+
+Le discriminant est évalué une fois, en \code{ExprStmt} sans position (\srcline{src/lowering/cfg_builder.rs}{776}). La sortie \code{B1} est réservée en premier, avant même le discriminant ; viennent ensuite un bloc par \code{case} (\code{B2}, \code{B3}, \code{B4}), puis les dispatchs suivants (\code{B5}, \code{B6}), le premier dispatch étant le bloc courant. Le dispatch $i$ entre dans la case $i$ ou passe au dispatch $i+1$ ; le dernier passe à la sortie. Chaque case est abaissée dans son propre bloc, sous un cadre \code{push_loop(exit_block, None)} qui donne sa cible au \code{break} ; une case qui finit sans \code{break} saute dans la suivante (\code{3->4[U]}), exactement comme en JavaScript. \Cref{fig:lowering-switch-try} dessine le gabarit.
+
+Les dispatchs portent la condition littérale \code{true}. Le commentaire parle de dispatch \og opaque\fg{} : la condition l'est \emph{parce que} le point fixe ne raffine pas sur un littéral, et que les deux successeurs reçoivent donc l'environnement entier. Un lecteur qui évaluerait cette condition concrètement élaguerait à tort la branche \og suivant\fg{}. \code{lower_try}, lui, utilise la vraie sentinelle \code{SummaryVal(Top)}.
+
+Le commentaire du code rappelle l'ancienne forme, qui enchaînait les conséquences en ligne droite : c'était \og an under-approximation twice over\fg{}. Entrer dans \code{case 2} sans exécuter \code{case 1} était irreprésentable, et le premier \code{break} scellait la chaîne, si bien que toutes les cases suivantes disparaissaient du CFG. La forme actuelle a trois propriétés : chaque case est atteignable sans les précédentes ; la sortie est atteignable sans entrer dans aucune case (un \code{default} est sur-approximé comme facultatif) ; le fall-through est fidèle.
+
+\begin{exemple}{Pourquoi \Warning{} et non \Error{}}{lowering-status}
+L'analyseur rapporte sur \code{Status} :
+\begin{sortie}
+  Status  (1 hooks)  e4_switch_try.tsx
+    warn   setter-in-render  [hook:0]  (line 7:6)  setter `setMsg` called directly in the render body, move this call into a useEffect or an event handler
+\end{sortie}
+Un \Warning{}, pas une \Error{} : aucun appel de \code{setMsg} n'est sur tous les chemins, puisque la sortie \code{B1} du \code{switch} est atteignable sans entrer dans une case (\code{0->5}, \code{5->6}, \code{6->1}). Le prix de la sur-approximation du \code{default} est payé en force must, jamais en finding.
+\end{exemple}
+
+Trois détails complètent le tableau. Les tests \code{case k:} ne sont pas abaissés : en pratique des constantes, mais si \code{k} est une variable, sa lecture est perdue (\cref{sec:lowering-limites}). Un \code{default} placé au milieu est dispatché dans l'ordre du texte. Enfin, la boucle d'instructions d'une case est recopiée (\src{src/lowering/cfg_builder.rs}{826}{831}) au lieu d'appeler \code{lower_stmts}, avec le même arrêt au premier terminateur.
+
+\subsection{Le \code{try} : une branche sur l'inconnu}
+
+\rustsnippet[label={lst:lowering-try}]{src/lowering/cfg_builder.rs}{492}{510}{le \code{try} : un \code{Branch} sur ⊤}
+
+La suite de la fonction (\src{src/lowering/cfg_builder.rs}{511}{542}) scelle le corps du \code{try} par un saut vers \code{after} ; ouvre \code{catch_block}, y lie le paramètre \code{catch (e)} à ⊤ --- la valeur levée est inconnaissable, et la lier évite qu'\code{e} soit lu comme une capture ---, abaisse le corps du \code{catch} et saute aussi vers \code{after} ; enfin ouvre \code{after} et y abaisse le \code{finally}. Sans \code{catch}, le bloc \code{catch_block} reste vide : \og a throw runs the finalizer and keeps propagating\fg{}. Dans \code{Status}, c'est \code{B1} $\to$ \code{B7} ou \code{B8} $\to$ \code{B9}.
+
+Le commentaire de conception (\src{src/lowering/cfg_builder.rs}{470}{491}) décrit l'ancien défaut avec précision. Le corps du \code{try}, celui du \code{catch} et le \code{finally} étaient enchaînés, chacun sous la garde \code{!builder.is_terminated()} ; un \code{try} dont le corps retourne terminait le bloc, et \emph{tout} le \code{catch} et le \code{finally} n'étaient jamais abaissés --- hooks et setters compris. Quand la garde passait, le \code{catch} était séquencé inconditionnellement après le corps, et une écriture faite seulement dans le \code{catch} passait pour faite sur tous les chemins. La forme actuelle dit les deux choses vraies à la fois : le \code{catch} est sur \emph{un} chemin, le \code{finally} sur tous.
+
+\begin{figure}[htbp]\centering
+\begin{subfigure}[b]{0.55\linewidth}\centering
+\begin{tikzpicture}[node distance=5mm and 3mm]
+  \node[cfgbloc] (d0) {courant\\expr disc\\branch true ? C1 : D1};
+  \node[cfgbloc,right=of d0] (c1) {C1\\case 1 …\\jump X / C2};
+  \node[cfgbloc,below=of d0] (d1) {D1\\branch true ? C2 : D2};
+  \node[cfgbloc,right=of d1] (c2) {C2\\case 2 …\\jump X / C3};
+  \node[cfgbloc,below=of d1] (d2) {D2\\branch true ? C3 : X};
+  \node[cfgbloc,right=of d2] (c3) {C3\\default …\\jump X};
+  \node[cfgbloc,below=of d2] (x) {X (sortie)};
+  \draw[fleche] (d0) -- node[etiquette,above] {T} (c1);
+  \draw[fleche] (d0) -- node[etiquette,left] {F} (d1);
+  \draw[fleche] (d1) -- node[etiquette,above] {T} (c2);
+  \draw[fleche] (d1) -- node[etiquette,left] {F} (d2);
+  \draw[fleche] (d2) -- node[etiquette,above] {T} (c3);
+  \draw[fleche] (d2) -- node[etiquette,left] {F} (x);
+  \draw[fleche,dashed] (c1) -- node[etiquette,right] {fall-through} (c2);
+  \draw[fleche,dashed] (c2) -- (c3);
+  \draw[fleche] (c3.south) |- (x.east);
+\end{tikzpicture}
+\caption{\code{switch} à trois cases}
+\end{subfigure}\hfill
+\begin{subfigure}[b]{0.42\linewidth}\centering
+\begin{tikzpicture}[node distance=7mm and 2mm]
+  \node[cfgbloc] (c) {courant\\branch ⊤ ? T : C};
+  \node[cfgbloc,below left=of c] (t) {T\\corps du try\\jump A};
+  \node[cfgbloc,below right=of c] (k) {C\\let e = ⊤\\corps du catch\\jump A};
+  \node[cfgbloc,below=26mm of c] (a) {A (after)\\finally\\suite …};
+  \draw[fleche] (c) -- node[etiquette,left=1pt] {IfTrue} (t);
+  \draw[fleche] (c) -- node[etiquette,right=1pt] {IfFalse} (k);
+  \draw[fleche] (t) -- node[etiquette,left=1pt] {U} (a);
+  \draw[fleche] (k) -- node[etiquette,right=1pt] {U} (a);
+\end{tikzpicture}
+\caption{\code{try {...} catch (e) {...} finally {...}}}
+\end{subfigure}
+\caption{Gabarits du \code{switch} et du \code{try}. Les dispatchs du \code{switch} portent \code{Lit(true)}, que le point fixe ne raffine pas ; les arêtes pointillées (fall-through) n'existent que pour une case sans \code{break}, les autres sautent à X. Le \code{try} branche sur la sentinelle ⊤ et place le \code{finally} sur la jonction.}\label{fig:lowering-switch-try}
+\end{figure}
+
+\begin{piege}
+\textbf{Deux divergences du \code{try}.} La première est documentée (\src{src/lowering/cfg_builder.rs}{486}{491}) : un \code{return} dans le corps du \code{try} scelle son bloc, donc ce chemin ne passe pas par le \code{finally}, alors que JavaScript l'y ferait passer d'abord. Le \code{finally} reste atteignable par le bras du \code{catch}, donc ses hooks et ses écritures sont trouvés ; seule sa présence sur le chemin qui retourne est perdue, ce qui coûte la force must (une \Error{} rétrogradée en \Warning{}). La seconde ne l'est pas : le \code{Branch} sur ⊤ est placé \emph{avant} le corps du \code{try}, donc le \code{catch} part de l'état d'avant le \code{try}. Le chemin \og le \code{try} a partiellement exécuté, puis a levé\fg{} n'existe pas ; \cref{sec:lowering-limites} en montre une conséquence observée.
+\end{piege}
+
+% ===========================================================================
+\section{Motifs, déstructurations et temporaires}
+\label{sec:lowering-motifs}
+
+\subsection{Le principe : un temporaire, puis des projections}
+
+Le motif le plus fréquent de tout programme React est une déstructuration : \code{const [n, setN] = useState(0)}. Voici ce qu'en fait la construction du CFG, \emph{avant} l'extraction des hooks (sortie \code{--raw} de la sonde, sans positions) :
+
+\begin{sortie}
+=== raw (before extract_hooks) Counter (params []) ===
+  B0:
+      let __arr_71 = useState(0)
+      let n = __arr_71[0]
+      let setN = __arr_71[1]
+      => return Native<button>({#0 onClick: fn#1() { ... }})[n]
+\end{sortie}
+
+Un temporaire reçoit la source, puis chaque sous-motif est lié à une projection de ce temporaire, récursivement :
+
+\rustsnippet[label={lst:lowering-array-pattern}]{src/lowering/cfg_builder.rs}{869}{894}{le motif tableau}
+
+Le motif objet (\src{src/lowering/cfg_builder.rs}{895}{937}) est construit de la même façon avec un temporaire \code{__obj_{offset}} : une clé statique ou chaîne donne un \code{FieldAccess} ; une clé calculée \code{[k]} est lue pour effet et la liaison reçoit ⊤ (\og the key expression runs and \code{v} is bound --- to an unknown value, not to nothing\fg{}) ; une clé numérique suit le même chemin. Dans les deux motifs, un reste (\code{...rest}) est lié au temporaire lui-même : c'est une sur-approximation sound, puisque le reste contient un sous-ensemble des champs, chacun avec la même valeur ; ne pas le lier perdait les setters transmis par les composants enveloppes (\code{({...props}) => <X {...props}/>}). Chaque sous-liaison prend la position de son sous-nœud, avec repli sur celle du motif (\issue{131}).
+
+Le nom du temporaire est calculé à partir de l'\emph{offset} du motif dans le fichier, pas tiré d'un compteur. Ce choix est figé :
+
+\begin{decision}[ADR-20 §11 --- des noms de temporaires à offset]
+\adr{20} §11 garde les noms \code{__arr_{offset}} et \code{__obj_{offset}} au lieu du compteur \code{fresh_temp}. Un offset est unique par position dans un fichier (pas de collision), déterministe, et les noms sont de toute façon α-renommés au splice (\cref{chap:splice-inlining}). L'offset n'est jamais relu ; en revanche le préfixe \code{__arr_} est porteur : \code{hook_extractor} teste \code{starts_with("__arr_")} pour résoudre la destructuration de \code{useState}. Un renommage par compteur devrait garder le préfixe : du mouvement sans bénéfice.
+\end{decision}
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}llX@{}}
+\toprule
+Nom & Créé par & Unicité \\
+\midrule
+\code{__tN} & \code{fresh_temp} (ternaire, court-circuit, hoist d'\code{await}) & par constructeur : chaque corps imbriqué repart de 0 \\
+\code{__arr_N}, \code{__obj_N} & motifs de liaison & offset du motif, unique par fichier \\
+\code{__dstr_N} & cible de déstructuration en \emph{affectation} & idem \\
+\code{__pI} & paramètre déstructuré (\code{inject_param_preamble}) & index du paramètre, par corps \\
+\code{__term_B} & hoist de terminateur (\cref{sec:lowering-hoist}) & identifiant du bloc \\
+\bottomrule
+\end{tabularx}
+\caption{Les temporaires du lowering. Tous sont des noms réservés implicites : aucun code source n'est censé les employer.}\label{tab:lowering-temporaires}
+\end{table}
+
+\subsection{Défauts et paramètres}
+
+\rustsnippet[label={lst:lowering-default}]{src/lowering/cfg_builder.rs}{938}{946}{un défaut de motif est émis, sans être modélisé}
+
+Le défaut \code{x = d} est émis \emph{inconditionnellement} --- il ne s'exécute en vrai que si la source vaut \code{undefined} --- et la liaison garde la projection : la valeur du défaut ne rejoint pas celle de la liaison. Ses lectures et ses effets sont visibles (\cref{inv:lowering-lectures}) ; sa valeur ne l'est pas. Pour \code{const { cb = () => setX(1) } = props}, la liaison \code{cb} vaut \code{props.cb} et non \code{props.cb} $\join$ la flèche.
+
+Un appel ultérieur à \code{cb} en hérite. Vérifié au commit \snapshotCommit{} sur un couple témoin (\file{e23_cb_witness.tsx}, où \code{cb} est lié directement à la flèche) et fautif (\file{e24_cb_default.tsx}, où la même flèche n'est qu'un défaut de \code{props.cb}), tous deux passant \code{cb} en dépendance d'un effet qui l'appelle :
+
+\begin{sortie}
+  CbWitness  (2 hooks)  e23_cb_witness.tsx
+    warn   always-unstable-deps  [hook:1]  (line 6:2)  this effect depends on `cb`,
+      a new reference every render, so `Object.is` always differs ...
+
+  CbDefault  (2 hooks)  e24_cb_default.tsx  ✓
+    verified  always-unstable-deps  no deps array is defeated by an always-fresh reference
+\end{sortie}
+
+Le témoin est signalé parce que la liaison directe donne à \code{cb} un \code{FnLit} frais à chaque rendu. Le fautif est certifié : la liaison \code{cb = props.cb} n'est jamais qu'une prop, dont la stabilité ne doit rien à la flèche du défaut, et l'appel \code{cb()} ne peut donc pas être relié au \code{setX(1)} qu'il exécuterait réellement si l'appelant ne fournit pas la prop. C'est une sous-approximation : le même programme, au même risque de rendu perpétuel, est couvert dans un cas et ne l'est pas dans l'autre.
+
+Les paramètres suivent la même mécanique, dans un préambule injecté en tête de corps :
+
+\rustsnippet[label={lst:lowering-preamble}]{src/lowering/cfg_builder.rs}{952}{970}{le préambule des paramètres}
+
+Un paramètre simple \code{x} ne produit \emph{aucune} instruction : il est lié par l'appelant (le splice émet \code{let x' = arg}) ou par l'environnement initial du point fixe. Un paramètre déstructuré reçoit le nom synthétique \code{__pI} et son motif est abaissé sur \code{Var(__pI)}, sans position pour le \code{Let} de tête (argument \code{None}) : c'est la ligne \code{let __obj_56 = __p0} sans \code{@} de tous nos exemples. Un composant à props déstructurées a donc pour paramètre \code{__p0}. Un paramètre avec défaut (\code{x = 1}) est un motif et reçoit aussi un nom \code{__pI}. Le paramètre de reste \code{(...args)}, lui, n'est pas lu du tout : seul \code{params.items} est parcouru (\cref{sec:lowering-limites}).
+
+\subsection{Les cibles d'affectation}
+
+Une affectation à motif (\code{[i, max] = [max, i]}) doit \emph{écrire} des liaisons existantes, pas en créer. \code{lower_assignment_target} (\src{src/lowering/expr_lower.rs}{1023}{1135}) est le miroir de \code{lower_binding_pattern} : il émet des \code{Assign} au lieu de \code{Let}, via un temporaire \code{__dstr_{offset}}, et des \code{MemberWrite} pour les cibles membres imbriquées. Son commentaire de tête énonce le pendant de \cref{inv:lowering-lectures} pour les écritures.
+
+\begin{invariant}{Écrire chaque feuille}{lowering-ecritures}
+\og Every leaf identifier is written on every path: a shape the walker cannot track precisely passes \code{opaque()} down rather than emitting nothing, because leaving a variable at its previous abstract value falsifies it.\fg{} (\src{src/lowering/expr_lower.rs}{1027}{1029}.) Une \terme{liaison périmée} --- une variable laissée à sa valeur antérieure alors que le programme l'a écrite --- n'est pas une ignorance : c'est une affirmation fausse, donc une sous-approximation.
+\end{invariant}
+
+\begin{exemple}{Déstructurations, composés, \code{delete}, gabarit, \code{void}}{lowering-destr}
+\begin{lstlisting}[language=TypeScript]
+import { useState } from "react";
+
+export function Destr({ a = 1, ...rest }: any) {
+  const [[min, max], setRange] = useState([0, 100]);
+  const { [rest.k]: v, w = min, ...others } = rest;
+  let i = 0;
+  [i, max] = [max, i];
+  i += 2;
+  i **= 2;
+  i ||= 3;
+  delete others.x;
+  const s = `n=${i}`;
+  void track(s);
+  return <X {...others} title={s}><span>{v}</span></X>;
+}
+\end{lstlisting}
+\begin{sortie}
+  B0:
+      let __obj_57 = __p0
+      expr 1  @3:28
+      let a = __obj_57.a  @3:24
+      let rest = __obj_57  @3:31
+      let __arr_93 = StateVal(0)  @4:9
+      let min = __arr_93[0]  @4:10
+      let max = __arr_93[1]  @4:15
+      let setRange = StateSetter(0)  @4:21
+      let __obj_145 = rest  @5:8
+      expr rest.k  @5:11
+      let v = ⊤  @5:10
+      expr min  @5:27
+      let w = __obj_145.w  @5:23
+      let others = __obj_145  @5:32
+      let i = 0  @6:6
+      let __dstr_204 = [#1 max, i]<Exact(2)>  @7:2
+      i := __dstr_204[0]
+      max := __dstr_204[1]
+      expr [#1 max, i]<Exact(2)>  @7:2
+      i := (i Add 2)  @8:2
+      expr i  @8:2
+      i := (i Pow 2)  @9:2
+      expr i  @9:2
+      i := ⊤  @10:2
+      expr i  @10:2
+      others.x <- undefined  @11:2
+      expr true  @11:2
+      let s = (("n=" Add i) Add "")  @12:8
+      expr track(s)  @13:2
+      expr undefined  @13:2
+      => return CompApp<X>({#3 ...4: others, title: s, children: [#5 Native<span>({#2 })[v]]<AtLeast(1)>})
+hooks:
+  #0 State init=[#0 0, 100]<Exact(2)>  @4:8
+\end{sortie}
+Tout le chapitre se lit dans ce bloc. Le défaut \code{a = 1} est émis (\code{expr 1}) sans que \code{a} le reçoive ; le reste \code{rest} est la source. Le motif imbriqué sur \code{useState} : le temporaire externe a disparu (c'est un temporaire d'état, \cref{sec:lowering-hooks}), le temporaire interne \code{__arr_93} reçoit \code{StateVal(0)} et ses projections restent des \code{IndexAccess}. La clé calculée donne la lecture \code{rest.k} puis \code{v =} ⊤. La déstructuration en affectation écrit ses feuilles par des \code{Assign} sans position, puis l'\code{ExprStmt} final réutilise la même valeur : le même \code{ArrayLit} \texttt{\#1} apparaît deux fois, avec le même \code{ExprId}. \code{**=} est fidèle, \code{||=} met \code{i} à ⊤. \code{delete} est un \code{MemberWrite} d'\code{undefined} suivi de \code{true}, le gabarit une chaîne d'additions, \code{void} une lecture suivie d'\code{undefined}. Enfin \code{<X {...others}>} range le spread sous la clé synthétique \code{...4} et ses enfants dans \code{children}, d'arité \code{AtLeast(1)}.
+\end{exemple}
+
+% ===========================================================================
+\section{Fonctions imbriquées, classes et sites d'allocation}
+\label{sec:lowering-sites}
+
+\subsection{Un corps par fonction}
+
+Une fonction imbriquée n'est pas \og mise à plat\fg{} dans le CFG de son parent : elle est abaissée dans son propre \code{BlockBuilder}, et son CFG est emballé dans le littéral de fonction.
+
+\rustsnippet[label={lst:lowering-arrow}]{src/lowering/expr_lower.rs}{442}{457}{une flèche : un corps à part}
+
+Le contexte est cloné (\code{builder.ctx.clone()}) : le nouveau constructeur partage avec son parent la table des positions, les origines JSX et, surtout, le compteur d'identifiants d'allocation. Aucune notion de fermeture n'est stockée : les captures sont retrouvées plus tard, sur le corps, par l'analyse de variables libres (\code{ir::free_vars::compute_free_vars}, \cref{chap:ir}). Une \code{function} expression suit le même chemin ; une fonction sans corps (déclaration ambiante, surcharge TypeScript) reçoit \code{empty_cfg()}, un unique bloc \code{Unreachable}.
+
+Une déclaration \code{function f() {}} devient un \code{Let f = FnLit} (\src{src/lowering/cfg_builder.rs}{398}{418}). Le commentaire de ce bras dit \og Hoisted declarations: bind name but emit no CFG node\fg{} ; c'est l'inverse de ce que fait le code, qui émet le \code{Let} \emph{à la position textuelle}. Le hissage de JavaScript n'est pas modélisé, avec une conséquence que la \cref{sec:lowering-limites} montrera.
+
+Une classe (\code{lower_class}, \src{src/lowering/expr_lower.rs}{58}{135}) devient un \code{ObjectLit} dont les membres sont rangés sous des clés synthétiques (\code{[method]N}, \code{[field]N}, \code{[accessor]N}, \code{[static]N}, \code{[extends]N}) qu'aucun \code{FieldAccess} ne peut atteindre ; méthodes et blocs \code{static} deviennent des \code{FnLit}. Le motif est \issue{77} : les corps de classes tombaient dans le bras vide de \code{lower_stmt}, et \code{class X { m() { setC(1) } }} se lisait comme un composant qui n'écrit jamais \code{c}. Une classe ne lie rien que l'environnement modélise, mais ses corps sont du code.
+
+\subsection{Le compteur d'allocation}
+
+Chaque nœud allouant (\code{ObjectLit}, \code{ArrayLit}, \code{FnLit}, \code{New}) porte un \code{ExprId}, son \emph{site} d'allocation (\cref{def:site}) : c'est la clé du tas abstrait. D'où vient ce numéro ?
+
+\rustsnippet[label={lst:lowering-exprids}]{src/lowering/cfg_builder.rs}{20}{58}{le compteur partagé et le contexte par fichier}
+
+\begin{decision}[ADR-10 et \#134 --- un compteur par fichier]
+\adr{10} adopte l'abstraction par sites d'allocation : un \code{ExprId} sur chaque nœud allouant, un \code{Arc<CFG>} dans \code{FnLit}, un tas monotone indexé par \code{ExprId}. À l'origine, le compteur vivait dans \code{BlockBuilder}. Comme chaque corps imbriqué a son propre constructeur, chacun numérotait ses sites depuis 0 ; or le tas d'\emph{un} composant contient les sites de son rendu, de tous ses corps imbriqués et de tous les callés greffés. Deux objets sans rapport partageaient donc une entrée de tas, et le second répondait aux lectures de membres du premier --- un faux négatif quand l'imposteur était le plus stable des deux (\issue{134}). Le compteur est désormais un \code{Rc<Cell<usize>>} porté par \code{LowerCtx} ; cloner le contexte partage le compteur. Un compteur par fichier suffit, parce que le splice donne à un callé greffé sa propre plage d'identifiants (\og One counter per file; the splice gives an inlined callee its own range\fg{}, \code{Offsets}, \cref{chap:splice-inlining}). Côté moteur, \adr{10} a refusé une carte d'environnement unique \code{EnvVal = Val | Loc}, dont l'extension écrasait la \code{Loc}, au profit de deux cartes.
+\end{decision}
+
+\begin{piege}
+\textbf{\og Un compteur par fichier\fg{} signifie un par famille.} Chacun des trois points d'entrée crée son propre \code{LowerCtx} (\src{src/lowering/mod.rs}{382}{385}, \src{src/lowering/mod.rs}{446}{449}, \file{utility_lowerer.rs}) : tous les composants d'un fichier partagent un compteur, tous ses hooks custom un deuxième, ses utilitaires un troisième, chacun partant de 0. Ce n'est pas une collision, grâce au décalage du splice ; mais deux \code{ExprId} égaux dans un composant et dans un hook du même fichier ne désignent pas le même site.
+\end{piege}
+
+\begin{piege}
+\textbf{L'ordre des identifiants dépend de la construction.} Une flèche tire son identifiant \emph{avant} d'abaisser son corps (\cref{lst:lowering-arrow}) ; une déclaration de fonction abaisse son corps d'abord et tire son identifiant ensuite, si bien que les sites de son corps ont des identifiants inférieurs au sien. Une clé synthétique consomme un identifiant. Dans \code{Loader} (ci-dessous), la fonction \code{load} porte l'identifiant 1, la flèche \code{useless} le 3 et l'objet de props le 4 ; d'après l'ordre d'abaissement, 0 et 2 ont été consommés par la flèche de l'effet et par le tableau de deps, qui n'apparaissent plus dans le rendu. Rien ne doit dépendre de ces valeurs, seulement de leur unicité.
+\end{piege}
+
+% ===========================================================================
+\section{\code{await}, arêtes \code{Await} et positions synthétiques}
+\label{sec:lowering-await}
+
+\subsection{Le problème : ce qui suit un \code{await} n'est plus dans la phase}
+
+\begin{react}[asynchronisme et phases]
+Une fonction \code{async} s'exécute de façon synchrone jusqu'à son premier \code{await}, puis rend la main. La suite reprend à un tour ultérieur de la boucle d'événements, hors de toute phase de React : un \code{setState} écrit après un \code{await} dans un effet ne s'exécute ni pendant le rendu ni pendant le commit, mais plus tard, comme un callback de timer (\cref{chap:react-modele}).
+\end{react}
+
+Jusqu'à \issue{117}, \code{await e} s'abaissait en \code{e}, et un \code{setState} écrit après un \code{await} gardait la phase synchrone de sa région. \adr{35} a fendu le bloc.
+
+\begin{lstlisting}[language=TypeScript,caption={Un effet asynchrone (\file{/tmp/ch07/e6_async.tsx})},label={lst:lowering-loader}]
+import { useState, useEffect } from "react";
+
+export function Loader({ url }: { url: string }) {
+  const [data, setData] = useState(null);
+  useEffect(() => {
+    async function load() {
+      const res = await fetch(url);
+      setData(await res.json());
+    }
+    load();
+  }, [url]);
+  const useless = () => (url ? 1 : 2);
+  return <div>{String(data)}</div>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+  #1 Effect deps=List[url]<Exact(1)>  @5:2
+    B0:
+        let load = fn#1() {
+            B0:
+                let __t0 = fetch(url)  @7:24
+                => jump B1
+            B1:
+                let res = __t0  @7:12
+                let __t1 = res.json()  @8:20
+                => jump B2
+            B2:
+                expr setData(__t1)  @8:6
+                => return undefined
+            edges: 0->1[Await] 1->2[Await]
+        }  @6:4
+        expr load()  @10:4
+        => return undefined
+\end{sortie}
+
+\rustsnippet[label={lst:lowering-await}]{src/lowering/expr_lower.rs}{577}{606}{\code{await} : lier l'argument, puis couper}
+
+Chaque \code{await} fait deux choses. D'abord, l'argument est lié à un temporaire \emph{de ce côté-ci} de la coupure : \code{await fetch(u)} appelle \code{fetch} de façon synchrone et ne suspend qu'ensuite. Rendre l'argument tel quel l'emporterait dans l'instruction englobante, que la coupure place dans le bloc suivant ; l'appel serait alors lu comme \og différé\fg{}, et \og différé\fg{} est une affirmation (\og jamais dans une phase React\fg{}), pas une sur-approximation. Un nom ou un littéral, qui n'ont rien à évaluer, passent sans temporaire. Ensuite, \code{split_at_await} (\cref{lst:lowering-seal}) scelle le bloc courant par un \code{Jump} et l'ouvre sur un bloc neuf, relié par une arête \code{Await}. Si le bloc est déjà scellé, rien n'est fait : un \code{return await f()} n'a plus rien à différer. Dans \code{load}, on voit les deux temporaires \code{__t0} et \code{__t1} liés avant chaque coupure, la liaison \code{res} et l'appel \code{setData} placés après. Le ternaire du render helper \code{useless} a ses propres \code{__t0} et ses propres blocs : autre constructeur, autre compteur de temporaires. \Cref{fig:lowering-await} dessine le gabarit.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=6mm]
+  \node[cfgbloc] (a) {courant\\… \\let \_\_tN = f(x)};
+  \node[cfgbloc,right=14mm of a] (b) {suivant (post-await)\\let r = \_\_tN\\suite …};
+  \draw[fleche,ra-teal] (a) -- node[etiquette,above] {Await} (b);
+  \node[etiquette,below=2mm of a] {\code{jump} scellé par \code{split_at_await}};
+\end{tikzpicture}
+\caption{Gabarit de \code{const r = await f(x)}. Le contrôle est inconditionnel --- dominance et accessibilité sont inchangées ---, mais le successeur s'exécute après une suspension.}\label{fig:lowering-await}
+\end{figure}
+
+\begin{decision}[ADR-35 --- une nature d'arête, pas un champ de bloc]
+\adr{35} décide que l'\code{await} fend le bloc par une arête \code{EdgeKind::Await}. Pourquoi pas un champ \og post-await\fg{} sur \code{BasicBlock} ? Parce que \code{BasicBlock} et \code{CFG} sont construits en plus de deux cents endroits, pour la plupart de l'IR de test écrite à la main : un champ serait un changement de deux cents sites pour un fait que ces fixtures n'ont pas. Une nature d'arête est additive, survit au remappage, et place le fait où il est : entre deux blocs. L'ensemble post-await est calculé par le consommateur (\code{CFG::post_await_blocks}, la fermeture des cibles d'arêtes \code{Await}) ; un corps imbriqué répond pour lui-même, et un \code{await} dans un callback ne diffère pas les instructions suivantes du corps englobant. Dominance et accessibilité ne changent pas, puisque l'arête est inconditionnelle. L'ADR dit que l'instruction en cours atterrit dans le successeur ; le code actuel (\cref{lst:lowering-await}) en retire l'argument attendu, lié avant la coupure.
+\end{decision}
+
+\subsection{Positions synthétiques}
+
+Le lowering crée beaucoup d'instructions que la source n'écrit pas : temporaires de diamants et d'\code{await}, projections de motifs, lectures conservées. Quelle position leur donner ? Un diagnostic sans ligne est presque inutilisable.
+
+\begin{decision}[ADR-39 --- une liaison synthétique est synthétique, sa position ne l'est pas]
+\adr{39} (\issue{131}) décide que toute instruction synthétique prend la position de l'expression qu'elle lie : l'argument d'un \code{await}, la conséquence et l'alternative d'un ternaire, l'opérande droit d'un court-circuit, chaque sous-nœud d'un motif (élément, propriété, reste, clé calculée, défaut), avec repli sur la position du motif. Ce que la source ne nomme pas, le splice le nomme par son site d'appel ; un corps sans instruction hérite du témoin d'où l'on y est entré ; un finding prend la première position de sa chaîne de témoins. L'alternative refusée était d'ajouter une position à \code{Terminator::Return} : \og better by a line, at the cost of a hundred construction sites\fg{}, laissée ouverte en \issue{140}. Mesure : 82 findings sans position ramenés à 0, ensemble de findings inchangé.
+\end{decision}
+
+Quelques instructions restent sans position au commit \snapshotCommit{}, et on les a toutes rencontrées : le \code{Let} de tête d'un paramètre déstructuré, l'\code{ExprStmt} de l'\code{init} (expression) et de l'\code{update} d'un \code{for}, le discriminant d'un \code{switch}, les feuilles d'une déstructuration en affectation, et le \code{Let __term_B} du hoist de terminateur quand le terminateur est un \code{Return} (\cref{sec:lowering-hoist}). Un \code{Stmt::span()} à \code{None} est documenté comme \og a bug to fix, not a shape to route around\fg{} (\src{src/ir/stmt.rs}{37}{44}).
+
+% ===========================================================================
+\section{L'extraction des hooks}
+\label{sec:lowering-hooks}
+
+\subsection{Avant, après}
+
+Jusqu'ici, un appel \code{useState(0)} n'était qu'un \code{Call} parmi d'autres. La passe \code{extract_hooks} le reconnaît, lui attribue un label, crée l'entrée \code{HookEntry} correspondante et réécrit l'IR pour que les liaisons lisent des valeurs marquées. \Cref{fig:lowering-avant-apres} montre la transformation sur le compteur, d'après les deux sorties de la sonde.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=5mm]
+  \node[cfgbloc] (av) {B0 (avant)\\let \_\_arr\_71 = useState(0)\\let n = \_\_arr\_71[0]\\let setN = \_\_arr\_71[1]\\return Native<button>(\{\#0 onClick: fn\#1\})[n]};
+  \node[cfgbloc,right=24mm of av] (ap) {B0 (après)\\let n = StateVal(0)  @4:9\\let setN = StateSetter(0)  @4:12\\return Native<button>(\{\#0 onClick: fn\#1\})[n]};
+  \node[cfgbloc,below=of ap] (h) {hooks :\\\#0 State init=0  @4:8\\\#1 Handler event=click  @5:17\\ \ \ B0: return setN((n Add 1))};
+  \node[cfgbloc,below=of h] (p) {provenance :\\\#0 origin=useState react=true\\ \ \ specifier=Some("react")};
+  \draw[fleche] (av.east) -- node[etiquette,above,align=center] {extract\_hooks\\extract\_handlers} (av.east -| ap.west);
+  \node[etiquette,left=3mm of h] {table des hooks};
+  \node[etiquette,left=3mm of p] {provenance};
+\end{tikzpicture}
+\caption{Le compteur avant et après les passes d'extraction. Le \code{Let} du temporaire d'état disparaît ; ses deux projections sont réécrites en \code{StateVal(0)} et \code{StateSetter(0)} ; la table des hooks reçoit l'état (label 0) puis le handler (label 1) ; la provenance n'a qu'une ligne, car un handler n'en a jamais.}\label{fig:lowering-avant-apres}
+\end{figure}
+
+\rustsnippet[label={lst:lowering-extract}]{src/lowering/hook_extractor.rs}{264}{304}{la passe \code{extract_hooks}}
+
+La passe commence par normaliser les terminateurs (\code{hoist_terminator_hooks}, \cref{sec:lowering-hoist}), puis parcourt les blocs par identifiant croissant et, dans chaque bloc, les instructions dans l'ordre ; chacune passe par \code{process_stmt}. La table \code{state_temps} associe à chaque temporaire \code{__arr_N} lié à un \code{useState} ou un \code{useReducer} le label de ce hook.
+
+\rustsnippet[label={lst:lowering-process}]{src/lowering/hook_extractor.rs}{369}{417}{\code{process_stmt} : le cas \code{Let}}
+
+Trois cas, lus dans le code :
+
+\begin{itemize}
+  \item \code{Let v = <hook>(...)} : un label neuf, une entrée, une ligne de provenance ; la liaison est réécrite en \code{Let v = marqueur}. Exception : un \code{useState} ou \code{useReducer} destructuré en tableau (le nom commence par \code{__arr_}) --- le \code{Let} du temporaire est supprimé, et le temporaire enregistré dans \code{state_temps}.
+  \item \code{ExprStmt(<hook>(...))} (\src{src/lowering/hook_extractor.rs}{418}{435}) : même chose, et l'instruction devient \code{ExprStmt(HookMarker(L, marker_val))} --- c'est le \code{expr HookMarker(1, Undefined)} du \code{useEffect} de \code{Profile}.
+  \item tout le reste --- \code{Assign}, \code{MemberWrite}, et tout RHS qui n'est pas un appel de hook --- est seulement réécrit par \code{rewrite_expr}, qui remplace \code{Var(t)[0]} par \code{StateVal(L)}, \code{Var(t)[1]} par \code{StateSetter(L)} et \code{Var(t)[k]} ($k \geq 2$) par \code{Lit(Unit)} pour tout temporaire d'état \code{t} (\src{src/lowering/hook_extractor.rs}{842}{910}).
+\end{itemize}
+
+Le mot important est \emph{racine} : \code{try_consume_hook_call} (\src{src/lowering/hook_extractor.rs}{504}{525}) ne reconnaît un hook que si l'appel est la racine du RHS d'un \code{Let} ou d'un \code{ExprStmt}, à une enveloppe \code{TSAnnotated} près (\code{useState<T>(x)}). Un appel de hook imbriqué dans une expression --- \code{useContext(C).theme}, \code{f(useX())}, l'opérande droit d'un \code{&&} qui est un \code{Assign} --- n'est pas extrait. \Cref{sec:lowering-limites} en mesure le coût. Le label de chaque hook étant attribué dans l'ordre des blocs, et les blocs étant numérotés à la réservation, \emph{les labels ne suivent pas toujours l'ordre du texte} (\cref{sec:lowering-limites}).
+
+\subsection{Qui est un hook ? La provenance}
+
+Avant de fabriquer une entrée, il faut décider si le callee est un hook, et lequel. \code{ImportCtx::classify_callee} (\src{src/lowering/hook_extractor.rs}{572}{636}) applique, pour un nom nu, un ordre de priorité strict :
+
+\begin{enumerate}
+  \item un hook défini localement dans le fichier masque tout (portée JavaScript) : hook custom, fichier courant ;
+  \item sinon, une origine d'import \emph{prouvée} (\code{HookOrigin::React}, \code{File} ou \code{Package}, \cref{chap:frontend-detection}) fixe l'identité, sous le nom \emph{importé} et non sous l'alias local (\code{import { useMemo as useM }} donne \code{useMemo}) ;
+  \item sinon, un nom de forme hook non importé (\code{is_hook_name} : \code{use} suivi d'une majuscule ou d'un chiffre) est présumé être de React --- c'est le cas des sources de test et des globales.
+\end{enumerate}
+
+Pour un appel \code{ns.useX()}, le hook est de React si et seulement si \code{ns} est lié au module \code{react} (\code{import React from "react"}, \code{import * as R from "react"}) ou s'appelle \code{React} ; sinon c'est un hook custom de provenance inconnue (\code{store.useThing()}). La classification est \og fail-closed\fg{} : un binding importé n'est classé que par ce que prouve son import. Le prédicat \code{is_hook_name} est partagé avec les détecteurs ; l'ancien test \code{starts_with("use")} classait \code{userId()} comme hook.
+
+Le résultat, un \code{ResolvedHookCall}, alimente à la fois l'entrée et la ligne de provenance \code{HookProvenance} (\cref{chap:ir}). Cette dernière existe pour une raison que l'on voit en pratique : un \code{useLayoutEffect} devient un \code{HookEntry::Effect} comme un \code{useEffect}, et seule sa provenance garde \code{origin_hook = "useLayoutEffect"}.
+
+\subsection{L'entrée et le marqueur}
+
+Deux fonctions décident ensemble de l'entrée et de ce que lit la liaison (\cref{tab:lowering-hookentry}) : \code{make_hook_entry}, aux lignes 642 à 747 de \file{hook_extractor.rs}, et \code{hook_result_expr}, aux lignes 775 à 792 du même fichier.
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}lXl@{}}
+\toprule
+Appel & \code{HookEntry} & la liaison lit \\
+\midrule
+non React (local, fichier, paquet) & \code{Custom{name, args, deps: Absent, binding, import_source, resolved_file}} & \code{HookMarker(L, Unknown)} \\
+\code{useState(init)} & \code{State{init}} (absent : \code{Lit(Unit)}) & \code{StateVal(L)} \\
+\code{useReducer(r, init)} & \code{State{init}} (réducteur ignoré) & \code{StateVal(L)} \\
+\code{useEffect}, \code{useLayoutEffect}, \code{useInsertionEffect} & \code{Effect{body_cfg, deps}} & \code{HookMarker(L, Undefined)} \\
+\code{useMemo(f, deps)} & \code{Memo{body_cfg, deps}} & \code{MemoVal(L)} \\
+\code{useCallback(f, deps)} & \code{Callback{body_cfg, params, deps}} & \code{CallbackVal(L)} \\
+\code{useRef(init)} & \code{Ref{init}} (absent : \code{Lit(Null)}) & \code{HookMarker(L, StableRef)} \\
+autre hook de React & \code{Custom{..., resolved_file: None}} & \code{HookMarker(L, Unknown)} \\
+\bottomrule
+\end{tabularx}
+\caption{L'entrée créée pour chaque appel de hook, et la valeur marquée qui remplace l'appel (\code{L} est le label).}\label{tab:lowering-hookentry}
+\end{table}
+
+Le choix du marqueur est commenté longuement (\src{src/lowering/hook_extractor.rs}{749}{765}). Les hooks de React que le moteur ne modélise pas (\code{useContext}, \code{useId}, \code{useTransition}) sont rangés en \code{Custom}, et leur liaison lit \code{Unknown}, c'est-à-dire ⊤. Leur faire lire \code{Undefined} les rendait \emph{prouvablement stables} et faisait taire toute règle de stabilité sur une valeur de contexte --- un faux négatif. \code{Undefined} est réservé au seul hook réellement sans valeur, l'effet ; un ref n'est pas sans valeur, c'est un conteneur d'identité constante, d'où \code{StableRef}.
+
+\begin{react}[les hooks et leurs corps]
+\code{useEffect(f, deps)} exécute \code{f} après le commit, quand un élément de \code{deps} a changé au sens d'\code{Object.is} ; \code{useMemo(f, deps)} appelle \code{f} pendant le rendu et mémorise son résultat ; \code{useCallback(f, deps)} mémorise \code{f} elle-même. Un effet et un memo reçoivent une fonction sans argument ; un callback est appelé plus tard avec les arguments de son appelant (\cref{chap:react-modele}).
+\end{react}
+
+Le corps d'un hook à callback est calculé par \code{hook_body_cfg} :
+
+\rustsnippet[label={lst:lowering-hookbody}]{src/lowering/hook_extractor.rs}{809}{821}{le corps d'un hook : le \code{FnLit}, ou l'appel du callee}
+
+Un littéral \code{() => ...} apporte son CFG, \emph{déplacé} hors du rendu (\code{Arc::try_unwrap}) : le \code{FnLit} disparaît de l'IR de rendu, qui ne voit plus que le marqueur. Ses paramètres sont jetés pour un effet ou un memo (corps sans argument, conformément à React), gardés dans \code{params} pour un callback. Toute autre expression --- une variable, un membre, un appel qui rend une fonction --- donne un corps qui est exactement l'\emph{appel} de ce callee, que le moteur résoudra dans l'environnement comme n'importe quel appel. Le commentaire (\src{src/lowering/hook_extractor.rs}{798}{808}) rappelle la version précédente : elle rendait un CFG \code{Unreachable}, c'est-à-dire \og le callback ne fait rien\fg{} --- $\Bot$ là où $\Top$ était requis ---, et \code{useEffect(handler)} ressortait propre et \emph{certifié} \code{verified infinite-loop}, alors que le même corps écrit en ligne était signalé.
+
+\begin{exemple}{Hooks custom, \code{useRef}, \code{useMemo}, handler de composant}{lowering-panel}
+\begin{lstlisting}[language=TypeScript]
+import { useState, useEffect, useMemo, useRef } from "react";
+import { useQuery } from "@tanstack/react-query";
+
+function useToggle(init: boolean) {
+  const [on, setOn] = useState(init);
+  const toggle = () => setOn(!on);
+  return [on, toggle] as const;
+}
+
+export function Panel({ id, opts }: { id: string; opts: object }) {
+  const { data } = useQuery({ queryKey: [id] });
+  const [on, toggle] = useToggle(false);
+  const ref = useRef(null);
+  const merged = useMemo(() => ({ ...opts, id }), [opts, id]);
+  useEffect(() => {
+    window.addEventListener("resize", () => toggle());
+  }, [merged]);
+  return <Child ref={ref} data={data} onPick={(x: number) => toggle()} {...merged} />;
+}
+\end{lstlisting}
+Extrait de la sortie de la sonde (corps des hooks \texttt{\#4} à \texttt{\#6} élagués) :
+\begin{sortie}
+  B0:
+      let __obj_279 = __p0
+      let id = __obj_279.id  @10:24
+      let opts = __obj_279.opts  @10:28
+      let __obj_333 = HookMarker(0, Unknown)  @11:8
+      let data = __obj_333.data  @11:10
+      let __arr_382 = HookMarker(1, Unknown)  @12:8
+      let on = __arr_382[0]  @12:9
+      let toggle = __arr_382[1]  @12:13
+      let ref = HookMarker(2, StableRef)  @13:8
+      let merged = MemoVal(3)  @14:8
+      expr HookMarker(4, Undefined)  @15:2
+      => return CompApp<Child>({#9 ref: ref, data: data, onPick: fn#10(x) {
+          B0:
+              => return toggle()
+          edges:
+      }, ...11: merged})
+hooks:
+  #0 Custom useQuery({#0 queryKey: [#1 id]<Exact(1)>}) binding=Some("__obj_333") import_source=Some("@tanstack/react-query") resolved_file=None  @11:8
+  #1 Custom useToggle(false) binding=None import_source=None resolved_file=Some("e5_hooks.tsx")  @12:8
+  #2 Ref init=null  @13:8
+  #3 Memo deps=List[opts, id]<Exact(2)>  @14:8
+    B0:
+        => return {#3 ...4: opts, id: id}
+  #4 Effect deps=List[merged]<Exact(1)>  @15:2
+  #5 Handler event=pick  @18:9
+  #6 Handler event=resize  @16:4
+\end{sortie}
+\code{useQuery} (un paquet) et \code{useToggle} (local) sont des \code{Custom} dont la liaison lit \code{HookMarker(L, Unknown)}. Un custom destructuré en objet garde son temporaire \code{__obj_333} comme \code{binding} (seul le préfixe \code{__arr_} est exclu) ; destructuré en tableau, \code{binding} vaut \code{None} et les projections \code{__arr_382[i]} restent des \code{IndexAccess} --- la réécriture ne concerne que \code{useState}. \code{useRef} donne \code{StableRef} ; \code{useMemo} donne \code{MemoVal(3)}, avec pour corps la flèche concise déplacée. Les labels 5 et 6 sont un handler de composant (\code{onPick}, à la position de la balise ouvrante) et une subscription, que la section suivante explique. Le hook \code{useToggle}, abaissé par l'autre point d'entrée, a son propre compteur d'identifiants : dans sa sortie (non reproduite), la flèche \code{toggle} est \texttt{fn\#0}.
+\end{exemple}
+
+\begin{piege}
+\textbf{Les formes de \code{useState} autres que \code{const [a, b] = useState()}.} Le traitement d'état ne reconnaît que la destructuration en tableau. \code{const t = useState(1)} lie \code{t} à \code{StateVal(1)} --- le tuple entier lu comme la valeur ---, et \code{t[1]} n'est plus reconnu comme setter : appeler \code{t[1](2)} dans le rendu (\file{e25_t_index_call.tsx}) donne \code{verified setter-in-render}, quand l'équivalent destructuré (\file{e26_t_index_witness.tsx}, \code{setV(2)}) donne \code{error setter-in-render}. Le fautif appelle un \code{IndexAccess} sur \code{StateVal(1)}, une expression, jamais un \code{Var} du tableau des setters : c'est une sous-approximation vérifiée, pas seulement déduite du dump. Un \code{useState(2);} en instruction crée bien une entrée \code{State}, mais son marqueur vaut \code{Unknown}, ce qui déclenche un \code{analysis-limit} trompeur (\og hook \code{<hook:2>} was not found in the registry\fg{}). \code{const [s, ...rest] = useState(0)} lie \code{rest} au temporaire supprimé, qui n'est plus lié nulle part. Le moteur n'a pas été vérifié au-delà de ces formes rares.
+\end{piege}
+
+% ===========================================================================
+\section{Handlers et subscriptions}
+\label{sec:lowering-handlers}
+
+\subsection{La règle : par fuite, pas par nom}
+
+Un handler n'est pas un hook au sens de React, mais le moteur le traite comme une entrée de la table : un corps qu'un tiers (React, un composant enfant) peut invoquer zéro, une ou plusieurs fois, hors rendu. Oublier un handler, c'est oublier les écritures qu'il fait ; c'est donc une classe de faux négatifs. Le commentaire de \code{extract_handlers} fixe la règle :
+
+\rustsnippet[label={lst:lowering-handlers-doc}]{src/lowering/hook_extractor.rs}{84}{100}{les handlers se décident par fuite}
+
+\begin{definition}{Handler}{lowering-handler}
+Un \terme{handler} est un corps de fonction qui \emph{s'échappe} du rendu vers un tiers susceptible de l'appeler : sur un élément hôte, la valeur d'une prop \code{onX} ou \code{ref} ; sur un composant, la valeur de \emph{n'importe quelle} prop. Il est extrait comme \code{HookEntry::Handler{label, event, body_cfg, span}} quand sa valeur se résout en corps : un \code{FnLit} en ligne, une variable liée à un \code{FnLit}, ou un \code{CallbackVal(L)} dont le corps est celui du \code{useCallback}.
+\end{definition}
+
+\begin{react}[qui appelle quoi]
+React DOM n'invoque, sur un élément hôte, que les props d'événements \code{on[A-Z]...} et \code{ref} (appelé au montage et au démontage) ; toute autre prop est une donnée du DOM. Un composant, lui, peut appeler n'importe quelle fonction qu'il reçoit : render props, \code{children} en fonction, \code{action={cb}} des formulaires de React 19.
+\end{react}
+
+L'algorithme a deux temps (\src{src/lowering/hook_extractor.rs}{113}{240}). Une pré-passe construit une table \code{var_bodies} : nom de variable $\to$ corps, pour tout \code{Let} ou \code{Assign} du CFG de rendu dont le RHS est un \code{FnLit} ou un \code{CallbackVal} ; un seul corps par nom, le dernier rencontré gagne. Puis une descente dans toutes les expressions de premier niveau (instructions, \code{Return}, \code{Branch}) cherche les éléments JSX. Dans un \code{NativeElem}, une prop \code{onX}/\code{ref} résolue devient un handler, avec la position de la prop (tirée de \code{prop_spans}) et le nom d'événement de \code{prop_to_event} (\code{onClick} $\to$ \code{click}, \code{onMouseEnter} $\to$ \code{mouseEnter}) ; les autres props et les enfants sont descendus. Dans un \code{CompApp}, toute prop résolue devient un handler, à la position de la balise ouvrante. Dans un \code{FnLit} encore présent dans le rendu (un render helper), la descente entre dans le corps.
+
+Un setter nu passé en prop (\code{onChange={setN}}) n'est \emph{pas} un handler : que le receveur puisse l'appeler avec des arguments arbitraires dépend de ce que l'enfant est analysable, ce que seul le moteur sait (le \emph{havoc} d'enfant inconnu, \cref{chap:inter-composants}). Synthétiser ici une écriture ⊤ écraserait l'analyse inter-composants précise des enfants connus.
+
+\subsection{Les subscriptions}
+
+\rustsnippet[label={lst:lowering-subs}]{src/lowering/hook_extractor.rs}{18}{41}{les subscriptions : \code{addEventListener} dans un corps d'effet}
+
+Pour chaque \code{HookEntry::Effect}, la passe cherche dans les instructions du corps le motif \code{recv.addEventListener("<lit>", <FnLit>)} (où \code{<lit>} est une chaîne littérale) --- le prédicat \code{Expr::subscription_listener}, partagé avec la relation des écrivains --- et crée un handler dont l'événement est le littéral et le corps celui du listener. Le receveur et les arguments au-delà du deuxième sont redescendus ; les corps de \code{FnLit} ne le sont pas (\code{for_each_child} ne les traverse pas), si bien qu'un listener enregistré dans un \code{setTimeout} n'est pas trouvé. Un nom d'événement non littéral, ou un listener passé par variable, ne donne rien (\og acceptable FN\fg{} selon les tests). Dans \code{Panel}, c'est le label 6 (\code{event=resize}), à la position de l'instruction qui contient l'appel.
+
+\begin{piege}
+\textbf{Le terminateur n'est pas lu.} Le commentaire \og Terminator::Return not scanned addEventListener is never a return expr\fg{} est faux pour un effet concis : dans \code{useEffect(() => el.addEventListener("x", f), [])}, l'appel est le \code{Return} du corps (\cref{sec:lowering-hoist}). La \cref{sec:lowering-limites} montre l'assurance fausse qui en résulte. \code{CFG::for_each_expr}, qui visite aussi les \code{Return} et les \code{Branch}, aurait couvert le cas.
+\end{piege}
+
+% ===========================================================================
+\section{Hoist de terminateur et flèches concises}
+\label{sec:lowering-hoist}
+
+Ces deux corrections forment une paire (\issue{4} et \issue{5}, commit \code{30a00c5}) : la seconde a rendu la première nécessaire.
+
+\paragraph{Les flèches concises (\#5).} oxc représente \code{x => expr} comme un \code{FunctionBody} d'une seule \code{ExpressionStatement}, indiscernable de \code{x => { expr; }} sauf par le drapeau \code{expression}. Un consommateur qui oubliait ce drapeau abaissait le corps comme une instruction-expression, et la valeur de retour était perdue. La correction a deux parts : une fonction dédiée, et le point de dispatch unique \code{Candidate::build_cfg} (\cref{lst:lowering-candidate}).
+
+\rustsnippet[label={lst:lowering-concise}]{src/lowering/cfg_builder.rs}{985}{1001}{le corps d'une flèche concise est un \code{Return}}
+
+\paragraph{Le hoist de terminateur (\#4).} Mais alors, dans un hook custom concis comme \code{const useCount = () => useState(0)}, l'appel du hook est dans le terminateur \code{Return}, et \code{extract_hooks} ne réécrit que les instructions. Le hook ne produisait aucune entrée ; le composant déclarait zéro hook, et toutes les règles le laissaient passer en silence. Le commentaire (\src{src/lowering/hook_extractor.rs}{306}{320}) explique le choix : apprendre à l'extracteur à parcourir aussi les terminateurs aurait dupliqué la destructuration, l'étiquetage et la réécriture des marqueurs sur une seconde position ; on normalise donc le CFG.
+
+\rustsnippet[label={lst:lowering-hoist}]{src/lowering/hook_extractor.rs}{321}{341}{sortir un appel de hook d'un terminateur}
+
+Tout \code{Return(e)} ou \code{Branch{cond}} dont l'expression \emph{contient} un appel de hook est remplacé par \code{Var(__term_B)}, et \code{Let __term_B = e} est ajouté en fin de bloc --- les instructions s'exécutent avant le terminateur, c'est donc la bonne place. L'extracteur voit ensuite un \code{Let} ordinaire. Le test est un test de \emph{contenance} (\code{contains_hook_call}, \src{src/lowering/hook_extractor.rs}{343}{358}), pour que l'expression entière se déplace d'un bloc. Le \code{Let} hissé d'un \code{Return} n'a pas de position, puisque \code{Return} n'en porte pas (\issue{140}) : le hook est rapporté, mais sans ligne --- \og it costs a position, never a finding\fg{}, dit \file{docs/limitations.md}.
+
+\begin{exemple}{Flèche concise, hoist, hooks conditionnels}{lowering-edge}
+\begin{lstlisting}[language=TypeScript]
+import { useState, useEffect, useContext } from "react";
+
+const useCount = () => useState(0);
+
+export function Edge({ flag, Ctx }: { flag: boolean; Ctx: any }) {
+  const [c, setC] = useCount();
+  const theme = useContext(Ctx).theme;
+  flag && useEffect(() => {}, []);
+  const x = flag ? useState(1) : null;
+  return <div>{theme}{c}{x}</div>;
+}
+\end{lstlisting}
+Extrait de la sortie de la sonde :
+\begin{sortie}
+  B0:
+      ...
+      let __arr_170 = HookMarker(0, Unknown)  @6:8
+      let c = __arr_170[0]  @6:9
+      let setC = __arr_170[1]  @6:12
+      let theme = useContext(Ctx).theme  @7:8
+      let __t0 = flag  @8:2
+      => branch __t0 ? B1 : B2
+  B1:
+      __t0 := useEffect(fn#0() {
+          B0:
+              => return undefined
+          edges:
+      }, [#1 ]<Exact(0)>)  @8:10
+      => jump B2
+  B2:
+      expr __t0  @8:2
+      => branch flag ? B3 : B4
+  B3:
+      let __t1 = StateVal(1)  @9:19
+      => jump B5
+  ...
+hooks:
+  #0 Custom useCount() binding=None import_source=None resolved_file=Some("e7_edge.tsx")  @6:8
+  #1 State init=1  @9:19
+=== custom hook useCount (params []) ===
+  B0:
+      let __term_0 = StateVal(0)
+      => return __term_0
+hooks:
+  #0 State init=0
+\end{sortie}
+Dans \code{useCount}, \code{Return(useState(0))} a été normalisé en \code{let __term_0 = ...}, sans position, puis extrait. Dans \code{Edge}, le \code{useState(1)} d'un bras de ternaire est dans un \code{Let} : il est extrait, et l'analyseur rapporte \code{error conditional-hook [hook:1] (line 9:19)}. En revanche \code{useContext(Ctx).theme} (un hook imbriqué dans un \code{FieldAccess}) et \code{flag && useEffect(...)} (un hook dans un \code{Assign}) ne le sont pas : ils restent des \code{Call} ordinaires, et le composant annonce deux hooks.
+\end{exemple}
+
+\begin{remarque}
+Le commentaire de \code{contains_hook_call} évoque \code{return cond ? useA() : useB()}. En réalité, un ternaire dans un \code{return} a déjà été fendu par \code{lower_ternary} : le terminateur ne lit que \code{Var(__tN)}, et les appels sont dans les \code{Let} des bras. Le hoist ne sert effectivement qu'aux appels directs ou imbriqués dans le terminateur ; et, pour un appel imbriqué (\code{return <div>{useLabel()}</div>}), le \code{Let} hissé n'a pas un appel pour racine, donc l'extracteur ne le reconnaît pas davantage.
+\end{remarque}
+
+% ===========================================================================
+\section{Limites du lowering}
+\label{sec:lowering-limites}
+
+\subsection{Écarts vérifiés}
+
+Les écarts suivants ont été reproduits au commit \snapshotCommit{}, chacun sur un couple \og programme fautif / programme témoin\fg{} ; aucun n'avait d'issue sur le tracker au moment de la rédaction du dossier de notes. Tous sont des sous-approximations --- une lecture, une écriture ou un chemin perdus ---, sauf le paramètre de reste qui produit un faux positif. \Cref{tab:lowering-limites} les résume.
+
+\begin{table}[htbp]\centering\small\setlength{\extrarowheight}{3pt}
+\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}p{0.33\linewidth}>{\raggedright\arraybackslash}X@{}}
+\toprule
+Source (extrait) & Cause, et verdict observé \\
+\midrule
+\code{flag && useEffect(() => { setN(1); }, [])} & hook imbriqué (RHS d'un \code{Assign}) non extrait : \code{AndHook (1 hooks)}, \code{verified conditional-hook} \\
+\code{useContext(Ctx).theme} ; \code{return <div>{useLabel()}</div>} & hook non racine : aucune entrée, aucun \code{analysis-limit} \\
+\code{const z = 0 ?? 5; if (z === 0) setX(1);} & \code{??} comme \code{||} + raffinement truthy : \code{Coalesce} \checkmark{} \code{verified setter-in-render} ; le témoin \code{const z = 0} donne \code{warn setter-in-render} \\
+\code{try { obj = {a:1}; risky(); } catch (e) { cfg = obj; }} & le \code{catch} part d'avant le \code{try} : \code{Partial} \checkmark{} \code{verified always-unstable-deps} ; le témoin sans \code{try} donne \code{warn always-unstable-deps} \\
+\code{useEffect(() => window.addEventListener("resize", ...), [])} & subscription dans le \code{Return} non lue : \code{ConciseSub} \checkmark{} \code{verified missing-cleanup} ; la forme bloc donne \code{warn missing-cleanup} \\
+\code{return <button onClick={handle}/>; function handle() {...}} & déclaration après \code{return} non abaissée : aucun handler, \checkmark{} \\
+\code{onClick={flag ? () => setA(1) : () => setB(2)}} & un corps par nom dans \code{var_bodies} : un seul handler (\code{setB(2)}) \\
+\code{useEffect(() => { import(path); }, [])} & repli \code{_ => opaque()} : lecture de \code{path} perdue, \code{Lazy} \checkmark{} \code{verified missing-deps} ; le témoin \code{load(path)} donne \code{warn missing-deps} \\
+\code{let x = 1; (x as any) = { a: 1 };} (aussi \code{x! = ...}, \code{x!++}) & cible enveloppée non écrite : \code{TsTarget} \checkmark{} \code{verified always-unstable-deps} ; le témoin \code{x = {a:1}} donne \code{warn} \\
+\code{for ([a, b] of pairs) {...}} & cible motif pré-déclarée non écrite : \code{a}, \code{b} gardent leur valeur \\
+\code{if (c) { const [] = useState(0); }} & aucun label laissé dans le CFG : \code{verified conditional-hook} \\
+\code{(...args) => args.length} & reste non lu : \code{args} lu comme capture, \code{warn missing-deps var:args} (FP) \\
+\bottomrule
+\end{tabularx}
+\caption{Écarts du lowering reproduits au commit \snapshotCommit{} (fichiers \file{/tmp/ch07/e8}, \code{e9}, \code{e13}, \code{e15}--\code{e21}, \code{v1}--\code{v4} ; sorties \code{--info --show-clean}).}\label{tab:lowering-limites}
+\end{table}
+
+Deux d'entre eux méritent d'être vus en entier, parce qu'ils produisent une assurance \code{verified} fausse. Le premier est le \code{??} :
+
+\begin{sortie}
+  Coalesce  (1 hooks)  e19_coalesce.tsx  ✓
+    verified  conditional-hook  all hooks run unconditionally, in a stable order
+    verified  lazy-init  no useState/useRef initializer re-runs work on every render
+    verified  setter-in-render  no setter is called during render
+    verified  state-mutation  no state or prop object is mutated in place
+  Control  (1 hooks)  e19_coalesce.tsx
+    warn   setter-in-render  [hook:0]  (line 16:4)  setter `setX` called directly in the render body, ...
+\end{sortie}
+
+\code{0 ?? 5} vaut \code{0} ; le diamant l'envoie à la jonction par la branche \code{then_}, où le raffinement \og truthy\fg{} retire \code{0} ; seul \code{5} survit, et le \code{setX(1)} gardé par \code{z === 0} devient inatteignable pour l'analyse. Le second est le hook conditionnel non extrait :
+
+\begin{sortie}
+  AndHook  (1 hooks)  e8_nested_hook.tsx
+    warn   setter-in-render  [hook:0]  (line 5:28)  setter `setN` is handed to a callee with no timing summary. ...
+    verified  conditional-hook  all hooks run unconditionally, in a stable order
+\end{sortie}
+
+L'appel \code{useEffect(...)} n'est pas extrait ; il reste un appel ordinaire à une fonction inconnue, à laquelle le setter est transmis (d'où l'avertissement \regle{setter-in-render}), et \regle{conditional-hook} certifie l'ordre des hooks sur le seul hook qu'il voit. Le composant est pourtant détecté : \file{hook_call_detect.rs} (la détection syntaxique sur l'AST, \cref{chap:frontend-detection}) voit ces formes, que l'extracteur ne voit pas.
+
+\begin{remarque}
+Trois écarts moins visibles complètent la liste. Les labels suivent l'ordre des blocs, non celui du texte : dans \code{if (a) { if (b) {...} const [x] = useState("x"); } const [y] = useState("y");}, la jonction de l'\code{if} externe a été réservée avant les blocs de l'\code{if} interne, et \code{y} reçoit le label 0, \code{x} le label 1 (le verdict, \code{error conditional-hook [hook:1] (line 8:10)}, est juste). Les tests \code{case k:} d'un \code{switch} ne sont pas abaissés. Et \code{useReducer(r, init, initFn)} jette le réducteur et le troisième argument, avec leurs lectures.
+\end{remarque}
+
+Aucun de ces écarts ne demande de cas particulier dans une règle ; tous se corrigent dans le lowering, selon les principes du projet. Quelques pistes, relevées par le dossier de notes et non décidées par le projet : peler les enveloppes TypeScript d'une cible d'affectation avant \code{assign_target_ident}, comme \code{lower_expr} le fait pour les expressions ; lire les subscriptions par \code{CFG::for_each_expr} ; généraliser la normalisation du \issue{4} en liant tout sous-appel de hook dans un \code{Let} au point de son évaluation ; donner à \code{??} une forme propre dont la branche de jonction ne raffine pas en truthy.
+
+\subsection{Pièges pour qui modifie ce code}
+
+\begin{piege}
+\begin{itemize}
+  \item Ne jamais ajouter de bras \code{_ => {}} dans \code{lower_stmt}, \code{lower_binop}, \code{for_each_child} ou \code{HookEntry::body_cfg} : l'exhaustivité est la garantie (\issue{77}).
+  \item Toute nouvelle instruction synthétique porte une position (\adr{39}) ; toute expression non représentable passe par \code{lower_for_effect} plutôt que d'être jetée (\cref{inv:lowering-lectures}) ; toute nouvelle forme de cible d'affectation écrit la liaison, au pire à ⊤ (\cref{inv:lowering-ecritures}).
+  \item Toujours \code{add_edge} après \code{seal_with(Jump|Branch)}, et tester \code{is_terminated()} avant de sceller une fin de branche (sinon le \code{debug_assert!} de \code{seal_with} se déclenche).
+  \item \code{lower_expr} ne scelle jamais un bloc en \code{Return} ou \code{Unreachable} : ses seules fentes (diamants, \code{split_at_await}) laissent un bloc ouvert. C'est ce qui garantit qu'une jonction de diamant a toujours deux prédécesseurs.
+  \item \code{Unreachable} ne se produit que si le contrôle ne continue pas (\adr{25}).
+  \item Le préfixe \code{__arr_} est lu par l'extracteur ; \code{__term_}, \code{__tN}, \code{__obj_}, \code{__dstr_} et \code{__pI} sont réservés.
+  \item \code{expr_lower::is_event_prop_key} et \code{hook_extractor::is_event_prop} ont un corps identique : le premier décide quelles props reçoivent une position, le second lesquelles deviennent des handlers. Les modifier séparément désalignerait handlers et positions.
+  \item \code{extract_hooks} \emph{déplace} les corps d'effets, de memos et de callbacks hors du rendu : une passe qui les chercherait dans le rendu ne les trouvera pas. C'est pourquoi un \code{<button onClick>} construit dans un \code{useMemo} ne produit aucun \code{HookEntry::Handler}.
+\end{itemize}
+\end{piege}
+
+% ===========================================================================
+\begin{resume}
+Le lowering traduit l'AST d'oxc en un CFG de blocs de base et une table de hooks ; après lui, rien ne voit plus l'AST. Il s'organise en trois passes : \code{Candidate::build_cfg} (instructions dans \file{cfg_builder.rs}, expressions dans \file{expr_lower.rs}), puis \code{extract_hooks}, \code{extract_handlers} et \code{extract_subscriptions} (\file{hook_extractor.rs}), dans cet ordre, qui fixe aussi l'ordre des labels.
+
+\begin{itemize}
+  \item \textbf{La machine à blocs.} \code{BlockBuilder} réserve, scelle, ouvre et relie des blocs selon un protocole unique ; \code{lower_stmts} s'arrête au premier terminateur ; \code{into_cfg} scelle la chute en fin de corps en \code{Return(undefined)}, et \code{Unreachable} ne veut dire que \og le contrôle ne continue pas\fg{} (\adr{25}).
+  \item \textbf{Les gabarits.} \code{if} : trois blocs, même sans \code{else} ; retour anticipé : une branche sans arête vers la jonction. Boucles : en-tête, corps, sortie (et \code{update} pour \code{for}), retour par une arête \code{Back}, seul lieu du widening ; \code{continue} est une arête \code{Back}, \code{break} une vraie arête. \code{switch} : chaîne de dispatchs \code{Branch(true)}, une case par bloc, fall-through fidèle (\issue{1}). \code{try} : \code{Branch} sur ⊤, \code{finally} sur la jonction (\issue{2}). Diamants : un temporaire \code{__tN}, un \code{Branch} sur lui (\adr{20} §1). \code{await} : argument lié, puis arête \code{Await} (\adr{35}).
+  \item \textbf{Les expressions.} Ne perdre aucune lecture (\code{lower_for_effect}, clés synthétiques), écrire chaque feuille ; ⊤ (\code{opaque()}) pour ce qui n'est pas modélisé. Chaque nœud allouant reçoit un \code{ExprId} tiré d'un compteur partagé par fichier et par famille (\adr{10}, \issue{134}).
+  \item \textbf{Les hooks.} Reconnaissance d'un appel racine de \code{Let}/\code{ExprStmt}, par provenance d'import ; entrée \code{HookEntry}, marqueur, ligne de provenance ; destructuration d'état par \code{__arr_} ; corps déplacés hors du rendu. Handlers par fuite ; subscriptions dans les corps d'effets. Le hoist de terminateur (\issue{4}) rend les flèches concises (\issue{5}) sûres.
+  \item \textbf{Les limites.} Hooks imbriqués non extraits, \code{??} lu comme \code{||}, \code{catch} partant d'avant le \code{try}, subscriptions d'effets concis, déclarations après \code{return}, cibles TypeScript : autant d'assurances fausses possibles, toutes corrigeables à la racine dans ce sous-système.
+\end{itemize}
+
+Fichiers rencontrés : \file{src/lowering/mod.rs}, \file{cfg_builder.rs}, \file{expr_lower.rs}, \file{hook_extractor.rs}. Le chapitre suivant (\cref{chap:splice-inlining}) greffe ces CFG les uns dans les autres : il lira les \code{Return} et les \code{Unreachable} que nous avons produits, et renommera les temporaires. Le moteur (\cref{chap:cfg-analyzer-dominance}) interprétera les arêtes \code{Back} et \code{Await} ; les relations (\cref{chap:relations}) liront les phases que l'\code{await} délimite.
+\end{resume}
+
+% ===========================================================================
+\section*{Exercices}
+\addcontentsline{toc}{section}{Exercices}
+
+\begin{exercice}{Un \code{for} à la main}{lowering-for}
+Dessinez le CFG que produit le lowering pour \code{for (let i = 0; i < n; i++) { if (a[i]) continue; f(); }} : numéros de blocs, terminateurs, arêtes et leur nature. Comparez au test \code{continue_reaches_the_loop_header} (\src{src/lowering/cfg_builder.rs}{1144}{1169}).
+\end{exercice}
+\begin{solution}
+Le bloc courant reçoit \code{let i = 0} puis saute (U) à l'en-tête H ; les blocs réservés sont, dans l'ordre, H, le corps C, l'\code{update} U et la sortie X. H porte \code{branch (i Lt n) ? C : X} (T/F). Dans C, l'\code{if} réserve trois blocs : le \code{then} contient le \code{continue}, soit \code{jump U} par une arête \code{Back} ; le \code{else} saute à la jonction, qui contient \code{expr f()} puis \code{jump U} (U). U contient \code{i := (i Add 1)}, \code{expr i} sans position, puis \code{jump H} par une arête \code{Back}. Deux arêtes arrière aboutissent donc à U ou à H.
+\end{solution}
+
+\begin{exercice}{Pourquoi \code{continue} est une arête \code{Back}}{lowering-continue}
+Écrivez une boucle dont le compteur n'avance que sur le chemin d'un \code{continue}, et expliquez pourquoi le point fixe ne convergerait pas si l'arête du \code{continue} était \code{Unconditional} (commentaire \src{src/lowering/cfg_builder.rs}{390}{393}).
+\end{exercice}
+\begin{solution}
+Par exemple \code{while (left < right) { if (p(left)) { left += 1; continue; } right -= 1; }}. Sur le chemin du \code{continue}, \code{left} croît à chaque tour ; si ce chemin revient à l'en-tête par une arête \code{Unconditional}, l'en-tête n'est pas un point de widening pour lui, et l'intervalle de \code{left} y croît d'une unité par itération du point fixe sans jamais se stabiliser. Avec une arête \code{Back}, le widening s'applique à l'en-tête : l'intervalle est étendu d'un coup (vers $+\infty$ ou vers le seuil suivant), et l'itération converge en un nombre fini de pas.
+\end{solution}
+
+\begin{exercice}{Un \code{switch} et un niveau de diagnostic}{lowering-switch}
+Donnez le CFG d'un \code{switch} à trois cases dont la deuxième n'a pas de \code{break}, et justifiez que \code{setMsg} dans la première case ne peut être qu'un \Warning{} de \regle{setter-in-render} (\cref{ex:lowering-status}).
+\end{exercice}
+
+\begin{exercice}{Garde-\code{throw} et splice}{lowering-throw}
+En vous appuyant sur \adr{25} §2 et le test \code{a_hook_after_a_guard_throw_is_not_conditional} (\src{tests/cfg_exit_integrity.rs}{138}{162}), montrez que relier le \code{Unreachable} d'un \code{throw} à la jonction du splice ferait signaler comme conditionnel le \code{useState} qui suit la garde, au niveau \Error{}.
+\end{exercice}
+
+\begin{exercice}{Un défaut de motif}{lowering-defaut}
+Pour \code{const { a = f() } = props}, listez les instructions émises, dans l'ordre, et dites quelles lectures sont préservées et quelle valeur reçoit \code{a}.
+\end{exercice}
+\begin{solution}
+\code{let __obj_N = props} (position du déclarateur), \code{expr f()} (position du défaut), \code{let a = __obj_N.a} (position de la propriété). Les lectures de \code{props} et de \code{f} sont préservées, et l'appel \code{f()} est visible comme effet ; \code{a} reçoit \code{props.a} seulement, sans le résultat de \code{f()}.
+\end{solution}
+
+\begin{exercice}{Corriger à la racine}{lowering-racine}
+Sur \code{flag && useEffect(...)}, vérifiez avec l'analyseur que le hook n'est pas extrait. Proposez une correction conforme aux principes du projet (pas de cas particulier dans \code{process_stmt} ni dans une règle), en vous inspirant de la façon dont le \issue{4} a été résolu.
+\end{exercice}
+
+\begin{exercice}{Le \code{catch} partiel}{lowering-catch}
+Reproduisez l'écart \code{Partial} de la \cref{tab:lowering-limites}, puis proposez une modélisation sound du \code{try} : d'où devraient partir les arêtes vers le \code{catch} ? Quel coût en précision et en force must votre forme aurait-elle ?
+\end{exercice}

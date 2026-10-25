@@ -1,0 +1,1031 @@
+% ---------------------------------------------------------------------------
+% Chapitre 19 — Étude de cas : infinite-loop et state-lifted-too-high
+% Sources : notes/10-rules-state.md (§ infinite-loop, § state-lifted-too-high) ;
+% notes/07-engine-relations.md (churn) ; notes/06-engine-fixpoint.md (widen_trace,
+% effect_setter_writes) ; notes/08-engine-program.md (render_deps) ;
+% src/rules/impls/{infinite_loop,state_lifted_too_high,widening_info}.rs ;
+% src/engine/{churn,guards,triggers,fixpoint,analysis_result}.rs ; src/rules/api/{query,witness}.rs ;
+% src/rules/helpers/{render_tree,cycles,mod}.rs ; ADR-008, 014, 015, 017, 018, 029, 041 ;
+% issues #144, #90, #157, #20, #64.
+% Sorties observées avec target/debug/reactant (commit e67b10a) sur les fichiers /tmp/ch19/*.tsx
+% et sur tests/fixtures/state_lifted_too_high/. Les lignes « slot=… fresh=… » viennent de la sonde
+% hors dépôt du chapitre 15 (~/.cache/verif07-target/debug/mprobe), qui imprime slot_writers.
+% ---------------------------------------------------------------------------
+\chapter{Étude de cas : \regle{infinite-loop} et \regle{state-lifted-too-high}}
+\label{chap:infinite-loop}
+
+\begin{objectifs}
+  \item Connaître les quatre bras de \regle{infinite-loop} --- point fixe, cross-component, cycles du graphe de churn, self-churn ---, l'ordre dans lequel ils s'exécutent, ce que chacun lit dans l'\code{AnalysisResult} et dans les relations du moteur, et la manière dont ils se dédoublonnent.
+  \item Savoir pourquoi le widening est un \emph{signal} et non une preuve (plafond \Warning, \issue{144}), et pourquoi seul un cycle tout-\code{Must} d'un seul composant, ou une écriture fraîche sur tous les chemins vers le slot exact d'un dep, atteint l'\Error.
+  \item Lire la garde $\forall$-stable sur les deps, le filtre des écritures \code{Handler}, la revivification multi-écrivains et le re-déclenchement sensible aux champs (\issue{90}) comme autant de décisions de soundness ou de précision, chacune adossée à un test.
+  \item Reproduire chaque verdict sur un programme court, lire les témoins produits et connaître les faux positifs assumés et les faux négatifs observés au commit \snapshotCommit.
+  \item Comprendre \regle{state-lifted-too-high} : la dépendance de rendu, le foyer d'un slot, le principe \og l'absence d'usage vaut preuve\fg{} et le plafond \Warning{} d'une règle de coût.
+\end{objectifs}
+
+\prerequis{\cref{chap:point-fixe-composant} (la boucle externe, \code{widen_trace}, \code{effect_setter_writes}) ; \cref{chap:churn} (le graphe de churn, \cref{def:churn-graph}, les sites, la preuve multi-site et le plus petit point fixe des sites) ; \cref{chap:inter-composants} (le store partagé, la dépendance de rendu, \cref{def:render-dep}, et \code{home_of}) ; \cref{chap:api-regles} (le sceau de sévérité, \cref{def:certified}, les primitives must et les témoins, \cref{def:witness}) ; \cref{chap:regles-etat} (la grille de lecture d'une règle d'état, les tables de noms).}
+
+Le \cref{chap:regles-etat} a parcouru sept règles d'état en suivant une grille fixe. Ce chapitre applique la même grille aux deux règles restantes, mais en changeant d'échelle : \regle{infinite-loop} est la règle la plus riche du catalogue, celle qui consomme le plus de produits du moteur --- le point fixe et sa trace de widening, le store partagé, la relation des écrivains, celle des déclencheurs, le graphe de churn --- et celle dont l'histoire (\adr{8}, \adr{15}, \adr{17}, \adr{18}, \adr{42}) raconte le mieux comment le projet a appris à séparer un signal d'une preuve. \regle{state-lifted-too-high}, plus jeune et plus courte, illustre la situation inverse : une règle de coût qui n'atteindra jamais l'\Error, construite sur une analyse qui prouve des \emph{absences}.
+
+La progression suit celle du code de \file{src/rules/impls/infinite_loop.rs} (1\,667 lignes, tests compris), bras par bras et du plus simple au plus difficile : le compteur qui s'élargit, le setter d'un parent, les cycles du graphe, le self-churn. Chaque bras est introduit par un programme React court et sa sortie observée, puis lu ligne à ligne, puis confronté à ses cas limites. Les mécanismes du moteur que ces bras consomment ont été construits dans les chapitres précédents ; nous les rappelons d'une phrase et renvoyons à leur définition, sans les redémontrer.
+
+Toutes les sorties ont été obtenues au commit \snapshotCommit{} avec le binaire \file{target/debug/reactant} sur des fichiers écrits pour ce chapitre sous \file{/tmp/ch19/}, ou sur les fixtures du dépôt. Sauf mention contraire, la commande est :
+
+\begin{shell}
+reactant check /tmp/ch19/<fichier>.tsx --all-roots --no-color --fail-on never
+\end{shell}
+
+\noindent complétée de \code{--trace} (notes de témoin), \code{--info} (niveau \Info{} et assurances \code{verified}), \code{--show-clean}, \code{--verbose} (itérations et labels élargis) et \code{--rule <nom>} selon le besoin. Les numéros de ligne des sorties renvoient aux listings reproduits, qui portent les vrais numéros des fichiers (en-tête \code{import} compris).
+
+% ===========================================================================
+\section{Le bug visé et l'anatomie de la règle}
+\label{sec:infinite-loop-anatomie}
+
+\subsection{Une boucle que React n'arrête pas}
+
+\begin{react}[la boucle rendu → commit → effets → setState]
+Après avoir rendu un composant et commité le résultat, React exécute les effets \code{useEffect} dont un dep a changé : la comparaison est \code{Object.is}, élément par élément, et l'effet ré-exécute dès qu'\emph{un} élément diffère (sémantique \og ou\fg) ; un effet sans tableau ré-exécute après chaque commit. Un \code{setState} dans l'effet planifie un nouveau rendu. Si la nouvelle valeur fait à nouveau échouer \code{Object.is} sur un dep --- un nombre qui a grandi, un objet fraîchement alloué ---, l'effet repart, et ainsi de suite (la chronologie du \cref{chap:react-modele}). Contrairement à un setter appelé \emph{pendant} le rendu, que React interrompt par \og Too many re-renders\fg{} (\regle{setter-in-render}, \cref{chap:regles-etat}), une boucle portée par des effets passifs n'est pas interrompue. En développement, React compte les mises à jour planifiées pendant le vidage des effets passifs et, au-delà de 50 (\code{NESTED_PASSIVE_UPDATE_LIMIT} dans \file{ReactFiberWorkLoop.js}, branche \code{main} du dépôt de React consultée pour ce manuscrit), \emph{écrit} dans la console \og Maximum update depth exceeded. This can happen when a component calls setState inside useEffect, but useEffect either doesn't have a dependency array, or one of the dependencies changes on every render\fg{} --- un \code{console.error}, pas une exception : la boucle continue. En production, rien : l'onglet gèle. C'est la classe \og outage\fg{} du catalogue.
+\end{react}
+
+Deux mécanismes distincts font échouer \code{Object.is} d'un rendu au suivant, et ils demandent deux analyses différentes. Une \emph{valeur qui grandit} (\code{setCount(count + 1)}) se voit dans le domaine numérique : l'intervalle du slot ne converge pas et le point fixe doit l'élargir. Une \emph{référence recréée} (\code{setObj({ ...obj })}) ne se voit pas ainsi : \code{PerRender} joint à \code{PerRender} donne \code{PerRender}, rien ne grandit, le point fixe converge au premier tour (\cref{chap:statevalue-stabilite}). La certitude vient alors de la \emph{structure} des deps et des écritures, c'est-à-dire des relations du moteur et du graphe de churn. La règle est la réunion de ces deux lectures, plus deux extensions : le setter d'un parent, et les cycles qui traversent plusieurs effets.
+
+\subsection{Les quatre bras}
+
+Le type et son doc-comment ouvrent le fichier :
+
+\rustsnippet[label={lst:infinite-loop-type}]{src/rules/impls/infinite_loop.rs}{26}{37}{le type de la règle et un doc-comment en retard sur le code}
+
+\begin{piege}
+Ce doc-comment décrit la règle telle qu'elle était avant \adr{21} §5 et avant \adr{18}. Deux affirmations sont fausses au commit \snapshotCommit{} : \og Effects with all-unstable deps are treated as no-deps\fg{} (le filtre actuel est le quantificateur inverse, $\forall$-stable, \cref{sec:infinite-loop-deps}) et \og If parent not in results, cross fires as Warning\fg{} (le code \emph{saute} l'appel quand l'écriture partagée est $\Bot$, \cref{sec:infinite-loop-cross}). Un lecteur qui apprend la règle par ses commentaires apprend une règle qui n'existe plus ; le manuscrit lit le code.
+\end{piege}
+
+\code{safe_check} déclare la règle applicable dès qu'un composant a au moins un \code{useState} et un \code{useEffect} --- une boucle rendu → effet → setState a besoin des deux :
+
+\rustsnippet[label={lst:infinite-loop-safe-check}]{src/rules/impls/infinite_loop.rs}{44}{54}{l'applicabilité et l'assurance publiée sous \code{--info}}
+
+La méthode \code{check} commence par construire ses tables de noms puis boucle sur les effets ; les deux premiers bras vivent dans cette boucle, les deux autres la suivent :
+
+\rustsnippet[label={lst:infinite-loop-prelude}]{src/rules/impls/infinite_loop.rs}{56}{83}{le prélude de \code{check} : tables de setters, retour anticipé, ensemble de déduplication}
+
+Trois tables sont lues. \code{all_setter_labels} (le socle commun du \cref{chap:regles-etat}) est la table la plus large : les setters du rendu, fermés par alias sur le rendu \emph{et} sur tous les corps de hooks, ce qui permet de suivre \code{const s = setO} jusque dans un effet. \code{cross_component_setters} (\src{src/engine/setters.rs}{426}{440}) donne les props reconnus comme setters d'un \emph{autre} composant, sous la forme d'un \code{SetterProp} (\src{src/engine/setters.rs}{244}{259}) qui porte le composant propriétaire et le label. \code{collect_fn_bindings} enfin liste les fonctions liées dans le rendu, pour suivre \code{const cb = () => setN(n + 1)} appelé depuis l'effet. Si aucune variable de setter n'existe, ni locale ni prop, la règle rend \code{vec![]} avant même de consulter le graphe de churn ; un effet qui n'écrit rien ne porte de toute façon aucune arête.
+
+Le \cref{tab:infinite-loop-bras} résume les quatre bras ; la \cref{fig:infinite-loop-bras} montre le chemin d'un effet à travers eux. Le reste du chapitre les détaille dans cet ordre.
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}p{22mm}p{44mm}p{44mm}p{30mm}@{}}
+\toprule
+bras & condition de déclenchement & ce qu'il lit & niveau, nom émis \\
+\midrule
+1. point fixe (intra) & setter local appelé dans le corps hors \code{Handler} ; slot dans \code{widen_trace} ; écriture rejouée $\Bot$ ou non bornée & \code{widen_trace}, \code{effect_setter_writes}, \code{all_setter_labels}, marche des setters & \Warning{} au plus (\issue{144}) ; \regle{infinite-loop} \\
+2. cross-component & prop setter d'un autre composant appelé dans le corps ; écriture partagée ni $\Bot$ ni bornée & \code{cross_component_setters}, \code{shared_state} & \Warning{} au plus ; \regle{cross-component-infinite-loop} \\
+3. graphe de churn & une arête d'un cycle du graphe portée par un effet de ce composant, effet non déjà signalé & \code{ChurnGraph::cycles}, \code{must_effect_cycle} & \Error{} si cycle tout-\code{Must} mono-composant, sinon \Warning{} ; l'un ou l'autre nom selon \code{cross_component} \\
+4. self-churn & arête pilotée par deps d'un slot du composant vers un slot du composant ; \code{self_slot} pour l'\Error/\Warning, autre slot pour l'\Info & arêtes \code{!no_deps} du graphe, \relation{slot_writers}, \code{must_on_all_paths} & \Error{} (triple must), \Warning, \Info{} ; \regle{infinite-loop} \\
+\bottomrule
+\end{tabular}
+\caption{Les quatre bras de \regle{infinite-loop} (\src{src/rules/impls/infinite_loop.rs}{56}{241}). Les bras 1 et 2 sont évalués dans la boucle sur les effets ; les bras 3 et 4 après. Les niveaux sont des plafonds : aucun bras n'atteint l'\Error{} sans passer par une primitive must.}
+\label{tab:infinite-loop-bras}
+\end{table}
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[
+    q/.style={bloc,draw=ra-gray,fill=white,text width=62mm},
+    v/.style={bloc,text width=58mm},
+    stop/.style={bloc,draw=ra-gray,fill=white,font=\scriptsize\itshape,text=ra-gray,text width=24mm}]
+  \node[q] (mount) at (-1.6,0) {deps \code{[]} d'arité exacte 0 ?};
+  \node[stop] (s1) at (4.4,0) {tire une fois : ignoré};
+  \node[q] (stable) at (-1.6,-1.3) {liste exacte et tous les deps prouvés stables ?};
+  \node[stop] (s2) at (4.4,-1.3) {gaté : ignoré};
+  \node[q] (calls) at (-1.6,-2.6) {appel de setter dans le corps, classe $\neq$ \code{Handler} ?};
+  \node[v] (b1) at (-3.6,-4.7) {setter local ; \code{widen_trace} $\ni$ slot ; écriture rejouée $\Bot$ ou non bornée\\ \textbf{bras 1 : \Warning}};
+  \node[v] (b2) at (3.2,-4.7) {prop setter d'un parent ; \code{shared_state} ni $\Bot$ ni borné\\ \textbf{bras 2 : \Warning}};
+  \node[q] (graph) at (-0.2,-6.7) {après la boucle sur les effets : \code{ctx.cache().churn()}, arêtes portées par un effet du composant};
+  \node[v] (b3) at (-3.6,-8.9) {arête d'un cycle, effet non déjà signalé ; tout-\code{Must} mono-composant ?\\ \textbf{bras 3 : \Error{} / \Warning}};
+  \node[v] (b4) at (3.2,-8.9) {arête \code{!no_deps} locale → locale ; \code{self_slot} : \Error{} / \Warning{} ; autre slot non couvert : \Info\\ \textbf{bras 4}};
+  \draw[fleche] (mount) -- node[etiquette,above] {oui} (s1);
+  \draw[fleche] (mount) -- node[etiquette,right] {non} (stable);
+  \draw[fleche] (stable) -- node[etiquette,above] {oui} (s2);
+  \draw[fleche] (stable) -- node[etiquette,right] {non} (calls);
+  \draw[fleche] (calls.south) -- (b1.north);
+  \draw[fleche] (calls.south) -- (b2.north);
+  \draw[fleche] (graph.south) -- (b3.north);
+  \draw[fleche] (graph.south) -- (b4.north);
+  \draw[flechemay] (b1.south) to[out=-90,in=90] node[etiquette,left,align=right,pos=0.5] {\code{reported_effects}\\ (saute l'effet)} (b3.north);
+  \draw[flechemay] (b3.south) to[out=-90,in=-90] node[etiquette,below,align=center,pos=0.5] {\code{covered} (supprime l'\Info{} du bras 4)} (b4.south);
+\end{tikzpicture}
+\caption{Le chemin d'un effet à travers les quatre bras. Les deux premiers filtres (montage seul, $\forall$-stable) ne concernent que les bras 1 et 2 ; le graphe de churn a appliqué ses propres filtres au moment de construire ses arêtes (\cref{chap:churn}). Les flèches pointillées sont les deux canaux de déduplication.}
+\label{fig:infinite-loop-bras}
+\end{figure}
+
+La déduplication se fait en deux temps, visibles à la fin de \code{check} :
+
+\rustsnippet[label={lst:infinite-loop-dispatch}]{src/rules/impls/infinite_loop.rs}{230}{241}{les bras 3 et 4, après la boucle sur les effets}
+
+\code{reported_effects} contient les labels d'effets signalés par les bras 1 et 2 ; le bras 3 les saute (\og same outage class, one report per effect\fg). Le bras 3 rend en retour \code{covered}, les paires (effet, slot local) qu'un cycle signalé recouvre ; le bras 4 s'en sert pour taire son \Info. Le graphe lui-même vient du cache programme (\code{ctx.cache().churn()}, le cache programme du \cref{chap:api-regles}) : il est construit une fois par exécution, jamais par composant --- c'est la leçon de l'\issue{86}, où une construction par \code{check} rendait la phase des règles quadratique, et le test \code{churn_graph_is_built_once_per_program} (\src{src/rules/impls/infinite_loop.rs}{634}{684}) la verrouille par un compteur thread-local.
+
+% ===========================================================================
+\section{Bras 1 : le widening comme signal}
+\label{sec:infinite-loop-point-fixe}
+
+\subsection{Trois compteurs}
+
+\begin{exemple}{Un compteur, un compteur borné, un compteur de montage}{infinite-loop-counter}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch19/counter.tsx}},label={lst:infinite-loop-counter}]
+import { useState, useEffect } from "react";
+
+export function Counter() {
+  const [count, setCount] = useState(0);
+  useEffect(() => {
+    setCount(count + 1);
+  }, [count]);
+  return <p>{count}</p>;
+}
+
+export function Bounded() {
+  const [count, setCount] = useState(0);
+  useEffect(() => {
+    if (count < 10) setCount(count + 1);
+  }, [count]);
+  return <p>{count}</p>;
+}
+
+export function MountOnly() {
+  const [count, setCount] = useState(0);
+  useEffect(() => {
+    setCount(count + 1);
+  }, []);
+  return <p>{count}</p>;
+}
+\end{lstlisting}
+Concrètement, \code{Counter} boucle (chaque écriture change \code{count}, dep de l'effet), \code{Bounded} s'arrête à 10, \code{MountOnly} écrit une fois. Sortie (\code{--trace --verbose}, lignes \code{verified} omises) :
+\begin{sortie}
+  [verbose] Bounded: 3 iteration(s), widened: [0]
+  [verbose] Counter: 3 iteration(s), widened: [0]
+  [verbose] MountOnly: 3 iteration(s), widened: [0]
+  Counter  (2 hooks)  /tmp/ch19/counter.tsx
+    warn   infinite-loop  [hook:0]  (line 5:2)  this effect keeps pushing state `count` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop
+       → state `count` is written here [hook:1] (line 5:2)
+       → the abstract value of state `count` kept growing and was widened at iteration 3
+  MountOnly  (2 hooks)  /tmp/ch19/counter.tsx
+    warn   missing-deps  [hook:1]  var:count  (line 21:2)  `count` is used in this effect but not in its deps array, and it is recreated on every render
+       → `count` is read here [hook:1] (line 21:2)
+\end{sortie}
+\end{exemple}
+
+Trois observations guident la section. D'abord, les \emph{trois} slots sont élargis (\code{widened: [0]} partout) : le point fixe exécute chaque effet à chaque tour quels que soient ses deps (\cref{chap:point-fixe-composant}), donc \code{MountOnly} et \code{Bounded} font grandir \code{count} exactement comme \code{Counter}. Le widening seul ne distingue donc rien ; il faut deux filtres de plus. Ensuite, \code{Bounded} est absous par la valeur que son effet \emph{écrit} : \code{[1,10]}, bornée. Enfin \code{MountOnly} est absous par ses deps avant toute lecture du point fixe. Le niveau est \Warning, pas \Error{} : nous y reviendrons (\cref{sec:infinite-loop-plafond}).
+
+\subsection{La frise des itérations}
+
+La \cref{fig:infinite-loop-frise} rejoue les tours de la boucle externe pour \code{Counter} et \code{Bounded}, d'après les déroulés vérifiés du \cref{chap:point-fixe-composant} (les compteurs emballé et gardé y sont déroulés tour par tour ; ce sont les mêmes programmes à la présence des deps près, qui ne changent pas les valeurs puisque le point fixe exécute chaque effet à chaque tour). Seuil de widening \code{widen_threshold = 3} (\srcline{src/engine/fixpoint.rs}{54}) ; seuils de valeur $\{0,1\}$ pour \code{Counter}, $\{0,1,10\}$ pour \code{Bounded} (la constante de la garde est collectée comme seuil, même chapitre).
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=3mm and 11mm,
+    tour/.style={bloc,minimum width=15mm,minimum height=9mm,font=\scriptsize},
+    wide/.style={tour,draw=ra-amber,very thick},
+    fin/.style={bloc,draw=ra-gray,fill=white,font=\scriptsize,text width=30mm},
+    lab/.style={font=\scriptsize\bfseries,anchor=east}]
+  % Counter
+  \node[lab] (lc) at (-0.2,0) {\code{Counter}};
+  \node[tour,right=0mm of lc] (c0) {tour 0\\ $[0,0]$};
+  \node[tour,right=of c0] (c1) {tour 1\\ $[0,1]$};
+  \node[tour,right=of c1] (c2) {tour 2\\ $[0,2]$};
+  \node[wide,right=of c2] (c3) {tour 3\\ $[0,+\infty]$};
+  \node[fin,right=of c3] (c4) {sortie : $N \lleq S$\\ rejeu depuis $\Bot$ :\\ \code{effect_setter_writes[0]} $= [1,+\infty]$};
+  \draw[fleche] (c0) -- node[etiquette,above] {join} (c1);
+  \draw[fleche] (c1) -- node[etiquette,above] {join} (c2);
+  \draw[fleche] (c2) -- node[etiquette,above] {$\widen$} (c3);
+  \draw[fleche] (c3) -- (c4);
+  \node[etiquette,above=1mm of c3,align=center] {\code{iteration = 3}, aucun seuil $\geq 3$};
+  \node[etiquette,below=1mm of c3,align=center,text=ra-amber] {\code{widen_trace[0]} $=$ \{3, [1]\}};
+  % Bounded
+  \node[lab] (lb) at (-0.2,-2.9) {\code{Bounded}};
+  \node[tour,right=0mm of lb] (b0) {tour 0\\ $[0,0]$};
+  \node[tour,right=of b0] (b1) {tour 1\\ $[0,1]$};
+  \node[tour,right=of b1] (b2) {tour 2\\ $[0,2]$};
+  \node[wide,right=of b2] (b3) {tour 3\\ $[0,10]$};
+  \node[fin,right=of b3] (b4) {sortie : $[0,10] \lleq S$\\ rejeu depuis $\Bot$, \emph{then} sur $[0,9]$ :\\ \code{effect_setter_writes[0]} $= [1,10]$};
+  \draw[fleche] (b0) -- node[etiquette,above] {join} (b1);
+  \draw[fleche] (b1) -- node[etiquette,above] {join} (b2);
+  \draw[fleche] (b2) -- node[etiquette,above] {$\widen$} (b3);
+  \draw[fleche] (b3) -- (b4);
+  \node[etiquette,above=1mm of b3,align=center] {\code{iteration = 3}, seuil 10};
+  \node[etiquette,below=1mm of b3,align=center,text=ra-amber] {\code{widen_trace[0]} $=$ \{3, [1]\}};
+\end{tikzpicture}
+\caption{Frise des itérations de la boucle externe pour \code{Counter} et \code{Bounded}. Les deux slots entrent dans \code{widen_trace} au même tour ; seule la valeur rejouée depuis $\Bot$ après convergence les distingue : $[1,+\infty]$ est non bornée, $[1,10]$ est bornée.}
+\label{fig:infinite-loop-frise}
+\end{figure}
+
+\subsection{Ce que le point fixe laisse à la règle}
+\label{sec:infinite-loop-signal}
+
+Deux champs de l'\code{AnalysisResult} portent le signal. Le premier est la trace de widening :
+
+\rustsnippet[label={lst:infinite-loop-widen-event}]{src/engine/analysis_result.rs}{18}{28}{la provenance d'un widening forcé}
+
+Elle est remplie par la boucle externe, à la fin de chaque tour, au test de convergence :
+
+\rustsnippet[label={lst:infinite-loop-widen-fill}]{src/engine/fixpoint.rs}{485}{529}{le test de convergence et l'enregistrement du widening, sur \code{render} $\join$ \code{effets} seulement}
+
+Trois détails de cet extrait comptent pour la règle. D'abord, \code{changed_labels} est pris sur \code{new_state_incycle}, le join du rendu et des effets \emph{sans} les handlers ni les écritures des enfants (l.~486) : un slot que seul un clic fait grandir s'élargit dans le store (le \code{widen_to} porte sur \code{new_state} entier, l.~491--493) mais n'entre pas dans \code{widen_trace} --- \og handler widening is not a bug\fg. Ensuite, \code{or_insert_with} garde la \emph{première} itération de widening, la plus informative pour le témoin. Enfin, le garde-fou des 100 itérations (l.~500--512) inscrit \emph{tous} les labels du store dans la trace avant de forcer la convergence : sur une entrée pathologique, la première porte du bras 1 est ouverte pour chaque slot. Le second champ est la valeur écrite par les effets, recalculée après convergence en rejouant chaque corps d'effet depuis un store $\Bot$ (\cref{chap:point-fixe-composant}, où ce rejeu \og pur\fg{} est lu ligne à ligne) : elle ne contient que ce que les setters écrivent, pas la valeur préexistante. Le prédicat qui la lit vit dans le domaine :
+
+\rustsnippet[label={lst:infinite-loop-unbounded}]{src/domains/impls/state_value.rs}{371}{382}{\code{is_unbounded} : les trois formes de la croissance non bornée}
+
+\begin{definition}{Signal de divergence d'un slot}{infinite-loop-signal}
+Dans un \code{AnalysisResult} convergé, un slot $\ell$ porte un \emph{signal de divergence} lorsque $\ell \in \dom(\code{widen_trace})$ et que \code{effect_setter_writes.get}$(\ell)$ est soit $\Bot$ (aucune écriture rejouée n'a produit de valeur), soit non bornée au sens de \code{is_unbounded} : une borne d'intervalle infinie, une référence \code{PerRender}, ou un résidu $\Top$.
+\end{definition}
+
+Le signal est un \emph{fait may} au sens de la \cref{def:must-may} : un widening n'est qu'un abandon de précision, forcé par un seuil d'itérations, sur un store qui joint aussi ce que les handlers et les enfants écrivent. Il inclut les vraies boucles ; il n'inclut qu'elles seulement si aucune autre source de croissance n'existe.
+
+\subsection{Les deux portes}
+
+Le bras intra tient en une vingtaine de lignes. Après avoir collecté les appels de setter du corps (\code{collect_setter_calls_with_extra}, profondeur 1, avec les fonctions liées dans le rendu), il applique trois filtres :
+
+\rustsnippet[label={lst:infinite-loop-portes}]{src/rules/impls/infinite_loop.rs}{115}{136}{le filtre \code{Handler} et les deux portes du bras intra}
+
+La première porte demande que le slot soit dans \code{widen_trace} ; la seconde, que l'écriture rejouée ne soit pas à la fois non-$\Bot$ et bornée. Sur \code{Bounded}, la première passe (\code{widened: [0]}) et la seconde absout : \code{[1,10]} est bornée. Le commentaire du code le dit en une phrase, \og narrowing held the growth\fg{} --- le mot est celui de l'\adr{14}, dont la partie narrowing n'a jamais été implémentée : c'est le \emph{raffinement de garde} pendant la phase ascendante et le widening à seuils qui bornent l'écriture (\cref{chap:point-fixe-composant}).
+
+\begin{piege}
+La seconde porte traite $\Bot$ comme \og inconnu, ne pas absoudre\fg{}, pas comme \og rien n'est écrit\fg. La raison est un effet de bord du rejeu depuis $\Bot$ : un updater fonctionnel \code{setX(c => c + 1)} y lie \code{c} à la valeur du store $\Bot$, donc écrit $\Bot$ (\cref{chap:point-fixe-composant}). Absoudre sur $\Bot$ serait un faux négatif certain sur la forme fonctionnelle de \code{Counter}. Le test unitaire \code{is_unbounded_requires_active_num_slot} (\srcline{src/domains/impls/state_value.rs}{807}) fixe la frontière : un intervalle $\Bot$ n'est pas \og non borné\fg{}, c'est la règle qui en fait un cas à part.
+\end{piege}
+
+Le filtre qui précède les portes est le filtre de \emph{classe} : une écriture que seul un écouteur d'événement enregistré atteint (\code{addEventListener('keydown', h)} dans le corps de l'effet) a la classe \code{SetterCallPhase::Handler} et ne ferme pas la boucle, puisqu'il faut un événement utilisateur par itération. C'est la même raison qui exclut les handlers du graphe de churn (\cref{chap:churn}). Le commentaire rappelle l'\issue{93} : avant \adr{34} §4, la marche calculait cette classe et le repli la jetait, si bien qu'un écouteur \code{keydown} se lisait comme une écriture de corps d'effet.
+
+\subsection{La garde $\forall$-stable sur les deps}
+\label{sec:infinite-loop-deps}
+
+Avant les portes, deux filtres portent sur les deps de l'effet :
+
+\rustsnippet[label={lst:infinite-loop-deps}]{src/rules/impls/infinite_loop.rs}{96}{113}{montage seul, puis suppression seulement si \emph{tous} les deps sont prouvés stables}
+
+Le premier reconnaît un tableau vide, mais seulement si le moteur \emph{sait} qu'il est vide : \code{Arity::Exact(0)}. Un \code{[...xs]} dont l'aplatissement ne laisse rien n'a pas cette arité et n'est pas mount-only. Le second est le filtre qui a coûté un faux négatif au projet, et dont le quantificateur a été corrigé deux fois.
+
+\begin{decision}[ADR-021 §5 : le dep $\Top$ et son jumeau de quantificateur]
+\textbf{Constat.} La première version du filtre s'appuyait sur \code{is_unstable} (\code{PerRender} seulement) : un dep prop, évalué $\Top$, se lisait \og ne change pas\fg, l'effet était sauté, et \code{useEffect(() => setN(n + 1), [data])} bouclait en silence --- le faux négatif livré. Le premier correctif (\code{all_deps_may_change}) a réparé $\Top$ mais gardé le mauvais quantificateur : il sautait dès qu'\emph{un} dep était prouvé stable, ce qui rouvrait le FN une constante plus loin (\code{[label, data]}).
+\textbf{Décision.} React ré-exécute un effet dès qu'\emph{un} dep change (sémantique \og ou\fg) ; la suppression doit donc quantifier $\forall$ : l'effet n'est ignoré que si \emph{tous} ses deps sont prouvés stables, sur une liste d'arité exacte (un spread aplati cache des éléments qui peuvent bouger), $\Top$ et \code{Versioned} n'étant jamais stables. \textbf{Alternatives refusées} : garder \og un dep stable gate\fg{} (FN), ou ne plus filtrer du tout (FP massifs sur les effets à deps constants).
+\end{decision}
+
+Le prédicat lui-même est dans les helpers, et son doc-comment raconte la même histoire :
+
+\rustsnippet[label={lst:infinite-loop-forall}]{src/rules/helpers/mod.rs}{225}{235}{\code{all_deps_provably_stable} : $\forall$-stable, clé sur \code{stability_verdict_of}}
+
+\code{stability_verdict_of} (\cref{chap:api-regles}) replie $\Top$ du côté may ; \code{Versioned} n'est pas stable non plus. Deux tests d'intégration verrouillent les deux FN, \code{top_prop_dep_does_not_silence_self_write_loop} et \code{stable_dep_alongside_top_dep_does_not_gate_self_write_loop} (\src{tests/effect_cycles.rs}{367}{417}) ; leur complément \code{all_stable_deps_gate_self_write_effect} (l.~419) vérifie que le filtre agit encore.
+
+\begin{exemple}{Un dep stable, puis un dep stable à côté d'un dep $\Top$}{infinite-loop-deps}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch19/deps.tsx}},label={lst:infinite-loop-deps-tsx}]
+import { useState, useEffect } from "react";
+
+export function StableGate({ label }: { label: string }) {
+  const [n, setN] = useState(0);
+  const limit = 10;
+  useEffect(() => {
+    setN(n + 1);
+  }, [limit]);
+  return <p>{label} {n}</p>;
+}
+
+export function MixedDeps({ data }: { data: unknown }) {
+  const [n, setN] = useState(0);
+  const limit = 10;
+  useEffect(() => {
+    setN(n + 1);
+  }, [limit, data]);
+  return <p>{n}</p>;
+}
+\end{lstlisting}
+Sortie (\code{--trace --show-clean --rule infinite-loop} ; sans le filtre \code{--rule}, \regle{missing-deps} signale en plus la lecture de \code{n} dans les deux effets, et \code{StableGate} n'est plus propre) :
+\begin{sortie}
+  MixedDeps  (2 hooks)  /tmp/ch19/deps.tsx
+    warn   infinite-loop  [hook:0]  (line 15:2)  this effect keeps pushing state `n` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop
+       → state `n` is written here [hook:1] (line 15:2)
+       → the abstract value of state `n` kept growing and was widened at iteration 3
+  StableGate  (2 hooks)  /tmp/ch19/deps.tsx  ✓
+\end{sortie}
+\code{StableGate} : \code{limit} est une constante, l'effet tire une fois après le montage, la règle se tait (les deux slots sont pourtant élargis, comme au \cref{ex:infinite-loop-counter}). \code{MixedDeps} : \code{data} est un prop, $\Top$ ; le quantificateur $\forall$ échoue, l'effet est examiné, le signal est là. Concrètement, un parent qui passe un \code{data} neuf à chaque rendu fait bien boucler \code{MixedDeps}.
+\end{exemple}
+
+\subsection{Le diagnostic et ses témoins}
+
+Quand les deux portes passent, la règle émet un \Warning{} ancré sur le \emph{slot} et sur la plage de l'effet, respectivement par \code{with_label(state_label)} et par \code{with_range} :
+
+\rustsnippet[label={lst:infinite-loop-diag}]{src/rules/impls/infinite_loop.rs}{143}{156}{le \Warning{} du bras intra}
+
+La chaîne \code{deps_note}, calculée juste avant (l.~138--142), ajoute la parenthèse \og its deps do not provably gate it, so the effect can re-run every render\fg{} dès que \code{deps.is_declared()} (\src{src/ir/hooks.rs}{145}{150}) : l'auteur a écrit un tableau, lisible ou non ; un effet sans tableau n'a pas besoin qu'on le dise. Suivent deux séries de notes. Pour chaque handler du composant qui appelle aussi un setter du slot, une note \code{Step::Handler} (\src{src/rules/impls/infinite_loop.rs}{158}{183}) : l'événement qui relance la boucle. Puis l'historique du slot, pris directement dans la provenance du moteur :
+
+\rustsnippet[label={lst:infinite-loop-slot-history}]{src/rules/api/witness.rs}{529}{560}{\code{slot_history} : un \code{Write} par effet écrivain au tour du widening, puis le \code{Widen}}
+
+C'est exactement ce qu'affiche la sortie du \cref{ex:infinite-loop-counter} : \og state \code{`count`} is written here [hook:1]\fg{} (l'effet 1 était dans \code{writers}), puis \og kept growing and was widened at iteration 3\fg. La règle \regle{widening-info} (\file{src/rules/impls/widening_info.rs}, 41 lignes) émet, sous \code{--info}, une \Info{} portant la même chaîne de témoins (\code{slot_history}) pour \emph{chaque} label de \code{widen_trace}, sans porte : c'est le marqueur de perte de précision du \cref{chap:regles-effets}, et la raison pour laquelle \code{Bounded} et \code{MountOnly} affichent une \Info{} là où \regle{infinite-loop} se tait (\code{--info --rule widening-info --show-clean}) :
+\begin{sortie}
+  Bounded  (2 hooks)  /tmp/ch19/counter.tsx
+    info   widening-info  (line 13:2)  state `count` kept changing during analysis and was approximated to converge, so findings that depend on it may be imprecise
+       (2 trace step(s), rerun with --trace)
+  Counter  (2 hooks)  /tmp/ch19/counter.tsx
+    info   widening-info  (line 5:2)  state `count` kept changing during analysis and was approximated to converge, so findings that depend on it may be imprecise
+       (2 trace step(s), rerun with --trace)
+  MountOnly  (2 hooks)  /tmp/ch19/counter.tsx
+    info   widening-info  (line 21:2)  state `count` kept changing during analysis and was approximated to converge, so findings that depend on it may be imprecise
+       (2 trace step(s), rerun with --trace)
+\end{sortie}
+
+\begin{piege}
+Dans \og \code{[hook:0]}\fg, le label désigne le \emph{slot} pour les bras 1 et 4 (\code{with_label(state_label)}), mais l'\emph{effet} pour les bras 2 et 3 (\code{with_label(*eff_label)}, \code{with_label(e.effect_label)}). Sur \code{Counter}, \code{[hook:0]} est \code{count} et la note \code{[hook:1]} est l'effet. La \cref{sec:infinite-loop-self-churn} montre les deux conventions côte à côte sur \code{NoDeps} et \code{ObjChurn}.
+\end{piege}
+
+\subsection{Pourquoi \Warning{} et pas \Error}
+\label{sec:infinite-loop-plafond}
+
+Le bras 1 n'a aucune voie vers l'\Error{} : le constructeur est \code{Diagnostic::warn}, et aucune primitive must ne frappe de jeton pour lui. L'\issue{144} (ouverte, \emph{precision-fn}) constate l'asymétrie : la divergence de \emph{valeur} plafonne à \Warning{} alors que la divergence de \emph{référence} (bras 4) atteint l'\Error. La raison tient à ce que le signal prouve.
+
+\begin{decision}[ADR-008 puis ADR-015 : le widening comme signal de boucle]
+\textbf{Constat.} L'\adr{8} pose le principe : \og If \code{StateStore<StateValue>} widens on a label → potential infinite loop\fg, avec une table de précision par type ; sa limite documentée est \code{useState(null)} sans annotation, dont le join \code{Null} $\join$ \code{Number} donnait $\Top$ et convergeait immédiatement --- un FN.
+\textbf{Décision.} L'\adr{15} remplace l'énumération plate par un \emph{produit} de sortes disjointes (\cref{chap:statevalue-stabilite}) et choisit la coercition JS \code{ToNumber(null) = 0} dans l'arithmétique : le compteur \code{useState(null)} non gardé s'élargit et est signalé ; \code{if (!user) setUser({...})} converge par raffinement de nullité. Ce que l'\adr{15} ne change pas : le signal reste un widening, c'est-à-dire un fait may.
+\end{decision}
+
+Un widening dit \og l'analyse n'a pas su borner cette valeur en trois tours\fg. Ce n'est pas \og cette valeur change à chaque rendu concret\fg. Trois causes autres qu'une boucle le produisent : une garde que l'analyse n'exploite pas (\code{Dead} au \cref{chap:point-fixe-composant} : une branche morte quand même exécutée), une croissance venue d'un \emph{autre} slot, et la coercition ou le join qui perdent l'information. Le programme suivant montre la deuxième cause.
+
+\begin{exemple}{Un miroir nourri par un handler : faux positif du bras 1}{infinite-loop-mirror}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch19/handlerfp.tsx}},label={lst:infinite-loop-mirror}]
+import { useState, useEffect } from "react";
+
+export function Mirror() {
+  const [a, setA] = useState(0);
+  const [b, setB] = useState(0);
+  useEffect(() => {
+    setB(a * 2);
+  }, [a]);
+  return <button onClick={() => setA(a + 1)}>{b}</button>;
+}
+\end{lstlisting}
+\begin{sortie}
+  [verbose] Mirror: 3 iteration(s), widened: [1]
+  Mirror  (4 hooks)  /tmp/ch19/handlerfp.tsx
+    warn   derived-state  [hook:2]  (line 6:2)  this effect always sets `setB` to a call-free expression of `a` replace with `useMemo` or compute during render
+       → `a` is read here [hook:0] (line 6:2)
+       → state `b` is written here [hook:2] (line 7:4)
+    warn   infinite-loop  [hook:1]  (line 6:2)  this effect keeps pushing state `b` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop
+       → state `b` is written here [hook:2] (line 6:2)
+       → the abstract value of state `b` kept growing and was widened at iteration 3
+\end{sortie}
+Concrètement, \code{Mirror} ne boucle pas : l'effet ne re-tire qu'à chaque clic. Abstraitement, le store joint les écritures des handlers (\code{new_state = new_state_incycle.join(&state_from_handlers)}, \cref{lst:infinite-loop-widen-fill}) : \code{a} grandit à cause du clic, \code{b = a * 2} grandit avec lui \emph{par l'effet}, donc \code{b} change dans \code{new_state_incycle} et entre dans \code{widen_trace} ; au rejeu, \code{a} vaut déjà un intervalle élargi, donc \code{a * 2} est non borné. Les deux portes passent (le diagnostic observé l'atteste). C'est un faux positif toléré par l'invariant de soundness, au niveau \Warning{} ; le \regle{derived-state} voisin est, lui, un vrai positif.
+\end{exemple}
+
+Ce FP est la démonstration par l'exemple de l'\issue{144} : promouvoir le bras 1 en \Error{} demanderait un fait de plus, par exemple \og l'effet est re-déclenché par le slot qu'il écrit\fg{} (un trigger exact du slot écrit vers l'effet écrivain), et ce fait n'est pas dans le signal. L'exercice \ref{exo:infinite-loop-mirror} y revient.
+
+\begin{piege}
+Le chemin CLI a un faux négatif que le chemin \code{analyze_component} n'a pas. Sur \code{useEffect(() => { setX((c) => c + 1); })} (\file{/tmp/ch19/updater.tsx}), \code{--verbose} affiche \og \code{Updater: 2 iteration(s), widened: []}\fg{} et \code{verified infinite-loop} : aucun diagnostic, alors que le composant boucle. En intra, l'updater rejoué donne $\Bot$ et la porte laisse passer ; en inter (\code{analyze_program}), le slot vaut $\Top$ dès le deuxième tour par le store partagé, \code{widen_trace} reste vide et la première porte ferme : le composant écrit ses propres slots dans le \code{SharedStateStore}, qui les rejoint au tour suivant par \code{external_updates} (l.~488--493 de \cref{lst:infinite-loop-widen-fill}), et le join atteint $\Top$ sans passer par le widening (\cref{chap:point-fixe-composant}). Aucune issue ne décrit ce cas au commit \snapshotCommit.
+\end{piege}
+
+% ===========================================================================
+\section{Bras 2 : le setter d'un parent}
+\label{sec:infinite-loop-cross}
+
+\begin{exemple}{L'enfant réécrit l'état du parent}{infinite-loop-cross}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch19/cross.tsx}},label={lst:infinite-loop-cross}]
+import { useState, useEffect } from "react";
+
+export function Parent() {
+  const [data, setData] = useState({ n: 0 });
+  return <Child value={data} onUpdate={setData} />;
+}
+
+function Child({ value, onUpdate }: { value: { n: number }; onUpdate: (v: { n: number; seen: boolean }) => void }) {
+  useEffect(() => { onUpdate({ n: value.n, seen: true }); }, [value]);
+  return <div />;
+}
+\end{lstlisting}
+\begin{sortie}
+  Child  (1 hooks)  /tmp/ch19/cross.tsx
+    warn   cross-component-infinite-loop  [hook:0]  (line 9:2)  this effect calls `onUpdate`, a state setter of parent `Parent` (its deps do not provably gate it, so the effect can re-run every render). Parent re-renders → child re-renders → effect fires again: infinite loop
+  Parent  (1 hooks)  /tmp/ch19/cross.tsx  ✓
+\end{sortie}
+Concrètement : \code{onUpdate} pose un objet neuf dans \code{data}, \code{Parent} re-rend, \code{Child} reçoit un \code{value} neuf, son effet repart. Le diagnostic est émis dans \code{Child}, ancré sur l'\emph{effet} (\code{[hook:0]} est le label de l'effet, le seul hook de \code{Child}).
+\end{exemple}
+
+Le bras cross est la branche \code{else if} du même \code{for} :
+
+\rustsnippet[label={lst:infinite-loop-cross-code}]{src/rules/impls/infinite_loop.rs}{195}{226}{le bras cross-component}
+
+\code{cs_vars} associe la variable \code{onUpdate} à un \code{SetterProp} $\{$\code{component: Parent}, \code{label: 0}$\}$ : la reconnaissance vient de l'analyse descendante, qui a passé à \code{Child} un \code{StateSetter} qualifié par son propriétaire (\cref{chap:inter-composants}). La valeur lue est \code{result.shared_state.get(parent_comp, parent_label)}, la tranche du \code{SharedStateStore} où les enfants déposent ce qu'ils écrivent dans les slots de leurs parents. Deux \code{continue} : $\Bot$ (le setter n'a jamais été atteint par l'analyse sémantique) et une écriture bornée. Ici l'écriture est un littéral objet, \code{PerRender}, donc \code{is_unbounded}.
+
+Le niveau est \Warning{} sans voie vers l'\Error, pour une raison structurelle que le bras 3 partagera : le dep \code{value} de l'effet enfant est \emph{versionné} par le slot du parent, jamais le slot exact (un prop n'est pas un \code{StateVal}), donc le must-rerun est improuvable. Le filtre de deps de la \cref{sec:infinite-loop-deps} s'applique tel quel : \code{value} évalue \code{Versioned({(Parent, 0)})}, qui n'est pas stable, donc l'effet n'est pas gaté.
+
+\begin{piege}
+L'ordre des bras décide de la formulation. L'effet de \code{Child} entre dans \code{reported_effects} ; le bras 3, qui aurait aussi trouvé l'auto-boucle $(\code{Parent}, \code{data}) \to (\code{Parent}, \code{data})$ portée par cet effet (cycle \code{cross_component} de longueur 1), le saute. Le même programme, si le bras 2 se taisait, recevrait un \Warning{} du bras 3 avec la formulation \og may store a fresh reference into state \code{`data` of `Parent`}\fg. Deux bras, un même plafond, deux textes. Le test \code{cross_component_object_churn_warns} (\src{tests/effect_cycles.rs}{211}{244}), écrit sur ce même programme, ne verrouille que le nom, le nombre et le niveau (un \Warning{} qui nomme \code{`Parent`}) : les deux formulations le satisfont. Son commentaire attribue encore le diagnostic au graphe (\og The Versioned dep gates the old cross arm\fg), ce qui était vrai tant que le filtre de deps tenait \code{Versioned} pour stable ; depuis le quantificateur $\forall$-stable (\cref{sec:infinite-loop-deps}), c'est le bras 2 qui parle, comme le montre la sortie observée.
+\end{piege}
+
+La limite de ce bras est celle de l'analyse descendante. Un parent qui n'est pas atteint en phase 1 (parce qu'il n'est pas une racine, ou parce que l'élément \code{<Child/>} ne se résout pas) laisse \code{shared_state} à $\Bot$ pour son slot : \code{continue}, silence. C'est l'\issue{20} (\emph{precision-fn}, \file{docs/limitations.md}) : \og cross-component rules need the parent to be reached top-down\fg. Le graphe de churn a la même dépendance, puisque ses lignes \code{owner} viennent de la même résolution.
+
+% ===========================================================================
+\section{Bras 3 : les cycles du graphe de churn}
+\label{sec:infinite-loop-graphe}
+
+\subsection{Quatre programmes, quatre verdicts}
+
+Le bras 3 ne calcule rien : il lit les cycles que le moteur a trouvés dans le graphe de churn (\cref{def:churn-graph}) et décide, pour chaque arête portée par un effet du composant courant, d'un niveau et d'un texte. Les quatre composants suivants couvrent les verdicts possibles ; le \cref{chap:churn} a construit leurs graphes ligne à ligne, nous ne retenons ici que ce que la règle en fait.
+
+\begin{exemple}{Cycle tout-Must, revivification, paire fetch-once, DAG}{infinite-loop-cycles}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch19/cycles.tsx}},label={lst:infinite-loop-cycles}]
+import { useState, useEffect } from "react";
+
+export function TwoEffects() {
+  const [a, setA] = useState({ n: 0 });
+  const [b, setB] = useState({ n: 0 });
+  useEffect(() => { setB({ from: a.n }); }, [a]);
+  useEffect(() => { setA({ from: b.n }); }, [b]);
+  return <div>{a.n + b.n}</div>;
+}
+
+export function MultiWriter() {
+  const [a, setA] = useState<object | null>(null);
+  const [b, setB] = useState<object | null>(null);
+  useEffect(() => { if (!b) setB({ src: 'e1' }); }, [a]);
+  useEffect(() => { setA({ src: 'e2' }); }, [b]);
+  useEffect(() => { setB(null); }, [a]);
+  return <div />;
+}
+
+export function FetchOncePair() {
+  const [a, setA] = useState<object | null>(null);
+  const [b, setB] = useState<object | null>(null);
+  useEffect(() => { if (!b) setB({ src: 'e1' }); }, [a]);
+  useEffect(() => { if (!a) setA({ src: 'e2' }); }, [b]);
+  return <div>{a && b ? 'ok' : 'loading'}</div>;
+}
+
+export function Dag() {
+  const [a, setA] = useState({ n: 0 });
+  const [b, setB] = useState({ n: 0 });
+  const [c, setC] = useState({ n: 0 });
+  useEffect(() => { setB({ from: a.n }); }, [a]);
+  useEffect(() => { setC({ from: b.n }); }, [b]);
+  return <div onClick={() => setA({ n: 1 })}>{c.n}</div>;
+}
+\end{lstlisting}
+Sortie (\code{--trace --info --show-clean --rule infinite-loop --rule cross-component-infinite-loop}) :
+\begin{sortie}
+  Dag  (6 hooks)  /tmp/ch19/cycles.tsx
+    info   infinite-loop  [hook:1]  (line 32:2)  this effect depends on object state but freshly recreates state `b` outside its deps. No update cycle was found, but deps may be too imprecise to rule one out
+       → a fresh value is written to state `b` here [hook:3] (line 32:20)
+    info   infinite-loop  [hook:2]  (line 33:2)  this effect depends on object state but freshly recreates state `c` outside its deps. No update cycle was found, but deps may be too imprecise to rule one out
+       → a fresh value is written to state `c` here [hook:4] (line 33:20)
+  FetchOncePair  (4 hooks)  /tmp/ch19/cycles.tsx  ✓
+    verified  infinite-loop  no effect diverges into an infinite render loop
+  MultiWriter  (5 hooks)  /tmp/ch19/cycles.tsx
+    warn   infinite-loop  [hook:2]  (line 14:2)  these effects may form a state-update cycle (`a` → `b` → `a`) where each step may store a fresh reference that re-runs the next effect: possible infinite render loop
+       → a fresh value is written to state `b` here [hook:2] (line 14:28)
+       → cycle continues: this effect freshly stores state `a` [hook:3] (line 15:20)
+    warn   infinite-loop  [hook:3]  (line 15:2)  these effects may form a state-update cycle (`a` → `b` → `a`) where each step may store a fresh reference that re-runs the next effect: possible infinite render loop
+       → a fresh value is written to state `a` here [hook:3] (line 15:20)
+       → cycle continues: this effect freshly stores state `b` [hook:2] (line 14:28)
+  TwoEffects  (4 hooks)  /tmp/ch19/cycles.tsx
+    error  infinite-loop  [hook:2]  (line 6:2)  these effects form a state-update cycle (`a` → `b` → `a`) where each step stores a fresh reference that re-runs the next effect: infinite render loop
+       → a fresh value is written to state `b` here [hook:2] (line 6:20)
+       → cycle continues: this effect freshly stores state `a` [hook:3] (line 7:20)
+    error  infinite-loop  [hook:3]  (line 7:2)  these effects form a state-update cycle (`a` → `b` → `a`) where each step stores a fresh reference that re-runs the next effect: infinite render loop
+       → a fresh value is written to state `a` here [hook:3] (line 7:20)
+       → cycle continues: this effect freshly stores state `b` [hook:2] (line 6:20)
+\end{sortie}
+\end{exemple}
+
+Les lignes de la relation \relation{slot_writers} (imprimées par une petite sonde hors dépôt, écrite pour le \cref{chap:churn}, qui parcourt la relation ; colonne \code{via} élaguée) expliquent les forces des arêtes de la \cref{fig:infinite-loop-graphes}~:
+
+\begin{sortie}
+=== TwoEffects
+  slot=0 setter=setA line=Some(7) region=Effect(3) phase=Effect block=Some(0) fresh=Fresh
+  slot=1 setter=setB line=Some(6) region=Effect(2) phase=Effect block=Some(0) fresh=Fresh
+=== MultiWriter
+  slot=0 setter=setA line=Some(15) region=Effect(3) phase=Effect block=Some(0) fresh=Fresh
+  slot=1 setter=setB line=Some(14) region=Effect(2) phase=Effect block=Some(1) fresh=Fresh
+  slot=1 setter=setB line=Some(16) region=Effect(4) phase=Effect block=Some(0) fresh=Not
+=== FetchOncePair
+  slot=0 setter=setA line=Some(24) region=Effect(3) phase=Effect block=Some(1) fresh=Fresh
+  slot=1 setter=setB line=Some(23) region=Effect(2) phase=Effect block=Some(1) fresh=Fresh
+=== Dag
+  slot=0 setter=setA line=None    region=Handler(5) phase=Handler block=Some(0) fresh=Fresh
+  slot=1 setter=setB line=Some(32) region=Effect(3) phase=Effect block=Some(0) fresh=Fresh
+  slot=2 setter=setC line=Some(33) region=Effect(4) phase=Effect block=Some(0) fresh=Fresh
+\end{sortie}
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}
+  % TwoEffects
+  \begin{scope}
+    \begin{scope}[on background layer]
+      \node[fill=ra-bg,rounded corners=6pt,fit={(-0.9,-0.8) (2.7,0.8)},inner sep=0pt] {};
+    \end{scope}
+    \node[noeud] (a1) at (0,0) {$a$};
+    \node[noeud] (b1) at (1.8,0) {$b$};
+    \draw[flechemust] (a1) to[bend left=30] node[etiquette,above] {\code{e2}, bloc 0} (b1);
+    \draw[flechemust] (b1) to[bend left=30] node[etiquette,below] {\code{e3}, bloc 0} (a1);
+    \node[etiquette,align=center,text=black] at (0.9,-1.5) {\code{TwoEffects}\\ SCC tout-\code{Must}, un composant\\ $\Rightarrow$ \Error{} sur \code{e2} et \code{e3}};
+  \end{scope}
+  % MultiWriter
+  \begin{scope}[xshift=52mm]
+    \begin{scope}[on background layer]
+      \node[fill=ra-bg,rounded corners=6pt,fit={(-0.9,-0.8) (2.7,0.8)},inner sep=0pt] {};
+    \end{scope}
+    \node[noeud] (a2) at (0,0) {$a$};
+    \node[noeud] (b2) at (1.8,0) {$b$};
+    \draw[flechemay] (a2) to[bend left=30] node[etiquette,above] {\code{e2}, bloc 1, \code{if (!b)}} (b2);
+    \draw[flechemust] (b2) to[bend left=30] node[etiquette,below] {\code{e3}, bloc 0} (a2);
+    \node[etiquette,align=center,text=black] at (0.9,-1.5) {\code{MultiWriter}\\ \code{setB(null)} (\code{e4}) ranime la garde :\\ arête gardée, \code{May} $\Rightarrow$ \Warning};
+  \end{scope}
+  % FetchOncePair
+  \begin{scope}[yshift=-38mm]
+    \node[noeud] (a3) at (0,0) {$a$};
+    \node[noeud] (b3) at (1.8,0) {$b$};
+    \draw[fleche,draw=ra-gray!50,dotted] (a3) to[bend left=30] node[etiquette,above] {tuée} (b3);
+    \draw[fleche,draw=ra-gray!50,dotted] (b3) to[bend left=30] node[etiquette,below] {tuée} (a3);
+    \node[etiquette,align=center,text=black] at (0.9,-1.5) {\code{FetchOncePair}\\ chaque garde meurt sous toutes les\\ écritures de son slot : graphe vide, silence};
+  \end{scope}
+  % Dag
+  \begin{scope}[xshift=52mm,yshift=-38mm]
+    \node[noeud] (a4) at (0,0) {$a$};
+    \node[noeud] (b4) at (1.8,0) {$b$};
+    \node[noeud] (c4) at (3.6,0) {$c$};
+    \draw[flechemust] (a4) -- node[etiquette,above] {\code{e3}} (b4);
+    \draw[flechemust] (b4) -- node[etiquette,above] {\code{e4}} (c4);
+    \node[etiquette,align=center,text=black] at (1.8,-1.5) {\code{Dag}\\ aucune SCC cyclique ; \code{onClick} n'est pas un site\\ $\Rightarrow$ deux \Info{} du bras 4};
+  \end{scope}
+  % légende
+  \begin{scope}[xshift=52mm,yshift=-72mm]
+    \draw[flechemust] (0,0.35) -- (1,0.35) node[etiquette,right,text=black] {\code{Must} : dep exact $\wedge$ \code{Fresh} sur tous les chemins};
+    \draw[flechemay] (0,-0.15) -- (1,-0.15) node[etiquette,right,text=black] {\code{May} : écriture conditionnelle ou dep versionné};
+    \node[fill=ra-bg,rounded corners=3pt,minimum width=9mm,minimum height=5mm] at (0.5,-0.7) {};
+    \node[etiquette,right,text=black] at (1,-0.7) {SCC cyclique trouvée par Tarjan};
+  \end{scope}
+\end{tikzpicture}
+\caption{Les graphes de churn des quatre composants de \cref{lst:infinite-loop-cycles}, avec le verdict du bras 3. \code{eN} est le label du hook porteur ; le bloc est celui de l'écriture dans le corps de l'effet (bloc 0 = entrée = tous les chemins). La ligne \code{setB(null)} de \code{MultiWriter} n'est pas fraîche et ne porte pas d'arête, mais elle est un \emph{site} qui empêche le kill de l'arête $a \to b$.}
+\label{fig:infinite-loop-graphes}
+\end{figure}
+
+Résumons ce que le moteur a décidé avant que la règle ne lise (\cref{chap:churn}). \code{TwoEffects} : deux écritures \code{Fresh} au bloc 0, deux deps exacts, deux arêtes \code{Must}, une SCC $\{a, b\}$ dans le sous-graphe \code{Must}. \code{MultiWriter} : l'écriture de \code{e2} est au bloc 1, sous \code{if (!b)}, donc \code{May} ; elle mourrait sous sa propre écriture, mais le site \code{setB(null)} de \code{e4} la ranime à chaque tour, \code{converges_under_all_writes} échoue, l'arête reste (test \code{multi_writer_revival_is_warning}, \src{tests/effect_cycles.rs}{184}{209}). \code{FetchOncePair} : chaque garde meurt sous toutes les écritures de son slot, les deux arêtes sont tuées, le graphe est vide. \code{Dag} : deux arêtes \code{Must} sans retour ; la ligne de \code{setA} a la phase \code{Handler} et n'est ni un site ni une arête.
+
+\begin{remarque}
+Le commentaire du test \code{multi_writer_revival_is_warning} dit du cycle $a \to b \to a$ qu'il est \og real\fg. Une exécution concrète le nuance : quand \code{a} change, \code{e2} puis \code{e4} tirent dans le même vidage des effets ; l'écriture de \code{e4} (\code{null}) est traitée la dernière, et si \code{b} valait déjà \code{null} l'état final de \code{b} ne change pas, \code{e3} ne repart pas. L'analyse ne modélise pas l'ordre des écritures d'un même vidage ; elle suppose que la revivification peut avoir lieu, et le \Warning{} est la réponse sound --- au pire un faux positif, jamais un silence.
+% Note de rédaction : la trace concrète de MultiWriter est raisonnée sur la sémantique de batching de React, elle n'a pas été exécutée dans un runtime React.
+\end{remarque}
+
+\subsection{Ce que la règle lit et ce qu'elle re-dérive}
+
+La boucle du bras 3 parcourt les cycles, puis les arêtes de chaque cycle portées par un effet du composant :
+
+\rustsnippet[label={lst:infinite-loop-cycles-loop}]{src/rules/impls/infinite_loop.rs}{267}{296}{une arête du cycle, un diagnostic ; la preuve est re-dérivée}
+
+Trois choses se passent avant le texte. La paire (effet, slot cible) entre dans \code{covered} si le slot est local --- \emph{avant} le test de \code{reported_effects}, si bien qu'un effet déjà signalé par le bras 1 ou 2 couvre quand même son écriture pour le bras 4. Le nom du diagnostic suit \code{cycle.cross_component} : c'est un booléen exact du \code{ChurnCycle} (\src{src/engine/churn.rs}{109}{119}), calculé par \code{make_cycle} sur l'ensemble des composants propriétaires et porteurs. Et la preuve vient de \code{must_effect_cycle} (\src{src/rules/api/query.rs}{1002}{1031}, \cref{chap:api-regles}), qui \emph{re-dérive} les deux faits sur les arêtes brutes --- toutes \code{Must}, un seul composant --- au lieu de faire confiance à \code{cycle.all_must}. C'est la frappe \og au point de connaissance\fg{} de l'\adr{21} : le graphe dit \code{Must} ou \code{May}, il ne frappe rien.
+
+\begin{invariant}{Toute \Error{} d'\regle{infinite-loop} passe par une primitive must}{infinite-loop-error}
+Au commit \snapshotCommit, \file{infinite_loop.rs} appelle \code{Diagnostic::error} en deux points seulement : l.~337 avec le jeton de \code{must_effect_cycle} (bras 3) et l.~496 avec celui de \code{must_on_all_paths} (bras 4). Les bras 1 et 2 n'appellent que \code{Diagnostic::warn}. Le sceau de sévérité (\cref{def:certified}) rend impossible une \Error{} construite autrement ; la règle n'a donc pas à \emph{vérifier} \code{all_must}, elle ne peut simplement pas en abuser.
+\end{invariant}
+
+Six formulations suivent, choisies par (longueur du cycle $= 1$ ?, \code{no_deps} ?, preuve ?) :
+
+\rustsnippet[label={lst:infinite-loop-cycles-msg}]{src/rules/impls/infinite_loop.rs}{298}{334}{les six textes du bras 3 ; le texte suit la preuve, pas \code{all_must}}
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}lllp{70mm}@{}}
+\toprule
+longueur & \code{no_deps} & preuve & texte (début) et niveau \\
+\midrule
+1 & oui & oui & \og this effect has no dependency array and stores a fresh reference into state \ldots{} re-triggers itself: infinite render loop\fg{} --- \Error \\
+1 & oui & non & \og \ldots{} and may store a fresh reference \ldots{} can re-trigger itself: possible infinite render loop\fg{} --- \Warning \\
+1 & non & oui & \og this effect stores a fresh reference into state \ldots{} which its own deps react to \ldots{} infinite render loop\fg{} --- \Error \\
+1 & non & non & \og this effect may store a fresh reference \ldots{} can run it again: possible \ldots\fg{} --- \Warning \\
+$\geq 2$ & --- & oui & \og these effects form a state-update cycle (\emph{chemin}) where each step stores a fresh reference \ldots\fg{} --- \Error \\
+$\geq 2$ & --- & non & \og these effects may form a state-update cycle (\emph{chemin}) \ldots{} possible infinite render loop\fg{} --- \Warning \\
+\bottomrule
+\end{tabular}
+\caption{Les six formulations du bras 3 (\src{src/rules/impls/infinite_loop.rs}{298}{334}). \og preuve\fg{} signifie \code{must_effect_cycle} $=$ \code{All} ; un cycle \code{cross_component} peut être tout-\code{Must} et n'avoir pas de preuve, il reçoit alors le texte \og may\fg. Le chemin est rendu par \code{cycle_path} (\src{src/rules/helpers/cycles.rs}{54}{69}), les slots d'un autre composant s'affichant \og \code{`x` of `Parent`}\fg.}
+\label{tab:infinite-loop-textes}
+\end{table}
+
+La longueur 1 avec \code{no_deps} est le cas de \code{NoDeps} (\cref{sec:infinite-loop-self-churn}) : un effet sans tableau qui écrit une référence fraîche est une auto-arête \emph{non} \code{self_slot} du graphe, donc un cycle de longueur 1 du bras 3 --- et non du bras 4, qui saute les effets sans tableau. La longueur 1 sans \code{no_deps} est plus rare : une arête pilotée par deps d'un slot vers lui-même est \code{self_slot} et jamais dans un cycle ; il reste le cas cross, où le slot écrit appartient au parent et le dep est versionné par lui --- l'auto-boucle de \code{Parent}/\code{Child} que le bras 2 a devancée.
+
+Le diagnostic est ancré sur l'\emph{effet} porteur et porte deux sortes de notes, construites aux l.~336--377 du même fichier : un \code{Step::Write} avec \code{ValueClass::Fresh} à la plage de l'écriture, dont le nom est le nom qualifié de la cible (\code{node_display}), puis un \code{Step::CycleEdge} par autre arête du cycle portée par un effet \emph{du même composant} --- les arêtes des autres composants seront racontées dans leur propre passe. C'est ce qu'on lit sur \code{TwoEffects} : \og a fresh value is written to state \code{`b`} here [hook:2]\fg, puis \og cycle continues: this effect freshly stores state \code{`a`} [hook:3]\fg.
+
+\subsection{Deux passes de Tarjan, un plafond pour le cross}
+
+\begin{decision}[ADR-018 : un graphe de churn multi-effets, et ce qui en a bougé]
+\textbf{Constat.} L'\adr{17} avait laissé une limite explicite : deux effets, chacun écrivant l'état que l'autre lit, forment une boucle qu'aucun bras ne voit --- ni le point fixe (rien ne grandit), ni le self-churn (aucun effet ne réécrit \emph{son} dep).
+\textbf{Décision.} Un graphe sur les slots qualifiés $(\text{composant}, \text{label})$, arête $x \to y$ \og un changement de $x$ ré-exécute un effet qui écrit une référence fraîche dans $y$\fg, force \code{Must} ou \code{May} ; un effet sans deps porte une auto-arête ; les écritures de handlers ne portent rien ; Tarjan en deux passes, sous-graphe \code{Must} d'abord (\Error), graphe complet ensuite (\Warning) en sautant les régions déjà couvertes ; les cycles qui traversent plusieurs composants sont plafonnés à \Warning{} sous le nom \regle{cross-component-infinite-loop}, parce qu'un dep prop est \code{Versioned}, jamais le slot exact. \textbf{Alternatives refusées} : une nouvelle règle (même classe de panne, un seul nom), un compteur d'événements encodé dans le store pour faire tirer le widening (\og non-standard hack\fg, déjà refusé par l'\adr{17} §3).
+\textbf{Dérive.} L'ADR situe le graphe dans \file{src/rules/helpers/churn_graph.rs} et conditionne le kill de convergence à un \emph{unique} écrivain d'effet. Au commit \snapshotCommit{} le graphe est un produit du moteur (\file{src/engine/churn.rs}, \adr{42} §4) et le kill est la preuve multi-site sur un plus petit point fixe des sites (\cref{chap:churn}, \issue{154}, \issue{160}, \issue{162}). Le commentaire \og see churn\_graph.rs\fg{} de \cref{lst:infinite-loop-dispatch} est un vestige.
+\end{decision}
+
+Le double passage de Tarjan (\code{find_cycles}, \src{src/engine/churn.rs}{635}{662}, \cref{chap:churn}) a une conséquence de lecture : un nœud pris dans un cycle tout-\code{Must} n'est jamais re-signalé par un cycle \code{May} qui le traverserait aussi. L'\Error{} \og couvre\fg{} la région. Symétriquement, les arêtes \code{self_slot} n'entrent dans aucune des deux passes : c'est la partition du bras 4.
+
+\begin{decision}[ADR-029 : exposer les cycles aux packs sans schéma programme]
+Les règles déclaratives (\cref{chap:regles-declaratives}) lisent le \emph{même} graphe par une ancre \code{churn_cycles} sans arête, projetée sur le composant ancré : une ligne par arête du cycle portée par un effet de ce composant, colonnes exactes $\{$\code{path}, \code{cross_component}, \code{all_must}$\}$. Aucun jeton \code{Certified} n'y est atteignable : le plafond \Warning{} est structurel. La duplication avec le bras 3 est délibérée, et seul le bras graphe est exposé --- l'\adr{20} item 2 interdit de fusionner les deux bras churn.
+\end{decision}
+
+% ===========================================================================
+\section{Bras 4 : le self-churn}
+\label{sec:infinite-loop-self-churn}
+
+\subsection{Une référence recréée dans ses propres deps}
+
+\begin{exemple}{Objet recréé, sans deps, gardé, conditionnel}{infinite-loop-churn}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch19/churn.tsx}},label={lst:infinite-loop-churn}]
+import { useState, useEffect } from "react";
+
+export function ObjChurn() {
+  const [obj, setObj] = useState({ a: 1 });
+  useEffect(() => {
+    setObj({ ...obj, b: 2 });
+  }, [obj]);
+  return <p>{obj.a}</p>;
+}
+
+export function NoDeps() {
+  const [obj, setObj] = useState({ a: 1 });
+  useEffect(() => {
+    setObj({ a: 2 });
+  });
+  return <p>{obj.a}</p>;
+}
+
+export function FetchOnce() {
+  const [user, setUser] = useState<{ id: number } | null>(null);
+  useEffect(() => {
+    if (user === null) setUser({ id: 1 });
+  }, [user]);
+  return <p>{user?.id}</p>;
+}
+
+export function Conditional() {
+  const [obj, setObj] = useState({ a: 1 });
+  useEffect(() => {
+    if (Math.random() > 0.5) setObj({ ...obj, b: 2 });
+  }, [obj]);
+  return <p>{obj.a}</p>;
+}
+\end{lstlisting}
+\begin{sortie}
+  Conditional  (2 hooks)  /tmp/ch19/churn.tsx
+    warn   infinite-loop  [hook:0]  (line 29:2)  this effect may store a fresh reference into state `obj` which its deps react to: possible infinite render loop
+       → a fresh value is written to state `obj` here [hook:1] (line 30:29)
+  FetchOnce  (2 hooks)  /tmp/ch19/churn.tsx  ✓
+    verified  infinite-loop  no effect diverges into an infinite render loop
+  NoDeps  (2 hooks)  /tmp/ch19/churn.tsx
+    error  infinite-loop  [hook:1]  (line 13:2)  this effect has no dependency array and stores a fresh reference into state `obj`, so it re-runs after every render and re-triggers itself: infinite render loop
+       → a fresh value is written to state `obj` here [hook:1] (line 14:4)
+  ObjChurn  (2 hooks)  /tmp/ch19/churn.tsx
+    error  infinite-loop  [hook:0]  (line 5:2)  this effect recreates object state `obj` it depends on. Every run stores a fresh reference (`Object.is` always fails) and re-triggers itself: infinite render loop
+       → a fresh value is written to state `obj` here [hook:1] (line 6:4)
+\end{sortie}
+\end{exemple}
+
+Quatre programmes, quatre bras différents ou presque. \code{ObjChurn} est le cas nominal du bras 4 : \Error, ancrée sur le slot (\code{[hook:0]}). \code{NoDeps} est le bras 3, cycle de longueur 1, ancré sur l'effet (\code{[hook:1]}) ; les deux conventions d'ancrage sont côte à côte. \code{Conditional} est le bras 4 sans preuve : \Warning. \code{FetchOnce} est le silence du kill de convergence : la garde \code{user === null} meurt une fois \code{{ id: 1 }} posé dans le slot, l'arête est tuée par le moteur, le bras 4 ne voit rien.
+
+\begin{react}[Object.is et les références]
+\code{Object.is} compare deux objets par identité. Un littéral \code{{ ...obj, b: 2 }} alloue un objet neuf à chaque évaluation, même si ses champs sont égaux aux précédents : \code{Object.is(prev, next)} est faux à chaque rendu, le dep a changé, l'effet ré-exécute. C'est ce que capture \code{Stability::PerRender} (\cref{def:stabilite}), et ce qui rend le bras 1 aveugle : le join de deux \code{PerRender} est \code{PerRender}, le store converge au premier tour, rien n'entre dans \code{widen_trace}. L'\adr{17} l'énonce comme le point de départ de ce bras.
+\end{react}
+
+\subsection{La partition et le verdict}
+
+Le bras 4 saute d'emblée les effets sans tableau de deps (ils appartiennent au bras 3), puis lit sa partition du graphe :
+
+\rustsnippet[label={lst:infinite-loop-partition}]{src/rules/impls/infinite_loop.rs}{417}{433}{la partition du bras 4 : arêtes pilotées par deps, locales de bout en bout}
+
+Le commentaire énumère ce que le moteur a déjà appliqué en construisant l'arête : la fraîcheur de l'écriture, le kill de convergence, le re-déclenchement sensible aux champs. La règle ne refait rien de tout cela ; elle stratifie :
+
+\rustsnippet[label={lst:infinite-loop-verdict}]{src/rules/impls/infinite_loop.rs}{439}{471}{le verdict par arête : la preuve est re-dérivée des lignes d'écrivains}
+
+Une arête \code{self_slot} est \emph{la} boucle : un dep de l'effet réagit au slot même que l'effet écrit. Le moteur la pousse de deux façons (\src{src/engine/churn.rs}{577}{594}) : depuis un dep \emph{exact} (le dep est le slot), avec la force calculée (\code{Must} si l'écriture est \code{Fresh} sur tous les chemins), ou depuis un dep seulement \emph{versionné} par le slot (un alias, un memo, un champ), toujours \code{May}. Pour l'\Error, la règle ne fait pas confiance à \code{e.strength == Must} seul : elle recollecte, dans \relation{slot_writers}, les blocs des écritures \code{Fresh} de ce slot dans la région de cet effet (lignes \code{owner.is_none()}), et demande à \code{must_on_all_paths} (\cref{chap:api-regles}) de frapper le jeton. Si la force est \code{May} (dep versionné, écriture conditionnelle), ou si le jeton n'est pas frappé (écriture imbriquée, différée), c'est un \Warning. Une arête vers un \emph{autre} slot local est un candidat à cycle multi-effets : si le bras 3 a couvert la paire, silence ; sinon une \Info.
+
+\begin{proposition}{L'\Error{} du self-churn est un triple must}{infinite-loop-triple-must}
+Quand le bras 4 émet une \Error{} pour l'effet $e$ et le slot $\ell$, les trois faits suivants sont établis, chacun par une primitive ou une colonne must : (i) \emph{must-rerun} : un dep de $e$ \emph{est} le slot $\ell$ (\code{EffectTrigger.exact}, \cref{chap:relations}) --- toute écriture qui change $\ell$ ré-exécute $e$, par la sémantique \og ou\fg{} des deps ; (ii) \emph{must-change} : l'écriture est \code{Freshness::Fresh}, c'est-à-dire un argument de sorte référence \code{PerRender} seulement (\cref{chap:relations}) --- chaque exécution pose une référence que \code{Object.is} distingue de la précédente ; (iii) \emph{must-reach} : les blocs des écritures fraîches sont sur tous les chemins du corps (\code{must_on_all_paths}). La composition (i)$\circ$(ii)$\circ$(iii) est une boucle certaine dès le premier commit. Aucun fait may n'entre dans la chaîne ; en particulier la garde $\forall$-stable n'y joue aucun rôle, puisqu'un dep exact n'est jamais stable.
+\end{proposition}
+
+C'est mot pour mot la stratification de l'\adr{17} §3, et l'argument de soundness 3 de la même ADR.
+
+\begin{decision}[ADR-017 §3 et §4 : un bras, pas une règle ; un gate couplé à ce bras]
+\textbf{Constat.} La scission d'\code{Unstable} en \code{Versioned}/\code{PerRender} (\cref{chap:statevalue-stabilite}) tuait un faux positif massif d'\regle{always-unstable-deps} sur l'état objet, mais rouvrait un faux négatif : un effet dont le dep est \code{Versioned({X})} était considéré \emph{gaté}, alors que l'effet lui-même peut être ce qui change $X$.
+\textbf{Décision.} Un nouveau bras d'\regle{infinite-loop} plutôt qu'une nouvelle règle (même classe de panne) et plutôt qu'un compteur d'événements dans le store ; la certitude vient de la \emph{structure} des deps --- \og Certainty cannot come from \code{Versioned}\fg, qui est une borne may --- avec la stratification \Error{}/\Warning{}/silence ci-dessus. Et une dépendance explicite : le fait que \code{Versioned} gate un effet ailleurs n'est sound \emph{que} couplé à ce bras (\og load-bearing soundness dependency\fg).
+\textbf{Dérive.} L'ADR nomme le gate \code{all_deps_unstable}, avec le quantificateur \og un dep stable gate\fg{} ; le code actuel est \code{all_deps_provably_stable}, $\forall$-stable (\cref{sec:infinite-loop-deps}), depuis \adr{21} §5.
+\end{decision}
+
+\begin{decision}[ADR-020 item 2 : les deux bras churn restent séparés]
+Le bras 4 et le graphe ne sont pas deux implémentations parallèles : ils couvrent deux partitions disjointes de la même relation d'arêtes --- \og single-effect same-slot \emph{with deps}\fg{} pour le self-churn, \og length-1 self-edges for effects \emph{without deps} and cross-slot cycles\fg{} pour le graphe ---, tenues par des \code{continue} explicites (\cref{lst:infinite-loop-partition}, \srcline{src/rules/impls/infinite_loop.rs}{417}). Supprimer le self-churn serait un FN sur \code{useEffect(() => setObj({...obj}), [obj])} et la perte de l'\Info. À ne pas re-tenter.
+\end{decision}
+
+\subsection{Meilleur verdict par slot, et les trois textes}
+
+Un même effet peut porter plusieurs arêtes vers le même slot (deux écritures, ou un dep exact et un dep versionné). La règle garde le meilleur verdict par slot, rang \Error{} $>$ \Warning{} $>$ \Info, départagé sur la position source la plus tôt pour que l'ancrage ne dépende pas de l'ordre de la relation (\src{src/rules/impls/infinite_loop.rs}{472}{491}). Les trois textes :
+
+\rustsnippet[label={lst:infinite-loop-textes4}]{src/rules/impls/infinite_loop.rs}{493}{523}{les trois strates du bras 4}
+
+L'\Info{} mérite une phrase. Elle marque une \emph{imprécision résiduelle} : l'effet dépend d'un état objet et recrée fraîchement un \emph{autre} état objet, mais le graphe n'a fermé aucun cycle par cette écriture. Sur \code{Dag}, c'est exact --- il n'y a pas de cycle. Sur un programme où les deps seraient trop imprécis pour que le graphe voie l'arête retour, ce serait le seul indice. Le bloc de commentaires qui précède la fonction (\src{src/rules/impls/infinite_loop.rs}{383}{394}) dit encore, pour l'\Info, \og cross-effect cycles are not analyzed (FN-flavor limit)\fg{} : c'est faux depuis l'\adr{18}, ils le sont, et l'\Info{} n'est émise que quand aucun cycle ne couvre l'écriture. Second doc-comment en retard du fichier.
+
+\subsection{Le re-déclenchement sensible aux champs}
+\label{sec:infinite-loop-fields}
+
+\begin{exemple}{Un updater qui préserve le membre lu par le dep}{infinite-loop-fields}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch19/fields.tsx}},label={lst:infinite-loop-fields}]
+import { useState, useEffect } from "react";
+
+export function Slugify() {
+  const [data, setData] = useState({ name: "", slug: "" });
+  useEffect(() => {
+    setData((prev) => ({ ...prev, slug: prev.name.toLowerCase() }));
+  }, [data.name]);
+  return <p>{data.slug}</p>;
+}
+
+export function SlugifyWhole() {
+  const [data, setData] = useState({ name: "", slug: "" });
+  useEffect(() => {
+    setData((prev) => ({ ...prev, slug: prev.name.toLowerCase() }));
+  }, [data]);
+  return <p>{data.slug}</p>;
+}
+\end{lstlisting}
+\begin{sortie}
+  Slugify  (2 hooks)  /tmp/ch19/fields.tsx  ✓
+    verified  infinite-loop  no effect diverges into an infinite render loop
+  SlugifyWhole  (2 hooks)  /tmp/ch19/fields.tsx
+    error  infinite-loop  [hook:0]  (line 13:2)  this effect recreates object state `data` it depends on. Every run stores a fresh reference (`Object.is` always fails) and re-triggers itself: infinite render loop
+       → a fresh value is written to state `data` here [hook:1] (line 14:4)
+\end{sortie}
+Concrètement, \code{Slugify} ne boucle pas : l'écriture change \code{data} (objet neuf) mais préserve \code{data.name}, le seul membre que le dep lit ; \code{Object.is("", "")} est vrai, l'effet ne repart pas. \code{SlugifyWhole}, dont le dep est l'objet entier, boucle.
+\end{exemple}
+
+Avant l'\issue{90} (\emph{precision-fp}, fermée), les deux composants recevaient l'\Error{} : le graphe était granulaire au slot. Le correctif est dans le moteur, au moment de pousser une arête \code{self_slot} (\src{src/engine/churn.rs}{577}{594}, \code{write_can_retrigger}), et son cœur est une fonction de trente lignes :
+
+\rustsnippet[label={lst:infinite-loop-retrigger}]{src/engine/churn.rs}{828}{852}{\code{can_retrigger} : \code{false} seulement si chaque dep réactif lit un membre préservé}
+
+\code{updater_overwrites} (\src{src/engine/churn.rs}{856}{876}) n'accepte qu'un updater à un paramètre dont chaque \code{return} est soit \code{prev} lui-même, soit un littéral \code{{ ...prev, k: … }} avec le spread \emph{en premier} et des clés nommées ; il rend l'ensemble des clés écrasées. \code{slot_member} (l.~910--927) donne le premier membre qu'un dep lit sur le slot, \code{None} pour le slot nu. La réponse est \code{true} --- \og peut re-déclencher\fg, direction sound --- dès qu'un dep réactif n'est pas placé sous un membre préservé. Le dep \code{data.name} de \code{Slugify} lit \code{name}, l'updater n'écrase que \code{slug} : \code{false}, l'arête est abandonnée. Le dep \code{data} de \code{SlugifyWhole} est le slot nu : \code{true}.
+
+\begin{piege}
+Ce raffinement ne joue que pour l'arête \code{self_slot}, et seulement pour un updater fonctionnel de cette forme exacte. Un \code{setData({ ...data, slug })} (sans updater), un spread en seconde position, une clé calculée ou un second spread rendent \code{None}, donc \code{true} : l'arête reste, et la règle signale. C'est un choix de précision borné par la soundness, pas une analyse générale des champs ; la limite \og granularité slot vs membre du graphe multi-effets\fg{} de \file{docs/limitations.md} le rappelle pour les cycles à plusieurs effets, qui ne bénéficient pas de ce test.
+\end{piege}
+
+\subsection{Un faux négatif de soundness : l'écriture d'une valeur dérivée}
+
+\begin{exemple}{Le memo qui se réécrit}{infinite-loop-derived}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch19/derived157.tsx}},label={lst:infinite-loop-derived}]
+import { useState, useEffect, useMemo } from "react";
+
+export function DerivedWrite() {
+  const [items, setItems] = useState<number[]>([]);
+  const sorted = useMemo(() => [...items].sort(), [items]);
+  useEffect(() => {
+    setItems(sorted);
+  }, [sorted]);
+  return <p>{items.length}</p>;
+}
+\end{lstlisting}
+\begin{sortie}
+  DerivedWrite  (3 hooks)  /tmp/ch19/derived157.tsx  ✓
+    verified  infinite-loop  no effect diverges into an infinite render loop
+\end{sortie}
+Sonde : \code{slot=0 setter=setItems line=Some(7) region=Effect(2) phase=Effect block=Some(0) fresh=Not}.
+\end{exemple}
+
+Concrètement, ce composant boucle : \code{setItems(sorted)} pose un tableau neuf (le memo recalcule \code{[...items].sort()} dès que \code{items} change), \code{items} change, le memo recalcule, \code{sorted} est une référence neuve, l'effet repart. L'analyseur affirme le contraire. La cause est dans la colonne \code{written.fresh} : la valeur de \code{sorted} évalue \code{Versioned({items})} --- le memo porte les labels de ses deps (\adr{17} §4) ---, et \code{value_freshness} (\src{src/engine/written.rs}{185}{200}, \cref{chap:relations}) lit \og \code{Versioned} par le seul slot cible\fg{} comme \code{Freshness::Not} : \og le slot ne change qu'à ses propres sets\fg. C'est vrai du slot, faux de la \emph{valeur dérivée} qu'on y écrit. Une écriture \code{Not} ne porte aucune arête ; le bras 4 ne voit rien, ni le bras 1 (rien ne s'élargit). C'est l'\issue{157} (\emph{soundness-bug}, ouverte), documentée dans \file{docs/limitations.md} : \og a loop carried by such a write is silent\fg. C'est, au commit \snapshotCommit, le seul faux négatif de classe soundness que le projet reconnaisse à cette règle.
+
+% ===========================================================================
+\section{Synthèse : témoins, pièges, écarts}
+\label{sec:infinite-loop-synthese}
+
+\subsection{Les témoins produits}
+
+Chaque bras ancre son diagnostic et raconte sa preuve avec un sous-ensemble fermé des pas de la \cref{def:witness} :
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}lp{30mm}p{80mm}@{}}
+\toprule
+bras & ancre (\code{with_label}, plage) & notes, dans l'ordre \\
+\midrule
+1 & slot ; plage de l'effet & un \code{Step::Handler}$\{$\code{event}, \code{slot}$\}$ par handler qui écrit aussi le slot ; puis \code{slot_history} : un \code{Step::Write}$\{$\code{Unknown}$\}$ par effet écrivain au tour du widening, un \code{Step::Widen}$\{$\code{iteration}$\}$ \\
+2 & effet ; plage de l'effet & aucune \\
+3 & effet ; plage de l'effet & \code{Step::Write}$\{$\code{Fresh}$\}$ à la plage de l'écriture, nom qualifié ; un \code{Step::CycleEdge}$\{$\code{from}, \code{to}$\}$ par autre arête du cycle portée par ce composant \\
+4 & slot ; plage de l'effet & \code{Step::Write}$\{$\code{Fresh}$\}$ à la plage de l'écriture retenue \\
+\bottomrule
+\end{tabular}
+\caption{Les témoins de \regle{infinite-loop} par bras (\file{src/rules/impls/infinite_loop.rs}, l.~158--191, 348--376, 528--538 ; \code{Step} dans \src{src/rules/api/witness.rs}{85}{131}).}
+\label{tab:infinite-loop-temoins}
+\end{table}
+
+\subsection{Faux positifs assumés, faux négatifs observés}
+
+Le tableau qui suit rassemble ce que le chapitre a rencontré, avec l'issue ou le test qui le fixe. Les faux positifs sont tous au niveau \Warning{} ou \Info, conformément à l'invariant ; les faux négatifs sont le vrai coût.
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}lp{52mm}p{28mm}p{44mm}@{}}
+\toprule
+sorte & programme & bras & cause, référence \\
+\midrule
+FP \Warning & \code{Mirror} (\cref{ex:infinite-loop-mirror}) : un slot nourri par un handler en fait grandir un autre par l'effet & 1 & le store joint les handlers ; \code{widen_trace} est par label, pas par déclencheur ; \issue{144} \\
+FP \Warning & \code{Dead} (\cref{chap:point-fixe-composant}) : branche morte exécutée & 1 & la garde réfutée n'élimine pas sa branche \\
+FP \Warning & une garde qui converge mais dont la preuve échoue : reviver qui ne tire qu'une fois par événement externe, fait d'un hook lu comme mouvant & 3, 4 & kill refusé faute de preuve de convergence ; \issue{160}, \issue{161} (ouvertes) \\
+FN & \code{Updater} : \code{setX(c => c + 1)} sans deps, chemin CLI & 1 & $\Top$ par le store partagé ; \code{widen_trace} vide ; non répertorié \\
+FN & \code{DerivedWrite} (\cref{ex:infinite-loop-derived}) & 4 & valeur dérivée lue \code{Not} ; \issue{157} \\
+FN & parent atteint seulement en intra & 2, 3 & \code{shared_state} $\Bot$, lignes \code{owner} absentes ; \issue{20} \\
+FN (hors règle) & alias de setter appelé au rendu & --- & \regle{setter-in-render} ne suit pas les alias ; \regle{infinite-loop} les suit via \code{all_setter_labels} (\cref{chap:regles-etat}) \\
+\bottomrule
+\end{tabular}
+\caption{Faux positifs et faux négatifs d'\regle{infinite-loop} rencontrés au commit \snapshotCommit.}
+\label{tab:infinite-loop-fpfn}
+\end{table}
+
+\begin{piege}
+Deux vues de l'état coexistent (\cref{chap:statevalue-stabilite}) : le \emph{store}, où une écriture \code{PerRender} rend le slot \code{PerRender}, et l'\emph{évaluation} de \code{StateVal}$(\ell)$, qui rend \code{Versioned}$(\{\ell\})$ parce qu'un slot React ne change qu'à ses sets. Le bras 1 lit le store (\code{effect_setter_writes}) ; les deps et la fraîcheur lisent l'évaluation. Confondre les deux produit soit le FP d'\regle{always-unstable-deps} sur l'état objet, soit le FN \code{ObjChurn} : c'est précisément la tension que l'\adr{17} résout en couplant le gate \code{Versioned} au bras 4.
+\end{piege}
+
+\subsection{Mesure sur le corpus}
+
+Sur le corpus de référence (\file{docs/corpus-baseline.json}, 1\,498 diagnostics), \regle{infinite-loop} en compte 35 et \regle{cross-component-infinite-loop} 18 (dossier 10, §5.5). Le \cref{chap:tests-corpus} décrit la méthode ; retenons qu'une modification d'un bras se mesure d'abord là, avant de se justifier.
+
+% ===========================================================================
+\section{\regle{state-lifted-too-high} : un état porté trop haut}
+\label{sec:infinite-loop-lifted}
+
+\subsection{Le bug visé : le \emph{prop drilling}}
+
+\begin{react}[un parent qui re-rend re-rend ses enfants]
+Quand un composant re-rend, React re-rend par défaut tous les éléments qu'il retourne, que leurs props aient changé ou non (sauf barrière \code{React.memo}). Un état possédé par \code{App} et utilisé seulement dans \code{Field}, trois niveaux plus bas, fait donc re-rendre \code{App}, chaque intermédiaire et tous leurs autres enfants à chaque frappe de clavier, pour la seule raison que la valeur \emph{traverse} ces composants en props. La correction est de descendre l'état au plus près de son usage --- la recommandation \og lift state up\fg{} lue à l'envers.
+\end{react}
+
+\begin{exemple}{Trois niveaux de transmission}{infinite-loop-drill}
+\tsxsnippet[label={lst:infinite-loop-drill}]{tests/fixtures/state_lifted_too_high/drill.tsx}{6}{19}{la fixture \code{drill.tsx}}
+\begin{sortie}
+$ reactant check tests/fixtures/state_lifted_too_high/drill.tsx --no-color --fail-on never --trace --rule state-lifted-too-high
+  App  (1 hooks)  tests/fixtures/state_lifted_too_high/drill.tsx
+    warn   state-lifted-too-high  [hook:0]  (line 17:8)  state `value` is only used inside `<Field>`, 3 levels below `App`. Every write re-renders `App`, `Layout`, `Sidebar` and 1 other component they render only to pass it down; move the state into `Field`
+       → `App` passes it to `<Layout>` as `value`, `onChange` without using it itself (line 18:9)
+       → `Layout` passes it to `<Sidebar>` as `value`, `onChange` without using it itself (line 14:15)
+       → `Sidebar` passes it to `<Field>` as `value`, `onChange` without using it itself (line 11:32)
+\end{sortie}
+La version corrigée, \file{drill_fixed.tsx}, où \code{Field} possède l'état, est silencieuse (test \code{the_fixed_version_is_silent}, \srcline{tests/state_lifted_too_high.rs}{58}).
+\end{exemple}
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=7mm and 10mm,
+    comp/.style={bloc,minimum width=22mm},
+    chemin/.style={comp,draw=ra-amber,very thick},
+    maison/.style={comp,draw=ra-blue,fill=ra-blue!12,very thick},
+    frere/.style={comp,draw=ra-gray,dashed}]
+  \node[chemin] (app) {\code{App}\\{\scriptsize propriétaire du slot 0}};
+  \node[chemin,below=of app] (lay) {\code{Layout}};
+  \node[chemin,below left=of lay] (side) {\code{Sidebar}};
+  \node[frere,below right=of lay] (cont) {\code{Content}};
+  \node[maison,below=of side] (field) {\code{Field}\\{\scriptsize \code{<input value onChange>}}};
+  \draw[fleche] (app) -- node[etiquette,right] {\code{value}, \code{onChange}} (lay);
+  \draw[fleche] (lay) -- node[etiquette,left,align=right] {\code{value},\\ \code{onChange}} (side);
+  \draw[fleche,draw=ra-gray] (lay) -- node[etiquette,right] {aucune prop} (cont);
+  \draw[fleche] (side) -- node[etiquette,left,align=right] {\code{value},\\ \code{onChange}} (field);
+  \node[etiquette,text=black,align=left,anchor=north,text width=125mm] at ($(field.south)+(2.4,-0.4)$) {%
+    \code{home.path} $=$ [\code{App}→\code{Layout}, \code{Layout}→\code{Sidebar}, \code{Sidebar}→\code{Field}]\\[3pt]
+    \code{path.len()} $= 3$ (\og 3 levels below \code{`App`}\fg)\\[3pt]
+    \code{siblings} $= 1$ : les autres sites non-provider des composants du chemin (\code{<Content/>} dans \code{Layout} ; \code{<h2>} est un élément hôte, pas un site)\\[3pt]
+    \code{wasted_renders()} $= 3 + 1 = 4 \geq$ \code{minWastedRenders} $= 2$\\[3pt]
+    \code{mount_count(Field)} $= 1$ : conseil \og move the state into \code{`Field`}\fg};
+\end{tikzpicture}
+\caption{L'arbre d'éléments de \file{drill.tsx} vu par \regle{state-lifted-too-high} : le chemin du foyer (bord orangé) descend d'\code{App} à \code{Field} (bleu), le foyer ; \code{Content} (pointillé) est un frère compté dans \code{siblings}. En dessous, les quantités que la règle calcule et le seuil qu'elles franchissent. La construction du chemin par \code{home_of} est détaillée au \cref{chap:inter-composants}.}
+\label{fig:infinite-loop-drill}
+\end{figure}
+
+\subsection{Le foyer d'un slot}
+
+La règle repose sur la dépendance de rendu (\cref{def:render-dep}, \cref{chap:inter-composants}) : pour chaque composant, un résumé local dit quelles \emph{sources} (slots, setters, props, contextes, noms de module) atteignent sa sortie hôte, ses effets, ses conditions de montage --- ce qu'il \emph{utilise} ---, et pour chaque élément qu'il construit, quelles sources chaque prop transporte --- ce qu'il \emph{transmet}. L'index de rendu (\code{RenderIndex}, \file{src/rules/helpers/render_tree.rs}) compose ces résumés sur l'arbre d'éléments, en traduisant la question à chaque saut dans le repère de l'enfant : \code{Slot(0)} d'\code{App} devient \code{Prop(value)} dans \code{Layout}.
+
+\begin{definition}{Foyer d'un slot}{infinite-loop-home}
+Soit un slot $\ell$ possédé par un composant $o$. Un composant \emph{utilise} $\ell$ s'il utilise la valeur du slot, son setter, ou un nom de module que les écrivains de $\ell$ écrivent aussi (\og co-écritures\fg). Le \emph{foyer} de $\ell$ est le composant atteint depuis $o$ en descendant l'arbre d'éléments tant que le composant courant n'utilise pas $\ell$ lui-même et qu'\emph{exactement un} de ses enfants (au sens du sous-arbre) l'utilise ; le \emph{chemin} est la suite des sauts parcourus. Le foyer est indéfini (\code{None}) si un écrivain de $\ell$ peut écrire n'importe quel nom de module, si rien ne lit la valeur de $\ell$, ou si rien n'appelle son setter.
+\end{definition}
+
+C'est exactement \code{home_of} (\src{src/rules/helpers/render_tree.rs}{195}{257}, lu au \cref{chap:inter-composants}), qui rend un \code{Home} :
+
+\rustsnippet[label={lst:infinite-loop-home}]{src/rules/helpers/render_tree.rs}{34}{64}{\code{Hop}, \code{Home} et le compte des rendus gaspillés}
+
+Un \code{Hop} porte les props qui transportent la valeur (\code{None} pour un spread) ou, à défaut, le nom du contexte qui la porte. \code{siblings} est une \emph{borne inférieure} : un site de liste compte une fois. \code{wasted_renders} additionne les composants du chemin et leurs frères.
+
+\subsection{L'absence d'usage vaut preuve}
+
+Le foyer prouve une \emph{absence} : \og aucun composant au-dessus du foyer n'utilise le slot\fg. Pour une règle qui signale sur cette base, la polarité est inversée par rapport à \regle{infinite-loop} : une source \emph{manquante} dans un résumé serait un faux positif, et \og sound\fg{} veut dire ici \og ne jamais affirmer une absence qu'on n'a pas vue\fg. D'où le principe de l'\adr{41} §2, que l'en-tête de \file{render_tree.rs} énonce et que la descente applique à chaque site :
+
+\rustsnippet[label={lst:infinite-loop-uses}]{src/rules/helpers/render_tree.rs}{531}{590}{la descente d'\code{uses} : garde touchée, liste, élément non résolu, profondeur, récursion --- tout inconnu est un usage --- puis la question traduite dans le repère de l'enfant}
+
+\begin{invariant}{Tout inconnu est un usage}{infinite-loop-inconnu-usage}
+Dans la descente de \code{uses}, un composant sans résumé de rendu (\code{UseTree::user()}, \srcline{src/rules/helpers/render_tree.rs}{525}), un site dont la garde de montage touche la question, un site en liste, un élément dont l'origine ne se résout pas à un composant unique enregistré (\code{resolve}, \src{src/rules/helpers/render_tree.rs}{767}{777} : une enveloppe \code{memo}, un composant de bibliothèque, un import non résolu), un composant déjà en cours de visite (récursion) ou une profondeur $\geq 64$ marquent le composant courant comme \emph{utilisateur}. La descente s'arrête donc \emph{au-dessus} de l'inconnu, et le foyer ne peut jamais être placé sous un composant dont on ignore ce qu'il fait de la valeur.
+\end{invariant}
+
+\begin{exemple}{Trois arrêts de la descente}{infinite-loop-arrets}
+Sur les fixtures du dépôt (\file{tests/fixtures/state_lifted_too_high/}), commande avec \code{--rule state-lifted-too-high --show-clean} :
+\begin{itemize}
+  \item \file{unresolved_child.tsx} : \code{Field} vient de \code{some-ui-lib}. \code{Layout} construit un élément non résolu et devient utilisateur ; la descente s'arrête à lui, un niveau sous \code{App}, et ne descend jamais dans \code{Field}. Avec les seuils par défaut le résultat est le silence (test \code{what_cannot_be_proven_is_not_claimed}, l.~137), mais pour une raison de \emph{seuil} : \code{App} ne construit qu'un élément, donc \code{siblings = 0} et \code{wasted_renders() = 1 < 2}. Avec \code{--rule-option state-lifted-too-high:minWastedRenders=1}, on observe bien \og state \code{`value`} is only used inside \code{`<Layout>`}, 1 level below \code{`App`}\fg{} : l'invariant a placé le foyer au-dessus de l'inconnu, pas plus bas.
+  \item \file{list_items.tsx} : \code{Row} est rendu dans un \code{.map}. Le site en liste fait de \code{Wrapper} l'utilisateur ; le foyer est \code{Wrapper}, \og 1 level below \code{`App`}\fg, avec \code{Side} pour frère : \Warning{} \og move the state into \code{`Wrapper`}\fg, jamais \code{Row} --- un état par ligne changerait le sens du programme (test \code{list_items_keep_the_state_in_the_component_that_maps_them}, l.~158).
+  \item \file{intermediate_uses.tsx} : \code{Layout} lit \code{value} dans un attribut hôte (\code{<main title={value}>}). Il est utilisateur ; le foyer est \code{Layout}, \og 1 level below \code{`App`}\fg, frère \code{Other} : \Warning{} \og move the state into \code{`Layout`}\fg{} (test \code{the_home_stops_at_the_first_component_that_uses_it}, l.~96).
+\end{itemize}
+\end{exemple}
+
+\subsection{La règle, ligne à ligne}
+
+Le fichier fait 146 lignes ; en voici la moitié utile. Les deux options d'abord :
+
+\rustsnippet[label={lst:infinite-loop-lifted-options}]{src/rules/impls/state_lifted_too_high.rs}{22}{43}{les deux seuils, déclarés comme options typées}
+
+\code{minDepth} (défaut 1, bornes $[1,64]$) est la profondeur minimale du foyer ; \code{minWastedRenders} (défaut 2, bornes $[1,1000]$) le nombre minimal de rendus gaspillés par écriture. Ce sont des options au sens de l'\adr{41} §4 : le registre valide la configuration contre la spécification, bruyamment. Une valeur hors bornes est refusée avec le code de sortie 2 (observé) :
+\begin{sortie}
+$ reactant check tests/fixtures/state_lifted_too_high/drill.tsx --no-color --fail-on never --rule-option state-lifted-too-high:minDepth=99
+[error] option `minDepth` of rule `state-lifted-too-high` must be an integer between 1 and 64
+\end{sortie}
+Un nom d'option inconnu l'est aussi : c'est ce que verrouille le test \code{a_bad_option_is_a_usage_error} (\srcline{tests/state_lifted_too_high.rs}{187}), avec \code{depth=2}, le code 2 et le message \og has no option \code{`depth`}\fg.
+Puis le cœur de \code{check} :
+
+\rustsnippet[label={lst:infinite-loop-lifted-check}]{src/rules/impls/state_lifted_too_high.rs}{54}{77}{un foyer par slot \code{useState}, trois filtres}
+
+Pour chaque \code{HookEntry::State} du composant courant (le propriétaire), la règle demande le foyer à l'index de rendu du cache programme (\code{ctx.cache().render()}, construit une fois par exécution comme le graphe de churn). Trois \code{continue} : un chemin vide (le propriétaire est lui-même utilisateur, ou plusieurs enfants le sont), un chemin plus court que \code{minDepth}, un gaspillage sous \code{minWastedRenders}. Sur \file{drill.tsx} avec \code{minDepth=4} ou \code{minWastedRenders=5}, la règle se tait (observé) ; avec les défauts, $3 \geq 1$ et $4 \geq 2$ passent.
+
+Le message est assemblé ensuite (l.~78--124) : la liste des composants re-rendus est le chemin plus \og \code{N} other component(s) they render\fg{} pour les frères ; le conseil dépend de \code{mount_count} :
+
+\rustsnippet[label={lst:infinite-loop-lifted-fix}]{src/rules/impls/state_lifted_too_high.rs}{96}{117}{le conseil suit le nombre de sites qui montent le foyer, et le contexte éventuel}
+
+Un foyer monté depuis plusieurs endroits est \emph{partagé} : y déplacer l'état le changerait pour tous les autres appelants, d'où le conseil d'envelopper \emph{ce} \code{<Target>} dans un petit composant propriétaire. Un chemin qui passe par un contexte change le \og pourquoi\fg{} (\og although none of them uses it\fg{} : les composants intermédiaires ne transmettent même pas la valeur, le provider la porte) et le \og comment\fg{} (\og with the \code{`Ctx`} provider that hands it on\fg). Le diagnostic est un \Warning{} ancré sur le slot et la plage du \code{useState}, avec une note \code{Step::Forward}$\{$\code{from}, \code{to}, \code{props}, \code{context}$\}$ par saut (l.~125--142) : c'est la chaîne de la sortie du \cref{ex:infinite-loop-drill}.
+
+\begin{exemple}{Un état qui voyage par contexte}{infinite-loop-context}
+\tsxsnippet[label={lst:infinite-loop-context}]{tests/fixtures/state_lifted_too_high/context.tsx}{6}{21}{la fixture \code{context.tsx}, première moitié}
+\begin{sortie}
+  App  (1 hooks)  tests/fixtures/state_lifted_too_high/context.tsx
+    warn   state-lifted-too-high  [hook:0]  (line 14:8)  state `q` is only used inside `<Search>`, 2 levels below `App`. Every write re-renders `App`, `Page` and 2 other components they render although none of them uses it; move the state into `Search`, with the `Query` provider that hands it on
+       → `App` renders `<Page>` inside the `Query` provider without using it itself (line 18:6)
+       → `Page` renders `<Search>` inside the `Query` provider without using it itself (line 12:41)
+  Guarded  (1 hooks)  tests/fixtures/state_lifted_too_high/context.tsx  ✓
+  OtherSearch  (2 hooks)  tests/fixtures/state_lifted_too_high/context.tsx  ✓
+  Search  (2 hooks)  tests/fixtures/state_lifted_too_high/context.tsx  ✓
+\end{sortie}
+(Commande : \code{--trace --show-clean --rule state-lifted-too-high}.)
+Le site \code{<Query.Provider value={{ q, setQ }}>} a \code{provides = Some(Query)} ; il est sauté par la descente (\cref{lst:infinite-loop-uses}, \og A provider's value is followed to the elements it wraps\fg), et les éléments qu'il enveloppe reçoivent \code{Context(Query)} dans leur question. \code{Header} ne consomme pas le contexte, \code{Page} non plus ; \code{Search} l'appelle par \code{useContext(Query)}. Les deux frères comptés sont \code{Header} dans \code{App} et \code{Header} dans \code{Page}. La seconde moitié du fichier, \code{Guarded}, place un \code{<Tooltip/>} importé d'une bibliothèque sous le provider : élément non résolu, donc utilisateur possible, donc silence --- l'invariant en action (le suivi des contextes est au \cref{chap:inter-composants}).
+\end{exemple}
+
+\subsection{Pourquoi \Warning, et ce qui arrête la cascade}
+
+\begin{decision}[ADR-041 §3 : deux règles de cascade, toutes deux Warning]
+\textbf{Constat.} Les cascades de rendu (\regle{state-lifted-too-high}, \regle{wasted-subtree-render}) constatent un fait certain --- ces composants re-rendent pour rien --- dont le \emph{coût} est incertain : un composant statique re-rendu trois fois par seconde ne coûte rien.
+\textbf{Décision.} Aucune des deux règles n'atteint l'\Error{} : c'est la définition du \Warning{} de \file{CLAUDE.md}, \og fait certain au coût incertain\fg. Les seuils sont des options parce que le coût acceptable est l'affaire d'une équipe, pas de l'analyseur (§4 de la même ADR). \textbf{Alternative refusée} : porter la dépendance de rendu dans \code{StateValue} comme un champ de plus --- elle aurait changé toutes les comparaisons de valeurs existantes (\code{unnecessary-rerender}, clé du cache de composants) pour un fait qui n'est pas une valeur (§1).
+\end{decision}
+
+Ce qui arrête la descente arrête aussi la règle, et c'est voulu. Une enveloppe \code{React.memo} ou \code{forwardRef} n'est pas dans le registre des composants : l'élément est opaque, le composant qui le construit est utilisateur, le foyer s'arrête là. L'\issue{64} (\emph{precision-fn}, ouverte) note que cela tronque les cascades ; le \cref{chap:regles-rendu-rsc} y revient pour \regle{wasted-subtree-render}. Symétriquement, un état que \emph{personne} n'écrit, ou dont le setter n'atterrit nulle part, n'a pas de foyer : la règle n'a alors rien à dire sur des écritures qui n'existent pas.
+
+\begin{piege}
+La règle n'a pas de \code{safe_check} : aucune ligne \code{verified state-lifted-too-high} n'apparaît sous \code{--info}. La raison est la polarité : une règle d'affirmation qui se tait n'a pas prouvé l'absence de défaut, elle a seulement manqué une preuve de présence (\cref{chap:regles-etat}, \og signaler ou affirmer\fg). Sur la fixture \file{owner_effect.tsx} (le tableau kanban de \code{makeplane/plane}), le propriétaire enregistre ses écouteurs dans un effet sur une \code{ref} : l'effet est un usage, le chemin est vide, silence --- pas d'assurance.
+\end{piege}
+
+% ===========================================================================
+\begin{resume}
+\regle{infinite-loop} est une règle à quatre bras qui partagent un nom, une classe de panne et deux canaux de déduplication (\code{reported_effects}, \code{covered}), mais pas leurs preuves. Le \emph{bras point fixe} lit un \emph{signal} (\cref{def:infinite-loop-signal}) : un slot dans \code{widen_trace} dont l'écriture rejouée depuis $\Bot$ est $\Bot$ ou non bornée ; c'est un fait may, plafonné à \Warning{} (\issue{144}), filtré par le montage seul, par la garde $\forall$-stable sur les deps (\adr{21} §5) et par la classe \code{Handler} des écritures. Le \emph{bras cross-component} lit le store partagé pour un prop setter d'un autre composant, \Warning{} aussi, muet si le parent n'est pas atteint en descendant (\issue{20}). Le \emph{bras graphe} lit les cycles du graphe de churn et frappe l'\Error{} par \code{must_effect_cycle} quand le cycle est tout-\code{Must} dans un seul composant, \Warning{} sinon ; six textes, un nom par \code{cross_component}. Le \emph{bras self-churn} lit les arêtes pilotées par deps locales de bout en bout : \Error{} par \code{must_on_all_paths} sur une arête \code{self_slot} (triple must, \cref{prop:infinite-loop-triple-must}), \Warning{} sans preuve, \Info{} pour une écriture fraîche vers un autre slot qu'aucun cycle ne couvre. Le moteur a déjà appliqué la fraîcheur, le kill de convergence et le re-déclenchement sensible aux champs (\issue{90}) en construisant les arêtes. Deux invariants tiennent tout : toute \Error{} passe par une primitive must (\cref{inv:infinite-loop-error}), et le widening n'est jamais une preuve.
+
+\regle{state-lifted-too-high} lit le foyer d'un slot (\cref{def:infinite-loop-home}) dans l'index de rendu, filtre par \code{minDepth} et \code{minWastedRenders}, et émet un \Warning{} dont le conseil suit \code{mount_count} et le contexte. Sa soundness est celle d'une preuve d'\emph{absence} : tout inconnu est un usage (\cref{inv:infinite-loop-inconnu-usage}), la descente s'arrête au-dessus.
+
+\textbf{Types et fichiers rencontrés.}
+\begin{sloppypar}
+\begin{itemize}
+  \item \code{InfiniteLoop}, \code{check_multi_effect_cycles} et \code{check_object_churn}, dans \file{src/rules/impls/infinite_loop.rs}.
+  \item \file{src/engine/analysis_result.rs}, \file{src/engine/fixpoint.rs}, \file{src/domains/impls/state_value.rs} : \code{WidenEvent}, \code{widen_trace}, \code{effect_setter_writes}, \code{is_unbounded}.
+  \item \file{src/engine/setters.rs} : \code{SetterProp}, \code{cross_component_setters}, \code{all_setter_labels}.
+  \item \file{src/engine/churn.rs} : \code{ChurnEdge}, \code{ChurnCycle}, \code{ChurnGraph}, \code{find_cycles}, \code{can_retrigger}.
+  \item \file{src/rules/api/query.rs}, \file{src/rules/api/witness.rs} : \code{must_effect_cycle}, \code{must_on_all_paths}, \code{slot_history}, \code{Step}.
+  \item \file{src/rules/impls/state_lifted_too_high.rs} : \code{StateLiftedTooHigh}, \code{OptionSpec}.
+  \item \file{src/rules/helpers/render_tree.rs} : \code{RenderIndex}, \code{Home}, \code{Hop}, \code{home_of}, \code{uses}, \code{resolve}.
+\end{itemize}
+\end{sloppypar}
+
+\textbf{Faux négatifs observés.} \code{DerivedWrite} (\issue{157}) ; \code{Updater} sur le chemin CLI (non répertorié) ; parent atteint seulement en intra (\issue{20}).
+
+\textbf{Doc-comments en retard sur le code.} La tête d'\code{InfiniteLoop} (l.~26--32) ; le bloc du self-churn (l.~390--394) ; le renvoi \og see \code{churn_graph.rs}\fg{} (l.~230).
+
+Le \cref{chap:regles-effets} passe aux règles sur les effets, dont \regle{widening-info} rencontrée ici, et aux primitives de dominance et de couverture qu'elles partagent avec les bras 3 et 4.
+\end{resume}
+
+\section*{Exercices}
+\label{sec:infinite-loop-exercices}
+
+\begin{exercice}{Les portes à la main}{infinite-loop-portes}
+Pour \code{Bounded} (\cref{lst:infinite-loop-counter}), calculer les intervalles successifs du slot, l'itération d'élargissement et \code{effect_setter_writes}, puis dire quelle porte absout et pourquoi \regle{widening-info} parle quand même. Refaire l'exercice avec la garde \code{if (count < limit)} où \code{limit} est un prop : quelle porte change de réponse ?
+\end{exercice}
+
+\begin{exercice}{Le quantificateur}{infinite-loop-quantificateur}
+Montrer qu'un filtre \og un dep prouvé stable suffit à gater l'effet\fg{} introduit un faux négatif ; construire le contre-exemple à partir de \code{MixedDeps} (\cref{lst:infinite-loop-deps-tsx}) et le relier au test \code{stable_dep_alongside_top_dep_does_not_gate_self_write_loop}. Pourquoi l'arité exacte de la liste est-elle nécessaire en plus du quantificateur ?
+\end{exercice}
+
+\begin{exercice}{Promouvoir le bras 1 ?}{infinite-loop-mirror}
+Reproduire le faux positif \code{Mirror} (\cref{ex:infinite-loop-mirror}). Proposer une condition supplémentaire du bras 1 fondée sur \relation{effect_triggers} (\og l'effet est re-déclenché par le slot qu'il écrit\fg) et dire si elle suffirait à promouvoir le bras en \Error{} au sens de l'\issue{144}. Vérifier qu'elle ne rouvre pas le faux négatif des effets sans deps, puis celui d'\code{Updater} : la condition lit-elle le bon store ?
+\end{exercice}
+
+\begin{exercice}{Ordre des bras}{infinite-loop-ordre}
+Sur \code{Parent}/\code{Child} (\cref{lst:infinite-loop-cross}), donner l'arête du graphe de churn que le bras 3 aurait rapportée si le bras 2 s'était tu, sa force, son \code{cross_component} et le texte du \cref{tab:infinite-loop-textes} qu'elle aurait reçu. Que se passe-t-il si l'on inverse l'ordre des bras 2 et 3 dans \code{check} ?
+\end{exercice}
+
+\begin{exercice}{Deux sites qui se ranimement}{infinite-loop-revivers}
+Écrire un composant où deux effets écrivent le même slot sous des gardes que l'écriture de l'autre ranime, et prédire le verdict du bras 3 à l'aide du théorème du plus petit point fixe des sites (\cref{chap:churn}) : pourquoi un plus grand point fixe des sites convergents les déclarerait-il convergents à tort ? Vérifier avec le test \code{two_writes_of_one_slot_that_revive_each_other_are_a_loop}.
+\end{exercice}
+
+\begin{exercice}{Le membre préservé}{infinite-loop-membre}
+Transformer \code{Slugify} (\cref{lst:infinite-loop-fields}) en écrivant \code{setData({ ...data, slug })} sans updater ; prédire le verdict à partir de \code{updater_overwrites}, puis observer. Proposer une extension de \code{can_retrigger} à cette forme et dire quel fait supplémentaire elle exige pour rester sound.
+\end{exercice}
+
+\begin{exercice}{Réparer \code{DerivedWrite}}{infinite-loop-derived}
+Expliquer, colonne par colonne, pourquoi la ligne de \code{setItems(sorted)} est \code{Freshness::Not} (\cref{ex:infinite-loop-derived}). Proposer, dans l'esprit \og général d'abord\fg{} de \file{CLAUDE.md}, où placer le correctif de l'\issue{157} : dans \code{value_freshness}, dans l'évaluation des memos, ou dans la construction des arêtes ? Quel FP chaque emplacement risque-t-il de créer ?
+\end{exercice}
+
+\begin{exercice}{Un foyer sans preuve}{infinite-loop-foyer}
+Réécrire \file{drill.tsx} pour que \regle{state-lifted-too-high} se taise sans déplacer l'état (indice : faire lire \code{value} par \code{Layout}, ou rendre \code{<Field/>} depuis deux endroits). Pour chaque variante, dire lequel des trois filtres de \cref{lst:infinite-loop-lifted-check} se ferme, et quel conseil la règle donnerait si elle parlait.
+\end{exercice}
+
+

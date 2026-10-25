@@ -1,0 +1,1332 @@
+% ---------------------------------------------------------------------------
+% Chapitre 18 — Les règles sur l'état
+% Sources : notes/10-rules-state.md (tout sauf infinite-loop et state-lifted-too-high) ;
+% src/rules/impls/{lazy_init,unstable_context_value,redundant_set_state,setter_in_render,
+% derived_state,state_mutation,frozen_initial_state}.rs ; src/rules/helpers/{providers,jsx,mount}.rs ;
+% src/engine/{setters,seeds,guards}.rs ; src/rules/api/query.rs ; ADR-021, 027, 028, 031, 038.
+% Sorties observées avec target/debug/reactant (commit e67b10a) sur les fichiers /tmp/ch18/*.tsx.
+% Impressions d'IR : sonde hors dépôt ~/.cache/irdump-target/debug/irdump (voir chapitre 7).
+% ---------------------------------------------------------------------------
+\chapter{Les règles sur l'état}
+\label{chap:regles-etat}
+
+\begin{objectifs}
+  \item Connaître les sept règles natives qui parlent de l'état \code{useState} hors boucles infinies : \regle{lazy-init}, \regle{unstable-context-value}, \regle{redundant-set-state}, \regle{setter-in-render}, \regle{derived-state}, \regle{state-mutation}, \regle{frozen-initial-state} --- le bug React que chacune vise et les conditions exactes de son déclenchement.
+  \item Savoir dire, pour chacune, quelle primitive must lui ouvre l'\Error{}, et ce qui la retient au \Warning{} ou à l'\Info.
+  \item Distinguer les règles qui \emph{signalent un défaut possible} (leur silence doit être une preuve) de celles qui \emph{affirment un fait} (elles se taisent tant que le fait n'est pas établi).
+  \item Savoir quelles relations et quelles tables de noms chaque règle lit, et reconnaître les écarts entre ces lectures, source de plusieurs faux négatifs observés.
+  \item Reproduire chaque verdict sur un programme court avec l'analyseur, et connaître les faux positifs assumés et les faux négatifs relevés au commit \snapshotCommit.
+\end{objectifs}
+
+\prerequis{\cref{chap:api-regles} (le trait \code{Rule}, le jeton \code{Certified}, \cref{def:certified}, les primitives must, les témoins, \cref{def:witness}) ; \cref{chap:relations} (relations du moteur, \cref{def:relation}, en particulier \relation{slot_writers} et \relation{slot_seeds}) ; \cref{chap:statevalue-stabilite} (treillis de stabilité, \cref{def:stabilite}, et la double vue de l'état) ; la dominance (\cref{def:dominance}). Les deux règles d'état les plus difficiles, \regle{infinite-loop} et \regle{state-lifted-too-high}, sont l'objet du \cref{chap:infinite-loop}.}
+
+Le \cref{chap:api-regles} a décrit la surface contre laquelle toute règle est écrite : un contexte \code{RuleCtx}, des verdicts polarisés, un sceau qui interdit de fabriquer une \Error{} sans preuve. Ce chapitre ouvre la partie consacrée aux règles elles-mêmes, en commençant par la famille la plus nombreuse, celle qui parle de l'état local d'un composant. Neuf fichiers de \file{src/rules/impls/} en relèvent ; sept sont traités ici, les deux restants au chapitre suivant.
+
+L'ordre suit la difficulté. \regle{lazy-init} ne regarde qu'une expression, syntaxiquement ; \regle{unstable-context-value} lit un seul fait must du domaine ; \regle{redundant-set-state} lit le store d'état ; \regle{setter-in-render} raisonne par dominance et par phase ; \regle{derived-state} exige un fait \og sur tous les chemins\fg{} et interroge la relation des écrivains ; \regle{state-mutation} poursuit une identité de référence à travers des portées ; \regle{frozen-initial-state}, enfin, a besoin de l'analyse descendante entre composants et d'une stratification en trois niveaux. Chaque section suit la même grille : le bug React visé, les conditions exactes, le niveau et la preuve requise, les relations lues, des exemples gradués avec leur sortie réelle, les faux positifs (FP) assumés et les faux négatifs (FN) interdits ou observés, les pièges.
+
+Toutes les sorties ont été obtenues au commit \snapshotCommit{} avec le binaire \file{target/debug/reactant} sur des fichiers écrits pour ce chapitre sous \file{/tmp/ch18/}. Sauf mention contraire, la commande est :
+
+\begin{shell}
+reactant check /tmp/ch18/<fichier>.tsx --all-roots --no-color --fail-on never
+\end{shell}
+
+\noindent complétée de \code{--trace} (notes de témoin), \code{--info} (niveau \Info{} et assurances \code{verified}), \code{--show-clean} (composants sans diagnostic) et \code{--rule <nom>} (filtre sur un nom de diagnostic) selon le besoin. Les numéros de ligne des sorties renvoient aux fichiers reproduits, dont les listings portent les vrais numéros.
+
+% ===========================================================================
+\section{Le socle commun}
+\label{sec:regles-etat-socle}
+
+Avant d'entrer dans les règles, fixons ce qu'elles ont en commun : la manière dont elles retrouvent un slot à partir d'un nom, la manière dont elles déclarent leur applicabilité, et les deux attitudes qu'une règle peut avoir face à l'incertitude.
+
+\subsection{Du nom au slot}
+
+Une règle ne voit pas le code source, elle voit l'IR (\cref{chap:ir}). Un \code{const [n, setN] = useState(0)} y devient deux liaisons du CFG de rendu, \code{Let n = StateVal(0)} et \code{Let setN = StateSetter(0)}, où \code{0} est le label du slot (\cref{def:slot}). Pour savoir qu'un appel \code{setN(1)} écrit le slot~0, il faut donc une table \og variable → label\fg. Le moteur en fournit plusieurs, de portée croissante :
+
+\rustsnippet[label={lst:regles-etat-labels}]{src/engine/setters.rs}{515}{528}{les deux tables syntaxiques du rendu}
+
+\code{setter_var_labels} et \code{state_val_labels} ne lisent que les liaisons \emph{directes} du CFG de rendu. Un alias \code{const s = setN} n'y figure pas. La fermeture par alias est l'affaire de \code{resolve_setter_aliases}, et sa forme complète, appliquée au rendu \emph{et} à tous les corps de hooks, est \code{all_setter_labels} :
+
+\rustsnippet[label={lst:regles-etat-all-setter-labels}]{src/engine/setters.rs}{621}{635}{la table fermée par alias, sur tous les corps}
+
+Son doc-comment nomme la raison d'être de la fonction : l'inlining d'un utilitaire lie les paramètres setter par des alias (\code{let setter = setX}) dans les corps greffés (\cref{chap:splice-inlining}), et une règle qui cherche un setter par son nom sans suivre ces alias rate l'appel --- un faux négatif. Le nom affiché d'un slot, enfin, vient de \code{state_slot_name} (\src{src/rules/helpers/mod.rs}{94}{105}), qui choisit le plus petit nom source non technique et se replie sur \og \code{state #N}\fg.
+
+Les sept règles n'utilisent pas toutes la même table. Le \cref{tab:regles-etat-tables} en fait l'inventaire ; nous verrons que deux FN observés viennent précisément de règles qui lisent une table plus étroite que leurs voisines.
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+règle & reconnaissance d'un setter & reconnaissance d'une valeur d'état \\
+\midrule
+\regle{lazy-init} & \code{setter_var_labels} (rendu, sans alias) & --- \\
+\regle{unstable-context-value} & --- & --- \\
+\regle{redundant-set-state} & \code{env.setter_label} (environnement abstrait) & store \code{state} \\
+\regle{setter-in-render} & liaisons \code{Let … = StateSetter} du rendu, & \code{state_val_labels}, fermée \\
+ & plus les setters reçus en props & par alias sur le rendu \\
+\regle{derived-state} & \code{all_setter_labels} & \code{state_val_labels} \\
+\regle{state-mutation} & \code{all_setter_labels} & \code{state_val_labels} \\
+\regle{frozen-initial-state} & \code{all_setter_labels} & \code{state_val_labels} \\
+\bottomrule
+\end{tabular}
+\caption{Les tables de noms lues par chaque règle (lecture des fichiers de \file{src/rules/impls/} au commit \snapshotCommit).}
+\label{tab:regles-etat-tables}
+\end{table}
+
+\subsection{Applicabilité et assurance}
+
+Chaque règle implémente \code{safe_check} (\cref{sec:api-regles-trait}) : si \code{check} n'a rien trouvé et que la règle est \emph{applicable} au composant, elle publie une assurance positive, affichée sous \code{--info} par une ligne \code{verified}. L'applicabilité se décide presque toujours par \code{has_hook_kind} (\src{src/rules/helpers/mod.rs}{107}{118}), qui teste la présence d'un appel de hook d'un genre donné. Le registre suspend ces assurances dans un composant qui porte un \regle{analysis-limit} (\cref{sec:api-regles-suspension}) ; nous en verrons un exemple à la \cref{sec:regles-etat-context}.
+
+\subsection{Signaler ou affirmer}
+
+Les sept règles ne prennent pas le même risque quand l'analyse ne sait pas. Deux attitudes coexistent, et les confondre fait mal lire le code.
+
+\begin{definition}{Règle de signalement, règle d'affirmation}{regles-etat-familles}
+Une \terme{règle de signalement} rapporte un \emph{défaut possible} : un appel coûteux répété, un setter qui peut s'exécuter au rendu, un objet d'état muté, un état figé. L'invariant de soundness (\cref{def:soundness}) s'y applique pleinement : elle ne peut se taire que sur une \emph{preuve} d'absence du défaut, et une incertitude se traduit en \Warning{} ou en \Info, jamais en silence.
+
+Une \terme{règle d'affirmation} rapporte un \emph{fait} : \og cette écriture stocke la valeur déjà présente\fg{}, \og cet effet recopie un autre état\fg{}, \og cette valeur est une nouvelle référence à chaque rendu\fg. Elle ne parle que si le fait est établi, et elle utilise des faits may pour \emph{retenir} son diagnostic. Son silence sur un cas incertain est une perte de précision.
+\end{definition}
+
+Le code dit lui-même dans quelle famille il se range. Le doc-comment de \code{InitEffect} (\src{src/rules/impls/lazy_init.rs}{50}{54}) garantit que \og the trigger stays "a call is present" (sound: no false negative)\fg{} ; celui d'\code{UnstableContextValue} assume qu'un cas non prouvé est sauté, \og precision lost, never soundness\fg{} (\src{src/rules/impls/unstable_context_value.rs}{19}{24}) ; le commentaire des slots contestés de \regle{redundant-set-state} résume la seconde attitude en une phrase : \og Both are may-facts used to \emph{withhold}, so over-approximating costs a warning instead of inventing one\fg{} (\src{src/rules/impls/redundant_set_state.rs}{46}{56}). \regle{lazy-init}, \regle{setter-in-render}, \regle{state-mutation} et \regle{frozen-initial-state} sont des règles de signalement ; \regle{unstable-context-value}, \regle{redundant-set-state} et \regle{derived-state} des règles d'affirmation.
+
+\begin{piege}
+\og Règle d'affirmation\fg{} ne veut pas dire \og règle qui peut atteindre l'\Error\fg. Les trois règles d'affirmation de ce chapitre plafonnent au \Warning{} : le fait est certain, son coût ne l'est pas (un re-rendu de plus, une valeur recopiée). À l'inverse, les \Error{} du chapitre viennent toutes de règles de signalement, et chacune passe par une primitive must qui re-dérive le fait qu'elle certifie (\cref{inv:api-regles-frappe}).
+\end{piege}
+
+% ===========================================================================
+\section{\regle{lazy-init} : un appel dans l'initialiseur}
+\label{sec:regles-etat-lazy-init}
+
+\begin{react}[l'initialiseur de \code{useState}]
+\code{useState(init)} n'utilise \code{init} qu'au premier rendu ; aux rendus suivants, React rend la valeur courante du slot et ignore l'argument. Mais l'argument est une expression JavaScript ordinaire : elle est \emph{évaluée} à chaque appel du composant, avant que \code{useState} ne soit appelé. \code{useState(buildTree())} construit donc un arbre à chaque rendu pour le jeter aussitôt. La forme paresseuse \code{useState(() => buildTree())} passe une fonction, que React n'appelle qu'au montage \cite{ReactDocs}. \code{useRef(init)} a le même défaut, mais pas de forme paresseuse : \code{useRef(() => x)} stocke la fonction elle-même, et le correctif est l'idiome \code{if (ref.current === null) ref.current = …}.
+\end{react}
+
+\subsection{La condition : un appel syntaxiquement présent}
+
+La règle parcourt les hooks du composant et ne retient que les entrées \code{HookEntry::State} et \code{HookEntry::Ref}. Son critère de déclenchement tient en une ligne :
+
+\rustsnippet[label={lst:regles-etat-lazy-trigger}]{src/rules/impls/lazy_init.rs}{107}{115}{le déclencheur : un appel dans l'initialiseur, sans poursuite des liaisons}
+
+\code{Expr::is_call_free} (\src{src/ir/expr.rs}{513}{528}) est faux dès que l'arbre de l'expression contient un nœud \code{Call}, \code{New}, \code{CompApp} ou \code{NativeElem} ; les corps de \code{FnLit} ne sont pas traversés, ce qui laisse passer la forme paresseuse. Un appel imbriqué (\code{useState(1 + f())}, \code{useState(\{ key: getValue() \})}) déclenche ; un littéral, une lecture de champ (\code{useState(props.value)}) ou une arithmétique sans appel ne déclenchent pas.
+
+La décision la plus importante est ce que la règle \emph{ne fait pas} : elle ne suit pas les liaisons locales. \code{const initial = buildTree(); useState(initial)} est muet.
+
+\begin{decision}[pas de poursuite des liaisons]
+\textbf{Constat.} Après l'inlining d'un hook utilisateur (\cref{chap:splice-inlining}), une forme déjà paresseuse \code{useState(() => f())} écrite dans le corps du hook est aplatie en un temporaire lié à \code{f()} dans le composant appelant ; l'IR devient indiscernable de \code{const x = f(); useState(x)}. \textbf{Décision.} Ne déclencher que sur un appel syntaxiquement présent dans l'initialiseur. \textbf{Alternative refusée.} Poursuivre la liaison, ce qui signalait du code correct : le commentaire cite un faux positif du corpus, \code{useMediaQuery}. \textbf{Coût.} Un appel caché derrière un \code{const} n'est pas signalé.
+\end{decision}
+
+\begin{piege}
+Deux commentaires du fichier disent le contraire du code. Le doc-comment du type (\src{src/rules/impls/lazy_init.rs}{19}{24}) présente comme premier atout la poursuite de l'appel \og through local bindings\fg{} ; le commentaire en tête de \code{check} (\src{src/rules/impls/lazy_init.rs}{89}{93}) décrit une poursuite \og only when that binding is used exactly once\fg. Les deux décrivent un comportement retiré. C'est le code (l.~107--115), et le test \code{call_behind_binding_is_not_chased}, qui font foi.
+\end{piege}
+
+\subsection{Graduer par la nature de l'appel}
+
+Déclencher est une décision binaire ; le niveau, lui, dépend de ce que fait l'appel. La règle classe les callees de l'initialiseur :
+
+\rustsnippet[label={lst:regles-etat-lazy-classify}]{src/rules/impls/lazy_init.rs}{206}{234}{classification de l'initialiseur, avec sa précédence}
+
+\code{collect_callees} (\src{src/rules/helpers/mod.rs}{173}{195}) rassemble le callee de chaque \code{Call} et \code{New}, et l'élément lui-même pour un \code{CompApp} ou un \code{NativeElem} (travail réel de coût inconnu). Chaque callee est classé par \code{classify_callee} (\src{src/rules/impls/lazy_init.rs}{246}{265}) : un \code{StateSetter} ou une variable de la table \code{setters} est un setter ; sinon la classification par nom, partagée avec les témoins (\code{witness::classify_callee_name}, \src{src/rules/api/witness.rs}{324}{348}), reconnaît une courte liste d'appels à effet de bord (\code{fetch}, \code{subscribe}, \code{addEventListener}, \code{setTimeout}, \code{setInterval}, \code{requestAnimationFrame}, \code{postMessage}\ldots, \src{src/rules/api/witness.rs}{309}{319}) et quelques fonctions pures et bon marché (\code{Math.*}, \code{Date.now}, \code{performance.now}, \code{parseInt}, \code{Number}\ldots). La précédence est \code{Setter} $>$ \code{Effectful} $>$ \code{Unknown} $>$ \code{PureCheap} : un seul appel inconnu suffit à perdre le verdict \og tout est bon marché\fg.
+
+Cette classification est une heuristique de \emph{nommage}. Elle ne peut que changer le niveau et la formulation, jamais le déclenchement : c'est ce qui la rend inoffensive pour la soundness. Le \cref{tab:regles-etat-lazy-matrice} donne la matrice complète, lue sur \src{src/rules/impls/lazy_init.rs}{122}{181}.
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\code{InitEffect} & \code{useState} & \code{useRef} \\
+\midrule
+\code{Setter} & \Error{} (via \code{must_init_calls_setter}) & \Error{} (idem) \\
+\code{Effectful(n)} & \Warning{} \og calls \code{n}, which has side effects\fg & \Warning \\
+\code{Unknown} & \Warning{} \og initialised by a direct function call\fg & \Info \\
+\code{PureCheap(n)} & \Info{} \og wrapping \ldots\ is optional\fg & silence (\code{continue}) \\
+\bottomrule
+\end{tabular}
+\caption{Niveau de \regle{lazy-init} selon la nature de l'appel et le hook. Pour \code{useRef}, le correctif coûte trois lignes au lieu d'un jeton : la règle ne le recommande en \Warning{} que si l'appel répété nuit (écriture d'état, effet de bord).}
+\label{tab:regles-etat-lazy-matrice}
+\end{table}
+
+\subsection{La seule \Error{} : un setter dans l'initialiseur}
+
+\code{useState(setN(1))} exécute une écriture d'état à chaque rendu : c'est une boucle de rendu, pas une simple perte de temps. La règle passe alors par la primitive \code{must_init_calls_setter} :
+
+\rustsnippet[label={lst:regles-etat-must-init}]{src/rules/api/query.rs}{722}{740}{la primitive qui certifie un setter dans l'initialiseur}
+
+\rustsnippet[label={lst:regles-etat-lazy-setter}]{src/rules/impls/lazy_init.rs}{148}{158}{le bras \code{Setter} de \code{useState}}
+
+La primitive refait la détection de \code{classify_callee} sur les seuls setters ; comme la règle n'entre dans ce bras que si la classification a rendu \code{Setter}, le repli \code{Diagnostic::warn} est inatteignable, ce que dit le commentaire (l.~154--155). Garder ce repli est la discipline du \cref{chap:api-regles} : le niveau \Error{} ne s'obtient que par le jeton, et une incohérence future entre la règle et la primitive coûterait un \Warning, jamais une \Error{} non prouvée. La primitive mint sans provenance (\og an \code{Expr} carries no span\fg) ; la règle ancre le diagnostic sur la plage du hook.
+
+\subsection{Exemples}
+
+\begin{lstlisting}[language=TypeScript,caption={Initialiseurs gradués (\file{/tmp/ch18/lazy.tsx})},label={lst:regles-etat-lazy-ex}]
+import { useState, useRef } from "react";
+
+declare function buildTree(): object;
+
+export function Lazy() {
+  const [t] = useState(buildTree());
+  const [now] = useState(Date.now());
+  const [data] = useState(fetch("/api"));
+  const [ok] = useState(() => buildTree());
+  return <p>{String(t)}{now}{String(data)}{String(ok)}</p>;
+}
+
+export function SetterInInit() {
+  const [n, setN] = useState(0);
+  const [m] = useState(setN(1));
+  return <p>{n}{String(m)}</p>;
+}
+
+export function Refs() {
+  const cache = useRef(new Map());
+  const seed = useRef(Math.random());
+  const req = useRef(fetch("/x"));
+  return <p>{String(cache.current)}{seed.current}{String(req.current)}</p>;
+}
+\end{lstlisting}
+
+Sortie avec \code{--info --trace --rule lazy-init} (composant \code{Behind} omis, il est étudié plus bas) :
+
+\begin{sortie}
+  Lazy  (4 hooks)  lazy.tsx
+    warn   lazy-init  [hook:0]  (line 6:8)  this useState is initialised by a direct function call. The call runs on every render but the result is only used on mount; wrap as `useState(() => …)` to defer it
+       → `buildTree` could not be resolved, treated as opaque
+    warn   lazy-init  [hook:2]  (line 8:8)  this useState init calls `fetch`, which has side effects, on every render, and the result is only used on mount, so every later render repeats the effect (duplicate subscriptions/requests/timers, not just wasted work); wrap as `useState(() => …)`
+       → `fetch` could not be resolved, treated as opaque
+    info   lazy-init  [hook:1]  (line 7:8)  this useState init calls `Date.now` on every render; the call is cheap and pure, so wrapping as `useState(() => …)` is optional
+  Refs  (3 hooks)  lazy.tsx
+    warn   lazy-init  [hook:2]  (line 22:8)  this useRef init calls `fetch`, which has side effects, on every render, and only the first render's value is kept, so every later render repeats the effect (duplicate subscriptions/requests/timers); initialise lazily with `if (ref.current === null) ref.current = …`
+       → `fetch` could not be resolved, treated as opaque
+    info   lazy-init  [hook:0]  (line 20:8)  this useRef is initialised by a direct function call. The call runs on every render but the result is only kept from the first; if it is not cheap, initialise lazily with `if (ref.current === null) ref.current = …`
+  SetterInInit  (2 hooks)  lazy.tsx
+    error  lazy-init  [hook:1]  (line 15:8)  this useState init calls a state setter, so it runs a state write on every render (the result is discarded after mount); move the call into an effect or event handler
+       → `setN` could not be resolved, treated as opaque
+\end{sortie}
+
+Chaque ligne se lit sur la matrice. \code{buildTree()} est un appel inconnu (\Warning) ; \code{Date.now()} est pur et bon marché (\Info) ; \code{fetch} est à effet (\Warning{} au message distinct) ; la forme paresseuse est muette. Pour les refs, \code{new Map()} est un \code{New} de callee inconnu (\Info{} pour \code{useRef}), \code{Math.random()} est classé pur et bon marché (silence pour \code{useRef}), \code{fetch} garde son \Warning. \code{[hook:N]} est ici le label du slot ou de la ref. La note de témoin vient de \code{witness::chase_value}, qui tente de résoudre le callee par le registre de fonctions ; pour \code{setN}, elle affirme \og could not be resolved\fg{} alors que le setter est parfaitement connu de la règle --- la note décrit la résolution de fonction, pas la classification. Sur le même composant, \regle{setter-in-render} est muet : l'initialiseur d'un \code{HookEntry::State} n'est pas une instruction du CFG de rendu que cette règle parcourt (\cref{sec:regles-etat-setter-in-render}).
+
+\subsection{Ce que la règle ne voit pas}
+
+\begin{lstlisting}[language=TypeScript,firstnumber=26,caption={Un appel caché, deux fois (\file{/tmp/ch18/lazy.tsx}, suite)},label={lst:regles-etat-lazy-behind}]
+export function Behind({ c }: { c: boolean }) {
+  const initial = buildTree();
+  const [a] = useState(initial);
+  const [b] = useState(c ? buildTree() : 0);
+  const [d] = useState(1 + Number(buildTree()));
+  return <p>{String(a)}{String(b)}{d}</p>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+  Behind  (3 hooks)  lazy.tsx
+    warn   lazy-init  [hook:2]  (line 30:8)  this useState is initialised by a direct function call. The call runs on every render but the result is only used on mount; wrap as `useState(() => …)` to defer it
+       → `Number` could not be resolved, treated as opaque
+\end{sortie}
+
+Le slot \code{a} est muet par décision. Le slot \code{b} l'est aussi, et c'est plus surprenant : l'appel est bien écrit dans l'argument de \code{useState}. L'impression de l'IR (sonde du \cref{chap:lowering-cfg}) en donne la raison :
+
+\begin{sortie}
+  B0:
+      let initial = buildTree()  @27:8
+      let a = StateVal(0)  @28:9
+      => branch c ? B1 : B2
+  B1:
+      let __t0 = buildTree()  @29:27
+      => jump B3
+  B2:
+      let __t0 = 0  @29:41
+      => jump B3
+  ...
+hooks:
+  #0 State init=initial  @28:8
+  #1 State init=__t0  @29:8
+  #2 State init=(1 Add Number(buildTree()))  @30:8
+\end{sortie}
+
+(Élagué.) Le lowering abaisse la conditionnelle en diamant avec un temporaire \code{__t0} (\cref{chap:lowering-cfg}), et l'initialiseur du hook \#1 devient \code{Var(__t0)}, sans appel. Le refus de poursuivre les liaisons, pensé pour les temporaires de l'inlining, frappe aussi ceux du lowering. \code{useState(c \&\& buildTree())} se comporte de même. C'est un FN d'une règle de signalement : sous \code{--info}, le composant reçoit même l'assurance \code{verified lazy-init}. Aucune issue ne le suit au commit \snapshotCommit. La correction naturelle, dans l'esprit \og général d'abord\fg, distinguerait un temporaire introduit par le lowering (préfixe \code{__t}) d'une liaison écrite par l'auteur (\cref{exo:regles-etat-lazy-ternaire}).
+
+% ===========================================================================
+\section{\regle{unstable-context-value} : une valeur neuve à chaque rendu}
+\label{sec:regles-etat-context}
+
+\begin{react}[contexte et identité]
+Un composant qui appelle \code{useContext(Ctx)} est re-rendu chaque fois que la \code{value} du provider le plus proche change, et React compare par \code{Object.is} --- indépendamment de \code{React.memo} sur le consommateur. Écrire \code{<Ctx.Provider value=\{\{ a, b \}\}>} alloue un nouvel objet à chaque rendu du provider : \emph{tous} les consommateurs re-rendent alors à chaque rendu du provider, même quand \code{a} et \code{b} n'ont pas bougé. Le correctif est \code{useMemo} sur la valeur. React~19 accepte aussi \code{<Ctx value>} comme provider, en plus de \code{<Ctx.Provider value>} \cite{ReactDocs}.
+\end{react}
+
+Cette règle est la plus courte du chapitre (72 lignes) parce que tout son travail est délégué : à un helper qui trouve les providers, et à un fait must du domaine qui dit si la valeur est neuve.
+
+\subsection{Trouver les providers prouvés}
+
+\rustsnippet[label={lst:regles-etat-providers}]{src/rules/helpers/providers.rs}{47}{86}{les sites de providers prouvés, dans un ordre déterministe}
+
+Un élément est un provider de cette règle si son nom est \code{X.Provider} et si \code{X} est une constante de module initialisée par un \code{createContext} atteint par un import React (\code{ModuleConstInit::Context}). \code{provider_context} (\src{src/rules/helpers/providers.rs}{88}{99}) retire le suffixe \code{.Provider} et cherche la base parmi ces contextes ; l'identité canonique \code{ContextId} (\issue{109}) sert aux relations qui apparient consommateurs et providers entre fichiers. Seuls les expressions de premier niveau du corps de rendu sont parcourues (\code{top_level_exprs}) : un provider construit dans une flèche passée à \code{.map} ou dans un \code{useCallback} n'est pas vu (\issue{30}), ce que le code motive par le fait qu'un provider bâti dans un \code{useMemo} est précisément la forme corrigée. Les sites sont triés par (bloc, index d'expression) pour que la sortie ne dépende pas de l'itération d'une table.
+
+\subsection{Le fait must : \code{FreshEveryRender}}
+
+\rustsnippet[label={lst:regles-etat-site-identity}]{src/rules/helpers/jsx.rs}{267}{298}{l'identité d'une valeur à un site du rendu}
+
+Deux étapes. D'abord une garde syntaxique : si la valeur est une variable, elle n'est lue dans l'environnement du bloc que si elle est liée \emph{exactement une fois} dans le corps. Zéro liaison signifie que la valeur vient du parent (sa fraîcheur est l'affaire du parent) ; deux liaisons signifient que la valeur en sortie de bloc n'est pas forcément celle que l'élément a reçue. Ensuite l'évaluation avec le tas convergé, et le prédicat :
+
+\rustsnippet[label={lst:regles-etat-unstable-only}]{src/domains/impls/state_value.rs}{281}{287}{un fait must : une référence neuve, et rien d'autre}
+
+Le verdict \code{Stability::PerRender} seul ne suffirait pas : pour une sorte non référence, \code{to_stability} rend aussi \code{PerRender} quand la valeur \og peut changer à chaque rendu\fg{} (un nombre qui bouge, \cref{chap:statevalue-stabilite}), et un nombre qui change n'est pas un problème d'identité. \code{is_unstable_reference_only} exige que la seule sorte peuplée soit la référence. Une valeur tirée d'un état (\code{Versioned}, \cref{def:stabilite}) ou d'un memo n'est pas \code{PerRender} : elle rend \code{Unknown}, et la règle se tait.
+
+\rustsnippet[label={lst:regles-etat-context-check}]{src/rules/impls/unstable_context_value.rs}{50}{71}{la règle entière}
+
+\begin{decision}[\Warning, jamais \Error]
+La référence neuve est certaine ; ce qu'elle coûte ne l'est pas. Le doc-comment (\src{src/rules/impls/unstable_context_value.rs}{30}{31}) en donne l'exemple : un provider dont les deux consommateurs re-rendent de toute façon ne paie rien. C'est la définition même du \Warning{} pour \og un fait certain au coût incertain\fg{} (CLAUDE.md, niveaux de diagnostic). Le diagnostic n'a ni label ni variable : il est ancré sur la balise ouvrante du provider.
+\end{decision}
+
+\subsection{Exemples}
+
+\begin{lstlisting}[language=TypeScript,caption={Cinq providers (\file{/tmp/ch18/ctx.tsx})},label={lst:regles-etat-ctx-ex}]
+import { createContext, useMemo, useState } from "react";
+
+const Theme = createContext({ dark: false });
+
+export function Inline({ dark }: { dark: boolean }) {
+  return (
+    <Theme.Provider value={{ dark }}>
+      <p />
+    </Theme.Provider>
+  );
+}
+
+export function ViaLocal({ dark }: { dark: boolean }) {
+  const value = { dark, size: 2 };
+  return (
+    <Theme.Provider value={value}>
+      <p />
+    </Theme.Provider>
+  );
+}
+
+export function Memoized({ dark }: { dark: boolean }) {
+  const value = useMemo(() => ({ dark }), [dark]);
+  return (
+    <Theme.Provider value={value}>
+      <p />
+    </Theme.Provider>
+  );
+}
+
+export function FromState() {
+  const [value] = useState({ dark: true });
+  return (
+    <Theme.Provider value={value}>
+      <p />
+    </Theme.Provider>
+  );
+}
+
+export function React19({ dark }: { dark: boolean }) {
+  return (
+    <Theme value={{ dark }}>
+      <p />
+    </Theme>
+  );
+}
+\end{lstlisting}
+
+Sortie avec \code{--info --show-clean} :
+
+\begin{sortie}
+  FromState  (1 hooks)  ctx.tsx
+    info   analysis-limit  component `Theme.Provider` was not found in the analysis registry. Pass its file on the command line to analyse it (FN possible)
+    suspended  analysis-limit  5 passing check(s) withheld: the analysis was truncated in this component, so they are not guaranteed
+  Inline  (0 hooks)  ctx.tsx
+    info   analysis-limit  component `Theme.Provider` was not found in the analysis registry. Pass its file on the command line to analyse it (FN possible)
+    warn   unstable-context-value  (line 7:4)  `Theme.Provider` is given a newly allocated value on every render. `Object.is` fails for every consumer, so each `useContext(Theme)` re-renders whenever this component does, even when nothing in the value changed; wrap the value in `useMemo`
+  Memoized  (1 hooks)  ctx.tsx
+    info   analysis-limit  component `Theme.Provider` was not found in the analysis registry. Pass its file on the command line to analyse it (FN possible)
+    suspended  analysis-limit  4 passing check(s) withheld: the analysis was truncated in this component, so they are not guaranteed
+  React19  (0 hooks)  ctx.tsx
+    info   analysis-limit  component `Theme` was not found in the analysis registry. Pass its file on the command line to analyse it (FN possible)
+  ViaLocal  (0 hooks)  ctx.tsx
+    info   analysis-limit  component `Theme.Provider` was not found in the analysis registry. Pass its file on the command line to analyse it (FN possible)
+    warn   unstable-context-value  (line 16:4)  `Theme.Provider` is given a newly allocated value on every render. `Object.is` fails for every consumer, so each `useContext(Theme)` re-renders whenever this component does, even when nothing in the value changed; wrap the value in `useMemo`
+\end{sortie}
+
+\code{Inline} et \code{ViaLocal} déclenchent : la valeur est un littéral objet, directement ou à travers une variable liée une seule fois. \code{Memoized} et \code{FromState} se taisent : une valeur de memo ou d'état n'est pas \code{PerRender}. La sortie montre au passage deux mécanismes du registre. L'élément JSX \code{Theme.Provider} est aussi, pour le moteur, un composant inconnu, d'où l'\Info{} \regle{analysis-limit} ; et dans les composants où aucune règle n'a rien trouvé, cet aveu de troncature \emph{suspend} les assurances \code{verified} (\cref{sec:api-regles-suspension}) --- on lit \og 4 passing check(s) withheld\fg{} au lieu de \og verified unstable-context-value\fg. \code{React19} se tait : la forme \code{<Theme value>} n'est pas reconnue, faute du suffixe \code{.Provider}. C'est un FN de précision que la règle assume.
+
+\begin{piege}
+Le doc-comment du type affirme qu'\og an imported context is not proven here and is skipped\fg{} (\src{src/rules/impls/unstable_context_value.rs}{21}{24}). Ce n'est vrai que si le fichier qui définit le contexte n'est pas analysé. Quand il l'est, le résolveur recopie \code{ModuleConstInit::Context} dans les constantes de module de l'importateur, et le provider devient prouvé. Vérifié sur deux fichiers (\file{/tmp/rs-verif/ctx/}, \code{app.tsx} important \code{ThemeCtx} de \code{./ctx}) : \code{reactant check .} rapporte \code{ThemeCtx.Provider} ligne~8, \code{reactant check app.tsx} ne rapporte que le contexte local. Le périmètre de la règle dépend donc des fichiers passés sur la ligne de commande (\cref{chap:projet-cli-driver}).
+\end{piege}
+
+% ===========================================================================
+\section{\regle{redundant-set-state} : écrire ce que l'état contient déjà}
+\label{sec:regles-etat-redundant}
+
+\begin{react}[bail-out]
+Quand un setter reçoit une valeur \code{Object.is}-égale à la valeur courante, React abandonne la mise à jour (\emph{bail-out}) : pas de re-rendu des enfants, pas d'effets. L'écriture n'en reste pas moins du code mort, souvent le reste d'une refonte, et React peut devoir rendre le composant une fois de plus pour s'apercevoir qu'elle ne change rien \cite{ReactDocs}.
+\end{react}
+
+C'est la première règle qui lit le \emph{store d'état} convergé (\cref{def:store}) plutôt qu'une expression. Son principe tient en une comparaison ; tout l'intérêt est dans ce que la comparaison approxime, et dans les cas où la règle se déclare incompétente.
+
+\subsection{Le test : stable et stable}
+
+La règle examine deux familles de corps. Dans le corps de rendu, chaque bloc est lu avec son environnement d'entrée (\code{block_states}) ; dans chaque corps d'effet, l'environnement de sortie du rendu. Handlers, callbacks et memos ne sont pas examinés. Dans ces corps, seules les instructions de premier niveau de la forme \code{setX(e)} sont testées :
+
+\rustsnippet[label={lst:regles-etat-redundant-test}]{src/rules/impls/redundant_set_state.rs}{253}{279}{le test d'un appel de setter}
+
+Le setter est reconnu par \code{env.setter_label}, la table de l'environnement abstrait (\cref{tab:regles-etat-tables}). La valeur écrite est évaluée dans les stores ; la valeur courante est lue dans le store d'état, \emph{pas} par l'évaluation de \code{StateVal}. La règle déclenche si les deux sont \code{Stable} au sens de \code{is_stable} (\src{src/domains/impls/state_value.rs}{414}{417}), c'est-à-dire si leur projection \code{to_stability} vaut \code{Stable}.
+
+Pourquoi \og stable et stable\fg{} approximerait-il \og égal\fg{} ? Parce que le store contient la \emph{jointure des valeurs écrites}, y compris celle que l'on teste. Pour un nombre, \code{useState(42)} puis \code{setN(42)} donne un store $[42,42]$, ponctuel, donc stable ; \code{useState(0)} puis \code{setN(42)} donne $[0,42]$, qui n'est pas ponctuel : la projection rend \code{PerRender} et la règle se tait. Le même raisonnement vaut pour les chaînes (ensemble de constantes), les booléens et le mélange de deux sortes. C'est la double vue de l'état du \cref{chap:statevalue-stabilite} : le store est la vue \og événementielle\fg{} de ce qui a été écrit, et c'est la seule qui puisse répondre à la question posée ; l'évaluation de \code{StateVal(l)} rend \code{Versioned}, qui n'est jamais \code{Stable}.
+
+\begin{piege}
+Pour les \emph{références}, l'argument s'effondre. \code{Stability::Stable} ne porte aucune identité : deux constantes de module distinctes sont toutes deux \code{Stable}, et leur jointure aussi. \og stable et stable\fg{} ne prouve donc pas \og même référence\fg. La documentation \code{explain} de la règle parle de \og stable and equal\fg{} (\srcline{src/rules/docs.rs}{223}) ; le code ne teste que la stabilité. L'exemple \code{TwoConsts} ci-dessous est un faux positif assumé de niveau \Warning.
+\end{piege}
+
+\subsection{Les slots contestés}
+
+Affirmer \og l'état contient déjà cette valeur\fg{} suppose que l'écriture testée est toute l'histoire du slot. Deux situations ôtent ce droit, et la règle les calcule avant tout test :
+
+\rustsnippet[label={lst:regles-etat-contested}]{src/rules/impls/redundant_set_state.rs}{57}{81}{les slots sur lesquels la règle n'a pas qualité pour parler}
+
+Un slot est \emph{contesté} s'il est écrit dans plus d'une région lexicale (\code{WriterRegion}, colonne exacte de \relation{slot_writers}, \cref{sec:relations-slotwriter}), ou si son setter s'échappe du composant (\code{escaping_slots}, \src{src/engine/setters.rs}{2383}{2398}). Les lignes étrangères (\code{owner} non vide, écriture d'un slot du parent par un setter reçu en prop) sont ignorées, car leur label est celui du propriétaire (\adr{42} §2). La lecture de la relation remplace un ancien balayage du rendu et des autres effets, qui manquait les écrivains des handlers, des \code{useCallback} et des continuations \code{.then()} (\issue{92}).
+
+Une seconde exclusion vise les corps d'effets. La fonction \code{collect_transition_setters}, définie en \src{src/rules/impls/redundant_set_state.rs}{172}{191}, écarte tout label dont deux appels, dans le même corps et y compris dans des \code{FnLit} imbriqués, reçoivent des arguments abstraits différents --- le motif \og machine à états\fg{} \code{if (ok) setMode("idle") else setMode("busy")}, où chaque écriture pourrait bien changer la valeur.
+
+\subsection{Exemples}
+
+\begin{lstlisting}[language=TypeScript,caption={Écritures redondantes ou non (\file{/tmp/ch18/redundant.tsx})},label={lst:regles-etat-redundant-ex}]
+import { useState, useEffect } from "react";
+
+export function Redundant() {
+  const [n, setN] = useState(42);
+  useEffect(() => {
+    setN(42);
+  }, []);
+  return <p>{n}</p>;
+}
+
+export function NotRedundant() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    setN(42);
+  }, []);
+  return <p>{n}</p>;
+}
+
+export function Contested() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    setN(0);
+  }, []);
+  return <button onClick={() => setN(1)}>{n}</button>;
+}
+
+export function Transition({ ok }: { ok: boolean }) {
+  const [mode, setMode] = useState("idle");
+  useEffect(() => {
+    if (ok) setMode("idle");
+    else setMode("busy");
+  }, [ok]);
+  return <p>{mode}</p>;
+}
+
+const A = { k: "a" };
+const B = { k: "b" };
+
+export function TwoConsts() {
+  const [v, setV] = useState(A);
+  useEffect(() => {
+    setV(B);
+  }, []);
+  return <p>{v.k}</p>;
+}
+
+export function InRender() {
+  const [n, setN] = useState(0);
+  setN(0);
+  return <p>{n}</p>;
+}
+\end{lstlisting}
+
+Sortie avec \code{--trace --rule redundant-set-state --show-clean} :
+
+\begin{sortie}
+  Contested  (3 hooks)  redundant.tsx  ✓
+  InRender  (1 hooks)  redundant.tsx
+    warn   redundant-set-state  [hook:0]  (line 49:2)  state `n` is set to a stable value it already holds, so the update is redundant
+       → the value written to state `n` is the value it already holds [hook:0] (line 49:2)
+  NotRedundant  (2 hooks)  redundant.tsx  ✓
+  Redundant  (2 hooks)  redundant.tsx
+    warn   redundant-set-state  [hook:0]  (line 5:2)  state `n` is set to a stable value it already holds, so the update is redundant
+       → the value written to state `n` is the value it already holds [hook:0] (line 6:4)
+  Transition  (2 hooks)  redundant.tsx  ✓
+  TwoConsts  (2 hooks)  redundant.tsx
+    warn   redundant-set-state  [hook:0]  (line 41:2)  state `v` is set to a stable value it already holds, so the update is redundant
+       → the value written to state `v` is the value it already holds [hook:0] (line 42:4)
+\end{sortie}
+
+\begin{itemize}
+  \item \code{Redundant} : store $[42,42]$, argument $[42,42]$. Le diagnostic est ancré sur l'effet (ligne~5), la note sur l'appel (ligne~6) : pour les effets, la règle recopie la plage de l'effet sur ses diagnostics a posteriori (\src{src/rules/impls/redundant_set_state.rs}{127}{133}).
+  \item \code{NotRedundant} : store $[0,42]$, silence. Sans filtre, c'est \regle{unnecessary-rerender} qui parle (\og mount-only effect sets state `n` to a constant different from its initial value\fg).
+  \item \code{Contested} : le slot est écrit par l'effet et par un handler, deux régions ; silence, bien que l'effet écrive \code{0} dans un état initialisé à \code{0}.
+  \item \code{Transition} : deux arguments différents dans le même corps, label écarté.
+  \item \code{TwoConsts} : le faux positif annoncé. \code{v} passe de \code{A} à \code{B}, un vrai changement de référence, mais les deux sont \code{Stable}.
+  \item \code{InRender} : dans le corps de rendu, la règle ne pose jamais de plage elle-même ; la position \code{(line 49:2)} vient de \code{located}, qui recopie la plage de la première note (\cref{sec:api-regles-temoins}). Sans filtre, le même appel reçoit aussi une \Error{} \regle{setter-in-render} : aucune déduplication entre règles.
+\end{itemize}
+
+\begin{remarque}
+Deux écritures identiques et redondantes dans un même effet (\file{/tmp/ch18/redundant2.tsx}, \code{if (ok) setMode("idle"); else setMode("idle");} avec un état initialisé à \code{"idle"}) produisent deux diagnostics de même message et de même plage (celle de l'effet), qui ne diffèrent que par la position de leur note. Le rendu humain les regroupe et affiche \og \code{[in 2 components]}\fg{} suivi de \og \code{in: Twice, Twice}\fg{} : le regroupement du rendu compte des attributions, et en trouve deux pour un seul composant. La sortie JSON montre bien deux diagnostics distincts. Défaut cosmétique du rendu, relevé au commit \snapshotCommit.
+\end{remarque}
+
+\begin{piege}
+La règle ne voit que les appels en \emph{position d'instruction} de premier niveau : un \code{setN(0)} dans un \code{.then(() => …)} d'un effet, ou dans l'argument d'un autre appel, n'est pas testé. Pour une règle d'affirmation de niveau \Warning, c'est une perte de précision et non une atteinte à la soundness ; mais c'est une troisième lecture des écritures, à côté de \relation{slot_writers} (qui voit toutes les positions depuis \adr{38}) et de \code{collect_setter_calls}. \file{redundant_set_state.rs} figure pour cette raison dans la liste du cliquet \og walk-free\fg{} (\cref{sec:api-regles-walk-free}).
+\end{piege}
+
+% ===========================================================================
+\section{\regle{setter-in-render} : écrire pendant le rendu}
+\label{sec:regles-etat-setter-in-render}
+
+\begin{react}[mise à jour pendant le rendu]
+Un setter appelé \emph{pendant} le rendu d'un composant planifie un nouveau rendu de ce même composant avant même le commit. Inconditionnel, l'appel se répète à chaque passe : React interrompt la boucle par l'erreur \og Too many re-renders\fg{} au-delà de 25~passes (\code{RE\_RENDER\_LIMIT} de \code{ReactFiberHooks.js}, constante depuis les premières versions des Hooks, hors du dépôt \reactant{} et non vérifiée sur le code source de React lui-même dans ce manuscrit).
+Un setter d'un \emph{autre} composant (reçu en prop) appelé pendant le rendu déclenche l'avertissement \og Cannot update a component while rendering a different component\fg. React documente pourtant une exception, l'idiome \og ajuster l'état pendant le rendu\fg : \code{if (prev !== value) setPrev(value)}, dont la garde s'éteint dès que l'écriture a eu lieu, coûte un rendu supplémentaire et converge \cite{ReactDocs}.
+\end{react}
+
+La règle doit donc séparer trois cas : l'écriture certaine à chaque rendu (\Error), l'écriture possible (\Warning), et l'écriture gardée qui converge (silence). Elle émet deux noms de diagnostic, \regle{setter-in-render} pour un setter local et \regle{cross-setter-in-render} pour le setter d'un parent.
+
+\subsection{Quels noms sont des setters}
+
+\rustsnippet[label={lst:regles-etat-sir-setters}]{src/rules/impls/setter_in_render.rs}{63}{97}{les setters locaux et étrangers}
+
+Les setters locaux sont les seules liaisons directes \code{Let x = StateSetter(l)} du rendu, sans fermeture d'alias. Les setters étrangers viennent de \code{cross_component_setters} (\src{src/engine/setters.rs}{432}{440}) : les props dont la valeur est un setter d'un autre composant, lue dans l'environnement des blocs (\code{SetterProp}, \cref{chap:relations}). Chaque \code{SetterProp} porte un booléen \code{must_write} : vrai si appeler la variable écrit prouvablement, faux pour une fonction qui ne fait que \emph{capturer} un setter (\adr{38} §4). Sans aucun setter, la règle rend immédiatement.
+
+\subsection{Les sites et leur phase}
+
+Les appels sont collectés par \code{collect_setter_calls(render_cfg, all_setter_vars, 2)} : la marche des écritures du moteur, qui descend dans les \code{FnLit} passés en argument ou liés à une variable jusqu'à deux niveaux, et classe chaque site par phase (\cref{chap:relations}). La règle pose une seule question à cette phase, \og l'écriture peut-elle s'exécuter pendant le passage du corps ?\fg :
+
+\rustsnippet[label={lst:regles-etat-sir-phase}]{src/rules/impls/setter_in_render.rs}{109}{121}{une ligne \code{Handler} ou \code{Deferred} est une preuve de non-rendu}
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+\code{SetterCallPhase} & exemple & \code{may_run_in_body} & effet sur la règle \\
+\midrule
+\code{Sync} & \code{setN(1)} au rendu, \code{wrap(setN(1))} & vrai & retenu ; \Error{} possible \\
+\code{Handler} & listener enregistré, handler JSX réifié & faux & écarté (preuve) \\
+\code{Deferred} & \code{setTimeout(() => setN(1))}, cleanup & faux & écarté (preuve) \\
+\code{Unknown} & \code{compose(() => setN(1))} sans résumé & vrai (⊤) & retenu ; jamais \Error \\
+\bottomrule
+\end{tabular}
+\caption{Les quatre phases d'un site et ce qu'en fait \regle{setter-in-render} (\src{src/engine/setters.rs}{56}{79}).}
+\label{tab:regles-etat-sir-phases}
+\end{table}
+
+Écarter \code{Unknown} serait le faux négatif que corrige \adr{38} (\issue{130}) : ⊤ inclut le passage du rendu.
+
+\subsection{La preuve : deux must, puis la dominance}
+
+\rustsnippet[label={lst:regles-etat-sir-proof}]{src/rules/impls/setter_in_render.rs}{147}{162}{l'unique chemin vers l'\Error}
+
+Trois conditions, toutes nécessaires. La phase doit être \code{Sync} : sur une ligne ⊤, une preuve de dominance porterait sur le bloc, pas sur le moment de l'écriture. La variable doit écrire à coup sûr : un setter local, ou un \code{SetterProp} dont \code{must_write} est vrai --- la dominance prouve que l'\emph{appel} a lieu, pas que l'\emph{écriture} a lieu. Enfin le bloc de l'appel doit dominer toutes les sorties atteignables du CFG de rendu : \code{ExitDominance::certify} (\cref{lst:api-regles-exit-dominance}) frappe alors un \code{Certified<DominatesAllExits>}. Un appel trouvé dans un \code{FnLit} imbriqué a \code{block_id = None} et ne peut jamais atteindre l'\Error. La \cref{fig:regles-etat-sir-cfg} montre la différence sur les deux programmes les plus simples.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=5mm and 8mm]
+  % --- Unconditional
+  \node[cfgbloc,text width=44mm,fill=ra-bg,draw=ra-blue,thick] (u0) {B0 (entrée et sortie)\\let n = StateVal(0)\\let setN = StateSetter(0)\\expr setN((n Add 1))\\=> return <p>};
+  \node[etiquette,above=1mm of u0] {\code{Unconditional}};
+  \node[etiquette,below=2mm of u0,text width=46mm,align=center] (ul) {sorties atteignables $=\{B0\}$ ;\\B0 domine B0 : \code{All(DominatesAllExits)}\\$\Rightarrow$ \Error};
+  % --- Conditional
+  \node[cfgbloc,text width=34mm,right=22mm of u0.north east,anchor=north west] (c0) {B0 (entrée)\\let flag = \ldots\\let setN = StateSetter(0)\\=> branch flag ? B1 : B2};
+  \node[etiquette,above=1mm of c0] {\code{Conditional}};
+  \node[cfgbloc,text width=24mm,below left=8mm and -12mm of c0,fill=ra-bg,draw=ra-amber,thick] (c1) {B1\\expr setN(1)\\=> jump B3};
+  \node[cfgbloc,text width=18mm,below right=8mm and -12mm of c0] (c2) {B2\\=> jump B3};
+  \node[cfgbloc,text width=24mm,below=24mm of c0] (c3) {B3 (sortie)\\=> return <p>};
+  \draw[fleche] (c0) -- node[etiquette,left] {T} (c1);
+  \draw[fleche,draw=ra-red,very thick] (c0) -- node[etiquette,right] {F} (c2);
+  \draw[fleche] (c1) -- (c3);
+  \draw[fleche,draw=ra-red,very thick] (c2) -- (c3);
+  \node[etiquette,below=2mm of c3,text width=62mm,align=center] (cl) {chemin B0 → B2 → B3 (en rouge) évite B1 :\\B1 ne domine pas B3, \code{certify(B1)} rend \code{None}\\$\Rightarrow$ \Warning{} (la garde \code{flag} ne lit pas le slot)};
+  % arbre de dominance
+  \node[etiquette,right=6mm of c2,text width=32mm,align=left] {arbre de dominance :\\B0 → B1, B2, B3};
+\end{tikzpicture}
+\caption{CFG de rendu de \code{Unconditional} et \code{Conditional} (\cref{lst:regles-etat-sir-ex}), tels que les imprime la sonde d'IR (élagués). La preuve d'\Error{} demande que le bloc de l'appel domine \emph{toutes} les sorties atteignables. Dans \code{Conditional}, B0 est le dominateur immédiat de B1, B2 et B3 ; B1 ne domine aucune sortie.}
+\label{fig:regles-etat-sir-cfg}
+\end{figure}
+
+\subsection{L'idiome d'ajustement : se taire sur une convergence prouvée}
+
+Sans preuve d'\Error, un appel de setter local gardé peut encore être silencieux, si ses gardes meurent une fois la valeur écrite :
+
+\rustsnippet[label={lst:regles-etat-sir-adjust}]{src/rules/impls/setter_in_render.rs}{164}{183}{le silence de l'idiome \og adjust during render\fg}
+
+\code{converges_once_written} (\src{src/engine/guards.rs}{60}{89}) est la preuve \og mono-site\fg{} étudiée au \cref{sec:relations-preuve-mono-site} : elle remonte la chaîne de prédécesseurs uniques du bloc d'appel, collecte les gardes qui le dominent, et tente trois arguments de mort --- le bras \emph{valeur} (après l'écriture, le narrowing rend la garde ⊥), le bras \emph{relationnel} (la garde compare le slot à l'expression même qu'on y écrit) et le bras \emph{membre} (le littéral écrit contredit la garde sur un champ). C'est une preuve, donc un silence légitime pour une règle de signalement. Le premier argument de l'appel est retrouvé par \code{setter_call_arg} (\src{src/rules/impls/setter_in_render.rs}{289}{304}), qui ne regarde que les instructions de premier niveau du bloc.
+
+L'idiome n'est jamais appliqué au setter d'un parent, et le doc-comment dit pourquoi : \og setting another component's state during render is a runtime error regardless of guards\fg{} (\src{src/rules/impls/setter_in_render.rs}{29}{35}).
+
+\subsection{Messages et ancrages}
+
+La formulation suit le verdict de phase (\adr{38} §3) : \og called directly in the render body\fg{} est une phrase \code{Sync}, et une ligne ⊤ reçoit \code{unknown_phase_message} (\src{src/rules/impls/setter_in_render.rs}{276}{287}), qui n'affirme que ce que la marche sait :
+
+\begin{itemize}
+  \item local \code{Sync} : \og setter `x` called directly in the render body, move this call into a useEffect or an event handler\fg{} ;
+  \item local ⊤ : \og setter `x` is handed to a callee with no timing summary. If that callee runs it during render, this re-renders on every render\fg{} ;
+  \item étranger \code{Sync} : \og prop `x` (a state setter of parent `P`) called during render of `C`, which triggers a parent re-render on every render\fg{} ;
+  \item étranger ⊤ : la même prop \og is handed to a callee with no timing summary\fg.
+\end{itemize}
+
+Un diagnostic local porte le label du slot (\code{[hook:N]}) ; un diagnostic étranger porte la variable (\code{var:x}) et pas de label. La troisième branche du choix de message, \og setter `x` called in the render body\fg{} (\src{src/rules/impls/setter_in_render.rs}{231}{245}), est inatteignable : \code{all_setter_vars} est exactement l'union des setters locaux et étrangers, et tout appel collecté relève donc d'une des deux premières branches.
+
+Reste une réfutation propre aux setters étrangers (\src{src/rules/impls/setter_in_render.rs}{122}{146}). La table des setters étrangers est un existentiel sur les points du programme ; si le nom n'est setter \emph{que} par elle et que le bloc même de l'appel le réassigne, avant l'appel, à une fonction qui ne mentionne aucun setter, il n'y a pas d'écriture à rapporter (\issue{119}). Le test est délibérément syntaxique : à la jonction de \code{if (c) \{ f = onUpdate; \} f()}, l'environnement contient le join de la flèche et du setter, et ce join perd la qualité de setter ; réfuter sur l'environnement supprimerait le vrai positif avec le faux.
+
+\subsection{Exemples}
+
+\begin{lstlisting}[language=TypeScript,caption={Six manières d'appeler un setter depuis le rendu (\file{/tmp/ch18/setter.tsx})},label={lst:regles-etat-sir-ex}]
+import { useState } from "react";
+
+declare function compose(f: () => void): () => void;
+declare function wrap(x: unknown): void;
+
+export function Unconditional() {
+  const [n, setN] = useState(0);
+  setN(n + 1);
+  return <p>{n}</p>;
+}
+
+export function Conditional({ flag }: { flag: boolean }) {
+  const [n, setN] = useState(0);
+  if (flag) setN(1);
+  return <p>{n}</p>;
+}
+
+export function Adjust({ open }: { open: boolean }) {
+  const [wasOpen, setWasOpen] = useState(open);
+  if (open !== wasOpen) setWasOpen(open);
+  return <p>{String(wasOpen)}</p>;
+}
+
+export function Handler() {
+  const [n, setN] = useState(0);
+  return <button onClick={() => setN(n + 1)}>{n}</button>;
+}
+
+export function Timing() {
+  const [n, setN] = useState(0);
+  setTimeout(() => setN(1), 0);
+  return <button onClick={compose(() => setN(2))}>{n}</button>;
+}
+
+export function Nested() {
+  const [n, setN] = useState(0);
+  wrap(setN(1));
+  return <p>{n}</p>;
+}
+
+function Child({ onMeasure }: { onMeasure: (w: number) => void }) {
+  onMeasure(42);
+  return <div />;
+}
+
+export function Parent() {
+  const [width, setWidth] = useState(0);
+  return <Child onMeasure={setWidth} />;
+}
+\end{lstlisting}
+
+Sortie avec \code{--trace --rule setter-in-render --rule cross-setter-in-render --show-clean} :
+
+\begin{sortie}
+  Adjust  (1 hooks)  setter.tsx  ✓
+  Child  (0 hooks)  setter.tsx
+    error  cross-setter-in-render  var:onMeasure  (line 42:2)  prop `onMeasure` (a state setter of parent `Parent`) called during render of `Child`, which triggers a parent re-render on every render
+       → `onMeasure` is a state setter, so calling it writes state (line 42:2)
+  Conditional  (1 hooks)  setter.tsx
+    warn   setter-in-render  [hook:0]  (line 14:12)  setter `setN` called directly in the render body, move this call into a useEffect or an event handler
+       → `setN` is a state setter, so calling it writes state (line 14:12)
+  Handler  (2 hooks)  setter.tsx  ✓
+  Nested  (1 hooks)  setter.tsx
+    error  setter-in-render  [hook:0]  (line 37:2)  setter `setN` called directly in the render body, move this call into a useEffect or an event handler
+       → `setN` is a state setter, so calling it writes state (line 37:2)
+  Parent  (1 hooks)  setter.tsx  ✓
+  Timing  (1 hooks)  setter.tsx  ✓
+  Unconditional  (1 hooks)  setter.tsx
+    error  setter-in-render  [hook:0]  (line 8:2)  setter `setN` called directly in the render body, move this call into a useEffect or an event handler
+       → `setN` is a state setter, so calling it writes state (line 8:2)
+\end{sortie}
+
+\begin{itemize}
+  \item \code{Unconditional} : \code{Sync}, bloc d'entrée qui est aussi la seule sortie : \Error.
+  \item \code{Conditional} : le bloc de l'appel ne domine pas la sortie ; la garde \code{flag} est une prop qui ne lit pas le slot, aucun des trois bras de mort ne s'applique : \Warning.
+  \item \code{Adjust} : bras relationnel. La garde \code{open !== wasOpen} compare le slot à l'expression même que l'on écrit ; une fois \code{wasOpen} égal à \code{open}, la garde est fausse. Silence.
+  \item \code{Handler} : le handler JSX est extrait en hook (\code{2 hooks}), la phase est \code{Handler} : silence.
+  \item \code{Nested} : \code{wrap(setN(1))} n'est pas en position d'instruction, mais depuis \adr{38} la marche visite toute position d'expression ; la ligne est \code{Sync} et le bloc domine la sortie : \Error.
+  \item \code{Child} : \code{onMeasure} est le setter lui-même, \code{must_write} vaut vrai : \Error{} \regle{cross-setter-in-render}, attribuée à l'enfant.
+  \item \code{Timing} : silencieux. On attendait au moins un \Warning{} pour \code{compose(() => setN(2))}, un callee sans résumé. L'explication est un défaut du repli par variable, étudié ci-dessous.
+\end{itemize}
+
+\begin{decision}[ADR-38 : une écriture est une écriture où qu'elle soit écrite]
+\textbf{Constat.} La marche des écritures ne voyait que les appels en position d'instruction : \code{wrap(setN(1))} était muet, sans même un \regle{analysis-limit}, et la règle ne lisait pas la phase que la marche calculait. \textbf{Décision.} Une seule traversée de toutes les positions d'expression, partagée par les trois canaux (écritures, appels, lectures) ; la règle lit \code{may_run_in_body} ; \code{Deferred} et \code{Unknown} deviennent deux variantes ; l'\Error{} exige \code{Sync} et \code{must_write}. \textbf{Alternative refusée.} Garder la formulation certaine sur les lignes ⊤ : ce serait affirmer \og la seule chose que la marche n'a pas pu établir\fg. \textbf{Mesure.} Sur 34\,730 fichiers, 27 diagnostics ajoutés, tous des \Warning{} dont 25 de la classe ⊤ (\code{handleSubmit(onSubmit)}\ldots), aucune \Error{} nouvelle.
+\end{decision}
+
+\subsection{Ce que la règle ne voit pas}
+
+Trois limites tiennent aux données que lit la règle, et non à son raisonnement.
+
+\paragraph{Les alias de setter.} \code{const s = setN; s(n + 1)} au rendu est une boucle certaine, et la règle donne pourtant l'assurance \code{verified setter-in-render} : sa table des setters locaux ne ferme pas les alias (\cref{tab:regles-etat-tables}), alors que \relation{slot_writers} porte la ligne. L'\cref{ex:relations-alias} du \cref{chap:relations} en fait l'analyse complète ; le correctif naturel est de lire la table fermée, ou mieux la relation, au niveau central (\cref{exo:regles-etat-alias}).
+
+\paragraph{Le repli par variable.} \code{collect_setter_calls} est la forme historique \og une ligne par variable\fg{} de la marche ; elle replie les sites explicitement, à la fin :
+
+\rustsnippet[label={lst:regles-etat-collapse}]{src/engine/setters.rs}{136}{157}{le repli : un site par variable, le plus petit dans l'ordre de \code{WalkClass}}
+
+L'ordre de \code{WalkClass} est celui de sa déclaration (\src{src/engine/setters.rs}{1331}{1344}) : \code{Sync} $<$ \code{Deferred} $<$ \code{Handler} $<$ \code{Cleanup} $<$ \code{Unknown}. Le repli garde le premier site de la plus petite classe. Deux conséquences, observées au commit \snapshotCommit{} :
+
+\begin{lstlisting}[language=TypeScript,caption={Deux effets du repli (\file{/tmp/ch18/timing.tsx} et \file{/tmp/ch18/tworender.tsx}, élagués)},label={lst:regles-etat-collapse-ex}]
+export function OnlyUnknown() {             // timing.tsx, l. 5
+  const [n, setN] = useState(0);
+  return <button onClick={compose(() => setN(2))}>{n}</button>;
+}
+
+export function DeferredThenUnknown() {     // timing.tsx, l. 10
+  const [n, setN] = useState(0);
+  setTimeout(() => setN(1), 0);
+  return <button onClick={compose(() => setN(2))}>{n}</button>;
+}
+
+export function TwoRenderCalls({ flag }: { flag: boolean }) {  // tworender.tsx, l. 3
+  const [n, setN] = useState(0);
+  if (flag) setN(1);                        // l. 5
+  setN(2);                                  // l. 6
+  return <p>{n}</p>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+  DeferredThenUnknown  (1 hooks)  timing.tsx  ✓
+  OnlyUnknown  (1 hooks)  timing.tsx
+    warn   setter-in-render  [hook:0]  (line 7:9)  setter `setN` is handed to a callee with no timing summary. If that callee runs it during render, this re-renders on every render
+
+  TwoRenderCalls  (1 hooks)  tworender.tsx
+    warn   setter-in-render  [hook:0]  (line 5:12)  setter `setN` called directly in the render body, move this call into a useEffect or an event handler
+\end{sortie}
+
+(Deux exécutions, notes omises.) Dans \code{DeferredThenUnknown}, le site \code{Deferred} du \code{setTimeout} est plus petit que le site \code{Unknown} du \code{compose} : c'est lui que le repli garde, la règle l'écarte comme preuve de non-rendu, et le site ⊤ disparaît avec lui. Le composant est déclaré propre alors que \code{OnlyUnknown}, qui ne diffère que par l'absence du \code{setTimeout}, reçoit son \Warning. C'est un faux négatif de soundness pour une règle de signalement. Dans \code{TwoRenderCalls}, les deux sites sont \code{Sync} ; le repli garde le premier, conditionnel, et la règle rend un \Warning{} ligne~5 alors que l'appel de la ligne~6 domine la sortie et vaudrait une \Error. Le composant est signalé, mais au mauvais niveau et au mauvais endroit. Les deux défauts ont la même cause : l'ordre du repli est un ordre de \emph{synchronicité}, pas l'ordre de la question \code{may_run_in_body}, et une règle qui a besoin de tous les sites lit une projection qui n'en garde qu'un. \relation{slot_writers}, lui, a une ligne par site (\adr{28}) : la règle y trouverait les deux. Aucune issue ne suit ces deux cas au commit \snapshotCommit.
+
+\paragraph{L'initialiseur.} \code{useState(setN(1))} (\cref{lst:regles-etat-lazy-ex}) n'est vu que par \regle{lazy-init} : l'initialiseur d'un hook n'est pas une instruction du CFG de rendu.
+
+\begin{piege}
+\og La règle est muette, donc aucun setter ne s'exécute au rendu\fg{} est faux dans les trois cas ci-dessus, et la ligne \code{verified} n'y change rien : l'assurance dit seulement que \code{check} n'a rien trouvé sur ce qu'il lit. Quand on étend la règle, la bonne question n'est pas \og quel cas ajouter ?\fg{} mais \og quelle relation lire ?\fg{} --- le principe \og modulaire et général d'abord\fg{} de CLAUDE.md.
+\end{piege}
+
+% ===========================================================================
+\section{\regle{derived-state} : un effet qui recopie un état}
+\label{sec:regles-etat-derived}
+
+\begin{react}[état dérivé]
+\code{useEffect(() => \{ setB(a * 2) \}, [a])} maintient \code{b} égal à une fonction de \code{a}. Chaque changement de \code{a} coûte deux rendus : le premier affiche l'ancien \code{b}, périmé, l'effet écrit, le second affiche la bonne valeur. La documentation React range ce motif parmi les effets inutiles : une valeur calculable à partir de l'état se calcule pendant le rendu, éventuellement dans un \code{useMemo} \cite{ReactDocs}.
+\end{react}
+
+C'est une règle d'affirmation : elle dit \og cet effet \emph{toujours} recopie une expression sans appel de \code{a}\fg, et ne parle que si chaque mot de cette phrase est établi.
+
+\subsection{Cinq conditions}
+
+\rustsnippet[label={lst:regles-etat-derived}]{src/rules/impls/derived_state.rs}{76}{128}{les conditions de \regle{derived-state}}
+
+\begin{enumerate}
+  \item L'effet a une liste de deps d'\emph{un seul} élément visible, dont l'arité ne réfute pas \og un seul\fg{} (\code{deps.arity.may_be(1)}) : une élision \code{[a, ,]} déclare deux éléments et réfute ; un spread aplati ne réfute pas, et le garder est la direction sûre (\cref{chap:ir}, arité des deps).
+  \item Ce dep est une variable liée directement à un \code{StateVal} du rendu (\code{state_val_labels}, sans alias) : état vers état, et non prop vers état.
+  \item \code{must_setter_on_all_paths(body_cfg, setter_vars, None)} rend \code{All} : un seul setter, des arguments sans appel, sur tous les chemins du corps. C'est l'analyse must en avant du \cref{sec:api-regles-must-setter} (\code{must_out[B]} est le meet des prédécesseurs, ou vrai si le bloc appelle). La règle lit le fait dans la preuve (\code{proof.evidence()}) mais reste au \Warning : le fait établit le motif, pas un défaut certain.
+  \item Le setter n'écrit pas le slot du dep : \code{setX(x + 1)} est une accumulation, laissée à \regle{infinite-loop}.
+  \item Personne d'autre n'écrit le slot, et son setter ne s'échappe pas. Cette question est posée à la relation \relation{slot_writers} (\code{slot_written_outside}) et à \code{slot_setter_escapes}, au lieu de l'ancien balayage du rendu et des autres effets, qui manquait les handlers, les \code{useCallback} et les continuations (\issue{92}) : \og every consumer that claims "no other writer" should ask the same question\fg.
+\end{enumerate}
+
+La branche \code{else if render_setters.contains(…)} (l.~124--128) n'est atteinte que si le setter retenu n'a pas de label dans \code{all_setter_labels} ; comme \code{setter_vars} en est issu, le cas est pratiquement impossible --- un filet hérité de l'ancien balayage. Le diagnostic est ancré sur l'effet, porte son label, et deux notes : \code{Step::Read} du dep, \code{Step::Write} du slot dérivé. Le message a une coquille (\og expression of `a` replace with\fg, sans ponctuation, l.~133--134).
+
+\subsection{Exemples}
+
+\begin{lstlisting}[language=TypeScript,caption={Dérivations, vraies et fausses (\file{/tmp/ch18/derived.tsx})},label={lst:regles-etat-derived-ex}]
+import { useState, useEffect } from "react";
+
+export function Derived({ start }: { start: number }) {
+  const [a] = useState(start);
+  const [b, setB] = useState(0);
+  useEffect(() => {
+    setB(a * 2);
+  }, [a]);
+  return <p>{b}</p>;
+}
+
+export function WithCall({ start }: { start: number }) {
+  const [a] = useState(start);
+  const [b, setB] = useState(0);
+  useEffect(() => {
+    setB(Math.abs(a));
+  }, [a]);
+  return <p>{b}</p>;
+}
+
+export function Editable({ start }: { start: number }) {
+  const [a] = useState(start);
+  const [b, setB] = useState(0);
+  useEffect(() => {
+    setB(a * 2);
+  }, [a]);
+  return <button onClick={() => setB(0)}>{b}</button>;
+}
+
+export function Partial({ start }: { start: number }) {
+  const [a] = useState(start);
+  const [b, setB] = useState(0);
+  useEffect(() => {
+    if (a > 0) setB(a * 2);
+  }, [a]);
+  return <p>{b}</p>;
+}
+
+export function TwoDeps({ start }: { start: number }) {
+  const [a] = useState(start);
+  const [c] = useState(start);
+  const [b, setB] = useState(0);
+  useEffect(() => {
+    setB(a + c);
+  }, [a, c]);
+  return <p>{b}</p>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+  Derived  (3 hooks)  derived.tsx
+    warn   derived-state  [hook:2]  (line 6:2)  this effect always sets `setB` to a call-free expression of `a` replace with `useMemo` or compute during render
+       → `a` is read here [hook:0] (line 6:2)
+       → state `b` is written here [hook:2] (line 7:4)
+  Editable  (4 hooks)  derived.tsx  ✓
+  Partial  (3 hooks)  derived.tsx  ✓
+  TwoDeps  (4 hooks)  derived.tsx  ✓
+  WithCall  (3 hooks)  derived.tsx  ✓
+\end{sortie}
+
+(Commande sans filtre, avec \code{--trace --show-clean}.) Seul \code{Derived} satisfait les cinq conditions. \code{WithCall} échoue à la troisième (un appel dans l'argument : peut-être pas pur, peut-être pas dérivable), \code{Partial} aussi (l'appel n'est pas sur tous les chemins : \code{MustResult::Some}), \code{TwoDeps} à la première, \code{Editable} à la cinquième (un handler écrit aussi \code{b}). Les états \code{a} ne sont jamais écrits ici ; quand un handler écrit \code{a}, \code{a} est élargi par le point fixe et \code{b} avec lui, et le composant reçoit en plus un \Warning{} \regle{infinite-loop} qui est un faux positif du bras point fixe (\cref{chap:api-regles}, discussion de \code{must_setter_on_all_paths} ; \cref{chap:infinite-loop}).
+
+\subsection{Un faux négatif par collision de labels}
+
+La cinquième condition interroge \code{slot_written_outside} :
+
+\rustsnippet[label={lst:regles-etat-written-outside}]{src/engine/setters.rs}{2356}{2364}{\og quelqu'un d'autre écrit-il ce slot ?\fg}
+
+La fonction compare le label du slot à celui de chaque ligne de \relation{slot_writers}, sans regarder la colonne \code{owner}. Or une ligne étrangère --- l'écriture d'un slot du parent par un setter reçu en prop --- porte le label \emph{du propriétaire} (\adr{42} §2), dans l'espace de labels du parent. Si ce numéro coïncide avec celui du slot local, la règle croit à un autre écrivain.
+
+\begin{lstlisting}[language=TypeScript,caption={Le slot 1 du parent masque le slot 1 de l'enfant (\file{/tmp/ch18/derived_foreign.tsx})},label={lst:regles-etat-derived-foreign}]
+import { useState, useEffect } from "react";
+
+export function Parent() {
+  const [p0] = useState(0);
+  const [p1, setP1] = useState(0);
+  return <Child onX={setP1} label={String(p0 + p1)} />;
+}
+
+function Child({ onX, label }: { onX: (n: number) => void; label: string }) {
+  const [a, setA] = useState(1);
+  const [b, setB] = useState(0);
+  useEffect(() => {
+    setB(a * 2);
+  }, [a]);
+  return <button onClick={() => { onX(1); setA(a + 1); }}>{b}{label}</button>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+  Child  (4 hooks)  derived_foreign.tsx  ✓
+    verified  derived-state  no effect merely mirrors other state
+  Parent  (2 hooks)  derived_foreign.tsx  ✓
+\end{sortie}
+
+(Commande sans \code{--all-roots}, avec \code{--rule derived-state --info --show-clean}.) Le handler de \code{Child} appelle \code{onX}, setter du slot~1 de \code{Parent} ; la ligne correspondante a \code{slot = 1} et \code{owner = Some(Parent)}. \code{b} est le slot~1 de \code{Child} : la règle se tait, et publie même l'assurance \code{verified}. Le même composant sans \code{onX(1)}, ou avec le setter du slot~0 du parent, reçoit le \Warning{} (vérifié sur \file{/tmp/rs-verif/derived_foreign.tsx} et \file{derived_foreign2.tsx}). \regle{redundant-set-state} ne souffre pas du défaut : elle filtre \code{w.owner.is_some()} (\cref{lst:regles-etat-contested}). Le correctif relève du \og général d'abord\fg{} : filtrer les lignes étrangères dans \code{slot_written_outside} elle-même, dont \regle{derived-state} est le seul appelant (\cref{exo:regles-etat-owner}). Aucune issue ne suit ce FN au commit \snapshotCommit.
+
+\begin{piege}
+Deux espaces de labels cohabitent dans \relation{slot_writers} d'un composant : les lignes \code{owner = None} parlent des slots locaux, les lignes \code{owner = Some(p)} des slots de \code{p}. \og Every native reader filters on \code{owner}\fg, dit la documentation de la relation ; un lecteur qui l'oublie ne plante pas, il compare des numéros qui n'ont rien à voir.
+\end{piege}
+
+% ===========================================================================
+\section{\regle{state-mutation} : muter l'état en place}
+\label{sec:regles-etat-mutation}
+
+\begin{react}[identité et mutation]
+React compare l'ancienne et la nouvelle valeur d'un slot par \code{Object.is}. \code{items.push(x); setItems(items)} passe au setter la \emph{même} référence : React voit que rien n'a changé et saute le re-rendu, l'interface reste figée alors que les données ont bougé. La forme correcte crée une nouvelle référence (\code{setItems([...items, x])}), y compris dans un updater (\code{setItems(prev => [...prev, x])}). Muter un objet reçu en props écrit dans des données possédées par le parent. Les refs, elles, sont faites pour être mutées : \code{ref.current.push(x)} est légitime et ne planifie aucun rendu.
+\end{react}
+
+La règle a deux bras : le bras A (état muté puis passé tel quel à son setter, \Error{} ou \Warning) et le bras B (objet de props muté, \Warning). Elle est la seule du chapitre à poursuivre une \emph{identité de référence} à travers les liaisons et les portées, et elle fait ce travail elle-même : \file{state_mutation.rs} est dans la liste du cliquet \og walk-free\fg{} (\cref{sec:api-regles-walk-free}).
+
+\subsection{Racines, sites et portées}
+
+\rustsnippet[label={lst:regles-etat-mut-types}]{src/rules/impls/state_mutation.rs}{37}{65}{racine d'identité, site enregistré, portée lexicale}
+
+La question centrale est \og à quoi cette expression est-elle identique ?\fg{}, et la réponse est une \code{MutRoot} : un slot d'état, l'objet props, ou autre chose. Chaque site enregistré (une mutation ou un appel de setter à même identité) garde sa plage, un texte d'affichage et un \emph{conteneur} : l'identifiant de la portée de déclenchement où il s'exécute. Le rendu est le conteneur~0, le hook d'indice \code{i} le conteneur \code{1 + i} :
+
+\rustsnippet[label={lst:regles-etat-mut-containers}]{src/rules/impls/state_mutation.rs}{384}{407}{un conteneur par corps de déclenchement}
+
+Les corps d'effets, de memos, de handlers et de callbacks héritent des liaisons du rendu, qu'ils capturent. Un \code{FnLit} imbriqué reste dans le conteneur de son corps englobant (\og a nested function runs on the same trigger family\fg, \src{src/rules/impls/state_mutation.rs}{283}{290}), avec ses paramètres en ombrage : un paramètre ne remonte jamais vers l'état ni vers les props.
+
+Un \emph{site de mutation} est une instruction \code{MemberWrite} (\code{obj.f = v}, \code{arr[i] = v}) ou un appel reconnu par \code{mutation_receiver} (\src{src/ir/expr.rs}{143}{158}) : une méthode de la liste \code{MUTATING_METHODS} (\code{push}, \code{pop}, \code{shift}, \code{unshift}, \code{splice}, \code{sort}, \code{reverse}, \code{fill}, \code{copyWithin}, \code{add}, \code{delete}, \code{clear}, \code{set}, \src{src/ir/expr.rs}{121}{135}) ou \code{Object.assign(target, …)}, dont le receveur est le premier argument.
+
+\begin{decision}[ADR-28 §4 : un seul reconnaisseur de sites de mutation]
+La liste des formes qui mutent est partagée par \regle{state-mutation}, par la garde de pureté du Tier~A et par la dépendance de rendu : \og the one list every reader of "is this a mutation site" shares\fg{} (\src{src/ir/expr.rs}{115}{120}). Ce qui reste propre à la règle est la question de la racine (\og ce receveur est-il \emph{ce} slot ?\fg). La migration s'est faite \og diagnostics unchanged\fg{} (\adr{28}, Consequences). Dupliquer la liste dans chaque lecteur, c'était préparer deux lectures d'un même fait qui dérivent.
+\end{decision}
+
+\begin{piege}
+Le commentaire source (\src{src/ir/expr.rs}{115}{120}) attribue lui-même ce partage à \og ADR-028 §2\fg, mais le texte cité vient de la §4 de cette ADR (\og ImpureBody is a second derived verdict over the same column\fg), la §2 traitant d'une tout autre décision (une seule colonne \code{Updater}, partagée entre le classifieur fonctionnel/non-fonctionnel et le classifieur de pureté). Une dérive de numérotation dans le commentaire, au commit \snapshotCommit.
+\end{piege}
+
+\subsection{La poursuite d'identité}
+
+\rustsnippet[label={lst:regles-etat-chase}]{src/rules/impls/state_mutation.rs}{112}{167}{\code{chase} : remonter une référence jusqu'à sa racine}
+
+La poursuite descend les accès : un champ ou un élément partage l'identité de son conteneur (muter \code{items[0]} mute ce que tient \code{items}). Trois exclusions sont posées \emph{par construction}, avant toute remontée : un chemin par \code{.current} (sémantique de ref), par \code{style}, \code{classList} ou \code{dataset} (manipulation du DOM, \code{DOM_FIELDS}), et une prop dont le type TypeScript déclaré est une interface DOM lue sur le paramètre props. Une variable se résout de la portée la plus intérieure vers l'extérieur : paramètre d'updater (\code{param_roots}, c'est le slot), nom ombré (autre chose), liaisons locales --- la première qui remonte à un slot gagne, c'est une analyse may --- puis les valeurs d'état du rendu, puis le paramètre props lui-même. Tout ce qui racine sur une allocation (\code{[...arr]}, \code{new Map(arr)}, un littéral) tombe dans \code{Other}. L'ensemble \code{seen} coupe les cycles de liaisons.
+
+Un appel de setter est à même identité si son argument remonte au slot du setter, ou si son argument est un updater :
+
+\rustsnippet[label={lst:regles-etat-updater}]{src/rules/impls/state_mutation.rs}{295}{334}{l'updater : son paramètre \emph{est} le slot}
+
+\subsection{Les deux bras et la preuve}
+
+Pour chaque slot muté qui a au moins un set de même identité, la règle calcule les conteneurs des mutations et ceux des sets, et appelle la primitive :
+
+\rustsnippet[label={lst:regles-etat-same-ref}]{src/rules/api/query.rs}{1039}{1057}{la primitive : un conteneur commun}
+
+\rustsnippet[label={lst:regles-etat-mut-proof}]{src/rules/impls/state_mutation.rs}{433}{440}{la seule voie vers l'\Error{} de \regle{state-mutation}}
+
+Intersection non vide : \Error{} ; sinon \Warning. Un diagnostic par slot, ancré sur le premier site de mutation dans l'ordre des positions, avec deux notes (\code{Step::Mutate}, \code{Step::Write} de valeur \code{SameAsCurrent}) ; la note d'écriture prend un set du même conteneur que ce site quand il y en a un (\src{src/rules/impls/state_mutation.rs}{447}{451}). Le bras B émet un \Warning{} par site de mutation racinée dans les props, dédoublonné par position, sans label.
+
+\subsection{Exemples}
+
+\begin{lstlisting}[language=TypeScript,caption={Mutations d'état et de props (\file{/tmp/ch18/mutation.tsx})},label={lst:regles-etat-mut-ex}]
+import { useState, useEffect, useRef } from "react";
+
+export function PushThenSet() {
+  const [items, setItems] = useState<string[]>([]);
+  const add = (x: string) => {
+    items.push(x);
+    setItems(items);
+  };
+  return <button onClick={() => add("a")}>{items.length}</button>;
+}
+
+export function UpdaterMutates() {
+  const [items, setItems] = useState<string[]>([]);
+  return (
+    <button onClick={() => setItems((prev) => { prev.push("a"); return prev; })}>
+      {items.length}
+    </button>
+  );
+}
+
+export function CopyThenSet() {
+  const [items, setItems] = useState<string[]>([]);
+  return <button onClick={() => setItems([...items, "a"])}>{items.length}</button>;
+}
+
+export function CrossContainer() {
+  const [items, setItems] = useState<string[]>([]);
+  useEffect(() => {
+    items.push("x");
+  }, []);
+  return <button onClick={() => setItems(items)}>{items.length}</button>;
+}
+
+export function PropMutation(props: { user: { name: string } }) {
+  props.user.name = "x";
+  return <p>{props.user.name}</p>;
+}
+
+export function RefIsFine() {
+  const ref = useRef<string[]>([]);
+  ref.current.push("x");
+  return <p>{ref.current.length}</p>;
+}
+
+export function ExclusiveBranches({ flag }: { flag: boolean }) {
+  const [items, setItems] = useState<string[]>([]);
+  const onClick = () => {
+    if (flag) {
+      items.push("x");
+    } else {
+      setItems(items);
+    }
+  };
+  return <button onClick={onClick}>{items.length}</button>;
+}
+\end{lstlisting}
+
+Sortie avec \code{--trace --rule state-mutation --show-clean} :
+
+\begin{sortie}
+  CopyThenSet  (2 hooks)  mutation.tsx  ✓
+  CrossContainer  (3 hooks)  mutation.tsx
+    warn   state-mutation  [hook:0]  var:items  (line 29:4)  `items` is mutated in place and `setItems` is called with the same reference. React compares with `Object.is`, sees no change, and skips the re-render
+       → `items` is mutated in place here, so its reference identity is unchanged [hook:0] (line 29:4)
+       → the value written to state `items` is the value it already holds [hook:0]
+  ExclusiveBranches  (2 hooks)  mutation.tsx
+    error  state-mutation  [hook:0]  var:items  (line 49:6)  `items` is mutated in place and `setItems` is called with the same reference. React compares with `Object.is`, sees no change, and skips the re-render
+       → `items` is mutated in place here, so its reference identity is unchanged [hook:0] (line 49:6)
+       → the value written to state `items` is the value it already holds [hook:0] (line 51:6)
+  PropMutation  (0 hooks)  mutation.tsx
+    warn   state-mutation  var:props.user  (line 35:2)  `props.user` roots in this component's props, so mutating it writes into an object owned by the parent; copy it before changing
+       → `props.user` is mutated in place here, so its reference identity is unchanged (line 35:2)
+  PushThenSet  (2 hooks)  mutation.tsx
+    error  state-mutation  [hook:0]  var:items  (line 6:4)  `items` is mutated in place and `setItems` is called with the same reference. React compares with `Object.is`, sees no change, and skips the re-render
+       → `items` is mutated in place here, so its reference identity is unchanged [hook:0] (line 6:4)
+       → the value written to state `items` is the value it already holds [hook:0] (line 7:4)
+  RefIsFine  (1 hooks)  mutation.tsx  ✓
+  UpdaterMutates  (2 hooks)  mutation.tsx
+    error  state-mutation  [hook:0]  var:prev  (line 15:48)  `items` is mutated in place and `setItems` is called with the same reference. React compares with `Object.is`, sees no change, and skips the re-render
+       → `prev` is mutated in place here, so its reference identity is unchanged [hook:0] (line 15:48)
+       → the value written to state `items` is the value it already holds [hook:0]
+\end{sortie}
+
+\begin{itemize}
+  \item \code{PushThenSet} : mutation et set dans la flèche \code{add}, liée au rendu, donc tous deux dans le conteneur~0. \Error.
+  \item \code{UpdaterMutates} : \code{prev} est le slot (\code{param_roots}) ; le \code{push} est une mutation d'état, le \code{return prev} un set de même identité, dans le conteneur du handler. \Error. La note d'écriture n'a pas de position : le corps concis \code{() => setItems(…)} est abaissé en terminateur \code{Return}, et \code{walk_cfg} parcourt les terminateurs sans plage (\src{src/rules/impls/state_mutation.rs}{216}{221}). Même cause pour la note de \code{CrossContainer}.
+  \item \code{CopyThenSet} : le spread est une allocation, \code{Other}. Silence.
+  \item \code{CrossContainer} : mutation dans l'effet (conteneur~2), set dans le handler (conteneur~3) : pas d'intersection, \Warning. Le défaut est pourtant réel --- le clic ne re-rendra pas.
+  \item \code{PropMutation} : bras B, \Warning{} sans label.
+  \item \code{RefIsFine} : le chemin passe par \code{.current}. Silence.
+  \item \code{ExclusiveBranches} : \Error, alors que la mutation et le set sont dans les deux branches exclusives d'un même handler et ne s'exécutent jamais dans le même clic.
+\end{itemize}
+
+\begin{piege}
+La preuve \og même conteneur\fg{} établit que la mutation et le set ont le même \emph{déclencheur}, pas qu'ils s'exécutent sur un même \emph{chemin}. Dans \code{ExclusiveBranches}, l'état est bel et bien corrompu (un premier clic mute sans re-rendre, un second passe la même référence et React l'ignore), mais la phrase du message, \og `setItems` is called with the same reference\fg{}, n'est pas vraie sur le chemin de la mutation. Au regard de la doctrine \og Error = preuve de toute la conclusion\fg{} (\issue{142}), le point reste ouvert : au commit \snapshotCommit, aucune issue ne tranche \code{ExclusiveBranches} pour \regle{state-mutation}. La colonne \code{same_tick} de \relation{slot_writers} existe déjà et pourrait fonder une primitive qui exigerait la co-exécution --- c'est l'objet de l'\cref{exo:regles-etat-coexec} --- mais elle est elle-même une approximation may dans un sens, dont un défaut de précision voisin (une indirection par helper local qui fait paraître co-exécutantes des branches exclusives) est suivi par \issue{123}.
+\end{piege}
+
+\begin{remarque}
+Le nom du setter affiché dans le message est choisi par \code{setter_label.iter().find(…)} sur une \code{HashMap} (\src{src/rules/impls/state_mutation.rs}{442}{446}). Quand un slot a plusieurs noms de setter (un alias), le choix dépend de l'ordre d'itération de la table, qui varie d'une exécution à l'autre en Rust. \code{state_slot_name} documente précisément ce risque pour le nom du slot et prend le minimum (\src{src/rules/helpers/mod.rs}{90}{105}) ; le nom du setter n'a pas reçu le même traitement. Le défaut se reproduit : sur un composant où \code{setItems} a trois alias \code{s}, \code{t}, \code{u} qui reçoivent tous \code{items} après un \code{items.push} (\file{/tmp/ch18/mutalias.tsx}), deux séries de douze exécutions de l'analyseur (chaque exécution est un nouveau processus, donc une nouvelle graine de hachage) ont chacune produit une répartition différente entre les quatre noms --- par exemple \code{t}:4, \code{s}:3, \code{u}:4, \code{setItems}:1 sur une série, \code{s}:5, \code{t}:3, \code{setItems}:3, \code{u}:1 sur l'autre --- sans qu'aucun nom ne domine de façon stable. La sortie n'est donc pas déterministe, ce qui gêne toute comparaison de corpus (\cref{chap:tests-corpus}).
+\end{remarque}
+
+Les limites documentées de la règle (\file{docs/limitations.md}) sont un FN sur un alias échappé (\code{ref.current = arr}, puis mutation par la ref, \issue{23}) et un FP sur une prop typée par une interface DOM \emph{importée} (\issue{38}). La campagne \og state\fg{} a relevé un autre FN : une valeur de module mutée puis copiée superficiellement (\code{filters.tags.push(t); setFilters(\{...filters\})}) --- la racine du set est une allocation, la mutation porte sur un objet partagé avec l'état initial.
+
+% ===========================================================================
+\section{\regle{frozen-initial-state} : un état figé sur la première prop}
+\label{sec:regles-etat-frozen}
+
+\begin{react}[initialiseur et remontage]
+\code{useState(props.value)} lit la prop au premier rendu seulement. Si le parent change ensuite \code{value} et que rien ne resynchronise le slot, l'enfant garde la valeur du montage : c'est le classique \og mon champ ne se met pas à jour quand les props changent\fg. Le gel n'est observable que si l'instance survit au changement : changer la \code{key} d'un élément démonte l'ancienne instance et en monte une nouvelle, dont l'initialiseur relit la prop ; un rendu conditionnel démonte aussi. Un nom de prop comme \code{initialValue} ou \code{defaultTab} annonce l'idiome \og non contrôlé avec valeur par défaut\fg, où le gel est voulu \cite{ReactDocs}.
+\end{react}
+
+C'est la règle la plus stratifiée du chapitre : elle rend une \Error, un \Warning{} ou une \Info{} selon une chaîne de faits dont un seul, le mouvement de la prop, exige l'analyse inter-composants. Le \cref{chap:api-regles} (\cref{sec:api-regles-motion}) a présenté ses deux primitives, \code{classify_motion} et \code{must_frozen_seed}, comme l'exemple type d'une frappe \og au point de connaissance\fg ; on regarde ici la règle entière.
+
+\subsection{Le seed et sa synchronisation : une relation du moteur}
+
+Le point de départ est la relation \relation{slot_seeds} (\cref{sec:relations-seeds}) : une ligne \code{SlotSeed} par chemin de prop qu'un initialiseur \code{useState} lit, avec un verdict de synchronisation et une colonne d'échappement du setter.
+
+\rustsnippet[label={lst:regles-etat-seeds}]{src/engine/seeds.rs}{34}{47}{le verdict de synchronisation, may dans un sens}
+
+\rustsnippet[label={lst:regles-etat-frozen-start}]{src/rules/impls/frozen_initial_state.rs}{106}{115}{pas de seed, ou un chemin de synchronisation : silence}
+
+\code{Synced} signifie qu'une écriture de rendu, ou une écriture d'effet qui se ré-exécute quand la prop bouge (ses deps couvrent le chemin du seed, ou il n'en déclare pas), a été vue. La qualité de cette synchronisation n'est pas la question de la règle : c'est celle de \regle{derived-state}, et l'écriture de rendu relève de \regle{setter-in-render}. \code{NoneSeen} n'est qu'une absence, que la colonne \code{setter_escapes} qualifie.
+
+\begin{decision}[ADR-31 : un pli promu au moteur]
+\textbf{Constat.} La règle possédait sa propre machinerie de seeds (chemins, normalisation vers le paramètre props, couverture par les deps, échappement), dont un second consommateur avait besoin. \textbf{Décision.} Déplacer ces plis dans \file{src/engine/seeds.rs}, sans les changer, et en faire une relation calculée à la convergence ; la moitié \og effet\fg{} de la synchronisation se dérive de \relation{slot_writers}, jamais d'un second balayage. Deux points d'attention : la moitié \og rendu\fg{} lit la \emph{phase} et non la région (un callback littéral du rendu est de région \code{Render} mais de phase ⊤, et y voir une synchronisation supprimait un vrai gel), et l'échappement est une colonne, pas un verdict \code{Synced} --- \og a no-sync claim is certain only when the setter stayed home\fg. \textbf{Ce qui reste natif.} La preuve de mouvement, les strates \Info{} et la rétrogradation par le montage (\issue{95}).
+\end{decision}
+
+\subsection{La prop bouge-t-elle ?}
+
+\rustsnippet[label={lst:regles-etat-frozen-motion}]{src/rules/impls/frozen_initial_state.rs}{140}{174}{classer le mouvement de chaque seed}
+
+Pour chaque seed, la règle reconstruit l'expression du chemin et l'évalue avec le \emph{tas convergé} (\code{eval_with_heap}, \src{src/rules/impls/frozen_initial_state.rs}{325}{336}), pour qu'un \code{props.a.b} se résolve au lieu de tomber à ⊤. \code{classify_motion} rend alors l'un de trois verdicts (\src{src/rules/api/query.rs}{839}{890}) :
+
+\begin{itemize}
+  \item \code{Proven(Certified<MovingFeeder>)} si la partie référence est \code{Versioned(S)} et que, pour un slot \code{(owner, l)} de \code{S}, le propriétaire est analysé et référence le setter de \code{l} : le prop est nourri par un état qui peut réellement bouger. C'est le seul endroit où ce jeton est frappé.
+  \item \code{Still} si la valeur est \code{Stable} ou ⊥, ou si tous les propriétaires sont analysés et qu'aucun ne référence le setter : un état React ne bouge que par son setter.
+  \item \code{Unproven} dans tous les autres cas : un propriétaire non analysé, \code{VersionedTop}, une valeur ⊤ ou \code{PerRender}.
+\end{itemize}
+
+Une valeur n'est \code{Versioned} que si le parent a été analysé \emph{avant} l'enfant et lui a transmis ses props (analyse descendante, \cref{chap:inter-composants}). Sous \code{--all-roots}, un composant exporté est aussi analysé comme racine, avec des props ⊤ : au mieux \code{Unproven}, donc au mieux \Warning.
+
+Tous les seeds \code{Still} : silence. Sinon la règle retient le premier \code{Proven} et, pour les \code{Unproven}, le préfixe commun de leurs chemins (plusieurs membres d'un même objet nomment la poignée qu'ils partagent). Elle note aussi les noms de props par lesquels arrivent les seeds mouvants : ils servent au raisonnement sur le montage.
+
+\subsection{Le montage}
+
+\rustsnippet[label={lst:regles-etat-mount}]{src/rules/helpers/mount.rs}{44}{67}{ce que les sites d'appel prouvent du montage}
+
+\code{MountIndex::coupling} (\src{src/rules/helpers/mount.rs}{116}{148}) examine tous les sites JSX qui instancient le composant. Si \emph{chacun} porte une \code{key} ou une garde qui couvre chaque prop de seed, le couplage est \code{Reseeds}. Si chacun est gardé par un état du propriétaire que toute écriture du slot nourricier écrit aussi, il est \code{WriterCoupled}. Sinon, ou sans site visible, \code{Free}. La couverture n'est pas symétrique (\src{src/rules/helpers/mount.rs}{152}{174}) : \code{key=\{item\}} couvre un seed lu comme \code{item.name}, mais \code{key=\{item.id\}} ne couvre pas un seed lu comme \code{item}, car un autre champ peut bouger seul. Ni \code{Reseeds} ni \code{WriterCoupled} ne sont des preuves que l'enfant ne survit pas au changement (une \code{key} objet se convertit en une chaîne constante) : ils \emph{dégradent}, ils ne suppriment jamais.
+
+\subsection{La stratification}
+
+\rustsnippet[label={lst:regles-etat-frozen-base}]{src/rules/impls/frozen_initial_state.rs}{195}{206}{le niveau de base d'une preuve de mouvement}
+
+\rustsnippet[label={lst:regles-etat-frozen-down}]{src/rules/impls/frozen_initial_state.rs}{231}{255}{les trois rétrogradations}
+
+Un seed prouvé part de l'\Error, sauf si le setter s'échappe (une synchronisation invisible est possible) ou si le montage est \code{WriterCoupled} ; un seed seulement \code{Unproven} part du \Warning. Viennent ensuite trois rétrogradations, dans l'ordre : tous les seeds mouvants nommés \code{initial*} ou \code{default*} (\code{is_seed_named} teste le dernier segment du chemin, \src{src/rules/impls/frozen_initial_state.rs}{60}{66}) font descendre d'un cran ; un slot jamais écrit localement (\code{const [snap] = useState(user)}, un instantané délibéré) tombe à l'\Info ; un montage \code{Reseeds} aussi. La \cref{fig:regles-etat-frozen-strates} résume le chemin de décision.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[
+    q/.style={bloc,text width=40mm},
+    issue/.style={draw=ra-gray,rounded corners=2pt,align=center,inner sep=3pt,font=\small,text width=20mm},
+    err/.style={issue,draw=ra-red,thick},
+    warn/.style={issue,draw=ra-amber,thick},
+    sil/.style={issue,dashed},
+    node distance=5mm and 9mm]
+  \node[q] (q1) at (0,0) {\code{seeds_of(label)} vide ?};
+  \node[sil] (s1) at (5,0) {silence};
+  \node[q] (q2) at (0,-1.2) {une ligne \code{Synced} ?};
+  \node[sil] (s2) at (5,-1.2) {silence};
+  \node[q] (q3) at (0,-2.5) {\code{classify_motion} de chaque seed};
+  \node[sil] (s3) at (5,-2.5) {silence\\(tous \code{Still})};
+  \node[q,text width=32mm] (q4) at (-2.0,-4.2) {≥ 1 \code{Proven} :\\escape ∨ \code{WriterCoupled} ?};
+  \node[warn,text width=24mm] (w0) at (2.4,-4.2) {base \Warning\\(\code{Unproven} seuls)};
+  \node[err] (e0) at (-3.2,-6.0) {base \Error};
+  \node[warn] (w1) at (-0.6,-6.0) {base \Warning};
+  \node[q,text width=70mm] (d1) at (0,-7.5) {tous les seeds mouvants \code{initial*}/\code{default*} ?\\\Error{} → \Warning, sinon → \Info};
+  \node[q,text width=70mm] (d2) at (0,-8.8) {slot jamais écrit localement ? → \Info};
+  \node[q,text width=70mm] (d3) at (0,-9.8) {\code{MountCoupling::Reseeds} ? → \Info};
+  \node[q,text width=70mm] (d4) at (0,-11.0) {niveau \Error{} : \code{must_frozen_seed} doit rendre \code{All},\\sinon \Warning};
+  \draw[fleche] (q1) -- node[etiquette,above] {oui} (s1);
+  \draw[fleche] (q1) -- node[etiquette,left] {non} (q2);
+  \draw[fleche] (q2) -- node[etiquette,above] {oui} (s2);
+  \draw[fleche] (q2) -- node[etiquette,left] {non} (q3);
+  \draw[fleche] (q3) -- (s3);
+  \draw[fleche] (q3) -- (q4);
+  \draw[fleche] (q3) -- (w0);
+  \draw[fleche] (q4) -- node[etiquette,left] {non} (e0);
+  \draw[fleche] (q4) -- node[etiquette,right] {oui} (w1);
+  \draw[fleche] (e0.south) -- (e0.south |- d1.north);
+  \draw[fleche] (w1.south) -- (w1.south |- d1.north);
+  \draw[fleche] (w0.south) -- (w0.south |- d1.north);
+  \draw[fleche] (d1) -- (d2);
+  \draw[fleche] (d2) -- (d3);
+  \draw[fleche] (d3) -- (d4);
+\end{tikzpicture}
+\caption{Les strates de \regle{frozen-initial-state} (\src{src/rules/impls/frozen_initial_state.rs}{97}{283}). Les rétrogradations ne font que descendre ; seule la dernière étape consomme le jeton de \code{classify_motion}. Le message ne dépend que de la branche \code{Proven}/\code{Unproven}, pas des rétrogradations.}
+\label{fig:regles-etat-frozen-strates}
+\end{figure}
+
+Le calcul du niveau est fait deux fois, et c'est voulu. La stratification ci-dessus produit une valeur de \code{Severity} ; mais une \code{Severity::Error} ne suffit pas à construire une \Error{} (\cref{sec:api-regles-sceau}) :
+
+\rustsnippet[label={lst:regles-etat-frozen-mint}]{src/rules/impls/frozen_initial_state.rs}{263}{285}{l'\Error{} consomme le jeton, que \code{must_frozen_seed} rend ou dégrade}
+
+\code{must_frozen_seed} (\cref{lst:api-regles-frozen-seed}) re-vérifie les quatre portes (pas d'échappement, pas tous nommés, écrit localement, montage \code{Free}) sur le jeton frappé par \code{classify_motion}, et rend \code{Some(into_evidence())} dès que l'une échoue. D'où l'invariant du commentaire : \og \code{severity == Error} ⟹ \code{All}\fg. Une erreur future dans la stratification coûterait un \Warning, jamais une \Error{} sans preuve.
+
+\subsection{Exemples}
+
+\begin{lstlisting}[language=TypeScript,caption={Un parent, six enfants (\file{/tmp/ch18/frozen.tsx})},label={lst:regles-etat-frozen-ex}]
+import { useState, useEffect } from "react";
+
+function Child({ user }: { user: { name: string } }) {
+  const [local, setLocal] = useState(user);
+  return <button onClick={() => setLocal({ name: "c" })}>{local.name}</button>;
+}
+
+function Keyed({ user }: { user: { name: string } }) {
+  const [local, setLocal] = useState(user);
+  return <button onClick={() => setLocal({ name: "k" })}>{local.name}</button>;
+}
+
+function Snapshot({ user }: { user: { name: string } }) {
+  const [snap] = useState(user);
+  return <p>{snap.name}</p>;
+}
+
+function Synced({ user }: { user: { name: string } }) {
+  const [local, setLocal] = useState(user);
+  useEffect(() => {
+    setLocal(user);
+  }, [user]);
+  return <button onClick={() => setLocal({ name: "s" })}>{local.name}</button>;
+}
+
+function Reseeded({ user }: { user: { name: string } }) {
+  const [local, setLocal] = useState(user);
+  return <button onClick={() => setLocal({ name: "r" })}>{local.name}</button>;
+}
+
+function Primitive({ title }: { title: string }) {
+  const [t, setT] = useState(title);
+  return <input value={t} onChange={(e) => setT(e.target.value)} />;
+}
+
+function Parent() {
+  const [user, setUser] = useState({ name: "a" });
+  const [title, setTitle] = useState("x");
+  return (
+    <div onClick={() => { setUser({ name: "b" }); setTitle("y"); }}>
+      <Child user={user} />
+      <Keyed key={user.name} user={user} />
+      <Reseeded key={user} user={user} />
+      <Snapshot user={user} />
+      <Synced user={user} />
+      <Primitive title={title} />
+    </div>
+  );
+}
+
+export function Root() {
+  return <Parent />;
+}
+\end{lstlisting}
+
+Sortie \emph{sans} \code{--all-roots}, avec \code{--trace --info --rule frozen-initial-state --show-clean} (notes élaguées sauf pour \code{Child}) :
+
+\begin{sortie}
+  Child  (2 hooks)  frozen.tsx
+    error  frozen-initial-state  [hook:0]  var:user  (line 4:8)  state `local` is seeded from `user`, which is fed by state `user` of `Parent` and changes. `useState` reads its initializer on the first render only and nothing here re-syncs it, so `local` stays frozen at the first `user` value
+       → `user` is read here [hook:0] (line 4:8)
+       → state `local` reads its initializer on the first render only, so later renders ignore it [hook:0] (line 4:8)
+       → state state `user` of `Parent` is written here
+  Keyed  (2 hooks)  frozen.tsx
+    error  frozen-initial-state  [hook:0]  var:user  (line 9:8)  state `local` is seeded from `user`, which is fed by state `user` of `Parent` and changes. …
+  Parent  (3 hooks)  frozen.tsx  ✓
+  Primitive  (2 hooks)  frozen.tsx
+    warn   frozen-initial-state  [hook:0]  var:title  (line 32:8)  state `t` is seeded from `title` and never re-synced. `useState` reads its initializer on the first render only, so if `title` changes, `t` keeps the mount-time value
+  Reseeded  (2 hooks)  frozen.tsx
+    info   frozen-initial-state  [hook:0]  var:user  (line 27:8)  state `local` is seeded from `user`, which is fed by state `user` of `Parent` and changes. …
+  Snapshot  (1 hooks)  frozen.tsx
+    info   frozen-initial-state  [hook:0]  var:user  (line 14:8)  state `snap` is seeded from `user`, which is fed by state `user` of `Parent` and changes. …
+  Synced  (3 hooks)  frozen.tsx  ✓
+    verified  frozen-initial-state  no state slot freezes a changing prop's first value
+\end{sortie}
+
+\begin{itemize}
+  \item \code{Child} : \code{user} vaut \code{Versioned(\{(Parent, 0)\})} ; \code{setUser} est référencé dans \code{Parent} : \code{Proven}. Pas d'échappement, pas de nom de seed, slot écrit localement, montage \code{Free} : \Error. La chaîne de témoins donne la lecture, la sémantique \og une seule fois\fg{} et l'écriture qui fait bouger la source.
+  \item \code{Keyed} : \code{key=\{user.name\}} ne couvre pas le seed lu comme \code{user} (asymétrie de la couverture) : \code{Free}, \Error.
+  \item \code{Reseeded} : \code{key=\{user\}} couvre le seed : \code{Reseeds}, \Info. Le message est identique à celui de l'\Error.
+  \item \code{Snapshot} : le setter n'est pas même destructuré, le slot n'est jamais écrit : \Info.
+  \item \code{Synced} : l'effet de deps \code{[user]} écrit le slot, ligne \code{Synced} : silence, avec assurance.
+  \item \code{Primitive} : \code{title} est une chaîne. La conversion côté lecture de \code{StateVal} ne pose \code{Versioned} que sur la partie référence (\cref{sec:statevalue-stabilite-lecture}) ; une chaîne n'en a pas, et la valeur jointe \code{\{"x", "y"\}} se projette en \code{PerRender} : \code{Unproven}, \Warning. C'est la limite documentée \og props primitifs\fg{} (\issue{25}) : le gel est signalé, mais jamais au niveau \Error.
+\end{itemize}
+
+Deux autres fichiers complètent la gradation. Avec \code{--all-roots} et des composants exportés sans parent (\file{/tmp/ch18/frozen_roots.tsx}) :
+
+\begin{lstlisting}[language=TypeScript,firstnumber=3,caption={Props ⊤ (\file{/tmp/ch18/frozen_roots.tsx}, élagué de l'import)},label={lst:regles-etat-frozen-roots}]
+export function FrozenWarn({ value }: { value: { n: number } }) {
+  const [v, setV] = useState(value);
+  return <button onClick={() => setV({ n: 1 })}>{v.n}</button>;
+}
+
+export function Seeded({ initialValue }: { initialValue: string }) {
+  const [v, setV] = useState(initialValue);
+  return <input value={v} onChange={(e) => setV(e.target.value)} />;
+}
+\end{lstlisting}
+
+\begin{sortie}
+  FrozenWarn  (2 hooks)  frozen_roots.tsx
+    warn   frozen-initial-state  [hook:0]  var:value  (line 4:8)  state `v` is seeded from `value` and never re-synced. `useState` reads its initializer on the first render only, so if `value` changes, `v` keeps the mount-time value
+  Seeded  (2 hooks)  frozen_roots.tsx
+    info   frozen-initial-state  [hook:0]  var:initialValue  (line 9:8)  state `v` is seeded from `initialValue` and never re-synced. …
+\end{sortie}
+
+\noindent Props ⊤ : \code{Unproven}, \Warning ; nommé \code{initialValue} : \Info. Et un setter qui s'échappe vers un petit-enfant (\file{/tmp/ch18/frozen_escape.tsx}, \code{<Editor onChange=\{setLocal\} />} dans l'enfant) rend \code{warn frozen-initial-state [hook:0] var:user (line 8:8)} avec le message \og prouvé\fg{} : le mouvement est certain, l'absence de synchronisation ne l'est plus.
+
+\begin{piege}
+Trois lectures trompeuses de cette règle. (1) Le message ne change pas avec les rétrogradations : une \Info{} \code{Reseeded} dit \og stays frozen\fg{} comme une \Error ; c'est le niveau qui porte la nuance. (2) Un \Warning{} sous \code{--all-roots} ne dit pas que le parent ne bouge pas la prop : il dit que l'analyse n'a pas vu le parent. Pour obtenir l'\Error, il faut que le parent soit atteint en analyse descendante (\cref{chap:inter-composants}). (3) La dernière note affiche \og state state `user` of `Parent`\fg{} : le \code{display} du \code{MovingFeeder} est déjà qualifié (\og state `user` of `Parent`\fg), et le gabarit de \code{Step::Write} préfixe à nouveau \og state\fg. Défaut cosmétique, déjà relevé au \cref{chap:api-regles}.
+\end{piege}
+
+Les limites documentées de la règle sont un FN sur les props primitifs et les seeds qui passent par un memo (\issue{25}) et un FP sur un enfant toujours remonté par une machinerie que l'analyse ne voit pas (\issue{136}), que \code{Reseeds} ne rattrape que pour les formes \code{key} et garde.
+
+% ===========================================================================
+\section{Synthèse}
+\label{sec:regles-etat-synthese}
+
+Le \cref{tab:regles-etat-recap} rassemble les sept règles sur la même grille. Deux colonnes méritent l'attention : la preuve qui ouvre l'\Error, qui est chaque fois une primitive must distincte, et la famille, qui dit comment lire un silence.
+
+\begin{table}[htbp]\centering\scriptsize
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{22mm}>{\raggedright\arraybackslash}p{16mm}>{\raggedright\arraybackslash}p{11mm}>{\raggedright\arraybackslash}p{31mm}>{\raggedright\arraybackslash}p{36mm}>{\raggedright\arraybackslash}p{24mm}@{}}
+\toprule
+règle & noms émis & niveaux & preuve de l'\Error & données lues & applicable si \\
+\midrule
+\regle{lazy-init} & idem & E, W, I & \code{must_init_calls_setter} (un setter dans l'initialiseur) & initialiseurs \code{State}/\code{Ref}, \code{setter_var_labels}, registre de fonctions (témoin) & \code{State} ou \code{Ref} \\
+\regle{unstable-context-value} & idem & W & --- & \code{module_consts}, rendu, tas convergé, \code{is_unstable_reference_only} & un provider prouvé \\
+\regle{redundant-set-state} & idem & W & --- & store d'état, \code{block_states}, \relation{slot_writers} (régions), \code{escaping_slots} & \code{State} et \code{Effect} \\
+\regle{setter-in-render} & idem, \regle{cross-setter-in-render} & E, W & \code{ExitDominance::certify} + phase \code{Sync} + \code{must_write} & \code{collect_setter_calls}, \code{cross_component_setters}, \code{converges_once_written} & \code{State} \\
+\regle{derived-state} & idem & W & --- (lit \code{must_setter_on_all_paths}) & deps, \code{all_setter_labels}, \relation{slot_writers}, \code{slot_setter_escapes} & \code{State} et \code{Effect} \\
+\regle{state-mutation} & idem & E, W & \code{must_same_ref_mutation} (conteneur commun) & tous les corps, \code{all_setter_labels}, \code{mutation_receiver} & \code{State} \\
+\regle{frozen-initial-state} & idem & E, W, I & \code{classify_motion} puis \code{must_frozen_seed} & \relation{slot_seeds}, tas convergé, \code{MountIndex}, \code{may_written_slots} & \relation{slot_seeds} non vide \\
+\bottomrule
+\end{tabular}
+\caption{Les sept règles d'état de ce chapitre (E = \Error, W = \Warning, I = \Info). La dernière colonne est la condition de \code{safe_check}.}
+\label{tab:regles-etat-recap}
+\end{table}
+
+Trois leçons générales s'en dégagent.
+
+\paragraph{Une \Error{} est toujours une conjonction re-dérivée.} \regle{setter-in-render} conjugue la phase, la certitude de l'écriture et la dominance ; \regle{frozen-initial-state} le mouvement prouvé et quatre portes ; \regle{state-mutation} la même identité et le même déclencheur. Chaque fois, la règle calcule un niveau, puis doit présenter un jeton qu'elle n'a pas pu forger ; un désaccord entre les deux coûte un \Warning{} (\cref{inv:api-regles-frappe}). Le cas \code{ExclusiveBranches} montre la limite de la méthode : le jeton prouve exactement ce que la primitive vérifie, et la question est alors de savoir si ce fait suffit à \og toute la conclusion\fg.
+
+\paragraph{Les faits may retiennent, les preuves font taire.} Les règles de signalement se taisent sur des preuves : une phase \code{Handler} ou \code{Deferred}, une garde qui meurt, un seed \code{Still} ou \code{Synced}, un appel absent. Les règles d'affirmation se taisent sur des faits may qui leur ôtent le droit de parler : un slot contesté, un setter échappé, un second écrivain. Confondre les deux, c'est soit inventer des diagnostics, soit en perdre.
+
+\paragraph{Les FN observés viennent des lectures, pas des raisonnements.} Au commit \snapshotCommit, aucun des défauts relevés dans ce chapitre n'est une erreur de logique dans une preuve. Tous tiennent à la \emph{donnée} qu'une règle lit : une table sans alias, une projection \og une ligne par variable\fg, un filtre \code{owner} oublié, un temporaire du lowering pris pour une liaison d'auteur. Le \cref{tab:regles-etat-constats} les récapitule. C'est l'argument même d'\adr{42} : une relation promue au moteur, lue par tous, ne peut pas dériver d'une relecture locale ; les trois fichiers de ce chapitre encore dans la liste du cliquet \og walk-free\fg{} (\file{redundant_set_state.rs}, \file{setter_in_render.rs}, \file{state_mutation.rs}) sont autant de promotions à faire.
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{30mm}>{\raggedright\arraybackslash}p{56mm}>{\raggedright\arraybackslash}p{20mm}>{\raggedright\arraybackslash}p{22mm}@{}}
+\toprule
+règle & constat & nature & cause \\
+\midrule
+\regle{lazy-init} & \code{useState(c ? f() : 0)}, \code{useState(c \&\& f())} muets & FN (signalement) & temporaire \code{__tN} non poursuivi \\
+\regle{unstable-context-value} & \code{<Ctx value>} (React 19) muet & FN de précision & suffixe \code{.Provider} exigé \\
+\regle{redundant-set-state} & deux constantes objet distinctes & FP (\Warning) & \code{Stable} sans identité \\
+\regle{redundant-set-state} & \og \code{[in 2 components]} … \code{Twice, Twice}\fg & cosmétique & regroupement du rendu \\
+\regle{setter-in-render} & alias \code{const s = setN} au rendu & FN (\Error) & table sans alias \\
+\regle{setter-in-render} & \code{setTimeout} puis \code{compose} : site ⊤ perdu & FN (\Warning) & repli par variable \\
+\regle{setter-in-render} & appel conditionnel puis inconditionnel & \Error{} rendue \Warning & repli par variable \\
+\regle{derived-state} & setter de parent de même label & FN (\Warning) & \code{owner} non filtré \\
+\regle{state-mutation} & branches exclusives & \Error{} discutable & preuve de conteneur \\
+\regle{frozen-initial-state} & prop primitive (\issue{25}) & plafond \Warning & \code{Versioned} sur la référence seule \\
+\bottomrule
+\end{tabular}
+\caption{Constats relevés au commit \snapshotCommit{} sur les exemples de ce chapitre, hors limites déjà suivies par une issue (sauf \issue{25}, rappelée pour mémoire).}
+\label{tab:regles-etat-constats}
+\end{table}
+
+% ===========================================================================
+\begin{resume}
+\begin{itemize}
+  \item Sept règles parlent de l'état local : \regle{lazy-init} (un appel dans l'initialiseur), \regle{unstable-context-value} (une valeur de provider neuve à chaque rendu), \regle{redundant-set-state} (écrire la valeur déjà présente), \regle{setter-in-render} et \regle{cross-setter-in-render} (écrire pendant le rendu), \regle{derived-state} (un effet qui recopie un état), \regle{state-mutation} (muter l'état ou les props en place), \regle{frozen-initial-state} (un état figé sur la première valeur d'une prop).
+  \item Deux familles : les règles de \emph{signalement} ne se taisent que sur une preuve ; les règles d'\emph{affirmation} ne parlent que sur un fait établi et retiennent sur des faits may (\cref{def:regles-etat-familles}). Les trois règles d'affirmation plafonnent au \Warning.
+  \item Quatre \Error{}, quatre primitives : \code{must_init_calls_setter} ; \code{ExitDominance::certify} après les deux must \code{Sync} et \code{must_write} ; \code{must_same_ref_mutation} ; \code{classify_motion} consommé par \code{must_frozen_seed}. La règle calcule un niveau, le jeton le confirme ou le dégrade.
+  \item Les données lues : les tables \code{setter_var_labels}, \code{state_val_labels}, \code{all_setter_labels} (\cref{tab:regles-etat-tables}) ; les relations \relation{slot_writers} et \relation{slot_seeds} ; le store d'état, le tas convergé, \code{collect_setter_calls}, \code{converges_once_written}, \code{MountIndex}.
+  \item Fichiers : les sept fichiers de règles de \file{src/rules/impls/} (un par règle, nommé d'après elle) ; \file{providers.rs}, \file{jsx.rs} et \file{mount.rs} dans \file{src/rules/helpers/} ; \file{setters.rs}, \file{seeds.rs} et \file{guards.rs} dans \file{src/engine/} ; les primitives de \file{src/rules/api/query.rs}. ADR : \adr{21}, \adr{27}, \adr{28}, \adr{31}, \adr{38}, \adr{42}.
+  \item Constats (\cref{tab:regles-etat-constats}) : les faux négatifs observés tiennent tous à la donnée lue --- table sans alias, repli par variable, \code{owner} non filtré, temporaire du lowering ---, ce qui plaide pour la lecture des relations du moteur.
+  \item Le \cref{chap:infinite-loop} traite les deux règles d'état restantes, \regle{infinite-loop} et \regle{state-lifted-too-high}, qui mobilisent le graphe de churn et la dépendance de rendu.
+\end{itemize}
+\end{resume}
+
+% ===========================================================================
+\section{Exercices}
+\label{sec:regles-etat-exercices}
+
+\begin{exercice}{Lire la matrice de \regle{lazy-init}}{regles-etat-lazy-matrice}
+Pour chacun des initialiseurs suivants, prédire le verdict de \regle{lazy-init} pour \code{useState} puis pour \code{useRef}, en justifiant par \code{classify_init_effect} : \code{parseInt(s)}, \code{Math.max(a, compute())}, \code{new Date()}, \code{\{ at: Date.now() \}}, \code{<Row />}. Vérifier ensuite avec l'analyseur.
+\end{exercice}
+
+\begin{solution}
+\code{parseInt(s)} : \code{PureCheap} ⇒ \Info{} / silence. \code{Math.max(a, compute())} : un \code{PureCheap} et un \code{Other}, \code{has_unknown} ⇒ \code{Unknown} ⇒ \Warning{} / \Info. \code{new Date()} : le callee \code{Date} d'un \code{New} n'est pas \code{now}, classé \code{Unknown} ⇒ \Warning{} / \Info. \code{\{ at: Date.now() \}} : l'appel est dans un \code{ObjectLit}, déclencheur actif, \code{PureCheap} ⇒ \Info{} / silence. \code{<Row />} : \code{CompApp} poussé par \code{collect_callees}, classé \code{Other} ⇒ \Warning{} / \Info. Les dix verdicts sont confirmés par l'analyseur sur \file{/tmp/ch18/exo1.tsx} (trois \Warning, cinq \Info, deux silences pour les refs \code{parseInt} et \code{Date.now}).
+\end{solution}
+
+\begin{exercice}{Le temporaire du lowering}{regles-etat-lazy-ternaire}
+Expliquer pourquoi \code{useState(c ? compute() : 0)} échappe à \regle{lazy-init} alors que \code{useState(1 + compute())} est signalé, en vous appuyant sur l'impression d'IR de la \cref{sec:regles-etat-lazy-init}. Proposer une correction qui ne rouvre pas le faux positif \code{useMediaQuery}, et dire où elle doit vivre (règle, helper, lowering).
+\end{exercice}
+
+\begin{solution}
+Le lowering abaisse la conditionnelle en diamant et l'initialiseur devient \code{Var(__t0)} ; la règle refuse de poursuivre les liaisons. Le faux positif \code{useMediaQuery} vient d'un temporaire d'\emph{inlining} qui cache une forme paresseuse. Une correction consiste à poursuivre les seules liaisons introduites par le lowering pour une expression de l'initialiseur (temporaires \code{__tN} dont toutes les affectations sont dans le diamant de cet initialiseur), en rassemblant les callees de toutes les branches. Pour rester générale, la distinction \og temporaire de lowering\fg{} / \og liaison d'auteur ou d'inlining\fg{} devrait être un fait de l'IR (une marque sur la liaison) plutôt qu'un test de préfixe dans la règle.
+\end{solution}
+
+\begin{exercice}{Égalité par stabilité}{regles-etat-stable-egal}
+Montrer, avec \code{TwoConsts}, que \code{is_stable(arg) ∧ is_stable(store)} n'implique pas l'égalité pour la sorte référence, alors qu'elle l'implique pour un intervalle. Proposer une restriction qui élimine ce faux positif sans en créer d'autre, et discuter de ce qu'elle coûte, sachant que la règle est une règle d'affirmation de niveau \Warning.
+\end{exercice}
+
+\begin{exercice}{Réparer le repli}{regles-etat-repli}
+Pour \code{DeferredThenUnknown} et \code{TwoRenderCalls} (\cref{lst:regles-etat-collapse-ex}), écrire la liste des sites que produit la marche avant repli, avec leur classe et leur bloc. (a) Montrer que le premier cas est un FN au sens de l'invariant de soundness, et le second une perte de niveau. (b) Proposer deux corrections : changer l'ordre du repli, ou faire lire à la règle une ligne par site. Laquelle respecte le principe \og modulaire et général d'abord\fg{} ? Quels autres appelants de \code{collect_setter_calls} seraient affectés par la première ?
+\end{exercice}
+
+\begin{solution}
+(a) \code{DeferredThenUnknown} : deux sites \code{(setN, Deferred, None)} et \code{(setN, Unknown, None)} ; le repli garde \code{Deferred}, que la règle écarte ; le site ⊤, qui peut s'exécuter au rendu, n'est jamais examiné : silence sur un défaut possible, FN. \code{TwoRenderCalls} : deux sites \code{Sync}, blocs B1 (conditionnel) et B3 (qui domine la sortie) ; le premier est gardé : \Warning{} au lieu d'\Error, le composant est signalé. (b) Changer l'ordre (\code{Unknown} avant \code{Deferred}) corrige le premier cas mais pas le second, et modifie les verdicts de \regle{derived-state}, \regle{infinite-loop}, \regle{stale-closure}, de \file{rules/helpers/mount.rs} et de l'entité Tier~A, qui appellent aussi \code{collect_setter_calls}. Lire une ligne par site --- \relation{slot_writers} ou la marche non repliée --- corrige les deux et fait sortir \file{setter_in_render.rs} de la liste du cliquet : c'est la correction au niveau central.
+\end{solution}
+
+\begin{exercice}{Fermer les alias}{regles-etat-alias}
+Écrire un composant où \code{const s = setN; s(n + 1)} est appelé au rendu, constater l'assurance \code{verified setter-in-render}, puis indiquer quelle table du \cref{tab:regles-etat-tables} la règle devrait lire. Écrire le test d'intégration qui verrouillerait la correction (un composant fautif, un composant sain de même forme).
+\end{exercice}
+
+\begin{exercice}{Filtrer \code{owner} au bon endroit}{regles-etat-owner}
+Reproduire le FN de \regle{derived-state} de la \cref{lst:regles-etat-derived-foreign}. Expliquer pourquoi une ligne \code{SlotWriter} d'\code{owner = Some(Parent)} porte le label du parent. Écrire la correction dans \code{slot_written_outside} et vérifier qu'elle ne change pas le verdict de \code{Editable} (\cref{lst:regles-etat-derived-ex}).
+\end{exercice}
+
+\begin{solution}
+L'écriture \code{onX(1)} dans le handler de \code{Child} écrit le slot~1 de \code{Parent} ; la relation la range dans les écrivains de \code{Child} (c'est là qu'est le site) avec le label du propriétaire, seul label qui désigne ce slot (\adr{42} §2). La correction ajoute \code{w.owner.is_none()} au prédicat de \code{slot_written_outside}. Dans \code{Editable}, le second écrivain est un handler local (\code{owner = None}, région \code{Handler}), toujours compté : le verdict (silence) ne change pas.
+\end{solution}
+
+\begin{exercice}{Co-exécution}{regles-etat-coexec}
+Pour \code{ExclusiveBranches}, discuter si l'\Error{} est justifiée au regard de \og Error = preuve de toute la conclusion\fg. Proposer une primitive \code{must_*} plus forte qui exige que la mutation et le set s'exécutent sur un même chemin (par exemple : le bloc du set est dominé par celui de la mutation, dans le même corps), et évaluer les cas où elle ferait descendre une \Error{} réelle au \Warning.
+\end{exercice}
+
+\begin{exercice}{Strates à la main}{regles-etat-strates}
+Pour chacun des enfants de la \cref{lst:regles-etat-frozen-ex}, suivre la \cref{fig:regles-etat-frozen-strates} et retrouver le niveau observé. Puis prédire le niveau de \code{Child} (a) si la prop s'appelle \code{initialUser}, (b) si l'enfant passe \code{setLocal} à un petit-enfant, (c) si le fichier est analysé avec \code{--all-roots} et \code{Child} exporté sans être rendu par \code{Parent}.
+\end{exercice}
+
+\begin{solution}
+(a) \code{Proven}, base \Error, tous les seeds nommés ⇒ \Warning ; \code{must_frozen_seed} n'est pas consulté (le niveau n'est plus \Error). (b) \code{setter_escapes} ⇒ base \Warning{} (observé sur \file{frozen_escape.tsx}). (c) Props ⊤ en analyse de racine : \code{Unproven} ⇒ \Warning.
+\end{solution}

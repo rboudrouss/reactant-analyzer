@@ -1,0 +1,522 @@
+% ---------------------------------------------------------------------------
+% Chapitre 24 — Distribution : WASM, npm, GitHub Action, CI
+% Sources : notes/12-declarative-packs.md (§1.4, §4.14, §5.2, §8.4) ;
+% notes/14-tests-corpus-methodo.md (§2.7, §3.8, §4.4, §4.5, §4.8, §4.13, §8.4) ;
+% Cargo.toml, crates/reactant-wasm/{Cargo.toml,src/lib.rs}, npm/ (package.json,
+% build.sh, bin/, lib/, scripts/, test/), action.yml, scripts/gh-action.mjs,
+% .github/workflows/{ci,corpus}.yml, .github/dependabot.yml ; ADR-016, 022 §6,
+% 023 §5.
+% Sorties observées avec target/debug/reactant (commit e67b10a), NO_COLOR=1,
+% depuis la racine du dépôt ou depuis /tmp/ch24. Node.js n'est PAS installé sur
+% la machine de rédaction : aucune sortie de `npx reactant`, de `packs build`
+% ni de npm/test/smoke.sh n'a été observée ; ce qui en est dit vient de la
+% lecture du code et des scripts.
+% ---------------------------------------------------------------------------
+\chapter{Distribution : WASM, npm, GitHub Action, CI}
+\label{chap:distribution}
+
+\begin{objectifs}
+  \item Comprendre comment un même cœur Rust est livré sous deux formes : un binaire natif (\code{cargo}) et un module WebAssembly enveloppé dans un paquet npm, exécutable sous Node comme dans un navigateur.
+  \item Savoir à quoi servent les features Cargo \code{cli} et \code{schema-gen}, et pourquoi le build WASM s'en passe.
+  \item Connaître le principe \og l'hôte n'est jamais une frontière de confiance\fg{} et sa mise en œuvre dans \file{crates/reactant-wasm/src/lib.rs}.
+  \item Parcourir le paquet npm : \code{bin}, API programmatique, chargement du cœur, \code{reactant packs build}, types \file{pack.d.ts} générés.
+  \item Savoir comment la parité native/WASM est testée, et connaître les divergences qui subsistent.
+  \item Utiliser l'Action GitHub en connaissant ses pièges (épingle de version, \code{args}, angles morts), et lire les jobs de la CI du dépôt.
+\end{objectifs}
+
+\prerequis{\cref{chap:projet-cli-driver} (la CLI, la configuration, \code{run_check}, la couture \code{FileSystem} et \code{MemFileSystem}, les blind spots, le rapport JSON v2) ; \cref{chap:regles-declaratives} (packs, \code{load_pack}, validation). Le \cref{chap:tests-corpus} reprend la mesure corpus, dont on ne voit ici que le workflow.}
+
+Les chapitres précédents décrivent un analyseur qu'on lance par \code{cargo run -- check}. Ce n'est pas ainsi que ses utilisateurs le rencontrent. Un développeur React tape \code{npx reactant-analyzer} ; une équipe ajoute trois lignes à un workflow GitHub ; un outil en ligne veut analyser le tampon d'un éditeur dans le navigateur. Aucun de ces hôtes n'a de chaîne Rust installée, et deux d'entre eux n'ont même pas de système de fichiers.
+
+La question de ce chapitre est donc : comment livrer \emph{le même} analyseur à des hôtes aussi différents, sans que son comportement bifurque ? Car la soundness (\cref{def:soundness}) est une propriété d'un programme précis. Si l'hôte npm réimplémentait la découverte des fichiers ou la validation des packs, un faux négatif pourrait exister sous \code{npx} et pas sous \code{cargo}, et aucun test du moteur ne le verrait. La réponse du projet tient en une phrase de l'\adr{22} §6 : un seul artefact WASM, un hôte JS réduit au transport, un cœur qui revalide tout ce qu'il reçoit.
+
+On procède du plus bas au plus haut : la compilation (\cref{sec:distribution-features}), le cœur WASM (\cref{sec:distribution-wasm}), le paquet npm (\cref{sec:distribution-npm}), les tests de parité (\cref{sec:distribution-parite}), l'Action GitHub (\cref{sec:distribution-action}), la CI (\cref{sec:distribution-ci}), et enfin ce qui est versionné et stable (\cref{sec:distribution-versions}).
+
+% ===========================================================================
+\section{Deux artefacts, un cœur : les features Cargo}
+\label{sec:distribution-features}
+
+\subsection{Un workspace, deux crates}
+
+Le dépôt est un workspace Cargo à deux membres : la crate racine \code{reactant} (bibliothèque et binaire) et \file{crates/reactant-wasm}. La crate racine sépare nettement ce qui est propre à l'hôte natif de ce qui a un sens partout :
+
+\rustsnippet[language={}]{Cargo.toml}{13}{33}{workspace, features et cibles de la crate racine}
+
+Deux features, toutes deux actives par défaut. La feature \code{cli} tire \code{clap}, le parseur d'arguments, et le binaire \code{reactant} l'exige (\code{required-features}). La feature \code{schema-gen} tire \code{schemars}, qui ne sert qu'à émettre les JSON Schemas (commande \code{reactant schemas}) : la validation elle-même est faite par \code{serde} et par des vérifications écrites à la main (\cref{chap:regles-declaratives}), elle n'a pas besoin de \code{schemars}. Dans le code, \code{schema-gen} n'apparaît que sous forme d'attributs conditionnels, \code{\#[cfg_attr(feature = "schema-gen", derive(JsonSchema))]}, dans \file{src/config.rs} et \file{src/rules/declarative/schema.rs}. La feature \code{cli} n'apparaît nulle part dans la bibliothèque : le module \code{cli} est déclaré par \file{src/main.rs}, pas par \file{src/lib.rs} (\cref{chap:projet-cli-driver}). C'est cette séparation, voulue par l'\adr{16} §1, qui rend possible un build sans CLI.
+
+La crate WASM est minuscule :
+
+\rustsnippet[language={}]{crates/reactant-wasm/Cargo.toml}{1}{15}{le manifeste de la crate WASM}
+
+\code{crate-type = ["cdylib"]} produit une bibliothèque dynamique, qui devient un module \file{.wasm} pour la cible \code{wasm32-unknown-unknown}. La dépendance \code{reactant = \{ path = "../..", default-features = false \}} retire \code{clap} et \code{schemars}. Il ne reste que ce que le commentaire de \file{Cargo.toml} promet : \og \emph{oxc + serde}\fg{}. On le vérifie avec \code{cargo tree} :
+
+\begin{shell}
+$ cargo tree -p reactant-wasm -e normal --depth 2 --offline
+\end{shell}
+\begin{sortie}
+reactant-wasm v0.6.0 (/home/rboudrouss/reactant-analyzer/crates/reactant-wasm)
+├── console_error_panic_hook v0.1.7
+│   ├── cfg-if v1.0.4
+│   └── wasm-bindgen v0.2.127
+├── reactant v0.6.0 (/home/rboudrouss/reactant-analyzer)
+│   ├── oxc_allocator v0.138.0
+│   ├── oxc_ast v0.138.0
+│   ├── oxc_parser v0.138.0
+│   ├── oxc_span v0.138.0
+│   ├── serde v1.0.228
+│   ├── serde_json v1.0.150
+│   └── serde_path_to_error v0.1.20
+├── serde v1.0.228 (*)
+├── serde_json v1.0.150 (*)
+└── wasm-bindgen v0.2.127 (*)
+\end{sortie}
+
+Le cœur ne dépend d'aucune bibliothèque d'entrées-sorties, de threads ou de \code{mmap}. C'est ce que l'\adr{22} §6 rappelle pour justifier la faisabilité : oxc est du Rust pur, et toutes les lectures de fichiers passent par les traits de l'\adr{13}, dont la couture \code{FileSystem} (\cref{chap:projet-cli-driver}).
+
+\begin{piege}
+Rien, dans la suite de tests ordinaire, ne compile la bibliothèque sans ses features par défaut : \code{cargo test} active \code{cli} et \code{schema-gen}. Un \code{use clap::…} égaré dans \file{src/} passerait donc tous les tests et ne casserait que le build WASM. C'est pourquoi la CI a un job dédié, \code{no-default-features}, qui lance \code{cargo clippy --lib --no-default-features} (\cref{sec:distribution-ci}).
+\end{piege}
+
+\subsection{Construire le paquet : \file{npm/build.sh}}
+
+Le script \file{npm/build.sh} fabrique tout ce que le paquet npm publie et que le dépôt ne versionne pas (\file{npm/dist/}, \file{npm/schemas/} et \file{npm/LICENSE} sont listés dans \file{npm/.gitignore}) :
+
+\rustsnippet[language=bash]{npm/build.sh}{13}{34}{les étapes de construction du paquet npm}
+
+Quatre décisions se lisent dans les commentaires.
+\begin{enumerate}
+  \item \textbf{Une pile de 8 Mio.} L'analyse est récursive (descente récursive d'oxc, inlining à profondeur bornée), et la pile par défaut d'un module WASM, 1 Mio, est plus étroite que celle d'un processus natif. Sans ce drapeau d'édition de liens, un fichier profondément imbriqué pourrait faire déborder la pile sous WASM et pas en natif.
+  \item \textbf{Une seule cible \code{wasm-bindgen}, \code{web}, pour les deux hôtes.} Le \file{.wasm} émis est identique octet pour octet quelle que soit la cible, seule la glue JS diffère, et la glue \code{web} fonctionne aussi sous Node à condition de lui fournir les octets (\cref{sec:distribution-npm}). Une seconde cible aurait livré une seconde copie du même module.
+  \item \textbf{Les schémas viennent du binaire natif du même commit.} \code{cargo run -- schemas --out npm/schemas} les engendre à partir des types Rust que le validateur utilise ; schémas publiés et validation ne peuvent donc pas diverger.
+  \item \textbf{\file{lib/pack.d.ts} est engendré à partir de ce schéma} (\cref{sec:distribution-npm-packs}).
+\end{enumerate}
+
+La commande \code{schemas} du binaire natif est la seule consommatrice de \code{schemars}. Lancée avec \code{--out /tmp/ch24/schemas}, elle écrit \file{pack.schema.json} et \file{reactant-config.schema.json} ; le premier est identique (vérifié avec \code{cmp}) à celui de \file{npm/schemas/} et à l'instantané versionné \file{docs/schemas/pack.schema.json}.
+
+\begin{remarque}
+Le commentaire de \file{npm/build.sh} parle d'un module de \og 3.5 MB\fg{}, l'\adr{23} §5 de 788 Ko compressés ; reconstruit à \code{e67b10a}, le \file{.wasm} pèse 4\,389\,894 octets, 1\,164\,013 après \code{gzip}. Aucun test ne borne cette taille.
+\end{remarque}
+
+% ===========================================================================
+\section{Le cœur WASM et l'hôte non fiable}
+\label{sec:distribution-wasm}
+
+\subsection{Le problème : un hôte qui pourrait mentir}
+
+Considérons une équipe dont le \file{reactant.config.json} déclare \code{"packs": ["@acme/react-rules"]} et règle la sévérité d'une règle de ce pack. Sous \code{npx}, c'est du JavaScript qui trouve le paquet \code{@acme/react-rules} dans \file{node\_modules}, lit son JSON et le transmet au cœur. Si ce code JS \og aidait\fg{} en validant lui-même le pack, ou en interprétant la configuration JSONC, il y aurait deux validateurs. Le jour où ils divergent, un pack refusé en natif serait accepté sous npm, ou une clé de configuration ignorée d'un côté seulement. L'\adr{22} §6 tranche par un principe, que l'en-tête du crate énonce :
+
+\rustsnippet[label={lst:wasm-header}]{crates/reactant-wasm/src/lib.rs}{1}{10}{l'en-tête du cœur WASM}
+
+\begin{definition}{Hôte de transport}{hote-transport}
+Un \terme{hôte} de \reactant{} est un frontend qui invoque le driver : le binaire natif, ou le wrapper JS du paquet npm (\cref{chap:projet-cli-driver}). Un hôte est dit \terme{de transport} lorsqu'il se borne à \emph{acheminer des octets} : \code{argv}, texte brut de la configuration, texte des packs, contenu des fichiers ; et à restituer les flux et le code de sortie qu'on lui rend. Il ne décide d'aucune sémantique : ni quels fichiers analyser, ni quel projet détecter, ni si un pack ou une configuration est valide.
+\end{definition}
+
+\begin{invariant}{L'hôte n'est jamais une frontière de confiance}{hote-non-fiable}
+Tout ce que le cœur WASM reçoit de l'hôte JS (enveloppe, configuration, packs, options) est reparsé et revalidé dans le cœur, par les mêmes fonctions que la CLI native : \code{config::parse}, \code{declarative::load_pack}, \code{RuleRegistry::register}, \code{RuleRegistry::set_overrides}, puis \code{driver::run_check}. La découverte des fichiers, la détection du projet, les chaînes \file{tsconfig} et la résolution d'alias tournent dans le moteur au-dessus d'un \code{MemFileSystem}. Un hôte altéré peut rendre un run indisponible (erreur d'usage), pas le rendre moins sound.
+\end{invariant}
+
+La contrepartie est assumée : l'hôte doit envoyer un \emph{sur-ensemble} des fichiers que le moteur lira, puisqu'un fichier absent de la table est, pour le moteur, un fichier qui n'existe pas.
+
+\subsection{Les cinq exports}
+
+Le crate expose cinq fonctions à JavaScript, par \code{\#[wasm_bindgen]}. Toutes échangent des chaînes JSON : aucune structure Rust ne traverse la frontière.
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}l l X@{}}
+\toprule
+Nom JS & Fonction Rust & Rôle \\
+\midrule
+\code{hostConstants()} & \code{host_constants} & sert \code{prunedDirs}, \code{sourceExtensions}, \code{configFileName} à l'hôte (\src{crates/reactant-wasm/src/lib.rs}{24}{39}) \\
+\code{helpPage(color)} & \code{help_page} & la page d'aide, mêmes octets que \code{reactant help} (l.~41--48) \\
+\code{packSpecs(text)} & \code{pack_specs} & la liste \code{packs} d'une configuration, extraite par le vrai parseur (l.~50--60) \\
+\code{validatePack(json)} & \code{validate_pack} & \code{load_pack} sans analyse, pour \code{packs build} (l.~62--83) \\
+\code{run(inputJson)} & \code{run} $\rightarrow$ \code{run_inner} & les commandes \code{check}, \code{rules}, \code{explain} (l.~163--260) \\
+\bottomrule
+\end{tabularx}
+\caption{Les exports \code{wasm_bindgen} du cœur.}\label{tab:distribution-exports}
+\end{table}
+
+Les trois premiers existent pour que l'hôte n'ait \emph{rien} à savoir par lui-même. \code{hostConstants} lui dit quels répertoires il peut ignorer sans jamais cacher un fichier au moteur (\code{HOST_PRUNED_DIRS} : \code{node_modules}, \code{.git}, \code{.next}, \srcline{src/resolver/mod.rs}{533}) et quelles extensions sont des sources. \code{packSpecs} répond à la seule question que l'hôte doit se poser \emph{avant} l'analyse, à savoir quels packs aller chercher, sans qu'il ait à parser du JSONC :
+
+\rustsnippet{crates/reactant-wasm/src/lib.rs}{50}{60}{l'hôte ne parse jamais la configuration}
+
+\subsection{L'enveloppe d'entrée}
+
+\code{run} reçoit un document JSON, l'\terme{enveloppe}, désérialisé dans le type \code{Input} :
+
+\rustsnippet{crates/reactant-wasm/src/lib.rs}{85}{105}{l'enveloppe d'entrée}
+
+Champ par champ : \code{command} vaut \code{"check"}, \code{"rules"} ou \code{"explain"} ; \code{explain_rule} nomme la règle à documenter ; \code{paths} rejoue les arguments positionnels d'une invocation CLI ; \code{files} est la table \og chemin relatif POSIX $\rightarrow$ texte\fg{} qui deviendra le \code{MemFileSystem} ; \code{config} est le texte \emph{brut} de \file{reactant.config.json} ; \code{packs} est une liste de \code{PackInput \{ name, json \}}, où \code{name} est la spécification écrite dans la configuration (pour les messages d'erreur) et \code{json} le texte du pack. \code{options} est un miroir un pour un des drapeaux de \code{check} (\src{crates/reactant-wasm/src/lib.rs}{114}{145}) : \code{info}, \code{showClean}, \code{trace}, \code{verbose}, \code{allRoots}, \code{entry}, \code{excludeDir}, \code{followImports}, \code{format}, \code{failOn}, \code{project}, \code{rule}, \code{ignoreRule}, \code{color}.
+
+\code{Input} et \code{Options} portent \code{deny_unknown_fields} : une clé mal orthographiée est une erreur d'usage, pas une option silencieusement ignorée. \code{PackInput} ne le porte pas. Le champ \code{options} est obligatoire (il n'a pas de \code{\#[serde(default)]}), les autres ont une valeur par défaut. La sortie est \code{Output \{ exitCode, stdout, stderr \}}, sérialisée elle aussi en JSON.
+
+\subsection{\code{run_inner} : tout refaire dans le cœur}
+
+\rustsnippet[label={lst:run-inner}]{crates/reactant-wasm/src/lib.rs}{170}{212}{la revalidation de la configuration et des packs}
+
+On reconnaît, étape par étape, la boucle native (\src{src/cli/config_load.rs}{45}{89}, \cref{chap:projet-cli-driver}) : registre des natives, table des options par règle extraite de la configuration, packs dans l'ordre de la configuration (\adr{22} §8), \code{load_pack} sur chacun, avertissements préfixés \code{[warn] rule}, enregistrement, puis overrides. Une seule différence de forme : le cœur ne lit pas de fichier, il reçoit les octets. La commande \code{check} construit ensuite le système de fichiers en mémoire et appelle le driver commun :
+
+\rustsnippet{crates/reactant-wasm/src/lib.rs}{237}{251}{la commande check sous WASM (extrait)}
+
+Deux détails comptent pour la parité. La fonction \code{display} est l'identité, là où la CLI native relativise les chemins au répertoire courant : l'hôte JS envoie déjà des chemins relatifs au répertoire courant, si bien que les deux affichages coïncident \emph{à condition} de lancer les deux hôtes depuis le même répertoire. Et \code{check_options} (\src{crates/reactant-wasm/src/lib.rs}{262}{323}) convertit les chaînes \code{format}, \code{failOn}, \code{project} (une valeur inconnue donne \code{[error] unknown format `x`}, code 2), remplit un \code{CheckArgsPartial} et le fusionne avec la configuration par \code{partial.merge(cfg)}, le même mécanisme de précédence que la CLI native.
+
+Enfin, \code{run} installe \code{console_error_panic_hook} avant \code{run_inner} (\src{crates/reactant-wasm/src/lib.rs}{163}{168}) : une panique du cœur apparaît dans la console JS avec son message, au lieu d'une instruction \code{unreachable} opaque.
+
+\subsection{Deux séquences de chargement, un point de convergence}
+
+La \cref{fig:distribution-sequences} met côte à côte les deux chemins, de l'invocation à l'analyse. Ils ne partagent rien au-dessus de la ligne pointillée de droite, qui sépare le JavaScript du cœur, et tout en dessous.
+
+\begin{figure}[tb]\centering
+\begin{tikzpicture}[
+  node distance=5mm,
+  h/.style={bloc,text width=4.6cm,font=\scriptsize},
+  c/.style={bloc,text width=6.2cm,font=\scriptsize,fill=ra-blue!12},
+]
+  % Colonne native
+  \node[etiquette] (tn) at (-3.6,0.8) {CLI native (Rust, binaire)};
+  \node[h] (n1) at (-3.6,0) {\code{reactant check} \\ (clap, \file{src/cli/check.rs})};
+  \node[h,below=of n1] (n2) {\code{config::load} / \code{config::discover} \\ (lecture \code{std::fs})};
+  \node[h,below=of n2] (n3) {\code{resolve_pack_path} \\ \file{<config>/node\_modules/<nom>/}};
+  \node[h,below=of n3] (n4) {\code{std::fs::read_to_string} \\ du pack};
+  % Colonne WASM
+  \node[etiquette] (tw) at (3.6,0.8) {paquet npm (Node ou navigateur)};
+  \node[h] (w1) at (3.6,0) {\code{npx reactant-analyzer} \\ (\file{npm/lib/args.js})};
+  \node[h,below=of w1] (w2) {\code{readConfigText} ; \\ \code{packSpecs} (parseur du cœur)};
+  \node[h,below=of w2] (w3) {\code{resolvePacks} (\code{createRequire}) ; \\ \code{buildFileMap} (sur-ensemble)};
+  \node[h,below=of w3] (w4) {\code{buildEnvelope} $\rightarrow$ \code{core.run(json)}};
+  \node[h,below=of w4] (w5) {\code{run_inner} : \code{config::parse} \\ (revalidation)};
+  % Frontière JS / cœur
+  \draw[dashed,ra-amber,thick] ($(w4.south west)+(-0.3,-0.25)$) -- ($(w4.south east)+(0.3,-0.25)$)
+     node[right,etiquette,text=ra-amber,align=left] {JS\\cœur};
+  % Tronc commun
+  \node[c] (s1) at (0,-6.4) {\code{declarative::load_pack(json, options)}};
+  \node[c,below=of s1] (s2) {\code{RuleRegistry::register} ; \\ \code{resolve_overrides} + \code{set_overrides}};
+  \node[h,text width=3.6cm] (f1) at (-3.2,-8.9) {\code{Arc::new(OsFileSystem)} \\ \code{display_relative}};
+  \node[h,text width=3.6cm] (f2) at (3.2,-8.9) {\code{MemFileSystem::from_map(files)} \\ \code{display} identité};
+  \node[c] (s3) at (0,-10.3) {\code{driver::run_check(fs, paths, registry, opts, display)}};
+  \draw[fleche] (n1) -- (n2); \draw[fleche] (n2) -- (n3); \draw[fleche] (n3) -- (n4);
+  \draw[fleche] (w1) -- (w2); \draw[fleche] (w2) -- (w3); \draw[fleche] (w3) -- (w4); \draw[fleche] (w4) -- (w5);
+  \draw[flechemust] (n4.south) |- (s1.west);
+  \draw[flechemust] (w5.south) |- (s1.east);
+  \draw[fleche] (s1) -- (s2);
+  \draw[fleche] (s2.south) -- ++(0,-0.3) -| (f1.north);
+  \draw[fleche] (s2.south) -- ++(0,-0.3) -| (f2.north);
+  \draw[flechemust] (f1.south) |- (s3.west);
+  \draw[flechemust] (f2.south) |- (s3.east);
+\end{tikzpicture}
+\caption{Séquences de chargement native (à gauche) et WASM (à droite). Au-dessus du tronc commun, chaque hôte ne fait que trouver et lire des octets ; le tronc commun (en bleu) est le même code Rust, appelé depuis \file{src/cli/} d'un côté et depuis \code{run_inner} de l'autre. Seul le choix de l'implémentation de \code{FileSystem} et de la fonction d'affichage diffère.}
+\label{fig:distribution-sequences}
+\end{figure}
+
+\begin{decision}[ADR-022 §6 --- WASM seul dans npm, résolution par l'hôte, validation par le cœur]
+\textbf{Décision.} Le paquet npm contient un seul artefact \file{.wasm} et un wrapper JS mince (\og le modèle prettier\fg{}) : \code{npx reactant} a le même comportement, bit pour bit, sur toutes les plateformes. L'hôte résout les noms de packs npm (champ \code{"reactant"} de leur \file{package.json}, via \code{require.resolve}) et transmet des chaînes JSON ; le cœur revalide chaque pack reçu ; les schémas sont engendrés depuis les types Rust.
+
+\textbf{Alternatives refusées.} Des binaires natifs par plateforme (le modèle esbuild/biome) : ce serait une optimisation \emph{additive} et future, car les publier plus tard ne casse rien alors que les retirer casserait. Un algorithme de résolution Node complet en Rust : la CLI native se contente de \file{node\_modules/<nom>/} et des chemins relatifs. Une validation côté JS : ce serait un second validateur, donc une bifurcation possible.
+\end{decision}
+
+% ===========================================================================
+\section{Le paquet npm}
+\label{sec:distribution-npm}
+
+\subsection{Ce que publie \file{npm/package.json}}
+
+Le paquet s'appelle \code{reactant-analyzer}, version 0.6.0, en modules ESM (\code{"type": "module"}), et exige Node 20.19 ou plus récent (\code{engines}). Il publie quatre répertoires, \file{bin/}, \file{lib/}, \file{dist/} et \file{schemas/}, et expose :
+
+\rustsnippet[language=JSON]{npm/package.json}{9}{21}{points d'entrée du paquet npm}
+
+La condition \code{browser} de l'export \code{"."} fait qu'un bundler (Vite, webpack) choisit automatiquement \file{lib/browser.js}, tandis que Node prend \file{lib/index.js}. \code{./wasm} expose la glue brute, \code{./lib/pack} n'expose que des types (pour l'auteur d'un pack), et \code{bin} fait de \code{npx reactant-analyzer} (ou \code{npx reactant} une fois le paquet installé) une commande.
+
+\subsection{L'architecture en couches de \file{npm/lib/}}
+
+Les fichiers de \file{npm/lib/} forment trois couches. La règle qui les organise est qu'une option ne puisse pas exister pour un hôte JS et pas pour l'autre.
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}l X@{}}
+\toprule
+Fichier & Rôle \\
+\midrule
+\multicolumn{2}{@{}l}{\emph{Entrées}} \\
+\file{bin/reactant.js} & \code{process.exitCode = await main(argv)} : le code de sortie est affecté, pas \code{process.exit}, pour que la sortie tamponnée soit vidée. \\
+\file{lib/cli.js} & \code{help}, \code{schemas}, \code{packs build} ; sinon \code{projectInput} puis \code{api.run}. \\
+\file{lib/index.js} & entrée Node : l'API, plus \code{analyzeProject} (lire un projet sur disque). \\
+\file{lib/browser.js} & entrée navigateur : la même API, plus \code{initWasm}, sans aucun import \code{node:}. \\
+\multicolumn{2}{@{}l}{\emph{Cœur de l'API, sans \code{node:}}} \\
+\file{lib/api.js} & \code{makeApi(loadCore)} : \code{run}, \code{analyze}, \code{rules}, \code{explain}, \code{help}, \code{packSpecs}, \code{validatePack}, \code{hostConstants}. \\
+\file{lib/envelope.js} & \code{buildEnvelope} : construit l'enveloppe, refuse les clés inconnues ; \code{UsageError}. \\
+\file{lib/args.js} & \code{argv} $\rightarrow$ options, un pour un avec l'enveloppe ; drapeau inconnu $\Rightarrow$ code 2. \\
+\multicolumn{2}{@{}l}{\emph{Transport disque et chargement du cœur}} \\
+\file{lib/project.js} & \code{projectInput} : configuration, packs résolus, table des fichiers. \\
+\file{lib/host.js} & \code{readConfigText}, \code{resolvePacks}, \code{buildFileMap}, \code{toPosix}. \\
+\file{lib/core-node.js} & \code{import()} de la glue, puis \code{initSync} sur les octets lus par \code{readFileSync}. \\
+\file{lib/core-web.js} & \code{init()} : \code{fetch} du \file{.wasm} voisin de la glue, ou source fournie par \code{initWasm}. \\
+\bottomrule
+\end{tabularx}
+\caption{Les modules de \file{npm/lib/} (hors fichiers \file{.d.ts}).}\label{tab:distribution-npm-lib}
+\end{table}
+
+La CLI JS n'est pas un chemin parallèle à l'API : elle \emph{consomme} l'API. \file{lib/cli.js} parse \code{argv}, appelle \code{projectInput} (partagé avec \code{analyzeProject}) puis le même \code{run} qu'un script appellerait. Et \code{run} passe toujours par \code{buildEnvelope}. L'en-tête de \file{npm/lib/envelope.js} précise que sa validation est seulement \emph{ergonomique} : une option mal orthographiée doit produire un message lisible plutôt qu'une erreur \code{serde} venue du WASM, mais \og \emph{It is NOT a trust boundary}\fg{}. C'est l'\cref{inv:hote-non-fiable}, vu du côté JS.
+
+\subsection{Un seul module, deux façons de l'amorcer}
+
+La glue \code{--target web} de \code{wasm-bindgen} attend normalement un \code{fetch}. Sous Node, le module \file{core-node.js} lui donne directement les octets :
+
+\tsxsnippet{npm/lib/core-node.js}{45}{55}{amorcer la glue web sous Node}
+
+Le résultat est mis en cache une fois par processus. \code{tryLoadCore} renvoie \code{null} au lieu de lever une exception si le bundle manque (arbre de développement où \file{npm/build.sh} n'a pas tourné) ; seul \code{packs build} s'en sert, pour dégrader en \og écrire sans valider\fg{}. Dans le navigateur, \file{npm/lib/core-web.js} appelle \code{init()}, qui va chercher le \file{.wasm} posé à côté de la glue, ce que Vite, webpack et un \code{<script type="module">} résolvent correctement ; \code{initWasm(source)} permet de fournir une URL, une \code{Response}, des octets ou un \code{WebAssembly.Module} déjà compilé.
+
+\begin{exemple}{Analyser un tampon d'éditeur dans le navigateur}{distribution-navigateur}
+Le navigateur n'a pas de disque : son seul mode est la table de fichiers virtuelle. \file{docs/usage.md} donne cet usage :
+\begin{lstlisting}[language=TypeScript,caption={Usage navigateur de l'API (extrait de \file{docs/usage.md}, élagué)}]
+import { analyze } from "reactant-analyzer/browser";
+
+const { report } = await analyze({
+  files: { "src/App.tsx": editorBuffer },   // cwd-relative POSIX keys
+  config: { rules: { "derived-state": "off" } },
+});
+\end{lstlisting}
+\code{config} peut être un objet : \code{normalizeConfig} le sérialise, et le cœur reste le seul à le parser. \code{report} est le document JSON v2 tel quel (\cref{chap:projet-cli-driver}). Les findings sont un résultat, jamais une exception ; seule une erreur d'usage (code 2) lève une \code{UsageError}. Le commentaire de \file{npm/lib/browser.js} ajoute que l'analyse est synchrone une fois le module prêt et monopolise le thread : un hôte interactif doit la lancer dans un Worker.
+\end{exemple}
+
+\subsection{La table des fichiers : un sur-ensemble}
+
+L'hôte Node doit construire \code{files} sans rien décider. \code{buildFileMap} parcourt les chemins donnés et retient toute source (extensions servies par le cœur), plus les fichiers qui orientent la découverte et la détection de projet :
+
+\tsxsnippet{npm/lib/host.js}{95}{103}{les fichiers que l'hôte charge}
+
+Il n'élague que \code{prunedDirs}. Le commentaire des lignes 81--85 en donne la raison : depuis \issue{137}, les exclusions du moteur dépendent du \file{.gitignore} de l'arbre, et un hôte qui appliquerait d'avance une liste de noms cacherait des fichiers que le moteur voulait lire, \og \emph{a superset walk that is not a superset}\fg{}. Sous \code{--follow-imports}, le parcours s'élargit au projet englobant (l'ancêtre le plus proche portant un \file{package.json} ou un \file{.git}), pour la raison de l'\issue{138} : sous WASM, le moteur ferme les arêtes d'import à l'intérieur de sa vue du système de fichiers, et un fichier que l'hôte n'a pas chargé est indiscernable d'un fichier inexistant. La fermeture reviendrait vide, \og \emph{followed 0}\fg{}, sans le dire.
+
+\subsection{Résoudre les packs : deux implémentations}
+\label{sec:distribution-npm-resolution}
+
+La résolution d'un nom de pack est la seule sémantique que l'\adr{22} laisse à l'hôte, et c'est là qu'on trouve la divergence la plus nette entre les deux hôtes. Côté natif :
+
+\rustsnippet{src/cli/config_load.rs}{98}{108}{la résolution native d'un nom de pack}
+
+Côté npm :
+
+\tsxsnippet{npm/lib/host.js}{55}{74}{la résolution npm d'un nom de pack}
+
+Les deux traitent comme un chemin toute spécification qui commence par \code{.}, qui est absolue ou qui finit par \code{.json}, relative au répertoire du fichier de configuration. Pour un nom npm, les deux lisent le champ \code{"reactant"} du \file{package.json} du paquet, à défaut \file{pack.json}. Mais le natif ne regarde que \file{<répertoire de la config>/node\_modules/<nom>/}, alors que \code{createRequire(…).resolve} applique l'algorithme de Node, qui remonte les \file{node\_modules} des répertoires parents.
+
+\begin{piege}
+Dans un monorepo dont le gestionnaire de paquets \og hisse\fg{} les dépendances à la racine, un pack installé seulement dans \file{node\_modules/} de la racine est trouvé par \code{npx reactant} lancé avec la configuration d'un sous-paquet, mais pas par le binaire natif. Celui-ci s'arrête sur une erreur d'usage, qu'on observe sur un arbre sans \file{node\_modules} :
+\begin{sortie}
+[error] pack `@acme/react-rules`: not installed: a/node_modules/@acme/react-rules does not exist
+\end{sortie}
+(code de sortie 2, observé). Le comportement npm dans le monorepo, lui, est déduit du code (Node absent), non exécuté. L'\adr{22} §6 assume ce choix (\og pas de résolution Node complète en Rust\fg{}). La direction de l'écart est la bonne : le natif refuse bruyamment, il n'exécute pas moins de règles en silence.
+\end{piege}
+
+Les messages diffèrent aussi d'un détail. Le natif ajoute le chemin résolu, \code{[error] pack `spec` (chemin): …} (\srcline{src/cli/config_load.rs}{76}) ; le cœur WASM, qui n'a reçu que des octets, écrit \code{[error] pack `spec`: …} (\srcline{crates/reactant-wasm/src/lib.rs}{197}). Le message interne, celui de \code{PackError}, est le même. On observe la forme native sur un pack incomplet :
+\begin{sortie}
+[error] pack `./bad.pack.json` (b/./bad.pack.json): at `rules[0]`: missing field `docs`
+\end{sortie}
+
+\subsection{\code{reactant packs build} : écrire un pack en JS, committer du JSON}
+\label{sec:distribution-npm-packs}
+
+Un pack est un fichier JSON inerte (\cref{chap:regles-declaratives}). Pour une équipe, écrire à la main dix règles presque identiques est fastidieux ; elle voudrait une boucle sur une table. L'\adr{23} §5 accorde cette commodité sans rien céder sur l'inertie : le pack peut être \emph{écrit} en JS ou TS, il est évalué \emph{au moment de l'écriture}, et c'est le JSON produit qu'on committe. L'analyseur, natif ou WASM, ne consomme jamais que du JSON. Le fixture \file{npm/test/fixtures/team.pack.cjs} montre la forme visée :
+
+\tsxsnippet{npm/test/fixtures/team.pack.cjs}{12}{29}{engendrer une règle par ligne d'une table}
+
+La commande n'existe que dans le paquet npm : elle a besoin de Node pour évaluer le module. Le binaire natif la mentionne dans son aide (\og \code{compile a JS rule pack to pack.json (npm package only)}\fg{}) et, donné hors du dépôt, répond \code{[error] no command or path named `packs`} (code 2, observé) — mais à la racine du dépôt, où \file{packs/} existe, il l'analyse comme un chemin (\src{src/driver/mod.rs}{115}{123}) et répond tout autre chose. L'algorithme de \file{npm/lib/packs.js} tient en trois temps. \code{evaluate} importe le module par \code{import(pathToFileURL(abs))}, qui charge ESM comme CommonJS (et \file{.ts} sur un Node qui retire les types) ; il déballe un éventuel double \code{default} de l'interopérabilité ESM/CJS, appelle la valeur exportée si c'est une fonction, et exige un objet. Puis vient l'écriture :
+
+\tsxsnippet{npm/lib/packs.js}{72}{91}{valider par le cœur avant d'écrire}
+
+\code{validatePack} est ici le \code{load_pack} du cœur (\cref{tab:distribution-exports}) : le générateur ne peut pas bénir un pack que le cœur refuserait. Si le bundle est trop ancien pour exposer \code{validatePack}, le fichier est écrit quand même, mais avec la mention \code{not validated} : un silence se lirait \og validé\fg{}. Le JSON est indenté, pour que le fichier committé soit lisible dans un diff.
+
+\begin{piege}
+\code{validate_pack} appelle \code{load_pack} avec une table d'options \emph{vide} (\srcline{crates/reactant-wasm/src/lib.rs}{70}). \code{packs build} ne peut donc pas détecter une option consommateur invalide écrite dans \file{reactant.config.json} ; c'est le \code{check} suivant qui la refusera.
+\end{piege}
+
+\begin{decision}[ADR-023 §5 --- JS/TS compilé en JSON, Starlark rejeté]
+\textbf{Décision.} La voie communautaire pour composer des règles est d'écrire le pack en JS/TS et de committer le JSON engendré. Un pack JS est de l'exécution de code arbitraire, comme une configuration ESLint ; committer le JSON confine ce risque à la machine de l'auteur, et la CI n'exécute que des données.
+
+\textbf{Alternatives refusées.} Un Tier B en Starlark : la crate \code{starlark} ne compilait ni pour l'hôte ni pour \code{wasm32}, et elle alourdissait une distribution qui se veut \og oxc + serde\fg{}. Exécuter le pack JS à chaque analyse : ce serait réintroduire du code d'auteur dans le run, et faire bifurquer les deux hôtes, puisque le natif n'a pas de moteur JS.
+\end{decision}
+
+\paragraph{Les types de l'auteur.} Le fichier \file{npm/lib/pack.d.ts} (448 lignes) est \emph{engendré} par le script \file{gen-pack-dts.js} de \file{npm/scripts/} à partir de \file{schemas/pack.schema.json}, donc des mêmes types Rust que le validateur. Le générateur traduit le JSON Schema 2020-12 de \code{schemars} : \code{\$ref} en nom de type, \code{enum}/\code{const} en unions de littéraux, \code{oneOf}/\code{anyOf} en unions dédoublonnées, objets en interfaces avec \code{?} pour les champs non requis. L'auteur annote son module par \code{/** @type \{import("reactant-analyzer/lib/pack").Pack\} */} et son éditeur complète les ancres et les gardes. Le mode \code{--check} échoue si le fichier committé n'est plus à jour ; la CI l'exécute (\cref{sec:distribution-parite}).
+
+% ===========================================================================
+\section{La parité native/WASM, testée}
+\label{sec:distribution-parite}
+
+Le principe de l'\cref{inv:hote-non-fiable} ne vaut que s'il est vérifié. Il l'est à trois niveaux, du plus interne au plus externe.
+
+\paragraph{1. Les deux systèmes de fichiers (Rust).} \file{tests/memfs_parity.rs} lance \code{driver::run_check} une fois sur \code{OsFileSystem}, une fois sur un \code{MemFileSystem} chargé des mêmes fichiers (y compris \file{tsconfig} et \file{vite.config}, \og \emph{the superset walk the WASM host performs}\fg{}), et exige l'égalité de \code{stdout}, \code{stderr} et du code de sortie sur trois fixtures, \code{vite_project}, \code{next_project} et \code{cross_file_hook} (\src{tests/memfs_parity.rs}{44}{117}). Ce test tourne dans \code{cargo test} : il ne demande ni WASM ni Node.
+
+\paragraph{2. Le binaire contre le paquet publié (shell).} \file{npm/test/smoke.sh} définit une fonction \code{compare} qui lance la même ligne de commande avec le binaire natif (\file{target/release/reactant}) puis avec \code{node npm/bin/reactant.js}, depuis le même répertoire courant et sous \code{NO_COLOR=1}, et exige l'égalité octet pour octet de la sortie combinée et du code de sortie (\src{npm/test/smoke.sh}{13}{26}). Elle est appliquée à treize invocations :
+
+\rustsnippet[language=bash]{npm/test/smoke.sh}{28}{40}{les treize invocations comparées}
+
+La liste couvre les deux rendus, \code{--trace}, le code de sortie sous \code{--fail-on warning}, un projet Next.js, un pack, une configuration qui éteint des règles, les commandes \code{rules}, \code{explain} et \code{help}, une commande mal tapée (\code{chekc}, à laquelle les deux hôtes doivent répondre par la même page d'aide précédée de \code{[error] no command or path named `chekc`}) et l'\code{explain} d'une règle de pack. Le script enchaîne sur \file{npm/test/packs.sh} et \file{npm/test/api.js}.
+
+\paragraph{3. L'écriture des packs et l'API (Node).} \file{npm/test/packs.sh} compile \file{team.pack.cjs} puis \file{team.pack.mjs} (qui réexporte le même objet) et exige un JSON identique octet pour octet à \file{team.pack.expected.json}, puis lance \code{gen-pack-dts.js --check}. De son côté, le test Rust \code{js_authored_pack_output_loads_in_the_core} charge ce JSON attendu par \code{load_pack} et vérifie ses trois identifiants et l'absence d'avertissement (\src{tests/declarative.rs}{953}{967}). \file{npm/test/api.js} vérifie d'abord que \code{analyzeProject} et \code{check --format json} produisent le même document, puis couvre ce que la CLI n'exerce jamais : table virtuelle, erreurs d'usage levées, absence d'import \code{node:} dans le graphe de l'entrée navigateur.
+
+\begin{piege}
+Comparer des \emph{comptes} ne suffit pas. Lors du travail sur l'\issue{138}, une vérification de parité comparait le nombre de findings des deux hôtes, égal des deux côtés ; comparer les fichiers nommés montrait immédiatement la divergence (\og \emph{comparing counts is not comparing behaviour}\fg{}). D'où la comparaison octet pour octet de \file{smoke.sh}, et le déterminisme du binaire, testé par ailleurs (\cref{chap:tests-corpus}), sans lequel une telle comparaison serait impossible.
+\end{piege}
+
+\paragraph{Divergences connues.} Trois écarts subsistent, tous documentés dans le code ou constatés à sa lecture.
+\begin{itemize}
+  \item Un fichier illisible est simplement absent de la table WASM, alors que le natif enregistre une erreur d'entrée-sortie pour un fichier passé explicitement (\og \emph{documented v1 divergence}\fg{}, \srcline{npm/lib/host.js}{109}).
+  \item La résolution des noms de packs et la forme des messages d'erreur de pack (\cref{sec:distribution-npm-resolution}).
+  \item \textbf{Le drapeau \code{--rule-option} n'existe qu'en natif.} Le commit \code{6e45e83} l'a ajouté à la CLI (\src{src/cli/check.rs}{85}{88}, appliqué l.~149--159 par \code{apply_rule_options}) et à \file{docs/usage.md}, mais ni l'enveloppe \code{Options} du cœur, ni \file{npm/lib/args.js}, ni \file{npm/lib/envelope.js} ne le connaissent. Sous \code{npx}, \code{--rule-option state-lifted-too-high:minDepth=2} tombe donc dans la branche \code{unknown flag} d'\file{args.js} (code 2), et \code{smoke.sh} ne contient aucune invocation qui l'utilise. La page d'aide commune ne le mentionne pas non plus. Les options d'une règle restent réglables sous npm par la configuration. Constat de lecture, non exécuté (Node absent) ; aucune issue ouverte sur cet écart.
+\end{itemize}
+
+% ===========================================================================
+\section{L'Action GitHub}
+\label{sec:distribution-action}
+
+\subsection{Trois lignes dans un workflow}
+
+Le dépôt est aussi une Action GitHub. Le \file{README.md} en donne l'usage :
+
+\begin{lstlisting}[language={},caption={Usage de l'Action (extrait du \file{README.md}, élagué)}]
+      - uses: actions/checkout@v4
+      - uses: rboudrouss/reactant-analyzer@v0.6.0
+        with:
+          path: .              # default: the whole checkout
+          fail-on: error       # warnings annotate the PR without failing it
+\end{lstlisting}
+
+\file{action.yml} déclare une action \emph{composite} à une seule étape, qui exécute \code{node "\$\{\{ github.action_path \}\}/scripts/gh-action.mjs"} en lui passant les entrées par des variables \code{INPUT_*}. Cinq entrées : \code{path} (défaut \code{.}, chemins séparés par des espaces), \code{fail-on} (défaut \code{warning}), \code{config} (défaut vide : découverte automatique), \code{version} (défaut \code{latest}) et \code{args} (drapeaux supplémentaires). Six sorties : \code{errors}, \code{warnings}, \code{infos}, \code{exit-code}, \code{blind-spots} et \code{json} (chemin du rapport complet).
+
+\subsection{Ce que fait \file{scripts/gh-action.mjs}}
+
+\tsxsnippet{scripts/gh-action.mjs}{18}{25}{l'invocation de npx}
+
+Le script ne lance pas le code du dépôt : il lance le \emph{paquet npm publié}, \code{npx --yes reactant-analyzer@<version> check … --format json --fail-on <niveau>}. Les packs viennent donc de la configuration du dépôt analysé, résolus par l'hôte npm, et leurs \Error{} font échouer \code{--fail-on error} exactement comme celles des règles natives. Si le lancement échoue, le script émet \code{::error::} et sort avec 2 ; si la sortie standard n'est pas un document JSON (erreur d'usage, code 2), il émet \code{::error::reactant exited … without a JSON report} et relaie le code.
+
+Il transforme ensuite le rapport v2 en \emph{commandes de workflow}, les lignes \code{::error …::} que GitHub affiche comme annotations sur le fichier et la ligne :
+
+\tsxsnippet{scripts/gh-action.mjs}{46}{62}{une annotation par erreur de parse et par diagnostic}
+
+Trois détails. La sévérité \code{info} devient \code{notice}, seul troisième niveau que GitHub connaisse. La colonne est incrémentée, car le JSON est indexé à partir de 0 et les annotations à partir de 1. Les notes de la chaîne de témoins (\cref{def:witness}) deviennent des lignes préfixées par \code{→}. Les valeurs sont échappées (\code{\%}, retour chariot et saut de ligne dans le message ; en plus \code{:} et \code{,} dans les propriétés).
+
+\begin{exemple}{Les annotations du fixture \code{pack_project}}{distribution-annotations}
+Sur \file{tests/fixtures/pack_project}, le rapport JSON observé (\code{reactant check tests/fixtures/pack_project --format json --fail-on never}) contient deux diagnostics : un \Warning{} \regle{infinite-loop} en \code{"line": 7, "col": 2} avec deux notes, et un \Error{} \code{team/effect-writes-own-dep} en \code{"line": 8, "col": 4} sans note. Appliquées à la main, les lignes 50--62 du script produiraient les deux commandes suivantes (messages coupés) :
+\begin{lstlisting}[language={},caption={Annotations reconstituées à la main à partir de \file{scripts/gh-action.mjs} (non exécuté, élagué)}]
+::warning title=infinite-loop,file=tests/fixtures/pack_project/App.tsx,line=7,col=3::[App] this effect keeps pushing state `n` (...) Potential infinite render loop%0A→ state `n` is written here%0A→ the abstract value of state `n` kept growing and was widened at iteration 3
+::error title=team/effect-writes-own-dep,file=tests/fixtures/pack_project/App.tsx,line=8,col=5::[App] this effect writes `n`, which is in its own deps array
+\end{lstlisting}
+Les colonnes 2 et 4 du JSON deviennent 3 et 5 ; reconstruction manuelle vérifiée contre \code{escData}/\code{escProp} et la boucle des l.~41--62, sur le JSON ci-dessus.
+\end{exemple}
+
+\subsection{Les angles morts dans une CI}
+
+Le contrat central du \cref{chap:projet-cli-driver}, pas de \og clean bill\fg{} pour du code non lu, doit survivre au passage par GitHub, où l'on ne lit souvent que le résumé du job. Le script émet donc un \code{::warning title=not analyzed::} par angle mort, et ajoute au résumé du job un bloc \og \textbf{Not a clean bill}\fg{} qui dit que les comptes sont une borne inférieure (\src{scripts/gh-action.mjs}{64}{77}). La sortie \code{blind-spots} le formule en toutes lettres :
+
+\rustsnippet[language={}]{action.yml}{53}{60}{la sortie blind-spots}
+
+Un angle mort n'est pas un finding : il ne change jamais le code de sortie. Une équipe qui veut un run exhaustif ou rien doit tester \code{steps.<id>.outputs.blind-spots} elle-même.
+
+\subsection{Pièges de l'Action}
+
+\begin{piege}
+\textbf{L'épingle ne fixe pas l'analyseur.}
+\code{uses: rboudrouss/reactant-analyzer@v0.6.0} fixe la version de \file{action.yml} et de \file{gh-action.mjs}, pas celle de l'analyseur. L'analyseur vient de \code{npx reactant-analyzer@\$\{version\}}, avec \code{version} à \code{latest} par défaut (\srcline{scripts/gh-action.mjs}{14}, l.~18--21). Un workflow épinglé au tag, sans entrée \code{version:}, exécute donc la dernière version publiée, et ses résultats peuvent changer du jour au lendemain sans aucun commit. Pour un résultat reproductible, il faut écrire aussi \code{version: 0.6.0}.
+\end{piege}
+
+\begin{piege}
+L'entrée \code{args} est coupée sur les espaces (\code{input("args").split(/\textbackslash s+/)}) : une valeur ne peut pas contenir d'espace, ce que la description de l'entrée dit (\src{action.yml}{33}{38}). Il en va de même de \code{path}. Et comme l'Action lance le paquet npm, \code{args} n'accepte que les drapeaux de l'hôte npm : \code{--rule-option}, propre au natif (\cref{sec:distribution-parite}), y serait refusé.
+\end{piege}
+
+% ===========================================================================
+\section{La CI du dépôt}
+\label{sec:distribution-ci}
+
+Le dépôt a deux workflows et une configuration Dependabot. \file{.github/workflows/ci.yml} tourne sur chaque push vers \code{main}, chaque pull request et à la demande, avec un groupe de \code{concurrency} par ref qui annule le run précédent. Ses sept jobs tournent tous sur \code{ubuntu-latest} :
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}l >{\raggedright\arraybackslash}p{5.6cm} X@{}}
+\toprule
+Job & Commande & Ce qu'il garde \\
+\midrule
+\code{fmt} & \code{cargo fmt --all --check} & le style ; \og \emph{the cheapest gate --- fail fast}\fg{} \\
+\code{clippy} & \code{cargo clippy --workspace --all-targets --all-features --locked -- -D warnings} & les lints, tests compris \\
+\code{test} & \code{cargo test --workspace --all-features --locked}, \code{RUSTFLAGS=-D warnings} & toute la suite Rust, dont \file{tests/memfs_parity.rs} \\
+\code{no-default-features} & \code{cargo clippy --lib --no-default-features --locked -- -D warnings} & la configuration du build WASM, sans \code{clap} ni \code{schemars} \\
+\code{docs} & \code{cargo doc --workspace --no-deps --all-features --locked}, \code{RUSTDOCFLAGS=-D warnings} & les liens de documentation interne, qu'un renommage casse en silence \\
+\code{wasm-parity} & \code{cargo build --release --locked} ; \file{npm/build.sh} ; \file{npm/test/smoke.sh} & l'artefact publié : parité octet pour octet, \code{packs build}, \file{pack.d.ts}, API \\
+\code{action} & \code{node --check scripts/gh-action.mjs} ; \code{actionlint} & la syntaxe du script de l'Action et la validité des workflows \\
+\bottomrule
+\end{tabularx}
+\caption{Les jobs de \file{.github/workflows/ci.yml}.}\label{tab:distribution-ci}
+\end{table}
+
+Le job \code{wasm-parity} est le seul à construire ce que les utilisateurs npm exécutent réellement : son commentaire le dit, \og \emph{The published artifact is the wasm core, not the native binary}\fg{} (\src{.github/workflows/ci.yml}{77}{79}). Il installe \code{wasm-bindgen-cli} à la version exacte que fixe \file{Cargo.lock} :
+
+\rustsnippet[language=bash]{.github/workflows/ci.yml}{94}{106}{épingler wasm-bindgen-cli sur Cargo.lock}
+
+Faute de quoi la glue engendrée et le \file{.wasm} ne s'accorderaient pas au chargement. Le job \code{action} existe parce que rien d'autre ne lit \file{action.yml} : c'est une action composite consommée par d'autres dépôts.
+
+\paragraph{Le workflow corpus.} \file{.github/workflows/corpus.yml} (job \code{measure}) rejoue l'analyseur sur les quatorze dépôts épinglés du corpus et compare le résultat à \file{docs/corpus-baseline.json}. Il ne tourne ni sur les pull requests ni la nuit : un run complet dure environ 13 minutes sur environ 40\,000 fichiers, et le corpus, épinglé commit par commit, ne peut pas dériver seul. Il se déclenche sur les pushes vers \code{main} qui touchent l'analyseur (\file{src/**}, \file{crates/**}, \file{packs/**}, \file{Cargo.lock}, la baseline, le script de clonage ou le workflow lui-même) et à la demande. Ce workflow est un instrument de mesure plus qu'une porte de livraison ; il est décrit au \cref{chap:tests-corpus}. Enfin, \file{.github/dependabot.yml} propose chaque mois les mises à jour Cargo (les crates \code{oxc_*} groupées) et celles des actions GitHub.
+
+% ===========================================================================
+\section{Versions et stabilité}
+\label{sec:distribution-versions}
+
+\subsection{Une version, cinq endroits}
+
+La version 0.6.0 est écrite à la main à cinq endroits, que le commit de release \code{adfe677} (\og \emph{release: v0.6.0}\fg{}) modifie ensemble : \file{Cargo.toml}, \file{crates/reactant-wasm/Cargo.toml}, \file{npm/package.json}, \file{.claude-plugin/plugin.json} et l'épingle de l'Action dans \file{README.md} (plus \file{Cargo.lock}, par voie de conséquence). Les tags \code{v0.1.0} à \code{v0.6.0} marquent les releases. Aucun test du dépôt ne vérifie que ces numéros restent alignés (ni \code{CARGO_PKG_VERSION} ni \file{npm/package.json} n'apparaissent dans \file{tests/} ou \file{src/}). Aucun workflow n'exécute \code{npm publish} : \code{wasm-parity} construit le paquet et le teste, sans le publier.
+
+\subsection{Ce qui est un contrat}
+
+Pour un consommateur, trois formats sont des contrats versionnés, et le reste ne l'est pas.
+\begin{itemize}
+  \item \textbf{Le rapport JSON} porte \code{"version": 2} (\srcline{src/driver/json.rs}{268}). L'\adr{16} §4 en fait des DTO propres à la sortie, précisément pour que le schéma reste stable à travers les refontes de l'IR ; la v2 a changé le sens de \code{file} et ajouté \code{blind_spots}, qu'un consommateur v2 plus ancien peut ignorer. L'API JS ne définit pas de second format : \code{analyze} rend ce document tel quel, car \og \emph{the wire schema is the stability contract}\fg{} (\file{npm/lib/api.js}).
+  \item \textbf{Les codes de sortie} : 0 propre, 1 findings au niveau de \code{--fail-on} ou au-dessus, 2 erreur d'usage ou d'entrée-sortie (\adr{16} §5). Un \file{tsconfig} manquant n'est qu'un avertissement, et un \Info{} ne change jamais le code. L'Action et le workflow corpus s'appuient sur cette distinction (le second lance \code{--fail-on never} pour que seul un code 2 le fasse échouer).
+  \item \textbf{Le format de pack} porte \code{schemaVersion}, dont \og \emph{only `1` exists}\fg{} ; les schémas publiés dans \file{npm/schemas/} décrivent ce format et celui de la configuration.
+\end{itemize}
+Les findings eux-mêmes ne sont pas stables : chaque amélioration du moteur les déplace, et c'est la baseline du corpus qui mesure ces déplacements (\cref{chap:tests-corpus}).
+
+\begin{piege}
+\textbf{Homonymie : l'ADR-017 ne parle pas de versions.}
+L'\adr{17}, \og \emph{Versioned reference stability}\fg{}, n'a rien à voir avec les versions du logiciel. Elle raffine la composante de stabilité référentielle du domaine abstrait : \code{Versioned} y désigne une référence qui ne change que lorsque certaines deps changent (\cref{def:stabilite}). La stabilité \emph{de l'interface} (CLI, JSON, codes de sortie) relève de l'\adr{16} ; la distribution relève de l'\adr{22} §6 et de l'\adr{23} §5.
+\end{piege}
+
+% ===========================================================================
+\begin{resume}
+\begin{itemize}
+  \item Un seul cœur Rust, deux artefacts. La feature \code{cli} (\code{clap}) et la feature \code{schema-gen} (\code{schemars}) sont actives par défaut et retirées par la crate \file{crates/reactant-wasm} (\code{default-features = false}), dont les dépendances se réduisent à oxc, serde et \code{wasm-bindgen}. Le job CI \code{no-default-features} garde cette configuration.
+  \item \file{npm/build.sh} construit un unique \file{.wasm} (pile de 8 Mio, cible \code{web} pour Node comme pour le navigateur), les schémas par le binaire natif du même commit, et \file{lib/pack.d.ts} depuis ces schémas.
+  \item L'hôte JS est un hôte \emph{de transport} (\cref{def:hote-transport}) et jamais une frontière de confiance (\cref{inv:hote-non-fiable}) : \code{run_inner} reparse la configuration, recharge chaque pack par \code{load_pack}, installe les overrides et appelle le même \code{driver::run_check} que la CLI, sur un \code{MemFileSystem}. L'hôte envoie un sur-ensemble des fichiers.
+  \item Le paquet npm \code{reactant-analyzer} a une CLI qui consomme son API, une entrée Node et une entrée navigateur au même comportement, et \code{packs build}, qui évalue un pack JS au moment de l'écriture, le valide par le cœur et écrit le JSON qu'on committe.
+  \item La parité se teste à trois niveaux : \file{tests/memfs_parity.rs} (deux systèmes de fichiers), \file{npm/test/smoke.sh} (treize invocations comparées octet pour octet), \file{packs.sh} et \file{api.js}. Divergences restantes : fichier illisible, résolution des noms de packs dans un monorepo, forme des messages d'erreur de pack, et \code{--rule-option} absent de l'hôte npm.
+  \item L'Action GitHub exécute le paquet npm publié, transforme le rapport v2 en annotations (colonne $+1$, \code{info} $\rightarrow$ \code{notice}) et rend visibles les angles morts sans toucher au code de sortie. Son épingle ne fixe pas l'analyseur : il faut une entrée \code{version}.
+  \item Les contrats stables sont le JSON v2, les codes de sortie 0/1/2 (\adr{16}) et le format de pack \code{schemaVersion: 1}. L'\adr{17} n'en fait pas partie, c'est une homonymie.
+\end{itemize}
+Fichiers rencontrés : \file{Cargo.toml} ; le crate \file{crates/reactant-wasm/} ; dans \file{npm/}, \file{package.json}, \file{build.sh}, \file{bin/}, \file{lib/}, \file{scripts/} et \file{test/} ; \file{action.yml} et \file{scripts/gh-action.mjs} ; \file{.github/} ; \file{tests/memfs_parity.rs}. Le \cref{chap:tests-corpus} décrit la méthode de mesure qu'outille le workflow corpus : tests, corpus, baseline et campagnes.
+\end{resume}
+
+% ===========================================================================
+\section{Exercices}
+\label{sec:distribution-exercices}
+
+\begin{exercice}{Ajouter un drapeau à \code{check}}{distribution-drapeau}
+On veut ajouter un drapeau booléen \code{--quiet} à \code{check}. Énumérer tous les endroits à modifier pour que les deux hôtes le connaissent, et dire quel test échouerait si l'on oubliait le côté npm. Appliquer la même grille à \code{--rule-option}.
+\end{exercice}
+\begin{solution}
+Côté natif : la structure clap de \file{src/cli/check.rs}, puis \code{CheckArgsPartial} et \code{CheckOptions} (et la configuration si le drapeau y a un équivalent). Côté cœur WASM : \code{Options} et \code{check_options} dans \file{crates/reactant-wasm/src/lib.rs}. Côté JS : \code{BOOL_FLAGS} dans \file{npm/lib/args.js}, \code{BOOL_OPTIONS} dans \file{npm/lib/envelope.js} et les types de \file{npm/lib/types.d.ts}. Côté aide : \code{driver::run_help}. Aucun test n'échoue automatiquement si le drapeau manque côté npm, tant que \file{npm/test/smoke.sh} ne contient pas d'invocation qui l'utilise : c'est exactement la situation de \code{--rule-option}, présent dans \file{src/cli/check.rs} et absent de \code{Options}, d'\file{args.js} et de \file{smoke.sh}. Il faut donc ajouter aussi une ligne \code{compare} à \file{smoke.sh}.
+\end{solution}
+
+\begin{exercice}{Pourquoi la cible \code{web} sous Node ?}{distribution-cible-web}
+\file{npm/build.sh} n'engendre que la glue \code{--target web}, alors que \code{wasm-bindgen} propose une cible \code{nodejs}. Expliquer ce que l'on gagne et ce que \file{npm/lib/core-node.js} doit faire en échange.
+\end{exercice}
+\begin{solution}
+Le \file{.wasm} est identique pour toutes les cibles ; seule la glue diffère. Une cible unique évite de publier deux copies d'un module de plusieurs mégaoctets, et garantit que Node et navigateur exécutent littéralement la même glue. En échange, sous Node, la glue ne peut pas faire de \code{fetch} d'un chemin de fichier : \file{core-node.js} importe la glue par \code{import()}, lit les octets du \file{.wasm} avec \code{readFileSync} et appelle \code{initSync(\{ module \})}.
+\end{solution}
+
+\begin{exercice}{Un workflow qui change tout seul}{distribution-epingle}
+Un workflow contient \code{uses: rboudrouss/reactant-analyzer@v0.6.0} sans bloc \code{with}. Une version 0.7.0 est publiée sur npm. Que se passe-t-il au prochain run ? Que faut-il écrire pour que le run soit reproductible ?
+\end{exercice}
+\begin{solution}
+\file{gh-action.mjs} est celui du tag v0.6.0, mais il lance \code{npx --yes reactant-analyzer@latest}, donc l'analyseur 0.7.0. Les findings, et donc le succès du job sous \code{fail-on: warning}, peuvent changer sans aucun commit du dépôt analysé. Il faut ajouter \code{with: \{ version: 0.6.0 \}} (idéalement la même version que le tag).
+\end{solution}
+
+\begin{exercice}{Pack hissé dans un monorepo}{distribution-monorepo}
+Un monorepo a \file{node\_modules/@acme/react-rules/} à la racine et \file{apps/web/reactant.config.json} qui déclare \code{"packs": ["@acme/react-rules"]}. On lance \code{reactant check apps/web} (binaire natif) puis \code{npx reactant-analyzer check apps/web}. Prédire les deux issues, et dire pourquoi l'écart n'est pas une faute de soundness.
+\end{exercice}
+\begin{solution}
+Le natif cherche \file{apps/web/node\_modules/@acme/react-rules/}, ne le trouve pas et sort en code 2 avec \code{[error] pack `@acme/react-rules`: not installed: …}. L'hôte npm, par \code{createRequire(…).resolve}, remonte jusqu'au \file{node\_modules} de la racine, trouve le pack et l'analyse a lieu. L'écart est une différence de disponibilité, pas de résultat : le natif ne lance jamais une analyse avec moins de règles que la configuration n'en demande, il refuse bruyamment (\src{src/cli/config_load.rs}{55}{57}). On le contourne en installant le pack dans le sous-paquet ou en le désignant par un chemin relatif.
+\end{solution}

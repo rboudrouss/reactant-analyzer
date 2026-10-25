@@ -1,0 +1,1209 @@
+% Chapitre 14 — Les relations du moteur
+% Dossier source : notes/07-engine-relations.md (§1–§8, exemples 1–4 et 11–16, §9), code au commit e67b10a.
+% Sorties observées avec target/debug/reactant (commit e67b10a) et la sonde /tmp/relprobe.
+\chapter{Les relations du moteur}
+\label{chap:relations}
+
+\begin{objectifs}
+  \item Comprendre pourquoi les faits que lisent les règles (\og A écrit B\fg{}, \og A se ré-exécute quand B bouge\fg{}) sont calculés une fois, dans le moteur, après convergence, et jamais re-dérivés par une règle.
+  \item Savoir lire la \terme{polarité} d'une colonne (exact, must, may, ⊤) et en déduire ce qu'une règle a le droit de certifier.
+  \item Suivre la marche des setters : région, classe de marche, phase ; appels directs, helpers locaux, IIFE, méthodes synchrones, \code{await}, cleanup.
+  \item Connaître la ligne \code{SlotWriter} colonne par colonne, puis les relations \relation{written}, \relation{effect_triggers}, \relation{slot_seeds}, \relation{registrations}, \relation{slot_reads} et \relation{body_calls}.
+  \item Comprendre la preuve mono-site \code{converges_once_written} : chaîne de gardes, dépliage des temporaires, trois arguments de mort.
+  \item Situer la frontière entre relations et certification (\code{ProgramRelations}, primitives \code{must_*}, cliquet \file{tests/layer_boundary.rs}).
+\end{objectifs}
+
+\prerequis{\cref{chap:ir} (CFG, \code{Expr}, \code{HookEntry}, slots et sites), \cref{chap:lowering-cfg} (extraction des handlers, diamant \code{&&}/\code{||}, arêtes \code{Await}), \cref{chap:statevalue-stabilite} (\code{Stability}), \cref{chap:transfert-stores} (environnements et stores), \cref{chap:point-fixe-composant} (la dernière tranche de \code{analyze_component_impl}), \cref{chap:interpretation-abstraite} (must / may, dominance).}
+
+Le \cref{chap:point-fixe-composant} s'est arrêté au moment où le point fixe d'un composant converge : on dispose alors d'un \code{StateStore}, d'un \code{MemoStore}, d'un tas, et d'un environnement abstrait par bloc de chaque corps. Ces objets décrivent des \emph{valeurs}. Or les règles posent des questions d'une autre nature : \og qui écrit ce slot, et quand ?\fg{}, \og cet effet relance-t-il celui-là ?\fg{}, \og ce listener est-il un jour retiré ?\fg{}. Ce sont des \emph{relations} entre positions du programme, et ce chapitre explique comment le moteur les calcule, une fois, avec leur polarité écrite noir sur blanc, avant de les ranger dans l'\code{AnalysisResult}.
+
+Le sous-système tient dans sept fichiers de \file{src/engine/} : \file{setters.rs} (2\,490 lignes, la marche des setters et la relation \relation{slot_writers}), \file{written.rs} (415, ce qu'une écriture stocke), \file{triggers.rs} (110, \relation{effect_triggers}), \file{seeds.rs} (552, \relation{slot_seeds}), \file{registrations.rs} (683, la table des registrars et \relation{registrations}), \file{guards.rs} (1\,058, les preuves de gardes) et \file{program_relations.rs} (42, les relations programme-entier). Le graphe de churn, \file{churn.rs}, et la preuve multi-site de \file{guards.rs} sont l'objet du \cref{chap:churn} ; nous n'en donnons ici que les entrées.
+
+Les sorties d'analyseur de ce chapitre ont été observées avec le binaire construit au commit \snapshotCommit{} sur des fichiers placés sous \file{/tmp/relprobe/}, \file{/tmp/verif07/} et \file{/tmp/ch14/}, par des commandes de la forme \code{reactant check --no-color --trace --show-clean [--info] <fichier>}. Les \emph{lignes de relation}, que la ligne de commande n'affiche pas, ont été lues par une petite sonde Rust (\file{/tmp/relprobe/src/main.rs}) qui lie la crate \code{reactant} par chemin, appelle \code{lower_program} puis \code{analyze_program} avec \code{RootStrategy::Heuristic}, et imprime les colonnes de chaque relation. Son cœur, élagué, est le suivant :
+
+\begin{lstlisting}[language=Rust,caption={la sonde de lecture des relations (élagué, \file{/tmp/relprobe/src/main.rs})},label={lst:relations-sonde}]
+let result = analyze_program(
+    ComponentRegistry::from_components(comps),
+    HookRegistry::new(), RootStrategy::Heuristic, &Config::default());
+for (id, c) in &result.components {
+    for w in &c.slot_writers {
+        println!("slot={} owner={:?} setter={} line={:?} region={:?} phase={:?} \
+                  via={:?} updater={} same_tick={} block={:?} guard_block={:?} \
+                  fresh={:?} value.ref={:?} value.null={} expr={}", ...);
+    }
+    for t in &c.effect_triggers { ... }   // hook, dep, slot, exact
+    for s in &c.slot_seeds { ... }        // slot, path, normalized, sync, setter_escapes
+    for r in &c.registrations { ... }     // effect, display, registrar, firing, timing,
+}                                         // handle, self_removing, block_id, pairing, event
+let rel = ProgramRelations::new(&result);
+for e in &rel.churn().edges { ... }
+\end{lstlisting}
+
+Dans les sorties de sonde, \code{line} est la ligne source du témoin (\code{span}), \code{value.ref} la composante \code{reference} de la valeur écrite et \code{expr} indique si la colonne \code{written.expr} est renseignée.
+
+% ---------------------------------------------------------------------------
+\section{Pourquoi des relations}
+\label{sec:relations-pourquoi}
+
+\subsection{Un fait calculé deux fois est deux faits qui dérivent}
+
+Commençons par le programme qui a motivé la promotion des relations dans le moteur. Un effet sans tableau de deps enregistre une continuation de promesse qui écrit un objet neuf dans l'état :
+
+\begin{exemple}{Une continuation dans un effet sans deps}{relations-nodeps}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/verif07/e12.tsx}},label={lst:relations-nodeps}]
+import { useState, useEffect } from 'react';
+export function NoDeps() {
+  const [x, setX] = useState({ n: 0 });
+  const [y, setY] = useState({ n: 0 });
+  useEffect(() => {
+    Promise.resolve().then(() => setX({ n: 1 }));
+    window.addEventListener('resize', () => setY({ n: 2 }));
+  });
+  return <div>{x.n}{y.n}</div>;
+}
+\end{lstlisting}
+L'effet tourne après chaque rendu ; sa continuation \code{.then} stocke une référence neuve dans \code{x} ; le composant re-rend ; l'effet tourne à nouveau. C'est une boucle automatique. L'analyseur la voit :
+\begin{sortie}
+  NoDeps  (4 hooks)  /tmp/verif07/e12.tsx
+    warn   infinite-loop  [hook:2]  (line 5:2)  this effect has no dependency array and may store a fresh reference into state `x`, so it re-runs after every render and can re-trigger itself: possible infinite render loop
+       → a fresh value is written to state `x` here [hook:2] (line 6:4)
+    warn   missing-cleanup  [hook:2]  (line 7:4)  this effect calls `window.addEventListener` but returns no cleanup. The registration is repeated every time the effect re-runs (and on every mount, twice under StrictMode) and nothing ever undoes it; return a function that tears it down
+\end{sortie}
+\end{exemple}
+
+Ce \Warning{} a été un faux négatif pendant toute la vie de l'issue \issue{26}, ouverte le 27 août et close le 27 septembre 2026. La raison est instructive. Le moteur possédait déjà une marche des setters (\file{src/engine/setters.rs}) qui savait qu'un callback confié à \code{.then} s'exécute sur un tour \emph{ultérieur} de la boucle d'événements. Mais le graphe de churn vivait dans \file{src/rules/helpers/churn.rs} et se servait d'une \emph{seconde} marche, écrite pour lui, qui ignorait cette classification et approximait \og imbriqué, donc jamais must-atteint\fg{} ; une écriture différée dans un effet sans deps n'y produisait aucune arête. Le texte de l'issue le disait déjà : \og the event-vs-async callback classification lives in the engine, not in the syntactic collector\fg{}. Deux lectures d'un même fait, dont une seule était juste.
+
+\adr{42} tire de ce constat une règle d'architecture qui se justifie en une phrase (principe du paragraphe unique) : \emph{un fait calculé à deux endroits est deux faits qui dérivent}. La marche des règles a été supprimée, le graphe de churn est devenu un pli sur les relations du moteur, et le \Warning{} ci-dessus est apparu \og par construction\fg{}.
+
+\subsection{Les trois couches}
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=6mm and 10mm]
+  \node[bloc,text width=122mm,align=left] (engine) {%
+    \textbf{Moteur} --- \code{analyze_program} : point fixe par composant\\
+    \small \code{StateStore}, \code{MemoStore}, \code{Heap}, environnements par bloc (\code{block_states}, \code{effect_block_states}, \code{handler_block_states})};
+  \node[bloc,text width=122mm,align=left,below=of engine,draw=ra-teal] (rel) {%
+    \textbf{Relations} --- dernière tranche de \code{analyze_component_impl}, puis \code{ProgramRelations}\\
+    \small par composant : \relation{slot_writers}, \relation{slot_seeds}, \relation{registrations}, \relation{effect_triggers} (+ \relation{slot_reads}, \relation{body_calls} à la demande)\\
+    \small par programme : \code{ChurnGraph} (paresseux, \code{OnceLock})\\
+    \small preuves : \code{converges_once_written}, \code{converges_under_all_writes}};
+  \node[bloc,text width=122mm,align=left,below=of rel,draw=ra-amber] (rules) {%
+    \textbf{Règles} --- lisent des lignes, appellent \code{must_*}, ne marchent aucune syntaxe\\
+    \small natives (\regle{infinite-loop}, \regle{setter-in-render}, \regle{frozen-initial-state}, \regle{stale-closure}, \dots) et packs Tier-A};
+  \draw[fleche] (engine) -- node[etiquette,right] {résultat convergé} (rel);
+  \draw[fleche] (rel) -- node[etiquette,right] {lignes + polarité} (rules);
+\end{tikzpicture}
+\caption{Les trois couches d'\adr{42}. Le moteur interprète ; la couche des relations dérive des faits du résultat convergé, chacun calculé une fois, avec sa polarité ; les règles transforment ces faits en diagnostics. La frontière basse est tenue par le cliquet \file{tests/layer_boundary.rs}.}
+\label{fig:relations-trois-couches}
+\end{figure}
+
+La \cref{fig:relations-trois-couches} résume l'architecture. Le catalogue \file{docs/relations.md} l'énonce dans ses premières lignes : \og The engine interprets each component to a fixpoint. A layer of \textbf{relations} derives facts from the converged result --- \code{A writes B}, \code{A reads B}, \code{A re-runs when B moves}, \code{A} → \code{B} --- each computed once, in one place, with its polarity written down. The rules turn those facts into diagnostics and never walk syntax themselves.\fg{}
+
+\begin{decision}[ADR-42 §1, la frontière et son cliquet]
+Une règle lit des lignes de relation et appelle des primitives \code{must_*} ; elle ne parcourt ni CFG ni expression. La frontière est tenue par un \emph{test-cliquet}, \file{tests/layer_boundary.rs} : une liste explicite des fichiers de \file{src/rules/} qui touchent encore la syntaxe (\src{tests/layer_boundary.rs}{20}{31}, dix entrées au commit \snapshotCommit), et cinq marqueurs qui définissent \og toucher la syntaxe\fg{} (\code{cfg.blocks}, \code{.blocks.values()}, \code{Stmt::}, \code{for_each_child}, \code{Terminator::}, \src{tests/layer_boundary.rs}{35}{41}). Un changement peut retirer un fichier de la liste, jamais en ajouter un. Chaque entrée est \og une promotion encore à faire, pas une exception\fg{}. L'alternative refusée était de laisser chaque règle garder sa propre lecture du programme, quitte à la corriger au cas par cas : c'est précisément le \emph{workaround} que le premier principe de \file{CLAUDE.md} interdit.
+\end{decision}
+
+\subsection{Le vocabulaire de polarité}
+
+Une relation est une table. Une \emph{ligne} y décrit une occurrence dans le code (un site d'appel de setter, un enregistrement de callback, un couple slot-chemin de prop) et chaque \emph{colonne} porte une affirmation dont la force est fixée à l'avance. Le catalogue donne quatre mots pour cette force, que nous adoptons tels quels.
+
+\begin{definition}{Relation du moteur, polarité d'une colonne}{relation}
+Une \terme{relation du moteur} est un vecteur de lignes calculé après convergence d'un composant (ou d'un programme), stocké sur l'\code{AnalysisResult} (ou construit paresseusement par \code{ProgramRelations}), et lu tel quel par les règles. Chaque colonne d'une ligne a une \terme{polarité} :
+\begin{itemize}
+  \item \textbf{exact} : un fait sur le code, vrai par construction (une région lexicale, une position, un nom tel qu'il est écrit) ;
+  \item \textbf{must} : une sous-approximation ; quand la colonne dit oui, le programme concret le fait à chaque exécution. Une colonne must peut soutenir une \Error ;
+  \item \textbf{may} : une sur-approximation ; quand la colonne dit non, le programme concret ne le fait jamais. Une colonne may ne peut soutenir qu'un \Warning, et son négatif n'est pas une preuve d'absence sauf mention contraire ;
+  \item \textbf{⊤-bearing} : la colonne a une valeur top (\code{Unknown}) qui satisfait toute requête ; l'analyse n'a pas pu trancher, et un lecteur doit prendre la branche qui \emph{tire davantage}.
+\end{itemize}
+L'absence d'une ligne n'est jamais une preuve, sauf si l'entrée du catalogue le dit : une ligne existe pour ce que l'analyse a pu voir ; un plafond de profondeur, un callee non résolu ou une closure que rien n'appelle ne contribuent rien.
+\end{definition}
+
+Cette définition prolonge celle des faits must et may du \cref{def:must-may} : la nouveauté est qu'elle s'applique \emph{colonne par colonne}, et qu'elle est écrite sur le type. Un lecteur de \code{SlotWriter} sait, avant toute règle, que \code{region} est exacte, que \code{phase} est may avec un ⊤, et que \code{written.fresh} est must pour \code{Fresh}. C'est ce qui permet à la couche des règles de n'accorder une \Error{} qu'à une preuve assemblée depuis des colonnes must ou exactes, par une primitive \code{must_*} de \file{src/rules/api/query.rs} (\cref{chap:api-regles}).
+
+\begin{piege}
+\og May\fg{} et \og must\fg{} qualifient \emph{la direction dans laquelle une colonne peut se tromper}, pas sa fiabilité. Une colonne may qui dit \code{false} ne promet rien : \code{same_tick = false} sur une ligne ne signifie pas que l'écriture est seule dans son tick, seulement que la marche n'en a pas vu d'autre. Symétriquement, une colonne must qui dit \code{Fresh} est une affirmation forte ; le code la refuse dès qu'un doute subsiste, quitte à produire \code{Maybe} sur du code correct. Toute la discipline du sous-système consiste à choisir, pour chaque colonne, dans quel sens elle a le droit d'être imprécise.
+\end{piege}
+
+\subsection{Où les relations naissent : la dernière tranche du point fixe}
+
+Les relations par composant sont calculées à un seul endroit : la fin de \code{analyze_component_impl} (\file{src/engine/fixpoint.rs}), après la boucle de point fixe et le rafraîchissement post-convergence décrits au \cref{chap:point-fixe-composant}. Toutes les voies d'analyse (\code{analyze_component}, \code{analyze_component_inter} pour un enfant inliné, les deux phases d'\code{analyze_program}) passent par cette tranche ; les relations existent donc sur \emph{tout} \code{AnalysisResult}, intra comme inter-composants.
+
+\rustsnippet[label={lst:relations-tranche}]{src/engine/fixpoint.rs}{596}{646}{la dernière tranche : setters étrangers, environnements de site, puis les quatre relations}
+
+Lisons cet extrait dans l'ordre, car l'ordre y est imposé.
+\begin{enumerate}
+  \item \code{foreign} : les variables du rendu dont la valeur convergée est un \code{ComponentSetter} d'un \emph{autre} composant (un setter reçu en prop), calculées par \code{collect_component_setter_vars} sur les environnements de bloc et le tas, puis filtrées sur \code{prop.component != comp_id}. Elles fourniront les lignes \emph{étrangères} de \relation{slot_writers} (\cref{sec:relations-slotwriter}).
+  \item \code{site_envs} : un \code{SiteEnvs}, la collection des stores convergés et des environnements par bloc de chaque région, dans lesquels l'argument de chaque écriture sera évalué (\cref{sec:relations-written}).
+  \item \code{collect_slot_writers} : la relation centrale, qui reçoit aussi les \code{InlineRegions} (les plages de blocs splicés, pour la provenance) et la table \code{hook_provenance}.
+  \item \code{collect_slot_seeds} : elle \emph{replie} \code{slot_writers} et les deps déclarés des effets, et doit donc venir après (le commentaire cite \issue{106} et \adr{31}). La table d'alias \code{labels} qu'elle reçoit est construite par \code{setter_var_labels} puis \code{resolve_setter_aliases} sur le rendu et chaque corps de hook.
+  \item \code{collect_registrations} : indépendante, un seul balayage des corps d'effets, lu par \regle{stale-closure}, \regle{missing-cleanup} et l'ancre Tier-A \code{registrations}.
+\end{enumerate}
+Quelques lignes plus bas (\src{src/engine/fixpoint.rs}{649}{667}), \code{collect_effect_triggers} est appelée avec un évaluateur \code{eval_in_stores} fermé sur l'environnement de sortie du rendu et les stores finaux ; puis les quatre vecteurs sont rangés dans l'\code{AnalysisResult} (champs \code{slot_writers}, \code{slot_seeds}, \code{registrations}, \code{effect_triggers}, \src{src/engine/fixpoint.rs}{670}{697}).
+
+Deux points méritent d'être soulignés. D'abord, les relations lisent les CFG \emph{post-expansion} : les utilitaires et les hooks personnalisés ont déjà été splicés (\cref{chap:splice-inlining}), si bien qu'une écriture faite dans un helper importé apparaît comme une ligne, avec sa provenance. Ensuite, elles ne modifient rien : \code{SiteEnvs::eval} clone les stores avant toute évaluation (\srcline{src/engine/written.rs}{240}), et le résultat convergé reste celui du point fixe.
+
+\subsection{Le catalogue}
+
+Le \cref{tab:relations-catalogue} donne la vue d'ensemble que le reste du chapitre déplie. Il suit \file{docs/relations.md}, qui est la source de vérité documentaire du sous-système (le \cref{sec:relations-limites} dira où ce document a un amendement de retard).
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}p{2.8cm}p{2.1cm}p{3.9cm}p{5.4cm}@{}}
+\toprule
+Relation & Stockage & Clé d'une ligne & Calculée par \\
+\midrule
+\relation{slot_writers} (\code{SlotWriter}) & \code{AnalysisResult} & un site d'appel de setter & \code{setters::}\allowbreak\code{collect_slot_writers} \\
+\relation{slot_seeds} (\code{SlotSeed}) & \code{AnalysisResult} & (slot, chemin de prop lu par l'initialiseur) & \code{seeds::collect_slot_seeds} \\
+\relation{registrations} (\code{Registration}) & \code{AnalysisResult} & un appel d'enregistrement dans un corps d'effet & \code{registrations::}\allowbreak\code{collect_registrations} \\
+\relation{effect_triggers} (\code{EffectTrigger}) & \code{AnalysisResult} & (effet, index de dep, slot qualifié) & \code{triggers::}\allowbreak\code{collect_effect_triggers} \\
+\relation{slot_reads}, \relation{body_calls} & à la demande & un site de lecture / d'appel & \code{setters::}\allowbreak\code{collect_slot_reads}, \code{collect_body_calls} \\
+\code{ChurnGraph} & \code{ProgramRelations} (\code{OnceLock}) & une arête (from, to, composant, effet) & \code{churn::ChurnGraph::build} (\cref{chap:churn}) \\
+\bottomrule
+\end{tabular}
+\caption{Les relations du moteur au commit \snapshotCommit. S'y ajoutent deux \emph{preuves} (des fonctions, pas des colonnes) : \code{guards::converges_once_written}, lue par \regle{setter-in-render}, et \code{guards::converges_under_all_writes}, lue par le graphe de churn.}
+\label{tab:relations-catalogue}
+\end{table}
+
+Le \code{HookLabel} qui identifie un slot est \emph{local au composant} (\cref{def:slot}) : le label 0 de \code{Parent} et le label 0 de \code{Child} sont deux slots différents. Quand une relation doit nommer un slot d'un autre composant, elle emploie un \terme{slot qualifié}, \code{QualifiedSlot = (ComponentId, HookLabel)} (\srcline{src/ir/types.rs}{9}) ; c'est la clé d'un \code{EffectTrigger} et le nœud du graphe de churn. De même, un \code{BlockId} est local à un CFG : un identifiant de bloc d'un corps imbriqué ne désigne rien dans le CFG de la région, invariant que nous retrouverons à chaque colonne de position.
+
+% ---------------------------------------------------------------------------
+\section{La marche des setters}
+\label{sec:relations-marche}
+\subsection{Le problème : quatre écritures, quatre moments}
+
+Un corps d'effet est une région lexicale : tout ce qui est écrit entre ses accolades lui appartient. Mais le \emph{moment} où une écriture s'exécute ne se lit pas à sa position. Voici un effet qui contient quatre appels de setter, dont aucun ne s'exécute au même moment que les autres.
+
+\begin{exemple}{Un effet, quatre phases}{relations-loader}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/relprobe/ex2.tsx}},label={lst:relations-loader}]
+import { useState, useEffect } from 'react';
+export function Loader({ url }: { url: string }) {
+  const [data, setData] = useState<any>(null);
+  const [pos, setPos] = useState({ x: 0 });
+  useEffect(() => {
+    setData(null);
+    fetch(url).then(r => setData({ r }));
+    const id = setInterval(() => setPos({ x: 1 }), 100);
+    const h = (e: any) => setPos({ x: e.clientX });
+    window.addEventListener('mousemove', h);
+    return () => {
+      clearInterval(id);
+      window.removeEventListener('mousemove', h);
+    };
+  }, [url]);
+  return <div>{String(data)}{pos.x}</div>;
+}
+\end{lstlisting}
+\code{setData(null)} s'exécute pendant la phase d'effet ; \code{setData({ r })} sur une microtâche ultérieure ; \code{setPos({ x: 1 })} sur un timer ; \code{setPos({ x: e.clientX })} sur un événement souris. Le cleanup, lui, ne contient aucune écriture : il rend un handle et un listener, il n'appelle rien. La sonde donne :
+\begin{sortie}
+-- slot_writers
+  slot=0 setter=setData line=Some(6)  region=Effect(2) phase=Effect   block=Some(0) guard_block=Some(0) fresh=Not   value.ref=Bottom value.null=true
+  slot=0 setter=setData line=Some(7)  region=Effect(2) phase=Deferred block=None    guard_block=Some(0) fresh=Fresh value.ref=PerRender
+  slot=1 setter=setPos  line=Some(10) region=Effect(2) phase=Handler  block=None    guard_block=Some(0) fresh=Fresh value.ref=PerRender
+  slot=1 setter=setPos  line=Some(8)  region=Effect(2) phase=Deferred block=None    guard_block=Some(0) fresh=Fresh value.ref=PerRender
+\end{sortie}
+(colonnes \code{owner=None via=Direct updater=Unknown same_tick=false} omises). Quatre lignes, une par site ; même \code{region}, quatre \code{phase} ; et seule la première a un \code{block}. La ligne de commande, elle, ne signale rien : ce composant est correct.
+\end{exemple}
+
+La \emph{marche des setters} (\code{SetterWalk}, \file{src/engine/setters.rs}) est l'algorithme qui produit ces lignes. Elle parcourt le CFG d'une région, descend dans les fonctions imbriquées selon des règles précises, et attribue à chaque appel de setter une \emph{classe} qui deviendra sa phase. Tout le reste du chapitre repose sur elle : les relations \relation{slot_reads} et \relation{body_calls} sont deux autres canaux de la même marche, et \relation{slot_seeds} replie ses lignes.
+
+\subsection{Région et phase : deux colonnes pour deux faits}
+
+\rustsnippet[label={lst:relations-region}]{src/engine/setters.rs}{641}{648}{la région lexicale d'une écriture}
+
+\code{WriterRegion} dit \emph{quel corps du composant} contient l'appel : le rendu, ou le corps d'un hook identifié par son label (effet, memo, callback, handler). C'est un fait exact. Un \code{onClick={() => set(1)}} extrait par le lowering en \code{HookEntry::Handler} (\cref{chap:lowering-cfg}) est de région \code{Handler(l)}. L'ordre dérivé (\code{Ord}) sert au tri déterministe des lignes, et \code{word()} (\src{src/engine/setters.rs}{652}{660}) donne le mot affiché dans les messages.
+
+\rustsnippet[label={lst:relations-phase}]{src/engine/setters.rs}{681}{701}{la phase d'exécution, un verdict may}
+
+\code{WriterPhase} dit \emph{quand} l'écriture s'exécute. Le commentaire de tête fixe la polarité : c'est un verdict may. Une écriture synchrone dans son corps porte la phase de ce corps ; une écriture dans une \code{FnLit} imbriquée est \code{Unknown}, c'est-à-dire ⊤, tant qu'un résumé du callee ne l'affine pas. Les deux variantes \code{Deferred} (un timer, une microtâche, une continuation de promesse : l'écriture ne s'exécute dans aucune phase React) et \code{Cleanup} (la fonction retournée par un effet) sont des \emph{preuves}, obtenues par contrat ; \code{Unknown} est l'absence de preuve.
+
+La correspondance entre une région et la phase d'une écriture \emph{synchrone} dans cette région est \code{sync_phase} (\src{src/engine/setters.rs}{670}{678}) : \code{Render} → \code{Render}, \code{Effect(_)} → \code{Effect}, et ainsi de suite. Son commentaire (\src{src/engine/setters.rs}{662}{669}) rappelle que cette égalité \og lexis = exécution\fg{} a été fausse au-delà d'un \code{await} jusqu'à \issue{117} : c'est la marche qui la rend vraie en basculant en \code{Deferred} à l'entrée d'un bloc post-\code{await}.
+
+\begin{decision}[ADR-27 §1, région exacte et phase may]
+La question \og lexical ou exécution ?\fg{} reçoit la réponse \emph{les deux, en deux colonnes distinctes}, parce que ce sont deux faits distincts. L'alternative examinée, classer toute \code{FnLit} imbriquée comme différée, aurait été une sous-approximation : \code{arr.forEach(x => setX(x))} dans un effet s'exécute \emph{synchroniquement} dans la phase d'effet. L'autre alternative, traiter ⊤ comme \og jamais dans cette phase\fg{}, perdrait des findings. ⊤ satisfait donc toute requête \code{includes} : c'est \og la sémantique may honnête du mot phase\fg{}.
+\end{decision}
+
+\subsection{La classe de marche}
+
+La marche ne manipule pas directement des \code{WriterPhase} mais une classe interne, \code{WalkClass}, décidée par \emph{la manière dont la marche est entrée dans un CFG}.
+
+\rustsnippet[label={lst:relations-walkclass}]{src/engine/setters.rs}{1319}{1344}{la classe interne de la marche}
+
+Le commentaire dit tout : \code{Sync} est la seule classe dont les identifiants de bloc ont un sens ; \code{Deferred} et \code{Handler} viennent de résumés de callees et sont \emph{indépendants du contexte} (un timer diffère, un listener tire sur événement, quelle que soit la phase qui les a enregistrés) ; les HOF synchrones (\code{arr.map(fn)}) exécutent leur argument dans la classe \emph{englobante} et la propagent au lieu d'en assigner une ; tout ce qui est inconnu est ⊤. Les résumés \og axiomatisent la sémantique de l'hôte\fg{} : un \code{setTimeout} nu est le timer de l'hôte sauf si une liaison locale l'ombre, \code{.then} est une promesse, les HOF de tableau sont ceux d'\code{Array.prototype}.
+
+La conversion vers la phase se fait au moment de pousser la ligne :
+
+\rustsnippet[label={lst:relations-class-phase}]{src/engine/setters.rs}{978}{986}{de la classe à la phase}
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}lp{2.6cm}p{9.2cm}@{}}
+\toprule
+\code{WalkClass} & \code{WriterPhase} & Comment la marche y entre \\
+\midrule
+\code{Sync} & \code{region.sync_phase()} & racine de la région ; corps d'un helper local appelé directement (B6) ; corps d'une IIFE ; callback d'un HOF synchrone (\code{map}, \code{forEach}, \dots) \\
+\code{Deferred} & \code{Deferred} & argument d'un registrar de \code{timing = Deferred} (\code{setTimeout}, \code{.then}, \code{queueMicrotask}, \dots) ; bloc post-\code{await} d'une marche \code{Sync} \\
+\code{Handler} & \code{Handler} & argument d'un registrar de \code{timing = Handler} (\code{addEventListener}) ; wrapper prouvé par résumé de bibliothèque (\code{form.handleSubmit(cb)}) \\
+\code{Cleanup} & \code{Cleanup} & fonction retournée par un corps d'effet, à la racine, en mode \code{Sync} \\
+\code{Unknown} & \code{Unknown} (⊤) & argument fonctionnel de tout autre callee, dont les registrars de \code{timing = Unknown} (\code{subscribe}, \code{on}, \code{addListener}) \\
+\bottomrule
+\end{tabular}
+\caption{De la classe de marche à la phase. Les régions et les classes sont orthogonales : une ligne \code{region = Effect(2), phase = Handler} est un listener enregistré par l'effet 2.}
+\label{tab:relations-walkclass}
+\end{table}
+
+Une projection publique plus grossière, \code{SetterCallPhase} (\src{src/engine/setters.rs}{56}{70}), replie \code{Cleanup} sur \code{Deferred} et offre \code{may_run_in_body()}, vraie pour \code{Sync} et \code{Unknown} (\src{src/engine/setters.rs}{72}{79}) : c'est la question qu'une règle comme \regle{setter-in-render} pose. Jusqu'à \issue{130}, \code{Deferred} et \code{Unknown} étaient une seule variante \code{Other}.
+
+\begin{decision}[ADR-38 §3, \code{Deferred} n'est pas \code{Unknown}]
+Replier la preuve de différé et l'absence de preuve dans une même variante coûtait à un consommateur \emph{exactement} la distinction dont il a besoin : \code{Deferred} est une preuve que l'écriture ne s'exécute pas dans le passage du corps ; \code{Unknown} est ⊤, et ⊤ inclut ce passage. Une règle qui doit taire une écriture prouvée différée mais signaler une écriture ⊤ ne pouvait pas les distinguer. Les deux variantes sont séparées et \code{may_run_in_body} est la seule question posée.
+\end{decision}
+
+\subsection{L'état d'une marche}
+
+\rustsnippet[label={lst:relations-setterwalk}]{src/engine/setters.rs}{1232}{1283}{l'état d'une marche, champ par champ}
+
+Les champs se lisent en trois groupes. Le \emph{contexte fixe} : \code{setter_vars}, les noms qui désignent un setter (alias résolus) ; \code{fn_bindings}, les \code{let f = FnLit} du corps ; \code{shadowed}, les noms liés localement qui désactivent un résumé de global (\code{let setTimeout = ...} n'importe où dans le composant fait perdre son sens au nom nu, fail-closed) ; \code{callback_bodies}, les corps des \code{useCallback} par label ; \code{certified_fns}, les noms liés \emph{une seule fois} à un littéral de fonction et jamais re-liés, seule barre que doit franchir un argument \code{set(fn)} pour être un updater fonctionnel prouvé ; \code{wrappers}, les orthographes de callees prouvées envelopper leur argument sans l'exécuter. Puis la \emph{pile} : \code{walking}, l'ensemble des CFG en cours d'expansion, par identité de pointeur, et \code{root}, la racine. Enfin les \emph{modes} : \code{effect_body} (la racine est un corps d'effet : ses listeners de premier niveau ont été réifiés, sa fonction retournée est le cleanup), \code{repeating} (on est dans un callback qu'un HOF synchrone exécute plusieurs fois par tick), et les deux drapeaux de canaux \code{collect_calls} et \code{read_vars}.
+
+Le commentaire sur \code{walking} mérite une lecture attentive. C'est une \emph{pile}, pas un ensemble global de visités : un corps atteint d'abord sans budget de profondeur, puis plus tard avec du budget, doit être marché de nouveau, sinon on perdrait des lignes. N'ignorer que les entrées \emph{ré-entrantes} ne perd rien, parce qu'un cycle ré-entre dans un corps avec un budget au plus égal à celui avec lequel il est déjà marché.
+
+Quatre fonctions construisent une \code{SetterWalk}, avec des réglages différents (\cref{tab:relations-entrees}). Toutes démarrent par \code{walk.cfg(cfg, max_depth, &mut found, WalkClass::Sync, None, None)} : mode \code{Sync}, pas de provenance, pas de témoin.
+
+\begin{table}[htbp]\centering\scriptsize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}lcccccc@{}}
+\toprule
+Point d'entrée (ligne) & \code{effect_body} & \code{shadowed} & \code{callback_bodies} & \code{wrappers} & \code{collect_calls} & \code{read_vars} \\
+\midrule
+\code{collect_setter_calls_with_extra} (105) & \code{false} & vide & vide & prouvés & non & vide \\
+\code{collect_write_sites} (189) & argument & argument & argument & prouvés & non & vide \\
+\code{collect_slot_reads} (2062) & région \code{Effect} & vide & vide & vide & non & slots + alias \\
+\code{collect_body_calls} (2153) & région \code{Effect} & vide & vide & vide & \textbf{oui} & vide \\
+\bottomrule
+\end{tabular}
+\caption{Les quatre points d'entrée de la marche (\file{src/engine/setters.rs}, constructions de \code{SetterWalk} l.~121, 213, 2081 et 2159). Seul \code{collect_write_sites}, appelé par \code{collect_slot_writers}, bénéficie de l'ombrage des registrars et des corps de \code{useCallback} ; \og prouvés\fg{} désigne les wrappers calculés par \code{wrapper_callees} sur le CFG marché lui-même (\srcline{src/engine/setters.rs}{1497}), qui ne cherche les objets à résumé (\code{useForm()}\dots) que parmi les \code{Let} de ce CFG : dans un corps d'effet ou de handler extrait, l'ensemble est donc vide en pratique, direction sûre ; les deux canaux de lecture et d'appel reçoivent l'ensemble vide \code{NO_WRAPPERS} ; \code{collect_setter_calls} est la forme historique \og une ligne par variable\fg{}, encore appelée directement par plusieurs règles (\cref{sec:relations-frontiere}).}
+\label{tab:relations-entrees}
+\end{table}
+
+\subsection{Parcourir un CFG}
+
+L'entrée dans un CFG (\code{SetterWalk::cfg}) commence par empiler le CFG dans \code{walking}, calculer \code{Reachability::of(cfg)} (un BFS par bloc, \src{src/engine/setters.rs}{933}{976}) et \code{cfg.post_await_blocks()} (\cref{chap:lowering-cfg}), puis parcourt les blocs en largeur depuis l'entrée :
+
+\rustsnippet[label={lst:relations-cfg-loop}]{src/engine/setters.rs}{1696}{1716}{la boucle sur les blocs}
+
+Trois idées tiennent dans ces vingt lignes.
+\begin{enumerate}
+  \item \textbf{Le bloc n'a de sens qu'en mode \code{Sync}.} \code{block_id}, et donc la position \code{at = (bloc, index d'instruction)}, ne sont renseignés que pour une marche synchrone ; une écriture différée ou imbriquée n'a pas de position dans le CFG de la région.
+  \item \textbf{\code{prov_block} est toujours un bloc de la racine.} À la racine, chaque bloc est sa propre provenance ; en profondeur, on hérite du bloc d'où l'on est descendu. C'est la seule clé qui ait un sens dans le CFG de la région : l'appartenance à une région inlinée la lit, et la co-exécution (\code{same_tick}) aussi.
+  \item \textbf{Un bloc qui s'atteint lui-même rend tout ce qu'il contient \code{repeating}.} \code{reach.reaches(bid, bid)} n'est vrai qu'à travers un vrai cycle, parce que le BFS part des \emph{successeurs} du bloc et non du bloc lui-même (\src{src/engine/setters.rs}{939}{941}).
+\end{enumerate}
+
+La bascule \code{Sync} → \code{Deferred} sur un bloc post-\code{await} est le cœur d'\adr{35}. Seule une marche \code{Sync} est affectée : \og a body already classified \code{Deferred}, \code{Handler} or ⊤ does not become more so\fg{}.
+
+\begin{react}[microtâches, \code{await} et IIFE]
+Le code qui suit un \code{await} s'exécute dans une microtâche ultérieure, jamais pendant le passage courant du corps, même si la promesse est déjà résolue ; il en va de même pour \code{.then}/\code{.catch}/\code{.finally} et \code{queueMicrotask}. Une fonction \code{async} \emph{appelée immédiatement} (IIFE) exécute en revanche \emph{synchroniquement} son code jusqu'au premier \code{await}. C'est pourquoi le lowering coupe le bloc à chaque \code{await} avec une arête \code{EdgeKind::Await} (\cref{chap:lowering-cfg}), et pourquoi la marche traite une IIFE comme un helper appelé au site.
+\end{react}
+
+\begin{decision}[ADR-35, la frontière \code{await}]
+\adr{35} choisit une \emph{arête} \code{Await} plutôt qu'un champ de bloc : \code{BasicBlock} et \code{CFG} sont construits à plus de deux cents endroits (surtout de l'IR de test bâti à la main), un champ nouveau serait un changement à deux cents sites pour un fait que ces fixtures n'ont pas, tandis qu'un genre d'arête est additif et survit à \code{remap_cfg}. Le consommateur calcule la clôture \code{post_await_blocks} par successeurs (\src{src/ir/cfg.rs}{121}{144}) ; un corps de boucle qui attend marque son propre en-tête, ce qui est juste (la seconde itération s'exécute bien après une suspension). Et la marche bascule \code{Sync} → \code{Deferred}, rien d'autre : cela \emph{restaure} l'exactitude au lieu d'ajouter une approximation, un post-\code{await} n'est pas \og phase inconnue\fg{} mais prouvablement un tour ultérieur. La mesure d'\adr{35} §4 a montré que ce découpage n'achetait \emph{rien} tant que l'IIFE n'était pas marchée au site : la forme \code{(async () => { ... })()} ne produisait aucune ligne du tout.
+\end{decision}
+
+Le terminateur \code{Return} d'un corps d'effet reçoit un traitement à part (\src{src/engine/setters.rs}{1720}{1745}) : si la racine est un corps d'effet et la marche en mode \code{Sync}, la fonction retournée, littéral ou nom lié dans \code{fn_bindings}, est descendue en classe \code{Cleanup} avec le bloc de provenance courant ; \og without this the cleanup's writes are invisible to the relation\fg{}.
+
+\subsection{Un appel : le site, le helper local, l'IIFE}
+
+Le traitement d'une expression d'appel (\code{SetterWalk::expr}) est le passage décisif. Quand le callee est une variable, deux choses peuvent se produire : c'est un setter, et l'on enregistre un site ; c'est un helper local, et l'on descend dans son corps \emph{dans le mode courant}.
+
+\rustsnippet[label={lst:relations-call}]{src/engine/setters.rs}{1882}{1919}{un site d'écriture, puis le bras B6}
+
+Un \code{FoundSite} capture, au moment où la marche a encore tout sous la main, la variable, la classe, le span de l'instruction (le \emph{témoin}), la position \code{at}, le bloc de provenance, le drapeau \code{repeats}, la classification de l'argument 0 (\code{updater_of}, \cref{sec:relations-slotwriter}) et l'argument lui-même.
+
+Le bras \textbf{B6} descend le corps d'un helper local appelé directement, en \code{Sync}, avec la provenance du site d'appel. Son résultat n'est pas ajouté tel quel : \code{Found::absorb} (\src{src/engine/setters.rs}{1373}{1408}) donne aux lignes que la marche interne a classées \code{Sync} la classe \emph{et le bloc du site d'appel}, et laisse aux autres la classe qu'elles ont gagnée. Le commentaire explique pourquoi : \og a \code{setTimeout} inside a sync helper is not a sync write --- lifting it was an under-approximation\fg{}. Les IIFE reçoivent exactement le même traitement (\src{src/engine/setters.rs}{1920}{1940}) : le corps de \code{(async () => { ... })()} est marché en \code{Sync}, puis absorbé.
+
+\begin{exemple}{IIFE, \code{await}, cleanup : trois phases dans un seul effet}{relations-phases}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/verif07/e11.tsx}},label={lst:relations-phases}]
+import { useState, useEffect } from 'react';
+declare function load(): Promise<number>;
+export function Phases() {
+  const [a, setA] = useState(0);
+  const [b, setB] = useState(0);
+  const [c, setC] = useState(0);
+  useEffect(() => {
+    (async () => {
+      setA(1);
+      const v = await load();
+      setB(v);
+    })();
+    return () => { setC(2); };
+  }, []);
+  return <div>{a}{b}{c}</div>;
+}
+\end{lstlisting}
+\begin{sortie}
+  slot=0 setter=setA line=Some(9)  region=Effect(3) phase=Effect   block=Some(0) guard_block=Some(0) fresh=Not   value.ref=Bottom
+  slot=1 setter=setB line=Some(11) region=Effect(3) phase=Deferred block=None    guard_block=Some(0) fresh=Maybe value.ref=Unknown
+  slot=2 setter=setC line=Some(13) region=Effect(3) phase=Cleanup  block=None    guard_block=Some(0) fresh=Not   value.ref=Bottom
+\end{sortie}
+\code{setA(1)}, écrit dans une fonction imbriquée, prend la classe \code{Sync} et le bloc 0 de l'effet par absorption de l'IIFE. \code{setB(v)} est dans un bloc post-\code{await} de l'IIFE : la marche interne l'a classé \code{Deferred}, et \code{absorb} conserve cette classe ; \code{block = None}, mais \code{guard_block = Some(0)}, le bloc de l'instruction qui l'a planifié. Le cleanup retourné est marché en \code{Cleanup}. La valeur de \code{v} est le résultat d'un \code{await} sur un callee opaque, donc ⊤, d'où \code{fresh = Maybe}. La ligne de commande ne signale rien.
+\end{exemple}
+
+La \cref{fig:relations-cfg-await} dessine ce que la marche voit : trois CFG, un seul \code{prov_block}.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=4mm and 7mm]
+  \node[cfgbloc,text width=44mm] (eff0) {\textbf{corps d'effet, bloc 0} [Sync]\\ExprStmt(Call\{ fn: FnLit(iife) \})\\term Return(FnLit(cleanup))};
+  \node[cfgbloc,text width=32mm,right=of eff0,yshift=9mm] (i0) {\textbf{iife, bloc 0} [Sync]\\ExprStmt(setA(1))\\Let \_\_t0 = load()\\term Jump(1)};
+  \node[cfgbloc,text width=34mm,right=of i0] (i1) {\textbf{iife, bloc 1} [Deferred]\\Let v = \_\_t0\\ExprStmt(setB(v))\\term Return(undefined)};
+  \node[cfgbloc,text width=32mm,right=of eff0,yshift=-9mm] (c0) {\textbf{cleanup, bloc 0} [Cleanup]\\ExprStmt(setC(2))};
+  \draw[flechemust] (eff0.east) -- node[etiquette,above left,pos=0.4] {IIFE : absorb} (i0.west);
+  \draw[flechemay] (i0) -- node[etiquette,above] {Await} (i1);
+  \draw[flechemay] (eff0.east) -- node[etiquette,below left,pos=0.4] {Return : Cleanup} (c0.west);
+  \node[etiquette,below=2mm of eff0] {prov\_block = 0 pour les trois sites};
+\end{tikzpicture}
+\caption{La marche sur l'\cref{ex:relations-phases}. Le corps de l'IIFE est entré en \code{Sync} au site d'appel ; \code{const v = await load()} est abaissé en \code{Let __t0 = load()}, fin de bloc, puis \code{Let v = __t0} dans le bloc suivant (blocs tels que les imprime la sonde \file{/tmp/verif07/irprobe}), et l'arête \code{EdgeKind::Await} qui les relie fait basculer la marche en \code{Deferred} pour le bloc 1 ; la fonction retournée est marchée en \code{Cleanup}. Les trois sites héritent du bloc de provenance 0, seul identifiant qui ait un sens dans le CFG de l'effet.}
+\label{fig:relations-cfg-await}
+\end{figure}
+
+\subsection{Les arguments fonctionnels}
+
+Après le callee viennent les arguments. Chaque argument fonctionnel reçoit une classe décidée par \code{arg_class} :
+
+\rustsnippet[label={lst:relations-arg-class}]{src/engine/setters.rs}{1626}{1651}{la classe d'un argument fonctionnel}
+
+Trois sources, dans cet ordre : la table des registrars (\cref{sec:relations-registrars}), dont le \code{timing} devient la classe, sauf si le nom nu est ombré localement ; un wrapper prouvé par résumé de bibliothèque (\code{form.handleSubmit(cb)}, \issue{94}), qui rend \code{Handler} ; enfin une méthode de \code{SYNC_HOF_METHODS} (\src{src/engine/setters.rs}{1460}{1474} : \code{map}, \code{forEach}, \code{filter}, \code{reduce}, \code{reduceRight}, \code{find}, \code{findIndex}, \code{findLast}, \code{findLastIndex}, \code{some}, \code{every}, \code{flatMap}, \code{sort}), qui propage le mode courant. Tout le reste est ⊤.
+
+La boucle sur les arguments (\src{src/engine/setters.rs}{1941}{1985}) ajoute quatre règles :
+\begin{itemize}
+  \item un listener \code{addEventListener} de \emph{premier niveau} d'un corps d'effet a déjà été réifié en \code{HookEntry::Handler} par \code{extract_subscriptions} (\srcline{src/lowering/hook_extractor.rs}{18}) : on ne le redescend pas, sous peine de le compter deux fois ; ailleurs, le même motif est classé \code{Handler} ;
+  \item un \emph{teardown} (\code{is_teardown} : \code{removeEventListener}, \code{clearInterval}, \dots) n'est jamais descendu : \og a teardown takes the callback back, it does not call it\fg{} (\adr{34} §5) ;
+  \item un callback d'un HOF synchrone rend ses écritures \code{repeating} ;
+  \item une \code{FnLit} en argument coûte un niveau de profondeur ; une variable liée (bras \textbf{B5}) est résolue \emph{sans} coût de profondeur. C'est le bras qui peut cycler (\code{const tick = t => raf(tick)}), et c'est la pile \code{walking} qui le termine (deux tests unitaires de terminaison, \src{src/engine/setters.rs}{2401}{2490}).
+\end{itemize}
+
+La profondeur maximale est 2 (\code{collect_write_sites(cfg, ..., 2, ...)} dans \code{push_sites}, \src{src/engine/setters.rs}{1077}{1085}) : un helper qui appelle un helper est vu, un troisième niveau ne l'est pas. Ce plafond est une des raisons pour lesquelles l'absence de ligne n'est pas une preuve.
+
+\subsection{Comment une \code{FnLit} est-elle entrée ?}
+
+C'est le point le plus souvent mal compris de la marche. \code{expr} visite tous les enfants d'une expression \emph{sauf} les littéraux de fonction :
+
+\rustsnippet[label={lst:relations-skip-fnlit}]{src/engine/setters.rs}{1870}{1875}{les \code{FnLit} ne sont jamais traversées de l'extérieur}
+
+Une fonction littérale n'est descendue que par la \emph{machinerie d'appel} : comme argument d'un \code{Call}/\code{New} (avec la classe de \code{arg_class}), comme callee d'une IIFE, comme corps d'un helper local appelé (B6) ou d'un nom passé en argument (B5), ou comme cleanup retourné. Le commentaire d'\adr{38} §1 le dit : \og skipping \code{FnLit} children --- those are entered by the machinery, which is the only place that knows what class the function runs in\fg{}.
+
+\begin{piege}
+Une \code{FnLit} placée en \emph{prop JSX} (\code{onClick={() => setN(1)}}) n'est donc jamais marchée depuis le CFG de rendu : elle n'y produit \emph{aucune} ligne. La seule ligne de ce site vient du corps réifié en \code{HookEntry::Handler} par \code{extract_handlers} (\srcline{src/lowering/hook_extractor.rs}{100}), marché comme sa propre région. Sur \file{/tmp/verif07/inl.tsx} (\code{<button onClick={() => setN(1)}>}), la sonde donne une seule ligne, \code{region=Handler(1) phase=Handler}. Le commentaire de \code{collect_slot_writers} (\src{src/engine/setters.rs}{991}{996}) dit qu'une ligne ⊤ dupliquée \og is dropped in favor of the handler row\fg{} : il décrit ce \emph{résultat}, non un code ; aucune déduplication explicite n'existe dans la fonction (\src{src/engine/setters.rs}{997}{1229}). C'est la règle structurelle \og une \code{FnLit} n'est entrée que par la machinerie\fg{} qui l'assure.
+\end{piege}
+
+\begin{decision}[ADR-38 §1, une traversée sans porte]
+Avant \issue{130}, \code{expr} ne traitait un appel qu'en position d'instruction ; un \code{setX(1)} dans un argument, un bras de ternaire ou une prop JSX était invisible. \adr{38} rend la traversée complète : chaque nœud est visité exactement une fois et la machinerie d'appel s'applique à tout \code{Call} rencontré, sur les trois canaux. \og A write is a write wherever it is written.\fg{} Corpus : rien retiré, 37 lignes ajoutées, temps d'exécution inchangé sur 34\,730 fichiers.
+\end{decision}
+
+\subsection{Le témoin}
+
+Une instruction sans span (un terminateur \code{Return}, un corps de flèche à expression) hérite du span du site par lequel le corps a été entré : c'est le paramètre \code{witness} que l'on voit circuler dans tous les appels, et un élément JSX rafraîchit le span pour son sous-arbre (\src{src/engine/setters.rs}{1861}{1869}). \adr{39} §3 a introduit ce mécanisme parce que la marche passait \code{None} pour tout terminateur et toute descente, jetant la position sur laquelle elle venait de se tenir. Le résidu de ce mécanisme, une ligne \emph{sans span} pour un handler à corps-expression marché comme racine de région, est traité au \cref{sec:relations-limites}.
+
+\subsection{Ce que la marche garantit}
+
+\begin{invariant}{Soundness de la marche des setters}{marche-sound}
+\begin{enumerate}
+  \item \textbf{⊤ par défaut.} Tout argument fonctionnel d'un callee inconnu est \code{Unknown}, qui satisfait toute requête. Rétrécir hors de ⊤ n'est permis que sur \emph{contrat} : un registrar de \code{timing} \code{Deferred} ou \code{Handler}, un wrapper prouvé par résumé de bibliothèque et non ré-invoqué, une arête \code{Await}.
+  \item \textbf{\code{Functional} n'est affirmé que sur un littéral ou un nom certifié} (\code{certified_fns}) : c'est une affirmation must, posée sur un chemin de suppression.
+  \item \textbf{\code{same_tick = false} n'est pas une promesse} : la profondeur est bornée et l'attribution se fait au site appelant.
+  \item \textbf{La granularité par site est monotone.} Ajouter des lignes ne fait perdre aucun appariement existentiel (\adr{28} §1).
+\end{enumerate}
+\end{invariant}
+
+% ---------------------------------------------------------------------------
+\section{La table des registrars : contrat contre devinette}
+\label{sec:relations-registrars}
+La marche a besoin, pour chaque appel qui reçoit un callback, d'un \emph{résumé} : ce callback sera-t-il exécuté maintenant, sur un tour ultérieur, sur un événement, ou ne sait-on pas ? Avant \adr{34}, deux listes de noms coexistaient : les \code{DEFERRING_GLOBALS} / \code{DEFERRING_METHODS} de la marche, et le \code{REGISTRARS} des règles \regle{stale-closure} et \regle{missing-cleanup}, qui se recouvraient sur les timers et les continuations de promesse et pouvaient dériver. Elles sont devenues \emph{une} table, \code{REGISTRARS}, dans \file{src/engine/registrations.rs}, avec une colonne par lecteur.
+
+\rustsnippet[label={lst:relations-registrar}]{src/engine/registrations.rs}{63}{78}{une ligne de la table des registrars}
+
+\code{cb_arg} est l'indice de l'argument callback (\code{addEventListener('click', cb)} → 1) ; \code{firing} dit si le callback tire une fois (\code{Once}) ou indéfiniment (\code{Repeating}), un \emph{axiome} de la table ; \code{method_only} exige la forme \code{recv.name(...)} (un \code{then(...)} nu est trop ambigu pour affirmer quoi que ce soit) ; \code{timing} est le résumé de phase que lit la marche ; \code{teardown} et \code{teardown_takes} servent à l'appariement (\cref{sec:relations-registrations}).
+
+\begin{table}[htbp]\centering\footnotesize
+\begin{tabular}{@{}lclllll@{}}
+\toprule
+\code{name} & \code{cb_arg} & \code{firing} & \code{method_only} & \code{timing} & \code{teardown} & \code{teardown_takes} \\
+\midrule
+\code{setInterval} & 0 & Repeating & false & Deferred & \code{clearInterval} & Handle \\
+\code{addEventListener} & 1 & Repeating & false & Handler & \code{removeEventListener} & Listener \\
+\code{subscribe} & 0 & Repeating & true & Unknown & \code{unsubscribe} & Listener \\
+\code{on} & 1 & Repeating & true & Unknown & \code{off}, \code{removeListener} & Listener \\
+\code{addListener} & 1 & Repeating & true & Unknown & \code{removeListener} & Listener \\
+\code{setTimeout} & 0 & Once & false & Deferred & \code{clearTimeout} & Handle \\
+\code{setImmediate} & 0 & Once & false & Deferred & \code{clearImmediate} & Handle \\
+\code{requestAnimationFrame} & 0 & Once & false & Deferred & \code{cancelAnimationFrame} & Handle \\
+\code{requestIdleCallback} & 0 & Once & false & Deferred & \code{cancelIdleCallback} & Handle \\
+\code{queueMicrotask} & 0 & Once & false & Deferred & --- & Handle \\
+\code{then} & 0 & Once & true & Deferred & --- & Handle \\
+\code{catch} & 0 & Once & true & Deferred & --- & Handle \\
+\code{finally} & 0 & Once & true & Deferred & --- & Handle \\
+\bottomrule
+\end{tabular}
+\caption{Le contenu de \code{REGISTRARS} au commit \snapshotCommit{} (\src{src/engine/registrations.rs}{93}{211}), treize lignes. Trois registrars ne peuvent pas être défaits (\code{teardown} vide) : une continuation de promesse ne se retire pas.}
+\label{tab:relations-registrars}
+\end{table}
+
+La colonne \code{timing} n'est pas uniforme, et c'est là toute la décision.
+
+\begin{decision}[ADR-34 §2, un contrat, pas un nom]
+\code{Deferred} couvre les timers, les microtâches et les continuations de promesse : le callback tourne sur un tour ultérieur de la boucle d'événements, prouvablement hors de toute phase React. \code{Handler} ne couvre que \code{addEventListener} : le DOM n'a pas de dispatch synchrone depuis un enregistrement, donc le listener ne tourne prouvablement pas pendant l'appel. \code{Unknown} couvre \code{subscribe}, \code{on}, \code{addListener} : un \code{BehaviorSubject} RxJS émet \emph{sur-le-champ} au nouvel abonné, si bien qu'une exécution synchrone n'est pas exclue et que la marche doit garder ⊤. L'alternative, classer \code{subscribe} en \code{Handler} par analogie de nom, aurait \emph{perdu} des findings : \code{WriterPhase} est may, ⊤ satisfait toute requête, et rétrécir une ligne d'\code{Unknown} vers \code{Handler} est la seule direction qui puisse en faire disparaître. Cette direction n'est permise que là où le timing est un contrat de la plateforme, non une devinette de table de noms. La décision \og faux positif accepté\fg{} de l'issue \issue{42} (wontfix) achète de la sur-approximation ; elle n'achète pas cela.
+\end{decision}
+
+\begin{react}[dispatch DOM et observables]
+\code{addEventListener} n'appelle jamais le listener pendant l'appel d'enregistrement ; il faut un dispatch, donc un événement ou un \code{dispatchEvent} explicite, tous deux extérieurs au passage courant. À l'inverse, beaucoup de stores \og subscribe\fg{} (RxJS \code{BehaviorSubject}, certains stores Redux-like) appellent immédiatement le callback avec la valeur courante. Le premier fait est un contrat de la plateforme ; le second est une propriété de chaque bibliothèque, que l'analyseur ne connaît pas. D'où \code{Handler} pour l'un et ⊤ pour les autres.
+\end{react}
+
+L'appariement d'un callee avec la table est \code{match_registrar} (\src{src/engine/registrations.rs}{292}{313}) : le callee est un \code{Var(name)} (forme nue) ou un \code{FieldAccess { obj, field }} (forme méthode), et la première ligne dont \code{name} correspond et dont \code{method_only} est compatible avec la forme est retenue. Un registrar non \code{method_only} (\code{setInterval}, \code{addEventListener}, \dots) est reconnu aussi bien nu qu'en position de méthode (\code{window.setTimeout}, \code{el.addEventListener}) ; la chaîne \code{display} rendue (\code{setInterval}, \code{socket.addEventListener}, \code{.then}) est celle qu'affichent les diagnostics. C'est le \emph{seul} appariement par nom du sous-système, et c'est pourquoi l'ombrage existe : dans \code{arg_class} (\cref{lst:relations-arg-class}), un nom nu lié localement (\code{let setTimeout = ...}) n'active pas le résumé. L'ombrage ne s'applique qu'à la forme nue : \code{!reg.method_only && matches!(fn_, Expr::Var(n) if shadowed...)}.
+
+Enfin, \code{is_teardown} (\src{src/engine/registrations.rs}{281}{288}) reconnaît un callee de la colonne \code{teardown}. Son commentaire souligne l'asymétrie : lire la table \emph{rétrécit} ici (un teardown n'est pas descendu), alors qu'elle \emph{élargit} côté registrar ; l'ensemble est donc volontairement limité aux partenaires de teardown des registrars déjà en table, \og nothing joins it without a registration to undo\fg{}.
+
+% ---------------------------------------------------------------------------
+\section{La ligne \code{SlotWriter}, colonne par colonne}
+\label{sec:relations-slotwriter}
+\subsection{Une ligne par site}
+
+\begin{exemple}{Deux écritures dans un handler}{relations-counter}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/relprobe/ex1.tsx}},label={lst:relations-counter}]
+import { useState } from 'react';
+export function Counter() {
+  const [count, setCount] = useState(0);
+  const inc = () => {
+    setCount(count + 1);
+    setCount(count + 1);
+  };
+  const safe = () => setCount(c => c + 1);
+  return <button onClick={inc} onDoubleClick={safe}>{count}</button>;
+}
+\end{lstlisting}
+\begin{sortie}
+  slot=0 setter=setCount line=Some(5) region=Handler(1) phase=Handler via=Direct updater=Unknown    same_tick=true  block=Some(0) fresh=Maybe
+  slot=0 setter=setCount line=Some(6) region=Handler(1) phase=Handler via=Direct updater=Unknown    same_tick=true  block=Some(0) fresh=Maybe
+  slot=0 setter=setCount line=None    region=Handler(2) phase=Handler via=Direct updater=Functional same_tick=false block=Some(0) fresh=Not
+\end{sortie}
+Les deux appels de \code{inc} sont \emph{deux lignes}, toutes deux \code{same_tick = true} : elles sont dans le même bloc du handler. La ligne de \code{safe} porte \code{updater = Functional} (le littéral \code{c => c + 1}) et \code{fresh = Not}. Elle n'a pas de span : le corps d'une flèche à expression est un simple terminateur \code{Return}, sans position, et marché comme \emph{racine} de région il n'hérite d'aucun témoin (\cref{sec:relations-limites}). La ligne de commande ne dit rien : aucune règle native ne lit le motif \og deux écritures non fonctionnelles du même slot dans un tick\fg{} (\issue{61}), mais un pack Tier-A peut l'exprimer depuis \code{same_tick} et \code{updater}.
+\end{exemple}
+
+\begin{decision}[ADR-28 §1, la granularité par site]
+Les lignes étaient autrefois clées \code{(region, variable de setter, classe)} : deux \code{setCount(count + 1)} dans un handler faisaient \emph{une} ligne. Ce repli, délibéré et documenté, est renversé : une ligne par site d'appel. \og A relation that cannot say there are two writes cannot express a rule about two writes\fg{}, et aucun vocabulaire de garde ne recrée une distinction que la relation a jetée. Multiplier les lignes est un \emph{raffinement monotone} (mêmes slots, mêmes phases, plus de témoins), et tout consommateur de la relation stockée la lit existentiellement : une requête qui appariait avant ne peut cesser d'apparier. Le seul consommateur qui veut l'ancienne forme, \code{collect_setter_calls}, replie \emph{explicitement} à la fin (\src{src/engine/setters.rs}{137}{157}), en préférant le site le plus synchrone.
+\end{decision}
+
+\subsection{La structure}
+
+\rustsnippet[label={lst:relations-slotwriter}]{src/engine/setters.rs}{728}{786}{la ligne \code{SlotWriter}}
+
+\begin{definition}{La ligne \code{SlotWriter}}{slot-writer}
+Une ligne de \relation{slot_writers} est un \terme{écrivain} : un site d'appel de setter d'un slot, avec sa cible (\code{slot}, \code{owner}), sa position (\code{span}, \code{region}, \code{block}, \code{guard_block}), son moment (\code{phase}), sa provenance (\code{via}), son argument (\code{updater}, \code{written}) et sa co-exécution (\code{same_tick}). Le \cref{tab:relations-slotwriter-colonnes} donne la polarité de chaque colonne.
+\end{definition}
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}lp{6.1cm}p{2.6cm}p{3.6cm}@{}}
+\toprule
+Colonne & Affirmation & Polarité & Remplie depuis \\
+\midrule
+\code{slot} & label du slot, \textbf{dans le composant propriétaire} & exact & \code{targets[var]} \\
+\code{owner} & \code{None} : slot local ; \code{Some(parent)} : écriture via une prop \code{ComponentSetter} & exact ; la ligne est une écriture may & \code{foreign} \\
+\code{setter} & variable au site, alias résolus & exact & \code{FoundSite::var} \\
+\code{span} & site témoin & exact ; \code{None} si non plaçable & span d'instruction, JSX, ou témoin hérité \\
+\code{region} & corps lexical & exact & la région marchée \\
+\code{phase} & quand ça s'exécute & may, ⊤-bearing & \code{class_phase(class, region)} \\
+\code{via} & \code{Direct} / \code{Via}(chaîne) / \code{Unknown} & exact ; \code{Direct} certifiable & \code{InlineRegions::chain} \\
+\code{updater} & \code{Functional(corps)} ou ⊤ & must pour \code{Functional} & \code{updater_of} \\
+\code{same_tick} & une autre écriture synchrone du même slot, même région, atteignable & may, unidirectionnel & \code{Reachability} \\
+\code{block} & bloc de la région, écriture \code{Sync} non répétée & exact ; \code{None} sinon & \code{site.at} \\
+\code{guard_block} & bloc dont les gardes dominantes s'appliquent & exact ; \code{None} sinon & \code{site.prov_block} \\
+\code{written.fresh} & \code{Fresh} / \code{Maybe} / \code{Not} & must pour \code{Fresh} et \code{Not} & \code{written::classify} \\
+\code{written.value} & valeur stockée & may & \code{SiteEnvs::eval} \\
+\code{written.expr} & argument 0 tel qu'écrit & exact & \code{FoundSite::arg} \\
+\bottomrule
+\end{tabular}
+\caption{Les colonnes de \relation{slot_writers} et leur polarité (d'après \file{docs/relations.md} et le code).}
+\label{tab:relations-slotwriter-colonnes}
+\end{table}
+
+\subsection{La cible et le propriétaire}
+
+La table des cibles est construite en tête de \code{collect_slot_writers} : d'abord les setters locaux (\code{setter_var_labels} : chaque \code{let v = StateSetter(l)} du rendu, puis \code{resolve_setter_aliases} sur le rendu et chaque corps, un point fixe sur \code{let a = b} / \code{a = b}, \src{src/engine/setters.rs}{581}{619}), puis les étrangers, \emph{sans écraser} un local (\src{src/engine/setters.rs}{1009}{1020} : \code{targets.entry(v).or_insert(...)}, \og a local binding wins a tie\fg{}). Les noms étrangers ne sont pas alias-résolus, parce que \code{cross_component_setters} lit déjà la valeur convergée de chaque liaison du rendu.
+
+Un setter étranger est décrit par \code{SetterProp} :
+
+\rustsnippet[label={lst:relations-setterprop}]{src/engine/setters.rs}{245}{259}{un setter reçu d'un autre composant}
+
+\code{must_write} distingue une variable qui \emph{est} le setter (ou une closure dont le corps l'appelle, \code{reset={() => setCount(0)}}) d'une closure qui ne fait que le \emph{porter} ; les deux sont des écritures pour un lecteur may, seule la première peut être certifiée (\adr{38} §4). Le calcul (\code{collect_component_setter_vars}, \src{src/engine/setters.rs}{275}{349}) parcourt les noms liés du rendu dans l'ordre de \code{cfg.blocks} (un \code{BTreeMap}, donc déterministe, \issue{120}) et interroge la valeur convergée de chaque bloc : \code{ComponentSetter(c, l)} ⇒ \code{must_write: true} ; un \code{EnvVal::Loc} vers une fonction du tas qui capture un setter ⇒ \code{must_write} = \og son corps appelle-t-il ce setter en \code{Sync} ?\fg{}. Le premier environnement qui résout un nom décide (la question \og lequel devrait gagner\fg{} est \issue{119}).
+
+\begin{exemple}{Une ligne étrangère}{relations-foreign}
+Dans \file{/tmp/verif07/e14.tsx}, \code{Seed} rend \code{<Child onSet={setS3} ... />} et \code{Child} appelle \code{onSet(v)} dans un \code{onClick}. \code{Child}, rendu par \code{Seed}, n'est pas une racine : il est analysé top-down (\cref{chap:inter-composants}) et sa prop \code{onSet} vaut \code{ComponentSetter(Seed, 2)}. Sa relation contient :
+\begin{sortie}
+=== component Child
+  slot=2 owner=Some("Seed") setter=onSet line=None region=Handler(0) phase=Handler via=Direct updater=Unknown same_tick=false block=Some(0) fresh=Maybe
+\end{sortie}
+Le slot est \emph{nommé dans le propriétaire} : c'est le label 2 de \code{Seed} (\code{s3}), qui n'a rien à voir avec un éventuel label 2 de \code{Child}.
+\end{exemple}
+
+\begin{decision}[ADR-30, lignes qualifiées par leur propriétaire]
+Trois points. (§1) Les lignes étrangères viennent de la résolution du moteur lui-même (\code{cross_component_setters}), pas d'une seconde passe ; un local gagne l'égalité. (§2) Côté packs Tier-A, l'énumération \emph{s'élargit sur la garde}, jamais sur la sorte : une règle qui ne nomme pas \code{slot_ownership} continue de lier exactement les lignes qu'elle liait ; l'alternative, élargir inconditionnellement, aurait changé en silence les findings de tous les packs déployés. (§3) Un \code{HookLabel} est par composant ; résoudre le label du parent dans la table de l'enfant nommerait un slot local sans rapport, \og a wrong name, not a missing one\fg{}. D'où l'invariant : \emph{tout lecteur natif filtre \code{owner.is_none()}} (par exemple \src{src/engine/seeds.rs}{114}{117}).
+\end{decision}
+
+\subsection{\code{same_tick} : la co-exécution comme fait de ligne}
+
+\rustsnippet[label={lst:relations-same-tick}]{src/engine/setters.rs}{1098}{1143}{\code{same_tick}, \code{block} et \code{written} pour chaque site}
+
+\code{same_tick} est vrai si le site est \code{repeats} (un callback de HOF synchrone, ou une écriture atteinte deux fois par un helper appelé deux fois), ou si, pour un site \code{Sync}, un autre site \code{Sync} du même slot est dans le même bloc, ou atteignable dans \emph{l'une ou l'autre} direction, ou si le bloc s'atteint lui-même. La clé est \code{prov_block}, jamais le bloc interne. Le commentaire insiste : la co-exécution est symétrique. Juste avant, \code{dedup_source_sites} (\src{src/engine/setters.rs}{913}{931}) a replié les copies d'un même site source atteint depuis deux appels d'un helper, en marquant la ligne survivante \code{repeats = true} : \og being reached from two call sites is exactly co-execution\fg{}.
+
+\begin{decision}[ADR-28 §3, un booléen par ligne, jamais un pli]
+Le fait \og deux écritures du même slot dans un tick\fg{} est une relation \emph{entre} deux lignes. La pousser dans un booléen \emph{sur} chaque ligne est ce qui garde les règles Tier-A mono-ancre et existentielles (pas de $\forall$ sur \relation{writers}, pas de seconde liaison), le même geste qui avait dissous la jointure effet + handler d'\adr{27} §1. Et le booléen est may dans une seule direction : la marche est bornée en profondeur, une écriture qu'elle n'a pas vue ne peut pas faire de \code{false} une promesse, donc aucune garde ne peut affirmer le négatif (\adr{28} §5). Limite connue : deux écritures de branches mutuellement exclusives à l'intérieur d'un helper inliné sont lues co-exécutées (\issue{123}).
+\end{decision}
+
+\subsection{\code{Updater} : l'argument 0 est-il une fonction prouvée ?}
+
+\rustsnippet[label={lst:relations-updater}]{src/engine/setters.rs}{709}{720}{la colonne \code{Updater}}
+
+\rustsnippet[label={lst:relations-updater-of}]{src/engine/setters.rs}{1303}{1316}{comment l'argument est classé}
+
+Trois formes seulement sont \code{Functional} : un \code{FnLit} inline ; un \code{CallbackVal(l)} dont le corps de \code{useCallback} est connu ; une variable \emph{certifiée}, c'est-à-dire liée une seule fois à un littéral et jamais re-liée dans aucune closure en dessous (\code{certified_fn_binding}, \src{src/ir/bindings.rs}{151}{160}). \code{collect_fn_bindings} n'est pas cette barre : c'est un \code{HashMap::insert}, il garde la \emph{dernière} liaison d'un nom re-lié. Tout le reste est ⊤, de sorte qu'une règle qui tire sur \og non fonctionnel\fg{} sur-rapporte plutôt que de manquer une écriture. \adr{28} §2 refuse deux colonnes (fonctionnel + pureté) : une seule colonne enregistre l'\emph{expression}, chaque consommateur en dérive son verdict.
+
+\subsection{\code{block} et \code{guard_block}}
+
+Les deux colonnes de position ont des rôles distincts, et il est facile de les confondre avec les champs internes de la marche.
+
+\begin{piege}
+Quatre notions de bloc coexistent. \code{at} (interne) est \code{(bloc, index d'instruction)}, seulement en \code{Sync}, et sert à l'environnement d'évaluation. \code{block} (colonne) vaut \code{at.0} si le site est \code{Sync} \emph{et} non répété : \og a position only a write that runs synchronously in this region, once per pass, can claim\fg{} ; c'est ce que \code{must_on_all_paths} prend. \code{guard_block} (colonne) vaut \code{prov_block} : toujours un bloc de la région, et pour un site différé, \emph{l'instruction qui l'a planifié} ; une continuation ne s'exécute que si le passage qui l'a planifiée a pris toutes les branches au-dessus (\issue{160}). Ne jamais comparer un \code{BlockId} d'un corps imbriqué avec un bloc de la région. Notons qu'\adr{42} §2 décrit \code{block} comme \og the walk's \code{prov_block}, exposed\fg{} : au commit \snapshotCommit, c'est \code{guard_block} qui expose \code{prov_block}, et \code{block} vient de \code{at}.
+\end{piege}
+
+\begin{invariant}{Positions d'une ligne}{slotwriter-positions}
+\code{block.is_some()} implique que \code{phase} est la phase synchrone de la région et que le site n'est pas \code{repeats}. \code{guard_block} est toujours un bloc du CFG de la région, ou \code{None} pour un site non plaçable. Sur l'\cref{ex:relations-loader}, seule \code{setData(null)} a un \code{block} ; les quatre lignes ont \code{guard_block = Some(0)}.
+\end{invariant}
+
+\subsection{\code{via} : qui a écrit l'appel}
+
+\rustsnippet[label={lst:relations-provenance}]{src/engine/setters.rs}{789}{804}{la provenance d'une écriture}
+
+Le lowering splice les utilitaires et les hooks personnalisés (\cref{chap:splice-inlining}) en enregistrant, à la primitive de splice, une \code{InlineRegion} par callee : une plage de blocs \code{start..end}, le nom \emph{exporté} du callee, le fichier d'origine et l'indice de la région englobante (\src{src/engine/setters.rs}{806}{834}). Les plages sont disjointes (chaque splice alloue strictement au-dessus), donc au plus une région contient un bloc, et \code{chain} remonte les \code{parent} :
+
+\rustsnippet[label={lst:relations-chain}]{src/engine/setters.rs}{847}{858}{de la plage de blocs à la chaîne de wrappers}
+
+Le calcul de \code{via} (\src{src/engine/setters.rs}{1144}{1179}) préfixe la chaîne par l'origine du hook si la région est le corps d'un hook custom inliné, puis : pas de \code{prov_block} et chaîne vide → \code{Unknown} (jamais \code{Direct} sur un site non plaçable) ; chaîne vide dans un CFG de rendu \code{render_poisoned} (un splice a dû greffer dans le bloc d'entrée) → \code{Unknown} ; sinon \code{Direct} ou \code{Via}(chaîne).
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=4mm and 8mm]
+  \node[cfgbloc,text width=34mm] (b0) {bloc 0 (rendu)\\Let setN = StateSetter(0)\\term Jump(1)};
+  \node[cfgbloc,text width=40mm,right=of b0,fill=ra-bg] (b1) {bloc 1 (putState)\\Let setter\#0 = setN\\Let v\#0 = 2\\ExprStmt(setter\#0(v\#0))\\term Jump(2)};
+  \node[cfgbloc,text width=30mm,right=of b1] (b2) {bloc 2 (rendu)\\HookMarker(1) ...};
+  \draw[fleche] (b0) -- (b1);
+  \draw[fleche] (b1) -- (b2);
+  \node[etiquette,below=1mm of b1] {InlineRegion \{ start: 1, end: 2, name: "putState", parent: None, .. \}};
+  \node[etiquette,below=7mm of b1] {prov\_block = 1 $\in$ [1, 2) $\Rightarrow$ via = Via(["putState"])};
+\end{tikzpicture}
+\caption{Provenance d'une écriture splicée (\cref{ex:relations-via}). Blocs tels que la sonde les imprime. Le splice émet le préfixe de paramètres \texttt{let setter\#0 = setN} en tête du premier bloc du callee, avec le span du site d'appel (ligne 5 de \file{App.tsx}, \adr{39} §2), enregistre la plage de blocs du callee, et \code{resolve_setter_aliases} rattache \texttt{setter\#0} au slot 0. Une chaîne \code{putState} → \code{helper} → \code{setX} donnerait \code{Via(["putState", "helper"])}.}
+\label{fig:relations-via}
+\end{figure}
+
+\begin{exemple}{Un utilitaire importé écrit au rendu}{relations-via}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch14/via/helpers.ts} et \file{/tmp/ch14/via/App.tsx}},label={lst:relations-via}]
+// helpers.ts
+export function putState(setter, v) {
+  setter(v);
+}
+// App.tsx
+import { putState } from "./helpers";
+import { useState, useEffect } from "react";
+export function App({ items }) {
+  const [n, setN] = useState(0);
+  putState(setN, 2);
+  useEffect(() => { putState(setN, items.length); }, [items]);
+  return <div>{n}</div>;
+}
+\end{lstlisting}
+Une sonde multi-fichiers (\code{lower_files} + \code{analyze_lowered}, \file{/tmp/verif07/mprobe}) donne pour \code{App} :
+\begin{sortie}
+  slot=0 setter=setter line=Some(2) region=Render    phase=Render via=Via(["putState"]) block=Some(1) fresh=Not
+  slot=0 setter=setter line=Some(2) region=Effect(1) phase=Effect via=Via(["putState"]) block=Some(1) fresh=Maybe
+\end{sortie}
+La colonne \code{setter} porte le paramètre renommé du callee (affiché par \code{source_name}, qui retire le sel de splice) et \code{line} est la ligne 2 \emph{de \file{helpers.ts}} : le span propre de l'instruction du callee, dans son fichier. La ligne de commande, elle, ne signale rien sur \code{putState(setN, 2)} au rendu ; ce silence est analysé au \cref{sec:relations-frontiere}.
+\end{exemple}
+
+Le consommateur de \code{via} est la primitive \code{must_direct_write} :
+
+\rustsnippet[label={lst:relations-must-direct}]{src/rules/api/query.rs}{763}{774}{la certification d'une écriture directe}
+
+Une ligne \code{Direct} est une certitude, non un fait may : les régions sont enregistrées à la primitive de splice unique, exhaustivement, et \code{Direct} n'est attribué qu'à un site dont le bloc de provenance est hors de toutes, dans un CFG qu'aucune greffe défensive n'a empoisonné. Les angles morts connus (appels de wrappers en position d'expression, \issue{52} ; budget de splice, \issue{54}) retirent des \emph{lignes}, ils ne rendent jamais incertain le \code{Direct} d'une ligne présente (\src{src/rules/api/query.rs}{755}{762}).
+
+\subsection{Tri et déterminisme}
+
+Le tri final (\src{src/engine/setters.rs}{1217}{1228}) par \code{(slot, region, phase, position, setter)} rend la relation déterministe et explique un détail de l'\cref{ex:relations-loader} : la ligne \code{Handler} (ligne source 10) précède la ligne \code{Deferred} (ligne 8) parce que \code{Handler < Deferred} dans l'ordre dérivé de \code{WriterPhase}. Une ligne sans span trie en dernier (\code{u32::MAX}).
+
+\begin{piege}
+Le commentaire du champ \code{AnalysisResult::slot_writers} dit encore \og one row per (region, alias-resolved setter variable, sync-vs-nested)\fg{} (\src{src/engine/analysis_result.rs}{239}{243}) : c'est la granularité d'\emph{avant} \adr{28}, un commentaire périmé au commit \snapshotCommit. La doc de la structure elle-même (\src{src/engine/setters.rs}{728}{737}) dit juste : \og one row \textbf{per call site}\fg{}. Même remarque pour la doc de \code{Found} (\src{src/engine/setters.rs}{1346}{1365}), qui concatène deux commentaires dont le premier décrivait l'ancien type.
+\end{piege}
+
+% ---------------------------------------------------------------------------
+\section{La colonne \code{written} : ce que l'écriture stocke}
+\label{sec:relations-written}
+La colonne \code{written} porte trois faits sur l'argument 0 d'une écriture, dont le graphe de churn et les preuves de gardes ont besoin (\file{src/engine/written.rs}, doc de module, \src{src/engine/written.rs}{1}{16}) : \code{fresh}, la jambe \og must-change\fg{} d'une arête de churn ; \code{value}, la valeur abstraite stockée, pour les preuves qui rétrécissent dessus ; \code{expr}, l'argument tel qu'il est écrit, pour la preuve \emph{relationnelle} (une garde compare le slot à l'expression même que l'écriture y stocke), \og a claim about two spellings being one value, which no abstract value can carry\fg{}.
+
+\rustsnippet[label={lst:relations-written}]{src/engine/written.rs}{37}{58}{\code{Freshness} et \code{Written}}
+
+\code{Freshness} est un treillis à trois points, \code{Not < Maybe < Fresh} (\cref{fig:relations-freshness}), utilisé comme tel : \code{l.max(r).min(Freshness::Maybe)} dans le classement d'un opérateur binaire. \code{Fresh} est must (\og à chaque appel, une référence neuve\fg{}), \code{Not} est must aussi (\og jamais\fg{}), \code{Maybe} est l'inconnu.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[treillis,node distance=8mm]
+  \node[noeud] (n) {\code{Not}};
+  \node[noeud,above=of n] (m) {\code{Maybe}};
+  \node[noeud,above=of m] (f) {\code{Fresh}};
+  \draw[thick,ra-gray] (n) -- (m) -- (f);
+  \node[etiquette,right=3mm of n] {jamais une référence neuve (littéral, \code{o => o}, \code{Versioned({cible})})};
+  \node[etiquette,right=3mm of m] {peut-être (valeur ⊤, updater imprécis)};
+  \node[etiquette,right=3mm of f] {toujours (\code{PerRender} seul, littéral objet, \code{new})};
+\end{tikzpicture}
+\caption{Le treillis \code{Freshness}. Ce n'est pas un treillis d'approximation au sens du \cref{chap:interpretation-abstraite} : \code{Not} et \code{Fresh} sont deux affirmations must opposées, \code{Maybe} leur join.}
+\label{fig:relations-freshness}
+\end{figure}
+
+\begin{piege}
+Le commentaire du champ \code{value} (\og approximated as a fresh reference\fg{}) est antérieur à \code{returns_value} : au commit \snapshotCommit, un updater fonctionnel stocke la \emph{jointure de ses \code{return}}, pas une référence de substitution. Le test \code{an_updater_stores_what_it_returns} (\srcline{src/engine/written.rs}{368}) le vérifie ; c'est ce qui permet à un \code{prev => null} d'un autre site de \emph{ranimer} une garde \code{if (!s)} (\cref{chap:churn}).
+\end{piege}
+
+\subsection{Les trois cas de \code{classify}}
+
+\rustsnippet[label={lst:relations-classify}]{src/engine/written.rs}{66}{106}{le calcul de la colonne \code{written}}
+
+\begin{enumerate}
+  \item \textbf{Pas d'argument} (\code{setX()}) : \code{Not}, valeur ⊤.
+  \item \textbf{Updater fonctionnel} (littéral, ou \code{Updater::Functional}) : classé \emph{sans environnement}, puisque l'updater s'exécute dans sa propre portée. \code{returns_freshness} donne \code{Fresh} si tous les \code{return} le sont, \code{Not} si aucun, \code{Maybe} sinon ou si rien ne retourne ; \code{returns_value} (\src{src/engine/written.rs}{113}{122}) est la jointure des \code{StateValue::from_init} de ses \code{return} : une allocation est \code{PerRender}, un littéral est lui-même, le reste (le paramètre compris) ⊤.
+  \item \textbf{Valeur} : évaluée par \code{value_of} (c'est-à-dire \code{SiteEnvs::eval}) puis passée à \code{value_freshness}.
+\end{enumerate}
+
+Par \code{return} (\code{classify_updater_return}, \src{src/engine/written.rs}{153}{171}) : une allocation (\code{ObjectLit}, \code{ArrayLit}, \code{FnLit}, \code{New}) est \code{Fresh} ; l'identité \code{o => o} et un littéral sont \code{Not} ; un opérateur binaire retourne un primitif \emph{sauf} les opérateurs logiques, qui retournent un opérande, d'où \code{l.max(r).min(Freshness::Maybe)} : \og jamais must-frais, au plus \code{Maybe}\fg{} ; tout le reste est \code{Maybe}. \code{Expr::New} compte comme allocation depuis \issue{158} (commit \snapshotCommit).
+
+\rustsnippet[label={lst:relations-value-freshness}]{src/engine/written.rs}{185}{200}{fraîcheur d'une valeur stockée}
+
+Le churn ne regarde \emph{que la sorte référence} de la valeur (\cref{chap:statevalue-stabilite}) : \code{count + 1} change mais ne rate jamais \code{Object.is} \og fraîchement\fg{}. \code{PerRender} seul (\code{is_unstable_reference_only}) est \code{Fresh} ; \code{PerRender} joint à d'autres sortes, \code{Unknown} et un résidu ⊤ sont \code{Maybe} ; \code{Versioned({cible})} est \code{Not}, parce qu'un contenu du slot réécrit dans le slot n'est pas un changement (\issue{155}). Une valeur versionnée par un \emph{autre} slot avec un résidu ⊤ reste \code{Maybe}, et \issue{157} est \og le compte rendu précis\fg{} de cette limite : une valeur dérivée du slot écrit par un \code{useMemo} lit \code{Versioned({s})}, donc \code{Not}, et une boucle réelle reste silencieuse (\cref{sec:relations-limites}).
+
+\begin{react}[\code{Object.is} et le bail-out]
+React abandonne une mise à jour d'état dont la nouvelle valeur est \code{Object.is}-égale à l'actuelle. Un objet littéral neuf, un tableau, une fonction, un \code{new Map()} échouent \emph{toujours} cette comparaison et provoquent un re-rendu ; un primitif égal ou la même référence, jamais. C'est pourquoi \code{Freshness} ne porte que sur la sorte référence, et pourquoi la preuve relationnelle du \cref{sec:relations-preuve-mono-site} peut ignorer \code{NaN}.
+\end{react}
+
+\subsection{Où évaluer l'argument : \code{SiteEnvs}}
+
+\code{SiteEnvs} (\src{src/engine/written.rs}{213}{226}) rassemble les stores convergés (\code{state}, \code{memo}, \code{heap}), l'environnement d'entrée et les sorties par bloc du rendu (\code{render_entry}, \code{render_exits}), l'environnement de sortie du rendu (\code{exit}, qui est aussi l'entrée de tout corps de hook) et les sorties par bloc des effets et des handlers (\code{effect_exits}, \code{handler_exits}). Sa méthode \code{env_at} choisit l'environnement d'un site :
+
+\rustsnippet[label={lst:relations-env-at}]{src/engine/written.rs}{248}{274}{l'environnement d'un site}
+
+Avec une position \code{at = (bloc, index)}, l'argument est évalué dans l'environnement d'\emph{entrée} du bloc (\code{entry_env_of} : jointure des sorties des prédécesseurs filtrées par arête, \cref{chap:cfg-analyzer-dominance}) rejoué à travers les instructions \emph{avant} l'appel. Le test \code{the_argument_is_read_in_the_env_before_the_call_not_after} (\file{tests/writer_columns.rs}) épingle la nuance : \code{let v = x; setX(v); v = { a: n };} n'est pas \code{Fresh}. Sans position (site imbriqué, différé, répété), on prend l'environnement de sortie de la région (jointure des blocs \code{Return}, \code{region_exit}), qui sur-approxime toute liaison capturée ; à défaut, la sortie du rendu. Les corps de memo et de callback ne gardent pas d'environnements par bloc.
+
+Deux remarques. \code{eval} (\src{src/engine/written.rs}{233}{246}) clone les trois stores à chaque appel : la relation ne perturbe jamais le résultat convergé, au prix de trois clones par ligne évaluée par valeur, coût non mesuré dans le dépôt. Et le gain de précision annoncé par \adr{42} §2 est réel : l'ancien collecteur des règles évaluait tout dans l'environnement de sortie du rendu, où un \code{const next = {...}} local à l'effet est inconnu et lit \code{Maybe} ; le moteur a l'environnement de bloc (test \code{an_effect_local_allocation_is_a_fresh_write}). Ce que l'ADR annonce pour un site imbriqué (\og ⊤ for a nested class with no env\fg{}) et pour \code{value} (\og the reference part\fg{}) est en revanche dépassé : le code stocke la valeur entière et évalue dans l'environnement de sortie de la région ; c'est le churn qui projette sur la partie référence, et seulement pour la \emph{propre} écriture d'un site (\code{reference_part}, \src{src/engine/written.rs}{207}{209}).
+
+% ---------------------------------------------------------------------------
+\section{La relation \relation{effect_triggers} : identité, pas dépendance}
+\label{sec:relations-triggers}
+Un effet se ré-exécute quand l'un de ses deps change au sens de \code{Object.is}. Pour savoir si une écriture dans un slot \emph{relance} un effet, il faut donc savoir si un dep de l'effet \emph{est} ce slot, ou seulement en dépend. C'est la relation \relation{effect_triggers} (\file{src/engine/triggers.rs}).
+
+\rustsnippet[label={lst:relations-trigger}]{src/engine/triggers.rs}{33}{44}{une ligne de \relation{effect_triggers}}
+
+Le calcul, \code{collect_effect_triggers} (\src{src/engine/triggers.rs}{50}{102}), examine chaque dep de chaque \code{HookEntry::Effect}. Une ligne par (effet, index de dep, slot qualifié) ; aucune pour un effet sans liste de deps ni pour \code{[]}. Un dep qui est \code{StateVal(l)} ou un alias résolu donne une ligne \code{exact = true} : l'effet \emph{doit} se ré-exécuter quand une valeur fraîche est stockée dans le slot (must). Sinon, la valeur convergée du dep (lue dans le memo store pour un memo ou un callback, parce que sa valeur d'environnement est liée avant le recalcul du store et lirait un ⊤ périmé) est examinée : si sa référence est \code{Versioned(labels)}, une ligne \code{exact = false} par label (may). Un slot d'un \emph{parent} peut apparaître, quand le dep est une prop que le parent a calculée depuis son propre état (test \code{a_prop_dep_is_versioned_by_the_parent_slot_that_feeds_it}, \file{tests/effect_triggers.rs}).
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}lp{7.6cm}p{3.4cm}@{}}
+\toprule
+Colonne & Affirmation & Polarité \\
+\midrule
+\code{hook} & l'effet & exact \\
+\code{dep} & indice dans la liste des deps & exact \\
+\code{slot} & \code{(composant, label)} ; le slot d'un parent quand le dep est une prop qu'il a calculée & exact \\
+\code{exact} & \code{true} : le dep \emph{est} la valeur du slot, une valeur fraîche relance l'effet ; \code{false} : le dep est versionné par le slot, l'effet \emph{peut} se relancer & must si \code{true}, may si \code{false} \\
+\bottomrule
+\end{tabular}
+\caption{Les colonnes de \relation{effect_triggers} (\file{docs/relations.md}).}
+\label{tab:relations-triggers-colonnes}
+\end{table}
+
+\begin{exemple}{Deux triggers exacts, deux arêtes must}{relations-triggers-two}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/relprobe/ex4.tsx}},label={lst:relations-triggers-two}]
+import { useState, useEffect } from 'react';
+export function C() {
+  const [a, setA] = useState({ n: 0 });
+  const [b, setB] = useState({ n: 0 });
+  useEffect(() => { setB({ from: a.n }); }, [a]);
+  useEffect(() => { setA({ from: b.n }); }, [b]);
+  return <div>{a.n + b.n}</div>;
+}
+\end{lstlisting}
+\begin{sortie}
+-- slot_writers
+  slot=0 setter=setA line=Some(6) region=Effect(3) phase=Effect via=Direct block=Some(0) guard_block=Some(0) fresh=Fresh value.ref=PerRender
+  slot=1 setter=setB line=Some(5) region=Effect(2) phase=Effect via=Direct block=Some(0) guard_block=Some(0) fresh=Fresh value.ref=PerRender
+-- effect_triggers
+  hook=2 dep=0 slot=(C, 0) exact=true
+  hook=3 dep=0 slot=(C, 1) exact=true
+=== churn graph
+  edge#0 (C, 0) -> (C, 1) strength=Must carrier=C effect=2 line=Some(5)
+  edge#1 (C, 1) -> (C, 0) strength=Must carrier=C effect=3 line=Some(6)
+  cycle edges=[0, 1] all_must=true cross_component=false
+\end{sortie}
+Les deux deps \emph{sont} les slots (\code{exact = true}) ; les deux écritures stockent un littéral objet (\code{fresh = Fresh}) dans un bloc qui domine la sortie de son effet. Le graphe de churn (\cref{chap:churn}) en tire deux arêtes \code{Must} et un cycle \code{all_must} d'un seul composant : \code{must_effect_cycle} frappe le jeton et \regle{infinite-loop} émet une \Error{} pour chaque effet (extrait de la sortie \code{--trace}) :
+\begin{sortie}
+    error  infinite-loop  [hook:2]  (line 5:2)  these effects form a state-update cycle (`a` → `b` → `a`) where each step stores a fresh reference that re-runs the next effect: infinite render loop
+       → a fresh value is written to state `b` here [hook:2] (line 5:20)
+       → cycle continues: this effect freshly stores state `a` [hook:3] (line 6:20)
+\end{sortie}
+La seconde \Error{}, ancrée sur \code{[hook:3]}, est symétrique. Les deux \Warning{} \regle{derived-state} que la ligne de commande ajoute relèvent d'une autre règle (\cref{chap:regles-etat}). Sur l'\cref{ex:relations-loader}, au contraire, la relation est vide : le seul dep est une prop, et ce composant est une racine (props ⊤).
+\end{exemple}
+
+\begin{decision}[ADR-42 §3, identité et non dépendance]
+La relation n'est \emph{pas} unifiée avec \code{render_deps::Deps} (\cref{chap:inter-composants}). Celle-ci répond à la \emph{dépendance} (\code{count + 1} découle de \code{count}) ; celle-là à l'\emph{identité} (le dep \emph{est} \code{count}), et c'est l'identité que réclame une affirmation must-rerun. Les deux restent séparées. La sémantique est celle de l'ancien \code{classify_effect_deps} des règles, inchangée, mais calculée une fois. Notons qu'\adr{42} §3 annonce \og one row per \code{(hook, qualified slot)}\fg{} : le code et \file{docs/relations.md} ont une ligne par \code{(effet, index de dep, slot)}.
+\end{decision}
+
+% ---------------------------------------------------------------------------
+\section{La relation \relation{slot_seeds}}
+\label{sec:relations-seeds}
+\code{useState(props.value)} lit son initialiseur au premier rendu seulement. Si la prop change ensuite, le slot garde la valeur de montage : c'est le défaut que \regle{frozen-initial-state} (\cref{chap:regles-etat}) signale. La relation \relation{slot_seeds} (\file{src/engine/seeds.rs}) répond à deux questions par slot : \emph{de quels chemins de props l'initialiseur lit-il ?} et \emph{quelque chose re-synchronise-t-il visiblement le slot quand la prop bouge ?}
+
+\begin{exemple}{\code{NoneSeen} contre \code{Synced}}{relations-mirror}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/relprobe/ex3.tsx}},label={lst:relations-mirror}]
+import { useState, useEffect } from 'react';
+export function Mirror({ value, other }: { value: string; other: string }) {
+  const [local, setLocal] = useState(value);
+  const [label, setLabel] = useState(other);
+  useEffect(() => { setLabel(other); }, [other]);
+  return <div>{local}{label}</div>;
+}
+\end{lstlisting}
+\begin{sortie}
+-- slot_writers
+  slot=1 setter=setLabel line=Some(5) region=Effect(2) phase=Effect block=Some(0) fresh=Maybe
+-- slot_seeds
+  slot=0 path=value normalized=["__p0.value"] sync=NoneSeen setter_escapes=false
+  slot=1 path=other normalized=["__p0.other"] sync=Synced   setter_escapes=false
+\end{sortie}
+\code{value} est lu par l'initialiseur de \code{local} à travers le préambule de destructuration (\code{let value = __p0.value}), normalisé exactement en \code{__p0.value} ; aucune écriture ne le re-synchronise : \code{NoneSeen}. \code{label} a une ligne d'effet de phase \code{Effect} dont les deps \code{[other]} couvrent exactement \code{__p0.other} : \code{Synced}. La ligne de commande (\code{--info}) affiche \code{info frozen-initial-state [hook:0] var:value (line 3:8) state `local` is seeded from `value` and never re-synced}. \Info{} et non \Warning{} : ce n'est pas la relation qui décide de la sévérité mais les strates de la règle native (\adr{31} §5) ; ici \code{setLocal} n'est jamais référencé, et la règle lit un instantané délibéré au montage (\src{src/rules/impls/frozen_initial_state.rs}{241}{247}).
+\end{exemple}
+
+\rustsnippet[label={lst:relations-seed}]{src/engine/seeds.rs}{35}{78}{\code{SeedSync} et la ligne \code{SlotSeed}}
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}lp{7.0cm}p{4.0cm}@{}}
+\toprule
+Colonne & Affirmation & Polarité \\
+\midrule
+\code{slot} & le slot ensemencé & exact \\
+\code{path} & le chemin tel qu'il est écrit au site de la graine & exact \\
+\code{normalized} & les formes enracinées au paramètre props que la graine \emph{peut} désigner & may-ensemble \\
+\code{sync} & \code{Synced} : une écriture au rendu, ou d'effet relancé quand la prop bouge, a été vue ; \code{NoneSeen} : aucune & \code{Synced} may ; \code{NoneSeen} est une absence \\
+\code{setter_escapes} & un alias du setter est allé là où la marche ne suit pas & may \\
+\bottomrule
+\end{tabular}
+\caption{Les colonnes de \relation{slot_seeds} (\file{docs/relations.md}).}
+\label{tab:relations-seeds-colonnes}
+\end{table}
+
+Trois colonnes portent une polarité explicite (\cref{tab:relations-seeds-colonnes}). \code{normalized} est un \emph{may-ensemble} : là où la poursuite n'a pas pu sélectionner à travers une liaison, elle s'est élargie à tous les chemins lus, et une forme présente est une forme que la graine \emph{peut} désigner. \code{sync} est may dans une seule direction : \code{Synced} est une affirmation faite depuis une écriture vue, \code{NoneSeen} une absence. \code{setter_escapes} est une colonne \emph{séparée}, non repliée dans \code{sync}, parce qu'elle répond à une autre question : non pas \og y a-t-il une sync\fg{} mais \og pourrait-il y en avoir une que nous ne voyons pas\fg{} ; c'est la porte \code{!escaped} de \code{must_frozen_seed} (\src{src/rules/api/query.rs}{904}{916}).
+
+\subsection{Le pli}
+
+\rustsnippet[label={lst:relations-seeds-fold}]{src/engine/seeds.rs}{108}{170}{les deux kills de slot et la couverture par graine}
+
+Le pli est \emph{syntaxique à dessein} (\adr{20} item 3, doc de module) : il ne lit aucune valeur abstraite, il répond \og une écriture se ré-exécute-t-elle quand cette prop bouge\fg{}, non \og produit-elle la bonne valeur\fg{} (question de \regle{derived-state}). Il se déroule ainsi :
+\begin{enumerate}
+  \item pour chaque \code{HookEntry::State}, \code{seed_paths(init, param, bindings)} donne les chemins lus par l'initialiseur, normalisés vers le paramètre props (\code{__p0}) ; un chemin qui ne se normalise pas n'est pas une graine ;
+  \item deux kills au niveau du slot, lus sur les lignes \emph{locales} de \relation{slot_writers} : une écriture de \textbf{phase} \code{Render}, ou un effet \emph{sans deps} (\code{DepsArg::Absent}) qui écrit le slot ;
+  \item la moitié effet : région \code{Effect(l)} \emph{et} phase dans \code{effect_triggered} (\src{src/engine/seeds.rs}{192}{197} : \code{Effect}, \code{Deferred}, \code{Cleanup}) ; un callback simplement \emph{confié} à un callee opaque (\code{manager.subscribe(setColor)}, phase ⊤) ne prouve pas de sync (\issue{121}) ;
+  \item par graine, la couverture par les deps déclarés (\code{deps_cover_seed}, \src{src/engine/seeds.rs}{356}{383}) : un test syntaxique direct du chemin tel qu'écrit, puis la comparaison des formes normalisées, en ne créditant que les normalisations \emph{exactes} des deux côtés ; \code{DepsArg::Opaque} ne couvre rien, \code{DepsArg::Absent} couvre tout ;
+  \item \code{setter_escapes} (\src{src/engine/setters.rs}{2271}{2334}) : un alias du setter apparaît ailleurs qu'en position de callee direct ou d'alias pur (argument d'appel, champ d'objet, prop JSX, capture, écriture de membre).
+\end{enumerate}
+
+\begin{decision}[ADR-31 §3 et ADR-33, phase et exactitude]
+Le kill de rendu lit la \textbf{phase}, pas la région : un callback littéral écrit au rendu (\code{useCallback(() => setValue(x), ...)}) est de région \code{Render} mais de phase ⊤, et supprimer un finding sur ⊤ est \og the false negative this project does not trade\fg{}. La première migration lisait la région et a fait perdre un \Warning{} réel (\code{use-provider-color-scheme} de mantine) ; la décision ne repose pas sur cette mesure, faite sous le flottement de \issue{120}, mais sur le principe. \adr{33} ajoute deux choses à la poursuite des liaisons : le garde-cycle \code{seen} est \emph{cloné par branche} (le partager tuait toutes les branches sœurs sauf la première, dans l'ordre d'un \code{HashSet}) ; un littéral objet est \emph{sélectionné} (\code{{ a: x }.a} est \code{x}, exact) et non élargi ; et le bit \code{exact} interdit qu'une forme élargie soutienne l'affirmation must de couverture. Sans §3, restaurer les branches sœurs seules aurait élargi le côté déclaré et supprimé davantage : la direction interdite.
+\end{decision}
+
+\begin{exemple}{Sélection à travers un littéral objet, setter échappé}{relations-seed-literal}
+Sur \file{/tmp/verif07/e14.tsx} (\code{const cfg = { x: props.a }; useState(cfg.x)} ; \code{useState(props.b ?? 'd')} ; \code{useState(props.c)} dont le setter est passé en prop à \code{Child}) :
+\begin{sortie}
+  slot=0 path=cfg.x   normalized=["props.a"] sync=Synced   setter_escapes=false
+  slot=2 path=props.c normalized=["props.c"] sync=NoneSeen setter_escapes=true
+\end{sortie}
+\code{cfg.x} est poursuivi jusqu'à \code{{ x: props.a }}, sélectionné et exact ; les deps \code{[props.a]} couvrent : \code{Synced}. \code{s3} n'a aucune écriture vue et son setter s'échappe : \code{NoneSeen}, \code{setter_escapes = true}, et la règle native reste à \Warning{} (\code{warn frozen-initial-state [hook:2] var:props.c (line 6:8)}). Le slot 1 (\code{props.b ?? 'd'}) n'a \emph{aucune ligne}. Le lowering traite \code{??} comme \code{||} (\srcline{src/lowering/expr_lower.rs}{754}) : \code{Let __tN = props.b}, un \code{Branch} sur \code{__tN}, puis \code{Assign __tN = 'd'} dans la branche fausse. L'initialiseur lit donc \code{__tN}, un nom à \emph{deux} membres droits dans \code{local_bindings} (\src{src/ir/bindings.rs}{37}{47}), et \code{normalize_to_prop} refuse de le poursuivre (\og a multi-write binding is uncertain and not chased\fg{}).
+\end{exemple}
+
+\begin{remarque}
+Ce refus contredit le commentaire de la même fonction, qui promet le cas \code{const v = props.a ?? d} (\src{src/engine/seeds.rs}{247}{248}). Sur \file{/tmp/ch14/nullish.tsx}, trois enfants reçoivent une prop tirée d'un état du parent : \code{useState(props.b)} donne une ligne \code{NoneSeen} et \code{warn frozen-initial-state [hook:0] var:props.b (line 12:8)} ; \code{useState(props.b ?? 'd')} et \code{const v = props.a ?? 'd'; useState(v)} ne donnent ni ligne ni diagnostic. Au commit \snapshotCommit, c'est un faux négatif de niveau \Warning{} qui ne figure pas dans le tracker (l'issue \issue{25} liste d'autres résidus de \regle{frozen-initial-state}).
+\end{remarque}
+
+% ---------------------------------------------------------------------------
+\section{La relation \relation{registrations} et l'appariement}
+\label{sec:relations-registrations}
+Un corps d'effet qui appelle \code{setInterval}, \code{addEventListener} ou \code{store.subscribe} confie un callback à quelque chose qui survit à l'effet. Deux règles natives (\cref{chap:regles-effets}) posent des questions sur ces appels : \regle{stale-closure} (\og que capture le callback ?\fg{}) et \regle{missing-cleanup} (\og l'enregistrement est-il un jour défait ?\fg{}). La relation \relation{registrations} (\file{src/engine/registrations.rs}) est leur lecture commune, calculée une fois sur les \emph{corps d'effets seulement} (doc de module, \src{src/engine/registrations.rs}{15}{17}).
+
+\begin{exemple}{Quatre enregistrements, trois formes de teardown}{relations-regs}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch14/regs.tsx}},label={lst:relations-regs}]
+import { useState, useEffect } from 'react';
+declare const store: { subscribe(cb: () => void): () => void };
+export function Regs() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setN(v => v + 1), 1000);
+    const u = store.subscribe(() => setN(0));
+    const h = () => setN(1);
+    window.addEventListener('resize', h);
+    window.addEventListener('scroll', () => setN(2), { once: true });
+    return () => {
+      clearInterval(id);
+      u();
+      window.removeEventListener('resize', () => setN(1));
+    };
+  }, []);
+  return <div>{n}</div>;
+}
+\end{lstlisting}
+\begin{sortie}
+-- slot_writers
+  slot=0 setter=setN line=Some(9) region=Effect(1)  phase=Handler  updater=Unknown    block=None    guard_block=Some(0)
+  slot=0 setter=setN line=Some(6) region=Effect(1)  phase=Deferred updater=Functional block=None    guard_block=Some(0)
+  slot=0 setter=setN line=Some(7) region=Effect(1)  phase=Unknown  updater=Unknown    block=None    guard_block=Some(0)
+  slot=0 setter=setN line=None    region=Handler(2) phase=Handler  updater=Unknown    block=Some(0) guard_block=Some(0)
+-- registrations
+  effect=1 display=setInterval             registrar=setInterval      firing=Repeating timing=Deferred handle=Some("id") self_removing=false pairing=Paired   event=None
+  effect=1 display=store.subscribe         registrar=subscribe        firing=Repeating timing=Unknown  handle=Some("u")  self_removing=false pairing=Paired   event=None
+  effect=1 display=window.addEventListener registrar=addEventListener firing=Repeating timing=Handler  handle=None       self_removing=false pairing=Unpaired event=Some("resize")
+  effect=1 display=window.addEventListener registrar=addEventListener firing=Repeating timing=Handler  handle=None       self_removing=true  pairing=Paired   event=Some("scroll")
+\end{sortie}
+Côté écritures : le callback de \code{subscribe} est de phase \code{Unknown} (contrat inconnu) ; le listener \code{h} passé par nom (bras B5) est \code{Handler} ; le listener littéral de \code{'scroll'}, de premier niveau, a été réifié en \code{Handler(2)} ; et le \code{setN(1)} du cleanup ne produit \emph{aucune} ligne, parce qu'il est l'argument d'un teardown, jamais descendu. Côté enregistrements : \code{setInterval} est \code{Paired} par le handle \code{id} ; \code{subscribe} par le disposer \code{u()} ; \code{'scroll'} par \code{{ once: true }} ; et \code{'resize'} est \code{Unpaired}, parce que le cleanup retire un \emph{autre} listener que \code{h}. La ligne de commande n'affiche pourtant rien pour ce fichier : \regle{missing-cleanup} ne lit pas \code{pairing}, elle ne tire que sur un effet qui ne retourne \emph{aucun} cleanup (\code{cleanup_verdict(body_cfg) != CleanupVerdict::Absent} ⇒ \code{continue}, \src{src/rules/impls/missing_cleanup.rs}{63}{65}) ; la colonne \code{pairing} est le sujet de l'ancre Tier-A \code{registrations} (\adr{34} §7, \cref{chap:regles-declaratives}).
+\end{exemple}
+
+La ligne \code{Registration} (\src{src/engine/registrations.rs}{239}{269}) est décrite colonne par colonne dans le \cref{tab:relations-registrations-colonnes}. \code{registrar} est la clé stable de la table ; \code{callback} est l'expression confiée (un clone de \code{FnLit} ne copie qu'un \code{Arc}) ; \code{handle} est la liaison du \emph{retour} de l'appel, celle que \code{clearInterval(id)} ou le disposer \code{u()} reprendront ; \code{event} est le nom littéral d'événement d'un \code{addEventListener}.
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}p{3.9cm}p{6.2cm}p{3.6cm}@{}}
+\toprule
+Colonne & Affirmation & Polarité \\
+\midrule
+\code{effect}, \code{span}, \code{display}, \code{registrar}, \code{callback}, \code{handle}, \code{event} & l'appel tel qu'il est écrit et la ligne de table qu'il a appariée & exact \\
+\code{firing} & le registrar appelle le callback \code{Once} ou \code{Repeating} & exact (axiome de la table) \\
+\code{timing} & le callback tourne \code{Deferred}, en \code{Handler}, ou \code{Unknown} & may, ⊤-bearing \\
+\code{self_removing} & l'enregistrement se retire lui-même après un dispatch & exact \\
+\code{block_id} & bloc de premier niveau du corps d'effet ; \code{None} si imbriqué & exact \\
+\code{pairing} & \code{Paired} : le cleanup défait cet enregistrement ; \code{Unpaired} : prouvablement non ; \code{Unknown} & must pour \code{Paired} ; \code{Unpaired} affirmé sur les seules formes reconnues ; ⊤-bearing \\
+\bottomrule
+\end{tabular}
+\caption{Les colonnes de \relation{registrations} (\file{docs/relations.md}).}
+\label{tab:relations-registrations-colonnes}
+\end{table}
+
+Deux détails de \code{collect_registrations} (\src{src/engine/registrations.rs}{322}{346}) : la table des helpers d'un effet est complétée par les liaisons de fonctions du \emph{rendu} (un helper défini au rendu et appelé dans l'effet est balayé, B6) ; et le \code{handle} est lié pour un \code{Let} \emph{ou un \code{Assign}} au-dessus de l'appel (\srcline{src/engine/registrations.rs}{606}). Le balayage (\code{scan_cfg}, \src{src/engine/registrations.rs}{589}{683}) va à profondeur 2 ; un callback \code{FnLit} est balayé avec \code{block_id = None} (\og never must-reached\fg{}) ; l'ordre des lignes suit \code{cfg.blocks}, donc est déterministe.
+
+\subsection{L'appariement, un fait à trois valeurs}
+
+\rustsnippet[label={lst:relations-pairing}]{src/engine/registrations.rs}{218}{236}{\code{Pairing} : seul \code{Paired} est une affirmation}
+
+\code{cleanup_bodies} (\src{src/engine/registrations.rs}{360}{385}) lit les \code{Return} du corps d'effet : \code{return () => ...} ou \code{return nom} lié à un littéral unique (\code{fn_binding_in}) donnent des corps lisibles ; aucun retour non-\code{undefined} donne \code{None} ; un \emph{seul} retour illisible rend le tout \code{Opaque}, même si d'autres sont lisibles (\code{(_, true) => Cleanups::Opaque}).
+
+L'appariement lui-même, \code{pair} (\src{src/engine/registrations.rs}{393}{455}), est un arbre de décision que la \cref{fig:relations-pair} reproduit.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=3mm and 6mm,every node/.style={font=\scriptsize}]
+  \node[bloc] (t) {\code{teardown} vide ?};
+  \node[bloc,below=of t] (s) {\code{self_removing} ?};
+  \node[bloc,below=of s] (c) {cleanups ?};
+  \node[bloc,below=of c] (h) {handle lié et \code{teardown(handle)} ou \code{handle()} ?};
+  \node[bloc,below=of h] (l) {\code{Listener} et \code{teardown(t, l)}, même liaison \code{l} ?};
+  \node[bloc,below=of l] (cmp) {comparable ? (handle lié, ou listener nommé)};
+  \node[bloc,right=18mm of t,draw=ra-red] (u1) {\code{Unpaired}};
+  \node[bloc,right=18mm of s,draw=ra-teal] (p1) {\code{Paired}};
+  \node[bloc,right=18mm of c,draw=ra-red] (u2) {\code{None} → \code{Unpaired}};
+  \node[bloc,right=2mm of u2,draw=ra-gray] (k2) {\code{Opaque} → \code{Unknown}};
+  \node[bloc,right=18mm of h,draw=ra-teal] (p2) {\code{Paired}};
+  \node[bloc,right=18mm of l,draw=ra-teal] (p3) {\code{Paired}};
+  \node[bloc,right=18mm of cmp,draw=ra-red] (u3) {oui → \code{Unpaired}};
+  \node[bloc,right=2mm of u3,draw=ra-gray] (k3) {non → \code{Unknown}};
+  \draw[fleche] (t) -- node[etiquette,above] {oui} (u1);
+  \draw[fleche] (t) -- node[etiquette,left] {non} (s);
+  \draw[fleche] (s) -- node[etiquette,above] {oui} (p1);
+  \draw[fleche] (s) -- node[etiquette,left] {non} (c);
+  \draw[fleche] (c) -- (u2);
+  \draw[fleche] (c) -- node[etiquette,left] {\code{Bodies}} (h);
+  \draw[fleche] (h) -- node[etiquette,above] {oui} (p2);
+  \draw[fleche] (h) -- node[etiquette,left] {non} (l);
+  \draw[fleche] (l) -- node[etiquette,above] {oui} (p3);
+  \draw[fleche] (l) -- node[etiquette,left] {non} (cmp);
+  \draw[fleche] (cmp) -- (u3);
+\end{tikzpicture}
+\caption{L'arbre de décision de \code{pair} (\src{src/engine/registrations.rs}{393}{455}). L'absence de cleanup est tranchée \emph{avant} toute comparaison : \og it is the one case where the absence is total\fg{}. Les disposers reconnus forment un ensemble fermé, \code{DISPOSERS} (\src{src/engine/registrations.rs}{478}{490}).}
+\label{fig:relations-pair}
+\end{figure}
+
+\begin{decision}[ADR-34 §3 et §5, la liaison est le fait, le nom ne l'est pas]
+Apparier sur le seul nom de teardown certifierait exactement le bug que \code{subscribe-with-fresh-listener} existe pour attraper : un cleanup qui retire un \emph{autre} listener. Le listener doit être la même \emph{liaison}. L'amendement \issue{124} a ajouté deux formes, après trois faux positifs mesurés sur le corpus dans les heures qui ont suivi la livraison : la forme \emph{handle} (\code{clearInterval(id)} prend ce que l'enregistrement a \emph{retourné}, une comparaison de listener ne peut jamais réussir) et la forme \emph{disposer} (\code{const u = s.subscribe(f); return () => u()}), disponible pour tout registrar qui retourne quelque chose. \code{Paired} étant le verdict qui \emph{supprime}, la forme disposer est un ensemble fermé de noms de méthodes (\code{unsubscribe}, \code{dispose}, \code{cancel}, \code{close}, \code{destroy}, \code{remove}, \code{off}, \code{abort}) : \code{s.emit('bye')} n'est pas un teardown. Le troisième argument booléen d'\code{addEventListener} est \code{capture}, pas \code{once}, et ne compte pas (\src{src/engine/registrations.rs}{571}{580}). Enfin (§5), un teardown n'est jamais descendu par la marche : le descendre donnait à chaque listener enregistré une \emph{seconde} ligne ⊤, produite par le cleanup même qui le retire, et une ligne ⊤ satisfait \code{writer_phases includes <anything>}.
+\end{decision}
+
+% ---------------------------------------------------------------------------
+\section{Deux canaux de plus : \relation{slot_reads} et \relation{body_calls}}
+\label{sec:relations-reads-calls}
+Deux relations de plus sortent de la même marche, sans être stockées : elles sont collectées à la demande par les règles ou les packs qui les lisent. La motivation est celle d'\adr{36} §1 : la marche répond déjà à la partie difficile (la classe d'un site, la greffe d'un helper ou d'une IIFE au site, la frontière \code{await}, le cleanup) ; \og a second traversal would re-derive all of it and drift\fg{}.
+
+\rustsnippet[label={lst:relations-bodycall-slotread}]{src/engine/setters.rs}{2017}{2051}{\code{BodyCall} et \code{SlotRead}}
+
+\code{Found} porte trois vecteurs, \code{setters}, \code{calls} et \code{reads} (\src{src/engine/setters.rs}{1366}{1371}), activés respectivement toujours, par \code{collect_calls} et par \code{read_vars} non vide. \code{Found::absorb} (\src{src/engine/setters.rs}{1373}{1408}) sert les trois canaux par construction : une ligne qu'une marche interne (B6, IIFE) a classée \code{Sync} prend la classe du site, une ligne différée ou imbriquée garde la sienne.
+
+Une ligne de \relation{body_calls} est \code{(name, receiver, phase, span)} : le nom d'un appel nu ou la \emph{méthode} d'un appel de membre, et la racine du receveur ; \code{socket.join} et n'importe quel \code{.join} sont deux questions différentes et une règle doit dire laquelle elle pose. Les valeurs d'arguments restent en dehors (\adr{36} §2). Une ligne de \relation{slot_reads} est \code{(slot, name, region, phase, span)}, le miroir de \code{SlotWriter} avec les deux colonnes qui \emph{transfèrent} ; \code{setter} et \code{via} ne transfèrent pas, ce sont des faits de provenance d'une écriture (\adr{37} §1).
+
+\begin{invariant}{Ce que voient les canaux}{canaux}
+Une lecture ou un appel dans une fonction imbriquée n'est enregistré que quand la marche \emph{entre} dans cette fonction, jamais en traversant un \code{FnLit} de l'extérieur (où la classe serait ⊤ et la ligne un doublon). Une closure que rien n'appelle ne contribue donc aucune ligne ; \og nothing may read the absence of a row as a proof that the slot is unread\fg{} (\src{src/engine/setters.rs}{2052}{2061}). Dans \relation{slot_reads}, la phase fait partie de l'identité d'une ligne (\adr{37} §3) : un même corps atteint comme callback de timer et comme cleanup donne deux lignes, et déduplication sur \code{(slot, span, region, name)} perdait la seconde.
+\end{invariant}
+
+Une différence de réglage mérite d'être connue (\cref{tab:relations-entrees}) : \code{collect_slot_reads} et \code{collect_body_calls} n'ont pas de table d'ombrage (\code{shadowed} vide), si bien qu'un \code{setTimeout} lié localement y est lu comme le timer de l'hôte ; et pas de wrappers prouvés (\code{NO_WRAPPERS}), si bien qu'un callback confié à \code{form.handleSubmit} y est ⊤ et non \code{Handler}, ce qui est la direction sûre. Aucune règle native ne lit ces deux canaux ; ce sont les ancres et arêtes Tier-A \code{reads} et \code{calls} (\cref{chap:regles-declaratives}) qui les consomment, plafonnées structurellement à \Warning{} (\adr{36} §4).
+
+% ---------------------------------------------------------------------------
+\section{La preuve mono-site : une écriture qui éteint ses gardes}
+\label{sec:relations-preuve-mono-site}
+\subsection{Le problème : écrire pendant le rendu, une seule fois}
+
+Appeler un setter pendant le rendu est interdit en général : l'écriture planifie un re-rendu, qui réexécute l'écriture, qui planifie un re-rendu. React tolère une exception documentée, \og adjusting state when a prop changes\fg{} : une écriture \emph{sous une garde que l'écriture elle-même éteint}.
+
+\begin{exemple}{Deux écritures au rendu, une seule fautive}{relations-adjust}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch14/guarded.tsx}},label={lst:relations-adjust}]
+import { useState } from 'react';
+export function Adjust({ value }: { value: number }) {
+  const [prev, setPrev] = useState(value);
+  const [n, setN] = useState(0);
+  if (prev !== value) {
+    setPrev(value);
+  }
+  setN(1);
+  return <div>{prev}{n}</div>;
+}
+\end{lstlisting}
+\begin{sortie}
+  slot=0 setter=setPrev line=Some(6) region=Render phase=Render block=Some(1) guard_block=Some(1) fresh=Maybe
+  slot=1 setter=setN    line=Some(8) region=Render phase=Render block=Some(3) guard_block=Some(3) fresh=Not
+\end{sortie}
+\begin{sortie}
+  Adjust  (2 hooks)  /tmp/ch14/guarded.tsx
+    error  setter-in-render  [hook:1]  (line 8:2)  setter `setN` called directly in the render body, move this call into a useEffect or an event handler
+       → `setN` is a state setter, so calling it writes state (line 8:2)
+\end{sortie}
+\code{setN(1)} est synchrone, dans un bloc qui domine toutes les sorties : \Error{} certifiée. \code{setPrev(value)} est silencieuse : après l'écriture, \code{prev} vaut \code{value}, la garde \code{prev !== value} est fausse au rendu suivant, le composant converge en un rendu supplémentaire. Cette seconde conclusion est une \emph{preuve}, \code{converges_once_written} (\file{src/engine/guards.rs}).
+\end{exemple}
+
+\begin{react}[ajuster l'état pendant le rendu]
+La documentation de React admet \code{if (prev !== value) { setPrev(value); setSelection(null); }} dans le corps d'un composant : React réexécute immédiatement le composant avec le nouvel état, avant de rendre les enfants, et la garde étant devenue fausse, l'écriture ne se reproduit pas. La condition de validité est exactement celle de la preuve : la garde doit \emph{mourir} sous l'écriture. \code{if (prev !== value) setPrev(value + 1)} bouclerait.
+\end{react}
+
+\subsection{Les gardes d'un site}
+
+\rustsnippet[label={lst:relations-guard-chain}]{src/engine/guards.rs}{655}{669}{la chaîne à prédécesseur unique}
+
+\rustsnippet[label={lst:relations-site-guards}]{src/engine/guards.rs}{671}{699}{les conjoints d'un site, dépliés}
+
+\code{guard_chain} remonte depuis le bloc de l'appel tant que le bloc courant a \emph{un seul} prédécesseur, et s'arrête au premier point de jonction ou à l'entrée. C'est une sous-approximation des dominateurs (\cref{def:dominance}) : on collecte \emph{moins} de gardes qu'il n'en domine réellement, donc on prouve moins de convergences, direction sûre. \code{site_guards} lit, pour chaque paire de la chaîne, la condition du \code{Branch} du prédécesseur et la polarité de l'arête (\code{IfTrue} → \code{(cond, true)}, \code{IfFalse} → \code{(cond, false)}), puis déplie chaque garde par \code{expand_guard} (profondeur 4).
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=4mm and 10mm]
+  \node[cfgbloc,text width=38mm] (b0) {bloc 0 (entrée)\\Let prev = StateVal(0) ...\\term Branch(prev !== value)};
+  \node[cfgbloc,text width=34mm,below left=of b0,fill=ra-bg] (b1) {bloc 1\\ExprStmt(setPrev(value))\\term Jump(3)};
+  \node[cfgbloc,text width=30mm,below right=of b0] (b2) {bloc 2 (branche fausse)\\term Jump(3)};
+  \node[cfgbloc,text width=34mm,below=18mm of b0] (b3) {bloc 3 (jonction)\\ExprStmt(setN(1))\\term Return(...)};
+  \draw[flechemust] (b0) -- node[etiquette,above left] {IfTrue} (b1);
+  \draw[fleche] (b0) -- node[etiquette,above right] {IfFalse} (b2);
+  \draw[fleche] (b1) -- (b3);
+  \draw[fleche] (b2) -- (b3);
+  \node[etiquette,text width=120mm,align=left,below=3mm of b3] (lab) {\code{guard_chain(cfg, 1) = [1, 0]}, \code{site_guards = [(prev !== value, true)]} ;\\\code{guard_chain(cfg, 3) = [3]} : le bloc 3 a deux prédécesseurs, la chaîne s'arrête ; \code{site_guards = []}, la preuve répond \code{false}.};
+\end{tikzpicture}
+\caption{Les chaînes de gardes des deux sites de l'\cref{ex:relations-adjust} (numéros de blocs de la sonde). Le site de \code{setN} n'a aucune garde : rien ne peut mourir, \code{converges_once_written} rend \code{false} et la règle passe à la dominance de sortie.}
+\label{fig:relations-guard-chain}
+\end{figure}
+
+Le lowering abaisse \code{a || b} et \code{a && b} en un temporaire \code{__tN} branché directement (\cref{chap:lowering-cfg}, diamant conservé par \adr{20} item 1) ; rétrécir \code{__tN} seul ne prouve rien sur le slot lu dans un opérande. \code{expand_guard} (\src{src/engine/guards.rs}{953}{1039}) reconnaît le diamant (exactement un \code{Let} et un \code{Assign} du temporaire, le \code{Let} dans un bloc qui branche dessus, l'\code{Assign} dans un successeur direct) et déplie les deux polarités conjonctives : \code{t = a || b} pris FAUX ⇒ \code{a} faux ∧ \code{b} faux ; \code{t = a && b} pris VRAI ⇒ \code{a} vrai ∧ \code{b} vrai ; \code{!e} inverse ; \code{??} est abaissé comme \code{||}. Les polarités disjonctives passent telles quelles. Un \code{if (!b)} simple, lui, n'a pas de temporaire : sa garde est \code{(UnaryOp Not b, true)}, réécrite en \code{(Var b, false)}.
+
+\subsection{Trois arguments de mort}
+
+\rustsnippet[label={lst:relations-dead-once-written}]{src/engine/guards.rs}{714}{780}{les trois bras, sur des gardes conjonctives}
+
+Les gardes sont \emph{conjonctives} : il suffit qu'une seule meure pour que le site ne puisse plus tirer, d'où le \code{return true} dès qu'un bras réussit. L'environnement de départ est celui du corps (ré-lié : chaque alias du slot reçoit la valeur écrite) ; \code{shadowed} n'intervient que pour la preuve multi-site sous l'environnement du rendu (\issue{162}), \code{converges_once_written} passe \code{None}.
+
+\begin{enumerate}
+  \item \textbf{Le bras valeur.} On applique le narrowing de branche du moteur (\code{narrow_env_for_branch}, \src{src/engine/cfg_analyzer.rs}{201}{294}) à l'environnement ré-lié ; si la variable gardée devient ⊥, la branche est morte. Sa portée est précise : il ne raffine que \code{Var(x)} (vérité), \code{!Var(x)}, et \code{Var(x) OP} littéral où le littéral est un nombre, \code{null} ou \code{undefined}. Toute autre forme laisse l'environnement inchangé, et ce bras ne prouve rien.
+  \item \textbf{Le bras relationnel} (\code{write_settles_comparison}, \src{src/engine/guards.rs}{782}{835}) : la garde compare le slot à \emph{l'expression même} que l'écriture y stocke ; après l'écriture les deux côtés sont la même valeur, donc \code{<}, \code{>}, \code{!=}, \code{!==} sont faux et \code{==}, \code{===}, \code{<=}, \code{>=} vrais. \og An interval domain cannot say that --- \code{x < y} after \code{x := y} needs the two to be related, not bounded --- but the spellings can.\fg{} L'égalité d'orthographe passe par \code{call_free_key}, qui refuse les appels (\og a call may not return the same thing twice\fg{}), et le bras est refusé si l'un des côtés est une \emph{orthographe fraîche} (\code{fresh_spelling}, \src{src/engine/guards.rs}{837}{842} : littéral objet, tableau, fonction, élément, \code{new}, nom lié à l'un d'eux, ou valeur convergée \code{PerRender} ; \issue{156}, \issue{158}), puisqu'une allocation dénote une nouvelle référence à chaque exécution.
+  \item \textbf{Le bras membre} (\code{write_settles_member_truth}, \src{src/engine/guards.rs}{908}{937}) : la garde teste un \emph{membre} du slot, et l'écriture place à ce membre un \emph{littéral} qui contredit la garde. Le slot étant une seule valeur abstraite, le narrowing sur le slot entier ne peut pas le voir (\issue{90}).
+\end{enumerate}
+
+\begin{exemple}{Un exemple par bras}{relations-three-arms}
+\emph{Valeur} : \code{if (u === null) setU({ id: 1 })} (\file{/tmp/ch14/value_arm.tsx}). L'écriture stocke \code{PerRender} non-null ; \code{u} ré-lié, la garde \code{u === null} prise vraie rétrécit \code{u} à ⊥. Aucun diagnostic. \emph{Relationnel} : l'\cref{ex:relations-adjust}, \code{prev !== value} contre \code{setPrev(value)}. \emph{Membre} : \code{if (!id && sheet.leadId) setSheet({ leadId: null, open: false })} (\file{/tmp/ch14/member_arm.tsx}) : la garde \code{sheet.leadId} prise vraie est contredite par le littéral \code{null} placé à \code{leadId}. Aucun diagnostic non plus. Contre-exemple : \code{if (u === null && user) setU(user)} avec \code{user} une prop (\file{/tmp/ch14/nullguard.tsx}) : \code{user} est ⊤ et peut être \code{null}, la garde survit, et l'analyseur émet \code{warn setter-in-render [hook:0] (line 5:4)}, un \Warning{} (conditionnel, pas de dominance) et non une \Error.
+\end{exemple}
+
+\subsection{La fonction et son appelant}
+
+\rustsnippet[label={lst:relations-converges-once}]{src/engine/guards.rs}{60}{89}{la preuve mono-site}
+
+Pas de garde ⇒ \code{false}. Sinon une seule \code{Rewrite} (la propre écriture du site, avec \code{scope = Some(cfg)} pour que le bras relationnel puisse lire les noms de l'argument dans le corps) et \code{dead_once_written}. Le seul appelant est \regle{setter-in-render} (\cref{chap:regles-etat} ; \src{src/rules/impls/setter_in_render.rs}{164}{183}) : la preuve n'est tentée que si aucune preuve d'\Error{} n'a été obtenue, le site vient de \code{collect_setter_calls} (forme \og une ligne par variable\fg{}), et la valeur écrite est évaluée par \code{eval_in_exit_env} dans l'environnement de sortie du rendu, non lue dans \code{written.value}.
+
+\begin{decision}[ADR-42 §6, tranche 4 : une fonction, pas une colonne]
+La question \og une écriture éteint-elle ses propres gardes ?\fg{} aurait pu devenir une colonne \code{settles} de \code{SlotWriter}. Elle reste une fonction sur les faits d'une ligne, parce que ses deux appelants lui donnent \emph{deux valeurs différentes} : le graphe de churn la partie référence d'une écriture d'effet (une exécution qui stocke \code{null} ne stocke pas de référence fraîche), \regle{setter-in-render} la valeur entière d'une écriture de rendu. Le \cref{chap:churn} montre la forme forte de la même preuve, \code{converges_under_all_writes}, où les gardes doivent mourir sous \emph{toutes} les écritures du slot qui s'exécutent dans la boucle.
+\end{decision}
+
+% ---------------------------------------------------------------------------
+\section{\code{ProgramRelations} et la frontière de certification}
+\label{sec:relations-frontiere}
+\subsection{Les relations programme-entier}
+
+\rustfile[label={lst:relations-program-relations}]{src/engine/program_relations.rs}{les relations programme-entier, paresseuses}
+
+Une relation qui est une propriété du \emph{programme} (le graphe de churn lit les écritures et les triggers de tous les composants pour trouver des cycles auxquels un composant seul ne fait que participer) n'a pas de tranche par composant. Elle vit ici : un champ \code{OnceLock} par relation, construit à la première demande, lié par sa durée de vie \code{'a} au programme dont il est issu (impossible de lire le graphe contre un autre résultat). Deux invariants tiennent en une phrase chacun : \og lazy stays lazy: a rule that is disabled must not pay for a graph it never reads\fg{}, et ajouter une relation programme signifie un champ de plus ici, jamais une reconstruction dans une règle. Le graphe était autrefois reconstruit par composant, ce qui rendait la phase des règles quadratique en nombre de composants (\issue{86} : dub et twenty ne finissaient pas) ; le test \code{churn_graph_is_built_once_per_program} (\src{src/rules/impls/infinite_loop.rs}{630}{684}) le garde par un compteur \code{BUILDS}.
+
+Côté règles, \code{ProgramCache} (\src{src/rules/api/cache.rs}{26}{31}) \emph{contient} un \code{ProgramRelations} et lui délègue \code{churn()}, à côté des trois structures programme-entier encore calculées dans \file{src/rules/helpers/} (\file{docs/relations.md}, section \og Still built by the rules layer\fg{}) : l'index de montage (\file{mount.rs}), l'arbre des éléments (\file{render_tree.rs}, sur \code{render_deps}) et la relation \relation{context_consumers} (\file{context_flow.rs}, \adr{32}). Cette dernière est le troisième exemple de relation programme projetée : une post-passe sur les résultats convergés qui, pour chaque site \code{useContext}, dit si un composant susceptible de le rendre fournit la cellule lue ; son verdict est une \emph{absence} (\og aucun provider sur aucun chemin\fg{}), et \adr{32} le protège par deux portes d'ascendance, parce qu'un composant que l'analyse n'a pas atteint est indistinguable d'une racine par \code{callers_of} seul (\src{src/rules/helpers/context_flow.rs}{10}{20}). Elle est construite paresseusement, \code{OnceLock<ContextConsumers>} (\srcline{src/rules/api/cache.rs}{29}), exactement comme le graphe de churn, et n'attend qu'un lecteur moteur pour descendre d'une couche. \code{ProgramCache} est construit une fois par le driver. \adr{42} §5 annonçait que \code{ProgramRelations} \emph{remplace} \code{ProgramCache} ; au commit \snapshotCommit, il l'enveloppe.
+
+\subsection{La frontière de certification}
+
+Les relations ne produisent aucun diagnostic et n'attribuent aucune sévérité. Une \Error{} n'existe qu'à travers un jeton \code{Certified<E>} frappé par une primitive \code{must_*} de \file{src/rules/api/query.rs} (\cref{def:certified}), et chaque primitive \emph{re-dérive} sa preuve depuis les colonnes must ou exactes plutôt que de faire confiance à un booléen. Le \cref{tab:relations-must} recense celles qui lisent ce chapitre.
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}lp{6.2cm}l@{}}
+\toprule
+Primitive & Ce qu'elle re-dérive & Lignes \\
+\midrule
+\code{must_direct_write} & \code{via == Direct} sur une ligne \code{SlotWriter} & \src{src/rules/api/query.rs}{763}{774} \\
+\code{must_on_all_paths} & tout chemin entrée→sortie passe par un des blocs (\code{block}) & l.~627--640 \\
+\code{must_setter_on_all_paths} & un setter appelé sur tous les chemins (plus grand point fixe) ; re-balaye le CFG lui-même, sans lire \relation{slot_writers} & l.~527--621 \\
+\code{must_effect_cycle} & toutes les arêtes \code{Must} et un seul composant & l.~1002--1031 \\
+\code{must_frozen_seed} & mouvement prouvé de la prop et \code{!escaped} (\code{setter_escapes}) & l.~904--916 \\
+\code{must_stale_capture} & une \code{Registration} \code{Repeating}, \code{timing != Unknown}, sur tous les chemins & l.~942--989 \\
+\bottomrule
+\end{tabular}
+\caption{Les primitives de certification qui consomment les relations de ce chapitre (\file{src/rules/api/query.rs}).}
+\label{tab:relations-must}
+\end{table}
+
+\code{must_effect_cycle} (\src{src/rules/api/query.rs}{996}{1031}) est exemplaire : il reçoit les arêtes brutes et le cycle, recalcule \code{all_must} en lisant \code{strength} sur chaque arête et l'ensemble des composants impliqués (propriétaires des slots et porteurs des effets), et ne frappe le jeton que si tout est \code{Must} et qu'un seul composant apparaît ; \og both facts are re-derived HERE from the raw edges \dots{} not trusted from caller-supplied booleans\fg{}.
+
+Deux nuances. \code{same_tick} et \relation{body_calls} n'ont \emph{aucun} chemin vers \Error{} (\adr{28} §5, \adr{36} §4) ; les ancres Tier-A \code{registrations} et \code{seeds} sont plafonnées à \Warning{} ; mais les \emph{règles natives} \regle{stale-closure} et \regle{frozen-initial-state} atteignent \Error{} depuis ces deux relations, via \code{must_stale_capture} et \code{must_frozen_seed}. Un cycle de churn qui traverse deux composants est plafonné à \Warning{} : une dep de prop n'est jamais exactement le slot du parent.
+
+\subsection{Le cliquet}
+
+\rustsnippet[label={lst:relations-ratchet}]{tests/layer_boundary.rs}{19}{31}{les fichiers de règles qui touchent encore la syntaxe}
+
+Dix fichiers, et la liste ne peut que rétrécir. Le test lit chaque fichier de \file{src/rules/}, ignore la partie après \texttt{\#[cfg(test)]}, cherche les cinq marqueurs, et échoue si un fichier hors liste en contient un \emph{ou si un fichier de la liste n'en contient plus} (il doit alors être retiré). Notons qu'\adr{42} §1 cite \file{impls/conditional_hook.rs} dans la liste : au commit \snapshotCommit{}, c'est \file{helpers/mod.rs} qui y figure à sa place ; l'ADR est un historique, le code fait foi.
+
+\subsection{Ce que la frontière ne garantit pas encore}
+
+Le cliquet interdit à une règle de \emph{marcher la syntaxe} ; il n'interdit pas une \emph{seconde lecture} d'un fait à travers une fonction du moteur. \code{collect_setter_calls}, la forme historique \og une ligne par variable\fg{}, est encore appelée directement par \regle{setter-in-render}, \regle{derived-state}, \regle{infinite-loop}, \regle{stale-closure}, \file{rules/helpers/mount.rs} et l'entité Tier-A. Voici ce que cela coûte.
+
+\begin{exemple}{Un alias de setter au rendu}{relations-alias}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/verif07/alias.tsx}},label={lst:relations-alias}]
+import { useState } from 'react';
+export function A() {
+  const [n, setN] = useState(0);
+  const s = setN;
+  s(1);
+  return <div>{n}</div>;
+}
+\end{lstlisting}
+La relation porte la ligne \code{slot=0 setter=s region=Render phase=Render via=Direct block=Some(0)} : une écriture synchrone au rendu, dans le bloc d'entrée. La ligne de commande (\code{--info --show-clean}) certifie pourtant l'absence :
+\begin{sortie}
+  A  (1 hooks)  /tmp/verif07/alias.tsx  ✓
+    verified  conditional-hook  all hooks run unconditionally, in a stable order
+    verified  lazy-init  no useState/useRef initializer re-runs work on every render
+    verified  setter-in-render  no setter is called during render
+    verified  state-mutation  no state or prop object is mutated in place
+\end{sortie}
+Cause : la règle construit ses noms de setters à partir des seuls \code{let v = StateSetter(l)} du rendu et des setters étrangers (\src{src/rules/impls/setter_in_render.rs}{62}{93}) ; son unique appel à \code{resolve_setter_aliases} (\src{src/rules/impls/setter_in_render.rs}{99}{102}) porte sur les \emph{valeurs} d'état, pas sur les setters. Elle re-marche ensuite le rendu par \code{collect_setter_calls} (\srcline{src/rules/impls/setter_in_render.rs}{109}) au lieu de lire \relation{slot_writers}. Le même silence frappe l'\cref{ex:relations-via} : \code{putState(setN, 2)} au rendu passe par l'alias de paramètre \texttt{setter\#0}, et la ligne \code{Via(["putState"])} de phase \code{Render} ne produit aucun diagnostic.
+\end{exemple}
+
+\begin{remarque}
+Au commit \snapshotCommit, ce faux négatif de niveau \Error{} ne figure pas dans le tracker. C'est, mot pour mot, la dérive entre deux lectures d'un même fait qu'\adr{42} §1 combat. \file{setter_in_render.rs} figure d'ailleurs encore dans la liste du cliquet (\cref{lst:relations-ratchet}).
+\end{remarque}
+
+% ---------------------------------------------------------------------------
+\section{Limites, pièges et dette documentaire}
+\label{sec:relations-limites}
+\subsection{Pièges de lecture}
+
+\begin{piege}
+\textbf{Région ≠ phase.} Un callback littéral écrit au rendu est de \emph{région} \code{Render} mais de \emph{phase} ⊤. Conclure \og écrit pendant le rendu\fg{} depuis la région a supprimé un vrai positif (\adr{31} §3). Réciproquement, \file{seeds.rs} utilise la région \code{Effect} \emph{et} un filtre de phase (\issue{121}).
+\end{piege}
+
+\begin{piege}
+\textbf{Les polarités sont à sens unique.} \code{same_tick = false} n'est pas une preuve ; \code{SeedSync::NoneSeen} est une absence, que \code{setter_escapes} qualifie ; \code{Pairing::Unpaired} n'est une affirmation que sur les formes que l'appariement reconnaît ; l'absence de ligne n'est jamais une preuve. Illustration (\file{/tmp/verif07/loc.tsx}) : \code{const put = (s, v) => s(v); put(setN, 2)} au rendu ne produit \emph{aucune} ligne, parce que le bras B6 marche le corps de \code{put} sans lier ses paramètres aux arguments ; \code{setter_escapes} vaut \code{true} pour ce slot, ce qui protège les règles qui affirment \og personne d'autre n'écrit\fg{}, mais une règle positive comme \regle{setter-in-render} perd le site.
+\end{piege}
+
+\begin{piege}
+\textbf{Deux \code{WriteSite}.} \code{setters::WriteSite} (\code{pub(crate)}, le site brut de la marche) et \code{guards::WriteSite} (\code{pub}, le site de la preuve multi-site du \cref{chap:churn}) sont deux types sans rapport. De même, \code{build_edges} contient deux \code{invariance_of}, une fonction imbriquée puis une closure du même nom qui la masque.
+\end{piege}
+
+\begin{piege}
+\textbf{Lignes sans span.} Le corps d'une flèche à expression (\code{const safe = () => setCount(c => c + 1)}, \cref{ex:relations-counter}) est un terminateur \code{Return}, qui ne porte pas de span ; marché comme racine de région, il est entré avec \code{witness = None} et n'hérite de rien. C'est le résidu connu de \issue{140} ; \adr{39} §3 ne couvre que les corps entrés \emph{depuis} un site d'appel. Conséquence : la ligne trie en dernier et \code{dedup_source_sites} ne peut pas l'identifier à une autre.
+\end{piege}
+
+\subsection{Une ligne étrangère lue comme écrivain local}
+
+La méthode \code{AnalysisResult::slot_written_outside(slot, except)} (\src{src/engine/setters.rs}{2346}{2364}) répond \og une autre région que \code{except} peut-elle écrire ce slot ?\fg{} par \code{self.slot_writers.iter().any(|w| w.slot == slot && w.region != except)}. L'invariant \og tout lecteur natif filtre \code{owner}\fg{} (\adr{30} §3) a une exception : cette méthode ne filtre pas \code{owner}. Sur \file{/tmp/verif07/fo1.tsx}, un \code{Child} reçoit \code{onP={setP}} d'un \code{Parent} dont le slot \code{p} a le label 0, et possède lui-même un slot local de label 0 (\code{a}) écrit par un effet \code{setA(b * 2)} sous \code{[b]}. La ligne étrangère \code{slot=0 owner=Some("Parent")} est prise pour un autre écrivain du slot local 0, et \regle{derived-state} renonce : aucun diagnostic. Sur \file{fo2.tsx}, même programme avec un \code{useState} de plus dans \code{Parent} (le setter écrit alors le label 1), la règle émet \code{warn derived-state [hook:2] (line 10:2)}. Même programme à un renommage près, verdict différent : un faux négatif de niveau \Warning{}, dans la direction \og retenue\fg{} (la doc de la méthode le dit : \og both consumers use it to \emph{withhold} a finding\fg{}), contraire à \adr{30} §3. Au commit \snapshotCommit, ce défaut ne figure pas dans le tracker, et le \og second consommateur\fg{} qu'annonce la doc n'existe pas : le seul appel de la méthode dans \file{src/} est \srcline{src/rules/impls/derived_state.rs}{118}.
+
+\subsection{Faux négatifs et faux positifs connus}
+
+Faux négatifs ouverts touchant ce chapitre : \issue{157} (valeur dérivée du slot écrit lue \code{Not} fraîche : le motif \og mirror state\fg{} rend le fix naïf \code{Versioned} ⇒ \code{Maybe} inacceptable), \issue{20} (un parent analysé seulement en intra ne donne pas de \code{ComponentSetter} à l'enfant, donc pas de ligne étrangère), \issue{46} (setter appelé via un index ou une fonction retournée), \issue{52} (utilitaires inlinés en position d'instruction seulement). S'y ajoutent les quatre constats non répertoriés de ce chapitre : l'alias de setter ignoré par \regle{setter-in-render} (\cref{ex:relations-alias}, niveau \Error) ; \code{slot_written_outside} sans filtre \code{owner} (niveau \Warning) ; le setter passé en paramètre à un helper local, sans ligne (piège ci-dessus) ; l'initialiseur \code{useState(p.x ?? d)} sans ligne \relation{slot_seeds} (\cref{ex:relations-seed-literal}, niveau \Warning). Faux positifs assumés, au plus \Warning{} : \code{same_tick} lu vrai sur des branches exclusives d'un helper inliné (\issue{123}), les résidus de la garde de synchronisation (\issue{91} : garde disjonctive, garde de bornage), l'heuristique de nom des registrations (\issue{42}, wontfix : un \code{on}/\code{addListener} à deux arguments ou \code{subscribe} à un argument est une registration longue durée), et les résidus de la preuve multi-site (\issue{159}, \issue{161}) traités au \cref{chap:churn}.
+
+\subsection{Coûts et déterminisme}
+
+La marche paie \code{Reachability::of} à chaque CFG entré : un BFS par bloc, la table des successeurs coûtant elle-même un balayage linéaire des arêtes par bloc (\src{src/engine/setters.rs}{933}{937} rappelle que l'ancienne version par ligne était en $O(\text{lignes} \times \text{blocs} \times \text{arêtes})$). \code{SiteEnvs::eval} clone les trois stores à chaque ligne évaluée par valeur, coût non mesuré dans le dépôt. Le déterminisme repose sur \code{CFG::blocks}, un \code{BTreeMap} (\src{src/ir/cfg.rs}{54}{65}) : toute marche qui itère \code{cfg.blocks} visite les blocs dans l'ordre des identifiants ; les sources de non-déterminisme restantes (les \code{HashMap} de résultats, les \code{HashSet} d'identifiants du tas) sont celles que \issue{120} a dû trier (\code{collect_component_setter_vars}, \code{normalize_to_prop}, la déduplication des arêtes de churn).
+
+\subsection{Dette documentaire au commit \snapshotCommit}
+
+Le lecteur qui compare les textes au code rencontrera ces écarts, tous vérifiés : le commentaire de \code{AnalysisResult::slot_writers} (granularité d'avant \adr{28}) ; le commentaire de \code{Written::value} (antérieur à \code{returns_value}) ; \adr{42} §2 (\code{block} = \code{prov_block} ; \code{value} = partie référence ; ⊤ pour un site imbriqué), §3 (clé d'un trigger), §4 (\og the convergence kill is unchanged\fg{}, remplacé par les amendements de §6), §5 (\code{ProgramRelations} remplace \code{ProgramCache}) et ses \og Consequences\fg{} (\file{rules/api/cache.rs} \og is gone\fg{}, \issue{39} \og untouched\fg{}, contredits par le dernier paragraphe) ; \adr{20} item 9 (\og the splice emits no param aliases\fg{}, alors que l'\cref{ex:relations-via} montre \texttt{let setter\#0 = setN}) ; le paragraphe \og An edge is dropped when\fg{} de \file{docs/relations.md}, en retard d'un amendement ; et deux doc-comments déplacés dans \file{setters.rs} (la première ligne de la doc de \code{resolve_setter_aliases} est au-dessus de \code{setter_var_labels}, \src{src/engine/setters.rs}{511}{514} ; celle de \code{collect_fn_bindings} en tête de \code{certified_fn_names}, \srcline{src/engine/setters.rs}{442}). Ordre de foi : le code ; les doc-comments de module de \file{churn.rs} et \file{guards.rs}, réécrits au commit \snapshotCommit ; le dernier amendement d'\adr{42} §6 ; \file{docs/relations.md} ; le reste d'\adr{42} comme récit historique.
+
+% ---------------------------------------------------------------------------
+\begin{resume}
+\paragraph{Idées à retenir.} Un fait calculé à deux endroits est deux faits qui dérivent (\adr{42}) : les relations sont calculées une fois, dans la dernière tranche du point fixe, sur les CFG post-expansion, et rangées dans l'\code{AnalysisResult} ; les règles les lisent et ne marchent aucune syntaxe (cliquet). Chaque colonne a une polarité (exact, must, may, ⊤-bearing), et une \Error{} ne s'assemble que depuis des colonnes must ou exactes, par une primitive \code{must_*} qui re-dérive sa preuve. La marche des setters décide la \emph{classe} d'un site par la manière dont elle est entrée dans son CFG : synchrone à la racine, dans un helper appelé (B6) ou une IIFE ; différée par un registrar, un \code{await} ou un cleanup ; handler par \code{addEventListener} ; ⊤ pour tout callee inconnu. Rétrécir hors de ⊤ n'est permis que sur contrat. Une \code{FnLit} n'est jamais traversée de l'extérieur.
+
+\paragraph{Types et fichiers.}
+\begin{itemize}
+  \item \file{src/engine/setters.rs} : \code{WriterRegion} (exact), \code{WriterPhase} (may), \code{WalkClass}, \code{SetterWalk}, \code{Found}, \code{SlotWriter} et ses douze champs (quatorze colonnes une fois \code{written} déplié), \code{SetterProp}, \code{WriteProvenance}, \code{InlineRegions}, \code{Updater} ;
+  \item \file{written.rs} : \code{Freshness}, \code{Written}, \code{SiteEnvs} ; \file{triggers.rs} : \code{EffectTrigger} ; \file{seeds.rs} : \code{SeedSync}, \code{SlotSeed} ;
+  \item \file{registrations.rs} : \code{Registrar}, \code{REGISTRARS}, \code{Timing}, \code{Pairing}, \code{Registration} ;
+  \item \file{guards.rs} : \code{guard_chain}, \code{site_guards}, \code{expand_guard}, \code{dead_once_written}, \code{converges_once_written} ; \file{program_relations.rs} : \code{ProgramRelations} ;
+  \item \file{src/rules/api/query.rs} : \code{must_direct_write} et \code{must_effect_cycle} ;
+  \item le cliquet : \file{tests/layer_boundary.rs}.
+\end{itemize}
+
+\paragraph{Ce que le chapitre suivant ajoute.} Le \cref{chap:churn} replie \relation{slot_writers} et \relation{effect_triggers} en un graphe programme-entier, cherche ses cycles, et généralise la preuve mono-site en \code{converges_under_all_writes} : les gardes d'un site doivent mourir sous \emph{toutes} les écritures du slot qui s'exécutent dans la boucle automatique, les revivers déjà convergents étant exclus par un plus petit point fixe.
+\end{resume}
+
+\section*{Exercices}
+\addcontentsline{toc}{section}{Exercices}
+\begin{exercice}{Prédire les lignes}{relations-predire}
+Prédire les lignes \relation{slot_writers} (région, phase, \code{block}, \code{guard_block}, \code{same_tick}, \code{fresh}) de
+\begin{lstlisting}[language=TypeScript]
+useEffect(() => {
+  items.forEach(i => setX(i));
+  setY(1);
+  setY(2);
+}, [items]);
+\end{lstlisting}
+\end{exercice}
+\begin{solution}
+Observé sur \file{/tmp/ch14/exo1.tsx} : \code{setX} a \code{phase=Effect} (le HOF synchrone propage la classe englobante), \code{repeats} donc \code{same_tick=true}, \code{block=None}, \code{guard_block=Some(0)}, \code{fresh=Maybe} (\code{i} est ⊤) ; les deux \code{setY} ont \code{block=Some(0)}, \code{same_tick=true} (même bloc), \code{fresh=Not}.
+\end{solution}
+
+\begin{exercice}{Un updater qui ranime}{relations-updater-revive}
+Pourquoi \code{setS(prev => null)} à un autre site ranime-t-il une garde \code{if (!s)} ? Quelle fonction de \file{written.rs} le garantit, et que dirait l'ancien commentaire du champ \code{value} ?
+\end{exercice}
+
+\begin{exercice}{Refuser \code{Functional}}{relations-refuse-functional}
+Construire un composant où \code{setN(inc)} n'est pas classé \code{Updater::Functional} bien que \code{inc} soit lié à un littéral de fonction au rendu ; expliquer le rôle de \code{certified_fn_binding} et pourquoi \code{collect_fn_bindings} n'est pas la bonne barre.
+\end{exercice}
+
+\begin{exercice}{\code{subscribe} et \code{BehaviorSubject}}{relations-subscribe}
+Donner un programme où classer \code{subscribe} en \code{Handler} produirait un faux négatif dans une règle Tier-A à garde \code{writer_phases includes effect}. Quelle colonne de \code{REGISTRARS} encode la décision ?
+\end{exercice}
+
+\begin{exercice}{\code{once} contre \code{capture}}{relations-once}
+Écrire un effet qui appelle \code{addEventListener(t, h, { once: true })} sans cleanup et prédire \code{pairing} ; puis avec \code{true} en troisième argument. Vérifier avec la sonde.
+\end{exercice}
+\begin{solution}
+\code{Paired} dans le premier cas (\code{self_removing}, tranché avant toute comparaison) ; \code{Unpaired} dans le second, si \code{h} est un nom (ligne comparable, \code{Cleanups::None}), conformément à la \cref{fig:relations-pair}. Sur \file{/tmp/ch14/regs.tsx}, la ligne \code{'scroll'} est \code{self_removing=true pairing=Paired}.
+\end{solution}
+
+\begin{exercice}{Aucune ligne de rendu pour un handler}{relations-onclick}
+Expliquer pourquoi \code{onClick={() => setN(1)}} ne produit aucune ligne de région \code{Render}, alors qu'aucun code de \code{collect_slot_writers} ne déduplique. Que se passerait-il si \code{expr} traversait les \code{FnLit} ?
+\end{exercice}
+\begin{solution}
+Le lowering réifie la flèche en \code{HookEntry::Handler} (\code{extract_handlers}), marchée comme sa propre région ; depuis le CFG de rendu, la flèche n'est ni appelée, ni passée à un callee, ni retournée par un effet, donc la machinerie d'appel n'y entre jamais (\cref{lst:relations-skip-fnlit}). Si \code{expr} traversait les \code{FnLit}, le site serait vu une seconde fois depuis le rendu, avec la classe ⊤ : une ligne \code{region = Render, phase = Unknown} en double, qui satisfait toute requête de phase (une garde Tier-A \code{writer_phases includes render}, par exemple) sans correspondre à aucune exécution nouvelle.
+\end{solution}
+
+\begin{exercice}{Réparer la dérive}{relations-reparer}
+Proposer, en une phrase justifiée, la modification de \regle{setter-in-render} qui ferait disparaître le faux négatif de l'\cref{ex:relations-alias} sans réintroduire une marche dans la règle. Quelles colonnes de \code{SlotWriter} suffisent à reconstituer la preuve d'\Error{} actuelle (dominance de sortie, phase synchrone, \code{must_write}) ?
+\end{exercice}

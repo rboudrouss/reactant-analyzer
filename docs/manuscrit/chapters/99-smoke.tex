@@ -1,0 +1,91 @@
+\chapter{Chapitre de test du préambule}
+\label{chap:smoke}
+
+\begin{objectifs}
+  \item Vérifier que tous les environnements compilent.
+  \item Vérifier les caractères Unicode dans les extraits : ⊤, ⊥, →, ─, é.
+\end{objectifs}
+
+\prerequis{aucun.}
+
+\section{Titre avec \code{snake_case} et \code{s0=⊤}}
+Cas : \code{a && b}, \code{x \% 2}, \code{\#[test]}, \code{\{ ...q \}}, \code{$x^2$}, $n \in \code{s_0}$,
+\code{a~b}, \code{✓ 1 file(s) no issues found.}, \code{règle → ⊥}, \code{\ldots},
+\file{src/ir/expr.rs}, \code{new_state.leq(&state)}, fin.
+
+Texte avec \code{snake_case_ident} et \file{src/ir/expr.rs}, une règle \regle{infinite-loop},
+une relation \relation{writers}, l'\adr{27}, l'issue \issue{63}, et un \terme{treillis}.
+Prose Unicode : ⊤ ⊥ ⊓ ⊔ → ⇒ ≤ ∀ ∞. Math : $x \lleq y \join z$, $\gam(\Top) = \Val$, $f^{\widen}$.
+
+\begin{definition}{Treillis}{treillis}
+  Un ensemble partiellement ordonné $(L, \lleq)$ dont toute paire admet une borne supérieure $\join$ et une borne inférieure $\meet$.
+\end{definition}
+
+\begin{react}[batching]
+  Plusieurs appels à \code{setState} dans le même tick sont fusionnés.
+\end{react}
+
+\begin{piege}
+  Un faux négatif est interdit.
+\end{piege}
+
+\begin{exemple}{Compteur}{compteur}
+Renvoi vers la \cref{def:treillis} et l'\cref{ex:compteur} ; deux points : ici.
+\begin{lstlisting}[language=TypeScript,caption={Un compteur — é ⊤ → …}]
+// … points de suspension …
+function Counter() {
+  const [n, setN] = useState(0);          // état local
+  useEffect(() => { setN(n + 1); }, [n]); // ⊤ → boucle
+  return <button onClick={() => setN(n + 1)}>{n}</button>;
+}
+\end{lstlisting}
+\end{exemple}
+
+\rustsnippet{src/ir/expr.rs}{1}{25}{en-tête du module des expressions}
+
+\begin{sortie}
+error[infinite-loop]: useEffect writes `n` and depends on it — é ⊤ → ─────
+\end{sortie}
+
+\ifhastikz
+\begin{figure}[H]\centering
+\begin{tikzpicture}[node distance=8mm]
+  \node[bloc] (a) {parse (oxc)};
+  \node[bloc,right=of a] (b) {lowering};
+  \node[bloc,right=of b] (c) {IR};
+  \node[bloc,right=of c] (d) {engine};
+  \node[bloc,right=of d] (e) {rules};
+  \draw[fleche] (a) -- (b); \draw[fleche] (b) -- (c); \draw[flechemust] (c) -- (d); \draw[flechemay] (d) -- (e);
+\end{tikzpicture}
+\caption{Pipeline (TikZ disponible).}
+\end{figure}
+\else
+\emph{TikZ indisponible : figure omise.}
+\fi
+
+\begin{exemple}{}{}
+  Exemple sans titre ni label.
+\end{exemple}
+
+\begin{algorithm}[H]
+\KwIn{un CFG $G$, un état initial $s_0$}
+\KwOut{une table $S$ d'états abstraits}
+$S[\mathit{entry}] \gets s_0$\;
+\While{la worklist n'est pas vide}{
+  $b \gets$ pop\;
+  $s \gets \bigsqcup_{p \in \pred(b)} S[p]$\;
+  \If{$b$ est une tête de boucle}{$s \gets S[b] \widen s$\;}
+}
+\caption{Itération de point fixe (test).}
+\end{algorithm}
+
+\begin{exercice}{Un exercice}{un}
+  Question ?
+\end{exercice}
+\begin{solution}
+  Réponse~\cite{CousotCousot77}.
+\end{solution}
+
+\begin{resume}
+Tout compile.
+\end{resume}

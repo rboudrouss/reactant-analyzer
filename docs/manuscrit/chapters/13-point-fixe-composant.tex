@@ -1,0 +1,1996 @@
+% ---------------------------------------------------------------------------
+% Chapitre 13 — Le point fixe d'un composant
+% Sources : notes/06-engine-fixpoint.md (intégralement, hors §4.4, §4.9,
+% §4.10 traités au chapitre 12), notes/16-react-semantics.md (§4.1, §5.1),
+% src/engine/fixpoint.rs (analyze_component_impl et ce qu'il appelle),
+% src/engine/triggers.rs, src/engine/hook_registry.rs,
+% src/domains/stores/{state_store,memo_store,shared_state_store}.rs,
+% src/engine/analysis_result.rs, src/rules/impls/infinite_loop.rs ;
+% ADR-001, 004, 005, 009, 012, 014, 017, 042.
+% Sorties CLI observées au commit e67b10a avec target/debug/reactant sur
+% /tmp/ch13/*.tsx. Les valeurs internes (stores, widen_trace,
+% effect_setter_writes, effect_triggers, SharedStateStore) ont été relevées
+% avec la sonde /tmp/eng/probe (crate hors dépôt liant `reactant` par chemin),
+% qui appelle analyze_component et analyze_program et imprime les champs de
+% l'AnalysisResult ; ses tableaux de tours viennent d'une réplique de la
+% boucle externe dont le résultat final coïncide avec celui du moteur sur
+% tous les exemples cités (sauf mention contraire).
+% ---------------------------------------------------------------------------
+\chapter{Le point fixe d'un composant}
+\label{chap:point-fixe-composant}
+
+\begin{objectifs}
+  \item Comprendre ce que calcule \code{analyze_component_impl} : non pas une simulation de React, mais un sur-ensemble des états qu'un composant peut atteindre, sous la forme d'un post-point fixe du \code{StateStore}.
+  \item Connaître la préparation d'un composant (constantes de module, inlining des utilitaires et des hooks personnalisés, seuils de widening, amorçage des \code{useState}) et ce qu'elle laisse dans les CFG.
+  \item Savoir dérouler un tour de la boucle externe --- rendu, mémos, effets, handlers, join, test --- et expliquer chaque choix par un fait de React : batching, fermetures, deps, événements.
+  \item Maîtriser la convergence : le test $N \lleq S$, le compteur global, le widening à seuils, \code{widen_trace}, le garde-fou à cent tours, et pourquoi tout cela termine.
+  \item Connaître les deux passes post-convergence (rafraîchissement du rendu, \code{effect_setter_writes}) et la tranche où naissent les relations.
+  \item Situer la boucle par rapport à React-tRace, en donner l'argument de soundness, et connaître, un par un, les trous observés au commit \snapshotCommit.
+\end{objectifs}
+
+\prerequis{\cref{chap:react-modele} (le tour de React, React-tRace et sa lecture réduite de la boucle) ; \cref{chap:interpretation-abstraite} (\cref{def:point-fixe}, \cref{def:widening}, \cref{def:soundness}) ; \cref{chap:statevalue-stabilite} (\cref{def:stabilite}) ; \cref{chap:transfert-stores} (environnements, \cref{def:store}, \code{exec_setter_call}, \code{recompute_memo}) ; \cref{chap:cfg-analyzer-dominance} (\code{analyze_cfg}, sa passe et la monotonie du store qu'elle rend) ; \cref{chap:splice-inlining} pour la mécanique des greffes.}
+
+Le \cref{chap:cfg-analyzer-dominance} sait exécuter abstraitement \emph{un}
+corps : le rendu, un effet, un handler. Mais un composant React n'est pas un
+corps, c'est un cycle : le rendu produit un environnement, les effets le lisent
+et écrivent l'état, l'état modifié provoque un nouveau rendu, et ainsi de suite
+jusqu'à ce que plus rien ne change --- ou indéfiniment, ce qui est précisément
+l'un des défauts à détecter. Ce chapitre décrit la fonction qui referme ce
+cycle, \code{analyze_component_impl} (\src{src/engine/fixpoint.rs}{130}{698}),
+et tout ce qu'elle appelle. C'est la pièce centrale du moteur : elle reçoit un
+\code{ComponentIR} et rend un \code{AnalysisResult}, l'objet que toutes les
+règles lisent.
+
+Le \cref{chap:react-modele} en a donné, sous forme d'algorithme, une
+lecture réduite, suffisante pour la correspondance avec React-tRace. Ici nous
+la reprenons à la taille du code, ligne à ligne : ce qui se passe une fois
+avant la boucle, ce que fait chacune des quatre passes d'un tour, comment on
+décide qu'on a fini, ce qu'on recalcule ensuite et pourquoi. La progression va
+du composant le plus simple (un \code{useState}, un effet) aux cas qui ont
+imposé les choix les moins évidents : handlers dans la boucle, mémos hors
+du test de convergence, ré-exécution des effets depuis $\Bot$. Le chapitre
+se termine par un inventaire honnête de ce que le moteur garantit et de ce
+qu'il ne garantit pas, au commit \snapshotCommit.
+
+Toutes les sorties d'analyseur ont été observées avec le binaire construit à
+ce commit sur des fichiers placés sous \file{/tmp/ch13/}, par
+\code{reactant check --verbose --info --no-color --project plain <fichier>}
+(la ligne \code{[verbose] X: N iteration(s), widened: [...]} vient de
+\src{src/driver/mod.rs}{419}{428} et affiche \code{iterations} et les clés de
+\code{widen_trace}). Les valeurs internes des stores, invisibles depuis la
+ligne de commande, ont été lues avec une petite sonde Rust hors dépôt qui lie
+la crate \code{reactant} par chemin et imprime les champs de
+l'\code{AnalysisResult} ; sa notation est \code{s0=num[0,3]} pour \og le slot
+0 vaut l'intervalle $[0,3]$\fg{}, \code{ref:PerRender} pour une référence
+fraîche à chaque rendu, \code{⊤} pour \code{StateValue::top()}.
+
+% ===========================================================================
+\section{Le problème : un ensemble d'états, pas une simulation}
+\label{sec:point-fixe-composant-probleme}
+
+\subsection{Un compteur qui ne s'arrête jamais}
+
+Le composant le plus court qui boucle à l'infini est celui-ci :
+
+\begin{lstlisting}[language=TypeScript,caption={La boucle infinie canonique (\file{/tmp/ch13/runaway.tsx})},label={lst:point-fixe-composant-runaway}]
+import { useState, useEffect } from "react";
+
+export function Runaway() {
+  const [x, setX] = useState(0);
+  useEffect(() => setX(x + 1));
+  return <div>{x}</div>;
+}
+\end{lstlisting}
+
+Concrètement (un tour de React au sens du \cref{chap:react-modele}) : React rend \code{Runaway} avec
+$x = 0$, commit, exécute l'effet, qui appelle \code{setX(1)} ; l'état ayant
+changé, React rend à nouveau avec $x = 1$, l'effet tourne encore (il n'a pas
+de tableau de deps), \code{setX(2)}, et ainsi de suite. La suite des valeurs
+de \code{x} est $0, 1, 2, 3, \dots$ ; le composant ne se stabilise jamais.
+L'analyseur le dit :
+
+\begin{sortie}
+$ reactant check --verbose --info --no-color --project plain runaway.tsx
+[verbose] symbol graph: 1 nodes, topo order = [Runaway@runaway.tsx]
+[verbose] 1 components analyzed
+[verbose] cache hits: 0, misses: 0
+  [verbose] Runaway: 3 iteration(s), widened: [0]
+  Runaway  (2 hooks)  runaway.tsx
+    warn   infinite-loop  [hook:0]  (line 5:2)  this effect keeps pushing state `x` to new values on every run. Potential infinite render loop
+       (2 trace step(s), rerun with --trace)
+    info   widening-info  (line 5:2)  state `x` kept changing during analysis and was approximated to converge, so findings that depend on it may be imprecise
+       (2 trace step(s), rerun with --trace)
+    verified  conditional-hook  all hooks run unconditionally, in a stable order
+    [... six autres lignes verified ...]
+
+⚠  1 warning(s) across 1 file(s).
+\end{sortie}
+
+Comment un programme qui ne fait que \emph{trois} itérations peut-il conclure
+quelque chose sur une exécution qui n'en finit pas ? La réponse est le sujet du
+chapitre, mais l'idée tient en deux phrases. Le moteur ne suit pas la suite
+$0, 1, 2, \dots$ ; il calcule, pour le slot de \code{x}, un \emph{ensemble}
+de valeurs qui contient toutes celles que \code{x} peut prendre, à n'importe
+quel tour. Cet ensemble est représenté par une valeur abstraite (ici un
+intervalle), il grossit tant que l'effet écrit quelque chose de neuf, et
+quand il grossit trop longtemps, un opérateur de widening
+(\cref{def:widening}) le fait sauter à $[0, +\infty]$ : \og \code{x} peut
+prendre n'importe quelle valeur $\geq 0$\fg{}. Ce saut est le signal de
+divergence que la règle \regle{infinite-loop} lit.
+
+\subsection{Pourquoi pas simuler}
+
+On pourrait vouloir exécuter le composant : rendre, appliquer les effets,
+rendre à nouveau, et déclarer une boucle infinie au bout de, disons, cent
+tours. Trois raisons rendent cette voie impraticable pour un analyseur
+statique.
+
+\begin{enumerate}
+  \item \emph{Les entrées sont inconnues.} Un composant reçoit des props, lit
+    des contextes, appelle des bibliothèques. Aucune valeur concrète n'est
+    disponible ; il faut raisonner sur \emph{toutes} les valeurs possibles à la
+    fois, c'est-à-dire sur des ensembles.
+  \item \emph{Les événements sont arbitraires.} Un \code{onClick} s'exécute
+    zéro, une ou mille fois, dans n'importe quel ordre par rapport aux autres
+    handlers. Aucune suite finie de tours ne représente toutes les
+    exécutions.
+  \item \emph{La terminaison n'est pas décidable}, et surtout, on veut une
+    réponse \emph{sound} (\cref{def:soundness}) : si l'analyseur dit
+    \og rien à signaler\fg, aucune exécution concrète ne doit boucler. Une
+    simulation bornée peut manquer une boucle qui n'apparaît qu'à la
+    cent-unième itération ou qu'avec une entrée particulière.
+\end{enumerate}
+
+L'interprétation abstraite répond aux trois points d'un coup : on remplace
+chaque valeur par un élément d'un treillis qui représente un ensemble de
+valeurs, on remplace la suite des tours par une suite \emph{croissante}
+d'états abstraits, et on s'arrête à un post-point fixe (\cref{def:point-fixe})
+qui, par le théorème du post-point fixe du
+\cref{chap:interpretation-abstraite}, contient tout état concret atteignable.
+
+\begin{definition}{État abstrait d'un composant, tour abstrait}{point-fixe-composant-etat}
+L'\emph{état abstrait} d'un composant est son \code{StateStore}
+(\cref{def:store}) : une fonction $S$ des labels de ses hooks \code{useState}
+vers des \code{StateValue}, un label absent valant $\Bot$. Un \emph{tour
+abstrait} est une exécution de la boucle de \code{analyze_component_impl} :
+une passe de rendu depuis $S$, le recalcul des mémos, une passe par effet
+et une passe par handler, toutes depuis $S$, puis le join $N$ des stores
+produits. La \emph{suite des tours} est $S_0 \lleq S_1 \lleq \dots$, où $S_0$
+est le store amorcé par les initialiseurs et $S_{k+1}$ vaut $N_k$ ou
+$S_k \widen N_k$. La boucle s'arrête au premier $k$ tel que
+$N_k \lleq S_k$ ; ce $S_k$ est l'état abstrait convergé.
+\end{definition}
+
+La \cref{fig:point-fixe-composant-chronogramme} met en regard le temps de
+React et celui de l'analyseur pour \code{Runaway}. Le point important est que
+le tour abstrait $k$ ne représente pas le $k$-ième tour de React : il
+représente \emph{tous} les états atteignables en au plus $k$ tours, et un
+tour de plus, quand il n'ajoute rien, prouve que l'ensemble est clos.
+
+\begin{figure}[htbp]\centering
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[font=\scriptsize,node distance=2mm]
+  % --- ligne React (concret)
+  \node[anchor=east] at (-0.9,0) {\textbf{React}};
+  \foreach \i/\v/\w in {0/0/1,1/1/2,2/2/3,3/3/4} {
+    \node[bloc,minimum width=11mm,inner sep=2pt] (r\i) at ({\i*3.8},0) {rendu\\$x=\v$};
+    \node[bloc,minimum width=9mm,inner sep=2pt,fill=white,right=of r\i] (e\i) {effet\\\texttt{setX(\w)}};
+  }
+  \foreach \i/\j in {0/1,1/2,2/3} { \draw[fleche] (e\i) -- node[etiquette,above]{commit} (r\j); }
+  \foreach \i in {0,1,2,3} { \draw[fleche] (r\i) -- (e\i); }
+  \node[right=of e3] {$\cdots$};
+  % --- ligne abstraite
+  \node[anchor=east] at (-0.9,-2.3) {\textbf{moteur}};
+  \node[bloc,minimum width=13mm,inner sep=2pt,draw=ra-amber] (s0) at (0,-2.3) {$S_0$\\$[0,0]$};
+  \node[bloc,minimum width=13mm,inner sep=2pt,draw=ra-amber] (s1) at (3.8,-2.3) {$S_1$\\$[0,1]$};
+  \node[bloc,minimum width=13mm,inner sep=2pt,draw=ra-amber] (s2) at (7.6,-2.3) {$S_2$\\$[0,2]$};
+  \node[bloc,minimum width=13mm,inner sep=2pt,draw=ra-amber] (s3) at (11.4,-2.3) {$S_3$\\$[0,+\infty]$};
+  \node[bloc,minimum width=13mm,inner sep=2pt,draw=ra-amber,fill=white] (s4) at (15.2,-2.3) {$N_3 \lleq S_3$\\fin};
+  \draw[fleche] (s0) -- node[etiquette,above]{tour 0 : join} (s1);
+  \draw[fleche] (s1) -- node[etiquette,above]{tour 1 : join} (s2);
+  \draw[fleche] (s2) -- node[etiquette,above,align=center]{tour 2 : $\widen$\\(\code{iteration} = 3)} (s3);
+  \draw[fleche] (s3) -- node[etiquette,above]{tour 3} (s4);
+  % --- liens de concrétisation
+  \foreach \i in {0,1,2} { \draw[flechemay] (r\i.south) -- node[etiquette,right,text=ra-amber]{$\in \gam$} (s\i.north); }
+  \draw[flechemay] (r3.south) -- node[etiquette,right,text=ra-amber]{$\in \gam$} (s3.north);
+  \node[etiquette,align=left,anchor=west,text width=150mm] at (-2.2,-3.7) {Chaque rendu concret de React lit une valeur de \code{x} contenue dans la concrétisation $\gam(S_k)$ du store abstrait de même rang ; le store $S_3$ contient aussi tous les rendus suivants.};
+\end{tikzpicture}}
+\caption{Chronogramme de \code{Runaway} : les tours de React (en haut,
+infinis) et les tours de la boucle externe (en bas, quatre). Le store abstrait
+$S_k$ sur-approxime toutes les valeurs de \code{x} atteignables en au plus $k$
+tours ; après le widening, $S_3$ les contient toutes.}
+\label{fig:point-fixe-composant-chronogramme}
+\end{figure}
+
+\subsection{Ce qu'un ensemble ne dit pas}
+
+Le prix de cette abstraction est visible sur un second exemple. Ici l'état
+est un objet, recréé par l'effet qui en dépend :
+
+\begin{lstlisting}[language=TypeScript,caption={Un objet recréé dans ses propres deps (\file{/tmp/ch13/fresh.tsx})},label={lst:point-fixe-composant-fresh}]
+import { useState, useEffect } from "react";
+
+export function Fresh() {
+  const [o, setO] = useState({ n: 0 });
+  useEffect(() => {
+    setO({ n: o.n + 1 });
+  }, [o]);
+  return <div>{o.n}</div>;
+}
+\end{lstlisting}
+
+Concrètement, c'est une boucle infinie : chaque exécution de l'effet stocke
+un objet neuf, \code{Object.is} échoue sur le dep \code{[o]}, l'effet
+tourne encore. Abstraitement, la valeur du slot est \code{ref:PerRender}
+(\cref{def:stabilite} : \og une référence fraîche à chaque rendu\fg) dès
+l'amorçage, l'effet écrit \code{ref:PerRender}, et
+$\mathit{PerRender} \join \mathit{PerRender} = \mathit{PerRender}$ : le
+store ne bouge pas, la boucle s'arrête \emph{au premier tour}, sans
+widening :
+
+\begin{sortie}
+  [verbose] Fresh: 0 iteration(s), widened: []
+  Fresh  (2 hooks)  fresh.tsx
+    error  infinite-loop  [hook:0]  (line 5:2)  this effect recreates object state `o` it depends on. Every run stores a fresh reference (`Object.is` always fails) and re-triggers itself: infinite render loop
+\end{sortie}
+
+L'\Error{} est pourtant là, et c'est une \Error{}, pas un \Warning{} : elle
+ne vient pas du point fixe mais des \emph{relations} dérivées après lui
+(\cref{chap:relations}, \cref{chap:churn}) --- ici la ligne \code{exact =
+true} de \relation{effect_triggers} et la fraîcheur de l'écriture dans
+\relation{slot_writers}. La leçon, que le \cref{chap:relations} reprend à son
+compte (\adr{42}), est celle-ci : le point fixe calcule un \emph{ensemble de
+valeurs}, jamais une \emph{suite de transitions}. La suite $0 \to 1 \to 0 \to
+1$ et le fait \og atteint $\{0, 1\}$\fg{} ont exactement la même abstraction.
+Une question qui porte sur les transitions (\og cette écriture
+relance-t-elle cet effet ?\fg) n'a pas de réponse dans le store ; elle en a
+une dans les relations, calculées à convergence sur les CFG. Ce chapitre
+s'arrête donc à la frontière : il montre comment le store converge et quelles
+données sont figées pour les relations, et laisse leur calcul aux chapitres
+suivants.
+
+\subsection{Les quatre portes d'entrée et la configuration}
+
+Le fichier \file{src/engine/fixpoint.rs} (2\,815 lignes, dont un millier de
+tests) expose quatre fonctions publiques, réexportées par
+\file{src/engine/mod.rs}, qui aboutissent toutes au cœur privé
+\code{analyze_component_impl}.
+
+\rustsnippet[label={lst:point-fixe-composant-entrees}]{src/engine/fixpoint.rs}{83}{118}{les deux entrées intra-composant}
+
+\begin{itemize}
+  \item \code{analyze_program} (\srcline{src/engine/fixpoint.rs}{704}) est
+    l'entrée de production, appelée par le driver : elle analyse les racines
+    avec un \code{InterCtx} (phase 1), puis les composants non atteints sans
+    (phase 2). Le \cref{sec:point-fixe-composant-programme} en dit ce qui
+    concerne la boucle ; le \cref{chap:inter-composants} fait le reste.
+  \item \code{analyze_component} et \code{analyze_component_as}
+    (\cref{lst:point-fixe-composant-entrees}) analysent un composant
+    \emph{isolé} : environnement d'entrée $\Bot$ (toute variable inconnue vaut
+    $\Top$, \cref{chap:transfert-stores}), tas neuf, \code{inter = None}. La première
+    l'identifie par \code{ComponentId::SYNTHETIC}
+    (\srcline{src/ir/component_id.rs}{38}), la seconde par un identifiant déjà
+    interné. Ce sont les entrées de la plupart des tests unitaires et de
+    plusieurs tests d'intégration (\file{tests/widening_e2e.rs},
+    \file{tests/functional_updater.rs}).
+  \item \code{analyze_component_inter} (\src{src/engine/fixpoint.rs}{65}{81})
+    est la fonction de rappel que \code{eval_comp_app} appelle pour analyser
+    un enfant rencontré dans un rendu ; elle existe pour casser la dépendance
+    circulaire entre \code{domains::transfer} et \code{engine::fixpoint}
+    (\cref{chap:transfert-stores}).
+\end{itemize}
+
+\begin{piege}
+Une analyse \emph{intra} (\code{analyze_component}) et une analyse
+\emph{inter} (\code{analyze_program}) du même composant ne calculent pas la
+même chose. En intra, il n'y a pas de \code{HookRegistry} donc pas d'inlining
+des hooks personnalisés (\cref{sec:point-fixe-composant-expansion}), pas de
+\code{SharedStateStore} (\cref{sec:point-fixe-composant-join}), et un
+\code{SummaryRegistry} vide par défaut. Un test qui passe par
+\code{analyze_component} ne prouve rien du chemin suivi par la ligne de
+commande ; l'\issue{14} relève que 36 des 42 fichiers de tests d'intégration
+construisent \code{Config::default()}, \og which no user ever runs\fg. Nous
+en verrons une conséquence concrète au
+\cref{sec:point-fixe-composant-trous} (l'updater fonctionnel).
+\end{piege}
+
+Les paramètres du moteur tiennent dans une structure :
+
+\rustsnippet[label={lst:point-fixe-composant-config}]{src/engine/fixpoint.rs}{38}{60}{les paramètres du moteur et leurs défauts}
+
+\code{widen_threshold} sert \emph{deux fois} : c'est le nombre de tours
+externes qui changent l'état avant que la boucle passe du join au widening
+(\cref{sec:point-fixe-composant-convergence}), et c'est aussi le nombre de
+passages par un arc arrière avant le widening d'un en-tête de boucle dans
+\code{analyze_cfg} (\cref{chap:cfg-analyzer-dominance}). Les deux registres
+alimentent l'expansion (\cref{sec:point-fixe-composant-expansion}) ;
+\code{max_inline_depth} borne le nombre de greffes d'utilitaires par CFG. Le
+driver n'utilise pas \code{Config::default()} tel quel : il remplace le
+\code{SummaryRegistry} vide par \code{SummaryRegistry::new_with_common()}
+(\src{src/driver/mod.rs}{370}{374}), qui connaît les hooks des bibliothèques
+courantes.
+
+La signature du cœur, avec le plan que son auteur en a écrit :
+
+\rustsnippet[label={lst:point-fixe-composant-signature}]{src/engine/fixpoint.rs}{120}{138}{la doc d'en-tête et la signature de \code{analyze_component_impl}}
+
+Un détail à corriger d'emblée : l'étape 1 du plan (\og Import cross-component
+state\fg) n'a pas lieu en tête de boucle. L'import de la tranche du
+\code{SharedStateStore} se fait dans le test de convergence
+(\src{src/engine/fixpoint.rs}{488}{493}), après les passes ; nous y
+reviendrons. Le reste du plan est fidèle, et la
+\cref{fig:point-fixe-composant-flot} le dessine en entier, préparation et
+post-convergence comprises. Les trois sections suivantes en parcourent les
+trois zones.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[font=\scriptsize,node distance=3mm and 6mm,
+    etape/.style={bloc,text width=50mm,align=left,inner sep=3pt},
+    zone/.style={draw=ra-gray,dashed,rounded corners=3pt,inner sep=4pt}]
+  % --- préparation
+  \node[etape] (consts) {constantes de module $\to$ \code{initial_env}, \code{module_env} \hfill l.~153--190};
+  \node[etape,below=of consts] (util) {\code{expand_utility_calls} (greffes d'utilitaires) \hfill l.~202--218};
+  \node[etape,below=of util] (hooks) {\code{expand_custom_hooks} (greffes de hooks, résumés) \hfill l.~221--229};
+  \node[etape,below=of hooks] (thr) {\code{custom_arg_returns} ; seuils $T$ ; \code{callback_bodies} \hfill l.~240--295};
+  \node[etape,below=of thr] (seed) {amorçage : $S[\ell] \join= \sem{\mathit{init}}$ pour chaque \code{State} \hfill l.~314--353};
+  \begin{scope}[on background layer]
+    \node[zone,fit=(consts)(seed),label={[etiquette,anchor=south west]north west:préparation (une fois)}] (prep) {};
+  \end{scope}
+  % --- boucle
+  \node[etape,right=of consts,xshift=4mm] (render) {rendu : \code{analyze_cfg(render_cfg, initial_env, S)} $\to$ \code{block_states}, $R$ \hfill l.~355--380};
+  \node[etape,below=of render] (memo) {\code{env_exit} ; mémos : \code{recompute_memo(deps, env_exit)} \hfill l.~382--413};
+  \node[etape,below=of memo] (eff) {effets : $E = \bigsqcup$ \code{analyze_cfg(body, env_exit, S)} \hfill l.~415--449};
+  \node[etape,below=of eff] (hdl) {handlers : $H = \bigsqcup$ \code{analyze_cfg(body, env_exit, S)} \hfill l.~451--483};
+  \node[etape,below=of hdl] (join) {$N = R \join E \join H \join$ \code{shared_state.slice(id)} \hfill l.~485--493};
+  \node[etape,below=of join,draw=ra-amber] (test) {$N \lleq S$ ? \hfill l.~495};
+  \node[etape,below=of test] (widen) {\code{iteration}++ ; $S := N$ ou $S := S \widen_T N$ (+ \code{widen_trace}) ; cap 100 \hfill l.~499--529};
+  \begin{scope}[on background layer]
+    \node[zone,fit=(render)(widen),label={[etiquette,anchor=south west]north west:boucle externe (\code{loop}, l.~355--530)}] (loop) {};
+  \end{scope}
+  % --- post
+  \node[etape,below=of widen,yshift=-6mm] (refresh) {rafraîchissement : \code{analyze_cfg(render_cfg, initial_env, S)}, \code{inter = None} \hfill l.~532--563};
+  \node[etape,below=of refresh] (pure) {\code{effect_setter_writes} : effets rejoués depuis $\Bot$ \hfill l.~565--594};
+  \node[etape,below=of pure] (rel) {relations : \relation{slot_writers}, \relation{slot_seeds}, \relation{registrations}, \relation{effect_triggers} \hfill l.~596--667};
+  \node[etape,below=of rel,fill=white] (out) {\texttt{AnalysisResult \{ state\_store: S, iterations, widen\_trace, \dots \}} \hfill l.~670--697};
+  \begin{scope}[on background layer]
+    \node[zone,fit=(refresh)(out),label={[etiquette,anchor=south west]north west:post-convergence}] (post) {};
+  \end{scope}
+  % --- flèches
+  \foreach \a/\b in {consts/util,util/hooks,hooks/thr,thr/seed,render/memo,memo/eff,eff/hdl,hdl/join,join/test,refresh/pure,pure/rel,rel/out} { \draw[fleche] (\a) -- (\b); }
+  \draw[fleche] (seed.east) -- ++(4mm,0) |- (render.west);
+  \draw[fleche] (test) -- node[etiquette,right]{non} (widen);
+  \draw[fleche] (widen.east) -- ++(4mm,0) |- node[etiquette,pos=0.25,right]{tour suivant} (render.east);
+  \draw[flechemust] (test.west) -- ++(-4mm,0) |- node[etiquette,pos=0.25,left]{oui} (refresh.west);
+\end{tikzpicture}
+\caption{Le flot de \code{analyze_component_impl}
+(\file{src/engine/fixpoint.rs}). Les numéros de ligne sont ceux du commit
+\snapshotCommit. La préparation s'exécute une fois ; la boucle externe
+répète les quatre passes jusqu'à $N \lleq S$ ; la post-convergence recalcule
+ce que les règles liront.}
+\label{fig:point-fixe-composant-flot}
+\end{figure}
+
+% ===========================================================================
+\section{La préparation : ce qui se passe une fois}
+\label{sec:point-fixe-composant-preparation}
+
+Avant le premier tour, \code{analyze_component_impl} transforme le
+\code{ComponentIR} qu'il reçoit (\src{src/engine/fixpoint.rs}{139}{353}).
+Rien de ce qui suit n'est répété : les CFG sont modifiés en place par les
+greffes, les seuils sont récoltés une fois, l'état est amorcé une fois. La
+boucle n'a ensuite plus qu'à exécuter.
+
+\subsection{Les constantes de module}
+
+Un composant lit souvent des constantes définies au niveau du module
+(\code{const LIMIT = 10;}, \code{const EMPTY = [];},
+\code{const Ctx = createContext(...)}). Sans traitement particulier, une
+lecture de \code{LIMIT} dans le rendu tomberait sur une variable absente de
+l'environnement, donc sur $\Top$ (\cref{chap:transfert-stores}) --- et une constante
+\code{EMPTY} passée en dep se lirait \og peut changer à chaque rendu\fg.
+
+\rustsnippet[label={lst:point-fixe-composant-consts}]{src/engine/fixpoint.rs}{153}{190}{les constantes de module amorcent deux environnements}
+
+Le lowering a rangé ces constantes dans \code{comp.module_consts}
+(\cref{chap:ir}), sous la forme d'un \code{ModuleConstInit} : un littéral
+primitif (\code{Prim}), une référence (\code{Ref}) ou un objet de contexte
+(\code{Context}). La boucle les évalue une fois, contre des stores vides et un
+environnement vide, et les place dans deux environnements distincts :
+\begin{itemize}
+  \item \code{initial_env}, l'environnement d'entrée du rendu, où une liaison
+    déjà présente --- une prop liée par le parent en analyse inter --- l'emporte
+    sur la constante de même nom ;
+  \item \code{module_env}, qui ne contient \emph{que} les constantes, et qui
+    servira d'environnement d'entrée aux corps des arguments de hooks opaques
+    (voir plus bas) : une constante de module a la même valeur en tout point
+    du programme, c'est la seule liaison que l'on puisse y semer sans risque.
+\end{itemize}
+
+\begin{react}[Constantes de module]
+Un module ECMAScript est évalué une fois par vie du programme ; une
+\code{const} de module ne change donc jamais entre deux rendus, quel que soit
+le composant qui la lit. C'est ce qui autorise \code{Stability::Stable} pour
+une référence de module, alors qu'un littéral objet écrit \emph{dans} le corps
+du composant vaut \code{PerRender} (\cref{def:stabilite}). Un objet
+\code{createContext(...)} est une référence de module comme une autre ; le
+rôle \code{Context} qu'il porte en plus n'est lu que par les règles
+(\code{unstable-context-value}), pas par le moteur.
+\end{react}
+
+\subsection{L'expansion : les utilitaires, puis les hooks personnalisés}
+\label{sec:point-fixe-composant-expansion}
+
+Le composant que reçoit la boucle n'est pas toujours celui que le programmeur
+a écrit. Un \code{useTicker(5)} n'est pas un hook natif : l'IR le représente
+par une entrée \code{HookEntry::Custom} et un \code{HookMarker} au site
+d'appel, et rien dans le domaine ne sait ce qu'il fait. De même, un appel
+\code{helper(x);} en position d'instruction est un \code{Call} opaque, qui
+s'évalue à $\Top$. La préparation remplace ce qu'elle peut par le corps
+correspondant, greffé dans le CFG de l'appelant --- c'est l'\emph{inlining}
+du \cref{chap:splice-inlining}, dont nous ne reprenons ici que ce que le point
+fixe en fait.
+
+\rustsnippet[label={lst:point-fixe-composant-expansion}]{src/engine/fixpoint.rs}{192}{229}{les deux expansions, dans cet ordre}
+
+L'ordre est voulu (commentaire des l.~200--201) : les utilitaires d'abord,
+pour qu'un hook appelé \emph{dans} un utilitaire devienne visible à
+l'expansion des hooks ; les hooks ensuite, \emph{avant} l'amorçage, pour que
+les \code{useState} d'un hook greffé soient amorcés comme les autres.
+
+\paragraph{Un exemple.} Le composant \code{Clock} appelle un hook
+personnalisé qui, à lui seul, boucle :
+
+\begin{lstlisting}[language=TypeScript,caption={Un hook personnalisé qui boucle (\file{/tmp/ch13/ticker.tsx})},label={lst:point-fixe-composant-ticker}]
+import { useState, useEffect } from "react";
+
+function useTicker(start: number) {
+  const [t, setT] = useState(start);
+  useEffect(() => {
+    setT(t + 1);
+  });
+  return t;
+}
+
+export function Clock() {
+  const t = useTicker(5);
+  return <div>{t}</div>;
+}
+\end{lstlisting}
+
+La sonde montre les deux visages du même composant. En \emph{intra}
+(\code{analyze_component}), l'entrée \code{hook 0: Custom useTicker} n'est
+pas expansée ; le store est vide et la boucle s'arrête au premier tour
+(\code{iterations = 0}). En \emph{inter} (\code{analyze_program}, le chemin
+du CLI), l'entrée \code{Custom} de label 0 a été remplacée par un
+\code{State} de label 1 et un \code{Effect} de label 2, l'init \code{start} a
+été substitué par \code{5}, et le point fixe trouve la divergence :
+
+\begin{sortie}
+## engine result Clock
+  iterations = 3
+  state_store = s1=num[5,inf]
+  effect_setter_writes = s1=num[6,inf]
+  widen_trace = [(1, WidenEvent { iteration: 3, writers: [2] })]
+\end{sortie}
+\begin{sortie}
+  [verbose] Clock: 3 iteration(s), widened: [1]
+  Clock  (1 hooks)  ticker.tsx
+    warn   infinite-loop  [hook:1]  (line 5:2)  this effect keeps pushing state `t` to new values on every run. Potential infinite render loop
+\end{sortie}
+
+Le rapport dit \code{(1 hooks)} --- le composant tel qu'écrit n'a qu'un
+appel de hook --- mais désigne \code{[hook:1]}, le label du \code{useState}
+greffé, et pointe la ligne 5, dans le corps de \code{useTicker}. C'est la
+provenance (\code{inline_origins}, \adr{19}) qui permet aux règles de
+retrouver ce fichier et cette ligne.
+
+\paragraph{Ce que fait \code{expand_custom_hooks}.} La fonction
+(\src{src/engine/fixpoint.rs}{889}{1142}) parcourt \code{hooks} par indice et,
+pour chaque entrée \code{Custom} qu'elle sait résoudre, la remplace par les
+sous-entrées du hook. Les étapes, avec leurs lignes :
+
+\begin{enumerate}
+  \item \emph{Sortie immédiate} sans \code{inter} ou sans
+    \code{HookRegistry} (l.~898--901) : c'est pourquoi l'analyse intra ne
+    greffe rien.
+  \item \emph{Garde de récursion par nom} (l.~927--931) : un ensemble
+    \code{expanding} des noms déjà greffés ; une seconde occurrence du même
+    nom est sautée et reste opaque.
+  \item \emph{Résolution} (l.~933--942) : d'abord la clé
+    \code{(fichier résolu, nom)}, sinon le premier hook de ce nom, trié par
+    clé (\code{get_by_name}). C'est plus permissif que la résolution des
+    utilitaires, qui est fail-closed (voir plus bas).
+  \item \emph{Repli sur un résumé} (l.~943--994) : un hook absent du registre
+    mais connu du \code{SummaryRegistry} (TanStack, React Router\dots) n'est
+    pas greffé ; son \code{HookMarker} est ré-étiqueté avec un
+    \code{SummaryValue} (\code{retag_marker}), et l'entrée \code{Custom} est
+    \emph{conservée} pour que les règles des hooks voient toujours le site
+    d'appel.
+  \item \emph{Décalage des labels} (l.~996--997) : \code{offset} est le
+    premier label libre ; les sous-entrées du hook sont renumérotées
+    à partir de lui, ce qui donne le label 1 au \code{useState} de
+    \code{Clock}.
+  \item \emph{Substitution des paramètres dans les inits}
+    (l.~999--1007) : les initialiseurs de \code{useState} sont évalués dans
+    un environnement séparé qui ne voit pas les liaisons du rendu
+    (\cref{sec:point-fixe-composant-amorcage}) ; \code{useState(start)} doit
+    donc devenir \code{useState(5)} par substitution syntaxique.
+  \item \emph{Sel et identités} (l.~1012--1026) : \code{salt.take(span)}
+    fournit un sel d'alpha-renommage (les locales du hook deviennent
+    \code{t\#0}, \code{setT\#0}) et un décalage d'\code{ExprId} pour les
+    sites d'allocation ; la table de renommage évite les liaisons de
+    l'appelant (\issue{141}).
+  \item \emph{Greffe du corps entier} au site du \code{HookMarker}
+    (l.~1043--1078), retour lié à la variable de l'appelant, et
+    enregistrement de la région greffée (\adr{27} §4 : une écriture dans
+    cette région est \og via \code{useTicker}\fg, pas directe). À défaut de
+    marqueur, cas défensif, seules les instructions du bloc d'entrée sont
+    greffées et la provenance du rendu est empoisonnée
+    (\code{render_poisoned}, fail-closed, l.~1079--1109).
+  \item \emph{Provenance} (l.~1111--1130) : un \code{InlineOrigin} et les
+    lignes \code{HookProvenance} du hook, décalées et marquées
+    \code{inlined: true} (\adr{23}).
+  \item \emph{Remplacement sans avancer} (l.~1132--1141) : l'entrée
+    \code{Custom} est remplacée par les sous-entrées, et l'indice \code{i}
+    n'est pas incrémenté, car la première sous-entrée peut elle-même être un
+    \code{Custom} : l'expansion est récursive, bornée par la garde de
+    récursion.
+\end{enumerate}
+
+Les deux réserves d'identités que consomme chaque greffe vivent dans une
+petite structure :
+
+\rustsnippet[label={lst:point-fixe-composant-spliceids}]{src/engine/fixpoint.rs}{828}{867}{les identités d'une greffe : sel et curseur d'\code{ExprId}}
+
+\begin{invariant}{Réserves monotones sur tout le composant}{point-fixe-composant-spliceids}
+Le sel et le curseur d'allocation de \code{SpliceIds} ne font que croître
+pendant toute la préparation d'un composant, greffes d'utilitaires, greffes
+de hooks et formes de résumé (\code{alloc_one}) comprises. Deux greffes
+n'occupent donc jamais le même site d'allocation, et le même hook greffé
+deux fois ne partage pas une entrée du tas (\issue{134}).
+\end{invariant}
+
+\begin{decision}[ADR-005 --- portée intra-procédurale et registre modulaire de hooks]
+\emph{Décision} (\adr{5}, 2026-05-29). Chaque composant est analysé
+indépendamment ; un hook inconnu rend \code{Unknown} ; un registre de
+modèles de hooks à quatre couches (natifs, bibliothèques, configuration
+utilisateur, repli) évite l'inlining ; une phase 2 ultérieure ajoutera un
+inlining \emph{call-string-1}. \emph{Ce qu'il en est au commit
+\snapshotCommit.} L'inlining des hooks personnalisés existe
+(\code{expand_custom_hooks}), et il n'est pas limité à la profondeur 1 : il
+est récursif, gardé par nom. Le trait \code{HookModel} de l'ADR est devenu
+\code{HookSummary} (\file{src/registry/summary.rs}) et la configuration est
+\file{reactant.config.json}, pas \file{reactant.toml}. L'ADR n'a pas été
+amendé ; sa lecture doit se faire avec ces trois corrections.
+\end{decision}
+
+\paragraph{Les utilitaires.} \code{expand_utility_calls}
+(\src{src/engine/fixpoint.rs}{1554}{1602}) parcourt le rendu puis chaque corps
+d'\code{Effect}, \code{Memo}, \code{Callback} et \code{Handler} --- pas les
+inits de \code{State} ni les arguments des \code{Custom} --- et appelle
+\code{inline_in_cfg} sur chacun :
+
+\rustsnippet[label={lst:point-fixe-composant-inline}]{src/engine/fixpoint.rs}{1611}{1634}{la boucle de greffes d'un CFG et son budget}
+
+Trois propriétés à retenir. La cible est une \emph{instruction}
+(\code{let x = util(...)} ou \code{util(...);}, \code{utility_call_target},
+l.~1698--1718) : un appel en position d'expression reste opaque
+(\issue{52}). La résolution du nom est fail-closed
+(\code{FunctionRegistry::resolve}, \src{src/engine/function_registry.rs}{51}{63}) :
+une définition dans le fichier de la région où se trouve l'appel, sinon
+l'arête d'import résolue au lowering pour ce nom local, jamais une devinette
+par nom à travers les fichiers. Enfin le budget \code{max_inline_depth} est
+\emph{par CFG} (\code{let mut budget = ctx.max_depth} au début de chaque
+\code{inline_in_cfg}), décrémenté même quand la greffe échoue, et chaque nom
+n'est greffé qu'une fois par CFG (\code{expanding}, neuf pour chaque CFG) :
+un second appel du même utilitaire dans le même corps reste un \code{Call}
+opaque.
+
+\begin{piege}
+Le drapeau \code{truncated}, qui signale qu'un appel est resté opaque faute
+de budget, n'est enregistré que sous \code{Some(inter)}
+(\cref{lst:point-fixe-composant-expansion}, l.~211) : il vit dans
+\code{AnalysisStats}, accessible seulement par l'\code{InterCtx}. En
+phase 2 --- et en intra --- il est jeté. Nous l'avons vérifié avec un
+composant \code{A} qui appelle dix utilitaires \code{u1(1); ... u10(1);}
+(budget 8), dans deux versions. Quand \code{A} est une racine (il rend un
+\code{<div>}), le CLI émet
+\code{info analysis-limit utility inlining ran out of splice budget here, so the remaining utility calls are treated as unknown (FN possible) [...]}
+puis \code{suspended analysis-limit 9 passing check(s) withheld}. Quand
+\code{A} et \code{B} se rendent mutuellement --- aucune racine, tous deux en
+phase 2 ---, la troncature a lieu de même, mais le CLI publie pour \code{A}
+neuf lignes \code{verified} et aucune Info. Les assurances couvrent alors
+du code que l'analyse n'a pas lu, contrairement à l'intention écrite au
+commentaire de \code{inline_in_cfg} (l.~1621--1625). Ce n'est pas une
+sous-approximation du store (les appels opaques valent $\Top$), mais un
+défaut de la couche de certification ; aucune issue ne le décrit au commit
+\snapshotCommit. Le correctif naturel, au niveau central, serait de porter le
+drapeau sur l'\code{AnalysisResult} plutôt que sur les statistiques inter.
+\end{piege}
+
+\begin{piege}
+La garde de récursion par \emph{nom} coupe aussi le second appel légitime
+d'un même hook. Avec \code{const a = useTicker(5); const b = useTicker(9);},
+seul le premier est greffé ; pour le second le CLI émet
+\code{info analysis-limit [hook:1] (line 13:8) hook `useTicker` was not found in the registry. Pass its source file or add a HookSummary to analyse it (FN possible)}
+puis suspend sept assurances. Le comportement est sound (le second appel
+vaut $\Top$ et le composant retient ses assurances), mais le message est
+trompeur : le hook \emph{est} dans le registre. Le commentaire de la garde
+(l.~884--888) assume ce cas comme \og rare\fg{} et \og FN, not FP\fg{} ;
+c'est un compromis, pas un défaut, au sens de \file{docs/limitations.md}.
+\end{piege}
+
+\paragraph{Les arguments des hooks restés opaques.} Un \code{useStore(s => s.count)}
+qui n'a été ni greffé ni résumé garde son entrée \code{Custom}. Le moteur
+exécute tout de même le corps de ses arguments \code{FnLit} (ou d'une variable
+dont la liaison à un littéral de fonction est certifiée syntaxiquement,
+\code{certified_fn_binding}), avec ses paramètres liés à $\Top$ sur
+\code{module_env}, et range la valeur de retour jointe dans
+\code{custom_arg_returns}, clé \code{(label, indice)}
+(\src{src/engine/fixpoint.rs}{231}{277}). L'argument de soundness tient en
+une phrase du commentaire : une capture non constante lit $\Top$, qui
+sur-approxime sa valeur en tout point du programme, donc quel que soit le
+moment où la bibliothèque appelle le sélecteur, la valeur stockée le couvre.
+Ce champ sert au vocabulaire déclaratif (\adr{23} §3, \cref{chap:regles-declaratives}).
+
+\subsection{Les seuils de widening}
+\label{sec:point-fixe-composant-seuils}
+
+Le widening des intervalles saute à $\pm\infty$ dès qu'une borne bouge ; avec
+lui, le compteur gardé \code{if (count < 10) setCount(count + 1)} vaudrait
+$[0, +\infty]$ alors que la garde le borne à 10. Le \emph{widening à seuils}
+(\cref{def:widening}) saute à la place au plus petit seuil qui englobe la
+nouvelle borne, et à $\pm\infty$ seulement au-delà du dernier seuil. Les
+seuils sont récoltés une fois, après expansion :
+
+\rustsnippet[label={lst:point-fixe-composant-thresholds}]{src/engine/fixpoint.rs}{1185}{1224}{la récolte des seuils : tous les littéraux numériques, y compris dans les fermetures}
+
+\begin{decision}[ADR-014 --- widening à seuils, et pas de narrowing]
+\emph{Contexte} (\adr{14}, 2026-06-27). \code{Interval::widen} jette toute
+l'information numérique ; l'information qui bornerait la croissance (le
+littéral \code{10} de la garde) est pourtant dans le programme.
+\emph{Décision, partie 1.} Un ensemble fini de seuils $T$ par composant ;
+\code{widen_to} ajouté à côté de \code{widen} sans changer la signature du
+trait, en ne traitant que la composante numérique ; les seuils sont possédés
+par le pilote du point fixe et passés en argument, jamais stockés dans les
+valeurs. \emph{Partie 2, abandonnée} (révision du 2026-06-28). Le narrowing
+classique --- une phase descendante après le post-point fixe --- n'a pas été
+implémenté : le raffinement de branche pendant la montée plus le widening à
+seuils, y compris sur l'arc arrière interne d'\code{analyze_cfg}, retrouvent
+déjà toutes les bornes littérales ; et une descente ne pourrait de toute
+façon pas faire redescendre le store d'état, dont les écritures s'accumulent
+par join monotone. Trois conséquences annoncées ne sont donc pas réalisées :
+\code{WidenOutcome}, \code{Config::narrow_iterations}, et la suppression du
+recalcul \code{effect_setter_writes}, que l'ADR qualifie de \og crude
+precision-recovery hack\fg{} et qui est resté
+(\cref{sec:point-fixe-composant-pure}).
+\end{decision}
+
+Deux écarts entre le code et sa documentation sont à connaître. L'ADR
+annonçait pour seuils les littéraux des \emph{gardes} et des inits ; le code
+prend \emph{tous} les littéraux numériques du rendu, des inits de
+\code{State}, des corps d'\code{Effect} et de \code{Handler}, en descendant
+dans les \code{FnLit} (l.~1217--1219). C'est sans conséquence de soundness
+(\og over-collecting is harmless\fg, l.~1189--1190) : l'ensemble reste fini,
+un seuil de plus n'est qu'une borne candidate de plus. Inversement, la doc de
+la fonction annonce \og all hook bodies\fg{} (l.~1187), mais les corps de
+\code{Memo} et de \code{Callback} et les arguments des \code{Custom} ne sont
+pas parcourus (le \code{match} des l.~1195--1201 les ignore). La
+\cref{tab:point-fixe-composant-seuils} donne les seuils des exemples du
+chapitre.
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+composant & littéraux du programme & $T$ \\
+\midrule
+\code{Runaway} & \code{useState(0)}, \code{x + 1} & $\{0, 1\}$ \\
+\code{Counter} & \code{useState(0)}, \code{count + 1} (dans le \code{onClick}) & $\{0, 1\}$ \\
+\code{Guarded} & \code{useState(0)}, \code{count < 10}, \code{count + 1} & $\{0, 1, 10\}$ \\
+\code{Lazy} & \code{useState(() => 7)}, \code{v < 20}, \code{v + 1} & $\{1, 7, 20\}$ \\
+\code{Dead} & \code{useState(0)}, \code{const k = 3}, \code{k > 10}, \code{n + 1} & $\{0, 1, 3, 10\}$ \\
+\code{Loader} & \code{useState(0)}, \code{setN(42)} & $\{0, 42\}$ \\
+\bottomrule
+\end{tabular}
+\caption{Les seuils récoltés par \code{collect_thresholds} sur les exemples
+du chapitre (relevés par la sonde). Le \code{7} de \code{Lazy} vient du
+corps du \code{FnLit} initialiseur ; le \code{3} de \code{Dead} n'est pas une
+garde mais une constante locale, et bornera pourtant la croissance d'un
+palier (\cref{sec:point-fixe-composant-trous}).}
+\label{tab:point-fixe-composant-seuils}
+\end{table}
+
+\subsection{Les corps de \code{useCallback}}
+
+Un \code{useCallback} est réécrit par le lowering en \code{CallbackVal(l)} :
+son corps quitte l'arbre d'expressions et vit dans l'entrée
+\code{HookEntry::Callback}. Pour qu'un appel à travers la variable liée
+(\code{const cb = useCallback(...); onLoad={(e) => cb(e)}}) exécute encore
+le corps pour ses effets de bord, la préparation construit une table
+\code{callback_bodies} des corps par label, exposée à l'interpréteur par
+\code{QueryContext::callback_body} (\src{src/engine/fixpoint.rs}{282}{295},
+\cref{chap:transfert-stores}). C'est le seul rôle du
+\code{FixpointCtx} construit à chaque passe : ses deux autres champs,
+\code{state} et \code{memo}, ne sont lus par aucune méthode du trait, et
+semblent résiduels.
+
+\subsection{L'amorçage des slots}
+\label{sec:point-fixe-composant-amorcage}
+
+Le sujet du point fixe est déclaré, avec ses compagnons, juste avant la
+boucle :
+
+\rustsnippet[label={lst:point-fixe-composant-porteurs}]{src/engine/fixpoint.rs}{297}{312}{le store sujet du point fixe et les accumulateurs de la boucle}
+
+Puis chaque \code{useState} reçoit la valeur de son initialiseur :
+
+\rustsnippet[label={lst:point-fixe-composant-seed}]{src/engine/fixpoint.rs}{314}{353}{l'amorçage : un join par \code{useState}, l'initialiseur paresseux exécuté}
+
+L'init est évalué dans \code{initial_env} (constantes et props venues du
+parent), contre des stores \emph{vides} et un tas neuf : un initialiseur ne
+lit pas l'état, il le crée. Le cas particulier des l.~342--346 mérite un
+rappel de React.
+
+\begin{react}[Initialiseur paresseux]
+\code{useState(() => e)} appelle le thunk \emph{une fois}, au montage, et
+stocke sa valeur de retour ; aux rendus suivants l'argument est ignoré
+(\og React saves the initial state once and ignores it on the next
+renders\fg, \cite{ReactDocs}). L'état n'est jamais la fermeture elle-même.
+Abstraire le \code{FnLit} comme une référence (ce que faisait une version
+antérieure) faisait de chaque slot à init paresseux un \og dep instable\fg{}
+--- un faux positif de corpus, cité par le commentaire. Le moteur exécute
+donc le corps du thunk (\code{exec_body}) et amorce le slot avec son retour.
+La règle \regle{lazy-init} exploite l'autre moitié du fait : un argument
+\emph{non} paresseux est ré-évalué à chaque rendu pour rien.
+\end{react}
+
+\begin{exemple}{Un initialiseur paresseux et le seuil 20}{point-fixe-composant-lazy}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch13/lazy.tsx}},label={lst:point-fixe-composant-lazy}]
+import { useState, useEffect } from "react";
+
+export function Lazy() {
+  const [v, setV] = useState(() => 7);
+  useEffect(() => { if (v < 20) setV(v + 1); }, [v]);
+  return <div>{v}</div>;
+}
+\end{lstlisting}
+L'IR de l'init est \texttt{FnLit \{ params: [], body\_cfg: Return(Lit(Int(7))) \}}.
+L'amorçage donne \code{s0=num[7,7]}, pas une référence. Les tours donnent
+$[7,8]$, $[7,9]$ (joins), puis au troisième changement le widening à seuils
+cherche le plus petit seuil $\geq 10$ dans $T = \{1, 7, 20\}$ : c'est 20, d'où
+$[7,20]$, stable au tour suivant. Sonde : \code{iterations = 3},
+\code{state_store = s0=num[7,20]}, \code{effect_setter_writes = s0=num[8,20]},
+\texttt{widen\_trace = [(0, WidenEvent \{ iteration: 3, writers: [1] \})]}. Le
+CLI n'émet que l'Info \regle{widening-info} et conclut
+\code{✓ 1 file(s) no issues found.} : le slot a été widené, mais la valeur
+que l'effet écrit est bornée (\cref{sec:point-fixe-composant-pure}).
+\end{exemple}
+
+\begin{piege}
+Le cas paresseux n'est reconnu que pour un \code{FnLit} \emph{sans paramètre
+écrit en place}. Avec \code{const makeInit = () => 7;} au niveau du module
+puis \code{useState(makeInit)}, l'init est un \code{Var} : il est évalué comme
+une expression ordinaire, pas exécuté. Et \code{makeInit} n'est pas une
+constante de module au sens du lowering. \code{ModuleConstInit} ne retient
+que les littéraux primitifs, les objets, tableaux, \code{new}, regex et JSX,
+et \code{createContext} (\src{src/lowering/mod.rs}{314}{336}), pas une
+fonction fléchée. La lecture de \code{makeInit} manque donc l'environnement
+et vaut $\Top$. Observé sur \file{/tmp/ch13/makeinit.tsx} (composant
+\code{LazyVar}) avec le même effet \code{if (v < 20) setV(v + 1)} : la sonde
+donne l'amorçage \code{s0=⊤}, \code{iterations = 0}, et le CLI émet un
+\Warning{} \regle{infinite-loop} (\og may store a fresh reference into state
+`v`\fg) : un faux positif. L'amorçage reste sound, car $\Top$ contient 7 ;
+c'est seulement une perte de précision.
+\end{piege}
+
+\begin{invariant}{Tout slot est présent dès l'amorçage}{point-fixe-composant-amorcage}
+Après l'amorçage, chaque label \code{State} du composant (hooks greffés
+compris) est une clé du store, même si sa valeur est $\Bot$ (un init qui
+s'évalue à $\Bot$ est rarissime, mais \code{update} insère la clé de toute
+façon). Une passe qui part de \code{state.clone()} rend donc un store dont
+\code{labels()} liste \emph{tous} les slots, qu'elle les ait écrits ou non.
+Ce fait anodin explique une imprécision de provenance décrite au
+\cref{sec:point-fixe-composant-widen-trace}.
+\end{invariant}
+
+% ===========================================================================
+\section{Un tour de la boucle externe}
+\label{sec:point-fixe-composant-tour}
+
+La boucle (\src{src/engine/fixpoint.rs}{355}{530}) est une itération de
+Kleene \emph{globale} (\cref{def:point-fixe}) : chaque tour ré-exécute tous
+les corps, dans un ordre fixe, à partir du même store $S$. Il n'y a pas de
+worklist à ce niveau --- la worklist n'existe qu'à l'intérieur d'un CFG
+(\cref{chap:cfg-analyzer-dominance}). Chaque tour commence par
+\code{let mut state_store = state.clone();} (l.~356) : c'est cette copie, et
+non \code{state}, que toutes les passes du tour reçoivent et enrichissent.
+
+\subsection{La passe de rendu}
+
+\rustsnippet[label={lst:point-fixe-composant-render}]{src/engine/fixpoint.rs}{355}{380}{la passe de rendu d'un tour}
+
+L'environnement d'entrée est \code{initial_env} : les constantes de module et,
+en analyse inter, les props que le parent a liées. \code{analyze_cfg} rend les
+environnements de sortie de chaque bloc (\code{bs}, rangé dans
+\code{block_states} malgré son nom, \cref{chap:cfg-analyzer-dominance})
+et un store \code{state_from_render}, noté $R$, qui part de
+\code{state_store} et y joint chaque écriture rencontrée pendant le rendu.
+Comme \code{analyze_cfg} part d'une copie du store reçu et n'y fait que
+joindre (\srcline{src/engine/cfg_analyzer.rs}{49},
+\cref{chap:cfg-analyzer-dominance}), $R \lgeq S$ toujours.
+Deux sortes d'écritures peuvent survenir pendant un rendu : un setter appelé
+dans le corps (\regle{setter-in-render} s'en occupe), et, quand \code{inter}
+est présent, l'analyse d'un enfant \code{<Child .../>} rencontré dans le JSX,
+lancée \emph{pendant} le rendu par \code{eval_comp_app}
+(\cref{chap:transfert-stores}) ; l'enfant peut alors écrire dans le
+\code{SharedStateStore}, que le test de convergence importera.
+
+\subsection{Les mémos : une valeur qui n'est qu'une stabilité}
+\label{sec:point-fixe-composant-memos}
+
+\rustsnippet[label={lst:point-fixe-composant-memo}]{src/engine/fixpoint.rs}{382}{413}{le recalcul des mémos depuis l'environnement de sortie du rendu}
+
+L'environnement de sortie du rendu, \code{env_exit}, est le join des
+environnements de sortie des blocs terminés par \code{Return} :
+
+\rustsnippet[label={lst:point-fixe-composant-exitenv}]{src/engine/fixpoint.rs}{1226}{1237}{\code{exit_env} : le join des sorties, par \code{reduce} et non par \code{fold}}
+
+Le \code{reduce} plutôt que \code{fold(bottom, join)} n'est pas une
+coquetterie : \code{AbstractEnv::bottom()} n'est pas neutre pour le join
+(une variable présente d'un seul côté devient $\Top$,
+\cref{chap:cfg-analyzer-dominance}) ; un CFG sans \code{Return}
+atteint rend un environnement vide, dont chaque lecture vaut $\Top$. C'est
+sound, et cette fonction est dupliquée à l'identique dans
+\code{AnalysisResult::exit_env} (\src{src/engine/analysis_result.rs}{274}{289}).
+
+Le recalcul lui-même est délégué au domaine
+(\code{Transfer::recompute_memo}, \cref{chap:transfert-stores}) : la
+valeur d'un \code{useMemo} ou d'un \code{useCallback} est
+\emph{uniquement une stabilité de référence} --- \code{Stable} pour des
+deps \code{[]} connues vides, \code{Unknown} pour des deps illisibles,
+sinon le join des stabilités de ses deps, un dep \code{StateVal(l)} donnant
+\code{Versioned({(composant, l)})}. Le corps du mémo n'est \emph{jamais}
+exécuté par le moteur : \code{useMemo(() => x + 1, [x])} n'a pas de
+composante numérique. Deux détails de la boucle en découlent.
+
+\begin{itemize}
+  \item Les écritures dans le memo store sont \emph{différées} (commentaire des
+    l.~383--387) : chaque \code{recompute_memo} lit un instantané cohérent,
+    et une chaîne mémo $\to$ mémo converge \og à travers les itérations\fg,
+    avec un tour de retard par maillon.
+  \item Le rendu du tour $n$ lit les mémos calculés au tour $n-1$, puisque le
+    recalcul suit la passe de rendu. Au tour 0, il n'y a encore rien, et
+    \code{MemoStore::get} d'un label absent vaut $\Top$ :
+\end{itemize}
+
+\rustsnippet[label={lst:point-fixe-composant-memoget}]{src/domains/stores/memo_store.rs}{27}{30}{un mémo pas encore calculé vaut $\Top$ --- à l'inverse du \code{StateStore}, où l'absent vaut $\Bot$}
+
+\begin{exemple}{Une boucle portée par un \code{useMemo}}{point-fixe-composant-memoloop}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch13/memoloop.tsx}},label={lst:point-fixe-composant-memoloop}]
+import { useState, useEffect, useMemo } from "react";
+
+export function MemoLoop() {
+  const [x, setX] = useState(0);
+  const d = useMemo(() => x + 1, [x]);
+  useEffect(() => {
+    setX(d);
+  }, [d]);
+  return <div>{x}</div>;
+}
+\end{lstlisting}
+Concrètement le composant boucle ($0 \to 1 \to 2 \to \dots$). Abstraitement,
+au tour 0 le rendu lie \code{d} à \code{MemoVal(1)} avant tout recalcul, soit
+$\Top$ ; l'effet exécute \code{setX(⊤)} et le slot saute à $\Top$ en un
+tour ; le tour 1 ne change rien. La sonde donne \code{iterations = 1},
+\code{state_store = s0=⊤}, \code{widen_trace = []}, et après convergence le
+mémo vaut \texttt{ref:Versioned(\{(C0, 0)\})}, d'où
+\code{effect_setter_writes = s0=ref:Versioned(...)} et un trigger
+\code{exact: false}. Le CLI répond \code{✓ 1 file(s) no issues found.} : un
+faux négatif, que nous rangerons au \cref{sec:point-fixe-composant-trous}
+(\issue{157}). La leçon pour la boucle : \emph{un slot qui atteint $\Top$ par
+join n'a pas été widené}, donc n'est pas dans \code{widen_trace}, donc n'est
+pas un signal de divergence.
+\end{exemple}
+
+\begin{piege}
+Le memo store n'entre pas dans le test de convergence : seul le
+\code{StateStore} y est comparé. Le memo store est recalculé à chaque tour et
+son dernier contenu est publié, mais si un mémo change au dernier tour sans
+que l'état change, aucun tour supplémentaire ne rejoue les effets avec sa
+nouvelle valeur. Les effets du tour ne la voient pas non plus : ils lisent
+la variable liée par le rendu, donc le mémo du recalcul précédent. Sur
+\code{MemoLoop}, l'effet du tour 0 écrit bien $\Top$, pas la valeur
+\code{Versioned} calculée juste avant lui. La question est donc de savoir si
+une valeur de mémo peut \emph{monter} entre deux tours sans que l'état
+bouge. Les deux sources de variation connues descendent. $\Top$ au tour 0
+laisse place à une stabilité plus précise. Dans une chaîne \code{m2}
+$\to$ \code{m1}, \code{m2} garde un tour de retard, mais sur une valeur de
+\code{m1} qui elle-même ne fait que descendre. Dans ces deux cas, la valeur
+périmée qu'une écriture a jointe dans l'état est au-dessus de la valeur
+finale, et l'état reste sound. Un dep dérivé de l'état reste la seule voie de
+montée. Un dep qui \emph{est} un slot n'en fait pas partie, car il vaut
+toujours \code{Versioned} (\src{src/domains/transfer/state_value.rs}{79}{88}).
+Au commit \snapshotCommit, nous n'avons pas construit d'instance d'une telle
+montée. La passe de rafraîchissement du \cref{sec:point-fixe-composant-post}
+corrige de toute façon ce que les \emph{règles} lisent.
+\end{piege}
+
+\subsection{Les effets : tous, à chaque tour, depuis la sortie du rendu}
+\label{sec:point-fixe-composant-effets}
+
+\rustsnippet[label={lst:point-fixe-composant-effets}]{src/engine/fixpoint.rs}{415}{449}{les passes d'effets d'un tour}
+
+Trois décisions tiennent dans ces trente lignes.
+
+\paragraph{Tous les effets, quelles que soient leurs deps.} Le motif
+\texttt{HookEntry::Effect \{ label, body\_cfg, .. \}} ignore \code{deps}. Un effet
+\code{[]} de montage, un effet \code{[count]}, un effet sans tableau sont
+exécutés de la même façon, à chaque tour. C'est une sur-approximation de la
+règle de React \og l'effet tourne si et seulement si un dep a changé selon
+\code{Object.is}\fg{} (\cref{chap:react-modele}) : l'ensemble des écritures
+possibles est un sur-ensemble de ce que React ferait. La précision est
+récupérée \emph{dans les règles}, qui relisent les deps : \regle{infinite-loop}
+saute les effets à \code{[]} et ceux dont tous les deps sont prouvés stables
+(\src{src/rules/impls/infinite_loop.rs}{96}{113}), et la relation
+\relation{effect_triggers} dit lesquels un slot relance. L'\adr{4} décrivait
+au contraire \og for each Effect whose decision = Effect\fg{} ; le code a
+choisi plus large, et il n'a pas de notion de décision.
+
+\paragraph{Depuis \code{env_exit}.} Chaque effet part de l'environnement de
+sortie du rendu de \emph{ce} tour : il voit les valeurs que ce rendu a
+liées, exactement comme la fermeture que React a créée pendant le rendu.
+
+\paragraph{Depuis le même \code{state_store}.} Tous les effets du tour
+reçoivent la même copie \code{state_store} ; ce qu'un effet écrit n'est pas
+visible des effets suivants du même tour, seulement du tour suivant, via
+le join \code{state_from_effects}. L'ordre concret des effets (enfants
+d'abord, puis ordre syntaxique) est abstrait par un join commutatif.
+
+\begin{react}[Fermetures, file de mises à jour et batching]
+Un effet est une fermeture créée pendant le rendu : il lit les variables du
+rendu qui l'a créé, pas les valeurs courantes (\textsc{Eff} de React-tRace
+met en file $\langle \lambda\_.e, \sigma\rangle$ avec l'environnement
+$\sigma$ \emph{du rendu}, \cref{chap:react-modele}). Un \code{setX(v)}
+n'écrit pas l'état : il met \code{v} en file, et React applique la file au
+rendu suivant --- depuis React 18, toutes les mises à jour d'un même effet ou
+d'un même événement sont regroupées (\emph{batching}). Le moteur abstrait ce
+double mécanisme en un seul : la mise à jour faible
+$S[\ell] := S[\ell] \join v$, qui contient tout résultat possible de la file
+(dernier gagne, updaters enchaînés, bail-out \code{Object.is}), au prix de
+l'ordre. Un effet qui appelle \code{setM(doubled)} puis
+\code{setM(prev => prev + 1)} voit, dans l'updater, un \code{prev} qui
+contient déjà la première écriture de la passe --- c'est la file, abstraite.
+\end{react}
+
+\begin{exemple}{Un effet de montage, rejoué à chaque tour}{point-fixe-composant-loader}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch13/loader.tsx}},label={lst:point-fixe-composant-loader}]
+import { useState, useEffect } from "react";
+
+export function Loader() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    setN(42);
+  }, []);
+  return <div>{n}</div>;
+}
+\end{lstlisting}
+React exécute l'effet une fois. Le moteur l'exécute à chaque tour :
+\begin{center}\small
+\begin{tabular}{@{}lllll@{}}
+\toprule
+tour & $R$ & effet 1 & $N$ & action \\
+\midrule
+amorçage & & & & \code{s0=num[0,0]} \\
+0 & $[0,0]$ & $[0,42]$ & $[0,42]$ & \code{iteration = 1} $< 3$ : $S := N$ \\
+1 & $[0,42]$ & $[0,42]$ & $[0,42]$ & $N \lleq S$ : sortie \\
+\bottomrule
+\end{tabular}
+\end{center}
+Résultat : \code{iterations = 1}, \code{s0=num[0,42]} --- l'enveloppe
+convexe de $\{0, 42\}$, que le domaine des intervalles ne peut pas
+distinguer de $\{0, \dots, 42\}$ ---, \code{effect_setter_writes =
+s0=num[42,42]}, aucun trigger (deps \code{[]}). La ré-exécution au tour 1
+est sans conséquence ici (l'écriture est idempotente). Le CLI émet un
+\Warning{} \regle{unnecessary-rerender} (\og mount-only effect sets state
+`n` to a constant different from its initial value\fg) et
+\code{verified infinite-loop}.
+\end{exemple}
+
+\begin{exemple}{Deux effets qui se nourrissent : le batching abstrait}{point-fixe-composant-mutual}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch13/mutual.tsx}},label={lst:point-fixe-composant-mutual}]
+import { useState, useEffect } from "react";
+
+export function Mutual() {
+  const [x, setX] = useState(0);
+  const [y, setY] = useState(0);
+  useEffect(() => { setY(x + 1); }, [x]);
+  useEffect(() => { setX(y + 1); }, [y]);
+  return <div>{x + y}</div>;
+}
+\end{lstlisting}
+Au tour 0, les deux effets partent du même store $\{s_0 = [0,0], s_1 = [0,0]\}$ :
+\begin{sortie}
+    iter 0: effect 2 out = s0=num[0,0], s1=num[0,1]
+    iter 0: effect 3 out = s0=num[0,1], s1=num[0,0]
+    iter 0: render out = s0=num[0,0], s1=num[0,0]
+    iter 0: new_state = s0=num[0,1], s1=num[0,1]
+\end{sortie}
+L'effet 3 ne voit pas l'écriture de l'effet 2 : il lit $y = [0,0]$ et écrit
+$x \in [0,1]$. Chaque tour n'ajoute donc que $+1$ à chaque slot, et le
+troisième changement déclenche le widening des deux :
+\code{s0=num[0,inf], s1=num[0,inf]}, \code{widen_trace} sur les labels 0 et
+1. Le CLI émet deux \Warning{} \regle{infinite-loop} (un par slot) et deux
+\regle{derived-state}.
+\end{exemple}
+
+\subsection{Les handlers : dans le point fixe, hors du signal}
+\label{sec:point-fixe-composant-handlers}
+
+\rustsnippet[label={lst:point-fixe-composant-handlers}]{src/engine/fixpoint.rs}{451}{483}{les passes de handlers : même schéma que les effets, avec le commentaire décisif}
+
+Le lowering a extrait chaque \code{onClick={...}} et chaque
+\code{addEventListener(ev, fn)} d'un effet en une entrée
+\code{HookEntry::Handler} avec son propre CFG (\cref{chap:lowering-cfg}).
+Les handlers sont analysés exactement comme les effets --- même
+\code{env_exit}, même \code{state_store} --- et leur store $H$ est joint
+dans $N$. Mais leur croissance n'entre pas dans \code{widen_trace}. Le
+commentaire des l.~452--453 dit tout : \og Handlers run 0..N times $\to$
+include in fixpoint for sound range approx. NOT tracked in widened\_labels
+(handler-caused widening $\neq$ InfiniteLoop)\fg.
+
+\begin{react}[Événements]
+Un handler s'exécute sur une entrée extérieure, zéro, une ou $N$ fois, dans
+un ordre arbitraire par rapport aux autres handlers ; en React-tRace c'est
+\textsc{StepEvent}, qui n'est franchi qu'en mode \emph{event loop}
+(\cref{chap:react-modele}). Un compteur que l'utilisateur
+incrémente mille fois atteint mille : c'est une \emph{valeur} que l'analyse
+doit admettre, mais ce n'est pas une boucle, puisque chaque tour exige un
+clic. Un effet qui incrémente, lui, relance le cycle sans intervention.
+\end{react}
+
+\begin{decision}[ADR-009 --- points d'entrée et classes de déclenchement]
+\emph{Décision} (\adr{9}). Un composant est un ensemble de \emph{points
+d'entrée} --- rendu, effets, callbacks différés (\code{.then}, timers),
+handlers --- analysés par la même machinerie, et qui ne diffèrent que sur deux
+axes : \og dans le cycle automatique ?\fg{} et \og un widening induit est-il
+un bug ?\fg. Le rendu \emph{est} le cycle ; un effet ou un \code{.then} y sont
+(oui / oui) ; un handler n'y est pas (non / non : \og clicking 1000$\times$
+isn't a bug\fg). La §5 de l'ADR (\emph{multiplicity}) demande que les
+handlers soient tout de même dans la boucle de point fixe, pour la
+soundness des intervalles, avec widening, mais exclus du signal ---
+c'est le code des l.~451--483 et le filtre \code{new_state_incycle} du test
+de convergence. \emph{Alternative refusée} : descendre uniformément dans
+tout callback, qui produirait un faux positif \regle{infinite-loop} sur
+\code{addEventListener('click', () => setCount(c => c + 1))}. \emph{Un choix
+en tension} : pour un callee \code{Unknown}, l'ADR retient \code{skip}
+(\og we accept the FN\fg), ce que l'invariant du projet interdit en principe ;
+le mécanisme B6 du \cref{chap:transfert-stores} en réduit la portée.
+\end{decision}
+
+\begin{exemple}{Un compteur par clic : widené, pas tracé}{point-fixe-composant-counter}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch13/counter.tsx}},label={lst:point-fixe-composant-counter}]
+import { useState } from "react";
+
+export function Counter() {
+  const [count, setCount] = useState(0);
+  return <button onClick={() => setCount(count + 1)}>{count}</button>;
+}
+\end{lstlisting}
+IR : \code{hook 0: State init=Lit(Int(0))}, \code{hook 1: Handler click}.
+Seuils $\{0, 1\}$.
+\begin{center}\small
+\begin{tabular}{@{}llllp{52mm}@{}}
+\toprule
+tour & $R$ & handler 1 & $N$ & action \\
+\midrule
+0 & $[0,0]$ & $[0,1]$ & $[0,1]$ & \code{iteration = 1} : $S := N$ \\
+1 & $[0,1]$ & $[0,2]$ & $[0,2]$ & \code{iteration = 2} : $S := N$ \\
+2 & $[0,2]$ & $[0,3]$ & $[0,3]$ & \code{iteration = 3} : \code{widen_to} $\to [0,+\infty]$ ; labels changés dans $R \join E$ : aucun \\
+3 & $[0,+\infty]$ & $[0,+\infty]$ & $[0,+\infty]$ & $N \lleq S$ : sortie \\
+\bottomrule
+\end{tabular}
+\end{center}
+Sonde : \code{iterations = 3}, \code{state_store = s0=num[0,inf]},
+\code{widen_trace = []}. CLI : \code{Counter: 3 iteration(s), widened: []},
+aucun diagnostic. Le slot est bien widené (l'intervalle $[0,+\infty]$ est
+la seule valeur sound pour un compteur de clics), mais comme seul le handler
+l'a fait bouger, \code{changed_labels} de $R \join E$ est vide et rien
+n'entre dans \code{widen_trace}.
+\end{exemple}
+
+L'inverse est tout aussi important : les handlers font partie du point fixe
+\emph{pour rendre les effets sound}. Le test unitaire
+\code{handler_enables_infinite_loop_detection}
+(\src{src/engine/fixpoint.rs}{2564}{2694}) analyse un effet
+\code{if (count > 1) setCount(count + 1)} avec deps \code{[count]}, plus un
+handler \code{setCount(count + 1)}. Sans les handlers dans la boucle, le
+slot resterait à $[0,0]$. Dans la branche, \code{count} serait raffiné à
+$\Bot$ (\code{narrow_gt(1)} sur $[0,0]$), l'écriture \code{count + 1} vaudrait
+$\Bot$, et la boucle infinie que
+déclenche le \emph{deuxième} clic ne serait jamais vue : un faux négatif.
+Avec eux, le handler fait croître \code{count} tour après tour jusqu'à
+rendre la branche vivante ; l'effet écrit alors, et c'est \emph{lui} qui
+fait entrer le label dans \code{widen_trace}. Les handlers participent à la
+\emph{valeur} sans participer au \emph{signal}.
+
+\subsection{Le join et le test de convergence}
+\label{sec:point-fixe-composant-join}
+
+\rustsnippet[label={lst:point-fixe-composant-test}]{src/engine/fixpoint.rs}{485}{497}{le join des quatre sources et le test d'arrêt}
+
+Le nouvel état est le join de quatre stores : $R$ (rendu), $E$ (effets),
+$H$ (handlers) et la tranche du \code{SharedStateStore} qui concerne ce
+composant --- les écritures faites, pendant ce tour ou un tour antérieur,
+par un setter de ce composant appelé \emph{ailleurs} (un enfant qui a reçu
+\code{setCount} en prop). C'est ici, et non en tête de boucle, que
+l'étape 1 du plan de \cref{lst:point-fixe-composant-signature} a lieu.
+Le store partagé n'a qu'une opération d'extraction :
+
+\rustsnippet[label={lst:point-fixe-composant-slice}]{src/domains/stores/shared_state_store.rs}{57}{66}{la tranche d'un composant dans le \code{SharedStateStore}}
+
+et le test d'arrêt est l'ordre point à point des stores :
+
+\rustsnippet[label={lst:point-fixe-composant-leq}]{src/domains/stores/state_store.rs}{69}{77}{$S \lleq S'$ : chaque label de $S$ est en dessous de sa valeur dans $S'$}
+
+\code{leq_pointwise} s'appuie sur le \code{PartialOrd} de \code{StateValue}
+(\code{Less | Equal}) : deux valeurs incomparables font échouer le test, ce
+qui est la bonne réponse (le nouvel état n'est pas contenu dans l'ancien).
+
+\begin{proposition}{Le test d'arrêt est un test d'égalité}{point-fixe-composant-egalite}
+À chaque tour, $R \lgeq S$, $E \lgeq S$ et $H \lgeq S$, car chacune de ces
+passes part de \code{state.clone()} et n'y fait que joindre
+(\srcline{src/engine/cfg_analyzer.rs}{49}) ; donc $N \lgeq S$. Par
+antisymétrie, \code{new_state.leq(&state)} équivaut à $N = S$ sur tous les
+labels : la boucle s'arrête exactement quand un tour de plus n'a rien
+ajouté. La suite $(S_k)$ est croissante, et $S_k$ à l'arrêt est un
+post-point fixe de la fonction \og un tour\fg{} au sens de la
+\cref{def:point-fixe-composant-etat}.
+\end{proposition}
+
+La tranche partagée réserve une surprise que le \cref{sec:point-fixe-composant-trous}
+détaillera : quand \code{inter} est présent, un composant écrit \emph{ses
+propres} slots dans le \code{SharedStateStore}. Sur \code{Counter} analysé
+par \code{analyze_program}, la sonde lit
+\texttt{shared\_state = \{(ComponentId(0), 0): number[1, inf]\}} --- l'écriture
+du handler, rangée dans le store partagé par le second bras de
+\code{exec_setter_call} (\src{src/domains/interp/interpreter.rs}{368}{391}),
+puis réimportée par \code{slice}. Ici c'est sans effet (la valeur est déjà
+dans $H$) ; avec un updater fonctionnel, ce ne l'est plus.
+
+% ===========================================================================
+\section{Convergence, widening et terminaison}
+\label{sec:point-fixe-composant-convergence}
+
+\subsection{Le compteur et les deux opérateurs}
+
+Quand $N \not\lleq S$, la boucle doit choisir comment avancer :
+
+\rustsnippet[label={lst:point-fixe-composant-widen}]{src/engine/fixpoint.rs}{499}{530}{join tant que le compteur est bas, widening à seuils ensuite, garde-fou à cent}
+
+Lecture pas à pas.
+
+\begin{enumerate}
+  \item \emph{Le compteur} \code{iteration} n'est incrémenté que si l'état a
+    changé. Au $k$-ième tour (compté de 0) qui change l'état, il passe à
+    $k+1$. Avec \code{widen_threshold = 3}, les deux premiers changements
+    sont des joins ($S := N$), le troisième et les suivants des widenings.
+    Le compteur est \emph{global au composant}, pas par label : un slot qui
+    commence à croître tard est widené dès son premier changement si le
+    seuil est déjà atteint.
+  \item \emph{Le widening} \code{widen_to(&new_state, &thresholds)} porte
+    sur \emph{tout} le store, y compris la croissance venue des handlers ;
+    mais \code{widen_trace} ne retient que les labels changés dans
+    \code{new_state_incycle} $= R \join E$ (l.~518). C'est la traduction
+    exacte de l'\adr{9} : la valeur est sound, le signal ne compte que le
+    cycle.
+  \item \emph{La première itération gagne} : \code{or_insert_with} garde
+    l'événement du premier widening d'un label, le plus informatif pour la
+    chaîne de témoins (\adr{19}).
+  \item \emph{Le garde-fou} : à \code{iteration >= 100}, un widening
+    \emph{sans seuils} (\code{widen}, pas \code{widen_to}) sur tout le store,
+    tous les labels du store dans \code{widen_trace} (y compris ceux qui
+    n'ont pas bougé), et \code{break} immédiat.
+\end{enumerate}
+
+Au niveau du store, les trois opérateurs ne diffèrent que par la fonction
+appliquée à chaque label :
+
+\rustsnippet[label={lst:point-fixe-composant-merge}]{src/domains/stores/state_store.rs}{35}{62}{\code{join}, \code{widen}, \code{widen_to} : un seul parcours, trois combinateurs}
+
+et au niveau de la valeur, seule la composante numérique a des seuils :
+
+\rustsnippet[label={lst:point-fixe-composant-svwiden}]{src/domains/impls/state_value.rs}{657}{676}{le widening du produit : intervalles et chaînes ont un vrai widening, le reste est un join}
+
+L'\cref{alg:point-fixe-composant-boucle} récapitule la boucle complète, garde-fou
+et provenance compris ; c'est la version détaillée de
+l'algorithme réduit du \cref{chap:react-modele}.
+
+\begin{algorithm}[htbp]
+\Entree{\code{render_cfg}, \code{hooks} (après expansion), \code{initial_env}, seuils $T$, $t$ = \code{widen_threshold}}
+\Sortie{$S$ convergé, \code{iteration}, \code{widen_trace}}
+$S \leftarrow \Bot$ ; \PourCh{$\mathtt{State}\{\ell, \mathit{init}\}$}{$S[\ell] \leftarrow S[\ell] \join \sem{\mathit{init}}$}
+$i \leftarrow 0$ ; $\mathit{trace} \leftarrow \emptyset$\;
+\Tq{vrai}{
+  $S' \leftarrow$ copie de $S$\;
+  $(\mathit{bs}, R) \leftarrow \mathtt{analyze\_cfg}(\mathtt{render\_cfg}, \mathtt{initial\_env}, S')$ ; $\mathit{env} \leftarrow \mathtt{exit\_env}(\mathit{bs})$\;
+  \PourCh{$\mathtt{Memo}/\mathtt{Callback}\{\ell, \mathit{deps}\}$}{$\mathit{memo}[\ell] \leftarrow \mathtt{recompute\_memo}(\mathit{deps}, \mathit{env})$ \tcp*{écritures différées}}
+  $E \leftarrow \Bot$ ; $W \leftarrow \emptyset$\;
+  \PourCh{$\mathtt{Effect}\{e, \mathit{body}\}$}{$(\_, E_e) \leftarrow \mathtt{analyze\_cfg}(\mathit{body}, \mathit{env}, S')$ ; $E \leftarrow E \join E_e$ ; $W[\ell] \mathrel{+}= e$ pour tout $\ell \in \mathtt{labels}(E_e)$\;}
+  $H \leftarrow \Bot$ ; \PourCh{$\mathtt{Handler}\{h, \mathit{body}\}$}{$(\_, H_h) \leftarrow \mathtt{analyze\_cfg}(\mathit{body}, \mathit{env}, S')$ ; $H \leftarrow H \join H_h$\;}
+  $N_{\mathrm{cycle}} \leftarrow R \join E$ ; $N \leftarrow N_{\mathrm{cycle}} \join H \join \mathtt{shared.slice}(\mathit{comp})$\;
+  \Si{$N \lleq S$}{\textbf{sortir}\;}
+  $i \leftarrow i + 1$\;
+  \Si{$i \geq 100$}{$\mathit{trace}[\ell] \leftarrow (i, W[\ell])$ pour tout $\ell \in \mathtt{labels}(S)$ non déjà tracé ; $S \leftarrow S \widen N$ ; \textbf{sortir}\;}
+  \eSi{$i \geq t$}{
+    \PourCh{$\ell \in \mathtt{changed\_labels}(N_{\mathrm{cycle}}, S)$ non déjà tracé}{$\mathit{trace}[\ell] \leftarrow (i, W[\ell])$\;}
+    $S \leftarrow S \widen_T N$\;
+  }{$S \leftarrow N$\;}
+}
+\caption{La boucle externe de \code{analyze_component_impl}
+(\src{src/engine/fixpoint.rs}{297}{530}). $W$ est la table locale
+\code{slot_writers} (\og quels effets ont un store contenant $\ell$\fg) ;
+$\widen_T$ est \code{widen_to} avec les seuils $T$.}
+\label{alg:point-fixe-composant-boucle}
+\end{algorithm}
+
+\subsection{Trois déroulés}
+\label{sec:point-fixe-composant-deroules}
+
+Les tableaux qui suivent ont été relevés avec la réplique de la sonde ; les
+valeurs finales coïncident avec celles du moteur.
+
+\paragraph{\code{Runaway} (\cref{lst:point-fixe-composant-runaway}).} Seuils
+$\{0, 1\}$. L'effet lit \code{x} dans \code{env_exit} (la valeur de fin de
+rendu) et écrit \code{x + 1} :
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}lllp{54mm}@{}}
+\toprule
+tour & \code{env_exit(x)} & effet 1 & $N$ et action \\
+\midrule
+0 & $[0,0]$ & $[0,0] \join ([0,0] + 1) = [0,1]$ & $[0,1]$ ; \code{iteration = 1} : $S := [0,1]$ \\
+1 & $[0,1]$ & $[0,1] \join [1,2] = [0,2]$ & $[0,2]$ ; \code{iteration = 2} : $S := [0,2]$ \\
+2 & $[0,2]$ & $[0,3]$ & $[0,3]$ ; \code{iteration = 3} : \texttt{widen\_to([0,2],} \texttt{[0,3], \{0,1\})} : la borne haute 3 dépasse 2 et aucun seuil n'est $\geq 3$ : $+\infty$ ; \texttt{widen\_trace[0]} $=$ \texttt{\{3, [1]\}} \\
+3 & $[0,+\infty]$ & $[0,+\infty]$ & $N \lleq S$ : sortie, \code{iterations = 3} \\
+\bottomrule
+\end{tabular}
+\caption{Les tours de \code{Runaway}.}
+\label{tab:point-fixe-composant-runaway}
+\end{table}
+
+\paragraph{\code{Guarded}.} Le compteur gardé, cas d'école de l'\adr{14} :
+
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch13/guarded.tsx}},label={lst:point-fixe-composant-guarded}]
+import { useState, useEffect } from "react";
+
+export function Guarded() {
+  const [count, setCount] = useState(0);
+  useEffect(() => {
+    if (count < 10) setCount(count + 1);
+  }, [count]);
+  return <div>{count}</div>;
+}
+\end{lstlisting}
+
+Seuils $\{0, 1, 10\}$. L'effet a quatre blocs (\code{Branch count < 10},
+la branche qui écrit, la branche vide, la jonction) et le raffinement de
+garde (\code{narrow_env_for_branch}, \cref{chap:cfg-analyzer-dominance}) borne \code{count} dans la
+branche \emph{then} :
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}llllp{58mm}@{}}
+\toprule
+tour & \code{count} & \code{count} dans le \emph{then} & effet & $N$ et action \\
+\midrule
+0 & $[0,0]$ & $[0,0]$ & $[0,1]$ & join \\
+1 & $[0,1]$ & $[0,1]$ & $[0,2]$ & join \\
+2 & $[0,2]$ & $[0,2]$ & $[0,3]$ & \code{iteration = 3} : plus petit seuil $\geq 3$ : \textbf{10} ; $S := [0,10]$ ; \code{widen_trace[0]} \\
+3 & $[0,10]$ & \code{narrow_lt(10)} : $[0,9]$ & $[0,10] \join [1,10]$ & $[0,10] \lleq S$ : sortie \\
+\bottomrule
+\end{tabular}
+\caption{Les tours de \code{Guarded} : le seuil 10 arrête la croissance, et la
+garde raffinée rend l'écriture bornée.}
+\label{tab:point-fixe-composant-guarded}
+\end{table}
+
+Résultat : \code{s0=num[0,10]}, \code{effect_setter_writes = s0=num[1,10]},
+un trigger \texttt{\{hook: 1, dep: 0, slot: (C0, 0), exact: true\}}. Le CLI
+n'émet que l'Info \regle{widening-info} et \code{verified infinite-loop} :
+le label est bien dans \code{widen_trace}, mais l'écriture rejouée est
+bornée (\cref{sec:point-fixe-composant-pure}).
+
+\paragraph{\code{Dead}.} Un dernier déroulé montre ce qu'un seuil qui n'est
+pas une garde fait à la suite :
+
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch13/dead.tsx}},label={lst:point-fixe-composant-dead}]
+import { useState, useEffect } from "react";
+
+export function Dead() {
+  const [n, setN] = useState(0);
+  const k = 3;
+  useEffect(() => {
+    if (k > 10) { setN(n + 1); }
+  });
+  return <div>{n}</div>;
+}
+\end{lstlisting}
+
+\begin{sloppypar}
+Concrètement, \code{k > 10} est toujours faux : l'effet n'écrit jamais.
+Abstraitement, \code{narrow_env_for_branch} raffine \code{k} à $\Bot$ dans la
+branche, mais le bloc est tout de même exécuté
+(\cref{chap:cfg-analyzer-dominance}) ; \code{setN(n + 1)} lit \code{n},
+qui n'est pas raffiné, et écrit. Seuils $\{0, 1, 3, 10\}$ : la suite est
+$[0,1]$, $[0,2]$ (joins), puis $[0,3]$ au seuil 3, puis $[0,10]$ au seuil 10,
+puis $[0,+\infty]$ ; \code{iterations = 5}, et \texttt{widen\_trace[0]} vaut
+\texttt{\{iteration: 3, writers: [1]\}} (la première itération de widening,
+pas la dernière). Le CLI émet un \Warning{} \regle{infinite-loop} : un faux
+positif, toléré par l'invariant, dont la cause est au
+\cref{chap:cfg-analyzer-dominance} et pas dans la boucle externe.
+\end{sloppypar}
+
+\subsection{\code{iterations} et \code{widen_trace}}
+\label{sec:point-fixe-composant-widen-trace}
+
+Deux champs de l'\code{AnalysisResult} racontent la convergence.
+\code{iterations} est la valeur du compteur à la sortie : le nombre de tours
+qui ont \emph{changé} l'état, pas le nombre de tours exécutés (il y en a
+toujours un de plus). Un composant dont l'état ne bouge pas au premier tour
+a \code{iterations = 0} : c'est le cas de \code{Fresh}
+(\cref{lst:point-fixe-composant-fresh}), dont le store est à
+\code{PerRender} dès l'amorçage. \code{widen_trace} est la table des labels
+widenés par le cycle :
+
+\rustsnippet[label={lst:point-fixe-composant-widenevent}]{src/engine/analysis_result.rs}{18}{28}{la provenance d'un widening}
+
+Elle a deux lecteurs : \regle{widening-info}
+(\srcline{src/rules/impls/widening_info.rs}{20}), qui émet une Info par
+label, et la première porte de \regle{infinite-loop}
+(\cref{sec:point-fixe-composant-pure}). Le champ \code{iteration} est exact.
+Le champ \code{writers} ne l'est pas.
+
+\begin{piege}
+\code{writers} est censé lister \og les effets dont la passe a écrit ce slot
+pendant l'itération du widening\fg. Il liste en réalité \emph{tous les
+effets du composant}, pour chaque slot. La table locale \code{slot_writers}
+(\cref{lst:point-fixe-composant-effets}, l.~444--446) est remplie pour chaque
+label de \code{eff_state.labels()} ; or \code{eff_state} part de
+\code{state_store.clone()}, qui contient tous les slots amorcés
+(\cref{inv:point-fixe-composant-amorcage}). Sur \code{Mutual}
+(\cref{lst:point-fixe-composant-mutual}), la sonde donne
+\code{writers: [2, 3]} pour les deux slots, et la chaîne \code{--trace} du
+CLI attribue à l'effet 3 une écriture de \code{y} qu'il ne fait pas :
+\begin{sortie}
+    warn   infinite-loop  [hook:1]  (line 6:2)  this effect keeps pushing state `y` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop
+       → state `y` is written here [hook:2] (line 6:2)
+       → state `y` is written here [hook:3] (line 7:2)
+       → the abstract value of state `y` kept growing and was widened at iteration 3
+\end{sortie}
+Aucun verdict n'en dépend : c'est une imprécision de \emph{provenance}, pas
+de soundness. Le correctif naturel serait de ne retenir que
+\code{eff_state.changed_labels(&state_store)}.
+\end{piege}
+
+\subsection{Terminaison}
+\label{sec:point-fixe-composant-terminaison}
+
+\begin{theoreme}{Terminaison de la boucle externe}{point-fixe-composant-terminaison}
+Pour tout composant et tout ensemble fini de seuils $T$, la boucle de
+\code{analyze_component_impl} s'arrête. Preuve. La suite $(S_k)$ est
+croissante (\cref{prop:point-fixe-composant-egalite}) et, à partir du tour
+$t$, chaque pas est un widening $S \widen_T N$ point à point sur des valeurs
+\code{StateValue}. Il suffit donc que toute chaîne
+$v_0 \lleq v_0 \widen_T v_1 \lleq \dots$ de \code{StateValue} se stabilise,
+composante par composante (\cref{lst:point-fixe-composant-svwiden}) :
+\begin{itemize}
+  \item \code{num} : \code{Interval::widen_to} ne fait que relâcher les
+    bornes vers un seuil de $T$ ou vers $\pm\infty$ ; chaque borne visite
+    chaque seuil au plus une fois avant $\pm\infty$
+    (\src{src/domains/impls/interval.rs}{112}{146}, \adr{14}) : au plus
+    $2(|T| + 1)$ pas ;
+  \item \code{str} : \code{StrConst::widen} bascule à $\Top$ au-delà de
+    \code{STR_WIDEN_THRESHOLD = 4} constantes
+    (\srcline{src/domains/impls/str_const.rs}{8}) ;
+  \item \code{reference} : \code{Stability::widen} est le join
+    (\src{src/domains/impls/stability.rs}{144}{146}) sur un treillis de
+    hauteur finie, les ensembles \code{Versioned} étant plafonnés à
+    \code{VERSIONED_LABELS_THRESHOLD = 4} labels
+    (\srcline{src/domains/impls/stability.rs}{11}) ;
+  \item \code{boolean}, \code{null}, \code{undef}, \code{other},
+    \code{setter} : treillis finis.
+\end{itemize}
+Le nombre de labels est fini (fixé par l'expansion), donc le store se
+stabilise, et le test $N \lleq S$ réussit. Le garde-fou à cent tours n'est
+pas nécessaire à l'argument ; c'est une ceinture de sécurité.
+\end{theoreme}
+
+Les $t - 1$ premiers pas sont des joins, en nombre borné par $t$ ; le tas et
+le memo store ne participent pas au test et ne peuvent pas retarder l'arrêt.
+La complexité est celle de $O(k)$ tours, chacun coûtant une passe de
+\code{analyze_cfg} sur le rendu, chaque effet et chaque handler, avec $k$
+borné par $t$ plus la hauteur effective ci-dessus. Le dépôt ne publie pas,
+au commit \snapshotCommit, de distribution de \code{iterations} sur le
+corpus. Sur les exemples de ce chapitre, la valeur la plus haute est
+\code{iterations = 5} (\code{Dead}), atteinte en franchissant deux seuils
+avant $+\infty$.
+
+\begin{piege}
+Le garde-fou n'est jamais exercé : \code{grep 'iteration >= 100'} ne trouve
+que \srcline{src/engine/fixpoint.rs}{500}, aucun test. S'il était atteint,
+le résultat serait $S \widen N$ sans re-vérification : un widening est
+au-dessus du join de ses opérandes, donc au-dessus de $N$, mais rien ne
+garantit qu'un tour de plus depuis ce nouvel état n'ajouterait rien ; le
+résultat pourrait sous-approximer d'un tour. Par le
+\cref{thm:point-fixe-composant-terminaison}, ce cas ne devrait pas se
+produire ; il n'est pas démontré qu'il ne se produit pas.
+\end{piege}
+
+% ===========================================================================
+\section{Après la convergence}
+\label{sec:point-fixe-composant-post}
+
+Le store a convergé ; il reste à produire ce que les règles liront. Deux
+passes supplémentaires et une tranche de calculs relationnels y pourvoient
+(\src{src/engine/fixpoint.rs}{532}{698}).
+
+\subsection{Rafraîchir le rendu}
+
+\rustsnippet[label={lst:point-fixe-composant-refresh}]{src/engine/fixpoint.rs}{532}{563}{une passe de rendu de plus, sur les stores convergés}
+
+Le commentaire dit pourquoi. Dans la boucle, le recalcul des mémos
+\emph{suit} la passe de rendu : la dernière passe --- et tout ce que les
+règles en lisent, \code{env_exit}, \code{block_states}, les objets alloués
+dans le tas --- a donc figé les mémos de l'itération \emph{précédente}. Pour
+un composant qui converge au premier tour, cela signifie $\Top$ pour chaque
+\code{useCallback}, et un callback prouvablement stable se lirait \og peut
+changer entre deux rendus\fg. Une passe de plus sur les stores convergés
+donne aux règles ce qu'elles veulent. Deux détails : \code{inter} est
+\code{None} (la passe ré-évalue et ré-alloue, elle ne ré-analyse pas les
+enfants), et le store de sortie de cette passe est jeté
+(\code{let (bs, _) = ...}) --- l'état convergé est $S$, pas un $S$ enrichi
+d'un tour de plus.
+
+\begin{invariant}{D'où vient chaque champ de l'\code{AnalysisResult}}{point-fixe-composant-provenance}
+\code{state_store} est le $S$ convergé de la boucle. \code{block_states} et
+\code{env_exit} (donc tout ce qui est évalué \og dans l'environnement de
+sortie du rendu\fg{} : triggers, sites, sondes des règles) viennent de la
+passe de \emph{rafraîchissement}. \code{effect_block_states} et
+\code{handler_block_states} viennent de la \emph{dernière itération} de la
+boucle (écrasés à chaque tour, l.~443 et~480). \code{memo_store} est le
+dernier recalcul, effectué au dernier tour. \code{heap} a été muté en place
+par toutes les passes, rafraîchissement et ré-exécution des effets compris.
+\code{effect_setter_writes} vient de la passe décrite ci-dessous.
+\end{invariant}
+
+\subsection{Les écritures pures des effets}
+\label{sec:point-fixe-composant-pure}
+
+\rustsnippet[label={lst:point-fixe-composant-pure}]{src/engine/fixpoint.rs}{565}{594}{rejouer les effets depuis un store $\Bot$ pour isoler ce qu'ils écrivent}
+
+Le store convergé de \code{Guarded} est $[0,10]$ ; celui de \code{Runaway}
+est $[0,+\infty]$ ; tous deux sont dans \code{widen_trace}. Pour les
+distinguer, il faut savoir non pas \emph{ce que vaut} le slot, mais
+\emph{ce que l'effet y écrit} : $[1,10]$, borné par la garde, contre
+$[1,+\infty]$. C'est ce que calcule la ré-exécution de chaque effet depuis
+un store $\Bot$, dans le même \code{env_exit} et contre les mêmes mémos : le
+store de sortie ne contient que les écritures des setters, sans la valeur
+préexistante. Les deux portes du bras intra de \regle{infinite-loop} lisent
+les deux champs dans l'ordre :
+
+\rustsnippet[label={lst:point-fixe-composant-portes}]{src/rules/impls/infinite_loop.rs}{128}{136}{les deux portes du bras intra}
+
+avec le prédicat de divergence :
+
+\rustsnippet[label={lst:point-fixe-composant-unbounded}]{src/domains/impls/state_value.rs}{371}{382}{ce que \og non borné\fg{} veut dire pour une valeur du produit}
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}>{\raggedright}p{0.17\linewidth}>{\raggedright}p{0.13\linewidth}>{\raggedright}p{0.1\linewidth}>{\raggedright}p{0.17\linewidth}>{\raggedright}p{0.14\linewidth}>{\raggedright\arraybackslash}X@{}}
+\toprule
+composant & \code{state_store} & tracé & \code{effect_setter_writes} & porte 2 & verdict \\
+\midrule
+\code{Runaway} & $[0,+\infty]$ & oui & $[1,+\infty]$ & non borné & \Warning \\
+\code{Guarded} & $[0,10]$ & oui & $[1,10]$ & borné & absous \\
+\code{Lazy} & $[7,20]$ & oui & $[8,20]$ & borné & absous \\
+\code{Dead} & $[0,+\infty]$ & oui & $[1,+\infty]$ & non borné & \Warning{} (FP) \\
+\code{Loader} & $[0,42]$ & non & $[42,42]$ & --- & absous, porte 1 \\
+\code{MemoLoop} & $\Top$ & non & \code{ref:Versioned} & --- & absous, porte 1 (FN) \\
+\code{Updater} (intra) & $[0,+\infty]$ & oui & $\Bot$ & $\Bot$ : ne pas absoudre & \Warning \\
+\bottomrule
+\end{tabularx}
+\caption{Les deux portes de \regle{infinite-loop} sur les exemples du
+chapitre (valeurs relevées par la sonde, verdicts du CLI). \code{Updater}
+est donné sur le chemin intra ; le chemin du CLI est au
+\cref{sec:point-fixe-composant-trous}.}
+\label{tab:point-fixe-composant-portes}
+\end{table}
+
+L'\adr{14} qualifie ce bloc de \og crude precision-recovery hack\fg{} et
+prévoyait de le supprimer avec le narrowing ; le narrowing ayant été
+abandonné, le bloc est resté, et il est le seul mécanisme du moteur qu'un
+ADR désigne ainsi. Il a un effet de bord à connaître.
+
+\begin{piege}
+Un updater fonctionnel rejoué depuis $\Bot$ écrit $\Bot$. Le premier bras de
+\code{exec_setter_call} (\src{src/domains/interp/interpreter.rs}{352}{360})
+lie le paramètre de \code{setX(c => c + 1)} à \code{ctx.state.get(label)}, qui
+vaut $\Bot$ dans le store \code{bottom_state} ; $\Bot + 1 = \Bot$. C'est
+exactement ce que montre \code{Updater} en intra :
+\code{effect_setter_writes = s0=⊥} alors que \code{state_store = s0=num[0,inf]}.
+La règle en tient compte : la porte 2 n'absout que si \code{!writes.is_bottom_value()}
+--- $\Bot$ signifie \og je ne sais pas ce qui a été écrit\fg, pas \og rien n'a
+été écrit\fg. Les tests de \file{tests/functional_updater.rs}
+(\code{functional_updater_without_deps_is_flagged}, etc.) fixent ce
+comportement, sur le chemin intra.
+\end{piege}
+
+\subsection{La tranche des relations}
+
+Le reste de la fonction (\src{src/engine/fixpoint.rs}{596}{667}) ne
+calcule plus rien sur le store : il dérive des \emph{relations} sur les CFG,
+dans les environnements convergés. Le moteur n'est ici qu'un ordonnanceur ;
+le \cref{chap:relations} détaille chaque relation. L'ordre compte :
+\code{collect_hook_calls}, \code{collect_effect_info},
+\code{collect_handler_info} d'abord (l.~596--598) ; puis les setters
+\emph{étrangers} (un setter reçu en prop d'un parent, qualifié par son
+propriétaire, l.~601--605) et les environnements par région
+(\code{SiteEnvs}, l.~608--618) dont \relation{slot_writers} a besoin ;
+\relation{slot_seeds} après, parce qu'elle replie les lignes de
+\relation{slot_writers} et les deps des effets (l.~627--642) ;
+\relation{registrations} (l.~646) ; enfin \relation{effect_triggers} :
+
+\rustsnippet[label={lst:point-fixe-composant-triggers}]{src/engine/fixpoint.rs}{647}{667}{la relation \relation{effect_triggers}, évaluée dans \code{env_exit} contre le store convergé}
+
+Chaque dep d'un effet est évalué par \code{eval_in_stores}
+(\cref{chap:cfg-analyzer-dominance}) dans l'environnement de sortie du
+rendu rafraîchi, contre \code{final_state} et le memo store, sur une copie
+jetable du tas. Un dep qui \emph{est} un slot donne une ligne
+\code{exact: true} --- l'effet \emph{doit} se relancer à toute écriture
+fraîche, un fait must ---, un dep dont la stabilité est
+\code{Versioned(S)} donne une ligne \code{exact: false} par slot de $S$ ---
+l'effet \emph{peut} se relancer, un fait may (\cref{def:stabilite},
+\adr{17}). Sur \code{Guarded}, \code{Fresh}, \code{Lazy} la ligne est exacte
+(le dep est la variable d'état) ; sur \code{MemoLoop} elle est versionnée
+(le dep est le mémo) ; sur \code{Runaway} et \code{Loader} il n'y en a pas
+(pas de liste de deps, ou liste vide).
+
+La fonction se termine en assemblant le résultat :
+
+\rustsnippet[label={lst:point-fixe-composant-result}]{src/engine/fixpoint.rs}{670}{698}{l'\code{AnalysisResult} rendu}
+
+\subsection{Le programme : phases 1 et 2}
+\label{sec:point-fixe-composant-programme}
+
+\code{analyze_program} (\src{src/engine/fixpoint.rs}{704}{819}) appelle
+\code{analyze_component_impl} sur chaque composant, en deux phases :
+
+\rustsnippet[label={lst:point-fixe-composant-phases}]{src/engine/fixpoint.rs}{757}{794}{la photographie de la phase 1 et le balayage intra de la phase 2}
+
+En \emph{phase 1}, chaque racine choisie par la \code{RootStrategy}
+(\code{Heuristic} : les composants qui n'apparaissent dans aucun
+\code{CompApp} ; \code{--all-roots} ; \code{--entry}) est analysée avec un
+\code{InterCtx}. Quand son rendu rencontre \code{<Child .../>},
+\code{eval_comp_app} évalue les props, consulte un cache par égalité des
+props abstraites, et sur échec appelle \code{analyze_component_inter} sur
+l'enfant, dont le résultat remplace celui déjà présent dans \code{results}
+(\cref{chap:transfert-stores}). Le rendu du parent étant rejoué à chaque
+tour de \emph{sa} boucle, l'enfant est analysé à chaque \emph{cache miss} ;
+c'est le résultat du dernier miss qui reste. Il n'y a pas de point fixe de
+niveau programme : \og no separate program-level fixpoint layer\fg{}
+(\adr{12}). Un enfant qui écrit un slot du parent le fait dans le
+\code{SharedStateStore}, et la boucle du parent l'importe au test de
+convergence suivant (\cref{lst:point-fixe-composant-test}).
+
+En \emph{phase 2}, chaque composant que la phase 1 n'a pas atteint est
+analysé \emph{intra} (\code{inter = None}, props $\Top$ par défaut
+d'environnement), avec son vrai \code{ComponentId}. L'ensemble
+\code{phase1_reached} est photographié \emph{avant}, pour ne pas confondre
+un composant analysé en intra avec une racine (\issue{110}). Quatre
+conséquences de \code{inter = None}, toutes lues dans le code et vérifiées :
+\begin{enumerate}
+  \item les hooks personnalisés ne sont pas greffés (l.~898) ;
+  \item le \code{SummaryRegistry} n'est pas consulté non plus (le repli est
+    \emph{dans} \code{expand_custom_hooks}, après ce \code{return}) : un
+    \code{useQuery()} de phase 2 reste un marqueur opaque, signalé par une
+    Info \regle{analysis-limit} ;
+  \item tout \code{<Enfant .../>} est un enfant inconnu : \code{eval_comp_app}
+    commence par \code{havoc_setter_props}
+    (\src{src/domains/transfer/state_value.rs}{477}{483}), donc tout setter
+    passé en prop reçoit $\Top$ --- sound ;
+  \item les utilitaires sont bien greffés (cela ne dépend que de
+    \code{config.function_registry}), mais la troncature de budget est
+    silencieuse (\cref{sec:point-fixe-composant-expansion}).
+\end{enumerate}
+Le \cref{chap:inter-composants} reprend la phase 1 en détail : cache, graphe
+d'appels, récursion, dépendances de rendu.
+
+% ===========================================================================
+\section{Correspondance avec React-tRace et argument de soundness}
+\label{sec:point-fixe-composant-soundness}
+
+\subsection{Un tour abstrait, quatre transitions concrètes}
+
+L'\adr{1} fait de React-tRace la sémantique concrète du projet, avec une
+justification qui concerne directement ce chapitre : \og the Tree Memory +
+render loop model (StepInit $\to$ StepEffect $\to$ StepCheck) directly
+corresponds to the fixpoint iteration of our abstract interpreter\fg. Le
+\cref{chap:react-modele} a donné la correspondance règle par règle, dans
+sa table de correspondance ; la
+\cref{tab:point-fixe-composant-trace} la donne \emph{passe par passe}, avec
+ce que chaque passe abstrait.
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}>{\raggedright}p{0.24\linewidth}>{\raggedright}p{0.3\linewidth}>{\raggedright\arraybackslash}X@{}}
+\toprule
+passe de la boucle & React-tRace & ce qui est abstrait \\
+\midrule
+amorçage $S[\ell] \join= \sem{\mathit{init}}$ & \textsc{SttBind} (phase \textsf{Init}) & rien : une fois, hors boucle \\
+passe de rendu depuis $S$ & \textsc{StepInit} puis les ré-évaluations \textsc{Succ} de \textsc{StepCheck} (\textsc{EvalOnce}/\textsc{EvalMult}) & tous les rendus possibles d'un coup ; \textsc{SttReBind} devient la lecture du store joint, convertie en \code{Versioned} (\srcline{src/domains/transfer/state_value.rs}{122}) \\
+recalcul des mémos & extension esquissée au §7 de l'article & valeur = stabilité seulement \\
+passes d'effets depuis \code{env_exit} & \textsc{StepEffect} : \textsc{CommitEffsPath} sur les vues à décision \textsf{Effect} & \emph{tous} les effets, ordre abstrait par le join ; fermeture = \code{env_exit} (\textsc{Eff}) ; \textsc{AppSetNormal} = mise à jour faible \\
+passes de handlers & \textsc{StepEvent} (mode \emph{event loop}) & 0..N exécutions, tout ordre ; hors \code{widen_trace} \\
+tranche du \code{SharedStateStore} & \textsc{AppSetNormal} vers la vue $m[p]$ d'un autre chemin & import différé au test de convergence \\
+test $N \lleq S$ & \textsc{StepCheck} : \textsc{CheckNoEffect} partout $\Rightarrow$ \emph{event loop} & \og un état a changé\fg{} devient \og le store a grossi\fg \\
+\code{widen_trace} & le cycle rendered $\to$ check $\to$ rendered qui ne passe jamais par \emph{event loop} (§3.1.1) & un signal abstrait : la croissance a dû être forcée à converger \\
+\bottomrule
+\end{tabularx}
+\caption{Les passes de \code{analyze_component_impl} et les transitions de
+React-tRace (\cref{chap:react-modele}).}
+\label{tab:point-fixe-composant-trace}
+\end{table}
+
+Rappelons ce que le \cref{chap:react-modele} a constaté : React-tRace est la
+référence \emph{conceptuelle} du moteur, pas un oracle outillé. Aucune
+fonction de \file{src/engine/} ne cite une règle de l'article, et aucun test
+ne compare la boucle à l'interpréteur OCaml sur les exemples du papier. La
+correspondance de la \cref{tab:point-fixe-composant-trace} est donc une
+lecture, faite ici, et non une propriété vérifiée par le dépôt.
+
+\subsection{L'argument de soundness}
+
+\begin{theoreme}{Soundness de la boucle externe (esquisse)}{point-fixe-composant-soundness}
+Soit un composant, et pour tout $k$ soit $\rho_k$ l'ensemble des stores
+d'état concrets (une valeur par slot) que React peut atteindre après au plus
+$k$ tours --- rendu, commit, effets, puis un nombre quelconque d'événements
+--- depuis le montage, pour toutes les props et toutes les suites
+d'événements. Sous les hypothèses
+\begin{description}
+  \item[H1] les fonctions de transfert sont correctes (\cref{chap:transfert-stores}) et \code{analyze_cfg} calcule, pour chaque corps, un environnement de sortie et un store qui sur-approximent tout chemin (\cref{chap:cfg-analyzer-dominance}) ;
+  \item[H2] toute écriture d'un slot passe par \code{exec_setter_call}, qui la joint au store (mise à jour faible, \src{src/domains/stores/state_store.rs}{29}{33}) ;
+  \item[H3] tout corps qui peut s'exécuter est l'un des corps passés : rendu, effets, handlers, callbacks descendus par l'interpréteur ;
+\end{description}
+on a $\abs(\rho_k) \lleq S_k$ pour tout $k$ (en notant $S_k$ le store
+après $k$ tours abstraits, prolongé par $S_{\infty}$ à l'arrêt), donc
+$\abs(\bigcup_k \rho_k) \lleq S_{\infty}$ : le store convergé contient tout
+état atteignable.
+
+\emph{Esquisse.} Par récurrence sur $k$. Pour $k = 0$, $\rho_0$ est l'état
+au montage, produit des initialiseurs, et $S_0$ les évalue tous
+(\cref{lst:point-fixe-composant-seed}). Supposons $\abs(\rho_k) \lleq S_k$.
+Un tour concret de plus part d'un état $\sigma \in \rho_k$ ; le rendu lit
+$\sigma$, que $S_k$ couvre, donc par H1 l'environnement de fin de rendu
+concret est dans $\gam(\mathtt{env\_exit})$ et toute écriture du rendu est
+dans $R$. Les effets qui tournent (quels que soient leurs deps) partent de
+cet environnement et de $\sigma$ ; chaque écriture, dans n'importe quel
+ordre et quel que soit le rejeu de la file, est une valeur que
+\code{analyze_cfg} sur le corps a jointe dans $E$ (H1, H2), et l'updater
+lit un \code{ctx.state.get} qui couvre la file. Les handlers, exécutés
+zéro ou plusieurs fois, ne produisent que des valeurs jointes dans $H$ ;
+un événement supplémentaire après un tour part d'un état déjà couvert par
+$N$, et $N$ est à nouveau un point de départ couvert au tour suivant, ce
+qui rend compte des suites d'événements de longueur quelconque. Un setter de
+ce composant appelé dans un autre composant écrit dans la tranche importée.
+Donc $\abs(\rho_{k+1}) \lleq N_k \lleq S_{k+1}$, la dernière inégalité
+parce que $S_{k+1}$ vaut $N_k$ ou $S_k \widen N_k \lgeq N_k$
+(\code{widen_to} $\lgeq$ join, \srcline{src/domains/impls/interval.rs}{112}).
+À l'arrêt, $N \lleq S$ ferme la récurrence pour tout $k$ ultérieur. $\square$
+\end{theoreme}
+
+Les trois hypothèses ne sont pas gratuites, et c'est précisément là que se
+logent les trous du \cref{sec:point-fixe-composant-trous} : H2 est violée par
+le second bras de \code{exec_setter_call} en inter et par le lowering de
+\code{useReducer} ; H3 est violée par les fonctions de nettoyage, que la
+boucle n'exécute pas. La \cref{tab:point-fixe-composant-garanties} liste,
+pour mémoire, les mécanismes sur lesquels l'argument s'appuie.
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}>{\raggedright}p{0.3\linewidth}>{\raggedright}p{0.27\linewidth}>{\raggedright\arraybackslash}X@{}}
+\toprule
+mécanisme & direction garantie & où \\
+\midrule
+mise à jour faible des setters & $S \lgeq$ toute valeur écrite & \src{src/domains/stores/state_store.rs}{29}{33} \\
+passes depuis \code{state.clone()} & suite croissante & \srcline{src/engine/cfg_analyzer.rs}{49} \\
+tous les effets à chaque tour & aucun effet oublié à cause des deps & \src{src/engine/fixpoint.rs}{418}{449} \\
+handlers dans la boucle & valeurs atteignables par événements incluses & \src{src/engine/fixpoint.rs}{451}{483} \\
+environnement d'effet = \code{env_exit} & l'effet voit toute valeur de fin de rendu & \srcline{src/engine/fixpoint.rs}{432} \\
+\code{widen_to} $\lgeq$ join & post-point fixe & \src{src/domains/impls/interval.rs}{112}{146} \\
+absent $= \Top$, join d'un seul côté $= \Top$ & pas de valeur inventée & \cref{chap:transfert-stores} \\
+mémo à deps illisibles $=$ \code{Unknown} & pas de mémo figé inventé & \srcline{src/domains/transfer/state_value.rs}{67} \\
+enfant inconnu : havoc des setters en props & l'enfant peut appeler tout setter reçu & \src{src/domains/transfer/state_value.rs}{477}{483} \\
+budget épuisé $\to$ Info, assurances suspendues (phase 1) & pas de \code{verified} sur du code non lu & \src{src/engine/fixpoint.rs}{1620}{1628} \\
+\bottomrule
+\end{tabularx}
+\caption{Où la soundness de la boucle est tenue.}
+\label{tab:point-fixe-composant-garanties}
+\end{table}
+
+% ===========================================================================
+\section{Ce que le moteur garantit, ce qu'il ne garantit pas}
+\label{sec:point-fixe-composant-trous}
+
+\file{docs/limitations.md} distingue deux registres : un \emph{défaut}
+(\og the analysis returns an under-approximation or reports something
+false\fg) se corrige ; un \emph{compromis} (l'analyse reste sound, elle
+est seulement imprécise) se décide. Les constats qui suivent ont tous été
+observés au commit \snapshotCommit{} sur les fichiers de \file{/tmp/ch13/}, et
+classés selon ce critère. Plusieurs ont déjà été rencontrés en chemin ; nous
+les rappelons pour que la liste soit complète.
+
+\begin{piege}
+\textbf{L'updater fonctionnel, sur le chemin du CLI (défaut, FN).}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch13/updater.tsx}},label={lst:point-fixe-composant-updater}]
+import { useState, useEffect } from "react";
+
+export function Updater() {
+  const [x, setX] = useState(0);
+  useEffect(() => {
+    setX((c) => c + 1);
+  });
+  return <div>{x}</div>;
+}
+\end{lstlisting}
+Concrètement, c'est \code{Runaway} écrit avec un updater : la boucle est
+infinie. En intra, le moteur la voit (\cref{tab:point-fixe-composant-portes}).
+Par \code{analyze_program}, la sonde donne \code{iterations = 2},
+\code{state_store = s0=⊤}, \code{widen_trace = []} et
+\texttt{shared\_state = \{(ComponentId(0), 0): ref(PerRender)\}}, et le CLI :
+\begin{sortie}
+  [verbose] Updater: 2 iteration(s), widened: []
+   1 clean component(s) hidden, rerun with --show-clean
+
+✓  1 file(s) no issues found.
+\end{sortie}
+Le mécanisme est le défaut D3 du \cref{chap:transfert-stores} : le second bras
+de \code{exec_setter_call} (\src{src/domains/interp/interpreter.rs}{368}{391})
+s'applique aussi au propre setter du composant dès que \code{inter} est
+présent, et il évalue l'argument comme une \emph{valeur} --- la fermeture
+\code{c => c + 1}, une référence \code{PerRender} --- qu'il écrit dans le
+\code{SharedStateStore}. La tranche est jointe à $N$
+(\cref{lst:point-fixe-composant-test}), \code{c} devient \og nombre ou
+référence\fg, \code{c + 1} vaut $\Top$, et le slot atteint $\Top$ en deux
+tours \emph{par join} : pas de widening, \code{widen_trace} vide, porte 1
+fermée. Deux causes se composent : le bras croisé ne devrait pas s'appliquer
+aux slots propres (ou devrait y exécuter l'updater comme le premier bras), et
+le signal de divergence ignore un slot qui atteint $\Top$ sans widening. Les
+tests de \file{tests/functional_updater.rs} passent parce qu'ils appellent
+\code{analyze_component}. Aucune issue ouverte ne décrit ce cas au commit
+étudié.
+\end{piege}
+
+\begin{piege}
+\textbf{$\Top$ atteint par join n'est pas un signal (défaut, FN).}
+\code{MemoLoop} (\cref{ex:point-fixe-composant-memoloop}) boucle
+concrètement et le CLI le déclare propre : le slot saute à $\Top$ au tour 0
+parce que le mémo n'est pas encore calculé, et la porte 1 de
+\regle{infinite-loop} ne connaît que \code{widen_trace}. Le prédicat
+\code{is_unbounded}, qui compte pourtant \code{other} ($\Top$ résiduel)
+comme non borné, n'est consulté qu'après la porte 1. Le bras churn lit
+l'écriture comme non fraîche (\issue{157}). Deux exemples du chapitre
+(\code{Updater} en inter, \code{MemoLoop}) montrent que
+\og widené\fg{} et \og a divergé\fg{} ne coïncident pas : un slot peut
+diverger vers $\Top$ en un ou deux joins, et ce chemin ne laisse aucune
+trace.
+\end{piege}
+
+\begin{piege}
+\textbf{Les fonctions de nettoyage n'écrivent pas dans le store (défaut).}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch13/cleanup.tsx}},label={lst:point-fixe-composant-cleanup}]
+import { useState, useEffect } from "react";
+
+export function CleanupDeps({ id }: { id: string }) {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    return () => setN(7);
+  }, [id]);
+  return <div>{n}</div>;
+}
+\end{lstlisting}
+À chaque changement de \code{id}, React exécute le nettoyage, donc
+\code{setN(7)}, puis rend avec $n = 7$. L'IR de l'effet est
+\texttt{Return(FnLit \{ ... setN(7) ... \})} ; \code{exec_expr_effects} sur un
+\code{FnLit} ne l'exécute pas. Sonde : \code{iterations = 0},
+\code{state_store = s0=num[0,0]} --- la valeur 7 n'est pas dans le store.
+C'est une sous-approximation de l'état, non répertoriée dans
+\file{docs/limitations.md}. La relation \relation{slot_writers} voit la
+ligne (\code{region: Effect(1), phase: Cleanup}, valeur \code{number[7, 7]},
+relevé par la sonde ; \cref{chap:relations}), ce qui protège les règles qui
+la lisent. Sous \file{src/rules/}, trois règles lisent \code{state_store}
+directement :
+\regle{redundant-set-state}, \regle{always-unstable-deps} et
+\regle{wasted-subtree-render}. La première écarte d'office un slot écrit
+depuis deux régions distinctes (l'ensemble \code{contested},
+\src{src/rules/impls/redundant_set_state.rs}{57}{81}). Nous l'avons vérifié :
+un nettoyage \code{setN(7)} plus un \code{setN(0)} dans un autre effet ou
+dans un \code{onClick} ne produit aucun diagnostic. Au commit
+\snapshotCommit, nous n'avons pas construit de cas où l'absence du 7 trompe
+l'une des deux autres. Le trou dans le store demeure.
+\end{piege}
+
+\begin{piege}
+\textbf{\code{useReducer} : l'action à la place de l'état (défaut).}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch13/reducer.tsx}},label={lst:point-fixe-composant-reducer}]
+import { useReducer, useEffect } from "react";
+
+export function Reducer() {
+  const [s, dispatch] = useReducer((acc: number, a: number) => acc + a, 0);
+  useEffect(() => {
+    dispatch(1);
+  });
+  return <div>{s}</div>;
+}
+\end{lstlisting}
+Le lowering traduit \code{useReducer} en \code{HookEntry::State} et
+\emph{ignore le réducteur} (\code{let _reducer = it.next(); // skip reducer fn},
+\src{src/lowering/hook_extractor.rs}{715}{719}) ; \code{dispatch} est lié
+comme un setter. Le moteur joint donc l'\emph{action} \code{1} au slot :
+\code{s0=num[0,1]}, \code{iterations = 1}, \code{widen_trace = []}.
+Concrètement $s$ vaut $0, 1, 2, 3, \dots$ et le composant boucle ; le CLI
+répond \code{✓ 1 file(s) no issues found.} Pour être sound, il faudrait
+exécuter le réducteur (\code{exec_body} avec \code{(état, action)}) ou
+écrire $\Top$. Aucune issue ne le décrit au commit étudié.
+\end{piege}
+
+\begin{piege}
+\textbf{Trois compromis déjà rencontrés.} Une branche dont la garde est
+réfutée est exécutée quand même (\code{Dead},
+\cref{sec:point-fixe-composant-deroules}) : faux positif, sound.
+\code{WidenEvent.writers} liste tous les effets
+(\cref{sec:point-fixe-composant-widen-trace}) : provenance inexacte, aucun
+verdict touché. Un second appel du même hook personnalisé reste opaque, avec
+un message trompeur (\cref{sec:point-fixe-composant-expansion}) : sound,
+assurances suspendues. À quoi s'ajoutent deux constats sur la couche de
+certification : la troncature d'inlining silencieuse en phase 2
+(\cref{sec:point-fixe-composant-expansion}, un défaut au sens des
+assurances publiées) et le garde-fou à cent tours jamais exercé
+(\cref{sec:point-fixe-composant-terminaison}).
+\end{piege}
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}>{\raggedright}p{0.36\linewidth}>{\raggedright}p{0.17\linewidth}>{\raggedright}p{0.15\linewidth}>{\raggedright\arraybackslash}X@{}}
+\toprule
+constat & exemple & registre & référence \\
+\midrule
+updater fonctionnel écrit comme fermeture dans le store partagé & \code{Updater} & défaut (FN) & \cref{chap:transfert-stores} D3 ; aucune issue \\
+$\Top$ par join sans widening : porte 1 fermée & \code{MemoLoop}, \code{Updater} & défaut (FN) & \issue{157}, \issue{144} \\
+nettoyages hors du store & \code{CleanupDeps} & défaut & non documenté \\
+\code{useReducer} : action jointe, réducteur ignoré & \code{Reducer} & défaut & non documenté \\
+troncature d'inlining silencieuse en phase 2 & \code{A}/\code{B} & défaut (assurances) & non documenté \\
+branche réfutée exécutée & \code{Dead} & compromis (FP) & \cref{chap:cfg-analyzer-dominance} \\
+\code{writers} = tous les effets & \code{Mutual} & compromis (provenance) & \cref{sec:point-fixe-composant-widen-trace} \\
+second appel d'un hook personnalisé opaque & \code{TwoClocks} & compromis & \srcline{src/engine/fixpoint.rs}{884} \\
+\code{useState(makeInit)} amorcé à $\Top$ & \code{LazyVar} & compromis (FP) & \cref{sec:point-fixe-composant-amorcage} \\
+cap à 100 sans re-vérification ni test & --- & risque théorique & \srcline{src/engine/fixpoint.rs}{500} \\
+\bottomrule
+\end{tabularx}
+\caption{Les constats du chapitre, classés selon les deux registres de
+\file{docs/limitations.md}.}
+\label{tab:point-fixe-composant-constats}
+\end{table}
+
+% ===========================================================================
+\begin{resume}
+\begin{itemize}
+  \item \code{analyze_component_impl} (\file{src/engine/fixpoint.rs}) ne
+    simule pas React : elle calcule un post-point fixe du \code{StateStore},
+    un sur-ensemble des états atteignables par tous les tours et toutes les
+    suites d'événements. Un tour abstrait représente tous les tours concrets
+    de même rang.
+  \item \emph{Préparation}, une fois : constantes de module dans
+    \code{initial_env} et \code{module_env} ; greffes des utilitaires puis
+    des hooks personnalisés (\code{SpliceIds} monotone, garde par nom,
+    résumés par \code{retag_marker}) ; seuils = tous les littéraux
+    numériques ; \code{callback_bodies} ; amorçage des \code{useState},
+    initialiseur paresseux exécuté.
+  \item \emph{Un tour} : rendu depuis \code{initial_env} ; mémos recalculés
+    depuis \code{env_exit} (valeur = stabilité, $\Top$ au tour 0, hors test
+    de convergence) ; tous les effets depuis \code{env_exit} et le même
+    store (deps ignorées, batching abstrait) ; handlers de même, hors
+    signal ; $N = R \join E \join H \join$ tranche partagée ; arrêt si
+    $N \lleq S$, ce qui équivaut à $N = S$.
+  \item \emph{Convergence} : compteur global des tours qui changent l'état ;
+    joins jusqu'à \code{widen_threshold = 3}, puis \code{widen_to} à seuils
+    sur tout le store, \code{widen_trace} sur les seuls labels changés par
+    $R \join E$ (première itération retenue) ; garde-fou à 100. Terminaison
+    par hauteur finie de chaque composante de \code{StateValue}.
+  \item \emph{Post-convergence} : passe de rafraîchissement (mémos à jour
+    pour les règles, \code{inter = None}) ; \code{effect_setter_writes}
+    depuis $\Bot$ (porte 2 de \regle{infinite-loop} ; un updater y écrit
+    $\Bot$) ; tranche des relations, dont \relation{effect_triggers}
+    (exact = must, versionné = may).
+  \item \emph{Deux moteurs} : intra (\code{analyze_component}, phase 2) sans
+    greffe de hooks ni résumés ni store partagé ; inter (phase 1) avec.
+  \item \emph{Trous au commit \snapshotCommit} : updater en inter (FN),
+    $\Top$ par join (FN), nettoyages et \code{useReducer} hors du store,
+    troncature silencieuse en phase 2 ; compromis : branche réfutée
+    exécutée, \code{writers} imprécis, second hook opaque.
+\end{itemize}
+\begin{sloppypar}
+Types et fichiers rencontrés : \code{Config} et \code{SpliceIds}
+(\file{src/engine/fixpoint.rs}) ; \code{AnalysisResult} et \code{WidenEvent}
+(\file{src/engine/analysis_result.rs}) ; \code{StateStore}, \code{MemoStore}
+et \code{SharedStateStore} (\file{src/domains/stores/}) ;
+\code{EffectTrigger} (\file{src/engine/triggers.rs}) ; \code{HookRegistry}
+et \code{FunctionRegistry}. Le \cref{chap:relations} reprend la dernière
+tranche de la fonction : ce que sont \relation{slot_writers},
+\relation{slot_seeds}, \relation{registrations} et \relation{effect_triggers},
+et ce qu'une règle a le droit d'en certifier.
+\end{sloppypar}
+\end{resume}
+
+\section*{Exercices}
+\addcontentsline{toc}{section}{Exercices}
+
+\begin{exercice}{Un compteur gardé à pas de deux}{point-fixe-composant-exo-pas2}
+Dérouler la boucle externe pour
+\texttt{useEffect(() => \{ if (count < 3) setCount(count + 2); \}, [count])}
+avec \code{useState(0)}. Quels sont les seuils ? Quelle valeur finale, quel
+\code{iterations}, quel \code{widen_trace} ? Vérifier avec le CLI.
+\end{exercice}
+\begin{solution}
+Seuils $\{0, 2, 3\}$. Tour 0 : dans la branche, \code{count} est raffiné à
+$[0,0]$, l'effet écrit $[2,2]$, $N = [0,2]$. Tour 1 : \code{count} $= [0,2]$,
+raffiné par $< 3$ à $[0,2]$, écriture $[2,4]$, $N = [0,4]$. Tour 2 :
+\code{count} $= [0,4]$, raffiné à $[0,2]$, écriture $[2,4]$, $N = [0,4] \lleq S$.
+Arrêt sans widening : \code{iterations = 2}, \code{s0=num[0,4]},
+\code{widen_trace = []}, \code{effect_setter_writes = s0=num[2,4]} (sonde,
+\file{/tmp/ch13/exo1.tsx}). CLI : \code{Exo: 2 iteration(s), widened: []},
+aucun diagnostic. Le raffinement de garde a suffi ; le seuil 3 n'a pas
+servi.
+\end{solution}
+
+\begin{exercice}{Seuil bas}{point-fixe-composant-exo-seuil}
+Refaire \code{Counter} (\cref{ex:point-fixe-composant-counter}) et
+\code{Runaway} avec \code{widen_threshold = 1}. Que devient chaque tableau ?
+Comparer au test \code{widened_labels_triggered_with_low_threshold}
+(\srcline{src/engine/fixpoint.rs}{2011}).
+\end{exercice}
+
+\begin{exercice}{Égalité}{point-fixe-composant-exo-egalite}
+La \cref{prop:point-fixe-composant-egalite} conclut que le test
+\code{new_state.leq(&state)} équivaut à $N = S$. Où l'implémentation
+\code{StateStore::leq} (\cref{lst:point-fixe-composant-leq}) diffère-t-elle
+d'un test d'égalité structurelle, et pourquoi la différence est-elle sans
+effet dans la boucle ? (Considérer un label présent dans $S$ et absent de
+$N$, et deux valeurs incomparables.)
+\end{exercice}
+
+\begin{exercice}{Provenance}{point-fixe-composant-exo-writers}
+Construire un composant où deux effets écrivent deux slots distincts,
+observer \code{WidenEvent.writers} avec \code{--trace}, puis écrire le
+correctif de la l.~444 de \file{src/engine/fixpoint.rs} qui ne retient que
+les labels réellement changés par la passe. Quel test du dépôt faudrait-il
+ajouter ?
+\end{exercice}
+
+\begin{exercice}{Zéro itération}{point-fixe-composant-exo-fresh}
+Expliquer pourquoi \code{Fresh} (\cref{lst:point-fixe-composant-fresh})
+converge avec \code{iterations = 0}, ce que valent \code{widen_trace} et
+\code{effect_setter_writes}, et par quelle chaîne de faits l'\Error{} est
+tout de même produite (lire les \cref{chap:relations,chap:churn}).
+\end{exercice}
+
+\begin{exercice}{Intra contre inter}{point-fixe-composant-exo-updater}
+Reproduire \code{Updater} (\cref{lst:point-fixe-composant-updater}) avec
+\code{analyze_component} puis avec \code{analyze_program}, et suivre la
+valeur écrite dans le \code{SharedStateStore} depuis
+\src{src/domains/interp/interpreter.rs}{368}{391} jusqu'à
+\src{src/engine/fixpoint.rs}{488}{493}. Proposer un correctif au niveau
+central, et dire lequel des deux défauts composés il corrige.
+\end{exercice}
+
+\begin{exercice}{Terminaison}{point-fixe-composant-exo-terminaison}
+Écrire l'argument de terminaison complet en donnant, pour chaque composante
+de \code{StateValue}, une borne explicite sur la longueur d'une chaîne
+$v \lleq v \widen_T v' \lleq \dots$ en fonction de $|T|$,
+\code{STR_WIDEN_THRESHOLD} et \code{VERSIONED_LABELS_THRESHOLD}. En déduire
+une borne sur \code{iterations}, et la comparer au cap de 100.
+\end{exercice}

@@ -1,0 +1,772 @@
+% ===========================================================================
+% Chapitre 27 — Limites connues, défauts observés et perspectives
+% Sources : notes/01 à notes/16 (§8 et « Vérification »), docs/limitations.md,
+% docs/TODO.md, gh issue list (état au 2026-09-29), exemples rejoués sous
+% /tmp/r27/ avec target/debug/reactant au commit e67b10a.
+% ===========================================================================
+\chapter{Limites connues, défauts observés et perspectives}
+\label{chap:limites-perspectives}
+
+\begin{objectifs}
+\item Savoir où \reactant{} déclare lui-même ne pas voir, et distinguer une limite \emph{assumée} (un compromis décidé, souvent une issue fermée \code{wontfix}) d'un \emph{défaut} (une sous-approximation qui viole la soundness).
+\item Connaître, programme minimal et sortie à l'appui, les défauts observés au commit \snapshotCommit{} pendant la rédaction de ce manuscrit : faux négatifs, faux positifs, écarts entre ADR et code.
+\item Pour chacun, savoir retrouver la cause dans le code et la piste de correction « à la racine » que la doctrine du projet impose.
+\item Voir que ces défauts se regroupent en quelques causes communes, et en tirer la dette et les perspectives de recherche du projet.
+\end{objectifs}
+
+\prerequis{tout le manuscrit ; plus particulièrement la définition de la soundness (\cref{def:soundness}), la distinction défaut/compromis (\cref{def:tests-corpus-defaut-compromis}), le point fixe d'un composant (\cref{chap:point-fixe-composant}), les relations (\cref{chap:relations}) et l'API des règles (\cref{chap:api-regles}).}
+
+Les chapitres précédents ont décrit ce que fait l'analyseur. Celui-ci dit ce qu'il ne fait pas. Le ton est celui d'un relevé : chaque constat a été reproduit au commit \snapshotCommit{} (27 septembre 2026) sur un programme minimal, et la sortie citée est celle du binaire \file{target/debug/reactant} construit à ce commit. Aucun constat n'est un jugement sur le projet ; plusieurs sont d'ailleurs le produit direct de sa méthode, qui consiste à écrire ce que l'on ne sait pas encore faire.
+
+Le chapitre avance en quatre temps. La \cref{sec:limites-perspectives-assumees} range les limites que le projet documente lui-même. La \cref{sec:limites-perspectives-defauts} présente les défauts observés pendant la rédaction, du plus simple à reproduire au plus subtil, et les récapitule dans un tableau. La \cref{sec:limites-perspectives-dette} regroupe ces défauts par cause et dresse l'état de la dette. La \cref{sec:limites-perspectives-recherche} ouvre sur les questions qui dépassent la correction d'un bogue.
+
+% ===========================================================================
+\section{Deux registres, et ce que le projet documente déjà}
+\label{sec:limites-perspectives-assumees}
+
+\subsection{Défaut ou compromis : la grille de lecture}
+
+Partons de deux phrases de \file{docs/limitations.md}. La première décrit un tableau de dépendances :
+
+\begin{quote}\small
+By decision: \code{arr.slice()} and \code{arr.concat()} in a deps array are not proven fresh, because the same method on a string returns a primitive and the proof would be false \issue{22}.
+\end{quote}
+
+La seconde décrit un hook atteint seulement par un \code{return} :
+
+\begin{quote}\small
+Reported, but with no line or column, since \code{Terminator::Return} carries no span \issue{140}. It costs a position, never a finding.
+\end{quote}
+
+La première est un \emph{compromis} : l'analyse reste sound (elle refuse de prouver une fraîcheur qu'elle ne peut pas garantir), elle est seulement moins précise ; le prix est un faux négatif \emph{de précision}, rangé sous l'étiquette \code{precision-fn}. La seconde est un \emph{défaut} : l'analyse perd une information (la position) sur laquelle le rapport s'appuie. La page les sépare explicitement (« Two registers, and they must not be confused ») et le \cref{chap:tests-corpus} en a fait une définition (\cref{def:tests-corpus-defaut-compromis}). Nous l'employons telle quelle : un \emph{défaut} se corrige, un \emph{compromis} se décide.
+
+\begin{definition}{Constat}{limites-perspectives-constat}
+Un \terme{constat} est un comportement de \reactant{} observé au commit \snapshotCommit{} sur un programme minimal, avec sa sortie, rangé dans l'un des trois types suivants :
+\begin{itemize}
+\item \textbf{FN} (faux négatif) : le programme a un défaut React certain ou possible que la règle concernée devrait signaler, et la sortie est muette (ou la ligne \code{✓ … no issues found} s'affiche) ;
+\item \textbf{FP} (faux positif) : la sortie affirme un défaut absent, ou l'affirme à un niveau que la preuve ne porte pas (une \Error{} sur une conclusion partiellement prouvée) ;
+\item \textbf{écart} : un texte du dépôt (ADR, doc-comment, page de \file{docs/}) décrit autre chose que le code.
+\end{itemize}
+Un FN dont la cause est une sous-approximation du moteur est un défaut de soundness au sens de \cref{def:soundness} ; un FP au niveau \Error{} viole la définition des niveaux (\cref{def:introduction-niveaux}) ; un FP au niveau \Warning{} est toléré par construction.
+\end{definition}
+
+\subsection{La page \texorpdfstring{\file{docs/limitations.md}}{docs/limitations.md}}
+
+La page des limites (370 lignes au commit étudié) est le résumé, le tracker est le détail : « Every entry links to its issue, which carries the repro, the cause and the shape of the fix » (l.~4--5). Sa structure suit la grille ci-dessus :
+\begin{itemize}
+\item \textbf{Confirmed defects} : une seule entrée, \issue{140}, déjà citée. La section est courte à dessein : un défaut connu est corrigé, pas documenté.
+\item \textbf{What reactant may miss} : les FN de précision (callees non atteints, \code{useContext} non modélisé, hooks React non modélisés, résidus par règle, hypothèses de la preuve de convergence).
+\item \textbf{Why reactant may warn wrongly} : les FP, précédés d'une promesse forte, « Every entry here is Warning or below by construction. A false positive never carries an Error. » (l.~112--113). Plusieurs constats de la \cref{sec:limites-perspectives-defauts} la mettent en défaut.
+\item \textbf{Reading the output}, \textbf{Cross-file limits}, \textbf{What a pack can name in a body}, \textbf{Writing declarative packs}, \textbf{Out of scope}.
+\end{itemize}
+
+\Cref{tab:limites-assumees} range ces entrées par couche, dans l'ordre du pipeline décrit au \cref{chap:tour-architecture}. Les numéros renvoient au tracker ; le détail de chaque mécanisme est dans le chapitre indiqué.
+
+\begin{table}[htbp]\centering\footnotesize
+\begin{tabularx}{\linewidth}{@{}p{2.3cm}XXp{2.2cm}@{}}
+\toprule
+Couche (chapitre) & FN documentés & FP documentés (\Warning{} au plus) & Hors périmètre / \code{wontfix} \\
+\midrule
+Détection (\cref{chap:frontend-detection}) & \code{memo}/\code{forwardRef} \issue{64} ; utilitaires par défaut \issue{55} ; closures imbriquées \issue{56} & — & composants dynamiques \issue{63} ; défaut anonyme \issue{65} ; \file{node_modules} \issue{51} \\
+IR, lowering (\cref{chap:lowering-cfg,chap:splice-inlining}) & spreads, clés calculées \issue{76} ; inlining en position d'instruction \issue{52}, une fois par récursion \issue{53}, \code{FnLit} retourné \issue{57} & — & — \\
+Domaines (\cref{chap:treillis-simples,chap:statevalue-stabilite}) & \code{useContext} ⊤ \issue{28} ; sept hooks React ⊤ \issue{27} ; \code{NaN} \issue{73} ; \code{slice}/\code{concat} \issue{22} & slot jamais écrit lu \code{Versioned} \issue{41} ; constantes de module ⊤ \issue{34}, \issue{36} & — \\
+Moteur (\cref{chap:point-fixe-composant,chap:inter-composants}) & callees sans \code{Loc} \issue{19} ; valeurs portées par une boucle \issue{21} ; parent analysé en intra \issue{20} ; setters échappés à un niveau \issue{46} & — & — \\
+Relations, churn (\cref{chap:relations,chap:churn}) & valeur dérivée du slot \issue{157} ; invariance supposée \issue{161} ; remontage \issue{162} & arêtes sur slot convergent \issue{39}, \issue{159}, \issue{160}, \issue{161} ; \code{same_tick} \issue{123} ; garde disjonctive \issue{91} & — \\
+Règles (\cref{chap:regles-etat,chap:regles-effets,chap:regles-rendu-rsc}) & résidus \issue{23}, \issue{24}, \issue{25}, \issue{30} ; \regle{server-component-hook} \issue{29} ; divergence jamais \Error{} \issue{144} & \regle{missing-deps} \issue{32}, \issue{35} ; \regle{state-mutation} \issue{38} ; \regle{frozen-initial-state} \issue{136} ; canal d'assurance \issue{31} & heuristique de nom \issue{42} ; objet entier lu par garde \issue{40} \\
+Packs (\cref{chap:regles-declaratives}) & verdicts d'expression \issue{67} ; ancre unique \issue{68} ; atteignabilité de rendu \issue{132} & — & une entrée du catalogue \issue{101} \\
+Projet, CLI (\cref{chap:projet-cli-driver}) & alias hors \file{tsconfig} \issue{47} ; \code{@workspace/*} \issue{48} ; ré-exports \issue{49}, \issue{50} ; run rétréci \issue{138} & — & TanStack Router \issue{66} \\
+\bottomrule
+\end{tabularx}
+\caption{Les limites que \file{docs/limitations.md} documente, rangées par couche (état du tracker au 29 septembre 2026).}
+\label{tab:limites-assumees}
+\end{table}
+
+\subsection{Les limites tranchées « on ne corrige pas »}
+
+Le projet ne supprime pas une limite qu'il a décidé de garder : il la ferme en \code{wontfix}, pour que le raisonnement reste citable et que personne ne repropose le correctif (\file{docs/TODO.md}, l.~15--17). Au 29 septembre 2026, six issues portent ce label.
+\begin{itemize}
+\item \issue{63} (composants dynamiques \code{const C = cond ? A : B}) et \issue{65} (exports par défaut anonymes) : hors périmètre. Le premier laisse un \code{analysis-limit} sur le composant qui rend l'élément dynamique (composant \code{Dyn} de la \cref{sec:limites-perspectives-detection}).
+\item \issue{51} : \file{node_modules} n'est jamais abaissé ; le point d'extension supporté est le \code{SummaryRegistry} (\cref{sec:projet-cli-driver-summary}).
+\item \issue{101} : l'entrée \code{nullable-return-unguarded} du catalogue Tier A est exclue « by design », car elle pose une question de flot de types et non de sémantique des hooks.
+\item \issue{42} : \regle{stale-closure} reconnaît une souscription à son nom (\code{on}, \code{addListener}, \code{subscribe}) ; l'heuristique ne mène jamais à une \Error{}.
+\item \issue{40} : une dep déclarée comme champ (\code{[x?.locale]}) ne couvre pas un test de véracité de l'objet entier ; le Warning est sound et aligné sur eslint.
+\end{itemize}
+À ces fermetures s'ajoutent les « deliberate non-changes » d'\adr{20}, onze simplifications apparentes que l'on ne doit pas faire sans refaire l'argument de soundness (\cref{sec:histoire-doctrine-codification}). L'une d'elles pèsera plus loin : l'item~9 garde \code{resolve_setter_aliases} comme passe propre à chaque règle, parce que « Removing it is an FN ».
+
+\begin{remarque}
+Une partie des limites documentées ne sont ni des défauts ni des compromis de précision, mais des \emph{hypothèses nommées} : la soundness de la preuve de convergence suppose qu'un appel sur des entrées tenues rend la même valeur, et qu'une navigation se voit (\file{docs/limitations.md}, l.~67--75, \issue{161}) ; la dépendance de rendu suppose qu'un appel opaque ne lit ni n'écrit de binding de module (\adr{41} §2). Ces hypothèses sont écrites ; c'est ce qui les distingue d'un défaut.
+\end{remarque}
+
+% ===========================================================================
+\section{Les défauts observés au commit \texorpdfstring{\code{e67b10a}}{e67b10a}}
+\label{sec:limites-perspectives-defauts}
+
+Les seize dossiers de notes qui ont servi à écrire ce manuscrit ont chacun été relus et vérifiés contre le code. Chaque relecture a produit une section « Subtilités, pièges, limites » et, souvent, des constats nouveaux, reproduits sur des programmes minimaux mais absents du tracker à la date de la relecture. Cette section les rassemble. Sauf pour L4, dont la trace vient d'une sonde du moteur (dossier 06), tous les programmes ci-dessous ont été rejoués pour ce chapitre, sous \file{/tmp/r27/}, avec \code{reactant check . --show-clean --no-color --trace} lancé depuis le répertoire de l'exemple (et \code{--info} quand c'est indiqué). Chaque constat est accompagné d'un \emph{témoin} : une variante voisine que l'analyseur traite correctement, ce qui localise le défaut.
+
+La \cref{fig:limites-carte} place les constats dans le pipeline ; le \cref{tab:limites-recap} (\cpageref{tab:limites-recap}) les récapitule.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=4mm and 3mm,
+    cat/.style={bloc,minimum width=2.2cm,minimum height=9mm},
+    d/.style={font=\scriptsize,align=left,text width=2.3cm}]
+  \node[cat] (fe) {détection};
+  \node[cat,right=of fe] (ir) {IR, splice};
+  \node[cat,right=of ir] (dom) {domaines,\\interpréteur};
+  \node[cat,right=of dom] (eng) {moteur\\(point fixe)};
+  \node[cat,right=of eng] (rul) {règles};
+  \draw[fleche] (fe) -- (ir);
+  \draw[fleche] (ir) -- (dom);
+  \draw[fleche] (dom) -- (eng);
+  \draw[fleche] (eng) -- (rul);
+  \node[d,below=of fe] {L11 \code{switch}, \code{.map}, hook en argument, classes};
+  \node[d,below=of ir] {L3 \code{useReducer}\\L7 \code{return} jeté};
+  \node[d,below=of dom] {L1 updater (inter)\\L2 setter en expression\\L4 nettoyage};
+  \node[d,below=of eng] {L5 ⊤ par join\\L6 chaîne croissante\\L8 contexte aplati\\L14 bras point fixe};
+  \node[d,below=of rul] {L9 alias en rendu\\L10 \code{<Ctx value>}\\L12 deux constantes\\L13 branches exclusives};
+\end{tikzpicture}
+\caption{Où naissent les constats de ce chapitre. Chaque étiquette renvoie à une ligne du \cref{tab:limites-recap}. Un constat est placé dans la couche qui contient sa \emph{cause}, pas celle où il devient visible : presque tous se voient dans les règles.}
+\label{fig:limites-carte}
+\end{figure}
+
+% ---------------------------------------------------------------------------
+\subsection{L1 --- L'updater fonctionnel sur le chemin programme}
+\label{sec:limites-perspectives-updater}
+
+Commençons par le plus simple à écrire, et le plus inattendu.
+
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/r27/updater/Updater.tsx} : la même boucle, deux écritures},label={lst:limites-updater}]
+export function Updater() {
+  const [count, setCount] = useState(0);
+  useEffect(() => {
+    setCount((c) => c + 1);
+  }, [count]);
+  return <p>{count}</p>;
+}
+
+export function Direct() {
+  const [count, setCount] = useState(0);
+  useEffect(() => {
+    setCount(count + 1);
+  }, [count]);
+  return <p>{count}</p>;
+}
+\end{lstlisting}
+
+Les deux composants bouclent en React : l'effet écrit une valeur nouvelle, le rendu suivant change \code{count}, l'effet se relance. L'analyseur ne signale que le second.
+
+\begin{sortie}
+  Direct  (2 hooks)  Updater.tsx
+    warn   infinite-loop  [hook:0]  (line 13:2)  this effect keeps pushing state `count` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop
+       → state `count` is written here [hook:1] (line 13:2)
+       → the abstract value of state `count` kept growing and was widened at iteration 3
+  Updater  (2 hooks)  Updater.tsx  ✓
+\end{sortie}
+
+Pourtant le test de \src{tests/functional_updater.rs}{62}{79} décrit exactement ce programme, attend un finding, et passe. La différence est le chemin : le test appelle \code{analyze_component} (\srcline{tests/functional_updater.rs}{53}), l'analyse intra sans \code{InterCtx} ; la CLI appelle \code{analyze_program}, qui en a un (\cref{sec:point-fixe-composant-programme}). Sur le second chemin, \code{exec_setter_call} a deux bras indépendants.
+
+Le premier bras, \src{src/domains/interp/interpreter.rs}{348}{366}, exécute l'updater avec \code{c} lié à l'état courant. Le second, destiné aux setters d'un \emph{autre} composant, s'applique dès que le callee s'évalue en setter porteur de propriétaire :
+
+\rustsnippet{src/domains/interp/interpreter.rs}{368}{391}{le second bras}
+
+Or un setter local s'évalue lui aussi en setter porteur de propriétaire : \code{Expr::StateSetter(label)} rend \code{StateValue::component_setter(ctx.component, *label)} (\srcline{src/domains/transfer/state_value.rs}{135}). Aucun test \code{component != ctx.component} n'écarte le composant lui-même, et l'argument est évalué par \code{eval_expr} : c'est la \emph{fonction} \code{c => c + 1}, une référence \code{PerRender}, qui entre dans le \code{SharedStateStore}. La tranche partagée est jointe au nouvel état (\src{src/engine/fixpoint.rs}{487}{492}) ; le slot vaut alors nombre ⊔ référence, \code{c + 1} n'est plus arithmétique et rend ⊤, et ⊤ ne croît plus. Le slot atteint ⊤ en deux tours \emph{par join}, sans widening : \code{widen_trace} reste vide et le bras point fixe d'\regle{infinite-loop} n'est jamais consulté (\cref{sec:limites-perspectives-top-join}). La valeur écrite par l'updater est un nombre, donc pas fraîche : le bras churn se tait aussi.
+
+\begin{piege}
+Un test vert sur \code{analyze_component} ne prouve rien du CLI. Deux différences au moins séparent les chemins : pas de \code{SharedStateStore} en intra, et un \code{Config::default()} dont le \code{SummaryRegistry} est vide. L'issue \issue{14} le dit du second point (« which no user ever runs ») ; au commit étudié, 47 fichiers de \file{tests/} construisent \code{Config::default()}.
+\end{piege}
+
+\paragraph{Piste de correction.} Deux causes se composent, et chacune se corrige au centre : le second bras ne devrait pas s'appliquer aux slots du composant courant (ou devrait exécuter l'updater comme le premier), et le signal de divergence ne devrait pas ignorer un slot qui atteint ⊤ sans widening (L5). La première correction relève d'une même question que L2 et L3 : \emph{qu'est-ce qu'écrire un slot ?} (\cref{sec:limites-perspectives-racines}).
+
+% ---------------------------------------------------------------------------
+\subsection{L2 --- Un appel de setter hors position d'instruction}
+
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/r27/misc/Misc.tsx} et son témoin \file{/tmp/r27/ctrl/Ctrl.tsx} (extraits)}]
+export function AndSetter({ flag }: { flag: boolean }) {
+  const [a, setA] = useState(0);
+  useEffect(() => {
+    flag && setA(a + 1);
+  });
+  return <p>{a}</p>;
+}
+export function IfSetter({ flag }: { flag: boolean }) {
+  const [a, setA] = useState(0);
+  useEffect(() => {
+    if (flag) setA(a + 1);
+  });
+  return <p>{a}</p>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+  AndSetter  (2 hooks)  Misc.tsx  ✓
+  IfSetter  (2 hooks)  Ctrl.tsx
+    warn   infinite-loop  [hook:0]  (line 17:2)  this effect keeps pushing state `a` to new values on every run. Potential infinite render loop
+\end{sortie}
+
+Le lowering abaisse \code{flag \&\& setA(a + 1)} en diamant : \code{Let __tN = flag}, puis, dans le bras droit, \code{Assign __tN = setA(a + 1)} (\src{src/lowering/expr_lower.rs}{782}{789}, \cref{sec:lowering-diamants}). L'interpréteur ne passe par \code{exec_setter_call} que pour un \code{ExprStmt} ou un \code{Return} ; un \code{Let} ou un \code{Assign} ne reçoit que la pré-passe des callbacks et le cœur de liaison :
+
+\rustsnippet{src/domains/interp/interpreter.rs}{81}{89}{seul \code{ExprStmt} déclenche l'écriture d'état}
+
+L'écriture n'atteint donc jamais le \code{StateStore}. \file{docs/limitations.md} affirme pourtant (l.~49--50)~: « A setter \emph{call} in any expression position, \code{wrap(setN(1))}, a ternary arm, a JSX prop, is seen ». C'est vrai de la relation \relation{slot_writers} depuis \issue{130}, pas du store que lit le bras point fixe. La piste centrale est la même que pour L1 : un seul endroit où « appeler un setter » est interprété, atteint par toute évaluation d'un \code{Call}, quelle que soit sa position.
+
+% ---------------------------------------------------------------------------
+\subsection{L3 --- \texorpdfstring{\code{useReducer}}{useReducer} : l'action écrite à la place de l'état}
+
+\begin{react}[\code{useReducer}]
+\code{const [s, dispatch] = useReducer(reducer, init)} tient un état comme \code{useState}, mais \code{dispatch(a)} ne l'écrit pas directement : React appelle \code{reducer(s, a)} et stocke le résultat, avec le même bail-out \code{Object.is} qu'un setter. Un réducteur qui renvoie \code{s} inchangé ne provoque donc pas de rendu.
+\end{react}
+
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/r27/reducer/Reducer.tsx}},label={lst:limites-reducer}]
+export function Grows() {
+  const [s, dispatch] = useReducer((acc: number, a: number) => acc + a, 0);
+  useEffect(() => {
+    dispatch(1);
+  });
+  return <p>{s}</p>;
+}
+
+function keep(s: { n: number }, a: { type: string }) {
+  return a.type === "noop" ? s : { n: s.n + 1 };
+}
+
+export function Settles() {
+  const [state, dispatch] = useReducer(keep, { n: 0 });
+  useEffect(() => {
+    dispatch({ type: "noop" });
+  }, [state]);
+  return <p>{state.n}</p>;
+}
+\end{lstlisting}
+
+\code{Grows} boucle (0, 1, 2…) ; \code{Settles} ne boucle pas (le réducteur rend \code{s}, React sort par bail-out). L'analyseur répond exactement l'inverse :
+
+\begin{sortie}
+  Grows  (2 hooks)  Reducer.tsx  ✓
+  Settles  (2 hooks)  Reducer.tsx
+    error  infinite-loop  [hook:0]  (line 17:2)  this effect recreates object state `state` it depends on. Every run stores a fresh reference (`Object.is` always fails) and re-triggers itself: infinite render loop
+       → a fresh value is written to state `state` here [hook:1] (line 18:4)
+\end{sortie}
+
+La cause est dans le lowering, qui traduit le hook en slot d'état ordinaire en sautant le réducteur :
+
+\rustsnippet{src/lowering/hook_extractor.rs}{715}{719}{\code{useReducer} devient un \code{HookEntry::State}}
+
+\code{dispatch} est lié comme un setter : l'interpréteur écrit l'\emph{action} dans le slot. Pour \code{Grows}, l'action est le point \code{1} : le store vaut $[0,1]$, converge sans widening, et le composant est déclaré propre. Pour \code{Settles}, l'action est un littéral objet frais : le bras self-churn en tire une \Error{} certifiée sur un programme sain, ce que la promesse « A false positive never carries an Error » exclut. Ni \file{docs/limitations.md} ni le tracker ne mentionnent \code{useReducer} (recherche au 28 septembre 2026). Une modélisation sound exécute le réducteur comme un updater à deux paramètres (\code{exec_body} avec \code{(state, action)}), ou, à défaut, écrit ⊤ ; dans les deux cas le changement est local au lowering du hook et à l'interprétation des setters, pas aux règles.
+
+% ---------------------------------------------------------------------------
+\subsection{L4 --- Les écritures d'un nettoyage n'entrent pas dans le store}
+
+\begin{react}[nettoyage d'effet]
+La fonction renvoyée par un effet est son \emph{nettoyage} : React l'exécute avant de relancer l'effet (quand ses deps changent) et au démontage. Un setter appelé là est une écriture d'état réelle, faite pendant la phase de commit.
+\end{react}
+
+Dans \code{useEffect(() => \{ return () => setN(7); \}, [id])}, l'IR de l'effet se termine par \code{Return(FnLit \{ … setN(7) \})}. L'analyseur de CFG ne fait, sur l'expression d'un \code{Return}, que tirer ses effets de bord (\src{src/engine/cfg_analyzer.rs}{84}{86}) ; une \code{FnLit} est une valeur, son corps n'est pas exécuté.
+La CLI n'expose pas le store, mais la primitive publique qui le calcule, \code{analyze_component} (la même que \src{tests/functional_updater.rs}{53}{53} appelle), le fait : rejouée au commit \snapshotCommit{} sur ce composant, elle donne \code{state\_store = StateStore(\{0: number[0, 0]\})}, ce qui confirme la sonde du dossier 06 (§6.11). La valeur~7, que \code{n} prend à chaque changement de \code{id}, n'est pas dans le store, alors que la relation \relation{slot_writers} porte bien la ligne (\code{phase: Cleanup}, dossier 06 §6.11). Aucun finding faux n'a été exhibé : c'est une sous-approximation \emph{latente}, qui fausse toute règle qui lirait la valeur du slot plutôt que la relation (\cref{sec:point-fixe-composant-trous}). La piste est d'exécuter le nettoyage renvoyé comme un corps de l'effet, joint au store au même titre que le corps lui-même.
+
+% ---------------------------------------------------------------------------
+\subsection{L5 --- ⊤ par join n'est pas un signal}
+\label{sec:limites-perspectives-top-join}
+
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/r27/memo/MemoLoop.tsx}},label={lst:limites-memoloop}]
+export function MemoLoop() {
+  const [x, setX] = useState(0);
+  const d = useMemo(() => x + 1, [x]);
+  useEffect(() => {
+    setX(d);
+  }, [d]);
+  return <p>{x}</p>;
+}
+\end{lstlisting}
+
+Concrètement, \code{x} vaut 0, 1, 2… : chaque écriture change \code{d}, qui relance l'effet. La sortie est \code{MemoLoop (3 hooks) MemoLoop.tsx ✓} puis \code{✓ 1 file(s) no issues found.} Le mécanisme tient en deux faits. D'abord, au tour~0, le rendu lit le mémo avant tout calcul, et un label absent du \code{MemoStore} vaut ⊤ :
+
+\rustsnippet{src/domains/stores/memo_store.rs}{27}{30}{un mémo pas encore calculé vaut ⊤}
+
+L'effet écrit donc ⊤ dans \code{x} dès le premier tour ; le tour suivant est stable. Ensuite, \code{widen_trace}, le seul signal de divergence que lit le bras point fixe (\srcline{src/rules/impls/infinite_loop.rs}{130}), n'est rempli qu'au moment du widening :
+
+\rustsnippet{src/engine/fixpoint.rs}{514}{526}{\code{widen_trace} n'enregistre que les slots élargis}
+
+Un slot qui saute à ⊤ avant le seuil converge « proprement » et la porte~1 le déclare borné. Le prédicat \code{is_unbounded}, qui compterait ce ⊤ comme non borné, n'est consulté qu'\emph{après} cette porte. Le bras churn, lui, lit l'écriture comme non fraîche (\code{Versioned}), ce qui est le cas documenté \issue{157}. La leçon, énoncée par le dossier 06, est générale : \emph{atteindre ⊤ par join est une divergence au même titre qu'être élargi}. La piste centrale est d'en faire un seul prédicat de divergence, lu par toutes les portes, plutôt qu'un effet de bord de l'étape de widening.
+
+% ---------------------------------------------------------------------------
+\subsection{L6 --- Une chaîne qui grandit sans borne}
+
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/r27/misc/Misc.tsx}, composant \code{StrGrow}}]
+export function StrGrow() {
+  const [s, setS] = useState("");
+  useEffect(() => {
+    setS(s + "x");
+  }, [s]);
+  return <p>{s}</p>;
+}
+\end{lstlisting}
+
+Ici le widening a bien lieu, et l'analyseur le dit, mais seulement sous \code{--info} :
+
+\begin{sortie}
+  StrGrow  (2 hooks)  Misc.tsx
+    info   widening-info  (line 13:2)  state `s` kept changing during analysis and was approximated to converge, so findings that depend on it may be imprecise
+       → state `s` is written here [hook:1] (line 13:2)
+       → the abstract value of state `s` kept growing and was widened at iteration 3
+\end{sortie}
+
+\regle{infinite-loop} se tait, parce que la seconde porte demande que l'écriture soit non bornée, et que le prédicat ne regarde pas les chaînes :
+
+\rustsnippet{src/domains/impls/state_value.rs}{371}{382}{\code{is_unbounded} ignore l'emplacement \code{str}}
+
+Parmi les emplacements que \code{is_unbounded} ne lit pas (booléen, chaîne, \code{null}, \code{undefined}, setter), seule la chaîne a un ensemble concret infini (\cref{def:treillis-simples-k-ensemble}) : c'est le seul oubli qui puisse cacher une croissance. La correction est locale au domaine : \code{StrConst::Top} atteint par widening est une croissance non bornée.
+
+% ---------------------------------------------------------------------------
+\subsection{L7 --- Le \texorpdfstring{\code{return}}{return} d'un appelé greffé sans liaison}
+
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/r27/ret/Ret.tsx} ; le témoin \file{/tmp/r27/ctrl/Ctrl.tsx} écrit \code{set(n + 1);} sans \code{return}}]
+function bump(set: (n: number) => void, n: number) {
+  return set(n + 1);
+}
+
+export function C() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    bump(setN, n);
+  });
+  return <div />;
+}
+\end{lstlisting}
+
+La sortie est \code{C (2 hooks) Ret.tsx ✓} ; le témoin reçoit \code{warn infinite-loop [hook:0] (line 9:2) this effect keeps pushing state `n`…}. La seule différence est le mot \code{return}. Le splice d'un appelé (\cref{sec:splice-primitive}) remplace chaque \code{Return(e)} de l'appelé par un saut vers la jonction, et ne garde \code{e} que si l'appel était lié à une variable :
+
+\rustsnippet{src/ir/splice.rs}{158}{174}{le bras \code{Return} du splice}
+
+Pour une instruction \code{bump(setN, n);}, \code{bound_var} vaut \code{None} et l'expression est jetée avec ses effets. Le commentaire du paramètre dit « \code{None} to discard as in a bare \code{f(..);} » (\src{src/ir/splice.rs}{37}{38}) ; mais JavaScript évalue l'expression du \code{return} avant de rendre la main : jeter la \emph{valeur} n'autorise pas à jeter l'\emph{évaluation}. La correction est d'une ligne et centrale : pousser \code{Stmt::ExprStmt(ret, call_span)} quand \code{bound_var} est \code{None}, comme le lowering le fait déjà pour \code{void e}.
+
+% ---------------------------------------------------------------------------
+\subsection{L8 --- Deux instances, un seul résultat}
+
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/r27/persp/Persp.tsx} (extrait) ; le témoin \file{/tmp/r27/persp2/One.tsx} ne garde que la première instance}]
+function Counter({ step }: { step: number }) {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    setN(n + step);
+  }, [n]);
+  return <p>{n}</p>;
+}
+
+export function Two() {
+  return (
+    <div>
+      <Counter step={1} />
+      <Counter step={0} />
+    </div>
+  );
+}
+\end{lstlisting}
+
+La première instance boucle. Avec elle seule, l'analyseur le voit (\code{warn infinite-loop [hook:0] (line 5:2)} dans \file{One.tsx}) ; avec les deux, il affiche \code{Counter (2 hooks) Persp.tsx ✓} et \code{--verbose} donne \code{Counter: 1 iteration(s), widened: []}. Chaque site d'appel d'un enfant est analysé par \code{eval_comp_app}, qui range le résultat dans la table du programme par identité d'enfant :
+
+\rustsnippet{src/domains/transfer/state_value.rs}{582}{590}{le résultat d'un enfant écrase le précédent}
+
+Le second site (\code{step = 0}, point fixe immédiat) remplace le résultat du premier. C'est le prix d'une sensibilité au contexte décidée par \adr{12} (\cref{sec:inter-composants-resultats}) : la table \code{results} suppose que l'analyse d'un enfant ne dépend que de ses props aplaties, et garde la dernière. Joindre les résultats des sites, ou garder un résultat par (enfant, props abstraites), rendrait la table sound ; le dossier 08 relève aussi que le cache ne sert que de « déjà vu » (\cref{sec:inter-composants-cache}).
+
+% ---------------------------------------------------------------------------
+\subsection{L9 --- Un alias de setter appelé pendant le rendu}
+
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/r27/alias/Alias.tsx}},label={lst:limites-alias}]
+export function AliasInRender() {
+  const [n, setN] = useState(0);
+  const s = setN;
+  s(n + 1);
+  return <p>{n}</p>;
+}
+
+export function DirectInRender() {
+  const [n, setN] = useState(0);
+  setN(n + 1);
+  return <p>{n}</p>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+  AliasInRender  (1 hooks)  Alias.tsx  ✓
+  DirectInRender  (1 hooks)  Alias.tsx
+    error  setter-in-render  [hook:0]  (line 12:2)  setter `setN` called directly in the render body, move this call into a useEffect or an event handler
+       → `setN` is a state setter, so calling it writes state (line 12:2)
+\end{sortie}
+
+Les deux composants lèvent « Too many re-renders » en React. Sous \code{--info}, \code{AliasInRender} affiche même \code{verified setter-in-render no setter is called during render}, une assurance fausse, à côté d'un \code{widening-info} sur \code{n} : le moteur a bien vu l'écriture, c'est la règle qui ne la voit pas. La règle construit sa table des setters à la main, en ne retenant que les \code{Let x = StateSetter(l)} du rendu :
+
+\rustsnippet{src/rules/impls/setter_in_render.rs}{63}{86}{les setters locaux de \regle{setter-in-render}}
+
+\code{const s = setN} est un \code{Let s = Var(setN)} et n'y entre pas. Les autres règles passent par \code{all_setter_labels} ou \code{resolve_setter_aliases}, et \regle{infinite-loop} voit l'alias équivalent dans un effet (dossier 10, §6.12).
+
+\begin{decision}[ADR-020, item 9]
+\og \code{resolve_setter_aliases} stays a per-rule pass\fg{}, parce que les alias écrits à la main existent dans le CFG de rendu : « Removing it is an FN. » L'ADR a vu le risque ; c'est une règle qui ne l'applique pas. Alternative plus profonde, conforme à \adr{42} : \file{setter_in_render.rs} figure dans la liste du cliquet \file{tests/layer_boundary.rs} des fichiers de règles qui marchent encore la syntaxe, alors que \relation{slot_writers} porte déjà la ligne \code{phase=Render} de cet appel. Lire la relation, c'est hériter de la résolution des alias faite une fois dans le moteur.
+\end{decision}
+
+% ---------------------------------------------------------------------------
+\subsection{L10 --- Le provider React~19}
+
+\begin{react}[\code{<Ctx value>}]
+Depuis React~19, un contexte se fournit directement par \code{<Ctx value=\{v\}>} ; \code{<Ctx.Provider value=\{v\}>} reste accepté. Les deux formes ont le même coût : une \code{value} fraîche à chaque rendu re-rend tous les consommateurs.
+\end{react}
+
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/r27/ctx19/Ctx.tsx}}]
+const Ctx = createContext(null);
+
+export function P19({ children }) {
+  const [user, setUser] = useState(null);
+  return <Ctx value={{ user, setUser }}>{children}</Ctx>;
+}
+
+export function P18({ children }) {
+  const [user, setUser] = useState(null);
+  return <Ctx.Provider value={{ user, setUser }}>{children}</Ctx.Provider>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+  P18  (1 hooks)  Ctx.tsx
+    warn   unstable-context-value  (line 12:9)  `Ctx.Provider` is given a newly allocated value on every render. `Object.is` fails for every consumer, so each `useContext(Ctx)` re-renders whenever this component does, even when nothing in the value changed; wrap the value in `useMemo`
+  P19  (1 hooks)  Ctx.tsx  ✓
+\end{sortie}
+
+La couche règles reconnaît un provider à son suffixe :
+
+\rustsnippet{src/rules/helpers/providers.rs}{88}{99}{un provider se reconnaît à \code{.Provider}}
+
+Le moteur, lui, accepte les deux formes (\code{strip_suffix(".Provider").unwrap_or(name)}, \srcline{src/engine/render_deps.rs}{977}). Deux définitions d'un même fait divergent donc : \code{render_tree} suit le contexte d'un \code{<Ctx>}, \regle{unstable-context-value} et la relation des consommateurs ne le voient pas. Sous \code{--info}, le seul signal est un \code{analysis-limit} (« component \code{Ctx} was not found… »), qui suspend les assurances : le canal d'assurance reste honnête, le finding manque. La correction naturelle est la descente de \file{providers.rs} dans le moteur que prévoit \adr{42} §5 : un seul endroit dit ce qu'est un provider.
+
+% ---------------------------------------------------------------------------
+\subsection{L11 --- Les formes que la détection ne reconnaît pas}
+\label{sec:limites-perspectives-detection}
+
+Le front-end décide, par des tests syntaxiques, quelles fonctions sont des composants, des hooks ou des utilitaires (\cref{def:composant-hook-utilitaire}). Une fonction refusée n'est pas sur-approximée par ⊤ : elle est \emph{absente}. Une heuristique trop étroite est donc un risque de soundness, pas de précision ; c'est la requalification que \issue{122} a faite (étiquettes \code{soundness-bug} et \code{precision-fn}) en ajoutant la règle~4.
+
+\begin{exemple}{Un même défaut, deux formes de retour}{limites-perspectives-detection}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/r27/switch/App.tsx}}]
+function ViaIf({ k, onChange }: { k: number; onChange: (n: number) => void }) {
+  onChange(1);
+  if (k === 1) return <a />;
+  return <b />;
+}
+function ViaSwitch({ k, onChange }: { k: number; onChange: (n: number) => void }) {
+  onChange(1);
+  switch (k) {
+    case 1: return <a />;
+    default: return <b />;
+  }
+}
+export function App() {
+  const [n, setN] = useState(0);
+  return (
+    <div>
+      <ViaIf k={n} onChange={setN} />
+      <ViaSwitch k={n} onChange={setN} />
+    </div>
+  );
+}
+\end{lstlisting}
+Avec \code{--info} (lignes \code{verified} omises) :
+\begin{sortie}
+  App  (1 hooks)  App.tsx
+    info   analysis-limit  component `ViaSwitch` was not found in the analysis registry. Pass its file on the command line to analyse it (FN possible)
+    suspended  analysis-limit  4 passing check(s) withheld: the analysis was truncated in this component, so they are not guaranteed
+  ViaIf  (0 hooks)  App.tsx
+    error  cross-setter-in-render  var:onChange  (line 4:2)  prop `onChange` (a state setter of parent `App`) called during render of `ViaIf`, which triggers a parent re-render on every render
+       → `onChange` is a state setter, so calling it writes state (line 4:2)
+\end{sortie}
+La même \Error{} certaine est trouvée dans \code{ViaIf} et manquée dans \code{ViaSwitch} ; la perte n'est avouée qu'en \Info{}, masquée par défaut, avec un conseil trompeur (le fichier est déjà sur la ligne de commande).
+\end{exemple}
+
+La cause est une énumération à la main des formes de retour :
+
+\rustsnippet{src/lowering/jsx_detect.rs}{14}{45}{les formes de retour qui comptent pour la règle~2}
+
+Il n'y a pas de bras \code{SwitchStatement}, et \code{expr_contains_jsx} (même fichier, l.~47--63) ne descend ni dans un appel ni dans un tableau : \code{return items.map(i => <li/>)}, \code{return createPortal(<div/>, el)} et \code{return [<a/>, <b/>]} ne comptent pas. La règle~4 (« it calls a React hook », \src{src/lowering/component_detector.rs}{66}{72}) rattrape une partie des composants, mais \code{expr_calls_hook} n'inspecte que le callee d'un appel (\src{src/lowering/hook_call_detect.rs}{60}{63}) : un hook qui n'apparaît qu'en argument, \code{console.log(useState(0))}, n'est pas vu. Enfin \code{detect_fns} ne visite que les déclarations de fonctions, les \code{const} initialisés à une fonction et leurs exports (\src{src/lowering/detector.rs}{41}{71}) : une classe \code{extends React.Component} n'est jamais candidate. Le fichier \file{/tmp/r27/detect/Limits.tsx} réunit ces formes ; sur huit définitions, seule \code{Dyn} est analysée, et la sortie se termine par \code{✓ 1 file(s) no issues found.}
+
+\begin{piege}
+La ligne \code{✓ … no issues found.} promet qu'un run « read everything it was pointed at » (\file{docs/limitations.md}, l.~37--38) : elle porte sur les \emph{fichiers} lus, pas sur les fonctions reconnues. Une fonction que la détection ignore ne laisse aucun angle mort.
+\end{piege}
+
+La piste centrale est de remplacer les \code{match} à bras par défaut \code{_ => false} par un parcours exhaustif de l'AST (un visiteur oxc), comme le lowering s'interdit déjà tout bras \code{_ => \{\}} (\issue{77}). Les classes, elles, relèvent d'une décision de périmètre qui n'est écrite nulle part : ni \file{docs/limitations.md} ni une issue ne les mentionnent.
+
+% ---------------------------------------------------------------------------
+\subsection{L12 à L14 --- Trois faux positifs}
+
+Les faux positifs sont tolérés au niveau \Warning{} ; deux des trois constats suivants le sont, le troisième non.
+
+\paragraph{L12 --- Deux constantes, une seule stabilité.}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/r27/fp/Fp.tsx}, composant \code{TwoConsts}}]
+const A = { k: "a" };
+const B = { k: "b" };
+
+export function TwoConsts() {
+  const [v, setV] = useState(A);
+  useEffect(() => {
+    setV(B);
+  }, []);
+  return <p>{v.k}</p>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+  TwoConsts  (2 hooks)  Fp.tsx
+    warn   redundant-set-state  [hook:0]  (line 8:2)  state `v` is set to a stable value it already holds, so the update is redundant
+\end{sortie}
+
+\code{v} passe de \code{A} à \code{B}, et React re-rend. La règle conclut « already holds » de ce que la valeur écrite et la valeur courante sont toutes deux \emph{stables} (\srcline{src/rules/impls/redundant_set_state.rs}{269}) ; or \code{StateValue::is_stable} teste seulement \code{to_stability() == Stable} (\src{src/domains/impls/state_value.rs}{415}{417}). Pour un primitif ponctuel, stable et égal coïncident ; pour deux références, la stabilité ne dit rien de l'identité. La piste est de demander l'égalité, pas la stabilité : même point pour un primitif, même site d'allocation (\cref{def:site}) pour une référence.
+
+\paragraph{L13 --- Une \Error{} sur deux branches exclusives.}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/r27/fp/Fp.tsx}, composant \code{ExclusiveBranches}}]
+export function ExclusiveBranches({ flag }: { flag: boolean }) {
+  const [items, setItems] = useState<string[]>([]);
+  const onClick = () => {
+    if (flag) {
+      items.push("x");
+    } else {
+      setItems(items);
+    }
+  };
+  return <button onClick={onClick}>{items.length}</button>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+  ExclusiveBranches  (2 hooks)  Fp.tsx
+    error  state-mutation  [hook:0]  var:items  (line 18:6)  `items` is mutated in place and `setItems` is called with the same reference. React compares with `Object.is`, sees no change, and skips the re-render
+       → `items` is mutated in place here, so its reference identity is unchanged [hook:0] (line 18:6)
+       → the value written to state `items` is the value it already holds [hook:0] (line 20:6)
+\end{sortie}
+
+La mutation et le set ne s'exécutent jamais dans le même clic. L'état est bien corrompu (une mutation sans re-rendu), mais la phrase affirmée, « \code{setItems} is called with the same reference » \emph{après} la mutation, est fausse sur tout chemin. La primitive qui certifie l'\Error{} ne regarde que les \emph{conteneurs} :
+
+\rustsnippet{src/rules/api/query.rs}{1039}{1057}{la preuve « même conteneur » de \regle{state-mutation}}
+
+Deux sites dans le même handler partagent un déclencheur, pas un chemin. C'est une \Error{} tirée d'une preuve partielle, la classe même que \issue{142} a corrigée pour \regle{stale-closure} (« Error tier minted from a partial proof ») et que \file{CLAUDE.md} exclut depuis (une \Error{} prouve \emph{toute} la conclusion, pas un seul conjoint) : la conjonction « mutation \emph{et} set sur le même passage » n'est prouvée que pour son premier conjoint. La primitive doit demander la co-exécution (un chemin qui contient les deux sites, ou la dominance de l'un par l'autre, \cref{def:dominance}) ; à défaut, plafonner à \Warning{}.
+
+\paragraph{L14 --- Le bras point fixe sur un état dérivé.}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/r27/fp/Fp.tsx}, composant \code{Derived}}]
+export function Derived() {
+  const [a, setA] = useState(1);
+  const [b, setB] = useState(0);
+  useEffect(() => {
+    setB(a * 2);
+  }, [a]);
+  return <button onClick={() => setA(a + 1)}>{b}</button>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+  Derived  (4 hooks)  Fp.tsx
+    warn   derived-state  [hook:2]  (line 29:2)  this effect always sets `setB` to a call-free expression of `a` replace with `useMemo` or compute during render
+    warn   infinite-loop  [hook:1]  (line 29:2)  this effect keeps pushing state `b` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop
+       → state `b` is written here [hook:2] (line 29:2)
+       → the abstract value of state `b` kept growing and was widened at iteration 3
+\end{sortie}
+
+\regle{derived-state} est juste ; \regle{infinite-loop} ne l'est pas. \code{a} croît par le handler, le store le joint, et \code{b = a * 2} croît donc dans la partie « rendu + effets » du tour : \code{widen_trace} contient \code{b}, l'écriture $[2,+\infty)$ est non bornée, la dep \code{a} n'est pas prouvée stable, et le bras point fixe tire. Mais l'effet ne dépend pas de \code{b} et ne peut pas se relancer lui-même : la croissance est nourrie par un événement utilisateur, que le moteur exclut précisément de \code{widen_trace} (« handler widening is not a bug », \srcline{src/engine/fixpoint.rs}{515}) quand elle est \emph{directe}. Le bras demande « ce slot a-t-il été élargi ? » au lieu de « la boucle rendu $\to$ effet $\to$ rendu nourrit-elle cette croissance ? ». \issue{144} et \issue{91} sont voisines mais distinctes ; aucune issue ne décrit ce cas.
+
+% ---------------------------------------------------------------------------
+\subsection{Écarts entre ADR, documentation et code}
+\label{sec:limites-perspectives-ecarts}
+
+Le \cref{chap:histoire-doctrine} a relevé les écarts les plus visibles entre ADR et code (\cref{tab:histoire-ecarts}) : \file{docs/semantics.md} annoncé par \adr{1} et jamais créé, \file{docs/ir.md} d'\adr{3}, \file{rules/api/cache.rs} déclaré disparu par \adr{42}. Les dossiers de vérification en ajoutent d'autres, que voici avec leur état au commit.
+
+\begin{itemize}
+\item \textbf{\adr{3} et la règle~4.} L'ADR énumère trois priorités de détection (l.~50--52 : préfixe \code{use}, retour JSX, annotation). Le code en a quatre ; la quatrième, « it calls a React hook (\#122) », est commentée dans \src{src/lowering/component_detector.rs}{66}{72}.
+\item \textbf{\adr{13} et \file{symbol_extractor.rs}.} La section « Consequences » annonce un fichier nouveau, « lightweight pre-pass » (l.~165) : \file{src/lowering/symbol_extractor.rs}. Le fichier n'a jamais existé sur \code{main} ; le graphe de symboles se construit depuis l'IR déjà abaissée (\file{src/engine/symbol_graph.rs}).
+\item \textbf{\adr{18}.} L'ADR place le bras graphe dans \file{src/rules/helpers/churn_graph.rs} (l.~37) et fonde le kill de convergence sur « the single-writer condition » (l.~67). Le fichier a été supprimé par la promotion d'\adr{42} (le graphe vit dans \file{src/engine/churn.rs}), et la condition mono-écrivain a été remplacée par la preuve multi-site (\code{converges_under_all_writes}, \srcline{src/engine/guards.rs}{138} ; \issue{154}, \cref{sec:churn-preuve}).
+\item \textbf{\adr{42} §4 et §5.} §4 affirme encore « The convergence kill is unchanged: it applies only to a slot with a single effect write row program-wide » (l.~145--146), démenti par ses propres amendements de §6 (« Amended 2026-09-27 (\#154) », l.~184). §5 et les Consequences annoncent que \code{ProgramRelations} \emph{remplace} \code{ProgramCache} ; au commit, \file{src/rules/api/cache.rs} (77 lignes) existe et \code{ProgramCache} \emph{compose} \code{ProgramRelations} avec les trois structures que la couche règles construit encore (\code{MountIndex}, \code{ContextConsumers}, \code{RenderIndex}).
+\item \textbf{\adr{20} item~9.} « the splice α-renames and emits no param aliases » : le splice émet \code{let setter\#0 = setN} pour un paramètre (dossier 07, exemple 14).
+\item \textbf{Doc-comments en retard.} Trois renvois à une méthode \code{ImportCtx::callee_is_react} qui n'existe plus (\srcline{src/lowering/hook_detector.rs}{44}, \srcline{src/lowering/mod.rs}{164}, \srcline{src/lowering/mod.rs}{279} ; la méthode est \code{classify_callee}) ; « The 14 native rules and the 16-entry doc table » (\srcline{src/rules/registry.rs}{130}) pour 19 objets \code{Rule} ; « schema v1 » dans l'aide de \code{--format json} (\srcline{src/cli/mod.rs}{82}) pour une sortie en \code{version: 2} (\srcline{src/driver/json.rs}{268}) ; doc-comments déplacés au-dessus de la mauvaise fonction dans \file{src/engine/setters.rs} et \file{src/ir/expr.rs} (rustdoc les attache à la fonction suivante).
+\item \textbf{Tracker.} \issue{158} (\code{new X()}) est encore ouverte alors que \code{e67b10a} la cite et que \code{Expr::New} existe ; \issue{7} (identité de composant) l'est aussi alors qu'\adr{40} déclare l'implémenter. Le dossier 15 met en garde : une issue ouverte peut l'être pour ses résidus, et seul son dernier commentaire le dit.
+\end{itemize}
+
+Aucun de ces écarts ne change un diagnostic. Ils comptent parce que le projet fait du texte une source (\cref{sec:histoire-doctrine-methode}) : l'ordre de confiance que le dossier 07 a dû établir pour \adr{42} (le code, puis les doc-comments de module, puis le dernier amendement, puis \file{docs/relations.md}, puis le reste de l'ADR comme historique) est un symptôme, pas une règle du projet.
+
+% ---------------------------------------------------------------------------
+\subsection{Récapitulatif}
+
+\begin{center}\footnotesize
+\begin{longtable}{@{}p{0.6cm}>{\raggedright\arraybackslash}p{4.1cm}>{\raggedright\arraybackslash}p{0.9cm}>{\raggedright\arraybackslash}p{1.5cm}>{\raggedright\arraybackslash}p{1.6cm}>{\raggedright\arraybackslash}p{3.6cm}p{0.8cm}@{}}
+\caption{Défauts observés au commit \snapshotCommit{}. « Niveau » est celui du finding manqué (FN) ou émis à tort (FP). Aucune issue ne décrit L1 à L14 au 28 septembre 2026 ; la colonne donne l'issue voisine.}\label{tab:limites-recap}\\
+\toprule
+& Constat & Type & Couche & Niveau & Cause & Issue \\
+\midrule
+\endfirsthead
+\toprule
+& Constat & Type & Couche & Niveau & Cause & Issue \\
+\midrule
+\endhead
+L1 & updater \code{c => c + 1} ignoré en inter & FN & interpréteur & \Warning{} & \file{interpreter.rs} l.~368--391 & \issue{14} \\
+L2 & setter hors position d'instruction (\code{\&\&}, ternaire) & FN & interpréteur & \Warning{} & \file{interpreter.rs} l.~81--89 & \issue{130} \\
+L3 & \code{useReducer} : action écrite dans le slot & FN et FP & lowering & \Warning{} ; \Error{} & \file{hook_extractor.rs} l.~715--719 & — \\
+L4 & écritures d'un nettoyage hors store & latent & moteur & — & \file{cfg_analyzer.rs} l.~84--86 & — \\
+L5 & slot à ⊤ par join, jamais signalé & FN & moteur & \Warning{} & \file{fixpoint.rs} l.~514--526 & \issue{157} \\
+L6 & chaîne croissante non bornée ignorée & FN & domaines & \Warning{} & \file{state_value.rs} l.~378--382 & — \\
+L7 & \code{return e} d'un appelé greffé sans liaison & FN & splice & \Warning{} & \file{splice.rs} l.~158--174 & — \\
+L8 & deux instances d'un enfant, un résultat & FN & inter-composants & \Warning{} & \file{state_value.rs} l.~582--586 & — \\
+L9 & alias de setter appelé au rendu & FN & règle & \Error{} & \file{setter_in_render.rs} l.~63--86 & — \\
+L10 & provider \code{<Ctx value>} (React~19) & FN & règle & \Warning{} & \file{providers.rs} l.~94 & \issue{30} \\
+L11 & \code{switch}, \code{.map}, hook en argument, classe & FN & détection & tous & \file{jsx_detect.rs}, \file{hook_call_detect.rs}, \file{detector.rs} & \issue{122} \\
+L12 & deux constantes distinctes « already holds » & FP & règle & \Warning{} & \file{redundant_set_state.rs} l.~269 & — \\
+L13 & mutation et set sur branches exclusives & FP & primitive & \Error{} & \file{query.rs} l.~1039--1057 & \issue{142} \\
+L14 & bras point fixe sur état dérivé & FP & règle & \Warning{} & \file{infinite_loop.rs} l.~130--136 & \issue{144} \\
+\midrule
+E1 & \adr{3} : trois priorités, le code en a quatre & écart & ADR & — & \file{component_detector.rs} l.~66--72 & \issue{122} \\
+E2 & \adr{13} : \file{symbol_extractor.rs} jamais créé & écart & ADR & — & \file{symbol_graph.rs} & — \\
+E3 & \adr{18} : \file{churn_graph.rs}, kill mono-écrivain & écart & ADR & — & \file{churn.rs}, \file{guards.rs} & \issue{154} \\
+E4 & \adr{42} §4 « kill unchanged », §5 \file{cache.rs} « gone » & écart & ADR & — & \file{rules/api/cache.rs} & \issue{151} \\
+E5 & \file{docs/semantics.md} (\adr{1}), \file{docs/ir.md} (\adr{3}) absents & écart & docs & — & — & — \\
+E6 & doc-comments en retard (\code{callee_is_react}, « 14 native rules », « schema v1 ») & écart & code & — & \file{hook_detector.rs}, \file{registry.rs}, \file{cli/mod.rs} & — \\
+\bottomrule
+\end{longtable}
+\end{center}
+
+D'autres constats figurent dans les dossiers de notes sans avoir été rejoués ici ; ils sont signalés dans les chapitres correspondants : collision d'\code{ExprId} entre le fichier du parent et celui de l'enfant (\cref{sec:ir-limites}), \code{alloc_span} qui ne mesure pas les expressions des hooks sans corps, \code{??} lu comme \code{||} par le narrowing (\cref{sec:lowering-limites}), \code{catch} qui repart de l'état d'avant le \code{try}, hooks imbriqués dans une expression (\code{a \&\& useX()}) non extraits et déclarés inconditionnels, setter perdu au join de deux alias (\cref{sec:transfert-stores-soundness}), havoc incomplet d'un setter dans un littéral objet remis à un enfant inconnu (\cref{sec:inter-composants-soundness}), \code{slot_written_outside} qui ne filtre pas le propriétaire (\cref{sec:regles-etat-derived}).
+
+% ===========================================================================
+\section{Causes communes et dette}
+\label{sec:limites-perspectives-dette}
+
+\subsection{Quelques racines pour quatorze constats}
+\label{sec:limites-perspectives-racines}
+
+La doctrine du projet interdit le correctif local (\file{CLAUDE.md}, principes 1 et 3) : un problème qui touche plusieurs règles se corrige une fois, au niveau central. Relus sous cet angle, les constats de la section précédente se regroupent (\cref{fig:limites-racines}).
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[
+    c/.style={draw=ra-gray,rounded corners=1pt,font=\scriptsize,align=left,text width=3.9cm,inner sep=2.5pt},
+    r/.style={bloc,font=\scriptsize,text width=5.2cm,align=left},
+    lien/.style={-{Stealth[length=1.5mm]},draw=ra-gray}]
+  \node[c] (l1) at (0,0) {L1 updater en inter};
+  \node[c,below=1mm of l1] (l2) {L2 setter en expression};
+  \node[c,below=1mm of l2] (l3) {L3 \code{useReducer}};
+  \node[c,below=3mm of l3] (l5) {L5 ⊤ par join};
+  \node[c,below=1mm of l5] (l6) {L6 chaîne croissante};
+  \node[c,below=1mm of l6] (l14) {L14 bras point fixe (FP)};
+  \node[c,below=3mm of l14] (l9) {L9 alias en rendu};
+  \node[c,below=1mm of l9] (l10) {L10 \code{<Ctx value>}};
+  \node[c,below=1mm of l10] (l12) {L12 deux constantes (FP)};
+  \node[c,below=1mm of l12] (l13) {L13 branches exclusives (FP)};
+  \node[c,below=3mm of l13] (l4) {L4 nettoyage};
+  \node[c,below=1mm of l4] (l7) {L7 \code{return} jeté};
+  \node[c,below=3mm of l7] (l8) {L8 contexte aplati};
+  \node[c,below=3mm of l8] (l11) {L11 détection};
+  \node[r] (r1) at (7,-0.55) {R1. Écrire un slot a plusieurs interprétations (deux bras de \code{exec_setter_call}, \code{ExprStmt} seul, réducteur sauté)};
+  \node[r] (r2) at (7,-2.35) {R2. La divergence n'est signalée que par l'étape de widening, slot par slot};
+  \node[r] (r3) at (7,-4.55) {R3. Des règles recalculent un fait que le moteur a déjà (fichiers du cliquet \file{layer_boundary.rs})};
+  \node[r] (r4) at (7,-6.55) {R4. Une évaluation jetée ou jamais faite};
+  \node[r] (r5) at (7,-7.85) {R5. Le contexte d'appel est aplati en props};
+  \node[r] (r6) at (7,-8.85) {R6. Énumérations syntaxiques à bras par défaut};
+  \foreach \a in {l1,l2,l3} \draw[lien] (\a.east) -- (r1.west);
+  \foreach \a in {l5,l6,l14} \draw[lien] (\a.east) -- (r2.west);
+  \foreach \a in {l9,l10,l12,l13} \draw[lien] (\a.east) -- (r3.west);
+  \foreach \a in {l4,l7} \draw[lien] (\a.east) -- (r4.west);
+  \draw[lien] (l8.east) -- (r5.west);
+  \draw[lien] (l11.east) -- (r6.west);
+  \draw[lien,dashed] (l1.east) -- (r2.west);
+\end{tikzpicture}
+\caption{Les constats L1--L14 et leurs racines. La flèche pointillée rappelle que L1 cumule deux causes. Le regroupement est une lecture de ce chapitre, pas une décision du projet.}
+\label{fig:limites-racines}
+\end{figure}
+
+\paragraph{R1 --- Qu'est-ce qu'écrire un slot ?} L1, L2 et L3 sont trois réponses différentes à la même question : un updater exécuté par le premier bras et pas par le second, un appel vu en instruction et pas en expression, une action prise pour une valeur. Une seule fonction de transfert « écriture d'état », appelée par toute évaluation de \code{Call} et qui sait exécuter un updater ou un réducteur, supprimerait les trois. C'est la situation que la relation \relation{slot_writers} a déjà atteinte (\issue{130} a rendu visible un appel en toute position) ; le store, lui, garde trois chemins.
+
+\paragraph{R2 --- Un seul prédicat de divergence.} L5 et L6 sont des oublis dans ce qu'est « diverger » ; L14 est l'excès inverse, une divergence attribuée au slot et non à la boucle. Le dossier 04 ajoute les cycles finis (un booléen qui bascule, un \code{(i + 1) \% k}) qui convergent sans widening ; nous y revenons en \cref{sec:limites-perspectives-recherche}. Tous plaident pour un prédicat de divergence unique, calculé par le moteur, que les deux portes du bras point fixe liraient.
+
+\paragraph{R3 --- La frontière sans marche.} Les fichiers de L9, L12 et L13 (\file{setter_in_render.rs}, \file{redundant_set_state.rs}, \file{state_mutation.rs}) figurent tous trois dans la liste \code{ALLOWED} de \srcline{tests/layer_boundary.rs}{20}, qui recense les fichiers de règles marchant encore la syntaxe ; L10 naît d'un helper de la couche règles (\file{providers.rs}) que \adr{42} §5 prévoit de descendre. Chacun recalcule localement un fait (qui est un setter, ce qui est égal, ce qui co-exécute, ce qu'est un provider) que le moteur connaît mieux. La corrélation n'est pas une preuve, mais elle confirme la direction d'\adr{42} : « Each entry is a promotion still to do, not an exception ».
+
+\paragraph{R4 à R6.} L4 et L7 jettent une évaluation que JavaScript fait ; la règle générale est qu'une sous-expression non représentable passe par une évaluation pour effet plutôt que d'être supprimée, principe que le lowering s'applique déjà (\src{src/lowering/expr_lower.rs}{229}{232} pour \code{void e}). L8 relève de la sensibilité au contexte d'\adr{12}. L11 relève de l'exhaustivité (\issue{77}).
+
+\subsection{L'état de la dette}
+
+\file{docs/TODO.md} n'est plus qu'une redirection : le backlog vit sur le tracker depuis le 27 août 2026, une issue par limite. Au 29 septembre 2026, 59 issues sont ouvertes, dont 5 \code{soundness-bug} (\issue{7}, \issue{143}, \issue{157}, \issue{158}, \issue{162}), 25 \code{precision-fn}, 13 \code{precision-fp} et 5 \code{infra}. Trois familles méritent d'être nommées.
+
+\begin{itemize}
+\item \textbf{L'instrument de test.} \issue{14} : la plupart des tests d'intégration construisent \code{Config::default()}, dont le registre de résumés est vide, et beaucoup passent par l'analyse intra ; L1 en est la conséquence directe. \issue{17} : cinq fichiers restent sans test (\file{registry/keyed.rs}, \file{stores/heap.rs}, \file{ir/source_range.rs}, \file{import_resolution.rs} du lowering et le \file{lib.rs} de la crate WASM) ; \issue{18} : les tests à écrire en premier. \file{src/engine/render_deps.rs} n'a aucun test unitaire.
+\item \textbf{Les deux interpréteurs.} \issue{12} : « Two CFG interpreters of different strength, and nothing says which ran ». \code{analyze_cfg} (worklist, widening, narrowing) tourne sur le rendu, les effets et les handlers ; \code{exec_body_impl} (une passe, arcs arrière ignorés) sur tout corps imbriqué. Une même expression est évaluée avec une précision très différente selon qu'elle est écrite dans un effet ou dans le \code{setTimeout} de cet effet ; \issue{21} en est une conséquence documentée.
+\item \textbf{La politique \code{Unknown}.} Un callback passé à un callee inconnu n'est pas exécuté par le point fixe (\adr{9}, « \code{Unknown → skip} ») ; la relation des écrivains, elle, le descend à ⊤ (\adr{34} §5). Le dossier 15 y voit « la plus grande exception de principe encore dans le code » au regard de l'invariant « faux négatifs interdits » : un setter dans \code{myUtil(() => setX(x + 1))} ne fait pas bouger le store.
+\end{itemize}
+
+\begin{decision}[ADR-009 et ADR-034]
+\adr{9} a choisi de ne pas exécuter un callback remis à un callee de classe \code{Unknown} : « for a linter, false positives are more costly than false negatives. Descending an unknown callee would be the \emph{sound} choice […] We accept the FN » ; l'ADR le présente comme un réglage (« It's a \emph{knob} »). \adr{34} §5 a choisi l'inverse pour la relation des écrivains : « The walk descends any function argument of an unknown call, at ⊤ ». Les deux décisions coexistent. La première est un compromis au sens de \cref{def:tests-corpus-defaut-compromis} tant qu'aucune règle ne lit l'absence d'écriture dans le store comme une preuve ; c'est précisément ce que fait le bras point fixe d'\regle{infinite-loop}.
+\end{decision}
+
+% ===========================================================================
+\section{Perspectives de recherche}
+\label{sec:limites-perspectives-recherche}
+
+Les pistes de la section précédente sont des corrections. Celles qui suivent sont des questions ouvertes, qui demandent un travail de conception avant d'être codées.
+
+\subsection{Une sémantique concrète écrite}
+
+\adr{1} promettait un \file{docs/semantics.md} qui spécifie les extensions du modèle (effets, handlers, inter-composants), des fonctions de transfert qui citent la règle React-tRace correspondante \cite{LeeAhnYi2025}, et des tests de régression contre l'interpréteur de référence. Aucun des trois n'existe (\cref{sec:histoire-doctrine-ecarts}). Or plusieurs constats de ce chapitre (L3, L4, L7) sont des écarts à une sémantique concrète que personne n'a écrite : que fait \code{dispatch}, quand court un nettoyage, qu'évalue un \code{return}. Une sémantique concrète écrite, même partielle, serait l'oracle qui transforme ces constats en tests. Le Strict Mode (double montage en développement) n'a, lui, aucune position écrite dans le dépôt, hors du message de \regle{missing-cleanup}.
+
+\subsection{Réducteurs, contexte et cycle de vie}
+
+\code{useReducer} (L3) et \code{useContext} (\issue{28}, « the single largest source of analysis limits », 363 sites sur les huit corpus mesurés) ont un point commun : leur valeur est produite par du code que le composant ne contient pas, un réducteur ou le provider le plus proche. Le premier se modélise comme un updater à deux paramètres ; le second demande un store de programme indexé par contexte, alimenté par les \code{value} des providers que \code{render_deps} sait déjà trouver (\cref{sec:inter-composants-contextes}). Le cycle de vie (nettoyage, L4 ; remontage, \issue{162} ; Strict Mode) demande, lui, que le modèle abstrait de React (\cref{chap:react-modele}) représente le démontage comme une transition, ce qu'il ne fait pas aujourd'hui.
+
+\subsection{Précision relationnelle et information de transition}
+
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/r27/persp/Persp.tsx}, composant \code{Toggle}}]
+export function Toggle() {
+  const [on, setOn] = useState(false);
+  useEffect(() => {
+    setOn(!on);
+  }, [on]);
+  return <p>{String(on)}</p>;
+}
+\end{lstlisting}
+
+\code{Toggle} boucle : chaque écriture change \code{on}, qui relance l'effet. L'analyseur répond \code{Toggle (2 hooks) Persp.tsx ✓} (\code{--verbose} : \code{1 iteration(s), widened: []}). Le domaine abstrait sait que \code{on} est un booléen ; il ne sait pas que chaque exécution de l'effet \emph{le fait changer}. Les domaines non relationnels de \reactant{} (intervalles, ensembles bornés, \cref{chap:treillis-simples}) décrivent des valeurs, pas des transitions : un cycle fini (booléen qui bascule, compteur modulo $k$, deux chaînes qui alternent) converge sans widening, et ni le bras point fixe ni le churn (qui ne regarde que les références) ne le voient. Le dossier 04 range ce FN parmi les limites de conception. Deux directions sont ouvertes : un domaine de transitions (la valeur écrite est-elle toujours différente de la valeur lue ?), ou un domaine relationnel entre valeur lue et valeur écrite. La même absence de relations explique que \code{narrow_env_for_branch} ne raffine que les gardes \code{Var op Lit}, \code{Var} et \code{!Var} : une garde \code{x < y} ne dit rien.
+
+\subsection{Une \Error{} pour la divergence de valeur}
+
+Le bras point fixe est plafonné à \Warning{} (\issue{144}) parce que le widening n'est pas une preuve : il dit que l'analyse n'a pas su borner, pas que la valeur croît. Obtenir une \Error{} demande une primitive \code{must} de divergence, par exemple une fonction de rang : une quantité qui croît strictement à chaque tour de la boucle automatique et qu'aucune garde ne borne. C'est l'analogue, pour les valeurs, de ce que la preuve multi-site (\cref{chap:churn}) fait pour les références fraîches.
+
+\subsection{Le vocabulaire des packs}
+
+\issue{68} (une seule ancre par règle déclarative) et \issue{67} (pas de verdict d'expression sur une prop, une valeur de provider ou un argument de setter) bornent ce que Tier A peut dire (\cref{sec:regles-declaratives-limites}). La position du projet est constante : « Never by a syntactic bypass ». Chaque extension doit donc passer par un nouveau fait du moteur, avec sa polarité ; \issue{143} rappelle que la polarité d'une conjonction de gardes est elle-même à typer.
+
+% ===========================================================================
+\begin{resume}
+\begin{itemize}
+\item \reactant{} distingue le \emph{défaut} (sous-approximation, affirmation fausse : se corrige) du \emph{compromis} (imprécision sound : se décide). \file{docs/limitations.md} ne liste qu'un défaut confirmé (\issue{140}) ; les limites tranchées sont des issues fermées \code{wontfix} (\issue{40}, \issue{42}, \issue{51}, \issue{63}, \issue{65}, \issue{101}) et les non-changements d'\adr{20}.
+\item Au commit \snapshotCommit{}, quatorze constats (\cref{tab:limites-recap}) : dix FN, dont deux \Error{} manquées (un alias de setter en rendu, un enfant à \code{switch} que la détection fait disparaître) ; trois FP, dont une \Error{} sur branches exclusives ; une sous-approximation latente (les nettoyages) ; \code{useReducer} est à la fois FN et FP \Error{}. Aucun n'avait d'issue.
+\item Chaque constat a une cause localisée, fichier et lignes (de l'interpréteur des domaines à la détection du front-end, en passant par le splice, le point fixe et quatre fichiers de règles), et une piste centrale : une seule interprétation de l'écriture d'état, un seul prédicat de divergence, des règles qui lisent les relations au lieu de marcher la syntaxe, aucune évaluation jetée, des énumérations exhaustives.
+\item Les écarts ADR ↔ code (\adr{3} règle~4, \adr{13}, \adr{18}, \adr{42} §4--§5, \file{docs/semantics.md}, doc-comments) ne changent aucun diagnostic mais obligent à lire le code comme première source.
+\item Les perspectives de recherche : une sémantique concrète écrite, la modélisation des réducteurs, du contexte et du cycle de vie, une information de transition pour les primitifs, une primitive \code{must} de divergence, un vocabulaire de packs étendu par des faits du moteur.
+\end{itemize}
+Les annexes qui suivent rassemblent les fiches ADR, le glossaire, le catalogue des règles et la carte de la codebase.
+\end{resume}
+
+% ===========================================================================
+\section{Exercices}
+\label{sec:limites-perspectives-exercices}
+
+\begin{exercice}{Classer un constat}{limites-perspectives-classer}
+Pour chacun des cas suivants, dire s'il s'agit d'un défaut ou d'un compromis, et justifier en une phrase : (a) \issue{22}, \code{slice}/\code{concat} jamais prouvés frais ; (b) L6, \code{is_unbounded} qui ignore les chaînes ; (c) L12, \regle{redundant-set-state} sur deux constantes ; (d) L13, \regle{state-mutation} en \Error{} sur branches exclusives.
+\end{exercice}
+\begin{solution}
+(a) Compromis : refuser la preuve reste sound, le prix est un FN de précision décidé. (b) Défaut : une croissance réelle est déclarée bornée, une boucle certaine reste silencieuse. (c) Compromis toléré en l'état (FP de niveau \Warning{}), mais sa cause est une confusion de notions (stable pour égal) qui mérite correction. (d) Défaut : une \Error{} affirme une conclusion dont un seul conjoint est prouvé, ce que la définition des niveaux interdit.
+\end{solution}
+
+\begin{exercice}{Un témoin pour L2}{limites-perspectives-temoin}
+Écrire deux variantes de \code{AndSetter} qui, d'après le code cité, devraient elles aussi être muettes (le setter dans le bras d'un ternaire, en argument d'un appel), et une variante qui devrait être signalée. Vérifier avec \code{reactant check}.
+\end{exercice}
+\begin{solution}
+Muettes d'après \src{src/domains/interp/interpreter.rs}{81}{89} : \code{const r = flag ? setA(a + 1) : 0;} (chaque bras du ternaire est un \code{Let} du temporaire) et \code{wrap(setA(a + 1));} avec un \code{wrap} non inliné (le callee de l'\code{ExprStmt} est \code{wrap}, pas le setter). Signalée : \code{if (flag) setA(a + 1);}, un \code{ExprStmt} dans une branche. Rejoué (\file{/tmp/r27/exo/Exo.tsx}) : \code{Ternary} et \code{Arg} sont affichés \code{✓}, \code{Branch} reçoit \code{warn infinite-loop [hook:0]}.
+\end{solution}
+
+\begin{exercice}{Corriger L7 à la racine}{limites-perspectives-l7}
+Proposer le changement de \src{src/ir/splice.rs}{158}{174} qui corrige L7, et dire pourquoi il ne peut pas produire de faux négatif nouveau.
+\end{exercice}
+\begin{solution}
+Dans le bras \code{Terminator::Return(ret)}, quand \code{bound_var} est \code{None}, pousser \code{Stmt::ExprStmt(ret, call_span)} avant le saut vers la jonction. L'instruction ajoutée n'écrit aucune liaison (c'est une évaluation pour effet) ; elle ne peut qu'ajouter des effets (lectures, appels de setter) que JavaScript exécute réellement, donc sur-approximer davantage, jamais retirer un comportement.
+\end{solution}
+
+\begin{exercice}{Un prédicat de divergence}{limites-perspectives-divergence}
+Écrire en pseudo-code un prédicat \code{diverges(slot)} qui couvre L5 et L6 sans produire L14. Quelle information le moteur doit-il conserver que \code{widen_trace} n'a pas aujourd'hui ?
+\end{exercice}
+\begin{solution}
+Une piste : \code{diverges(s)} vrai si la valeur de \code{s} a été élargie \emph{ou} a atteint ⊤ par join pendant la partie « rendu + effets » d'un tour, \emph{et} si la croissance est entretenue par la boucle automatique, c'est-à-dire si un effet qui écrit \code{s} dépend (par ses deps) d'un slot dont la croissance vient de cette même boucle. Il faut conserver, par slot, l'origine de la croissance (rendu/effets contre handlers) et le graphe « écrit par / dépend de » entre effets et slots, que \relation{effect_triggers} fournit déjà (\cref{sec:relations-triggers}). \code{widen_trace} ne garde que l'itération et la liste des effets écrivains (et le dossier 06 note que cette liste est surestimée).
+\end{solution}

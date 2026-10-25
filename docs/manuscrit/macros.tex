@@ -1,0 +1,125 @@
+% ---------------------------------------------------------------------------
+% Macros du manuscrit. Les chapitres n'en définissent AUCUNE autre.
+% ---------------------------------------------------------------------------
+
+% Racine du dépôt, relative à docs/manuscrit (pour \rustsnippet & co).
+\newcommand{\repoRoot}{../..}
+% Commit photographié par le manuscrit.
+\newcommand{\snapshotCommit}{e67b10a}
+\newcommand{\snapshotDate}{27 septembre 2026}
+
+% ---- Texte -----------------------------------------------------------------
+% Identifiant / chemin en machine à écrire, accepte _ # & % $ ^ ~ sans
+% échappement ET les caractères UTF-8 (⊤, ✓, é…). Principe : on détokenise
+% l'argument, puis on le relit (\scantokens) avec les caractères spéciaux
+% rendus inertes, tandis que les octets UTF-8 restent actifs et sont décodés
+% par inputenc. \{ \} \# \ldots restent des commandes et s'impriment.
+\makeatletter
+\newcommand{\ra@codecatcodes}{%
+  \catcode`\_=12 \catcode`\#=12 \catcode`\&=12 \catcode`\%=12
+  \catcode`\$=12 \catcode`\^=12 \catcode`\~=12 \endlinechar=-1 }
+\DeclareRobustCommand{\code}[1]{\begingroup\ra@codecatcodes\edef\ra@tmp{\detokenize{#1}}\texttt{\scantokens\expandafter{\ra@tmp}}\endgroup}
+\DeclareRobustCommand{\file}[1]{\begingroup\ra@codecatcodes\edef\ra@tmp{\detokenize{#1}}\texttt{\scantokens\expandafter{\ra@tmp}}\endgroup}
+% Dans les signets PDF (hyperref), \code et \file rendent leur argument tel quel.
+\pdfstringdefDisableCommands{\let\code\@firstofone \let\file\@firstofone}
+\makeatother
+% Référence à un endroit du code : \src{src/ir/expr.rs}{12}{40}  /  \srcline{src/ir/expr.rs}{12}
+\newcommand{\src}[3]{\file{#1}, l.~#2--#3}
+\newcommand{\srcline}[2]{\file{#1}, l.~#2}
+% Nom d'une règle du catalogue : \regle{infinite-loop}
+\newcommand{\regle}[1]{\textsf{\detokenize{#1}}}
+% Nom d'une relation du moteur : \relation{writers}
+\newcommand{\relation}[1]{\textsf{\detokenize{#1}}}
+% Référence à une ADR : \adr{27} -> lien vers l'annexe, si le label existe
+\newcommand{\adr}[1]{\hyperref[adr:#1]{ADR-#1}}
+% Issue GitHub : \issue{63}
+\newcommand{\issue}[1]{\href{https://github.com/rboudrouss/reactant-analyzer/issues/#1}{\##1}}
+% Terme défini pour la première fois (italique + index)
+\newcommand{\terme}[1]{\emph{#1}\index{#1}}
+% Entrée d'index sans mise en forme
+\newcommand{\idx}[1]{\index{#1}}
+% Niveaux de diagnostic
+\newcommand{\Error}{\textsc{Error}}
+\newcommand{\Warning}{\textsc{Warning}}
+\newcommand{\Info}{\textsc{Info}}
+% Nom du projet
+\newcommand{\reactant}{\textsf{reactant-analyzer}}
+\newcommand{\React}{React}
+
+% ---- Mathématiques ---------------------------------------------------------
+\newcommand{\must}{\mathsf{must}}
+\newcommand{\may}{\mathsf{may}}
+\newcommand{\Top}{\top}
+\newcommand{\Bot}{\bot}
+\newcommand{\join}{\sqcup}
+\newcommand{\meet}{\sqcap}
+\newcommand{\widen}{\mathbin{\nabla}}
+\newcommand{\lleq}{\sqsubseteq}
+\newcommand{\lgeq}{\sqsupseteq}
+\newcommand{\lfp}{\mathrm{lfp}}
+\newcommand{\gam}{\gamma}
+\newcommand{\abs}{\alpha}
+\newcommand{\sem}[1]{\llbracket #1 \rrbracket}
+\providecommand{\llbracket}{[\![}
+\providecommand{\rrbracket}{]\!]}
+\newcommand{\Int}{\mathbb{Z}}
+\newcommand{\Nat}{\mathbb{N}}
+\newcommand{\Bool}{\mathbb{B}}
+\newcommand{\powerset}{\mathcal{P}}
+\newcommand{\Stab}{\mathcal{S}}
+\newcommand{\Val}{\mathcal{V}}
+\newcommand{\Env}{\mathcal{E}}
+\newcommand{\Heap}{\mathcal{H}}
+\newcommand{\Store}{\mathcal{M}}
+\newcommand{\Render}{\mathsf{render}}
+\newcommand{\Commit}{\mathsf{commit}}
+\newcommand{\Effect}{\mathsf{effect}}
+\newcommand{\Tick}{\mathsf{tick}}
+\newcommand{\Fix}{\mathsf{fix}}
+\DeclareMathOperator{\dom}{dom}
+\DeclareMathOperator{\reach}{reach}
+\DeclareMathOperator{\pred}{pred}
+\DeclareMathOperator{\succs}{succ}
+
+% ---- Extraits de code pris dans le dépôt -----------------------------------
+% \rustsnippet[options listings]{chemin relatif au dépôt}{première ligne}{dernière ligne}{légende}
+% Inclut VERBATIM les lignes du fichier, numérotées avec leurs vrais numéros.
+\newcommand{\rustsnippet}[5][]{%
+  \lstinputlisting[language=Rust,firstline=#3,lastline=#4,firstnumber=#3,
+    caption={\file{#2}, l.~#3--#4 --- #5},#1]{\repoRoot/#2}}
+% Même chose pour un fichier TSX/TS/JS du dépôt (fixtures, tests)
+\newcommand{\tsxsnippet}[5][]{%
+  \lstinputlisting[language=TypeScript,firstline=#3,lastline=#4,firstnumber=#3,
+    caption={\file{#2}, l.~#3--#4 --- #5},#1]{\repoRoot/#2}}
+% Fichier entier
+\newcommand{\rustfile}[3][]{\lstinputlisting[language=Rust,caption={\file{#2} --- #3},#1]{\repoRoot/#2}}
+\newcommand{\tsxfile}[3][]{\lstinputlisting[language=TypeScript,caption={\file{#2} --- #3},#1]{\repoRoot/#2}}
+% Sortie d'une commande (texte brut, sans numéros) : \begin{sortie} ... \end{sortie}
+\lstnewenvironment{sortie}[1][]{\lstset{language={},numbers=none,basicstyle=\ttfamily\scriptsize,backgroundcolor=\color{white},frame=leftline,#1}}{}
+% Terminal
+\lstnewenvironment{shell}[1][]{\lstset{language=bash,numbers=none,basicstyle=\ttfamily\footnotesize,#1}}{}
+
+% ---- Structure de chapitre -------------------------------------------------
+% Encadré d'objectifs en tête de chapitre
+\newenvironment{objectifs}{%
+  \par\noindent\begin{minipage}{\linewidth}\small
+  \textbf{Objectifs du chapitre.}\begin{itemize}}{\end{itemize}\end{minipage}\par\bigskip}
+% Résumé de fin de chapitre
+\newenvironment{resume}{\section*{Résumé du chapitre}\addcontentsline{toc}{section}{Résumé du chapitre}}{}
+% Prérequis
+\newcommand{\prerequis}[1]{\par\noindent{\small\textbf{Prérequis :} #1}\par\medskip}
+
+% ---- Figures ---------------------------------------------------------------
+% Style TikZ commun (si TikZ est chargé)
+\ifhastikz
+\tikzset{
+  bloc/.style={draw=ra-blue,fill=ra-bg,rounded corners=2pt,thick,align=center,inner sep=5pt,font=\small},
+  noeud/.style={draw=ra-blue,circle,thick,inner sep=2pt,font=\small},
+  cfgbloc/.style={draw=ra-gray,fill=white,rectangle,align=left,inner sep=4pt,font=\ttfamily\scriptsize},
+  fleche/.style={-{Stealth[length=2mm]},thick,draw=ra-gray},
+  flechemust/.style={fleche,draw=ra-blue},
+  flechemay/.style={fleche,dashed,draw=ra-amber},
+  treillis/.style={font=\small},
+  etiquette/.style={font=\scriptsize\itshape,text=ra-gray},
+}
+\fi

@@ -1,0 +1,149 @@
+% ---------------------------------------------------------------------------
+% Préambule commun du manuscrit reactant-analyzer.
+% Compilé avec pdflatex. Les paquets non essentiels sont chargés sous garde
+% \IfFileExists pour que le document compile aussi sur une installation TeX
+% minimale (mode dégradé : pas de TikZ, pas de boîtes colorées).
+% ---------------------------------------------------------------------------
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\IfFileExists{zi4.sty}{\usepackage[scaled=0.9]{zi4}}{}          % Inconsolata pour le code si dispo
+\usepackage{microtype}
+\IfFileExists{french.ldf}
+  {\usepackage[french]{babel}\frenchsetup{StandardLists=true}}
+  {\usepackage[english]{babel}\providecommand{\og}{\guillemotleft~}\providecommand{\fg}{~\guillemotright}}
+\usepackage[a4paper,margin=2.6cm,top=2.8cm,bottom=2.8cm,headheight=15pt]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{array,booktabs,longtable,tabularx}
+\IfFileExists{multirow.sty}{\usepackage{multirow}}{}
+\IfFileExists{enumitem.sty}{\usepackage{enumitem}\setlist{noitemsep,topsep=3pt}}{}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{float}
+\usepackage{etoolbox}
+\IfFileExists{needspace.sty}{\usepackage{needspace}}{\providecommand{\needspace}[1]{}}
+\usepackage{fancyhdr}
+\usepackage{listings}
+\IfFileExists{algorithm2e.sty}{\usepackage[french,algoruled,linesnumbered,vlined]{algorithm2e}}{}
+\IfFileExists{imakeidx.sty}{\usepackage{imakeidx}}{\usepackage{makeidx}}
+\makeindex
+\IfFileExists{csquotes.sty}{\usepackage{csquotes}}{}
+\usepackage[hidelinks,pdfusetitle,bookmarksnumbered,bookmarksopen,bookmarksopenlevel=1]{hyperref}
+\IfFileExists{cleveref.sty}{\usepackage[french,nameinlink,noabbrev]{cleveref}}{}
+% Le « : » actif de babel-french casse \cref sur les labels chap:/sec:/def:.
+% On le désactive pour tout le document ; le rendu « mot : suite » reste
+% correct avec une espace ordinaire. Les chapitres n'ont donc pas à le faire.
+\AtBeginDocument{\shorthandoff{:}}
+\AtBeginDocument{\renewcommand{\shorthandon}[1]{}}
+% Noms cleveref des boîtes tcolorbox (sinon « ?? »)
+\makeatletter
+  \@ifpackageloaded{cleveref}{%
+    \crefname{tcb@cnt@definition}{définition}{définitions}%
+    \Crefname{tcb@cnt@definition}{Définition}{Définitions}%
+    \crefname{tcb@cnt@theoreme}{théorème}{théorèmes}%
+    \Crefname{tcb@cnt@theoreme}{Théorème}{Théorèmes}%
+    \crefname{tcb@cnt@proposition}{proposition}{propositions}%
+    \Crefname{tcb@cnt@proposition}{Proposition}{Propositions}%
+    \crefname{tcb@cnt@lemme}{lemme}{lemmes}%
+    \Crefname{tcb@cnt@lemme}{Lemme}{Lemmes}%
+    \crefname{tcb@cnt@invariant}{invariant}{invariants}%
+    \Crefname{tcb@cnt@invariant}{Invariant}{Invariants}%
+    \crefname{tcb@cnt@exemple}{exemple}{exemples}%
+    \Crefname{tcb@cnt@exemple}{Exemple}{Exemples}%
+    \crefname{tcb@cnt@exercice}{exercice}{exercices}%
+    \Crefname{tcb@cnt@exercice}{Exercice}{Exercices}%
+    \crefname{lstlisting}{extrait}{extraits}%
+    \Crefname{lstlisting}{Extrait}{Extraits}%
+    \crefname{algocf}{algorithme}{algorithmes}%
+    \Crefname{algocf}{Algorithme}{Algorithmes}%
+  }{}%
+\makeatother
+
+% ---- TikZ (schémas) --------------------------------------------------------
+\IfFileExists{tikz.sty}{
+  \usepackage{tikz}
+  \usetikzlibrary{arrows.meta,positioning,shapes.geometric,shapes.misc,calc,fit,matrix,chains,decorations.pathreplacing,backgrounds,automata}
+  \newif\ifhastikz\hastikztrue
+}{
+  \newif\ifhastikz\hastikzfalse
+}
+
+% ---- Couleurs du manuscrit -------------------------------------------------
+\definecolor{ra-blue}{HTML}{1F4E79}
+\definecolor{ra-teal}{HTML}{0F766E}
+\definecolor{ra-amber}{HTML}{B45309}
+\definecolor{ra-red}{HTML}{9F1239}
+\definecolor{ra-gray}{HTML}{4B5563}
+\definecolor{ra-bg}{HTML}{F7F7F5}
+\definecolor{ra-kw}{HTML}{7C3AED}
+\definecolor{ra-str}{HTML}{047857}
+\definecolor{ra-cmt}{HTML}{6B7280}
+\definecolor{ra-num}{HTML}{B45309}
+
+% ---- Boîtes (tcolorbox si dispo, sinon amsthm) -----------------------------
+\theoremstyle{definition}
+\newif\ifhastcb
+\IfFileExists{tcolorbox.sty}{\hastcbtrue}{\hastcbfalse}
+\ifhastcb
+  \usepackage[most]{tcolorbox}
+  \tcbset{
+    manuscritbox/.style={enhanced,breakable,colback=ra-bg,colframe=#1,
+      boxrule=0.6pt,arc=1.5pt,left=6pt,right=6pt,top=4pt,bottom=4pt,
+      fonttitle=\bfseries\small,coltitle=white,colbacktitle=#1,
+      attach boxed title to top left={yshift=-2mm,xshift=4mm},
+      boxed title style={arc=1pt,boxrule=0pt},before skip=8pt,after skip=8pt},
+  }
+  \newtcbtheorem[number within=chapter]{definition}{Définition}{manuscritbox=ra-blue}{def}
+  \newtcbtheorem[number within=chapter]{theoreme}{Théorème}{manuscritbox=ra-blue}{thm}
+  \newtcbtheorem[number within=chapter]{proposition}{Proposition}{manuscritbox=ra-blue}{prop}
+  \newtcbtheorem[number within=chapter]{lemme}{Lemme}{manuscritbox=ra-blue}{lem}
+  \newtcbtheorem[number within=chapter]{invariant}{Invariant}{manuscritbox=ra-teal}{inv}
+  \newtcbtheorem[number within=chapter]{exemple}{Exemple}{manuscritbox=ra-teal,colback=white}{ex}
+  \newtcbtheorem[number within=chapter]{exercice}{Exercice}{manuscritbox=ra-gray,colback=white}{exo}
+  \newtcolorbox{remarque}{manuscritbox=ra-gray,title=Remarque}
+  \newtcolorbox{piege}{manuscritbox=ra-red,title=Piège}
+  \newtcolorbox{react}[1][]{manuscritbox=ra-amber,title={Rappel React\ifstrempty{#1}{}{ : #1}}}
+  \newtcolorbox{decision}[1][]{manuscritbox=ra-blue,colback=white,title={Décision\ifstrempty{#1}{}{ : #1}}}
+  \newtcolorbox{solution}{manuscritbox=ra-gray,colback=white,title=Solution}
+\else
+  \newtheorem{definitionthm}{Définition}[chapter]
+  \newtheorem{theoremethm}[definitionthm]{Théorème}
+  \newtheorem{propositionthm}[definitionthm]{Proposition}
+  \newtheorem{lemmethm}[definitionthm]{Lemme}
+  \newtheorem{invariantthm}[definitionthm]{Invariant}
+  \newtheorem{exemplethm}[definitionthm]{Exemple}
+  \newtheorem{exercicethm}[definitionthm]{Exercice}
+  % Même interface que tcolorbox : \begin{definition}{Titre}{label}
+  \newenvironment{definition}[2]{\begin{definitionthm}[#1]\label{def:#2}}{\end{definitionthm}}
+  \newenvironment{theoreme}[2]{\begin{theoremethm}[#1]\label{thm:#2}}{\end{theoremethm}}
+  \newenvironment{proposition}[2]{\begin{propositionthm}[#1]\label{prop:#2}}{\end{propositionthm}}
+  \newenvironment{lemme}[2]{\begin{lemmethm}[#1]\label{lem:#2}}{\end{lemmethm}}
+  \newenvironment{invariant}[2]{\begin{invariantthm}[#1]\label{inv:#2}}{\end{invariantthm}}
+  \newenvironment{exemple}[2]{\begin{exemplethm}[#1]\label{ex:#2}}{\end{exemplethm}}
+  \newenvironment{exercice}[2]{\begin{exercicethm}[#1]\label{exo:#2}}{\end{exercicethm}}
+  \newenvironment{remarque}{\par\medskip\noindent\textbf{Remarque.}\ }{\par\medskip}
+  \newenvironment{piege}{\par\medskip\noindent\textbf{Piège.}\ }{\par\medskip}
+  \newenvironment{react}[1][]{\par\medskip\noindent\textbf{Rappel React\ifstrempty{#1}{}{ : #1}.}\ }{\par\medskip}
+  \newenvironment{decision}[1][]{\par\medskip\noindent\textbf{Décision\ifstrempty{#1}{}{ : #1}.}\ }{\par\medskip}
+  \newenvironment{solution}{\par\medskip\noindent\textbf{Solution.}\ }{\par\medskip}
+\fi
+
+% ---- En-têtes --------------------------------------------------------------
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[LE,RO]{\small\thepage}
+\fancyhead[RE]{\small\nouppercase{\leftmark}}
+\fancyhead[LO]{\small\nouppercase{\rightmark}}
+\renewcommand{\headrulewidth}{0.3pt}
+\fancypagestyle{plain}{\fancyhf{}\fancyfoot[C]{\small\thepage}\renewcommand{\headrulewidth}{0pt}}
+
+\setcounter{tocdepth}{2}
+\setcounter{secnumdepth}{3}
+\setlength{\parskip}{3pt plus 1pt}
+\raggedbottom
+\emergencystretch=2em
+
+\input{listings-setup}
+\input{macros}
