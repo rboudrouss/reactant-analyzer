@@ -4,7 +4,9 @@ pub mod interp;
 pub mod stores;
 pub mod transfer;
 
-pub use context::{AnalysisCtx, AnalyzeChildFn, FixpointCtx, InterCtx, NullCtx, QueryContext};
+pub use context::{
+    AnalysisCtx, AnalyzeChildFn, FixpointCtx, InterCtx, NullCtx, QueryContext, Widening,
+};
 pub use impls::{BoolVal, Interval, Stability, StateValue};
 pub use stores::{AbstractEnv, EnvVal, Heap, HeapValue, MemoStore, StateStore};
 pub use transfer::StateValueTransfer;
@@ -126,19 +128,6 @@ pub trait Transfer {
     fn exec_stmt(
         &self,
         stmt: &Stmt,
-        env: &mut AbstractEnv<Self::Domain>,
-        ctx: &mut context::AnalysisCtx<Self::Domain>,
-    );
-
-    /// Fire the side effects of `expr` evaluated in *effect position* — a bare
-    /// `expr;` statement, a concise-arrow `Return` body or a branch condition:
-    /// the effects of every call in it (callbacks, slot writes), and the
-    /// inter-component eval a component application performs. This is the single definition of
-    /// "run an expression for its effects"; the fixpoint engine's `Return`
-    /// handling calls it instead of fabricating a throwaway `Stmt::ExprStmt`.
-    fn exec_expr_effects(
-        &self,
-        expr: &Expr,
         env: &mut AbstractEnv<Self::Domain>,
         ctx: &mut context::AnalysisCtx<Self::Domain>,
     );

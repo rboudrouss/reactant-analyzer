@@ -178,6 +178,32 @@ impl CFG {
             .collect()
     }
 
+    /// Every block reachable from the entry, in reverse post-order: a block
+    /// comes after each of its forward predecessors. Successors are visited
+    /// in edge order, so the order is deterministic. Iterative, so a long
+    /// body cannot overflow the stack.
+    pub fn rpo(&self) -> Vec<BlockId> {
+        let mut visited = std::collections::HashSet::from([self.entry]);
+        let mut post = Vec::new();
+        let succs = |b: BlockId| self.successors(b).into_iter().rev().collect::<Vec<_>>();
+        let mut stack = vec![(self.entry, succs(self.entry))];
+        while let Some((bid, pending)) = stack.last_mut() {
+            match pending.pop() {
+                Some(next) => {
+                    if visited.insert(next) {
+                        stack.push((next, succs(next)));
+                    }
+                }
+                None => {
+                    post.push(*bid);
+                    stack.pop();
+                }
+            }
+        }
+        post.reverse();
+        post
+    }
+
     /// Structural well-formedness, for `debug_assert!` after a transformation
     /// that rewrites blocks and edges (splicing, remapping).
     ///

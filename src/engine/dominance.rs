@@ -19,7 +19,7 @@ pub fn compute_dominators(cfg: &CFG) -> HashMap<BlockId, HashSet<BlockId>> {
         }
     }
 
-    let rpo = rpo(cfg);
+    let rpo = cfg.rpo();
 
     let mut changed = true;
     while changed {
@@ -108,30 +108,6 @@ impl DominatorTree {
     pub fn dominates(&self, a: BlockId, b: BlockId) -> bool {
         self.dom.get(&b).is_some_and(|dom_b| dom_b.contains(&a))
     }
-}
-
-/// Reverse Post-Order traversal starting from `cfg.entry`.
-pub fn rpo(cfg: &CFG) -> Vec<BlockId> {
-    let mut visited = HashSet::new();
-    let mut post_order = Vec::new();
-    dfs_post(cfg, cfg.entry, &mut visited, &mut post_order);
-    post_order.reverse();
-    post_order
-}
-
-fn dfs_post(
-    cfg: &CFG,
-    node: BlockId,
-    visited: &mut HashSet<BlockId>,
-    post_order: &mut Vec<BlockId>,
-) {
-    if !visited.insert(node) {
-        return;
-    }
-    for succ in cfg.successors(node) {
-        dfs_post(cfg, succ, visited, post_order);
-    }
-    post_order.push(node);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -299,6 +275,6 @@ mod tests {
     #[test]
     fn rpo_entry_is_first() {
         let cfg = linear_cfg();
-        assert_eq!(rpo(&cfg)[0], 0);
+        assert_eq!(cfg.rpo()[0], 0);
     }
 }

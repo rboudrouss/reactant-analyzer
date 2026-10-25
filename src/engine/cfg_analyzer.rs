@@ -1,297 +1,33 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+//! The engine's entry into the one CFG solver (#12): a hook body — render,
+//! effect, handler — run over the stores of the current fixpoint iteration.
+//! Every closure such a body executes runs through the same solver, from the
+//! interpreter, at its inlining depth.
+
+use std::collections::HashMap;
 
 use crate::{
-    domains::{
-        AbstractDomain, AnalysisCtx, Heap, InterCtx, QueryContext, Transfer,
-        stores::{AbstractEnv, MemoStore, StateStore},
-    },
-    ir::{
-        ComponentId,
-        cfg::{CFG, EdgeKind, Terminator},
-        expr::{BinOp, Expr, Prim},
-        types::BlockId,
-    },
+    domains::{AbstractEnv, AnalysisCtx, Transfer, interp::run_cfg},
+    ir::{cfg::CFG, types::BlockId},
 };
 
-/// Per-block entry environments produced by [`analyze_cfg`].
+/// Per-block exit environments produced by [`analyze_cfg`].
 pub type BlockEnvs<D> = HashMap<BlockId, AbstractEnv<D>>;
 
-/// Worklist-based abstract interpretation of a single CFG.
+/// Abstract interpretation of a hook body (depth 0), to a post-fixpoint.
 ///
-/// Returns `(exit_envs, state_out)`:
-/// - `exit_envs[b]` abstract environment at the *exit* of block `b`.
-/// - `state_out` outer state + all `setState` discoveries from this pass.
-///
-/// `heap` is mutated in-place (insert-only) as `FnLit`/`ObjectLit`/`ArrayLit`
-/// nodes are encountered. Callers pass and accumulate the same heap across
-/// render and effect passes so that closures allocated in render are visible
-/// when resolving variable callbacks in effects (B5 pattern).
-///
-/// Internally maintains `entry_envs[b]` (join of all predecessor exit envs).
-/// `state` is the outer state from the previous fixpoint iteration; new
-/// `setState` calls are accumulated on top of it.
-#[allow(clippy::too_many_arguments)]
-pub fn analyze_cfg<'inter, T: Transfer>(
-    component: ComponentId,
+/// Returns the exit env of every block the run reached. Every slot write the
+/// body makes lands in `ctx.state` (joined); `ctx.heap` is mutated in place
+/// as `FnLit`/`ObjectLit` nodes are encountered — callers pass and
+/// accumulate the same heap across render and effect passes so that closures
+/// allocated in render are visible when resolving variable callbacks in
+/// effects (B5 pattern).
+pub fn analyze_cfg<T: Transfer>(
+    transfer: &T,
     cfg: &CFG,
     entry_env: AbstractEnv<T::Domain>,
-    state: &StateStore<T::Domain>,
-    memo: &MemoStore<T::Domain>,
-    transfer: &T,
-    widen_threshold: usize,
-    thresholds: &[f64],
-    heap: &mut Heap,
-    ctx: &dyn QueryContext,
-    inter: Option<&'inter InterCtx<'inter>>,
-) -> (BlockEnvs<T::Domain>, StateStore<T::Domain>) {
-    let mut entry_envs: HashMap<BlockId, AbstractEnv<T::Domain>> = HashMap::new();
-    let mut exit_envs: HashMap<BlockId, AbstractEnv<T::Domain>> = HashMap::new();
-    let mut state_out = state.clone();
-
-    entry_envs.insert(cfg.entry, entry_env);
-
-    let mut worklist: VecDeque<BlockId> = VecDeque::new();
-    let mut in_worklist: HashSet<BlockId> = HashSet::new();
-    worklist.push_back(cfg.entry);
-    in_worklist.insert(cfg.entry);
-
-    let mut back_edge_counts: HashMap<BlockId, usize> = HashMap::new();
-
-    while let Some(b) = worklist.pop_front() {
-        in_worklist.remove(&b);
-
-        let env_in = entry_envs[&b].clone();
-        let mut env_out = env_in;
-        // Memo is fixed for this pass; local mutations are discarded.
-        let mut memo_local = memo.clone();
-
-        if let Some(block) = cfg.blocks.get(&b) {
-            let mut ac = AnalysisCtx {
-                component,
-                state: &mut state_out,
-                memo: &mut memo_local,
-                heap,
-                query: ctx,
-                inter,
-            };
-            for stmt in &block.stmts {
-                transfer.exec_stmt(stmt, &mut env_out, &mut ac);
-            }
-            // A concise-arrow body (`() => setN(1)`) lowers its expression to a
-            // `Return` terminator, not an `ExprStmt` — but its side effects must
-            // still fire, and so must a branch condition's. Run them through the
-            // shared effect-firing path instead of fabricating a throwaway
-            // `Stmt::ExprStmt`.
-            if let Terminator::Return(e) | Terminator::Branch { cond: e, .. } = &block.term {
-                transfer.exec_expr_effects(e, &mut env_out, &mut ac);
-            }
-        }
-
-        exit_envs.insert(b, env_out.clone());
-
-        for (succ, outgoing_env) in outgoing(cfg, b, &env_out) {
-            let is_back = cfg
-                .edges
-                .iter()
-                .any(|e| e.from == b && e.to == succ && matches!(e.kind, EdgeKind::Back));
-
-            let new_entry = match entry_envs.get(&succ) {
-                None => outgoing_env,
-                Some(existing) => {
-                    if is_back {
-                        let cnt = back_edge_counts.entry(succ).or_insert(0);
-                        *cnt += 1;
-                        if *cnt >= widen_threshold {
-                            existing.widen_to(&outgoing_env, thresholds)
-                        } else {
-                            existing.join(&outgoing_env)
-                        }
-                    } else {
-                        existing.join(&outgoing_env)
-                    }
-                }
-            };
-
-            if entry_envs.get(&succ) != Some(&new_entry) {
-                entry_envs.insert(succ, new_entry);
-                if in_worklist.insert(succ) {
-                    worklist.push_back(succ);
-                }
-            }
-        }
-    }
-
-    (exit_envs, state_out)
-}
-
-/// The env each successor of `b` receives when `b` exits with `env_out`: a
-/// branch narrows on its condition, a jump passes the env on unchanged.
-fn outgoing<D: AbstractDomain>(
-    cfg: &CFG,
-    b: BlockId,
-    env_out: &AbstractEnv<D>,
-) -> Vec<(BlockId, AbstractEnv<D>)> {
-    if let Some(block) = cfg.blocks.get(&b) {
-        match &block.term {
-            Terminator::Branch {
-                cond, then_, else_, ..
-            } => vec![
-                (*then_, narrow_env_for_branch(env_out, cond, true)),
-                (*else_, narrow_env_for_branch(env_out, cond, false)),
-            ],
-            Terminator::Jump(succ) => vec![(*succ, env_out.clone())],
-            Terminator::Return(_) | Terminator::Unreachable => vec![],
-        }
-    } else {
-        cfg.successors(b)
-            .into_iter()
-            .map(|s| (s, env_out.clone()))
-            .collect()
-    }
-}
-
-/// The entry env of `block`, read back from a finished pass: `initial` for
-/// the entry block, else the join of what each predecessor hands it from that
-/// predecessor's exit env (ADR-042 §2).
-///
-/// Joined, never widened. Every exit env over-approximates its block's
-/// concrete exits, so their join over-approximates the concrete entry; the
-/// widened entry the pass converged on is at least as large, never smaller.
-/// A predecessor with no exit env was unreachable and contributes nothing.
-pub(crate) fn entry_env_of<D: AbstractDomain>(
-    cfg: &CFG,
-    block: BlockId,
-    initial: &AbstractEnv<D>,
-    exits: &HashMap<BlockId, AbstractEnv<D>>,
-) -> AbstractEnv<D> {
-    if block == cfg.entry {
-        return initial.clone();
-    }
-    let mut env: Option<AbstractEnv<D>> = None;
-    for edge in cfg.edges.iter().filter(|e| e.to == block) {
-        let Some(exit) = exits.get(&edge.from) else {
-            continue;
-        };
-        for (succ, out) in outgoing(cfg, edge.from, exit) {
-            if succ != block {
-                continue;
-            }
-            env = Some(match env {
-                None => out,
-                Some(e) => e.join(&out),
-            });
-        }
-    }
-    env.unwrap_or_else(AbstractEnv::bottom)
-}
-
-// ── Branch narrowing ──────────────────────────────────────────────────────────
-
-/// Refine `env` by applying the constraint implied by `cond` on the chosen branch.
-///
-/// Handles:
-/// - `BinOp { op, lhs: Var(x), rhs: Lit(Int|Float) }` → numeric interval narrowing
-/// - `BinOp { Eq|Neq, lhs: Var(x), rhs: Lit(Null|Unit) }` → nullability narrowing
-///   (the IR conflates `==`/`===`, so refinements are the sound envelope of both:
-///   the positive `== null` branch keeps null AND undefined; the negative branch
-///   only drops the compared literal)
-/// - `Var(x)` / `!x` truthiness → drops null/undefined on the truthy branch
-///
-/// `taken = true` → then-branch constraint; `taken = false` → else-branch (negated).
-/// Falls through to cloning env unchanged for unrecognised patterns.
-pub(crate) fn narrow_env_for_branch<D: AbstractDomain>(
-    env: &AbstractEnv<D>,
-    cond: &Expr,
-    taken: bool,
-) -> AbstractEnv<D> {
-    let with_refined = |x: &str, refined: D| {
-        let mut narrowed = env.clone();
-        narrowed.extend(x.to_string(), refined);
-        narrowed
-    };
-
-    match cond {
-        Expr::BinOp { op, lhs, rhs } => {
-            let Expr::Var(x) = lhs.as_ref() else {
-                return env.clone();
-            };
-            match rhs.as_ref() {
-                Expr::Lit(Prim::Int(_) | Prim::Float(_)) => {
-                    let v = match rhs.as_ref() {
-                        Expr::Lit(Prim::Int(n)) => *n as f64,
-                        Expr::Lit(Prim::Float(f)) => *f,
-                        _ => unreachable!(),
-                    };
-                    let cur = env.lookup(x);
-                    let refined = match (op, taken) {
-                        (BinOp::Lt, true) => cur.narrow_lt(v),
-                        (BinOp::Lt, false) => cur.narrow_geq(v),
-                        (BinOp::Leq, true) => cur.narrow_leq(v),
-                        (BinOp::Leq, false) => cur.narrow_gt(v),
-                        (BinOp::Gt, true) => cur.narrow_gt(v),
-                        (BinOp::Gt, false) => cur.narrow_leq(v),
-                        (BinOp::Geq, true) => cur.narrow_geq(v),
-                        (BinOp::Geq, false) => cur.narrow_lt(v),
-                        (BinOp::Eq, true) => cur.narrow_eq(v),
-                        (BinOp::Eq, false) => cur.narrow_neq(v),
-                        (BinOp::Neq, true) => cur.narrow_neq(v),
-                        (BinOp::Neq, false) => cur.narrow_eq(v),
-                        _ => cur,
-                    };
-                    with_refined(x, refined)
-                }
-                Expr::Lit(Prim::Null) => {
-                    let cur = env.lookup(x);
-                    let refined = match (op, taken) {
-                        (BinOp::Eq, true) | (BinOp::Neq, false) => cur.narrow_keep_nullish_only(),
-                        (BinOp::Eq, false) | (BinOp::Neq, true) => cur.narrow_drop_null(),
-                        _ => cur,
-                    };
-                    with_refined(x, refined)
-                }
-                Expr::Lit(Prim::Unit) => {
-                    let cur = env.lookup(x);
-                    let refined = match (op, taken) {
-                        (BinOp::Eq, true) | (BinOp::Neq, false) => cur.narrow_keep_nullish_only(),
-                        (BinOp::Eq, false) | (BinOp::Neq, true) => cur.narrow_drop_undef(),
-                        _ => cur,
-                    };
-                    with_refined(x, refined)
-                }
-                _ => env.clone(),
-            }
-        }
-        // Truthiness guard `if (x)`: the taken branch excludes every falsy
-        // value (null, undefined, 0, "", false); the else branch keeps only
-        // the falsy ones (references are always truthy → ⊥ there).
-        Expr::Var(x) => with_refined(
-            x,
-            if taken {
-                env.lookup(x).narrow_truthy()
-            } else {
-                env.lookup(x).narrow_falsy()
-            },
-        ),
-        // `if (!x)`: branches swap — the ELSE branch is the truthy one.
-        Expr::UnaryOp {
-            op: crate::ir::expr::UnaryOp::Not,
-            arg,
-        } => {
-            if let Expr::Var(x) = arg.as_ref() {
-                with_refined(
-                    x,
-                    if taken {
-                        env.lookup(x).narrow_falsy()
-                    } else {
-                        env.lookup(x).narrow_truthy()
-                    },
-                )
-            } else {
-                env.clone()
-            }
-        }
-        _ => env.clone(),
-    }
+    ctx: &mut AnalysisCtx<T::Domain>,
+) -> BlockEnvs<T::Domain> {
+    run_cfg(transfer, cfg, entry_env, ctx, 0).exits
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -301,7 +37,7 @@ mod tests {
     use super::*;
     use crate::{
         domains::{
-            Heap, Interval, NullCtx, Stability, StateValue, StateValueTransfer,
+            AbstractDomain, Heap, Interval, Stability, StateValue, StateValueTransfer, Widening,
             stores::{AbstractEnv, MemoStore, StateStore},
         },
         ir::{
@@ -315,23 +51,34 @@ mod tests {
         crate::test_support::single_block_cfg(stmts)
     }
 
+    /// One depth-0 run of `cfg` from `entry` over `state`, widening after 3
+    /// back-edge arrivals up to `thresholds`: the exit envs and the state the
+    /// run's writes leave.
+    fn run(
+        cfg: &CFG,
+        entry: AbstractEnv<StateValue>,
+        state: &StateStore<StateValue>,
+        thresholds: &[f64],
+    ) -> (BlockEnvs<StateValue>, StateStore<StateValue>) {
+        let mut state = state.clone();
+        let mut memo = MemoStore::new();
+        let mut heap = Heap::new();
+        let envs = {
+            let mut ctx =
+                AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap);
+            ctx.widening = Widening {
+                after: 3,
+                thresholds,
+            };
+            analyze_cfg(&StateValueTransfer, cfg, entry, &mut ctx)
+        };
+        (envs, state)
+    }
+
     #[test]
     fn empty_cfg_entry_env_preserved() {
         let cfg = single_block_cfg(vec![]);
-        let mut heap = Heap::new();
-        let (exit_envs, state_out) = analyze_cfg::<StateValueTransfer>(
-            crate::test_support::C,
-            &cfg,
-            AbstractEnv::bottom(),
-            &StateStore::bottom(),
-            &MemoStore::new(),
-            &StateValueTransfer,
-            3,
-            &[],
-            &mut heap,
-            &NullCtx,
-            None,
-        );
+        let (exit_envs, state_out) = run(&cfg, AbstractEnv::bottom(), &StateStore::bottom(), &[]);
         assert!(exit_envs.contains_key(&0));
         assert_eq!(state_out, StateStore::bottom());
     }
@@ -343,20 +90,7 @@ mod tests {
             rhs: Expr::Lit(Prim::Int(42)),
             span: None,
         }]);
-        let mut heap = Heap::new();
-        let (exit_envs, _) = analyze_cfg::<StateValueTransfer>(
-            crate::test_support::C,
-            &cfg,
-            AbstractEnv::bottom(),
-            &StateStore::bottom(),
-            &MemoStore::new(),
-            &StateValueTransfer,
-            3,
-            &[],
-            &mut heap,
-            &NullCtx,
-            None,
-        );
+        let (exit_envs, _) = run(&cfg, AbstractEnv::bottom(), &StateStore::bottom(), &[]);
         assert_eq!(
             exit_envs[&0].lookup("x"),
             StateValue::number(Interval::point(42.0))
@@ -451,20 +185,7 @@ mod tests {
     #[test]
     fn loop_counter_unbounded_without_thresholds() {
         let cfg = counting_loop_cfg();
-        let mut heap = Heap::new();
-        let (exit_envs, _) = analyze_cfg::<StateValueTransfer>(
-            crate::test_support::C,
-            &cfg,
-            AbstractEnv::bottom(),
-            &StateStore::bottom(),
-            &MemoStore::new(),
-            &StateValueTransfer,
-            3,
-            &[],
-            &mut heap,
-            &NullCtx,
-            None,
-        );
+        let (exit_envs, _) = run(&cfg, AbstractEnv::bottom(), &StateStore::bottom(), &[]);
         // No threshold → plain widen jumps `i` to +∞ at the loop header.
         let i = exit_envs[&1].lookup("i");
         assert_eq!(
@@ -480,20 +201,8 @@ mod tests {
     #[test]
     fn loop_counter_bounded_by_threshold() {
         let cfg = counting_loop_cfg();
-        let mut heap = Heap::new();
-        let (exit_envs, _) = analyze_cfg::<StateValueTransfer>(
-            crate::test_support::C,
-            &cfg,
-            AbstractEnv::bottom(),
-            &StateStore::bottom(),
-            &MemoStore::new(),
-            &StateValueTransfer,
-            3,
-            &[5.0], // guard constant harvested as a threshold
-            &mut heap,
-            &NullCtx,
-            None,
-        );
+        // Guard constant 5 harvested as a threshold.
+        let (exit_envs, _) = run(&cfg, AbstractEnv::bottom(), &StateStore::bottom(), &[5.0]);
         // Threshold 5 caps the widen → loop-header `i` bounded to [0,5] (vs +∞),
         // and the loop-exit (else) block sees `i = [5,5]`.
         let header_i = exit_envs[&1].lookup("i");
@@ -528,20 +237,7 @@ mod tests {
                 span: None,
             },
         ]);
-        let mut heap = Heap::new();
-        let (exit_envs, _) = analyze_cfg::<StateValueTransfer>(
-            crate::test_support::C,
-            &cfg,
-            AbstractEnv::bottom(),
-            &StateStore::bottom(),
-            &MemoStore::new(),
-            &StateValueTransfer,
-            3,
-            &[],
-            &mut heap,
-            &NullCtx,
-            None,
-        );
+        let (exit_envs, _) = run(&cfg, AbstractEnv::bottom(), &StateStore::bottom(), &[]);
         assert_eq!(
             exit_envs[&0].setter_label("s2"),
             Some(0),
@@ -570,20 +266,7 @@ mod tests {
             ),
         ];
         let cfg = single_block_cfg(stmts);
-        let mut heap = Heap::new();
-        let (_, state_out) = analyze_cfg::<StateValueTransfer>(
-            crate::test_support::C,
-            &cfg,
-            AbstractEnv::bottom(),
-            &StateStore::bottom(),
-            &MemoStore::new(),
-            &StateValueTransfer,
-            3,
-            &[],
-            &mut heap,
-            &NullCtx,
-            None,
-        );
+        let (_, state_out) = run(&cfg, AbstractEnv::bottom(), &StateStore::bottom(), &[]);
         assert_eq!(
             state_out.get(0),
             StateValue::reference(Stability::PerRender)
@@ -629,20 +312,7 @@ mod tests {
             }],
         };
 
-        let mut heap = Heap::new();
-        let (exit_envs, _) = analyze_cfg::<StateValueTransfer>(
-            crate::test_support::C,
-            &cfg,
-            AbstractEnv::bottom(),
-            &StateStore::bottom(),
-            &MemoStore::new(),
-            &StateValueTransfer,
-            3,
-            &[],
-            &mut heap,
-            &NullCtx,
-            None,
-        );
+        let (exit_envs, _) = run(&cfg, AbstractEnv::bottom(), &StateStore::bottom(), &[]);
         assert_eq!(
             exit_envs[&1].lookup("x"),
             StateValue::reference(Stability::PerRender)
@@ -731,20 +401,7 @@ mod tests {
             ],
         };
 
-        let mut heap = Heap::new();
-        let (exit_envs, _) = analyze_cfg::<StateValueTransfer>(
-            crate::test_support::C,
-            &cfg,
-            AbstractEnv::bottom(),
-            &StateStore::bottom(),
-            &MemoStore::new(),
-            &StateValueTransfer,
-            3,
-            &[],
-            &mut heap,
-            &NullCtx,
-            None,
-        );
+        let (exit_envs, _) = run(&cfg, AbstractEnv::bottom(), &StateStore::bottom(), &[]);
         // join(Number([1,1]), Reference(Unstable)) keeps both slots at merge
         // block 3 (ADR-015 product) — no collapse to ⊤.
         let x = exit_envs[&3].lookup("x");
@@ -755,7 +412,7 @@ mod tests {
 
     #[test]
     fn branch_narrowing_restricts_then_env() {
-        use crate::domains::{Interval, StateValue, StateValueTransfer};
+        use crate::domains::{Interval, StateValue};
         use crate::ir::expr::BinOp;
         // block 0: let x = Number([0,+∞)); branch x < 10 → 1, else → 2
         // block 1 (then): x narrowed to [0, 9]
@@ -825,20 +482,7 @@ mod tests {
             }),
         );
 
-        let mut heap = Heap::new();
-        let (exit_envs, _) = analyze_cfg::<StateValueTransfer>(
-            crate::test_support::C,
-            &cfg,
-            entry_env,
-            &StateStore::bottom(),
-            &MemoStore::new(),
-            &StateValueTransfer,
-            3,
-            &[],
-            &mut heap,
-            &NullCtx,
-            None,
-        );
+        let (exit_envs, _) = run(&cfg, entry_env, &StateStore::bottom(), &[]);
 
         let then_x = exit_envs[&1].lookup("x");
         let else_x = exit_envs[&2].lookup("x");
@@ -871,20 +515,7 @@ mod tests {
         let mut entry_env = AbstractEnv::bottom();
         entry_env.bind_setter("setN".to_string(), 0);
 
-        let mut heap = Heap::new();
-        let (_, state_out) = analyze_cfg::<StateValueTransfer>(
-            crate::test_support::C,
-            &cfg,
-            entry_env,
-            &StateStore::bottom(),
-            &MemoStore::new(),
-            &StateValueTransfer,
-            3,
-            &[],
-            &mut heap,
-            &NullCtx,
-            None,
-        );
+        let (_, state_out) = run(&cfg, entry_env, &StateStore::bottom(), &[]);
 
         assert_eq!(
             state_out.get(0),
@@ -915,20 +546,7 @@ mod tests {
             edges: vec![],
         };
 
-        let mut heap = Heap::new();
-        let (_, state_out) = analyze_cfg::<StateValueTransfer>(
-            crate::test_support::C,
-            &cfg,
-            AbstractEnv::bottom(),
-            &StateStore::bottom(),
-            &MemoStore::new(),
-            &StateValueTransfer,
-            3,
-            &[],
-            &mut heap,
-            &NullCtx,
-            None,
-        );
+        let (_, state_out) = run(&cfg, AbstractEnv::bottom(), &StateStore::bottom(), &[]);
 
         assert_eq!(
             state_out.get(0),
@@ -991,20 +609,7 @@ mod tests {
         let mut initial_state = StateStore::bottom();
         initial_state.update(0, StateValue::number(Interval::point(5.0)));
 
-        let mut heap = Heap::new();
-        let (_, state_out) = analyze_cfg::<StateValueTransfer>(
-            crate::test_support::C,
-            &cfg,
-            entry_env,
-            &initial_state,
-            &MemoStore::new(),
-            &StateValueTransfer,
-            3,
-            &[],
-            &mut heap,
-            &NullCtx,
-            None,
-        );
+        let (_, state_out) = run(&cfg, entry_env, &initial_state, &[]);
 
         // c=5, c+1=6 → state[0] = join(5, 6) = [5,6].
         assert_eq!(

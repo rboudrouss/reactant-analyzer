@@ -7,6 +7,7 @@
 - **Updated**: 2026-06-03 — §5 (multiplicity) implemented: handlers in the fixpoint loop, `state_from_handlers` joined in `new_untyped_full` for convergence, `widened_labels` computed from `state_from_render ⊔ state_from_effects` only (not handlers). Remaining: §4 `addEventListener`.
 - **Updated**: 2026-06-04 — §4 implemented: `extract_subscriptions` in `src/lowering/hook_extractor.rs` scans the `body_cfg` of `HookEntry::Effect` for `addEventListener(str, FnLit)` and emits `HookEntry::Handler`. Interpreter-side `Subscription` policy unchanged (the callback is analyzed as a separate entry point, not inlined). ADR-009 fully implemented.
 - **Updated**: 2026-06-03 — back-edge bail removed: `exec_body` traverses the body for its side effects even with a loop (setters in a loop now fire); only the return value is joined to `Top`. FN "setter in a loop" resolved (cf. "Limits").
+- **Updated**: 2026-10-25 — one CFG solver (#12): `exec_body` runs the worklist the hook bodies run (`run_cfg`: RPO worklist, branch narrowing, threshold widening on back edges), so a loop-carried value reaches a callback's writes and return value (#21). The single forward pass is gone, and with it a bug: a block was handed its predecessors' *entry* envs, so a binding made in the block before a branch (`const s = setX; if (c) s(1)`) was unbound inside it.
 - **Context**: [ADR-008](ADR-008-value-domain.md) (value domain / fixpoint), [ADR-004](ADR-004-component-structure.md) (render_cfg + effect_cfg), [ADR-005](ADR-005-analysis-scope.md) (intra-procedural scope)
 
 ## Context

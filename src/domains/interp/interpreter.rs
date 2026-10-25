@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::{
@@ -17,7 +17,7 @@ use crate::{
 };
 
 use super::callbacks::{TriggerClass, classify_callee};
-use super::cfg::topo_sort;
+use super::cfg::outgoing;
 
 pub const MAX_INLINE_DEPTH: usize = 3;
 
@@ -46,7 +46,7 @@ pub(crate) fn exec_body<T: Transfer>(
     entry_env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
 ) -> T::Domain {
-    exec_body_impl(transfer, cfg, entry_env, ctx, 0)
+    run_cfg(transfer, cfg, entry_env.clone(), ctx, 0).ret
 }
 
 /// Depth-propagating variant of [`exec_body`]. Used inside callbacks/bodies so
@@ -58,14 +58,117 @@ pub(crate) fn exec_body_depth<T: Transfer>(
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
 ) -> T::Domain {
-    exec_body_impl(transfer, cfg, entry_env, ctx, depth)
+    run_cfg(transfer, cfg, entry_env.clone(), ctx, depth).ret
+}
+
+/// What one run of [`run_cfg`] over a body leaves behind, besides the writes
+/// it made through `ctx`.
+pub(crate) struct Run<D: AbstractDomain> {
+    /// The exit env of every block the run reached.
+    pub exits: HashMap<BlockId, AbstractEnv<D>>,
+    /// The join of what the body's reachable `return`s evaluate to; ⊥ for a
+    /// body no run can return from.
+    pub ret: D,
+}
+
+/// The one CFG solver (#12): every body runs through it — a render, effect
+/// or handler body from the fixpoint, and every closure, updater, reducer and
+/// lazy initializer those execute, at their inlining `depth`.
+///
+/// A worklist over the blocks in reverse post-order: each block runs its
+/// statements and its terminator's effects on the join of what its
+/// predecessors hand it, a branch narrows each side on its condition, and a
+/// loop header widens after `ctx.widening.after` arrivals over a back edge.
+/// The envs it settles on are a post-fixpoint, so a loop-carried value — a
+/// `setN(acc)` after `for (…) acc += x` — is the value every iteration may
+/// produce (#21), and so is a body's return value.
+///
+/// A block re-runs when its entry env grows, and each run fires its writes
+/// again: every slot write is a join, so a write made under a smaller env
+/// only adds what the final run adds as well.
+pub(crate) fn run_cfg<T: Transfer>(
+    transfer: &T,
+    cfg: &CFG,
+    entry_env: AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+    depth: usize,
+) -> Run<T::Domain> {
+    let order: HashMap<BlockId, usize> = cfg
+        .rpo()
+        .into_iter()
+        .enumerate()
+        .map(|(i, b)| (b, i))
+        .collect();
+    let back: HashSet<(BlockId, BlockId)> = cfg
+        .edges
+        .iter()
+        .filter(|e| matches!(e.kind, EdgeKind::Back))
+        .map(|e| (e.from, e.to))
+        .collect();
+    let rank = |b: BlockId| order.get(&b).copied().unwrap_or(usize::MAX);
+
+    let mut entries: HashMap<BlockId, AbstractEnv<T::Domain>> = HashMap::new();
+    let mut exits: HashMap<BlockId, AbstractEnv<T::Domain>> = HashMap::new();
+    let mut arrivals: HashMap<BlockId, usize> = HashMap::new();
+    let mut ret = T::Domain::bottom();
+    // Pending blocks by RPO rank, so a block runs once all its forward
+    // predecessors have.
+    let mut pending: BTreeSet<(usize, BlockId)> = BTreeSet::new();
+    entries.insert(cfg.entry, entry_env);
+    pending.insert((rank(cfg.entry), cfg.entry));
+
+    while let Some((_, b)) = pending.pop_first() {
+        let mut env = entries[&b].clone();
+        if let Some(block) = cfg.blocks.get(&b) {
+            for stmt in &block.stmts {
+                exec_full_stmt(transfer, stmt, &mut env, ctx, depth);
+            }
+            match &block.term {
+                // A concise arrow body (`() => EXPR`) lowers EXPR to this
+                // Return. EXPR may carry side effects (`() => setN(c => c+1)`,
+                // `() => arr.map(cb)`): fire them as a statement would, then
+                // take EXPR's value as the return (ADR-020 item 7).
+                Terminator::Return(expr) => {
+                    exec_callbacks_depth(transfer, expr, &env, ctx, depth);
+                    ret = ret.join(&transfer.eval_expr(expr, &env, ctx));
+                }
+                // A condition is evaluated, so its calls run.
+                Terminator::Branch { cond, .. } => {
+                    exec_expr_effects(transfer, cond, &mut env, ctx, depth);
+                }
+                Terminator::Jump(_) | Terminator::Unreachable => {}
+            }
+        }
+
+        for (succ, out) in outgoing(cfg, b, &env) {
+            let next = match entries.get(&succ) {
+                None => out,
+                Some(existing) if back.contains(&(b, succ)) => {
+                    let n = arrivals.entry(succ).or_insert(0);
+                    *n += 1;
+                    if *n >= ctx.widening.after {
+                        existing.widen_to(&out, ctx.widening.thresholds)
+                    } else {
+                        existing.join(&out)
+                    }
+                }
+                Some(existing) => existing.join(&out),
+            };
+            if entries.get(&succ) != Some(&next) {
+                entries.insert(succ, next);
+                pending.insert((rank(succ), succ));
+            }
+        }
+        exits.insert(b, env);
+    }
+    Run { exits, ret }
 }
 
 // ── Internal ──────────────────────────────────────────────────────────────────
 
 /// Callback pre-pass + domain core for a single statement.
 ///
-/// Called from `exec_stmt_with_callbacks` (depth 0) and from `exec_body_impl`
+/// Called from `exec_stmt_with_callbacks` (depth 0) and from [`run_cfg`]
 /// (depth N, preserving inlining budget across body boundaries).
 fn exec_full_stmt<T: Transfer>(
     transfer: &T,
@@ -101,20 +204,18 @@ fn exec_full_stmt<T: Transfer>(
 }
 
 /// Fire the side effects of an expression evaluated in *effect position* — a
-/// bare `expr;` statement, a concise-arrow `Return` body or a branch
-/// condition. Runs the effects of every call in it (callbacks and slot
-/// writes, [`exec_callbacks_depth`]) and — for a component application — the
-/// inter-component `eval_expr`.
+/// bare `expr;` statement or a branch condition. Runs the effects of every
+/// call in it (callbacks and slot writes, [`exec_callbacks_depth`]) and — for
+/// a component application — the inter-component `eval_expr`.
 ///
-/// This is the single definition of "run an expression for its effects". The
-/// interpreter's `ExprStmt` handling and the fixpoint engine's terminator
-/// handling both go through it (via [`Transfer::exec_expr_effects`]); the
-/// engine no longer fabricates a throwaway `Stmt::ExprStmt` to reach it.
+/// This is the single definition of "run an expression for its effects": the
+/// interpreter's `ExprStmt` handling and the solver's branch handling both go
+/// through it.
 ///
-/// Return *position* differs: [`exec_body_impl`] also needs the expression's
-/// value, so it fires the same effects then keeps `eval_expr`'s result — it
-/// cannot reduce to this helper without discarding that value.
-pub(crate) fn exec_expr_effects<T: Transfer>(
+/// Return *position* differs: [`run_cfg`] also needs the expression's value,
+/// so it fires the same effects then keeps `eval_expr`'s result — it cannot
+/// reduce to this helper without discarding that value (ADR-020 item 7).
+fn exec_expr_effects<T: Transfer>(
     transfer: &T,
     expr: &Expr,
     env: &mut AbstractEnv<T::Domain>,
@@ -403,86 +504,6 @@ fn exec_slot_write<T: Transfer>(
     ctx.write_slot(owner, label, next);
 }
 
-/// Processes blocks in topological order. Back edges are ignored for env
-/// propagation (forward-predecessor join only); statements still execute once so
-/// loop-body setter side effects are captured. Return values from all exits are
-/// joined; back-edge loops conservatively join return to Top.
-fn exec_body_impl<T: Transfer>(
-    transfer: &T,
-    cfg: &CFG,
-    entry_env: &AbstractEnv<T::Domain>,
-    ctx: &mut AnalysisCtx<T::Domain>,
-    depth: usize,
-) -> T::Domain {
-    let has_back_edge = cfg.edges.iter().any(|e| matches!(e.kind, EdgeKind::Back));
-
-    let order = topo_sort(cfg);
-    let mut env_at: HashMap<BlockId, AbstractEnv<T::Domain>> = HashMap::new();
-    env_at.insert(cfg.entry, entry_env.clone());
-
-    let mut return_val = T::Domain::bottom();
-
-    for bid in order {
-        let env = if bid == cfg.entry {
-            env_at
-                .get(&bid)
-                .cloned()
-                .unwrap_or_else(AbstractEnv::bottom)
-        } else {
-            cfg.predecessors(bid)
-                .iter()
-                .filter_map(|p| env_at.get(p))
-                .cloned()
-                .reduce(|a, b| a.join(&b))
-                .unwrap_or_else(AbstractEnv::bottom)
-        };
-        let mut env = env;
-
-        if let Some(block) = cfg.blocks.get(&bid) {
-            for stmt in &block.stmts {
-                exec_full_stmt(transfer, stmt, &mut env, ctx, depth);
-            }
-            match &block.term {
-                Terminator::Return(expr) => {
-                    // A concise arrow body (`() => EXPR`) lowers EXPR to this
-                    // Return. EXPR may carry side effects (`() => setN(c => c+1)`,
-                    // `() => arr.map(cb)`): fire them as a statement would, then
-                    // take EXPR's value as the return. `eval_expr` alone is pure
-                    // and would silently drop those effects.
-                    exec_callbacks_depth(transfer, expr, &env, ctx, depth);
-                    let v = transfer.eval_expr(expr, &env, ctx);
-                    return_val = return_val.join(&v);
-                }
-                Terminator::Jump(next) => {
-                    env_at
-                        .entry(*next)
-                        .and_modify(|e| *e = e.join(&env))
-                        .or_insert(env);
-                }
-                Terminator::Branch {
-                    cond, then_, else_, ..
-                } => {
-                    // A condition is evaluated, so its calls run.
-                    exec_callbacks_depth(transfer, cond, &env, ctx, depth);
-                    for &next in &[*then_, *else_] {
-                        env_at
-                            .entry(next)
-                            .and_modify(|e| *e = e.join(&env))
-                            .or_insert_with(|| env.clone());
-                    }
-                }
-                Terminator::Unreachable => {}
-            }
-        }
-    }
-
-    // Loop-carried return values can't be computed precisely in a single pass; be conservative.
-    if has_back_edge {
-        return_val = return_val.join(&T::Domain::top());
-    }
-    return_val
-}
-
 /// Per-expression effect walk: every call in `expr` runs its effects — the
 /// closure arguments of in-cycle calls (`.then`, timers, sync HOFs) and of
 /// local functions execute, and a call through a setter writes its slot
@@ -493,7 +514,7 @@ fn exec_body_impl<T: Transfer>(
 /// slot write still lands — dropping it would be a missed write.
 ///
 /// Invariant: never recurse INTO a `FnLit` body here bodies run only via
-/// `exec_body_depth`; otherwise `exec_body_impl → exec_full_stmt → exec_callbacks_depth`
+/// `exec_body_depth`; otherwise `run_cfg → exec_full_stmt → exec_callbacks_depth`
 /// would double-execute. Nesting is handled naturally by that recursion.
 fn exec_callbacks_depth<T: Transfer>(
     transfer: &T,

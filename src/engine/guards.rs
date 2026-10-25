@@ -44,8 +44,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::{
-    domains::{AbstractDomain, StateValue, stores::AbstractEnv},
-    engine::cfg_analyzer::narrow_env_for_branch,
+    domains::{AbstractDomain, StateValue, interp::narrow_env_for_branch, stores::AbstractEnv},
     ir::{
         ComponentId, QualifiedSlot,
         bindings::local_bindings,

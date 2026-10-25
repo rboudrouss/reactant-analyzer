@@ -7,7 +7,7 @@ use crate::{
     },
     ir::{
         ComponentId, SourceRange,
-        cfg::{CFG, Terminator},
+        cfg::CFG,
         expr::Expr,
         free_vars::AccessPath,
         hooks::{DepsArg, DepsList, HookEntry},
@@ -272,18 +272,10 @@ pub struct AnalysisResult<D: AbstractDomain> {
 }
 
 impl<D: AbstractDomain> AnalysisResult<D> {
-    /// Join the abstract exit envs of all `Return`-terminated blocks.
-    ///
-    /// Uses `reduce` (not `fold(bottom, join)`) since `bottom.join(env)` maps
-    /// any key not in `bottom` to `D::top()`, making bottom a non-identity.
+    /// Join the abstract exit envs of all `Return`-terminated blocks of the
+    /// render body.
     pub fn exit_env(&self) -> AbstractEnv<D> {
-        self.render_cfg
-            .blocks
-            .values()
-            .filter(|b| matches!(b.term, Terminator::Return(_)))
-            .filter_map(|b| self.block_states.get(&b.id))
-            .cloned()
-            .reduce(|acc, env| acc.join(&env))
+        crate::domains::interp::exit_env_of(&self.render_cfg, &self.block_states)
             .unwrap_or_else(AbstractEnv::bottom)
     }
 }

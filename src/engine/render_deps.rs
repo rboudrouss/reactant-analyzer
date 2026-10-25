@@ -678,7 +678,7 @@ impl<'a> Analyzer<'a> {
         let mut in_env: HashMap<BlockId, Env> = HashMap::from([(cfg.entry, entry)]);
         let mut out_env: HashMap<BlockId, Env> = HashMap::new();
         let mut pc: HashMap<BlockId, Deps> = HashMap::new();
-        let order = crate::engine::rpo(cfg);
+        let order = cfg.rpo();
         let mut converged = false;
         for _ in 0..MAX_ROUNDS {
             let mut changed = false;

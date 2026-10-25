@@ -308,6 +308,42 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         inter,
     );
 
+    // Every pass below runs one body through the one solver over the stores
+    // of the current iteration. What a pass varies is the body, its entry
+    // env, the state it starts from and whether it analyses children; what
+    // the fixpoint knows beyond the body's syntax (callback bodies, reducers)
+    // and how loops widen are the same for all of them.
+    let query = FixpointCtx {
+        callbacks: &callback_bodies,
+        reducers: &reducers,
+    };
+    let widening = crate::domains::Widening {
+        after: config.widen_threshold,
+        thresholds: &thresholds,
+    };
+    let pass = |cfg: &CFG,
+                entry: AbstractEnv<StateValue>,
+                state: &StateStore<StateValue>,
+                memo: &MemoStore<StateValue>,
+                heap: &mut Heap,
+                children: bool| {
+        let mut out = state.clone();
+        let mut memo = memo.clone();
+        let envs = {
+            let mut ac = AnalysisCtx {
+                component: comp_id,
+                state: &mut out,
+                memo: &mut memo,
+                heap,
+                query: &query,
+                inter: inter.filter(|_| children),
+                widening,
+            };
+            analyze_cfg(transfer, cfg, entry, &mut ac)
+        };
+        (envs, out)
+    };
+
     // Fixpoint carrier: the product StateValue tracks every JS kind per label
     // (ADR-015), so one store holds all slots — no per-type sub-store dispatch.
     let mut state: StateStore<StateValue> = StateStore::bottom();
@@ -371,27 +407,14 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
 
         // ── Render pass ───────────────────────────────────────────────────────
         // Use initial_env as entry: child analyses start with props bound.
-        let (bs, state_from_render) = {
-            let ctx = FixpointCtx {
-                state: &state_store,
-                memo: &memo_store,
-                callbacks: &callback_bodies,
-                reducers: &reducers,
-            };
-            analyze_cfg::<T>(
-                comp_id,
-                &render_cfg,
-                initial_env.clone(),
-                &state_store,
-                &memo_store,
-                transfer,
-                config.widen_threshold,
-                &thresholds,
-                &mut heap,
-                &ctx,
-                inter,
-            )
-        };
+        let (bs, state_from_render) = pass(
+            &render_cfg,
+            initial_env.clone(),
+            &state_store,
+            &memo_store,
+            &mut heap,
+            true,
+        );
         block_states = bs;
 
         // ── Recompute memo store from exit env ────────────────────────────────
@@ -410,6 +433,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 heap: &mut heap,
                 query: &null_query,
                 inter,
+                widening,
             };
             hooks
                 .iter()
@@ -435,27 +459,14 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 label, body_cfg, ..
             } = hook
             {
-                let (eff_bs, eff_state) = {
-                    let ctx = FixpointCtx {
-                        state: &state_store,
-                        memo: &memo_store,
-                        callbacks: &callback_bodies,
-                        reducers: &reducers,
-                    };
-                    analyze_cfg::<T>(
-                        comp_id,
-                        body_cfg,
-                        env_exit.clone(),
-                        &state_store,
-                        &memo_store,
-                        transfer,
-                        config.widen_threshold,
-                        &thresholds,
-                        &mut heap,
-                        &ctx,
-                        inter,
-                    )
-                };
+                let (eff_bs, eff_state) = pass(
+                    body_cfg,
+                    env_exit.clone(),
+                    &state_store,
+                    &memo_store,
+                    &mut heap,
+                    true,
+                );
                 effect_block_states.insert(*label, eff_bs);
                 for slot in eff_state.labels() {
                     slot_writers.entry(slot).or_default().push(*label);
@@ -473,27 +484,14 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 label, body_cfg, ..
             } = hook
             {
-                let (h_bs, h_state) = {
-                    let ctx = FixpointCtx {
-                        state: &state_store,
-                        memo: &memo_store,
-                        callbacks: &callback_bodies,
-                        reducers: &reducers,
-                    };
-                    analyze_cfg::<T>(
-                        comp_id,
-                        body_cfg,
-                        env_exit.clone(),
-                        &state_store,
-                        &memo_store,
-                        transfer,
-                        config.widen_threshold,
-                        &thresholds,
-                        &mut heap,
-                        &ctx,
-                        inter,
-                    )
-                };
+                let (h_bs, h_state) = pass(
+                    body_cfg,
+                    env_exit.clone(),
+                    &state_store,
+                    &memo_store,
+                    &mut heap,
+                    true,
+                );
                 handler_block_states.insert(*label, h_bs);
                 state_from_handlers = state_from_handlers.join(&h_state);
             }
@@ -557,24 +555,13 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     // `inter` is `None`: this re-evaluates and re-allocates, it does not
     // re-analyze children (same choice as the effect re-run below).
     {
-        let refresh_ctx = FixpointCtx {
-            state: &state,
-            memo: &memo_store,
-            callbacks: &callback_bodies,
-            reducers: &reducers,
-        };
-        let (bs, _) = analyze_cfg::<T>(
-            comp_id,
+        let (bs, _) = pass(
             &render_cfg,
             initial_env.clone(),
             &state,
             &memo_store,
-            transfer,
-            config.widen_threshold,
-            &thresholds,
             &mut heap,
-            &refresh_ctx,
-            None,
+            false,
         );
         block_states = bs;
         env_exit = exit_env(&render_cfg, &block_states);
@@ -585,28 +572,17 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     // actually wrote. InfiniteLoop uses this to distinguish bounded growth (narrowing
     // held: `[1,10]`) from true divergence (`[1,+∞)`).
     let final_state = state;
-    let final_ctx = FixpointCtx {
-        state: &final_state,
-        memo: &memo_store,
-        callbacks: &callback_bodies,
-        reducers: &reducers,
-    };
     let bottom_state: StateStore<StateValue> = StateStore::bottom();
     let mut effect_setter_writes: StateStore<StateValue> = StateStore::bottom();
     for hook in &hooks {
         if let HookEntry::Effect { body_cfg, .. } = hook {
-            let (_, pure_writes) = analyze_cfg::<T>(
-                comp_id,
+            let (_, pure_writes) = pass(
                 body_cfg,
                 env_exit.clone(),
                 &bottom_state,
                 &memo_store,
-                transfer,
-                config.widen_threshold,
-                &thresholds,
                 &mut heap,
-                &final_ctx,
-                None,
+                false,
             );
             effect_setter_writes = effect_setter_writes.join(&pure_writes);
         }
@@ -1255,13 +1231,7 @@ fn exit_env<D: AbstractDomain>(
     cfg: &CFG,
     block_states: &HashMap<BlockId, AbstractEnv<D>>,
 ) -> AbstractEnv<D> {
-    cfg.blocks
-        .values()
-        .filter(|b| matches!(b.term, crate::ir::cfg::Terminator::Return(_)))
-        .filter_map(|b| block_states.get(&b.id))
-        .cloned()
-        .reduce(|acc, env| acc.join(&env))
-        .unwrap_or_else(AbstractEnv::bottom)
+    crate::domains::interp::exit_env_of(cfg, block_states).unwrap_or_else(AbstractEnv::bottom)
 }
 
 /// Scan `render_cfg` for hook-related expressions and build `HookCallInfo` list.
