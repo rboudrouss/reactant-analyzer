@@ -35,7 +35,8 @@ use crate::ir::{
 /// - `params`/`args` are zipped into `let param = arg;` bindings prepended to
 ///   the callee's entry block (extra params or args are ignored, as in JS).
 /// - `bound_var` receives the callee's `Return(e)` value (`Some` for
-///   `let x = f(..)`, `None` to discard as in a bare `f(..);`).
+///   `let x = f(..)`, `None` for a bare `f(..);`, which discards the value but still
+///   evaluates the expression).
 /// - `rename` maps each callee-bound variable to its fresh name (build it with
 ///   [`callee_rename_map`]). It must be built from the *same* params and body,
 ///   and — for a hook whose effect/memo/callback bodies capture render-scope
@@ -168,6 +169,11 @@ pub fn splice_callee_into_cfg(
                         // the call site is the only position available here.
                         span: call_span,
                     });
+                } else {
+                    // A bare `f(..);` discards the value, not the evaluation:
+                    // JavaScript runs `return set(n + 1)` before handing control
+                    // back, so its effects stay (#174).
+                    block.stmts.push(Stmt::ExprStmt(ret, call_span));
                 }
                 return_blocks.push(*new_id);
                 Terminator::Jump(join_block_id)
