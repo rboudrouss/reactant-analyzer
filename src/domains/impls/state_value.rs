@@ -401,6 +401,59 @@ impl StateValue {
         })
     }
 
+    /// The primitive kinds of this value that hold more than one concrete
+    /// value (a non-point interval, either boolean, several or any strings),
+    /// alone. A kind with one value, `null` and `undefined` included, is
+    /// dropped: two writes of it are `Object.is`-equal.
+    pub fn varying_primitives(&self) -> StateValue {
+        let num_varies =
+            !self.num.is_bottom() && !(self.num.lo == self.num.hi && self.num.lo.is_finite());
+        StateValue {
+            num: if num_varies {
+                self.num
+            } else {
+                Self::bottom_value().num
+            },
+            boolean: if self.boolean == BoolVal::Top {
+                BoolVal::Top
+            } else {
+                BoolVal::Bottom
+            },
+            str: match &self.str {
+                StrConst::Set(s) if s.len() == 1 => StrConst::Bottom,
+                other => other.clone(),
+            },
+            ..Self::bottom_value()
+        }
+    }
+
+    /// True if the value is one concrete value, the same on every evaluation:
+    /// one kind, and within it a point number, one boolean, one string
+    /// constant, `null`, `undefined`, a stable reference or one setter. Two
+    /// writes of it are `Object.is`-equal (the interval domain does not tell
+    /// `-0` from `0`, the one point it conflates). ⊥ holds too: no value is
+    /// ever stored.
+    pub fn is_single_value(&self) -> bool {
+        let kinds = self.populated_kinds();
+        if kinds.is_empty() {
+            return true;
+        }
+        if kinds.count() != 1 {
+            return false;
+        }
+        let num_point = self.num.lo == self.num.hi && self.num.lo.is_finite();
+        let one_str = matches!(&self.str, StrConst::Set(s) if s.len() == 1);
+        match kinds.0 {
+            KindMask::NUM => num_point,
+            KindMask::BOOL => matches!(self.boolean, BoolVal::True | BoolVal::False),
+            KindMask::STR => one_str,
+            KindMask::REF => self.reference == Stability::Stable,
+            KindMask::NULL | KindMask::UNDEF => true,
+            KindMask::SETTER => self.setter.as_one().is_some(),
+            _ => false,
+        }
+    }
+
     /// True if the value ranges over a few primitives only: booleans,
     /// `null`/`undefined`, a finite set of string constants, a narrow integer
     /// range. A state holding such a value re-renders only when a write

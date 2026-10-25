@@ -331,6 +331,7 @@ mod tests {
         // useState(compute())
         let hooks = vec![HookEntry::State {
             label: 0,
+            reducer: None,
             init: Expr::Call {
                 fn_: Box::new(Expr::Var("compute".to_string())),
                 args: vec![],
@@ -356,6 +357,7 @@ mod tests {
         };
         let hooks = vec![HookEntry::State {
             label: 0,
+            reducer: None,
             init: Expr::TSAnnotated(Box::new(call)),
             span: None,
         }];
@@ -368,6 +370,7 @@ mod tests {
     fn literal_init_no_warning() {
         let hooks = vec![HookEntry::State {
             label: 0,
+            reducer: None,
             init: Expr::Lit(Prim::Int(0)),
             span: None,
         }];
@@ -389,6 +392,7 @@ mod tests {
         };
         let hooks = vec![HookEntry::State {
             label: 0,
+            reducer: None,
             init: lazy,
             span: None,
         }];
@@ -405,6 +409,7 @@ mod tests {
         // useState(props.value) no call.
         let hooks = vec![HookEntry::State {
             label: 0,
+            reducer: None,
             init: Expr::FieldAccess {
                 obj: Box::new(Expr::Var("props".to_string())),
                 field: "value".to_string(),
@@ -424,6 +429,7 @@ mod tests {
         // useState({}) ObjectLit, not a call.
         let hooks = vec![HookEntry::State {
             label: 0,
+            reducer: None,
             init: Expr::ObjectLit {
                 id: ExprId(0),
                 fields: vec![],
@@ -485,6 +491,7 @@ mod tests {
         }];
         let hooks = vec![HookEntry::State {
             label: 0,
+            reducer: None,
             init: Expr::Var("initial".to_string()),
             span: None,
         }];
@@ -505,6 +512,7 @@ mod tests {
         // useState(fetch(url)) — side effect re-fires every render.
         let hooks = vec![HookEntry::State {
             label: 0,
+            reducer: None,
             init: Expr::Call {
                 fn_: Box::new(Expr::Var("fetch".to_string())),
                 args: vec![Expr::Var("url".to_string())],
@@ -524,6 +532,7 @@ mod tests {
         // useState(Math.random()) — cheap pure, demoted to Info (advisory).
         let hooks = vec![HookEntry::State {
             label: 0,
+            reducer: None,
             init: Expr::Call {
                 fn_: Box::new(Expr::FieldAccess {
                     obj: Box::new(Expr::Var("Math".to_string())),
@@ -544,6 +553,7 @@ mod tests {
         // useState(1 + compute()) call nested inside BinOp → must fire.
         let hooks = vec![HookEntry::State {
             label: 0,
+            reducer: None,
             init: Expr::BinOp {
                 op: crate::ir::expr::BinOp::Add,
                 lhs: Box::new(Expr::Lit(Prim::Int(1))),
@@ -610,6 +620,7 @@ mod tests {
         let hooks = vec![
             HookEntry::State {
                 label: 0,
+                reducer: None,
                 init: Expr::Lit(Prim::Int(0)),
                 span: None,
             },

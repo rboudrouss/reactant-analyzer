@@ -1,5 +1,4 @@
 // oracle: react=converges
-// oracle: known=error-unsound #170
 // L3: the reducer returns its state unchanged on "noop"; React bails out.
 import { useEffect, useReducer } from "react";
 

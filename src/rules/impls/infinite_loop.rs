@@ -13,7 +13,7 @@ use crate::{
 };
 
 use crate::engine::setters::SetterCallPhase;
-use crate::engine::{ChurnEdge, ChurnGraph, EdgeStrength, Freshness, WriterRegion};
+use crate::engine::{Change, ChurnEdge, ChurnGraph, EdgeStrength, WriterRegion};
 use crate::ir::ComponentId;
 use crate::rules::api::query::must_effect_cycle;
 use crate::rules::helpers::cycles::{NodeNames, cycle_path, node_display};
@@ -263,6 +263,7 @@ fn check_multi_effect_cycles(
 
     let mut diags = Vec::new();
     let mut covered: HashSet<(HookLabel, HookLabel)> = HashSet::new();
+    let mut cycle_reported: HashSet<HookLabel> = HashSet::new();
     // Slot display names, resolved lazily per involved component.
     let mut names: NodeNames = HashMap::new();
 
@@ -278,6 +279,12 @@ fn check_multi_effect_cycles(
             }
             if reported_effects.contains(&e.effect_label) {
                 continue; // fixpoint/cross arm already flagged this effect
+            }
+            // One report per effect: a swap's two writes are two edges of one
+            // cycle in one effect. Cycles come must-first, so the kept report
+            // is the strongest.
+            if !cycle_reported.insert(e.effect_label) {
+                continue;
             }
 
             // Cross-component must-rerun is unprovable (prop deps are
@@ -297,7 +304,37 @@ fn check_multi_effect_cycles(
             // cycle can be all-must and still carry no proof (Warning).
             let certain = cycle_proof.is_some();
             let to_name = node_display(&e.to, component, result, &mut names);
-            let msg = if cyc.len() == 1 && e.no_deps && certain {
+            // A step that may only change a primitive is not a fresh reference.
+            let allocates = |e: &ChurnEdge| {
+                result.components[&e.component]
+                    .slot_writers
+                    .iter()
+                    .any(|w| {
+                        w.span == e.write_span
+                            && w.region == WriterRegion::Effect(e.effect_label)
+                            && w.written.change == Change::Must
+                    })
+            };
+            let msg = if !certain && !cyc.iter().all(|e| allocates(e)) {
+                if cyc.len() == 1 && e.no_deps {
+                    format!(
+                        "this effect has no dependency array and may change state \
+                         {to_name}, so it re-runs after every render and no write of \
+                         it is proven to settle: possible infinite render loop"
+                    )
+                } else if cyc.len() == 1 {
+                    format!(
+                        "this effect may change state {to_name} which its own deps \
+                         react to, and no write of it is proven to settle: possible \
+                         infinite render loop"
+                    )
+                } else {
+                    format!(
+                        "these effects may form a state-update cycle ({path}) where \
+                         no step is proven to settle: possible infinite render loop"
+                    )
+                }
+            } else if cyc.len() == 1 && e.no_deps && certain {
                 format!(
                     "this effect has no dependency array and stores a fresh \
                      reference into state {to_name}, so it re-runs after every \
@@ -351,7 +388,11 @@ fn check_multi_effect_cycles(
                 diag = diag.with_step(
                     crate::rules::Step::Write {
                         slot: e.to.1,
-                        value: crate::rules::ValueClass::Fresh,
+                        value: if allocates(e) {
+                            crate::rules::ValueClass::Fresh
+                        } else {
+                            crate::rules::ValueClass::Unknown
+                        },
                     },
                     Some(e.effect_label),
                     Some(r),
@@ -424,7 +465,7 @@ fn check_object_churn(
         // This arm's partition of the relation (ADR-020 item 2, ADR-042 §4):
         // the effect's dep-driven edges from this component's own slots into
         // this component's own slots. A `self_slot` edge is the loop; every
-        // other one feeds the Info branch. Freshness, the convergence kill and
+        // other one feeds the Info branch. The change leg, the convergence kill and
         // the field-sensitive re-trigger test (#90) were applied by the engine
         // when it built the edge.
         let edges = graph.edges.iter().filter(|e| {
@@ -436,21 +477,31 @@ fn check_object_churn(
         });
 
         // Strongest verdict per state label.
-        // Best object-churn finding per slot: (severity, call span, Error proof).
-        type ChurnBest = (Severity, Option<SourceRange>, Option<Certified<OnAllPaths>>);
+        // Best churn finding per slot: (severity, call span, Error proof,
+        // whether the effect stores a new reference into the slot).
+        type ChurnBest = (
+            Severity,
+            Option<SourceRange>,
+            Option<Certified<OnAllPaths>>,
+            bool,
+        );
         let mut best: HashMap<HookLabel, ChurnBest> = HashMap::new();
         for e in edges {
             let state_label = e.to.1;
-            let (sev, churn_proof) = if e.self_slot {
-                // The Error anchors on the fresh write being on all paths —
-                // re-derived from the writer rows and minted by the
-                // must-primitive, never trusted from the edge's own strength.
-                let fresh_blocks: HashSet<BlockId> = comp_result
+            let rows = || {
+                comp_result
                     .slot_writers
                     .iter()
                     .filter(|w| w.owner.is_none() && w.slot == state_label)
                     .filter(|w| w.region == WriterRegion::Effect(*eff_label))
-                    .filter(|w| w.written.fresh == Freshness::Fresh)
+            };
+            let allocates = rows().any(|w| w.written.change == Change::Must);
+            let (sev, churn_proof) = if e.self_slot {
+                // The Error anchors on the fresh write being on all paths —
+                // re-derived from the writer rows and minted by the
+                // must-primitive, never trusted from the edge's own strength.
+                let fresh_blocks: HashSet<BlockId> = rows()
+                    .filter(|w| w.written.change == Change::Must)
                     .filter_map(|w| w.block)
                     .collect();
                 if e.strength == EdgeStrength::Must && !fresh_blocks.is_empty() {
@@ -489,11 +540,11 @@ fn check_object_churn(
                 }
             };
             if replace {
-                best.insert(state_label, (sev, e.write_span, churn_proof));
+                best.insert(state_label, (sev, e.write_span, churn_proof, allocates));
             }
         }
 
-        for (state_label, (sev, call_span, proof)) in best {
+        for (state_label, (sev, call_span, proof, allocates)) in best {
             // One report per effect, as in the cycle arm: an effect the
             // fixpoint arm flagged keeps that report, unless this arm holds
             // the stronger, proven verdict.
@@ -512,7 +563,7 @@ fn check_object_churn(
                         state = state_slot_name(state_label, &state_vals)
                     ),
                 ),
-                (Severity::Info, _) => Diagnostic::info(
+                (Severity::Info, _) if allocates => Diagnostic::info(
                     "infinite-loop",
                     format!(
                         "this effect depends on object state but freshly recreates \
@@ -521,11 +572,29 @@ fn check_object_churn(
                         state = state_slot_name(state_label, &state_vals)
                     ),
                 ),
-                _ => Diagnostic::warn(
+                (Severity::Info, _) => Diagnostic::info(
+                    "infinite-loop",
+                    format!(
+                        "this effect depends on state and may change state {state} \
+                         outside its deps. No update cycle was found, but deps may be \
+                         too imprecise to rule one out",
+                        state = state_slot_name(state_label, &state_vals)
+                    ),
+                ),
+                _ if allocates => Diagnostic::warn(
                     "infinite-loop",
                     format!(
                         "this effect may store a fresh reference into state \
                          {state} which its deps react to: possible infinite render loop",
+                        state = state_slot_name(state_label, &state_vals)
+                    ),
+                ),
+                _ => Diagnostic::warn(
+                    "infinite-loop",
+                    format!(
+                        "this effect may change state {state} which its deps react to, \
+                         and no write of it is proven to settle: possible infinite \
+                         render loop",
                         state = state_slot_name(state_label, &state_vals)
                     ),
                 ),
@@ -538,7 +607,11 @@ fn check_object_churn(
                 diag = diag.with_step(
                     crate::rules::Step::Write {
                         slot: state_label,
-                        value: crate::rules::ValueClass::Fresh,
+                        value: if allocates {
+                            crate::rules::ValueClass::Fresh
+                        } else {
+                            crate::rules::ValueClass::Unknown
+                        },
                     },
                     Some(*eff_label),
                     Some(r),
@@ -803,6 +876,7 @@ mod tests {
         let hooks = vec![
             HookEntry::State {
                 label: 0,
+                reducer: None,
                 init: Expr::Lit(Prim::Int(0)),
                 span: None,
             },
@@ -869,6 +943,7 @@ mod tests {
         let hooks = vec![
             HookEntry::State {
                 label: 0,
+                reducer: None,
                 init: Expr::Lit(Prim::Int(0)),
                 span: None,
             },
@@ -991,6 +1066,7 @@ mod tests {
         let hooks = vec![
             HookEntry::State {
                 label: 0,
+                reducer: None,
                 init: Expr::Lit(Prim::Int(0)),
                 span: None,
             },
@@ -1340,6 +1416,7 @@ mod tests {
         let hooks = vec![
             HookEntry::State {
                 label: 0,
+                reducer: None,
                 init: Expr::Lit(Prim::Int(0)),
                 span: None,
             },

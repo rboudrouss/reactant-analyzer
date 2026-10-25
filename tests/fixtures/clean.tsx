@@ -25,10 +25,12 @@ function Toggle() {
   const [on, setOn] = useState(false);
 
   // Functional updater → classif == Functional, not Constant → no unnecessary-rerender
-  // Conditional → cond_depth > 0 → no infinite-loop-effect
+  // One literal returned → the write settles → no infinite-loop. (`(s) => !s`
+  // under the same guard is a documented Warning: the updater's parameter is
+  // not read under the guard, see tests/divergence.rs.)
   useEffect(() => {
     if (on) {
-      setOn((s) => !s); // ✓
+      setOn(() => false); // ✓
     }
   }, [on]);
 

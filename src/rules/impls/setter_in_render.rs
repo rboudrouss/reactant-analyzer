@@ -487,6 +487,7 @@ mod tests {
         // setCount(count + 1) directly in render body → Error (unconditional).
         let hooks = vec![HookEntry::State {
             label: 0,
+            reducer: None,
             init: Expr::Lit(Prim::Int(0)),
             span: None,
         }];

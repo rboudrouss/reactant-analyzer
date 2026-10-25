@@ -6,8 +6,8 @@ use crate::{
 /// How a call's closure arguments should be treated by the side-effect pre-pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TriggerClass {
-    /// Callee is a bound state setter handled by the core exec path (functional
-    /// updaters), so the pre-pass must NOT descend its closure.
+    /// Callee is a bound state setter: its closure argument is an updater the
+    /// slot write runs, so the walk must NOT descend it as well.
     Setter,
     /// Runs as a consequence of the current render/effect: synchronous HOFs
     /// (`map`, `forEach`, …) and scheduled async (`.then`/`.catch`/`.finally`,

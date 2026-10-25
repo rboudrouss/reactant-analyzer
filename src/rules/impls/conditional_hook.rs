@@ -442,6 +442,7 @@ mod tests {
     fn via_analyze_component_top_level_no_warning() {
         let hooks = vec![HookEntry::State {
             label: 0,
+            reducer: None,
             init: Expr::Lit(Prim::Int(0)),
             span: None,
         }];
@@ -484,6 +485,7 @@ mod tests {
     fn via_analyze_component_conditional_hook_warns() {
         let hooks = vec![HookEntry::State {
             label: 0,
+            reducer: None,
             init: Expr::Lit(Prim::Int(0)),
             span: None,
         }];

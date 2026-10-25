@@ -1,6 +1,5 @@
 // oracle: react=loop
-// oracle: known=fn #170
-// L3: `dispatch` runs the reducer; the lowering writes the action instead.
+// L3: `dispatch` runs the reducer, which grows the state (#170).
 import { useEffect, useReducer } from "react";
 
 export function App() {

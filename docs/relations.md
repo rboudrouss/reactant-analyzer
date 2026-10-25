@@ -47,7 +47,7 @@ params included. Two `setX(…)` calls in one body are two rows.
 | `same_tick` | another write of the same slot in this region is CFG-reachable from this one | may, one-directional: `false` is not a promise |
 | `block` | the region block a write that runs synchronously, once per pass, sits in — what `must_on_all_paths` takes | exact; `None` for nested, deferred, cleanup and repeating sites |
 | `guard_block` | the region block whose dominating guards the write runs under: `block` for a synchronous write, the statement that scheduled it for a nested, deferred, cleanup or repeating one (#160) | exact; `None` for a row with no placeable block |
-| `written.fresh` | the stored value is a new reference every call (`Fresh`), maybe (`Maybe`), or never (`Not`) — read off the reference kind alone: primitives and the `other` residue never carry a fresh identity (#155) | must for `Fresh`, must for `Not` |
+| `written.change` | the write may change its slot — store a value that fails `Object.is` against what the slot holds. `Must`: a new reference every call. `Never`: the slot's own state read (#155) or the updater's parameter. `Once`: a single value known in advance (`false`, `5`, `null`, a stable reference), which changes the slot again only if another write moves it away. `May`: everything else, a toggle and a bounded counter included | must for `Must`, must for `Never` |
 | `written.value` | the abstract value stored, evaluated in the env of the row's own statement | may (an over-approximation of the value) |
 | `written.expr` | argument 0 as written | exact |
 
@@ -126,8 +126,13 @@ slice. It is built once per program, lazily, and shared by every reader
 ### The churn graph — `ChurnGraph` (ADR-018, ADR-042 §4)
 
 A fold over `slot_writers` and `effect_triggers`: `edge x → y` when a change
-of `x` re-runs an effect that stores a fresh reference into `y`. Nothing is
-walked.
+of `x` re-runs an effect whose write may change `y`. Nothing is walked. The
+graph warns unless convergence is proven instead of looking for growth, and
+four proofs settle a write: `written.change` is `Never`, or `Once` with no
+other write moving the slot away; the write reads neither `x` nor its own
+slot (`Invariance::reads`), so a change of `x` re-runs it to the same value;
+every write of the slot moves it one way by a constant into a finite
+interval; or the guard proofs.
 
 | column | claim | polarity |
 |---|---|---|

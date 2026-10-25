@@ -1,9 +1,9 @@
 //! What a write stores: argument 0 of a setter call, classified at convergence
 //! (ADR-042 §2).
 //!
-//! Three facts ride one column of the writer row. `fresh` is whether the
-//! stored value is a new reference on every call — the must-change leg of a
-//! churn edge. `value` is the abstract value stored, for the guard proofs that
+//! Three facts ride one column of the writer row. `change` is whether the
+//! stored value may differ, under `Object.is`, from what the slot holds — the
+//! change leg of a churn edge. `value` is the abstract value stored, for the guard proofs that
 //! narrow on it. `expr` is the argument as written, for the relational proof
 //! that a guard compares the slot against the very expression the write stores
 //! — a claim about two spellings being one value, which no abstract value can
@@ -23,31 +23,45 @@ use crate::{
         stores::{AbstractEnv, Heap, MemoStore, StateStore},
     },
     engine::{
+        Reducer,
         cfg_analyzer::entry_env_of,
         setters::{Updater, WriterRegion},
     },
     ir::{
-        ComponentId, QualifiedSlot,
+        ComponentId,
         cfg::{CFG, Terminator},
         expr::Expr,
         types::{BlockId, HookLabel, Var},
     },
 };
 
-/// Does a write store a new reference every time it runs?
+/// May a write change its slot — store a value that fails `Object.is`
+/// against what the slot holds?
+///
+/// A write changes its slot unless that is proven impossible. One write is
+/// proven by itself: one that stores the slot's own content (React bails
+/// out). One that stores a single value known in advance (`false`, `5`, a
+/// stable reference) sits in the slot after its first run, so it changes the
+/// slot again only if another write moved it away — whether one does is the
+/// churn graph's question, which sees every write of the slot. Every other
+/// write may change it, a toggle `!on` as much as `count + 1`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Freshness {
-    Not,
-    /// May store a fresh reference (opaque value, imprecise updater).
-    Maybe,
-    /// Must store a fresh reference every call (`PerRender` argument).
-    Fresh,
+pub enum Change {
+    /// Never changes the slot: it stores the slot's own content.
+    Never,
+    /// Stores one value known in advance: changes the slot only when
+    /// another write moved it away from that value.
+    Once,
+    /// May change it.
+    May,
+    /// Changes it on every call: a new reference each time.
+    Must,
 }
 
 /// Argument 0 of a write, as the churn proofs read it.
 #[derive(Debug, Clone)]
 pub struct Written {
-    pub fresh: Freshness,
+    pub change: Change,
     /// The abstract value stored. A functional updater stores its return
     /// value, approximated as a fresh reference: the proofs only ever read
     /// the reference part, and a fresh-returning updater stores a truthy,
@@ -57,25 +71,28 @@ pub struct Written {
     pub expr: Option<Expr>,
 }
 
-/// Classify argument 0 of a write into `target`. `value_of` evaluates a
-/// value expression where the caller knows the env; it is not called for a
-/// function literal, whose returns are classified without one (the updater
-/// runs in its own scope). A bound updater the walk proved a function
-/// literal is read the same way; a bound name it could not prove stays on
-/// the value path, where a function value reads as an opaque reference.
-/// `memos` names the render bindings of memos and callbacks (aliases
-/// resolved): a read of one is a value derived from its deps.
+/// Classify argument 0 of a write. `value_of` evaluates a value expression
+/// where the caller knows the env; it is not called for a function literal,
+/// whose returns are classified without one (the updater runs in its own
+/// scope). A bound updater the walk proved a function literal is read the
+/// same way; a bound name it could not prove stays on the value path, where
+/// a function value reads as an opaque reference. `own_slot` is the written
+/// slot when it is the writer's own (`None` for another component's), and
+/// `states` the render bindings of state reads (aliases resolved): together
+/// they say whether the write stores the slot's own content.
 pub fn classify(
     arg: Option<&Expr>,
     updater: &Updater,
-    target: QualifiedSlot,
-    memos: &HashMap<Var, HookLabel>,
+    own_slot: Option<HookLabel>,
+    states: &HashMap<Var, HookLabel>,
     value_of: impl FnOnce(&Expr) -> StateValue,
 ) -> Written {
+    let identity = own_slot.is_some_and(|slot| stores_own_content(arg, slot, states));
+    // A bare `setX()` stores `undefined`, one value known in advance.
     let Some(arg) = arg else {
         return Written {
-            fresh: Freshness::Not,
-            value: StateValue::top(),
+            change: Change::Once,
+            value: StateValue::undefined(),
             expr: None,
         };
     };
@@ -88,28 +105,42 @@ pub fn classify(
             },
             _,
         ) => Written {
-            fresh: returns_freshness(body_cfg, params),
+            change: returns_change(body_cfg, params),
             value: returns_value(body_cfg),
             expr,
         },
         (_, Updater::Functional(body)) => Written {
-            fresh: returns_freshness(body, &[]),
+            change: returns_change(body, &[]),
             value: returns_value(body),
             expr,
         },
         (other, Updater::Unknown) => {
-            let memo_read = match other {
-                Expr::MemoVal(_) | Expr::CallbackVal(_) => true,
-                Expr::Var(v) => memos.contains_key(v),
-                _ => false,
-            };
             let value = value_of(other);
             Written {
-                fresh: value_freshness(&value, target, memo_read),
+                change: value_change(&value, identity),
                 value,
                 expr,
             }
         }
+    }
+}
+
+/// What a write into a `useReducer` slot stores: the reducer's return, its
+/// returns classified like a functional updater's (the state is its first
+/// parameter). The action is not the stored value, so it is not `expr`
+/// either: no proof may compare the slot against it.
+pub fn dispatched(reducer: &Reducer) -> Written {
+    match reducer {
+        Reducer::Body { params, body } => Written {
+            change: returns_change(body, params),
+            value: returns_value(body),
+            expr: None,
+        },
+        Reducer::Opaque => Written {
+            change: Change::May,
+            value: StateValue::top(),
+            expr: None,
+        },
     }
 }
 
@@ -129,9 +160,12 @@ fn returns_value(body: &CFG) -> StateValue {
         .unwrap_or_else(StateValue::top)
 }
 
-/// Freshness of what a functional updater returns: `Fresh` when every return
-/// is, `Not` when none is, `Maybe` otherwise or when nothing returns.
-fn returns_freshness(body: &CFG, params: &[Var]) -> Freshness {
+/// What a functional updater's (or a reducer's) returns do to the slot, read
+/// without an env (the body runs in its own scope): `Must` when every return
+/// allocates, `Never` when every return is the state parameter itself,
+/// `Once` when all of them are one literal, `May` otherwise or when nothing
+/// returns.
+fn returns_change(body: &CFG, params: &[Var]) -> Change {
     let returns: Vec<&Expr> = body
         .blocks
         .values()
@@ -141,92 +175,72 @@ fn returns_freshness(body: &CFG, params: &[Var]) -> Freshness {
         })
         .collect();
     if returns.is_empty() {
-        return Freshness::Maybe;
+        return Change::May;
     }
-    let fresh: Vec<Freshness> = returns
-        .iter()
-        .map(|e| classify_updater_return(e, params))
-        .collect();
-    if fresh.iter().all(|f| *f == Freshness::Fresh) {
-        Freshness::Fresh
-    } else if fresh.iter().all(|f| *f == Freshness::Not) {
-        Freshness::Not
+    let allocates = |e: &&Expr| {
+        matches!(
+            e,
+            Expr::ObjectLit { .. } | Expr::ArrayLit { .. } | Expr::FnLit { .. } | Expr::New { .. }
+        )
+    };
+    let identity = |e: &&Expr| matches!(e, Expr::Var(v) if params.first() == Some(v));
+    if returns.iter().all(allocates) {
+        Change::Must
+    } else if returns.iter().all(identity) {
+        Change::Never
+    } else if returns_value(body).is_single_value() {
+        Change::Once
     } else {
-        Freshness::Maybe
+        Change::May
     }
 }
 
-/// Freshness of one return expression of a functional updater, without an
-/// environment (the updater runs in its own scope).
-fn classify_updater_return(e: &Expr, params: &[Var]) -> Freshness {
-    match e.peel_ts() {
-        Expr::ObjectLit { .. } | Expr::ArrayLit { .. } | Expr::FnLit { .. } | Expr::New { .. } => {
-            Freshness::Fresh
-        }
-        // Identity updater `o => o` and literal resets converge.
-        Expr::Var(v) if params.first().is_some_and(|p| p == v) => Freshness::Not,
-        Expr::Lit(_) => Freshness::Not,
-        // JS operators return primitives — except logical ops, which return
-        // an operand: never *must*-fresh, at most maybe.
-        Expr::BinOp { lhs, rhs, .. } => {
-            let l = classify_updater_return(lhs, params);
-            let r = classify_updater_return(rhs, params);
-            l.max(r).min(Freshness::Maybe)
-        }
-        Expr::UnaryOp { .. } => Freshness::Not,
-        _ => Freshness::Maybe,
+/// Does argument 0 store the slot's own content: the slot's state read, or a
+/// name bound to it (`states`, aliases resolved)? React bails out on it.
+/// Only the read itself counts — a field of it, a memo over it, a copy
+/// carried through another slot are values derived from the slot.
+fn stores_own_content(
+    arg: Option<&Expr>,
+    slot: HookLabel,
+    states: &HashMap<Var, HookLabel>,
+) -> bool {
+    match arg.map(Expr::peel_ts) {
+        Some(Expr::StateVal(l)) => *l == slot,
+        Some(Expr::Var(v)) => states.get(v) == Some(&slot),
+        _ => false,
     }
 }
 
-/// Freshness of a value stored into `target`: may it differ, under
-/// `Object.is`, from what the slot holds? A fresh reference always does. A
-/// primitive does when its kind ranges over infinitely many values (an
-/// interval with an infinite bound, string ⊤): the analysis cannot bound
-/// what it stores, so a slot joined to ⊤ that way never widens and the churn
-/// graph is where its re-trigger is weighed against the guards (#172). A
-/// bounded primitive is the fixpoint arm's, which sees it grow.
-///
-/// A reference versioned by the target slot alone is that slot's own content
-/// — or something that moves only with it, the reading ADR-017 gives
-/// `Versioned` — whatever residue the value carries: a state read of a ⊤
-/// store keeps every kind ⊤ beside the `Versioned` reference the read-side
-/// conversion gives it, and written back it is not a change (#155). A memo
-/// read is not that content: its `Versioned` says when it recomputes, not
-/// what it holds, so a memo over the target written back into it moves
-/// whenever the target does (`memo_read`). A value versioned by *another*
-/// slot with a ⊤ residue stays `Maybe`, the reading it had: copying slot X
-/// into slot Y changes Y whenever X moves, and #157 is the precise account of
-/// that.
-fn value_freshness(val: &StateValue, target: QualifiedSlot, memo_read: bool) -> Freshness {
-    match &val.reference {
-        Stability::PerRender => {
-            if val.is_unstable_reference_only() {
-                Freshness::Fresh
-            } else {
-                Freshness::Maybe // joined with other kinds
-            }
-        }
-        Stability::Unknown => Freshness::Maybe,
-        Stability::Versioned(by) if memo_read && by.contains(&target) => Freshness::Maybe,
-        Stability::Versioned(by) if by.len() == 1 && by.contains(&target) => Freshness::Not,
-        // Stable / Versioned / ⊥ reference; residual ⊤ stays Maybe.
-        _ if val.other || val.unbounded_primitive().is_some() => Freshness::Maybe,
-        _ => Freshness::Not,
+/// May a stored value change the slot? It does on every call when it is a
+/// new reference; it never does when it is the slot's own content
+/// (`identity`); it does once when it is a single value known in advance.
+/// Everything else may: a toggle, a counter, a copy of another slot, a memo,
+/// an opaque value.
+fn value_change(val: &StateValue, identity: bool) -> Change {
+    if identity {
+        Change::Never
+    } else if val.reference == Stability::PerRender && val.is_unstable_reference_only() {
+        Change::Must
+    } else if val.is_single_value() {
+        Change::Once
+    } else {
+        Change::May
     }
 }
 
-/// Projection of a written value onto what a churn loop can carry across
-/// renders: its reference slot, and the primitive kinds the analysis
-/// computed but could not bound. Every other primitive part is dropped, so
-/// guard proofs don't lose to residual ⊤ noise — an opaque value (`other`)
-/// keeps reading as its reference, truthy and non-nullish. Nothing left
-/// yields ⊥: no change can ever be stored → the claimed churn is vacuous.
+/// Projection of a written value onto what can differ between two of its
+/// writes: its reference slot, and each primitive kind that holds more than
+/// one value. A single-valued kind (`null`, a point, one boolean) stored
+/// twice is `Object.is`-equal, so it moves the slot at most once — dropped,
+/// so guard proofs don't lose to it. An opaque value (`other`) keeps reading
+/// as its reference, truthy and non-nullish. Nothing left yields ⊥: no
+/// change can ever be stored → the claimed churn is vacuous.
 pub fn churning_part(written: &StateValue) -> StateValue {
     let reference = StateValue::reference(written.reference.clone());
-    match written.unbounded_primitive() {
-        Some(p) if !written.other => reference.join(&p),
-        _ => reference,
+    if written.other {
+        return reference;
     }
+    reference.join(&written.varying_primitives())
 }
 
 /// The converged envs a write site is evaluated in, one bundle per component,
@@ -312,6 +326,7 @@ fn region_exit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domains::impls::{BoolVal, Interval};
     use crate::ir::expr::Prim;
     use crate::ir::types::ExprId;
     use crate::test_support::single_block_cfg_term;
@@ -328,17 +343,19 @@ mod tests {
         panic!("a function literal is classified without an env")
     }
 
-    /// The slot the tests write.
-    const T: QualifiedSlot = (crate::test_support::C, 0);
+    /// The slot the tests write, the writer's own.
+    const T: Option<HookLabel> = Some(0);
 
-    fn no_memos() -> HashMap<Var, HookLabel> {
-        HashMap::new()
+    /// `x` reads slot 0, `y` reads slot 1.
+    fn states() -> HashMap<Var, HookLabel> {
+        HashMap::from([("x".to_string(), 0), ("y".to_string(), 1)])
     }
 
     #[test]
-    fn no_argument_stores_nothing_fresh() {
-        let w = classify(None, &Updater::Unknown, T, &no_memos(), opaque);
-        assert_eq!(w.fresh, Freshness::Not);
+    fn no_argument_stores_undefined_once() {
+        let w = classify(None, &Updater::Unknown, T, &states(), opaque);
+        assert_eq!(w.change, Change::Once);
+        assert_eq!(w.value, StateValue::undefined());
         assert!(w.expr.is_none());
     }
 
@@ -351,8 +368,8 @@ mod tests {
             },
             "p",
         );
-        let w = classify(Some(&e), &Updater::Unknown, T, &no_memos(), opaque);
-        assert_eq!(w.fresh, Freshness::Fresh);
+        let w = classify(Some(&e), &Updater::Unknown, T, &states(), opaque);
+        assert_eq!(w.change, Change::Must);
         assert_eq!(w.value.reference, Stability::PerRender);
     }
 
@@ -367,22 +384,51 @@ mod tests {
             },
             "p",
         );
-        let w = classify(Some(&e), &Updater::Unknown, T, &no_memos(), opaque);
-        assert_eq!(w.fresh, Freshness::Fresh);
+        let w = classify(Some(&e), &Updater::Unknown, T, &states(), opaque);
+        assert_eq!(w.change, Change::Must);
         assert_eq!(w.value.reference, Stability::PerRender);
     }
 
     #[test]
-    fn the_identity_updater_and_a_literal_reset_are_not_fresh() {
+    fn the_identity_updater_never_changes_the_slot_a_literal_reset_once() {
         let id = updater(Expr::Var("p".into()), "p");
         assert_eq!(
-            classify(Some(&id), &Updater::Unknown, T, &no_memos(), opaque).fresh,
-            Freshness::Not
+            classify(Some(&id), &Updater::Unknown, T, &states(), opaque).change,
+            Change::Never
         );
         let reset = updater(Expr::Lit(Prim::Int(0)), "p");
         assert_eq!(
-            classify(Some(&reset), &Updater::Unknown, T, &no_memos(), opaque).fresh,
-            Freshness::Not
+            classify(Some(&reset), &Updater::Unknown, T, &states(), opaque).change,
+            Change::Once
+        );
+    }
+
+    /// A toggle and a counter written through an updater may both change the
+    /// slot: neither is the parameter nor one literal (#187).
+    #[test]
+    fn a_toggling_or_counting_updater_may_change_the_slot() {
+        let not = updater(
+            Expr::UnaryOp {
+                op: crate::ir::expr::UnaryOp::Not,
+                arg: Box::new(Expr::Var("p".into())),
+            },
+            "p",
+        );
+        assert_eq!(
+            classify(Some(&not), &Updater::Unknown, T, &states(), opaque).change,
+            Change::May
+        );
+        let inc = updater(
+            Expr::BinOp {
+                op: crate::ir::expr::BinOp::Add,
+                lhs: Box::new(Expr::Var("p".into())),
+                rhs: Box::new(Expr::Lit(Prim::Int(1))),
+            },
+            "p",
+        );
+        assert_eq!(
+            classify(Some(&inc), &Updater::Unknown, T, &states(), opaque).change,
+            Change::May
         );
     }
 
@@ -392,120 +438,122 @@ mod tests {
     #[test]
     fn an_updater_stores_what_it_returns() {
         let reset = updater(Expr::Lit(Prim::Null), "p");
-        let w = classify(Some(&reset), &Updater::Unknown, T, &no_memos(), opaque);
+        let w = classify(Some(&reset), &Updater::Unknown, T, &states(), opaque);
         assert!(w.value.null);
         assert_eq!(w.value.reference, Stability::Bottom);
         let id = updater(Expr::Var("p".into()), "p");
         assert!(
-            classify(Some(&id), &Updater::Unknown, T, &no_memos(), opaque)
+            classify(Some(&id), &Updater::Unknown, T, &states(), opaque)
                 .value
                 .is_top_value()
         );
     }
 
     #[test]
-    fn a_value_argument_takes_the_freshness_of_its_evaluated_reference() {
+    fn a_value_argument_changes_the_slot_unless_it_is_one_known_value() {
         let arg = Expr::Var("next".into());
-        let fresh = classify(Some(&arg), &Updater::Unknown, T, &no_memos(), |_| {
-            StateValue::reference(Stability::PerRender)
-        });
-        assert_eq!(fresh.fresh, Freshness::Fresh);
-        let stable = classify(Some(&arg), &Updater::Unknown, T, &no_memos(), |_| {
-            StateValue::reference(Stability::Stable)
-        });
-        assert_eq!(stable.fresh, Freshness::Not);
-        let top = classify(Some(&arg), &Updater::Unknown, T, &no_memos(), |_| {
-            StateValue::top()
-        });
-        assert_eq!(top.fresh, Freshness::Maybe);
+        let change = |v: StateValue| classify(Some(&arg), &Updater::Unknown, T, &states(), |_| v);
+        assert_eq!(
+            change(StateValue::reference(Stability::PerRender)).change,
+            Change::Must
+        );
+        assert_eq!(
+            change(StateValue::reference(Stability::Stable)).change,
+            Change::Once
+        );
+        assert_eq!(
+            change(StateValue::boolean(BoolVal::False)).change,
+            Change::Once
+        );
+        assert_eq!(change(StateValue::null()).change, Change::Once);
+        assert_eq!(
+            change(StateValue::number(Interval::point(1.0))).change,
+            Change::Once
+        );
+        assert_eq!(
+            change(StateValue::str_singleton("a".into())).change,
+            Change::Once
+        );
+        // A toggle, a bounded counter, a growing string, ⊤: all may change it.
+        assert_eq!(
+            change(StateValue::boolean(BoolVal::Top)).change,
+            Change::May
+        );
+        assert_eq!(
+            change(StateValue::number(Interval {
+                lo: 0.0,
+                hi: 10.0,
+                is_int: true
+            }))
+            .change,
+            Change::May
+        );
+        assert_eq!(change(StateValue::str_top()).change, Change::May);
+        let top = change(StateValue::top());
+        assert_eq!(top.change, Change::May);
         assert!(matches!(top.expr, Some(Expr::Var(v)) if v == "next"));
     }
 
-    /// A state read of a ⊤ store: every kind ⊤ but the reference, which the
-    /// read-side conversion sets to `Versioned`. Written back into its own
-    /// slot it is the slot's content — the residue is not a fresh reference
-    /// (#155). Written into another slot it keeps the `Maybe` it had: a copy
-    /// moves whenever its source does.
+    /// The slot's own state read written back is its content, whatever the
+    /// read holds — a ⊤ store keeps every kind ⊤ beside the `Versioned`
+    /// reference (#155). The same read written into another slot, or into
+    /// this one by another component, is a copy that moves with its source.
     #[test]
-    fn a_versioned_read_with_a_top_residue_is_not_fresh_in_its_own_slot_only() {
-        let arg = Expr::Var("name".into());
+    fn only_the_slots_own_read_is_its_content() {
         let read = || {
             let mut v = StateValue::top();
-            v.reference = Stability::versioned_by(T.0, T.1);
+            v.reference = Stability::versioned_by(crate::test_support::C, 0);
             v
         };
-        let own = classify(Some(&arg), &Updater::Unknown, T, &no_memos(), |_| read());
-        assert_eq!(own.fresh, Freshness::Not);
-        let copy = classify(Some(&arg), &Updater::Unknown, (T.0, 1), &no_memos(), |_| {
-            read()
-        });
-        assert_eq!(copy.fresh, Freshness::Maybe);
-    }
-
-    /// A memo over the slot is not the slot's content: written back into it,
-    /// it moves whenever the slot does (#172, the self-slot case of #157).
-    #[test]
-    fn a_memo_over_the_slot_written_back_into_it_may_change_it() {
-        let memos = HashMap::from([("d".to_string(), 1)]);
-        let memo = || StateValue::reference(Stability::versioned_by(T.0, T.1));
-        let by_var = classify(
-            Some(&Expr::Var("d".into())),
-            &Updater::Unknown,
-            T,
-            &memos,
-            |_| memo(),
-        );
-        assert_eq!(by_var.fresh, Freshness::Maybe);
+        let x = Expr::Var("x".into());
+        let own = classify(Some(&x), &Updater::Unknown, T, &states(), |_| read());
+        assert_eq!(own.change, Change::Never);
         let direct = classify(
-            Some(&Expr::MemoVal(1)),
+            Some(&Expr::StateVal(0)),
             &Updater::Unknown,
             T,
-            &memos,
-            |_| memo(),
+            &states(),
+            |_| read(),
         );
-        assert_eq!(direct.fresh, Freshness::Maybe);
-        // The same value read from a non-memo binding keeps #155's reading.
-        let state = classify(
-            Some(&Expr::Var("x".into())),
-            &Updater::Unknown,
-            T,
-            &memos,
-            |_| memo(),
-        );
-        assert_eq!(state.fresh, Freshness::Not);
+        assert_eq!(direct.change, Change::Never);
+        let copy = classify(Some(&x), &Updater::Unknown, Some(1), &states(), |_| read());
+        assert_eq!(copy.change, Change::May);
+        let foreign = classify(Some(&x), &Updater::Unknown, None, &states(), |_| read());
+        assert_eq!(foreign.change, Change::May);
     }
 
-    /// A primitive that ranges over infinitely many values may differ on
-    /// every write; a finite one is the fixpoint arm's (#172, #173).
+    /// A memo over the slot, or a field of it, is a value derived from the
+    /// slot and not its content: written back, it may change it (#172, the
+    /// self-slot case of #157), even when its reference reads `Versioned` by
+    /// the slot alone.
     #[test]
-    fn an_unbounded_primitive_may_change_a_bounded_one_does_not() {
-        let arg = Expr::Var("v".into());
-        let fresh =
-            |v: StateValue| classify(Some(&arg), &Updater::Unknown, T, &no_memos(), |_| v).fresh;
-        assert_eq!(fresh(StateValue::str_top()), Freshness::Maybe);
-        assert_eq!(
-            fresh(StateValue::number(crate::domains::impls::Interval {
-                lo: 0.0,
-                hi: f64::INFINITY,
-                is_int: true
-            })),
-            Freshness::Maybe
-        );
-        assert_eq!(fresh(StateValue::str_singleton("a".into())), Freshness::Not);
-        assert_eq!(
-            fresh(StateValue::number(crate::domains::impls::Interval::point(
-                1.0
-            ))),
-            Freshness::Not
-        );
+    fn a_value_derived_from_the_slot_may_change_it() {
+        let derived = || StateValue::reference(Stability::versioned_by(crate::test_support::C, 0));
+        for arg in [
+            Expr::Var("d".into()),
+            Expr::MemoVal(1),
+            Expr::FieldAccess {
+                obj: Box::new(Expr::Var("x".into())),
+                field: "inner".into(),
+            },
+        ] {
+            let w = classify(Some(&arg), &Updater::Unknown, T, &states(), |_| derived());
+            assert_eq!(w.change, Change::May, "{arg:?}");
+        }
     }
 
-    /// The proofs read the churning part: an unbounded primitive survives
-    /// the projection, a bounded one is dropped.
+    /// The proofs read the churning part: every kind that holds more than
+    /// one value survives the projection, a single-valued one is dropped.
     #[test]
-    fn the_churning_part_keeps_unbounded_primitives() {
+    fn the_churning_part_keeps_every_varying_kind() {
         assert_eq!(churning_part(&StateValue::str_top()), StateValue::str_top());
+        assert_eq!(
+            churning_part(&StateValue::boolean(BoolVal::Top)),
+            StateValue::boolean(BoolVal::Top)
+        );
         assert!(churning_part(&StateValue::str_singleton("a".into())).is_bottom_value());
+        assert!(churning_part(&StateValue::boolean(BoolVal::True)).is_bottom_value());
+        assert!(churning_part(&StateValue::null()).is_bottom_value());
         // An opaque value reads as its reference only: its ⊤ string part is
         // residue, and would let `""` revive a truthiness guard.
         assert_eq!(

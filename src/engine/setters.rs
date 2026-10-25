@@ -994,6 +994,9 @@ fn class_phase(class: WalkClass, region: WriterRegion) -> WriterPhase {
 /// witness span — and the handler row's phase is what extraction proved.
 /// Keeping the ⊤ duplicate would make `writer_phases includes <anything>`
 /// true for every extracted `onClick={() => set(..)}`.
+///
+/// A write into a `useReducer` slot, own or foreign, stores what `reducers`
+/// says the slot's reducer returns, never its argument.
 pub(crate) fn collect_slot_writers(
     render_cfg: &CFG,
     hooks: &[HookEntry],
@@ -1001,6 +1004,7 @@ pub(crate) fn collect_slot_writers(
     hook_provenance: &[crate::ir::hooks::HookProvenance],
     foreign: &HashMap<Var, SetterProp>,
     envs: &SiteEnvs<'_>,
+    reducers: &crate::engine::Reducers<'_>,
 ) -> Vec<SlotWriter> {
     let mut labels = setter_var_labels(render_cfg);
     for cfg in std::iter::once(render_cfg).chain(hooks.iter().filter_map(|h| h.body_cfg())) {
@@ -1018,11 +1022,11 @@ pub(crate) fn collect_slot_writers(
             .or_insert((Some(prop.component), prop.label));
     }
     let setter_vars: HashSet<Var> = targets.keys().cloned().collect();
-    // Memo and callback bindings, aliases resolved the same way: a write of
-    // one stores a value derived from its deps (`written::classify`).
-    let mut memos = memo_val_labels(render_cfg);
+    // State-read bindings, aliases resolved the same way: a write of one
+    // into its own slot stores the slot's content (`written::classify`).
+    let mut states = state_val_labels(render_cfg);
     for cfg in std::iter::once(render_cfg).chain(hooks.iter().filter_map(|h| h.body_cfg())) {
-        memos = resolve_setter_aliases(cfg, &memos);
+        states = resolve_setter_aliases(cfg, &states);
     }
     // Any local binding of a deferring global's name disables its summary,
     // wherever the call sits (fail-closed across every body, nested `FnLit`
@@ -1141,13 +1145,17 @@ pub(crate) fn collect_slot_writers(
                 .then_some(site.at)
                 .flatten();
             let block = at.map(|(b, _)| b);
-            let written = written::classify(
-                site.arg.as_ref(),
-                &site.updater,
-                (owner.unwrap_or(envs.component), slot),
-                &memos,
-                |e| envs.eval(region, cfg, at, e),
-            );
+            let target = (owner.unwrap_or(envs.component), slot);
+            let written = match reducers.get(target.0, target.1) {
+                Some(reducer) => written::dispatched(&reducer),
+                None => written::classify(
+                    site.arg.as_ref(),
+                    &site.updater,
+                    owner.is_none().then_some(slot),
+                    &states,
+                    |e| envs.eval(region, cfg, at, e),
+                ),
+            };
             let via = {
                 let mut chain: Vec<Symbol> = hook_origin.into_iter().cloned().collect();
                 match site.prov_block {

@@ -1,5 +1,4 @@
 // oracle: react=loop
-// oracle: known=fn #168
 // L1: a functional updater in an effect keyed on the slot it writes.
 import { useEffect, useState } from "react";
 

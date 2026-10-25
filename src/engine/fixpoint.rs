@@ -294,6 +294,20 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         })
         .collect();
 
+    // `useReducer` reducers, resolved post-expansion and registered
+    // program-wide before the first render pass can hand a `dispatch` to a
+    // child: every write into one of these slots stores the reducer's return.
+    let reducers = crate::engine::Reducers::new(
+        comp_id,
+        crate::engine::reducers::resolve_reducers(
+            &hooks,
+            &render_cfg,
+            &config.function_registry,
+            &comp_file,
+        ),
+        inter,
+    );
+
     // Fixpoint carrier: the product StateValue tracks every JS kind per label
     // (ADR-015), so one store holds all slots — no per-type sub-store dispatch.
     let mut state: StateStore<StateValue> = StateStore::bottom();
@@ -362,6 +376,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 state: &state_store,
                 memo: &memo_store,
                 callbacks: &callback_bodies,
+                reducers: &reducers,
             };
             analyze_cfg::<T>(
                 comp_id,
@@ -425,6 +440,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                         state: &state_store,
                         memo: &memo_store,
                         callbacks: &callback_bodies,
+                        reducers: &reducers,
                     };
                     analyze_cfg::<T>(
                         comp_id,
@@ -462,6 +478,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                         state: &state_store,
                         memo: &memo_store,
                         callbacks: &callback_bodies,
+                        reducers: &reducers,
                     };
                     analyze_cfg::<T>(
                         comp_id,
@@ -544,6 +561,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             state: &state,
             memo: &memo_store,
             callbacks: &callback_bodies,
+            reducers: &reducers,
         };
         let (bs, _) = analyze_cfg::<T>(
             comp_id,
@@ -571,6 +589,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         state: &final_state,
         memo: &memo_store,
         callbacks: &callback_bodies,
+        reducers: &reducers,
     };
     let bottom_state: StateStore<StateValue> = StateStore::bottom();
     let mut effect_setter_writes: StateStore<StateValue> = StateStore::bottom();
@@ -623,6 +642,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         &hook_provenance,
         &foreign,
         &site_envs,
+        &reducers,
     );
     // The seed relation rides the same slice: it folds `slot_writers` rows and
     // the effects' declared deps, so it must come after both (#106, ADR-031).
@@ -712,6 +732,7 @@ pub fn analyze_program(
 
     let cache = RefCell::new(ComponentCache::new());
     let shared_state = RefCell::new(SharedStateStore::new());
+    let reducers: crate::engine::ProgramReducers = RefCell::new(HashMap::new());
     let call_graph = RefCell::new(ComponentCallGraph::new());
     let stats = RefCell::new(AnalysisStats::default());
     let results: RefCell<HashMap<ComponentId, AnalysisResult<crate::domains::StateValue>>> =
@@ -730,6 +751,7 @@ pub fn analyze_program(
                 registry: &registry,
                 cache: &cache,
                 shared_state: &shared_state,
+                reducers: &reducers,
                 call_graph: &call_graph,
                 stats: &stats,
                 results: &results,
@@ -1029,9 +1051,15 @@ fn expand_custom_hooks(
             .into_iter()
             .map(|h| {
                 let h = match h {
-                    HookEntry::State { label, init, span } => HookEntry::State {
+                    HookEntry::State {
+                        label,
+                        init,
+                        reducer,
+                        span,
+                    } => HookEntry::State {
                         label,
                         init: crate::ir::subst_vars_expr(init, &param_subst),
+                        reducer: reducer.map(|r| crate::ir::subst_vars_expr(r, &param_subst)),
                         span,
                     },
                     other => other,
@@ -1861,6 +1889,7 @@ mod tests {
         };
         let hooks = vec![HookEntry::State {
             label: 0,
+            reducer: None,
             init: Expr::Lit(Prim::Int(0)),
             span: None,
         }];
@@ -1885,6 +1914,7 @@ mod tests {
         // useState(0) with no setState → state[0] seeded to Number([0,0]) from init
         let hooks = vec![HookEntry::State {
             label: 0,
+            reducer: None,
             init: Expr::Lit(Prim::Int(0)),
             span: None,
         }];
@@ -1924,6 +1954,7 @@ mod tests {
         let hooks = vec![
             HookEntry::State {
                 label: 0,
+                reducer: None,
                 init: Expr::Lit(Prim::Int(0)),
                 span: None,
             },
@@ -1986,6 +2017,7 @@ mod tests {
         let hooks = vec![
             HookEntry::State {
                 label: 0,
+                reducer: None,
                 init: Expr::Lit(Prim::Int(0)),
                 span: None,
             },
@@ -2031,6 +2063,7 @@ mod tests {
         let hooks = vec![
             HookEntry::State {
                 label: 0,
+                reducer: None,
                 init: Expr::Lit(Prim::Int(0)),
                 span: None,
             },
@@ -2187,6 +2220,7 @@ mod tests {
         let hooks = vec![
             HookEntry::State {
                 label: 0,
+                reducer: None,
                 init: Expr::Lit(Prim::Int(0)),
                 span: None,
             },
@@ -2258,6 +2292,7 @@ mod tests {
         let hooks = vec![
             HookEntry::State {
                 label: 0,
+                reducer: None,
                 init: Expr::Lit(Prim::Int(0)),
                 span: None,
             },
@@ -2319,6 +2354,7 @@ mod tests {
         let hooks = vec![
             HookEntry::State {
                 label: 0,
+                reducer: None,
                 init: Expr::Lit(Prim::Int(0)),
                 span: None,
             },
@@ -2456,6 +2492,7 @@ mod tests {
         let hooks = vec![
             HookEntry::State {
                 label: 0,
+                reducer: None,
                 init: Expr::Lit(Prim::Int(0)),
                 span: None,
             },
@@ -2523,6 +2560,7 @@ mod tests {
         let hooks = vec![
             HookEntry::State {
                 label: 0,
+                reducer: None,
                 init: Expr::Lit(Prim::Int(0)),
                 span: None,
             },
@@ -2656,6 +2694,7 @@ mod tests {
         let hooks = vec![
             HookEntry::State {
                 label: 0,
+                reducer: None,
                 init: Expr::Lit(Prim::Int(0)),
                 span: None,
             },
@@ -2706,6 +2745,7 @@ mod tests {
         let hooks = vec![
             HookEntry::State {
                 label: 0,
+                reducer: None,
                 init: Expr::Lit(Prim::Int(0)),
                 span: None,
             },

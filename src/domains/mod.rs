@@ -131,9 +131,9 @@ pub trait Transfer {
     );
 
     /// Fire the side effects of `expr` evaluated in *effect position* — a bare
-    /// `expr;` statement or a concise-arrow `Return` body: the callback
-    /// pre-pass, the setter-call weak-update, and the inter-component eval a
-    /// component application performs. This is the single definition of
+    /// `expr;` statement, a concise-arrow `Return` body or a branch condition:
+    /// the effects of every call in it (callbacks, slot writes), and the
+    /// inter-component eval a component application performs. This is the single definition of
     /// "run an expression for its effects"; the fixpoint engine's `Return`
     /// handling calls it instead of fabricating a throwaway `Stmt::ExprStmt`.
     fn exec_expr_effects(

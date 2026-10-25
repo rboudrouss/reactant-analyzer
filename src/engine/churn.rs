@@ -1,17 +1,27 @@
 //! The program churn graph (ADR-018, ADR-042 §4): a fold over two relations.
 //!
 //! ```text
-//! edge x → y  ≡  "a change of x re-runs an effect that stores a fresh
-//!                 reference, or a value it cannot bound, into y"
+//! edge x → y  ≡  "a change of x re-runs an effect whose write may change y"
 //!                                            a cycle = self-sustaining loop
 //! ```
+//!
+//! A write may change its slot unless that is proven impossible
+//! (`written::Change`), and an edge exists unless its convergence is proven
+//! — the graph no longer looks for growth: a toggle `!on` closes an edge as
+//! surely as a counter. What settles a write: it stores the slot's own
+//! content; it stores one value known in advance and no other write moves
+//! the slot away; it reads neither the trigger nor its own slot
+//! (`Invariance::reads`), so the re-run stores what the last run did; every
+//! write of the slot moves it one way by a constant into a finite interval
+//! (`moves_one_way`); or the guard proofs below.
 //!
 //! Nothing is walked here. The writes are the effect-region rows of
 //! `slot_writers`, the re-run triggers the rows of `effect_triggers`, and the
 //! graph is the product of the two, per effect, program-wide. Edge strength:
 //! - `Must`: the dep on x is the exact slot (must-rerun) ∧ the fresh write to
 //!   y sits in a block on all paths of the body (must-reach) ∧ the written
-//!   value is `PerRender` (must-change). An all-must cycle ⇒ Error.
+//!   value is a new reference every call (`Change::Must`). An all-must cycle
+//!   ⇒ Error.
 //! - `May`: the dep is merely versioned by x, or the write is conditional,
 //!   nested, deferred or imprecise.
 //!
@@ -60,7 +70,7 @@ use std::collections::{HashMap, HashSet};
 use crate::{
     domains::{AbstractEnv, StateValue},
     engine::{
-        AnalysisResult, ConvergedEval, EffectTrigger, Freshness, ProgramAnalysisResult, SlotWriter,
+        AnalysisResult, Change, ConvergedEval, EffectTrigger, ProgramAnalysisResult, SlotWriter,
         WriterPhase, WriterRegion,
         dominance::on_all_paths,
         guards::{
@@ -442,6 +452,110 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             expr: s.row.written.expr.as_ref(),
         }
     }
+    /// Does every write of `slot` the automatic loop runs move it one way by
+    /// a constant (`s + 1`, `s - 2`, `p => p + 1`), and store a value in a
+    /// finite interval where it runs? A strictly monotone sequence in a
+    /// bounded set ends, so the slot settles whatever its guards say. A write
+    /// from another component is not read: its slot read is a prop.
+    fn moves_one_way(
+        slot: QualifiedSlot,
+        sites: &[SiteRef<'_>],
+        ctxs: &HashMap<ComponentId, CompCtx<'_>>,
+    ) -> bool {
+        // Bounded: what the write stores, read where it runs (under its
+        // guards), is a finite interval, and no kind `+` could grow instead
+        // (a string concatenates, a reference or an opaque value is
+        // anything). Every value after the first write is one of those.
+        let bounded = |v: &StateValue| {
+            v.num.lo.is_finite()
+                && v.num.hi.is_finite()
+                && v.str == crate::domains::impls::StrConst::Bottom
+                && v.reference == crate::domains::Stability::Bottom
+                && !v.other
+        };
+        let mut way = None;
+        for s in sites.iter().filter(|s| node_of(s.comp, s.row) == slot) {
+            if !bounded(&s.row.written.value) {
+                return false;
+            }
+            let Some(ctx) = ctxs.get(&s.comp) else {
+                return false;
+            };
+            let step = match (s.row.owner, s.row.written.expr.as_ref()) {
+                (None, Some(e)) => step_of(e, slot.1, &ctx.state_vals),
+                _ => None,
+            };
+            match (step, way) {
+                (None, _) => return false,
+                (Some(d), None) => way = Some(d),
+                (Some(d), Some(w)) if d != w => return false,
+                _ => {}
+            }
+        }
+        return way.is_some();
+
+        /// `+1` / `-1` when `e` adds to / subtracts from `label`'s read a
+        /// positive constant, directly or as an updater's only return.
+        fn step_of(e: &Expr, label: HookLabel, states: &HashMap<Var, HookLabel>) -> Option<i8> {
+            let positive = |e: &Expr| match e.peel_ts() {
+                Expr::Lit(crate::ir::expr::Prim::Int(n)) => *n > 0,
+                Expr::Lit(crate::ir::expr::Prim::Float(f)) => f.is_finite() && *f > 0.0,
+                _ => false,
+            };
+            let step = |e: &Expr, is_read: &dyn Fn(&Expr) -> bool| match e.peel_ts() {
+                Expr::BinOp {
+                    op: crate::ir::expr::BinOp::Add,
+                    lhs,
+                    rhs,
+                } if (is_read(lhs) && positive(rhs)) || (positive(lhs) && is_read(rhs)) => Some(1),
+                Expr::BinOp {
+                    op: crate::ir::expr::BinOp::Sub,
+                    lhs,
+                    rhs,
+                } if is_read(lhs) && positive(rhs) => Some(-1),
+                _ => None,
+            };
+            match e.peel_ts() {
+                Expr::FnLit {
+                    params, body_cfg, ..
+                } => {
+                    let [p] = params.as_slice() else {
+                        return None;
+                    };
+                    let mut returns = body_cfg.blocks.values().filter_map(|b| match &b.term {
+                        Terminator::Return(r) => Some(r),
+                        _ => None,
+                    });
+                    let (Some(r), None) = (returns.next(), returns.next()) else {
+                        return None;
+                    };
+                    step(r, &|x| matches!(x.peel_ts(), Expr::Var(v) if v == p))
+                }
+                other => step(other, &|x| match x.peel_ts() {
+                    Expr::StateVal(l) => *l == label,
+                    Expr::Var(v) => states.get(v) == Some(&label),
+                    _ => false,
+                }),
+            }
+        }
+    }
+    /// Can the loop re-run the body `s` sits in? A render or memo body, an
+    /// effect with no dependency array, or one with a slot among its
+    /// triggers. An effect whose deps no slot moves re-runs only when
+    /// something outside the loop changes.
+    fn reruns_in_loop(s: &SiteRef<'_>, result: &ProgramAnalysisResult) -> bool {
+        let WriterRegion::Effect(l) = s.row.region else {
+            return true;
+        };
+        let Some(r) = result.components.get(&s.comp) else {
+            return true;
+        };
+        let no_deps = r
+            .hooks
+            .iter()
+            .any(|h| matches!(h, HookEntry::Effect { label, deps, .. } if *label == l && deps.list().is_none()));
+        no_deps || triggers_of(&r.effect_triggers, l).next().is_some()
+    }
     let invariance_of = |ctx| invariance_of(ctx, navigates);
 
     // The sites that fire at most once in the automatic loop, by least
@@ -490,6 +604,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
     // does not depend on relation order.
     let mut best: HashMap<(QualifiedSlot, QualifiedSlot, ComponentId, HookLabel), ChurnEdge> =
         HashMap::new();
+    let mut one_way: HashMap<QualifiedSlot, bool> = HashMap::new();
     for f in &facts {
         let ctx = &ctxs[&f.comp];
         let invariance = invariance_of(ctx);
@@ -501,22 +616,57 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             .map(|&j| site_of(&all_sites[j], convergent[j]))
             .collect();
         for w in &f.writes {
-            if w.written.fresh == Freshness::Not {
+            if w.written.change == Change::Never {
                 continue;
             }
             let node = node_of(f.comp, w);
+            // Can another write the loop runs move the slot away from what
+            // this one leaves in it, again and again? An identity cannot, nor
+            // a write of the same single value this one stores, nor a site
+            // proven to fire at most once, nor an effect nothing in the loop
+            // re-runs — no slot among its triggers, the graph's own reading:
+            // such an effect has no edge into it either.
+            let moved = all_sites
+                .iter()
+                .enumerate()
+                .filter(|(j, s)| {
+                    node_of(s.comp, s.row) == node
+                        && !std::ptr::eq(s.row, *w)
+                        && !convergent[*j]
+                        && reruns_in_loop(s, result)
+                })
+                .any(|(_, s)| match s.row.written.change {
+                    Change::Never => false,
+                    Change::Once => {
+                        w.written.change != Change::Once || s.row.written.value != w.written.value
+                    }
+                    Change::May | Change::Must => true,
+                });
+            // One value known in advance changes the slot once, unless
+            // another write keeps moving it away.
+            if w.written.change == Change::Once && !moved {
+                continue;
+            }
             // Convergence proof: once a written value sits in the slot, do the
             // dominating guards kill this write — under its own write and
             // under every other site's? Edges claim churn, so the own write is
             // read as the part of its value that churns: its reference
             // (truthy and non-nullish) and its unbounded primitives; another
             // site's write revives with whatever it stores, `null` included.
-            let own_value = churning_part(&w.written.value);
+            // A single value another write moves away is stored again whole.
+            let own_value = if w.written.change == Change::Once {
+                w.written.value.clone()
+            } else {
+                churning_part(&w.written.value)
+            };
             let k = idxs
                 .iter()
                 .position(|&j| std::ptr::eq(all_sites[j].row, *w))
                 .expect("every effect write is a site");
             let killed = convergent[idxs[k]]
+                || *one_way
+                    .entry(node)
+                    .or_insert_with(|| moves_one_way(node, &all_sites, &ctxs))
                 || converges_under_all_writes(
                     &peers,
                     k,
@@ -528,13 +678,34 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     &ctx.exit,
                     &mut eval,
                 );
+            // What the write may depend on: it changes the slot only when one
+            // of those moved since it last ran. `None` — a new reference, an
+            // updater, an opaque value — may change it whatever moved, and so
+            // does a write that reads its own slot, which its last run moved,
+            // or a slot another write moves away.
+            let reads = match (&w.written.expr, w.written.change) {
+                _ if moved => None,
+                (Some(e), Change::May) => {
+                    let r = &f.comp_result;
+                    invariance.reads(e, f.body_cfg, &r.render_cfg, &|v| {
+                        v == r.param || r.module_consts.contains_key(v)
+                    })
+                }
+                _ => None,
+            }
+            .filter(|r| !(node.0 == f.comp && r.slots.contains(&node.1)));
+            let reads_slot = |x: QualifiedSlot| match &reads {
+                None => true,
+                Some(r) if x.0 == f.comp => r.slots.contains(&x.1),
+                Some(r) => r.props,
+            };
             let fresh_blocks: HashSet<BlockId> = f
                 .writes
                 .iter()
-                .filter(|o| node_of(f.comp, o) == node && o.written.fresh == Freshness::Fresh)
+                .filter(|o| node_of(f.comp, o) == node && o.written.change == Change::Must)
                 .filter_map(|o| o.block)
                 .collect();
-            let must_write = w.written.fresh == Freshness::Fresh
+            let must_write = w.written.change == Change::Must
                 && w.block.is_some()
                 && on_all_paths(f.body_cfg, &fresh_blocks);
             let strength = if must_write {
@@ -567,18 +738,33 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             };
 
             if f.no_deps {
-                // Re-runs after every render → its own write re-triggers it,
-                // whichever turn the write runs on (a handler row was dropped
-                // above).
-                if !killed {
-                    push(node, strength, false);
+                // Re-runs after every render → a change of anything the
+                // write reads re-runs it (a handler row was dropped above):
+                // each slot it reads is an edge into its own, and a write
+                // that reads everything or a prop re-triggers itself,
+                // whichever turn it runs on.
+                if killed {
+                    continue;
+                }
+                match &reads {
+                    Some(r) => {
+                        for &l in &r.slots {
+                            push((f.comp, l), strength, false);
+                        }
+                        if r.props {
+                            push(node, strength, false);
+                        }
+                    }
+                    None => push(node, strength, false),
                 }
                 continue;
             }
             for &l in &f.exact_local {
                 let x: QualifiedSlot = (f.comp, l);
                 let self_slot = x == node;
-                let dropped = killed || (self_slot && !write_can_retrigger(f, &ctx.state_vals, w));
+                let dropped = killed
+                    || !reads_slot(x)
+                    || (self_slot && !write_can_retrigger(f, &ctx.state_vals, w));
                 if !dropped {
                     push(x, strength, self_slot);
                 }
@@ -588,7 +774,9 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     continue; // already pushed as exact
                 }
                 let self_slot = x == node && x.0 == f.comp;
-                let dropped = killed || (self_slot && !write_can_retrigger(f, &ctx.state_vals, w));
+                let dropped = killed
+                    || !reads_slot(x)
+                    || (self_slot && !write_can_retrigger(f, &ctx.state_vals, w));
                 if !dropped {
                     push(x, EdgeStrength::May, self_slot);
                 }

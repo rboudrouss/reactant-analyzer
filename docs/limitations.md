@@ -57,8 +57,9 @@ that writes it (see *Cross-file limits*).
 - Hooks and callees it cannot reach: npm-package callees and utilities cut off by the inlining depth
   [#19](https://github.com/rboudrouss/reactant-analyzer/issues/19), silently: `pkgFn(() => setN(n + 1))` in an effect gets no
   analysis-limit, and `infinite-loop` is reported verified; utility *inlining* is statement-position only [#52](https://github.com/rboudrouss/reactant-analyzer/issues/52); a setter called
-  through an index or a returned function [#46](https://github.com/rboudrouss/reactant-analyzer/issues/46). A setter *call* in any expression position,
-  `wrap(setN(1))`, a ternary arm, a JSX prop, is seen; it is the callee's *inlining* that is not.
+  through an index or a returned function [#46](https://github.com/rboudrouss/reactant-analyzer/issues/46). A setter or `dispatch` *call* in any expression
+  position, `wrap(setN(1))`, a `&&` or ternary arm, a branch condition, a JSX prop, writes its slot
+  [#169](https://github.com/rboudrouss/reactant-analyzer/issues/169); it is the callee's *inlining* that is not.
 - `useContext` is unmodelled, so a context value reads ⊤. This is the single largest source of
   analysis limits, 363 sites across the eight corpora [#28](https://github.com/rboudrouss/reactant-analyzer/issues/28).
 - Seven React hooks are unmodelled and emit an Info rather than a summary: `useActionState`,
@@ -72,10 +73,6 @@ that writes it (see *Cross-file limits*).
   callback does not resolve syntactically [#24](https://github.com/rboudrouss/reactant-analyzer/issues/24), `frozen-initial-state` on primitive props
   and memo-chained seeds [#25](https://github.com/rboudrouss/reactant-analyzer/issues/25), provider detection inside an inline arrow
   [#30](https://github.com/rboudrouss/reactant-analyzer/issues/30).
-- The churn graph reads a write of a value derived from the written slot as not fresh, ADR-017's
-  reading of `Versioned`, unless the value is a memo over the slot: a field of it, or a copy that
-  comes back through another slot, is read as the slot's own content, and a loop carried by such a
-  write is silent [#157](https://github.com/rboudrouss/reactant-analyzer/issues/157).
 - The convergence proof assumes a call over held inputs returns the same value on every run, and
   that a call it cannot see into does not navigate: a router hook's result (`useSearchParams`,
   `useParams`, `usePathname`, `useLocation`) holds still across the loop unless some render,
@@ -129,6 +126,11 @@ carries an Error.
   [#35](https://github.com/rboudrouss/reactant-analyzer/issues/35).
 - **Module-level constants** read as ⊤ when the initializer is a call (`const X = f()`)
   [#34](https://github.com/rboudrouss/reactant-analyzer/issues/34), or when the hook was inlined from another file [#36](https://github.com/rboudrouss/reactant-analyzer/issues/36).
+- **`useReducer`**: a `dispatch` stores what the reducer returns, and the reducer runs in its own
+  scope, `(state, action)` bound and every other name ⊤. An action's members (`action.type`) are
+  not read, so a reducer that returns its state on one action and a fresh object on another may
+  store a fresh reference on every dispatch; a reducer the analysis cannot reach (a prop, an
+  unresolved import) stores ⊤ [#170](https://github.com/rboudrouss/reactant-analyzer/issues/170).
 - **`state-mutation`** on a DOM-typed prop whose type is imported from another file [#38](https://github.com/rboudrouss/reactant-analyzer/issues/38).
 - **The churn graph** keeps a cycle edge on a convergent slot when the proof cannot read what
   would settle it: a write site in another component, whose guards live in that component's
@@ -141,6 +143,16 @@ carries an Error.
   [#160](https://github.com/rboudrouss/reactant-analyzer/issues/160); and a write through a
   setter prop typed to take a primitive, whose ⊤ value reads as a possible fresh reference
   [#159](https://github.com/rboudrouss/reactant-analyzer/issues/159).
+- **The churn graph warns unless a write is proven to settle.** The proofs are: the write stores
+  the slot's own state read; it stores one value known in advance and nothing else moves the slot;
+  it reads neither the slot nor what re-ran it; every write of the slot steps it one way into a
+  finite interval; or a guard dies. So what reaches a fixed point any other way reads as a possible
+  loop: a counter capped by `Math.min(x + 1, 10)`, an updater under a guard on the slot
+  (`if (on) setOn((s) => !s)`, whose parameter is not read under the guard), a write of a value
+  derived from the slot, a child writing back the parent's own value it received as a prop, a
+  controlled input mirrored through two slots (`setLocal(value)`, then `onChange(local)`). Never an
+  Error: the Error still needs a new reference stored on all paths
+  [#157](https://github.com/rboudrouss/reactant-analyzer/issues/157).
 - **The churn graph is slot-granular where a program is member-granular.** The self-churn arm reads
   the member (`[data.name]` is not re-triggered by `setData(prev => ({...prev, slug}))`, and a guard
   on `sheet.leadId` is answered by the `null` the write puts there), but the multi-effect graph

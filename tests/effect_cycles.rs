@@ -618,14 +618,13 @@ export function C() {
 }
 
 #[test]
-fn a_child_writing_the_parents_own_value_back_builds_no_edge() {
+fn a_child_writing_the_parents_own_value_back_is_at_most_a_may_edge() {
     // The twenty shape: `<Child name={name} onNameUpdate={setName} />` and the
     // child's effect calls `onNameUpdate(name)` — the parent's slot, written
-    // with the parent's own value for it. The graph used to carry a May edge
-    // from the parent's slot into itself, a length-1 cross-component cycle.
-    // (The older cross arm, which reads the parent's store rather than the
-    // written value, still fires on this shape when the call is direct: the
-    // exactness it would need is #157.)
+    // with the parent's own value for it. An identity in React, but the
+    // child reads a prop, and that the prop is exactly the parent's slot is
+    // the exactness across components #157 asks for: a write is a change
+    // unless proven not to be, so the edge stays, never a Must.
     let src = r#"
 import { useState, useEffect } from 'react';
 declare function fetchName(): { name: string };
@@ -642,8 +641,11 @@ export function Parent() {
     let result = parse_and_analyze(src);
     let graph = reactant::engine::ChurnGraph::build(&result);
     assert!(
-        graph.edges.is_empty(),
-        "an identity write through a setter prop is not a change: {:?}",
+        graph
+            .edges
+            .iter()
+            .all(|e| e.strength == reactant::engine::EdgeStrength::May),
+        "an identity through a prop is unproven, never certain: {:?}",
         graph
             .edges
             .iter()
