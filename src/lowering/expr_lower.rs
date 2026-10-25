@@ -735,6 +735,17 @@ fn lower_ternary(cond: &ConditionalExpression, builder: &mut BlockBuilder) -> Ex
 ///   rhs:      Assign __tN = b; Jump(join)
 ///   join:     Var(__tN)   ← result
 ///
+/// `??`: if a nullish → b, else → a
+///   current:  Let __tN = a; Branch(__tN == null, rhs, join)
+///   rhs:      Assign __tN = b; Jump(join)
+///   join:     Var(__tN)   ← result
+///
+/// `??` tests nullishness, not truthiness, and its branch says so: lowered
+/// as `||`, the join side was narrowed truthy and `0 ?? d` lost its `0`, and
+/// a guard `!(a ?? b)` was read as "`b` is falsy" where `b` never ran. The IR
+/// conflates `==` and `===`, so the join side only drops `null` — the sound
+/// envelope of both (cf. `narrow_env_for_branch`).
+///
 /// Pre-declare + Assign: stability(__tN) = stability(a) ⊔ stability(b)
 fn lower_logical(log: &LogicalExpression, builder: &mut BlockBuilder) -> Expr {
     let tmp = builder.fresh_temp();
@@ -749,35 +760,31 @@ fn lower_logical(log: &LogicalExpression, builder: &mut BlockBuilder) -> Expr {
     let rhs_id = builder.new_block();
     let join_id = builder.new_block();
 
-    let (then_, else_) = match log.operator {
-        LogicalOperator::And => (rhs_id, join_id), // truthy → rhs; falsy → join (keep a)
-        LogicalOperator::Or | LogicalOperator::Coalesce => (join_id, rhs_id), // truthy → join (keep a); falsy → rhs
+    let (cond, then_, else_) = match log.operator {
+        // truthy → rhs; falsy → join (keep a)
+        LogicalOperator::And => (Expr::Var(tmp.clone()), rhs_id, join_id),
+        // truthy → join (keep a); falsy → rhs
+        LogicalOperator::Or => (Expr::Var(tmp.clone()), join_id, rhs_id),
+        // nullish → rhs; anything else → join (keep a)
+        LogicalOperator::Coalesce => (
+            Expr::BinOp {
+                op: IrBinOp::Eq,
+                lhs: Box::new(Expr::Var(tmp.clone())),
+                rhs: Box::new(Expr::Lit(Prim::Null)),
+            },
+            rhs_id,
+            join_id,
+        ),
     };
 
     let bid = builder.seal_with(Terminator::Branch {
-        cond: Expr::Var(tmp.clone()),
+        cond,
         then_,
         else_,
         span,
     });
-    builder.add_edge(
-        bid,
-        then_,
-        if then_ == rhs_id {
-            EdgeKind::IfTrue
-        } else {
-            EdgeKind::IfFalse
-        },
-    );
-    builder.add_edge(
-        bid,
-        else_,
-        if else_ == rhs_id {
-            EdgeKind::IfFalse
-        } else {
-            EdgeKind::IfTrue
-        },
-    );
+    builder.add_edge(bid, then_, EdgeKind::IfTrue);
+    builder.add_edge(bid, else_, EdgeKind::IfFalse);
 
     builder.start_block(rhs_id);
     let right_span = builder.span_at(log.right.span().start);
@@ -1380,6 +1387,34 @@ mod tests {
     fn coalesce_splits_blocks() {
         let cfg = build("function f(a, b) { return a ?? b; }");
         assert!(cfg.blocks.len() >= 3);
+    }
+
+    /// `a ?? b` evaluates `b` when `a` is nullish, so it branches on
+    /// `t == null` with the rhs on the true side — never on `t`'s truthiness,
+    /// which would drop `0`, `""` and `false` from the kept side.
+    #[test]
+    fn coalesce_branches_on_nullishness() {
+        let cfg = build("function f(a, b) { return a ?? b; }");
+        let entry = cfg.blocks.get(&cfg.entry).unwrap();
+        let Terminator::Branch { cond, then_, .. } = &entry.term else {
+            panic!("expected a branch, got {:?}", entry.term);
+        };
+        assert!(
+            matches!(cond, Expr::BinOp { op: IrBinOp::Eq, rhs, .. }
+                if matches!(rhs.as_ref(), Expr::Lit(Prim::Null))),
+            "expected `t == null`, got {cond:?}"
+        );
+        let rhs_block = cfg.blocks.get(then_).unwrap();
+        assert!(
+            matches!(rhs_block.stmts.first(), Some(Stmt::Assign { .. })),
+            "the true side evaluates the rhs"
+        );
+        let true_edge = cfg
+            .edges
+            .iter()
+            .find(|e| e.from == cfg.entry && e.to == *then_)
+            .unwrap();
+        assert_eq!(true_edge.kind, EdgeKind::IfTrue);
     }
 
     /// All `Stmt::Assign { var, rhs }` in `cfg`'s entry block, for assertions.

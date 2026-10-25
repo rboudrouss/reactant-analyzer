@@ -1117,9 +1117,10 @@ fn written_at<'e>(written: &'e Expr, segments: &[String]) -> Option<&'e Expr> {
 /// - `t = a || b` taken FALSE  ⇒ `a` falsy ∧ `b` falsy
 /// - `t = a && b` taken TRUE   ⇒ `a` truthy ∧ `b` truthy
 ///
-/// (`??` lowers identically to `||` — the truthiness approximation is the
-/// lowering's, inherited here, not introduced.) The disjunctive polarities
-/// and anything unrecognised pass through unexpanded.
+/// `t = a ?? b` is not expanded: `!(a ?? b)` holds when `a` is a falsy
+/// non-nullish value and `b` never ran, so no conjunction over `b` follows.
+/// The disjunctive polarities and anything unrecognised pass through
+/// unexpanded.
 fn expand_guard<'a>(
     cfg: &'a CFG,
     cond: &'a Expr,
@@ -1162,29 +1163,33 @@ fn expand_guard<'a>(
                 out.push((cond, taken));
                 return;
             };
-            let diamond = !extra_bindings
-                && matches!(
-                    &cfg.blocks.get(&let_block).map(|blk| &blk.term),
-                    Some(Terminator::Branch { cond: c, then_, else_, .. })
-                        if matches!(c, Expr::Var(v) if v == t)
-                            && (*then_ == rhs_block || *else_ == rhs_block)
-                );
-            if !diamond {
+            // Which side of the branch on `t` evaluates the rhs: the true side
+            // for `&&`, the false side for `||`. (`??` branches on `t == null`,
+            // not on `t`, and is never matched here.)
+            let rhs_on_true = match &cfg.blocks.get(&let_block).map(|blk| &blk.term) {
+                Some(Terminator::Branch {
+                    cond: Expr::Var(v),
+                    then_,
+                    else_,
+                    ..
+                }) if v == t && !extra_bindings => {
+                    if *then_ == rhs_block {
+                        Some(true)
+                    } else if *else_ == rhs_block {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            let Some(rhs_on_true) = rhs_on_true else {
                 out.push((cond, taken));
                 return;
-            }
-            // Edge polarity into the rhs block: falsy evaluates the rhs for
-            // `||`/`??`, truthy for `&&`.
-            let to_rhs_kind = cfg
-                .edges
-                .iter()
-                .find(|e| e.from == let_block && e.to == rhs_block)
-                .map(|e| &e.kind);
-            let conjunctive = match to_rhs_kind {
-                Some(EdgeKind::IfFalse) => !taken, // `a || b`: guard-false ⇒ a falsy ∧ b falsy
-                Some(EdgeKind::IfTrue) => taken,   // `a && b`: guard-true  ⇒ a truthy ∧ b truthy
-                _ => false,
             };
+            // `a && b` taken true ⇒ a truthy ∧ b truthy; `a || b` taken
+            // false ⇒ a falsy ∧ b falsy.
+            let conjunctive = rhs_on_true == taken;
             if conjunctive {
                 expand_guard(cfg, a, taken, depth - 1, out);
                 expand_guard(cfg, b, taken, depth - 1, out);

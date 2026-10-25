@@ -537,6 +537,43 @@ fn a_value_written_before_continue_reaches_the_loop_header() {
     assert_eq!(infinite_loop_hits(src), 1);
 }
 
+/// `n ?? 7` keeps `n` whenever it is not nullish — `0` included. Lowered as
+/// `||`, the kept side was narrowed truthy, `0` was dropped, and the write
+/// stored `7` alone. In a closure, which narrows since #12, and in a body.
+#[test]
+fn nullish_coalescing_keeps_a_falsy_left_operand() {
+    let src = r#"
+        function C() {
+            const [n, setN] = useState(0);
+            const [m, setM] = useState(5);
+            const [k, setK] = useState(5);
+            useEffect(() => { setM(n ?? 7); setK(() => n ?? 7); }, [n]);
+            return <div>{m}{k}</div>;
+        }
+    "#;
+    let alloc = Allocator::default();
+    let ret = Parser::new(&alloc, src, SourceType::tsx())
+        .with_options(ParseOptions::default())
+        .parse();
+    let comp = lower_program(
+        &ret.program,
+        src,
+        std::path::Path::new("test.tsx"),
+        &mut Default::default(),
+    )
+    .into_iter()
+    .next()
+    .expect("a component");
+    let result = analyze_component(comp, &StateValueTransfer, &Config::default());
+    for (slot, what) in [(1, "a body"), (2, "an updater")] {
+        let v = result.state_store.get(slot);
+        assert!(
+            v.num.lo <= 0.0 && 0.0 <= v.num.hi,
+            "`n ?? 7` with n = 0 stores 0 in {what}, got {v:?}"
+        );
+    }
+}
+
 /// A `switch` whose every case leaves used to make everything after it
 /// unreachable: no case has to match, so the fall-out path exists.
 #[test]
