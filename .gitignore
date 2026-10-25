@@ -1,4 +1,5 @@
 /target
+/oracle/node_modules/
 
 other/
 test-repo/

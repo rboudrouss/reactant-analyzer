@@ -7,7 +7,7 @@ ne sont pas des décisions et vivent dans [`../precision-log.md`](../precision-l
 
 | ADR | Title | Status |
 |---|---|---|
-| [ADR-001](ADR-001-concrete-semantics.md) | React-tRace as concrete semantics | Accepted |
+| [ADR-001](ADR-001-concrete-semantics.md) | React-tRace as concrete semantics (tests and `docs/semantics.md` delivered by ADR-043, against React itself) | Accepted |
 | [ADR-002](ADR-002-abstract-domains.md) | Stability lattice + 3 stores | Accepted |
 | [ADR-003](ADR-003-ir-design.md) | Dedicated CFG-based IR | Accepted |
 | [ADR-004](ADR-004-component-structure.md) | Separate render_cfg + effect_cfg | Accepted |
@@ -49,3 +49,4 @@ ne sont pas des décisions et vivent dans [`../precision-log.md`](../precision-l
 | [ADR-040](ADR-040-component-identity-is-an-interned-id.md) | Component identity is an interned `ComponentId`, the display name a rendering — one resolution for a JSX callee, `Ambiguous` rather than a guess, and one spelling for every path (#7) | Accepted |
 | [ADR-041](ADR-041-render-dependence.md) | Render dependence: a separate forward analysis over a converged component, composed over the proven-origin element tree; `state-lifted-too-high` and `wasted-subtree-render`; typed options on built-in rules (amends ADR-022 §4) | Accepted |
 | [ADR-042](ADR-042-relations-are-engine-products.md) | Relations are products of the engine — the churn relation promoted out of `rules/helpers` (writer row gains `owner`/`block`/`written`, `effect_triggers`), `ProgramRelations` replaces `ProgramCache`, the walk-free rules boundary held by a ratchet test (fixes #26) | Accepted |
+| [ADR-043](ADR-043-react-is-the-concrete-oracle.md) | React is the concrete oracle — generated programs rendered in real React, judged against the analyzer's claims (P1 no FN, P2 Error certain), shrunk, gated in CI; `docs/semantics.md` written (delivers ADR-001) | Accepted |

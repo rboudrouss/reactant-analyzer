@@ -105,6 +105,28 @@ jobs:
       # and `gen-pack-dts.js --check` (npm/test/packs.sh).
       - run: npm/test/smoke.sh
 
+  # The concrete oracle (ADR-043, docs/semantics.md): programs rendered in real
+  # React, judged against the analyzer. `cases` is the regression suite with
+  # its known violations; the fuzz sample must match oracle/fuzz-baseline.json
+  # exactly, in both directions.
+  oracle:
+    name: concrete oracle (React)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: oracle/package-lock.json
+      - run: cargo build --release --locked
+      - run: npm ci
+        working-directory: oracle
+      - run: node oracle/bin/oracle.mjs cases
+      - run: node oracle/bin/oracle.mjs fuzz --seed 1 --count 1000 --baseline oracle/fuzz-baseline.json
+
   # action.yml is a composite action consumed by other repos: nothing else in
   # the test suite parses it or its runner script.
   action:
