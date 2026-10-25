@@ -1,5 +1,4 @@
 // oracle: react=loop
-// oracle: known=fn #172
 // L5: the loop runs through a memo; the slot reaches ⊤ by join, not by widening.
 import { useEffect, useMemo, useState } from "react";
 

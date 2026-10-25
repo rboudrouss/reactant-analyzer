@@ -1,5 +1,4 @@
 // oracle: react=loop
-// oracle: known=fn #169
 // L2: the same write in a ternary arm.
 import { useEffect, useState } from "react";
 

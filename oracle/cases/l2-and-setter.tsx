@@ -1,5 +1,4 @@
 // oracle: react=loop
-// oracle: known=fn #169
 // L2: a setter call in `&&` position lowers to a `Let`/`Assign` right-hand side.
 import { useEffect, useState } from "react";
 
