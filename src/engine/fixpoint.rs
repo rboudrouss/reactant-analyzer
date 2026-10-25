@@ -2,8 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     domains::{
-        AbstractDomain, AnalysisCtx, AnalyzeChildFn, FixpointCtx, Heap, InterCtx, NullCtx,
-        Transfer,
+        AbstractDomain, AnalysisCtx, AnalyzeChildFn, FixpointCtx, Heap, InterCtx, Transfer,
         impls::{Stability, StateValue},
         stores::{AbstractEnv, MemoStore, StateStore},
     },
@@ -163,9 +162,9 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     // program point, so it is the only binding that may be seeded there.
     let module_env = {
         let mut seed_state = StateStore::bottom();
-        let mut seed_memo: MemoStore<StateValue> = MemoStore::new();
+        let seed_memo: MemoStore<StateValue> = MemoStore::new();
         let mut seed_heap = crate::domains::Heap::new();
-        let mut ac = AnalysisCtx::null(comp_id, &mut seed_state, &mut seed_memo, &mut seed_heap);
+        let mut ac = AnalysisCtx::null(comp_id, &mut seed_state, &seed_memo, &mut seed_heap);
         let empty_env = AbstractEnv::bottom();
         let mut env = AbstractEnv::bottom();
         for (name, init) in module_consts.iter() {
@@ -240,9 +239,9 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     let custom_arg_returns: HashMap<(HookLabel, usize), StateValue> = {
         let mut out = HashMap::new();
         let mut seed_state = StateStore::bottom();
-        let mut seed_memo: MemoStore<StateValue> = MemoStore::new();
+        let seed_memo: MemoStore<StateValue> = MemoStore::new();
         let mut seed_heap = crate::domains::Heap::new();
-        let mut ac = AnalysisCtx::null(comp_id, &mut seed_state, &mut seed_memo, &mut seed_heap);
+        let mut ac = AnalysisCtx::null(comp_id, &mut seed_state, &seed_memo, &mut seed_heap);
         for hook in &hooks {
             let HookEntry::Custom { label, args, .. } = hook else {
                 continue;
@@ -328,12 +327,11 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 heap: &mut Heap,
                 children: bool| {
         let mut out = state.clone();
-        let mut memo = memo.clone();
         let envs = {
             let mut ac = AnalysisCtx {
                 component: comp_id,
                 state: &mut out,
-                memo: &mut memo,
+                memo,
                 heap,
                 query: &query,
                 inter: inter.filter(|_| children),
@@ -367,19 +365,12 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     {
         let init_env = initial_env.clone();
         let init_memo = MemoStore::new();
-        let init_untyped = StateStore::bottom();
         for hook in &hooks {
             if let HookEntry::State { label, init, .. } = hook {
                 let init_val = {
-                    let mut init_untyped_mut = init_untyped.clone();
-                    let mut init_memo_mut = init_memo.clone();
+                    let mut init_state = StateStore::bottom();
                     let mut heap = crate::domains::Heap::new();
-                    let mut ac = AnalysisCtx::null(
-                        comp_id,
-                        &mut init_untyped_mut,
-                        &mut init_memo_mut,
-                        &mut heap,
-                    );
+                    let mut ac = AnalysisCtx::null(comp_id, &mut init_state, &init_memo, &mut heap);
                     // A null/undefined init needs no TS-hint override: the product
                     // value joins the null slot with whatever the setters write,
                     // and the num slot widens independently.
@@ -425,13 +416,12 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         // fixpoint converges any memo-to-memo dependency across iterations.
         env_exit = exit_env(&render_cfg, &block_states);
         let memo_updates: Vec<(HookLabel, StateValue)> = {
-            let null_query = NullCtx;
             let mut memo_ctx = AnalysisCtx {
                 component: comp_id,
                 state: &mut state_store,
-                memo: &mut memo_store,
+                memo: &memo_store,
                 heap: &mut heap,
-                query: &null_query,
+                query: &query,
                 inter,
                 widening,
             };

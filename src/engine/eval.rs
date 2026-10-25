@@ -20,8 +20,9 @@ use crate::{
 /// through a null [`AnalysisCtx`]. The shared core of every post-fixpoint value
 /// probe.
 ///
-/// The state and memo stores are cloned internally and the heap is borrowed
-/// mutably (callers pass a throwaway), so the caller's fixpoint result is never
+/// The state store is cloned internally (an evaluation may write a slot), the
+/// memo store is only read, and the heap is borrowed mutably (callers pass a
+/// throwaway), so the caller's fixpoint result is never
 /// disturbed. Each call site passes its OWN store bundle — the component's
 /// converged stores (`comp.state_store` + a seeded `comp.heap.clone()`), or an
 /// empty bundle (`StateStore::bottom()` + `Heap::new()`, for a mount-time init
@@ -37,11 +38,10 @@ pub fn eval_in_stores(
     heap: &mut Heap,
 ) -> StateValue {
     let mut s = state.clone();
-    let mut m = memo.clone();
     StateValueTransfer.eval_expr(
         expr,
         env,
-        &mut AnalysisCtx::null(component, &mut s, &mut m, heap),
+        &mut AnalysisCtx::null(component, &mut s, memo, heap),
     )
 }
 

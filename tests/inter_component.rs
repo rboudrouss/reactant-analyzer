@@ -409,8 +409,8 @@ fn field_access_resolves_abstract_object_in_heap() {
     env.extend_loc("props".to_string(), ExprId(1));
 
     let mut state = StateStore::bottom();
-    let mut memo = MemoStore::new();
-    let mut ctx = AnalysisCtx::null(own, &mut state, &mut memo, &mut heap);
+    let memo = MemoStore::new();
+    let mut ctx = AnalysisCtx::null(own, &mut state, &memo, &mut heap);
 
     let expr = Expr::FieldAccess {
         obj: Box::new(Expr::Var("props".to_string())),
@@ -443,11 +443,11 @@ fn field_access_unknown_field_returns_top() {
     env.extend_loc("props".to_string(), ExprId(1));
 
     let mut state = StateStore::bottom();
-    let mut memo = MemoStore::new();
+    let memo = MemoStore::new();
     let mut ctx = AnalysisCtx::null(
         reactant::ir::ComponentId::SYNTHETIC,
         &mut state,
-        &mut memo,
+        &memo,
         &mut heap,
     );
 

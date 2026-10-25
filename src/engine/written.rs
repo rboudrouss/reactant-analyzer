@@ -273,9 +273,8 @@ impl SiteEnvs<'_> {
         expr: &Expr,
     ) -> StateValue {
         let mut state = self.state.clone();
-        let mut memo = self.memo.clone();
         let mut heap = self.heap.clone();
-        let mut ac = AnalysisCtx::null(self.component, &mut state, &mut memo, &mut heap);
+        let mut ac = AnalysisCtx::null(self.component, &mut state, self.memo, &mut heap);
         let env = self.env_at(region, cfg, at, &mut ac);
         StateValueTransfer.eval_expr(expr, &env, &mut ac)
     }

@@ -61,11 +61,10 @@ mod tests {
         thresholds: &[f64],
     ) -> (BlockEnvs<StateValue>, StateStore<StateValue>) {
         let mut state = state.clone();
-        let mut memo = MemoStore::new();
+        let memo = MemoStore::new();
         let mut heap = Heap::new();
         let envs = {
-            let mut ctx =
-                AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap);
+            let mut ctx = AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap);
             ctx.widening = Widening {
                 after: 3,
                 thresholds,

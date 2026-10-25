@@ -127,7 +127,9 @@ pub struct AnalysisCtx<'a, D: AbstractDomain> {
     /// [`ComponentId::SYNTHETIC`].
     pub component: ComponentId,
     pub state: &'a mut StateStore<D>,
-    pub memo: &'a mut MemoStore<D>,
+    /// Read-only: a pass reads memo values, and only the fixpoint, between
+    /// passes, recomputes them.
+    pub memo: &'a MemoStore<D>,
     pub heap: &'a mut Heap,
     pub query: &'a dyn QueryContext,
     /// Optional inter-component context. `None` = intra-component analysis only.
@@ -160,7 +162,7 @@ impl<'a, D: AbstractDomain> AnalysisCtx<'a, D> {
     pub fn null(
         component: ComponentId,
         state: &'a mut StateStore<D>,
-        memo: &'a mut MemoStore<D>,
+        memo: &'a MemoStore<D>,
         heap: &'a mut Heap,
     ) -> Self {
         static NULL: NullCtx = NullCtx;
