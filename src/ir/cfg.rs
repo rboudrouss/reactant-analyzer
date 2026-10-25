@@ -9,6 +9,21 @@ pub struct BasicBlock {
     pub term: Terminator,
 }
 
+impl BasicBlock {
+    /// Apply `f` to every top-level expression of the block: each
+    /// statement's operands ([`Stmt::for_each_expr`]), then the `Return` or
+    /// `Branch` terminator's expression.
+    pub fn for_each_expr<'a>(&'a self, f: &mut impl FnMut(&'a Expr)) {
+        for stmt in &self.stmts {
+            stmt.for_each_expr(f);
+        }
+        match &self.term {
+            Terminator::Return(e) | Terminator::Branch { cond: e, .. } => f(e),
+            Terminator::Jump(_) | Terminator::Unreachable => {}
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Terminator {
     Jump(BlockId),
@@ -88,18 +103,7 @@ impl CFG {
     ) {
         for block in self.blocks.values() {
             for stmt in block.stmts.iter().filter(|s| keep(s)) {
-                match stmt {
-                    crate::ir::stmt::Stmt::Let { rhs, .. }
-                    | crate::ir::stmt::Stmt::Assign { rhs, .. } => f(rhs),
-                    crate::ir::stmt::Stmt::MemberWrite { obj, key, rhs, .. } => {
-                        f(obj);
-                        if let crate::ir::stmt::MemberKey::Index(idx) = key {
-                            f(idx);
-                        }
-                        f(rhs);
-                    }
-                    crate::ir::stmt::Stmt::ExprStmt(e, _) => f(e),
-                }
+                stmt.for_each_expr(f);
             }
             match &block.term {
                 Terminator::Return(e) | Terminator::Branch { cond: e, .. } => f(e),

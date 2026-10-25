@@ -439,7 +439,6 @@ pub(crate) fn cross_component_setters(
         .collect()
 }
 
-/// Scan all Let stmts in `cfg` for `let X = FnLit{...}` and return X → body_cfg.
 /// The subset of `bindings` whose name is bound exactly once, to a function
 /// literal, and never re-bound *anywhere below* — including inside nested
 /// closures, which `fn_binding_in` alone does not scan.
@@ -455,6 +454,7 @@ fn certified_fn_names(cfg: &CFG, bindings: &HashMap<Var, Arc<CFG>>) -> HashSet<V
         .collect()
 }
 
+/// Scan all Let stmts in `cfg` for `let X = FnLit{...}` and return X → body_cfg.
 pub(crate) fn collect_fn_bindings(cfg: &CFG) -> HashMap<Var, Arc<CFG>> {
     let mut map: HashMap<Var, Arc<CFG>> = HashMap::new();
     for block in cfg.blocks.values() {
@@ -487,28 +487,14 @@ pub(crate) fn collect_binders(cfg: &CFG, out: &mut HashSet<Var>) {
         }
         e.for_each_child(&mut |c| exprs(c, out));
     }
-    for block in cfg.blocks.values() {
-        for stmt in &block.stmts {
-            match stmt {
-                Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. } => {
-                    out.insert(var.clone());
-                    exprs(rhs, out);
-                }
-                Stmt::MemberWrite { obj, rhs, .. } => {
-                    exprs(obj, out);
-                    exprs(rhs, out);
-                }
-                Stmt::ExprStmt(e, _) => exprs(e, out),
-            }
-        }
-        match &block.term {
-            Terminator::Return(e) | Terminator::Branch { cond: e, .. } => exprs(e, out),
-            _ => {}
+    for stmt in cfg.blocks.values().flat_map(|b| &b.stmts) {
+        if let Stmt::Let { var, .. } | Stmt::Assign { var, .. } = stmt {
+            out.insert(var.clone());
         }
     }
+    cfg.for_each_expr(&mut |e| exprs(e, out));
 }
 
-/// Extend a `setter var → state label` map with alias `let a = b` bindings in
 /// `var → state label` for every `let var = useState(...)[1]` (the setter) in
 /// `cfg`. The render body's authoritative setter-name → label map; pass it as
 /// the `base` of [`resolve_setter_aliases`].
@@ -572,6 +558,7 @@ fn state_binding_labels(
     map
 }
 
+/// Extend a `setter var → state label` map with alias `let a = b` bindings in
 /// `cfg` (b a known setter ⇒ a is too). Iterates to a fixpoint so chains
 /// `let s1 = setX; let s2 = s1` all resolve.
 ///
@@ -625,10 +612,14 @@ pub(crate) fn resolve_setter_aliases(
 /// negative). The shared recipe of `derived-state`, `state-mutation`,
 /// `stale-closure` and `frozen-initial-state`.
 pub(crate) fn all_setter_labels(comp: &AnalysisResult<StateValue>) -> HashMap<Var, HookLabel> {
-    let mut labels = setter_var_labels(&comp.render_cfg);
-    for cfg in
-        std::iter::once(&comp.render_cfg).chain(comp.hooks.iter().filter_map(|h| h.body_cfg()))
-    {
+    setter_labels_of(&comp.render_cfg, &comp.hooks)
+}
+
+/// [`all_setter_labels`] over a render body and its hook table, before they
+/// are an [`AnalysisResult`] — what the fixpoint reads to store its relations.
+pub(crate) fn setter_labels_of(render_cfg: &CFG, hooks: &[HookEntry]) -> HashMap<Var, HookLabel> {
+    let mut labels = setter_var_labels(render_cfg);
+    for cfg in std::iter::once(render_cfg).chain(hooks.iter().filter_map(|h| h.body_cfg())) {
         labels = resolve_setter_aliases(cfg, &labels);
     }
     labels
@@ -2015,16 +2006,7 @@ impl<'a> SetterWalk<'a> {
 fn callee_name(fn_: &Expr) -> Option<(String, Option<String>)> {
     match fn_.peel_ts() {
         Expr::Var(n) => Some((n.to_string(), None)),
-        Expr::FieldAccess { obj, field } => Some((field.to_string(), receiver_root(obj))),
-        _ => None,
-    }
-}
-
-/// The outermost plain binding a receiver expression roots in.
-fn receiver_root(obj: &Expr) -> Option<String> {
-    match obj.peel_ts() {
-        Expr::Var(n) => Some(n.to_string()),
-        Expr::FieldAccess { obj, .. } | Expr::IndexAccess { arr: obj, .. } => receiver_root(obj),
+        Expr::FieldAccess { obj, field } => Some((field.to_string(), obj.root_var().cloned())),
         _ => None,
     }
 }
@@ -2221,29 +2203,7 @@ pub(crate) fn may_written_slots(
     setter_labels: &HashMap<Var, HookLabel>,
 ) -> HashSet<HookLabel> {
     fn scan_cfg(cfg: &CFG, used: &mut HashSet<Var>) {
-        for block in cfg.blocks.values() {
-            for stmt in &block.stmts {
-                match stmt {
-                    Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => {
-                        collect_used_vars(rhs, used)
-                    }
-                    Stmt::MemberWrite { obj, key, rhs, .. } => {
-                        collect_used_vars(obj, used);
-                        if let crate::ir::stmt::MemberKey::Index(idx) = key {
-                            collect_used_vars(idx, used);
-                        }
-                        collect_used_vars(rhs, used);
-                    }
-                    Stmt::ExprStmt(e, _) => collect_used_vars(e, used),
-                }
-            }
-            match &block.term {
-                Terminator::Return(e) | Terminator::Branch { cond: e, .. } => {
-                    collect_used_vars(e, used)
-                }
-                _ => {}
-            }
-        }
+        cfg.for_each_expr(&mut |e| collect_used_vars(e, used));
     }
     let mut used: HashSet<Var> = HashSet::new();
     scan_cfg(render_cfg, &mut used);

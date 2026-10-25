@@ -527,6 +527,17 @@ impl Expr {
         }
     }
 
+    /// The plain binding a member chain is rooted at — `x` for `x`, `x.a`,
+    /// `x[i].b`, through TS annotations — or `None` when the chain starts at
+    /// anything else (a call, a literal, a hook value).
+    pub fn root_var(&self) -> Option<&Symbol> {
+        match self.peel_ts() {
+            Expr::Var(v) => Some(v),
+            Expr::FieldAccess { obj, .. } | Expr::IndexAccess { arr: obj, .. } => obj.root_var(),
+            _ => None,
+        }
+    }
+
     /// Strip any `TSAnnotated` wrappers, returning the underlying expression.
     pub fn peel_ts(&self) -> &Expr {
         let mut e = self;

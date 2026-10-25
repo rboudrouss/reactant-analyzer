@@ -607,11 +607,7 @@ pub(crate) fn navigates(body: &CFG, render: &HashMap<&str, Vec<&Expr>>) -> bool 
     const BARE: &[&str] = &["navigate", "redirect"];
     const ELEMENTS: &[&str] = &["Navigate", "Redirect"];
     fn root(e: &Expr) -> Option<&str> {
-        match e.peel_ts() {
-            Expr::Var(v) => Some(v.as_str()),
-            Expr::FieldAccess { obj, .. } | Expr::IndexAccess { arr: obj, .. } => root(obj),
-            _ => None,
-        }
+        e.root_var().map(String::as_str)
     }
     struct Scan<'a> {
         body: HashMap<&'a str, Vec<&'a Expr>>,
@@ -792,16 +788,9 @@ pub fn let_bindings(cfg: &CFG) -> Bindings<'_> {
 /// The names a body mutates: the receivers of its member writes and of its
 /// mutating calls (the ADR-028 list), nested closures included.
 pub(crate) fn mutated_roots(body: &CFG) -> HashSet<Var> {
-    fn root(e: &Expr) -> Option<Var> {
-        match e.peel_ts() {
-            Expr::Var(v) => Some(v.clone()),
-            Expr::FieldAccess { obj, .. } | Expr::IndexAccess { arr: obj, .. } => root(obj),
-            _ => None,
-        }
-    }
     fn exprs(e: &Expr, out: &mut HashSet<Var>) {
-        if let Some(r) = mutation_receiver(e).and_then(root) {
-            out.insert(r);
+        if let Some(r) = mutation_receiver(e).and_then(Expr::root_var) {
+            out.insert(r.clone());
         }
         if let Expr::FnLit { body_cfg, .. } = e {
             out.extend(mutated_roots(body_cfg));
@@ -810,25 +799,14 @@ pub(crate) fn mutated_roots(body: &CFG) -> HashSet<Var> {
         e.for_each_child(&mut |c| exprs(c, out));
     }
     let mut out = HashSet::new();
-    for block in body.blocks.values() {
-        for stmt in &block.stmts {
-            match stmt {
-                Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => exprs(rhs, &mut out),
-                Stmt::MemberWrite { obj, rhs, .. } => {
-                    if let Some(r) = root(obj) {
-                        out.insert(r);
-                    }
-                    exprs(rhs, &mut out);
-                }
-                Stmt::ExprStmt(e, _) => exprs(e, &mut out),
-            }
-        }
-        match &block.term {
-            Terminator::Branch { cond, .. } => exprs(cond, &mut out),
-            Terminator::Return(e) => exprs(e, &mut out),
-            _ => {}
+    for stmt in body.blocks.values().flat_map(|b| &b.stmts) {
+        if let Stmt::MemberWrite { obj, .. } = stmt
+            && let Some(r) = obj.root_var()
+        {
+            out.insert(r.clone());
         }
     }
+    body.for_each_expr(&mut |e| exprs(e, &mut out));
     out
 }
 

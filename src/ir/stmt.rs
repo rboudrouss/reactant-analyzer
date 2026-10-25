@@ -42,6 +42,25 @@ impl Stmt {
             | Stmt::ExprStmt(_, span) => *span,
         }
     }
+
+    /// Apply `f` to every expression the statement evaluates: a binding's
+    /// right-hand side; a member write's object, index and value; an
+    /// expression statement's expression. The one place that knows a
+    /// statement's operands, so a walker over a body's expressions cannot
+    /// forget one (a member write's index was dropped by two of them).
+    pub fn for_each_expr<'a>(&'a self, f: &mut impl FnMut(&'a Expr)) {
+        match self {
+            Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => f(rhs),
+            Stmt::MemberWrite { obj, key, rhs, .. } => {
+                f(obj);
+                if let MemberKey::Index(idx) = key {
+                    f(idx);
+                }
+                f(rhs);
+            }
+            Stmt::ExprStmt(e, _) => f(e),
+        }
+    }
 }
 
 /// Which member of the object a [`Stmt::MemberWrite`] targets. `Index` keeps
