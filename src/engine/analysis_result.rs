@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     domains::{
-        AbstractDomain,
+        AbstractDomain, StateValue,
         stores::{AbstractEnv, Heap, MemoStore, StateStore},
     },
     ir::{
@@ -285,5 +285,22 @@ impl<D: AbstractDomain> AnalysisResult<D> {
             .cloned()
             .reduce(|acc, env| acc.join(&env))
             .unwrap_or_else(AbstractEnv::bottom)
+    }
+}
+
+impl AnalysisResult<StateValue> {
+    /// The value-divergence predicate: the render → effect cycle widened
+    /// `slot`, and what the effects write into it is not bounded either
+    /// (branch narrowing did not hold the growth; ⊥ = the write was not
+    /// seen, so nothing bounds it). Returns the provenance of the widening.
+    ///
+    /// A slot that reaches ⊤ by a plain join never widens, since ⊤ has
+    /// nowhere left to grow. That case is the churn graph's: an unbounded
+    /// write reads as `Maybe` fresh there (`written::value_freshness`), and
+    /// the guard proofs that settle it live there.
+    pub fn diverges(&self, slot: HookLabel) -> Option<&WidenEvent> {
+        let event = self.widen_trace.get(&slot)?;
+        let writes = self.effect_setter_writes.get(slot);
+        (writes.is_bottom_value() || writes.is_unbounded()).then_some(event)
     }
 }

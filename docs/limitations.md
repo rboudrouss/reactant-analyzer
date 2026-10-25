@@ -61,9 +61,10 @@ that writes it (see *Cross-file limits*).
   callback does not resolve syntactically [#24](https://github.com/rboudrouss/reactant-analyzer/issues/24), `frozen-initial-state` on primitive props
   and memo-chained seeds [#25](https://github.com/rboudrouss/reactant-analyzer/issues/25), provider detection inside an inline arrow
   [#30](https://github.com/rboudrouss/reactant-analyzer/issues/30).
-- The churn graph reads a write of a value derived from the written slot (a memo over it) as not
-  fresh, ADR-017's reading of `Versioned`; a loop carried by such a write is silent
-  [#157](https://github.com/rboudrouss/reactant-analyzer/issues/157).
+- The churn graph reads a write of a value derived from the written slot as not fresh, ADR-017's
+  reading of `Versioned`, unless the value is a memo over the slot: a field of it, or a copy that
+  comes back through another slot, is read as the slot's own content, and a loop carried by such a
+  write is silent [#157](https://github.com/rboudrouss/reactant-analyzer/issues/157).
 - The convergence proof assumes a call over held inputs returns the same value on every run, and
   that a call it cannot see into does not navigate: a router hook's result (`useSearchParams`,
   `useParams`, `usePathname`, `useLocation`) holds still across the loop unless some render,

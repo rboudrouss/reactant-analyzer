@@ -127,12 +127,8 @@ impl Rule for InfiniteLoop {
                 }
                 if let Some(&state_label) = local_setter_labels.get(&call.var) {
                     // ── Intra ─────────────────────────────────────────────────
-                    if !comp_result.widen_trace.contains_key(&state_label) {
-                        continue; // state didn't diverge → bounded
-                    }
-                    let writes = comp_result.effect_setter_writes.get(state_label);
-                    if !writes.is_bottom_value() && !writes.is_unbounded() {
-                        continue; // write bounded → narrowing held the growth
+                    if comp_result.diverges(state_label).is_none() {
+                        continue; // the cycle bounded the slot
                     }
 
                     let deps_note = if deps.is_declared() {
@@ -235,7 +231,13 @@ impl Rule for InfiniteLoop {
             check_multi_effect_cycles(graph, result, component, &reported_effects);
         diags.extend(cycle_diags);
         // Self-churn arm last: its Info branch skips writes a cycle covers.
-        diags.extend(check_object_churn(graph, result, component, &covered));
+        diags.extend(check_object_churn(
+            graph,
+            result,
+            component,
+            &covered,
+            &reported_effects,
+        ));
 
         diags
     }
@@ -398,6 +400,7 @@ fn check_object_churn(
     result: &ProgramAnalysisResult,
     component: ComponentId,
     covered: &HashSet<(HookLabel, HookLabel)>,
+    reported_effects: &HashSet<HookLabel>,
 ) -> Vec<Diagnostic> {
     let comp_result = &result.components[&component];
     let cfg = &comp_result.render_cfg;
@@ -491,6 +494,12 @@ fn check_object_churn(
         }
 
         for (state_label, (sev, call_span, proof)) in best {
+            // One report per effect, as in the cycle arm: an effect the
+            // fixpoint arm flagged keeps that report, unless this arm holds
+            // the stronger, proven verdict.
+            if reported_effects.contains(eff_label) && sev != Severity::Error {
+                continue;
+            }
             let eff_span = comp_result.effect_info.get(eff_label).and_then(|i| i.span);
             let mut diag = match (sev, proof) {
                 (Severity::Error, Some(proof)) => Diagnostic::error(

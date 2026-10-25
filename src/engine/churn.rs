@@ -2,7 +2,8 @@
 //!
 //! ```text
 //! edge x → y  ≡  "a change of x re-runs an effect that stores a fresh
-//!                 reference into y"          a cycle = self-sustaining loop
+//!                 reference, or a value it cannot bound, into y"
+//!                                            a cycle = self-sustaining loop
 //! ```
 //!
 //! Nothing is walked here. The writes are the effect-region rows of
@@ -46,8 +47,8 @@
 //! most once revives nothing indefinitely, so it is excluded from the
 //! revivers of every other site, and the set grows until nothing more can
 //! be proven. The graph then kills an edge when its write's site is in the
-//! set, or when the site converges once its write is read as the reference
-//! part of its value — a `null` run stores no fresh reference.
+//! set, or when the site converges once its write is read as the part of its
+//! value that churns (`churning_part`) — a `null` run stores no change.
 //!
 //! **Two arms, one relation** (ADR-020 item 2). A dep-driven edge whose write
 //! lands in the very slot its deps read is `self_slot`: the self-churn arm's
@@ -69,7 +70,7 @@ use crate::{
         render_deps::written_names,
         setters::{memo_val_labels, resolve_setter_aliases, state_val_labels},
         triggers_of,
-        written::reference_part,
+        written::churning_part,
     },
     ir::{
         ComponentId, QualifiedSlot, SourceRange,
@@ -506,11 +507,11 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             let node = node_of(f.comp, w);
             // Convergence proof: once a written value sits in the slot, do the
             // dominating guards kill this write — under its own write and
-            // under every other site's? Edges claim reference churn, so the
-            // own write is read as the reference part of its value
-            // (references are truthy and non-nullish); another site's write
-            // revives with whatever it stores, `null` included.
-            let own_value = reference_part(&w.written.value);
+            // under every other site's? Edges claim churn, so the own write is
+            // read as the part of its value that churns: its reference
+            // (truthy and non-nullish) and its unbounded primitives; another
+            // site's write revives with whatever it stores, `null` included.
+            let own_value = churning_part(&w.written.value);
             let k = idxs
                 .iter()
                 .position(|&j| std::ptr::eq(all_sites[j].row, *w))
