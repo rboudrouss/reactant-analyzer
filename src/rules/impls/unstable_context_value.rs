@@ -18,7 +18,7 @@ use crate::rules::{Diagnostic, Rule, RuleCtx};
 ///
 /// Two bounds:
 ///
-/// - **A proven context only.** `<X.Provider>` is a provider of *this* rule's
+/// - **A proven context only.** `<X.Provider>` (or `<X>`, React 19) is a provider of *this* rule's
 ///   kind only when `X` is a module-level `createContext(…)` reached through a
 ///   React import. An imported context is not proven here and is skipped —
 ///   precision lost, never soundness.
@@ -52,11 +52,11 @@ impl Rule for UnstableContextValue {
             .into_iter()
             .filter(|site| site.identity == ValueIdentity::FreshEveryRender)
             .map(|site| {
-                let context = site.context;
+                let (context, element) = (site.context, site.element);
                 let mut d = Diagnostic::warn(
                     Self::NAME,
                     format!(
-                        "`{context}.Provider` is given a newly allocated value on every render. \
+                        "`{element}` is given a newly allocated value on every render. \
                          `Object.is` fails for every consumer, so each `useContext({context})` \
                          re-renders whenever this component does, even when nothing in the value \
                          changed; wrap the value in `useMemo`"

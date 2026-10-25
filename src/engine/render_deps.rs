@@ -400,6 +400,14 @@ fn join_env(a: &mut Env, b: &Env) -> bool {
     changed
 }
 
+/// The binding an element names when it provides a context: `Ctx` for
+/// `<Ctx.Provider>` and, since React 19, for `<Ctx>`. The one definition of the
+/// provider spelling, for the engine and the rules alike (#177); whether the
+/// binding is a proven context is the caller's question.
+pub fn provided_context_name(element: &str) -> &str {
+    element.strip_suffix(".Provider").unwrap_or(element)
+}
+
 /// The names outside its bodies a component writes: the roots of the writes
 /// in its render and in every hook body, nested closures included. The union
 /// over the program is what [`render_deps`] reads a free name against.
@@ -974,7 +982,7 @@ impl<'a> Analyzer<'a> {
                     spread: Deps::default(),
                     guard,
                     in_list: ctx.in_list,
-                    provides: self.context_of(name.strip_suffix(".Provider").unwrap_or(name), env),
+                    provides: self.context_of(provided_context_name(name), env),
                     parent: ctx.parent,
                 };
                 match props.peel_ts() {

@@ -1051,7 +1051,7 @@ fn anonymous(v: &EntityVal<'_, '_>) -> String {
         EntityVal::Arg(a) => format!("argument #{}", a.index),
         EntityVal::Origin(p) => format!("`{}`", p.origin_hook),
         EntityVal::Writer(w) => format!("`{}`", crate::ir::source_name(&w.setter)),
-        EntityVal::Provider(p) => format!("`{}.Provider`", crate::ir::source_name(p.context)),
+        EntityVal::Provider(p) => format!("`{}`", p.element),
         EntityVal::JsxProp(j) => format!("`{}` of `<{}>`", j.prop, j.element),
         EntityVal::Cycle(c) => format!("the loop through effect #{}", c.effect),
         EntityVal::Read(r) => format!("`{}`", crate::ir::source_name(&r.name)),
