@@ -374,11 +374,31 @@ impl StateValue {
     /// (branch narrowing held the growth) from one that truly diverges:
     /// - Infinite interval bounds → numeric counter without a binding guard
     /// - Per-render reference slot → new object/function literal every render
+    /// - String ⊤ → a string that left every finite set (`s + "x"`, #173)
     /// - Residual ⊤ → precision lost, conservatively unbounded
+    ///
+    /// Booleans, `null`, `undefined` and setters have finite concrete sets, so
+    /// their ⊤ is not growth.
     pub fn is_unbounded(&self) -> bool {
-        (!self.num.is_bottom() && (self.num.lo.is_infinite() || self.num.hi.is_infinite()))
-            || self.reference == Stability::PerRender
-            || self.other
+        self.unbounded_primitive().is_some() || self.reference == Stability::PerRender || self.other
+    }
+
+    /// The primitive kinds of this value that range over infinitely many
+    /// concrete values (an interval with an infinite bound, string ⊤), alone;
+    /// `None` when there is none. A write of such a value may differ from
+    /// the last one on every run, whatever its reference does.
+    pub fn unbounded_primitive(&self) -> Option<StateValue> {
+        let num = !self.num.is_bottom() && (self.num.lo.is_infinite() || self.num.hi.is_infinite());
+        let str = self.str == StrConst::Top;
+        (num || str).then(|| StateValue {
+            num: if num {
+                self.num
+            } else {
+                Self::bottom_value().num
+            },
+            str: if str { StrConst::Top } else { StrConst::Bottom },
+            ..Self::bottom_value()
+        })
     }
 
     /// True if the value ranges over a few primitives only: booleans,
@@ -817,6 +837,13 @@ mod tests {
             .is_unbounded()
         );
         assert!(StateValue::top().is_unbounded());
+    }
+
+    #[test]
+    fn string_top_is_unbounded_a_finite_set_is_not() {
+        assert!(StateValue::str_top().is_unbounded());
+        assert!(!StateValue::str_singleton("x".into()).is_unbounded());
+        assert!(!StateValue::boolean(BoolVal::Top).is_unbounded());
     }
 
     #[test]

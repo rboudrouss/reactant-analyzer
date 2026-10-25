@@ -1018,6 +1018,12 @@ pub(crate) fn collect_slot_writers(
             .or_insert((Some(prop.component), prop.label));
     }
     let setter_vars: HashSet<Var> = targets.keys().cloned().collect();
+    // Memo and callback bindings, aliases resolved the same way: a write of
+    // one stores a value derived from its deps (`written::classify`).
+    let mut memos = memo_val_labels(render_cfg);
+    for cfg in std::iter::once(render_cfg).chain(hooks.iter().filter_map(|h| h.body_cfg())) {
+        memos = resolve_setter_aliases(cfg, &memos);
+    }
     // Any local binding of a deferring global's name disables its summary,
     // wherever the call sits (fail-closed across every body, nested `FnLit`
     // scopes included).
@@ -1139,6 +1145,7 @@ pub(crate) fn collect_slot_writers(
                 site.arg.as_ref(),
                 &site.updater,
                 (owner.unwrap_or(envs.component), slot),
+                &memos,
                 |e| envs.eval(region, cfg, at, e),
             );
             let via = {
