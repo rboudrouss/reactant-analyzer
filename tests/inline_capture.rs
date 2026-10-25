@@ -32,7 +32,14 @@ fn reactant(args: &[&str]) -> Output {
 
 /// `(component, rule)` for the fixture.
 fn findings() -> Vec<(String, String)> {
-    let out = reactant(&["tests/fixtures/inline_capture", "--format", "json"]);
+    // The probes (`always-unstable-deps`, `missing-deps`) are off by default.
+    let out = reactant(&[
+        "tests/fixtures/inline_capture",
+        "--config",
+        "tests/fixtures/all-rules.json",
+        "--format",
+        "json",
+    ]);
     let doc: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout))
         .expect("stdout must be valid JSON");
     let mut v: Vec<(String, String)> = doc["diagnostics"]

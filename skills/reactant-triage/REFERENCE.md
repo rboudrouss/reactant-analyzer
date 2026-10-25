@@ -16,6 +16,11 @@ often or sits on a rarely-mounted leaf.
 | React throws, or hook state corrupts | `conditional-hook`, `server-component-hook` | now. It crashes at runtime |
 | The UI shows stale or wrong data | `stale-closure`, `frozen-initial-state`, `state-mutation`, `missing-deps` | soon. Wrong behaviour, nothing in the console |
 | Extra renders and wasted work | `derived-state`, `unnecessary-rerender`, `unstable-context-value`, `state-lifted-too-high`, `wasted-subtree-render`, `always-unstable-deps`, `lazy-init`, `redundant-set-state`, `missing-cleanup` | later. Measure before spending time |
+| A request, a subscription or a state write repeated on every render | `side-effect-in-init` | soon. Duplicate work the user can observe |
+
+`missing-deps`, `always-unstable-deps` and `lazy-init` are off by default. They
+only show up when the config turns them on (`"<rule>": "on"`) or `--rule` names
+them.
 | Not a defect | `analysis-limit`, `widening-info` | never a work item |
 
 `missing-cleanup` jumps to "soon" when the effect subscribes, opens a socket or

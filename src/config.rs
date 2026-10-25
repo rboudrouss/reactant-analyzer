@@ -94,7 +94,9 @@ pub enum FormatConfig {
 }
 
 /// One `rules` entry, normalized from its three JSON forms:
-/// `"off"`, `"<severity>"`, `{ "severity": …, "options": {…} }`.
+/// `"off"`, `"on"` or `"<severity>"`, `{ "severity": …, "options": {…} }`.
+/// Any entry that is not `"off"` turns on a rule that is off by default
+/// ([`crate::rules::docs::OFF_BY_DEFAULT`]).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RuleSetting {
     pub off: bool,
@@ -103,12 +105,13 @@ pub struct RuleSetting {
     pub options: serde_json::Map<String, serde_json::Value>,
 }
 
-const LEVELS: &str = r#""off", "error", "warning" or "info""#;
+const LEVELS: &str = r#""off", "on", "error", "warning" or "info""#;
 
 fn level_from_str<E: serde::de::Error>(s: &str) -> Result<RuleSetting, E> {
     let mut setting = RuleSetting::default();
     match s {
         "off" => setting.off = true,
+        "on" => {}
         "error" => setting.severity = Some(Severity::Error),
         "warning" => setting.severity = Some(Severity::Warning),
         "info" => setting.severity = Some(Severity::Info),
@@ -184,13 +187,13 @@ impl JsonSchema for RuleSetting {
 
     fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         schemars::json_schema!({
-            "description": "\"off\", a severity ceiling, or a detailed form with options",
+            "description": "\"off\", \"on\", a severity ceiling, or a detailed form with options",
             "oneOf": [
-                { "type": "string", "enum": ["off", "error", "warning", "info"] },
+                { "type": "string", "enum": ["off", "on", "error", "warning", "info"] },
                 {
                     "type": "object",
                     "properties": {
-                        "severity": { "type": "string", "enum": ["off", "error", "warning", "info"] },
+                        "severity": { "type": "string", "enum": ["off", "on", "error", "warning", "info"] },
                         "options": { "type": "object" }
                     },
                     "additionalProperties": false
@@ -270,13 +273,19 @@ impl CheckArgsPartial {
 
 /// Resolve the config `rules` map and the CLI filters into one override set
 /// (ADR-022 §5): `--ignore-rule` always denies; an explicit `--rule X`
-/// resurrects a config-`"off"` X; severity pins come from config only.
+/// resurrects a config-`"off"` X; severity pins come from config only. A rule
+/// off by default stays off unless the config names it with anything but
+/// `"off"`, or `--rule` names it.
 pub fn resolve_overrides(
     cfg: &ReactantConfig,
     rule: &[String],
     ignore_rule: &[String],
 ) -> crate::rules::RuleOverrides {
     let mut overrides = crate::rules::RuleOverrides::default();
+    for &name in crate::rules::docs::OFF_BY_DEFAULT {
+        overrides.entries.entry(name.to_string()).or_default().off =
+            !rule.iter().any(|r| r == name);
+    }
     for (name, setting) in &cfg.rules {
         let entry = overrides.entries.entry(name.clone()).or_default();
         entry.off = setting.off && !rule.contains(name);

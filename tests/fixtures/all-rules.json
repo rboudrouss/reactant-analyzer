@@ -1,0 +1,9 @@
+{
+  // Every rule shown, the off-by-default ones included: for the tests that use
+  // them as probes of the engine, and for the corpus measurement.
+  "rules": {
+    "always-unstable-deps": "on",
+    "lazy-init": "on",
+    "missing-deps": "on"
+  }
+}

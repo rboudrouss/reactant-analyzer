@@ -115,7 +115,7 @@ Worker. Types ship with the package.
 
 ## What it catches
 
-Nineteen rules, sorted by what you see in the browser:
+Seventeen rules, sorted by what you see in the browser, and three off by default:
 
 | What you see | Rules |
 |---|---|
@@ -123,9 +123,10 @@ Nineteen rules, sorted by what you see in the browser:
 | Re-renders nobody asked for | `state-lifted-too-high`, `wasted-subtree-render`, `unstable-context-value` |
 | State that should not be state | `derived-state`, `unnecessary-rerender`, `redundant-set-state` |
 | Values frozen in time | `stale-closure`, `frozen-initial-state` |
-| Identity and mutation | `state-mutation`, `lazy-init` |
+| Identity and mutation | `state-mutation`, `side-effect-in-init` |
 | Lifecycle and environment | `missing-cleanup`, `server-component-hook` |
-| Also covered by ESLint, followed further | `missing-deps`, `always-unstable-deps`, `conditional-hook`, which fire through helpers and cross-file custom hooks too |
+| Also covered by ESLint, followed further | `conditional-hook`, which fires through helpers and cross-file custom hooks too |
+| Off by default | `missing-deps`, `always-unstable-deps`, `lazy-init`: a cause whose cost the run cannot see, mostly reported by ESLint already. Turn one on with `"<rule>": "on"` in the config `rules`, or `--rule <rule>` |
 
 `reactant rules` lists them, plus two informational entries (`analysis-limit`,
 `widening-info`) the run uses to say where it could not look. Run

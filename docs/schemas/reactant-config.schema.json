@@ -135,12 +135,13 @@
       ]
     },
     "RuleSetting": {
-      "description": "\"off\", a severity ceiling, or a detailed form with options",
+      "description": "\"off\", \"on\", a severity ceiling, or a detailed form with options",
       "oneOf": [
         {
           "type": "string",
           "enum": [
             "off",
+            "on",
             "error",
             "warning",
             "info"
@@ -156,6 +157,7 @@
               "type": "string",
               "enum": [
                 "off",
+                "on",
                 "error",
                 "warning",
                 "info"

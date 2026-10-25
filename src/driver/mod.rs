@@ -621,22 +621,29 @@ pub fn run_help(color: bool) -> String {
     out
 }
 
-/// The `rules` listing: every diagnostic name with its summary.
+/// The `rules` listing: every diagnostic name with its summary, the ones off
+/// by default marked.
 pub fn run_rules_list(registry: &RuleRegistry, color: bool) -> String {
     let p = Palette::pick(color);
     let mut out = String::new();
     let width = registry.docs().map(|d| d.name.len()).max().unwrap_or(0);
     for doc in registry.docs() {
+        let off = if crate::rules::docs::OFF_BY_DEFAULT.contains(&doc.name.as_ref()) {
+            format!("  {}(off by default){}", p.dim, p.reset)
+        } else {
+            String::new()
+        };
         let _ = writeln!(
             out,
-            "  {}{:width$}{}  {}",
+            "  {}{:width$}{}  {}{off}",
             p.bold, doc.name, p.reset, doc.summary
         );
     }
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "Run `reactant explain <rule>` for details, example, and fix."
+        "Run `reactant explain <rule>` for details, example, and fix. A rule off by \
+         default runs when the config names it (`\"<rule>\": \"on\"`) or `--rule <rule>` does."
     );
     out
 }
@@ -649,6 +656,14 @@ pub fn run_explain(registry: &RuleRegistry, rule: &str, color: bool) -> CheckOut
             let mut out = String::new();
             let _ = writeln!(out, "{}{}{}", p.bold, doc.name, p.reset);
             let _ = writeln!(out, "  {}", doc.summary);
+            if crate::rules::docs::OFF_BY_DEFAULT.contains(&doc.name.as_ref()) {
+                let _ = writeln!(
+                    out,
+                    "  Off by default: turn it on with `\"{}\": \"on\"` in the config `rules`, \
+                     or `--rule {}`.",
+                    doc.name, doc.name
+                );
+            }
             let _ = writeln!(out);
             let _ = writeln!(out, "{}", doc.explanation);
             let _ = writeln!(out);

@@ -120,10 +120,11 @@ only what was read. A file it was pointed at and could not read, or an import
 that resolved to a file it did not read, is listed here rather than counted as
 clean.
 
-## Nineteen rules, sorted by what you see in the browser
+## Seventeen rules, sorted by what you see in the browser
 
 The left column is what you saw in the browser. The right is the rule that
-names it. `reactant rules` lists them, plus two informational entries
+names it. Three more are off by default (see the end of the list).
+`reactant rules` lists them all, plus two informational entries
 (`analysis-limit`, `widening-info`) the run uses to say where it could not
 look. `reactant explain <rule>` gives an example and a fix for one.
 
@@ -164,7 +165,7 @@ look. `reactant explain <rule>` gives an example and a fix for one.
 | What you see | Rule |
 |---|---|
 | You pushed to the array and nothing re-rendered. | `state-mutation`: a state or prop object is mutated in place, so the reference never changes and React skips the re-render |
-| The expensive setup runs on every render instead of once. | `lazy-init`: a `useState` initializer calls a function on every render |
+| The request or the subscription in a `useState(…)` argument fires again on every render. | `side-effect-in-init`: a `useState`/`useRef` initializer writes state or has a side effect |
 
 **Lifecycle and environment**
 
@@ -177,9 +178,22 @@ look. `reactant explain <rule>` gives an example and a fix for one.
 
 | What you see | Rule |
 |---|---|
-| The deps array misses a value, but the read is inside a helper or a custom hook in another file. | `missing-deps`: `exhaustive-deps`, followed through helpers and other files |
-| A dep is a fresh object or function every render, so the effect re-runs every time. | `always-unstable-deps`: partly covered by `exhaustive-deps` |
 | A hook call that is conditional once you follow the value, not the syntax. | `conditional-hook`: `rules-of-hooks`, followed when the condition is on a value, not only when the `if` is around the call |
+
+**Off by default**
+
+These three name a cause whose cost the run cannot see, and ESLint's
+`exhaustive-deps` already reports most of it. The consequences that matter keep
+their own rules above: a stale value is `stale-closure`, a loop is
+`infinite-loop`, a broken memo that reaches a child or a provider is
+`unnecessary-rerender` or `unstable-context-value`. Turn one on with
+`"<rule>": "on"` in the config `rules`, or `--rule <rule>`.
+
+| Rule | What it says |
+|---|---|
+| `missing-deps` | `exhaustive-deps`, followed through helpers and other files |
+| `always-unstable-deps` | a dep is a fresh object or function every render, so the hook re-runs every time |
+| `lazy-init` | a `useState` initializer calls a function on every render, wasted work |
 
 The two render-cascade rules take options, in `reactant.config.json` or with
 `--rule-option`: how deep a state must sit below its owner before

@@ -37,7 +37,7 @@ reactant check my-next-app/                      # auto-detects Next.js (see bel
 reactant check src/ --format json                # machine-readable output
 reactant check src/ --fail-on error              # warnings don't fail CI
 reactant check src/ --rule infinite-loop         # only this diagnostic
-reactant check src/ --ignore-rule lazy-init      # all but this one
+reactant check src/ --ignore-rule derived-state  # all but this one
 ```
 
 ### Flags
@@ -47,7 +47,7 @@ reactant check src/ --ignore-rule lazy-init      # all but this one
 | `--format human\|json` | Output format. `json` prints exactly one JSON document on stdout (schema below); all warnings/verbose go to stderr. Default `human`. |
 | `--fail-on error\|warning\|never` | Which findings make the exit code `1`. Default `warning` (errors *or* warnings fail). `Info` diagnostics never affect the exit code. |
 | `--project auto\|vite\|next\|plain` | Project-kind handling. `auto` (default) detects from marker files; `vite`/`next` force those conventions; `plain` disables detection. |
-| `--rule <name>` | Only report this diagnostic (repeatable). An unknown name exits with code 2. |
+| `--rule <name>` | Only report this diagnostic (repeatable), an off-by-default one included. An unknown name exits with code 2. |
 | `--ignore-rule <name>` | Suppress this diagnostic (repeatable). |
 | `--rule-option <rule>:<key>=<value>` | Set an option of a rule (repeatable), e.g. `--rule-option state-lifted-too-high:minDepth=2`. Beats the config's value for the same key. `reactant explain <rule>` lists what a rule accepts; an unknown key or an out-of-range value exits with code 2. |
 | `--info` | Also display `Info` diagnostics (known analysis limits: widening, recursion cutoff, unknown hooks; and patterns that look intentional: a seed-once prop name, a cheap pure initializer), plus, per shown component, the applicable checks that ran and found nothing (`verified: …`) or, where the analysis was truncated, the count withheld (`suspended: …`). See [The assurance channel](#the-assurance-channel---info). |
@@ -86,7 +86,8 @@ degrades to defaults. CLI flags beat config values.
   "rules": {
     "infinite-loop": "warning",                  // native downgrade: allowed
     "team/effect-writes-own-dep": { "severity": "error", "options": { "maxDeps": 8 } },
-    "missing-deps": "off"                        // subsumes --ignore-rule
+    "derived-state": "off",                      // subsumes --ignore-rule
+    "missing-deps": "on"                         // off by default, shown here
   },
   // check-flag equivalents (camelCase): entry, excludeDirs, followImports,
   // allRoots, failOn, project, format, info, showClean, trace
@@ -94,8 +95,16 @@ degrades to defaults. CLI flags beat config values.
 }
 ```
 
-- `rules` entries are keyed by *diagnostic name* and accept `"off"`, a
-  severity, or `{ "severity": …, "options": … }`. Severity is a ceiling
+- `rules` entries are keyed by *diagnostic name* and accept `"off"`, `"on"`,
+  a severity, or `{ "severity": …, "options": … }`. Three diagnostics are
+  **off by default**: `missing-deps`, `always-unstable-deps` and `lazy-init`.
+  Each names a cause whose cost the run cannot see, which ESLint's
+  `exhaustive-deps` mostly reports already; the consequences keep rules that
+  are on (`stale-closure`, `infinite-loop`, `unnecessary-rerender`,
+  `unstable-context-value`, `side-effect-in-init`). Any entry other than
+  `"off"` turns one on, and so does `--rule <name>`; `"on"` does so without
+  pinning a severity. With one off, `--info` prints no `verified:` line for
+  it either. Severity is a ceiling
   (`pin ⊓ polarity`, ADR-022 §3): downgrades are always honored, but a
   Warning-polarity finding can never be promoted to Error. The clamp is
   structural, since an Error is only constructible from an engine-certified
@@ -478,7 +487,7 @@ schemars output the validator compiles from.
   Page  (2 hooks)  src/users/page.tsx         ← with diagnostics
     warn   infinite-loop  [hook:1]  (line 7:2)  this effect keeps pushing ...
        → handler `onClick` also calls setter ... [hook:3] (line 12:4)
-    warn   missing-deps  [hook:4]  (src/hooks/useData.ts:9:2)  ...
+    warn   stale-closure  [hook:4]  (src/hooks/useData.ts:9:2)  ...
 ```
 
 `(line L:C)` is a position in the file named on the component header;
@@ -567,7 +576,7 @@ Three properties of that line are deliberate:
 Note that ⊤ still does its normal work on the diagnostic side: an opaque hook's
 return value is unknown, so a rule reading it reports what it must. In the
 example above, an undeclared read of `useThing()`'s result still raises
-`missing-deps` with "its value may change between renders". Withholding an
+`missing-deps` (when it is on) with "its value may change between renders". Withholding an
 assurance is not the same as withholding an alert, and reactant does only the
 former.
 

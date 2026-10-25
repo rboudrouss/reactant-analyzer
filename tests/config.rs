@@ -84,6 +84,38 @@ fn config_upgrade_is_a_no_op() {
     );
 }
 
+// ── off by default ────────────────────────────────────────────────────────────
+
+#[test]
+fn an_off_by_default_rule_is_hidden_when_the_config_does_not_name_it() {
+    let out = check_json("tests/fixtures/config_project/failon.json", &[]);
+    let diags = json_diags(&out);
+    assert!(!diags.iter().any(|(r, _)| r == "missing-deps"), "{diags:?}");
+    assert!(diags.iter().any(|(r, _)| r == "setter-in-render"));
+}
+
+#[test]
+fn on_shows_an_off_by_default_rule_at_its_own_severity() {
+    let out = check_json("tests/fixtures/config_project/on.json", &[]);
+    let diags = json_diags(&out);
+    assert!(
+        diags.contains(&("missing-deps".into(), "warning".into())),
+        "{diags:?}"
+    );
+    // "on" pins nothing: the Error keeps its severity.
+    assert!(diags.contains(&("setter-in-render".into(), "error".into())));
+}
+
+#[test]
+fn rule_flag_shows_an_off_by_default_rule() {
+    let out = check_json(
+        "tests/fixtures/config_project/failon.json",
+        &["--rule", "missing-deps"],
+    );
+    let diags = json_diags(&out);
+    assert!(diags.iter().any(|(r, _)| r == "missing-deps"), "{diags:?}");
+}
+
 // ── off / resurrection / --ignore-rule composition ────────────────────────────
 
 #[test]

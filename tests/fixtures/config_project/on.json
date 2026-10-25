@@ -1,0 +1,4 @@
+{
+  // `missing-deps` is off by default; "on" shows it without pinning a severity.
+  "rules": { "missing-deps": "on" }
+}

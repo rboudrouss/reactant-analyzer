@@ -80,7 +80,7 @@ Never end a triage on a list of findings. End on four groups.
 3. False positives. The suppression to write, and the reason for it.
    ```jsonc
    // reactant.config.json
-   { "rules": { "missing-deps": "off" } }   // or a per-run --ignore-rule
+   { "rules": { "derived-state": "off" } }   // or a per-run --ignore-rule
    ```
    Severity only goes down. A warning can never be pinned to error.
 4. New false positives. Report upstream with the minimal repro.

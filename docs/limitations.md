@@ -40,8 +40,9 @@ These drop or falsify information the analysis then relies on.
 | Shape in your code | Effect | Issue |
 |---|---|---|
 | A hook reached only through a `return` | Reported, but with no line or column, since `Terminator::Return` carries no span | [#140](https://github.com/rboudrouss/reactant-analyzer/issues/140) |
+| A setter called in a hook argument, `useState(setA(1))` | `side-effect-in-init` reports it, but `setter-in-render` does not, and `--info` prints `verified  setter-in-render` | [#193](https://github.com/rboudrouss/reactant-analyzer/issues/193) |
 
-It costs a position, never a finding.
+The first costs a position, never a finding; the second a false assurance, never a finding.
 
 **How to tell in general.** A run that read everything it was pointed at ends
 with `✓ … no issues found.`. A run that did not never prints that line, and lists
@@ -239,6 +240,17 @@ carries an Error.
   [#31](https://github.com/rboudrouss/reactant-analyzer/issues/31). This affects `--info` output only, never a diagnostic and never the exit code.
 
 ## Reading the output
+
+**Three rules are off by default**: `missing-deps`, `always-unstable-deps` and
+`lazy-init`. They still run, and the corpus measures them, but a default run
+does not show them: each names a cause whose cost the run cannot see, mostly
+reported by ESLint already. A clean run therefore says nothing about them.
+Measured on the corpus at 7143def, 49 of the 381 `always-unstable-deps`
+locations sit in a component where a consequence rule also fires; the other 332,
+55 of them effects that re-run on every render, are visible only with the rule
+on. A setter or a side effect in a `useState`/`useRef` argument is not hidden:
+it is `side-effect-in-init`, on by default (and see #193 under *Confirmed
+defects*).
 
 **A finding inside a shared hook is produced once per consuming component, and
 reported once.** The rows are honest: each carries its own `component` and points

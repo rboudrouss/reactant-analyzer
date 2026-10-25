@@ -117,6 +117,11 @@ impl Run {
 fn run(paths: &[&Path], extra: &[&str]) -> Run {
     let out = Command::new(env!("CARGO_BIN_EXE_reactant"))
         .args(["--format", "json", "--fail-on", "never"])
+        // `always-unstable-deps` is the probe, and it is off by default.
+        .args([
+            "--config",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/all-rules.json"),
+        ])
         .args(extra)
         .args(paths)
         .env("NO_COLOR", "1")

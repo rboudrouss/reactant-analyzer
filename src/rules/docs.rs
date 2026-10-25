@@ -8,6 +8,14 @@
 
 use std::borrow::Cow;
 
+/// Diagnostic names that run but are not shown unless asked for (`"on"` or a
+/// severity in the config `rules` map, or `--rule <name>`). Each names a
+/// cause whose cost the run cannot see, and which `eslint-plugin-react-hooks`
+/// already reports in every React project; the consequences that matter keep
+/// their own rules (`stale-closure`, `infinite-loop`, `unnecessary-rerender`,
+/// `unstable-context-value`, `setter-in-render`).
+pub const OFF_BY_DEFAULT: &[&str] = &["always-unstable-deps", "lazy-init", "missing-deps"];
+
 /// Documentation entry for one diagnostic name.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuleDoc {
@@ -181,11 +189,11 @@ pub const RULE_DOCS: &[RuleDoc] = &[
         "useState initializer calls a function on every render",
         "`useState(f())` evaluates `f()` on every render but uses the result \
                       only on mount, so every later render wastes the work. The lazy form \
-                      `useState(() => f())` runs it once. Severity is graded by what the call \
-                      does: a state-setter call is an Error (state write every render); a \
-                      side-effecting/async call (`fetch`, `subscribe`, `setTimeout`) is a \
-                      Warning (the effect re-fires, not just wasted CPU); a proven-cheap pure \
-                      builtin (`Math.*`, `Date.now`) is Info (advisory).",
+                      `useState(() => f())` runs it once. Off by default: the cost is \
+                      usually small and the run cannot weigh it. A proven-cheap pure builtin \
+                      (`Math.*`, `Date.now`) is Info (advisory). An init call that writes \
+                      state or has a side effect is not only wasted work, and is reported \
+                      as `side-effect-in-init`, which stays on.",
         "const [data, setData] = useState(expensiveParse(blob));",
         "const [data, setData] = useState(() => expensiveParse(blob));",
     ),
@@ -258,6 +266,19 @@ pub const RULE_DOCS: &[RuleDoc] = &[
         "function C() { const [n, setN] = useState(0); setN(1); return <div/>; }",
         "Move the call into a `useEffect` or an event handler. To derive a value, \
               compute it during render without state.",
+    ),
+    doc(
+        "side-effect-in-init",
+        "useState/useRef initializer writes state or has a side effect, on every render",
+        "React evaluates the argument of `useState(…)` and `useRef(…)` on every \
+                      render and keeps only the first result. When that argument calls a \
+                      state setter, every render runs a state write (Error when the setter is \
+                      certain); when it calls `fetch`, `subscribe`, `setTimeout` or another \
+                      side-effecting function, every render repeats the effect: duplicate \
+                      requests, subscriptions, timers.",
+        "const [data] = useState(fetch(url));",
+        "Wrap the init as `useState(() => …)` for a value computed once; move a \
+              request, a subscription or a state write into an effect.",
     ),
     doc(
         "stale-closure",
@@ -403,6 +424,17 @@ mod tests {
         // Diagnostic names emitted under a different name than Rule::name().
         assert!(rule_doc("cross-component-infinite-loop").is_some());
         assert!(rule_doc("cross-setter-in-render").is_some());
+        assert!(rule_doc("side-effect-in-init").is_some());
+    }
+
+    #[test]
+    fn off_by_default_names_are_documented() {
+        for name in OFF_BY_DEFAULT {
+            assert!(
+                rule_doc(name).is_some(),
+                "`{name}` is off by default but has no doc"
+            );
+        }
     }
 
     #[test]

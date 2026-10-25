@@ -24,10 +24,11 @@ use crate::rules::{
 ///    ```
 /// 2. **Effect classification of the call** (see `InitEffect`), which grades
 ///    severity instead of firing one flat warning:
-///    - a state-setter call in init runs a state write every render → `Error`;
+///    - a state-setter call in init runs a state write every render → `Error`,
+///      under `side-effect-in-init`;
 ///    - a side-effecting/async call (`fetch`, `subscribe`, `setTimeout`, …)
 ///      re-fires the *effect* every render (leaked subscriptions/requests, not
-///      just wasted CPU) → `Warning` with a distinct message;
+///      just wasted CPU) → `Warning`, under `side-effect-in-init`;
 ///    - a proven-cheap pure builtin (`Math.*`, `Date.now`, …) → `Info`
 ///      (advisory; wrapping is optional), which keeps the corpus quiet;
 ///    - anything else (unknown callee) → `Warning`, as before.
@@ -65,6 +66,10 @@ enum InitEffect {
 
 impl LazyInit {
     const NAME: &'static str = "lazy-init";
+    /// The init calls that do harm, not only waste work: a state write or a
+    /// side effect on every render. A diagnostic name of its own, so it stays
+    /// on when `lazy-init` is off by default.
+    const SIDE_EFFECT: &'static str = "side-effect-in-init";
 }
 
 impl Rule for LazyInit {
@@ -77,9 +82,11 @@ impl Rule for LazyInit {
         use crate::engine::HookKind;
         let applies = crate::rules::has_hook_kind(result, component, HookKind::State)
             || crate::rules::has_hook_kind(result, component, HookKind::Ref);
+        // No init calls anything, so no init harms either: the assurance goes
+        // under the name that is on by default.
         applies.then_some(crate::rules::SafeCheck {
-            rule: Self::NAME,
-            message: "no useState/useRef initializer re-runs work on every render",
+            rule: Self::SIDE_EFFECT,
+            message: "no useState/useRef initializer calls a function on every render",
         })
     }
 
@@ -128,7 +135,7 @@ impl Rule for LazyInit {
                      cheap, initialise lazily with `if (ref.current === null) ref.current = …`",
                 ),
                 (InitEffect::Effectful(name), true) => Diagnostic::warn(
-                    "lazy-init",
+                    Self::SIDE_EFFECT,
                     format!(
                         "this useRef init calls `{name}`, which has side effects, on every \
                          render, and only the first render's value is kept, so every later render \
@@ -141,8 +148,8 @@ impl Rule for LazyInit {
                                every render (only the first render's value is kept); move the \
                                call into an effect or event handler";
                     match must_init_calls_setter(init, &setters) {
-                        MustResult::All(proof) => Diagnostic::error("lazy-init", proof, msg),
-                        _ => Diagnostic::warn("lazy-init", msg),
+                        MustResult::All(proof) => Diagnostic::error(Self::SIDE_EFFECT, proof, msg),
+                        _ => Diagnostic::warn(Self::SIDE_EFFECT, msg),
                     }
                 }
                 (InitEffect::Setter, false) => {
@@ -150,14 +157,14 @@ impl Rule for LazyInit {
                                every render (the result is discarded after mount); move the call \
                                into an effect or event handler";
                     match must_init_calls_setter(init, &setters) {
-                        MustResult::All(proof) => Diagnostic::error("lazy-init", proof, msg),
+                        MustResult::All(proof) => Diagnostic::error(Self::SIDE_EFFECT, proof, msg),
                         // Detection matches classify's `Setter` branch, so this is
                         // unreachable; fall back to Warning (still reported — no FN).
-                        _ => Diagnostic::warn("lazy-init", msg),
+                        _ => Diagnostic::warn(Self::SIDE_EFFECT, msg),
                     }
                 }
                 (InitEffect::Effectful(name), false) => Diagnostic::warn(
-                    "lazy-init",
+                    Self::SIDE_EFFECT,
                     format!(
                         "this useState init calls `{name}`, which has side effects, on every \
                          render, and the result is only used on mount, so every later render \
@@ -508,6 +515,7 @@ mod tests {
         let diags = LazyInit.check(&RuleCtx::new(&prog(&result), crate::test_support::C));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].severity(), Severity::Warning);
+        assert_eq!(diags[0].rule, "side-effect-in-init");
         assert!(diags[0].message.contains("side effects"));
     }
 
@@ -621,6 +629,7 @@ mod tests {
             .find(|d| d.hook_label == Some(1))
             .expect("the ref init must be reported");
         assert_eq!(d.severity(), crate::rules::Severity::Error);
+        assert_eq!(d.rule, "side-effect-in-init");
     }
 
     #[test]

@@ -1,7 +1,10 @@
 # ADR-022: Custom rule frontends & distribution — declarative packs over semantic anchors, pin ⊓ polarity, WASM-only npm
 
 - **Status**: Accepted — implemented (steps 1–4 of the implementation order,
-  2026-07-26; step 5, Tier B, still pending)
+  2026-07-26; step 5, Tier B, still pending). §5 amended by
+  [ADR-044](ADR-044-a-cause-without-a-cost-is-off-by-default.md): some
+  diagnostic names are off until the config or `--rule` names them, and
+  `"on"` is a setting.
 - **Date**: 2026-07-25
 
 ## Context
