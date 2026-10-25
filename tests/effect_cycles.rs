@@ -1213,3 +1213,206 @@ export function RetSelect() {
         "a return the other side answers with its own takes `a`: {diags:?}"
     );
 }
+
+// ── #188: the batch's last write decides ─────────────────────────────────────
+
+/// The `infinite-loop` severities on `component`, Info aside.
+fn loop_severities(src: &str, component: &str) -> Vec<Severity> {
+    infinite_loop_diags(src, component)
+        .into_iter()
+        .filter(|(rule, sev, _)| rule == "infinite-loop" && *sev != Severity::Info)
+        .map(|(_, sev, _)| sev)
+        .collect()
+}
+
+#[test]
+fn a_later_write_in_the_same_effect_undoes_the_fresh_one() {
+    // The queue ends on `0`, which is the committed state: React bails out.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [s, setS] = useState<any>(0);
+  useEffect(() => { setS({ v: 0 }); setS(0); });
+  return <div />;
+}
+"#;
+    let sevs = loop_severities(src, "C");
+    assert!(
+        !sevs.contains(&Severity::Error),
+        "the last write restores the state: {sevs:?}"
+    );
+}
+
+#[test]
+fn a_write_in_another_effect_of_the_commit_undoes_the_fresh_one() {
+    // Fuzz seed 1, program 390: both effects run on mount, the second one
+    // stores the committed object back.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function App() {
+  const [s0, setS0] = useState({ v: 0 });
+  useEffect(() => { setS0((prev) => ({ ...prev, v: Math.min(prev.v + 1, 3) })); }, [s0]);
+  useEffect(() => { setS0(s0); });
+  return <div />;
+}
+"#;
+    let sevs = loop_severities(src, "App");
+    assert!(
+        !sevs.contains(&Severity::Error),
+        "another effect of the commit restores the state: {sevs:?}"
+    );
+}
+
+#[test]
+fn a_mount_only_write_undoes_a_layout_effects_fresh_one() {
+    // Fuzz seed 1, program 792: the layout effect's update is sync, so React
+    // flushes the passive `[]` effect before re-rendering, and its
+    // `setS0(s0)` joins the batch.
+    let src = r#"
+import { useState, useEffect, useLayoutEffect } from 'react';
+export function App() {
+  const [s0, setS0] = useState(() => ({ v: 0 }));
+  useEffect(() => { setS0(s0); }, []);
+  useLayoutEffect(() => { setS0({ v: 1 + 2 }); }, [s0]);
+  return <div />;
+}
+"#;
+    let sevs = loop_severities(src, "App");
+    assert!(
+        !sevs.contains(&Severity::Error),
+        "the mount batch ends on the committed state: {sevs:?}"
+    );
+}
+
+#[test]
+fn a_write_under_the_callbacks_own_guard_is_not_on_every_path() {
+    // Fuzz seed 7, program 1125: the call `cb()` is on every path, the write
+    // inside it is not.
+    let src = r#"
+import { useState, useEffect, useCallback } from 'react';
+export function App() {
+  const [s, setS] = useState({ v: 0 });
+  const [n, setN] = useState(0);
+  const cb = useCallback(() => { if (n > 5) { setS({ v: 1 }); } }, [n]);
+  useEffect(() => { cb(); }, [s]);
+  return <div>{n}</div>;
+}
+"#;
+    let sevs = loop_severities(src, "App");
+    assert!(
+        !sevs.contains(&Severity::Error),
+        "a guarded write in a called body is conditional: {sevs:?}"
+    );
+}
+
+#[test]
+fn a_child_its_parent_may_unmount_proves_no_loop() {
+    // Fuzz seed 3, program 1366: the parent's mount effect moves the guard the
+    // child is rendered under, in the batch that should re-run the child.
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Child() {
+  const [s, setS] = useState<number[]>([]);
+  useEffect(() => { setS([...s, 1]); }, [s]);
+  return <div />;
+}
+export function App() {
+  const [shown, setShown] = useState(true);
+  useEffect(() => { setShown(false); }, []);
+  return <div>{shown && <Child />}</div>;
+}
+"#;
+    let sevs = loop_severities(src, "Child");
+    assert!(
+        !sevs.contains(&Severity::Error),
+        "the child may be unmounted before it re-renders: {sevs:?}"
+    );
+}
+
+#[test]
+fn a_child_its_parent_keeps_mounted_keeps_the_error() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Child() {
+  const [s, setS] = useState<number[]>([]);
+  useEffect(() => { setS([...s, 1]); }, [s]);
+  return <div />;
+}
+export function App() {
+  return <div><Child /></div>;
+}
+"#;
+    let sevs = loop_severities(src, "Child");
+    assert!(
+        sevs.contains(&Severity::Error),
+        "an unconditional child stays mounted: {sevs:?}"
+    );
+}
+
+#[test]
+fn a_prop_or_a_memo_over_it_is_not_fresh_at_the_childs_own_renders() {
+    // Fuzz seed 1, program 1706: `p` is new at each render of `App` only.
+    let src = r#"
+import { useState, useEffect, useMemo } from 'react';
+function A({ p }: { p: { v: number } }) {
+  const [s, setS] = useState({ v: 0 });
+  useEffect(() => { setS(p); });
+  return <div>{s.v}</div>;
+}
+function B({ p }: { p: { v: number } }) {
+  const [s, setS] = useState({ v: 0 });
+  const m = useMemo(() => ({ v: p.v }), [p]);
+  useEffect(() => { setS(m); });
+  return <div>{s.v}</div>;
+}
+export function App() {
+  return <div><A p={{ v: 1 }} /><B p={{ v: 1 }} /></div>;
+}
+"#;
+    for c in ["A", "B"] {
+        let sevs = loop_severities(src, c);
+        assert!(
+            !sevs.contains(&Severity::Error),
+            "{c}: the prop holds while {c} re-renders alone: {sevs:?}"
+        );
+    }
+}
+
+#[test]
+fn a_memo_over_a_fresh_own_dep_stays_fresh() {
+    // The dep is allocated by the component itself: the memo recomputes on
+    // every render, and the loop is certain.
+    let src = r#"
+import { useState, useEffect, useMemo } from 'react';
+export function C() {
+  const [s, setS] = useState({ v: 0 });
+  const m = useMemo(() => ({ v: 1 }), [{}]);
+  useEffect(() => { setS(m); });
+  return <div />;
+}
+"#;
+    let sevs = loop_severities(src, "C");
+    assert!(
+        sevs.contains(&Severity::Error),
+        "a memo over its own fresh dep is fresh: {sevs:?}"
+    );
+}
+
+#[test]
+fn every_write_fresh_keeps_the_error() {
+    // Two fresh writes: whichever runs last, the slot changes.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [s, setS] = useState({ v: 0 });
+  useEffect(() => { setS({ v: 1 }); }, [s]);
+  useEffect(() => { setS({ v: 2 }); }, []);
+  return <div />;
+}
+"#;
+    let sevs = loop_severities(src, "C");
+    assert!(
+        sevs.contains(&Severity::Error),
+        "every write stores a new reference: {sevs:?}"
+    );
+}
