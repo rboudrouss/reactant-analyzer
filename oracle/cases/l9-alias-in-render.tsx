@@ -1,6 +1,5 @@
 // oracle: react=loop
-// oracle: known=fn #176
-// L9: `setter-in-render` misses a setter alias.
+// L9: `setter-in-render` missed a setter alias (#176).
 import { useState } from "react";
 
 export function App() {

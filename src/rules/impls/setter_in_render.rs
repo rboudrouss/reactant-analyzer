@@ -12,7 +12,7 @@ use crate::engine::setters::SetterCallPhase;
 use crate::rules::helpers::eval_in_exit_env;
 use crate::rules::{
     Diagnostic, ExitDominance, MustResult, Rule, collect_setter_calls, resolve_setter_aliases,
-    state_val_labels,
+    setter_var_labels, state_val_labels,
 };
 
 /// Fires when a state setter is called directly in the render body either a
@@ -60,30 +60,13 @@ impl Rule for SetterInRender {
         let (result, component) = (ctx.program(), ctx.component());
         let comp_result = &result.components[&component];
 
-        let local_setter_info: HashMap<Var, (HookLabel, Option<crate::ir::SourceRange>)> =
-            comp_result
-                .render_cfg
-                .blocks
-                .values()
-                .flat_map(|b| b.stmts.iter())
-                .filter_map(|stmt| {
-                    if let Stmt::Let {
-                        var,
-                        rhs: Expr::StateSetter(label),
-                        ..
-                    } = stmt
-                    {
-                        let span = comp_result
-                            .hook_calls
-                            .iter()
-                            .find(|c| c.label == *label)
-                            .and_then(|c| c.span);
-                        Some((var.clone(), (*label, span)))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+        // Local setters with their aliases (`const s = setN`): a name the
+        // table misses is a call the rule never sees, and a false `verified`
+        // (#176).
+        let local_setter_info: HashMap<Var, HookLabel> = resolve_setter_aliases(
+            &comp_result.render_cfg,
+            &setter_var_labels(&comp_result.render_cfg),
+        );
 
         // Cross-component setters: ComponentSetter-valued props, excluding self-references.
         let cs_vars: HashMap<Var, crate::engine::setters::SetterProp> =
@@ -166,7 +149,7 @@ impl Rule for SetterInRender {
                 // converges after one extra render, no diagnostic.
                 if proof.is_none()
                     && let Some(bid) = call.block_id
-                    && let Some(&(label, _)) = local_setter_info.get(&call.var)
+                    && let Some(&label) = local_setter_info.get(&call.var)
                     && let Some(arg) = setter_call_arg(&comp_result.render_cfg, bid, &call.var)
                     && converges_once_written(
                         &comp_result.render_cfg,
@@ -188,7 +171,7 @@ impl Rule for SetterInRender {
                     String,
                     Option<HookLabel>,
                     Option<Var>,
-                ) = if let Some(&(label, _)) = local_setter_info.get(&call.var) {
+                ) = if let Some(&label) = local_setter_info.get(&call.var) {
                     (
                         "setter-in-render",
                         if call.class == SetterCallPhase::Sync {
@@ -380,6 +363,37 @@ mod tests {
             SetterInRender.check(&RuleCtx::new(&prog("C", &result), crate::test_support::C));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].rule, "setter-in-render");
+        assert_eq!(diags[0].severity(), Severity::Error);
+    }
+
+    #[test]
+    fn setter_alias_called_in_render_is_error() {
+        // `const s = setN; s(1)` is the same write as `setN(1)` (#176).
+        let render_stmts = vec![
+            Stmt::Let {
+                var: "setN".to_string(),
+                rhs: Expr::StateSetter(0),
+                span: None,
+            },
+            Stmt::Let {
+                var: "s".to_string(),
+                rhs: Expr::Var("setN".to_string()),
+                span: None,
+            },
+            Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("s".to_string())),
+                    args: vec![Expr::Lit(Prim::Int(1))],
+                },
+                None,
+            ),
+        ];
+        let result = make_result(vec![], render_stmts);
+        let diags =
+            SetterInRender.check(&RuleCtx::new(&prog("C", &result), crate::test_support::C));
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].rule, "setter-in-render");
+        assert_eq!(diags[0].hook_label, Some(0));
         assert_eq!(diags[0].severity(), Severity::Error);
     }
 
