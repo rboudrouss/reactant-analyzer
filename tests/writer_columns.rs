@@ -4,7 +4,7 @@
 //! whole of their contract.
 use reactant::domains::StateValue;
 use reactant::engine::{
-    AnalysisResult, ComponentRegistry, Config, Freshness, HookRegistry, ProgramAnalysisResult,
+    AnalysisResult, Change, ComponentRegistry, Config, HookRegistry, ProgramAnalysisResult,
     RootStrategy, SlotWriter, WriterRegion, analyze_program,
 };
 
@@ -126,7 +126,7 @@ fn an_effect_local_allocation_is_a_fresh_write() {
     let c = comp(&r, "C");
     let x = effect_rows(c, "setX");
     assert_eq!(x.len(), 1, "{:?}", c.slot_writers);
-    assert_eq!(x[0].written.fresh, Freshness::Fresh, "{:?}", x[0].written);
+    assert_eq!(x[0].written.change, Change::Must, "{:?}", x[0].written);
     assert!(x[0].written.expr.is_some());
 }
 
@@ -151,7 +151,7 @@ fn the_argument_is_read_in_the_env_before_the_call_not_after() {
     let c = comp(&r, "C");
     let x = effect_rows(c, "setX");
     assert_eq!(x.len(), 1, "{:?}", c.slot_writers);
-    assert_ne!(x[0].written.fresh, Freshness::Fresh, "{:?}", x[0].written);
+    assert_ne!(x[0].written.change, Change::Must, "{:?}", x[0].written);
 }
 
 #[test]
@@ -173,10 +173,10 @@ fn a_functional_updater_is_classified_by_what_it_returns() {
     let c = comp(&r, "C");
     let x = effect_rows(c, "setX");
     assert_eq!(x.len(), 1, "{:?}", c.slot_writers);
-    assert_eq!(x[0].written.fresh, Freshness::Fresh);
+    assert_eq!(x[0].written.change, Change::Must);
     let y = effect_rows(c, "setY");
     assert_eq!(y.len(), 1, "{:?}", c.slot_writers);
-    assert_eq!(y[0].written.fresh, Freshness::Not);
+    assert_eq!(y[0].written.change, Change::Never);
 }
 
 // ── `owner` ──────────────────────────────────────────────────────────────────
@@ -208,7 +208,7 @@ fn a_parent_setter_called_in_the_child_is_an_owner_qualified_row() {
     assert_eq!(foreign.len(), 1, "{:?}", child.slot_writers);
     assert_eq!(foreign[0].owner, Some(parent));
     assert!(matches!(foreign[0].region, WriterRegion::Effect(_)));
-    assert_eq!(foreign[0].written.fresh, Freshness::Fresh);
+    assert_eq!(foreign[0].written.change, Change::Must);
     // The parent's own rows are local.
     assert!(
         comp(&r, "Parent")

@@ -1022,11 +1022,11 @@ pub(crate) fn collect_slot_writers(
             .or_insert((Some(prop.component), prop.label));
     }
     let setter_vars: HashSet<Var> = targets.keys().cloned().collect();
-    // Memo and callback bindings, aliases resolved the same way: a write of
-    // one stores a value derived from its deps (`written::classify`).
-    let mut memos = memo_val_labels(render_cfg);
+    // State-read bindings, aliases resolved the same way: a write of one
+    // into its own slot stores the slot's content (`written::classify`).
+    let mut states = state_val_labels(render_cfg);
     for cfg in std::iter::once(render_cfg).chain(hooks.iter().filter_map(|h| h.body_cfg())) {
-        memos = resolve_setter_aliases(cfg, &memos);
+        states = resolve_setter_aliases(cfg, &states);
     }
     // Any local binding of a deferring global's name disables its summary,
     // wherever the call sits (fail-closed across every body, nested `FnLit`
@@ -1148,9 +1148,13 @@ pub(crate) fn collect_slot_writers(
             let target = (owner.unwrap_or(envs.component), slot);
             let written = match reducers.get(target.0, target.1) {
                 Some(reducer) => written::dispatched(&reducer),
-                None => written::classify(site.arg.as_ref(), &site.updater, target, &memos, |e| {
-                    envs.eval(region, cfg, at, e)
-                }),
+                None => written::classify(
+                    site.arg.as_ref(),
+                    &site.updater,
+                    owner.is_none().then_some(slot),
+                    &states,
+                    |e| envs.eval(region, cfg, at, e),
+                ),
             };
             let via = {
                 let mut chain: Vec<Symbol> = hook_origin.into_iter().cloned().collect();

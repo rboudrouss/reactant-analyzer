@@ -41,7 +41,7 @@
 //! (A greatest fixpoint would read two sites that revive each other as
 //! convergent, which is exactly a loop.)
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::{
     domains::{AbstractDomain, StateValue, stores::AbstractEnv},
@@ -327,6 +327,135 @@ impl Invariance<'_> {
         self.go(e, Some(bindings), props_hold, 8)
     }
 
+    /// What `e`, read in `body` (whose names resolve before the render's),
+    /// may depend on among the things a loop can move: the component's own
+    /// slots, and whether it reads a prop (`holds`' reading of everything
+    /// else, a call over held inputs included). `None` when it may depend on
+    /// something else that moves — a memo, a mutated name, a hook result, a
+    /// name bound in a nested closure or nowhere, an allocation.
+    ///
+    /// A name bound once reads what its right-hand side reads. A name bound
+    /// more than once (a lowered `?:` or `&&` temp, a reassignment) also
+    /// reads every branch condition of its body, which over-approximates the
+    /// conditions that chose the binding: `x ? "a" : "b"` reads `x`.
+    pub fn reads(
+        &self,
+        e: &Expr,
+        body: &CFG,
+        render: &CFG,
+        free: &dyn Fn(&str) -> bool,
+    ) -> Option<Reads> {
+        let scopes = [ReadScope::of(body), ReadScope::of(render)];
+        // The render reading its own names: a body already resolved there.
+        let scopes: &[ReadScope] = if std::ptr::eq(body, render) {
+            &scopes[1..]
+        } else {
+            &scopes
+        };
+        let mut out = Reads::default();
+        let mut seen = HashSet::new();
+        self.read_into(e, scopes, free, &mut out, &mut seen, 16)
+            .then_some(out)
+    }
+
+    /// `scopes` innermost first: a name resolves in the first scope that
+    /// binds it, and its right-hand side reads from that scope outwards.
+    fn read_into<'e>(
+        &self,
+        e: &'e Expr,
+        scopes: &[ReadScope<'e>],
+        free: &dyn Fn(&str) -> bool,
+        out: &mut Reads,
+        seen: &mut HashSet<&'e str>,
+        depth: usize,
+    ) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        let next = depth - 1;
+        let all = |es: &mut dyn Iterator<Item = &'e Expr>,
+                   scopes: &[ReadScope<'e>],
+                   out: &mut Reads,
+                   seen: &mut HashSet<&'e str>| {
+            for x in es {
+                if !self.read_into(x, scopes, free, out, seen, next) {
+                    return false;
+                }
+            }
+            true
+        };
+        match e.peel_ts() {
+            Expr::Lit(_) => true,
+            Expr::StateVal(l) => {
+                out.slots.insert(*l);
+                true
+            }
+            Expr::Var(v) => {
+                if let Some(l) = self.state_vals.get(v) {
+                    out.slots.insert(*l);
+                    return true;
+                }
+                if self.memo_vals.contains_key(v)
+                    || self.mutated.contains(v)
+                    || scopes.iter().any(|s| s.nested.contains(v))
+                {
+                    return false;
+                }
+                let Some(at) = scopes
+                    .iter()
+                    .position(|s| s.bindings.contains_key(v.as_str()))
+                else {
+                    if free(v) {
+                        out.props = true;
+                        return true;
+                    }
+                    return false;
+                };
+                let scope = &scopes[at];
+                // A name that reaches itself (`i = i + 1`) moves by itself.
+                let Some((key, rhs)) = scope.bindings.get_key_value(v.as_str()) else {
+                    return false;
+                };
+                if !seen.insert(key) {
+                    return false;
+                }
+                let conds: &[&'e Expr] = if rhs.len() > 1 { &scope.conds } else { &[] };
+                let ok = all(
+                    &mut rhs.iter().copied().chain(conds.iter().copied()),
+                    &scopes[at..],
+                    out,
+                    seen,
+                );
+                seen.remove(key);
+                ok
+            }
+            Expr::FieldAccess { obj, .. } => self.read_into(obj, scopes, free, out, seen, next),
+            Expr::IndexAccess { arr, idx } => all(
+                &mut [arr.as_ref(), idx.as_ref()].into_iter(),
+                scopes,
+                out,
+                seen,
+            ),
+            Expr::BinOp { lhs, rhs, .. } => all(
+                &mut [lhs.as_ref(), rhs.as_ref()].into_iter(),
+                scopes,
+                out,
+                seen,
+            ),
+            Expr::UnaryOp { arg, .. } => self.read_into(arg, scopes, free, out, seen, next),
+            Expr::Call { fn_, args } => all(
+                &mut std::iter::once(fn_.as_ref()).chain(args.iter()),
+                scopes,
+                out,
+                seen,
+            ),
+            Expr::HookMarker(_, MarkerVal::Summary(sv)) | Expr::SummaryVal(sv) => {
+                matches!(sv, SummaryValue::Held) && !self.navigates
+            }
+            _ => false,
+        }
+    }
+
     fn go(
         &self,
         e: &Expr,
@@ -585,6 +714,58 @@ pub(crate) fn navigates(body: &CFG, render: &HashMap<&str, Vec<&Expr>>) -> bool 
 
 /// The names a body binds ([`let_bindings`]).
 pub type Bindings<'e> = HashMap<&'e str, Option<&'e Expr>>;
+
+/// What a value may depend on among the things a loop moves
+/// ([`Invariance::reads`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Reads {
+    /// The component's own slots it reads.
+    pub slots: BTreeSet<HookLabel>,
+    /// It reads a prop, which moves with another component's slots.
+    pub props: bool,
+}
+
+/// One scope [`Invariance::reads`] resolves names in.
+struct ReadScope<'e> {
+    /// Every right-hand side of each name bound at this level.
+    bindings: HashMap<&'e str, Vec<&'e Expr>>,
+    /// Every branch condition at this level.
+    conds: Vec<&'e Expr>,
+    /// Every name a function nested in this body binds: it may shadow a name
+    /// of this scope at the read, so it is never resolved here.
+    nested: HashSet<Var>,
+}
+
+impl<'e> ReadScope<'e> {
+    fn of(cfg: &'e CFG) -> Self {
+        let conds = cfg
+            .blocks
+            .values()
+            .filter_map(|b| match &b.term {
+                Terminator::Branch { cond, .. } => Some(cond),
+                _ => None,
+            })
+            .collect();
+        let mut nested = HashSet::new();
+        fn closures(e: &Expr, out: &mut HashSet<Var>) {
+            if let Expr::FnLit {
+                params, body_cfg, ..
+            } = e
+            {
+                out.extend(params.iter().cloned());
+                crate::engine::setters::collect_binders(body_cfg, out);
+                return;
+            }
+            e.for_each_child(&mut |c| closures(c, out));
+        }
+        cfg.for_each_expr(&mut |e| closures(e, &mut nested));
+        ReadScope {
+            bindings: local_bindings(cfg),
+            conds,
+            nested,
+        }
+    }
+}
 
 /// The names a body binds: `Some(rhs)` for a name bound by exactly one `let`
 /// and never assigned, `None` for one bound any other way — its value at a

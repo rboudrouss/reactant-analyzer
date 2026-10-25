@@ -73,10 +73,6 @@ that writes it (see *Cross-file limits*).
   callback does not resolve syntactically [#24](https://github.com/rboudrouss/reactant-analyzer/issues/24), `frozen-initial-state` on primitive props
   and memo-chained seeds [#25](https://github.com/rboudrouss/reactant-analyzer/issues/25), provider detection inside an inline arrow
   [#30](https://github.com/rboudrouss/reactant-analyzer/issues/30).
-- The churn graph reads a write of a value derived from the written slot as not fresh, ADR-017's
-  reading of `Versioned`, unless the value is a memo over the slot: a field of it, or a copy that
-  comes back through another slot, is read as the slot's own content, and a loop carried by such a
-  write is silent [#157](https://github.com/rboudrouss/reactant-analyzer/issues/157).
 - The convergence proof assumes a call over held inputs returns the same value on every run, and
   that a call it cannot see into does not navigate: a router hook's result (`useSearchParams`,
   `useParams`, `usePathname`, `useLocation`) holds still across the loop unless some render,
@@ -147,6 +143,16 @@ carries an Error.
   [#160](https://github.com/rboudrouss/reactant-analyzer/issues/160); and a write through a
   setter prop typed to take a primitive, whose ⊤ value reads as a possible fresh reference
   [#159](https://github.com/rboudrouss/reactant-analyzer/issues/159).
+- **The churn graph warns unless a write is proven to settle.** The proofs are: the write stores
+  the slot's own state read; it stores one value known in advance and nothing else moves the slot;
+  it reads neither the slot nor what re-ran it; every write of the slot steps it one way into a
+  finite interval; or a guard dies. So what reaches a fixed point any other way reads as a possible
+  loop: a counter capped by `Math.min(x + 1, 10)`, an updater under a guard on the slot
+  (`if (on) setOn((s) => !s)`, whose parameter is not read under the guard), a write of a value
+  derived from the slot, a child writing back the parent's own value it received as a prop, a
+  controlled input mirrored through two slots (`setLocal(value)`, then `onChange(local)`). Never an
+  Error: the Error still needs a new reference stored on all paths
+  [#157](https://github.com/rboudrouss/reactant-analyzer/issues/157).
 - **The churn graph is slot-granular where a program is member-granular.** The self-churn arm reads
   the member (`[data.name]` is not re-triggered by `setData(prev => ({...prev, slug}))`, and a guard
   on `sheet.leadId` is answered by the `null` the write puts there), but the multi-effect graph

@@ -1781,7 +1781,12 @@ fn a_write_derived_from_the_slot_still_loops() {
 /// A comparison the write does NOT settle: the guard tests one expression and
 /// the write stores another.
 #[test]
-fn a_write_of_something_else_still_fires() {
+fn a_write_of_something_else_settles_when_it_reads_no_slot() {
+    // `slot !== a` says nothing about a write of `b`, so the guard proves
+    // nothing — but `b` reads no slot and no other write moves `slot`: once
+    // `b` sits in it, writing `b` again is `Object.is`-equal and React bails
+    // out. A change of `slot` re-runs the effect without changing what it
+    // writes, so `slot` is no edge into itself.
     let fired = rules_fired(
         r#"
         function C({ a, b }) {
@@ -1793,10 +1798,7 @@ fn a_write_of_something_else_still_fires() {
         }
         "#,
     );
-    assert!(
-        fired.iter().any(|r| r == "infinite-loop"),
-        "`slot !== a` says nothing about a write of `b`: {fired:?}"
-    );
+    assert!(!fired.iter().any(|r| r == "infinite-loop"), "{fired:?}");
 }
 
 // ── #90 — a spread update preserves the member the deps read ──────────────────

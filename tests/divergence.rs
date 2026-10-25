@@ -157,3 +157,109 @@ fn bounded_string_set_is_clean() {
     );
     assert_eq!(hits, 0, "a finite set of strings is bounded");
 }
+
+// ── A write may change its slot unless it is proven to settle (#187) ────────
+
+/// The severities `infinite-loop` reports over `src`.
+fn infinite_loop_severities(src: &str) -> Vec<reactant::rules::Severity> {
+    let alloc = Allocator::default();
+    let ret = Parser::new(&alloc, src, SourceType::tsx())
+        .with_options(ParseOptions::default())
+        .parse();
+    let components = lower_program(
+        &ret.program,
+        src,
+        std::path::Path::new("test.tsx"),
+        &mut Default::default(),
+    );
+    components
+        .into_iter()
+        .flat_map(|comp| {
+            let name = comp.name.clone();
+            let result = analyze_component(comp, &StateValueTransfer, &Config::default());
+            let prog = reactant::engine::ProgramAnalysisResult::single(&name, result);
+            InfiniteLoop
+                .check(&RuleCtx::new(&prog, prog.component_named(&name).unwrap()))
+                .into_iter()
+                .map(|d| d.severity())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+#[test]
+fn a_toggle_and_a_swap_are_flagged() {
+    // Both converge abstractly ({false, true}, [0, 1]) and loop in React.
+    for src in [
+        r#"
+        import { useState, useEffect } from "react";
+        function Toggle() {
+          const [on, setOn] = useState(false);
+          useEffect(() => { setOn(!on); }, [on]);
+          return <p>{on ? 1 : 0}</p>;
+        }
+        "#,
+        r#"
+        import { useState, useEffect } from "react";
+        function Swap() {
+          const [a, setA] = useState(1);
+          const [b, setB] = useState(0);
+          useEffect(() => { setA(b); setB(a); });
+          return <p>{a}{b}</p>;
+        }
+        "#,
+        // The condition that picks the arm is what the value depends on.
+        r#"
+        import { useState, useEffect } from "react";
+        function Flip() {
+          const [mode, setMode] = useState("light");
+          useEffect(() => { setMode(mode === "light" ? "dark" : "light"); }, [mode]);
+          return <p>{mode}</p>;
+        }
+        "#,
+    ] {
+        assert_eq!(
+            infinite_loop_severities(src),
+            vec![reactant::rules::Severity::Warning],
+            "{src}"
+        );
+    }
+}
+
+#[test]
+fn a_counter_that_moves_one_way_in_a_bounded_slot_settles() {
+    // Every write adds 1 and the fixpoint bounds the slot: a strictly
+    // monotone sequence in a bounded set ends (React-tRace `SelfCounter`).
+    let hits = infinite_loop_hits(
+        r#"
+        import { useState, useEffect } from "react";
+        function SelfCounter() {
+          const [s, setS] = useState(0);
+          useEffect(() => { if (s < 3) setS(s + 1); });
+          return <p>{s}</p>;
+        }
+        "#,
+    );
+    assert_eq!(hits, 0);
+}
+
+#[test]
+fn a_guarded_toggle_through_an_updater_is_at_most_a_warning() {
+    // Converges in React: once `on` is false the guard fails. The updater's
+    // parameter is not read under the guard, so `!s` may change the slot —
+    // a documented false positive, never an Error.
+    let sevs = infinite_loop_severities(
+        r#"
+        import { useState, useEffect } from "react";
+        function GuardedToggle() {
+          const [on, setOn] = useState(true);
+          useEffect(() => { if (on) setOn((s) => !s); }, [on]);
+          return <p>{on ? 1 : 0}</p>;
+        }
+        "#,
+    );
+    assert!(
+        !sevs.contains(&reactant::rules::Severity::Error),
+        "{sevs:?}"
+    );
+}

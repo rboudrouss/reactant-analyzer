@@ -48,4 +48,4 @@ pub use setters::{
 };
 pub use symbol_graph::{SymbolGraph, SymbolKind, SymbolNode};
 pub use triggers::{EffectTrigger, triggers_of};
-pub use written::{Freshness, SiteEnvs, Written};
+pub use written::{Change, SiteEnvs, Written};
