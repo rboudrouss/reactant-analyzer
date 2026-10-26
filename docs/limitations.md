@@ -181,7 +181,13 @@ carries an Error.
   derived from the slot, a child writing back the parent's own value it received as a prop, a
   controlled input mirrored through two slots (`setLocal(value)`, then `onChange(local)`). Never an
   Error: the Error still needs a new reference stored on all paths
-  [#157](https://github.com/rboudrouss/reactant-analyzer/issues/157).
+  [#157](https://github.com/rboudrouss/reactant-analyzer/issues/157). Each proof reads only what
+  it can certify: a slot read through a name bound to it on one arm only, or rebound in the
+  effect's body, is not the slot [#222](https://github.com/rboudrouss/reactant-analyzer/issues/222);
+  a relational guard `s !== t` settles only while `t` holds still
+  [#209](https://github.com/rboudrouss/reactant-analyzer/issues/209); and a write that reads a slot
+  its effect does not depend on keeps an edge from that slot, even when the read sits on an arm
+  that never runs (`false ? s1 : 2`) [#204](https://github.com/rboudrouss/reactant-analyzer/issues/204).
 - **An effect loop is an Error only when nothing in the batch can undo it.** React re-renders on
   the last value a batch leaves in the slot, and the engine does not order the writes of one batch
   (two effects, a layout effect and the passive effects React flushes before its re-render, a

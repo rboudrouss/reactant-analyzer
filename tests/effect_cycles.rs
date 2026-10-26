@@ -1661,3 +1661,72 @@ export function C() {
 "#;
     assert!(!loop_severities(src, "C").is_empty());
 }
+
+#[test]
+fn a_dep_rooted_at_a_one_arm_alias_is_no_member_of_the_slot() {
+    // On the arm that runs, `d.name` is `data.slug`, which the spread
+    // update overwrites (#222).
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [data, setData] = useState({ name: "", slug: "" });
+  const d = data.slug.length >= 0 ? { name: data.slug } : data;
+  useEffect(() => {
+    setData((prev) => ({ ...prev, slug: prev.slug + "x" }));
+  }, [d.name]);
+  return <div />;
+}
+"#;
+    assert!(!loop_severities(src, "C").is_empty());
+}
+
+#[test]
+fn a_guard_on_a_one_arm_alias_is_not_settled_by_the_write() {
+    // `d` is `null` while `c` is false: the guard never dies (#222).
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [s, setS] = useState<any>(null);
+  const [c] = useState(false);
+  const d = c ? s : null;
+  useEffect(() => { if (d === null) setS({ n: 1 }); }, [s]);
+  return <div />;
+}
+"#;
+    assert!(!loop_severities(src, "C").is_empty());
+}
+
+#[test]
+fn a_guard_on_a_name_the_body_rebinds_is_not_settled_by_the_write() {
+    // The guard reads the body's `s`, not the slot (#222).
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [s, setS] = useState<any>(null);
+  useEffect(() => { let s = null; if (s === null) setS({ n: 1 }); }, [s]);
+  return <div />;
+}
+"#;
+    assert!(!loop_severities(src, "C").is_empty());
+}
+
+#[test]
+fn a_write_of_a_one_arm_alias_reads_every_arm() {
+    // `d` is `t` while `c` is false: the write reads `t`, not only `s`
+    // (#222, through #204's read edges).
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [c] = useState(false);
+  const [s] = useState(false);
+  const [t, setT] = useState(false);
+  const [b, setB] = useState(false);
+  const [y, setY] = useState<boolean | null>(null);
+  const d = c ? s : t;
+  useEffect(() => { setY(d); }, [b, s]);
+  useEffect(() => { setT(!t); setB(!b); }, [y]);
+  return <div />;
+}
+"#;
+    assert!(!loop_severities(src, "C").is_empty());
+}

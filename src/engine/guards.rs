@@ -137,7 +137,10 @@ pub struct WriteSite<'a> {
 /// reference part of an effect write, since a `null` run stores no fresh
 /// reference; the site fixpoint reads the whole value. `props_hold` is
 /// handed to [`Invariance::holds`]: the caller says whether a loop can
-/// reach the component through its props at all.
+/// reach the component through its props at all. `state_vals` names the
+/// render names that read a slot on every path
+/// ([`must_slot_read`](crate::ir::bindings::must_slot_read)): a name rebound
+/// to the written value must be the slot, not a name tied to it on one arm.
 #[allow(clippy::too_many_arguments)]
 pub fn converges_under_all_writes(
     peers: &[WriteSite<'_>],
@@ -351,7 +354,9 @@ impl Invariance<'_> {
     /// A name bound once reads what its right-hand side reads. A name bound
     /// more than once (a lowered `?:` or `&&` temp, a reassignment) also
     /// reads every branch condition of its body, which over-approximates the
-    /// conditions that chose the binding: `x ? "a" : "b"` reads `x`.
+    /// conditions that chose the binding: `x ? "a" : "b"` reads `x`. A state
+    /// name is no exception: the alias table is a may reading, and a name
+    /// bound to the read on one path only reads its other paths too (#222).
     ///
     /// A call is read as a function of its inputs, and [`Reads::call`] says
     /// one was crossed: whether the call may allocate is a fact about the
@@ -409,10 +414,8 @@ impl Invariance<'_> {
                 true
             }
             Expr::Var(v) => {
-                if let Some(l) = self.state_vals.get(v) {
-                    out.slots.insert(*l);
-                    return true;
-                }
+                // A state name reads the slot through its binding
+                // (`let s = StateVal(l)`), and every other binding with it.
                 if self.memo_vals.contains_key(v)
                     || self.mutated.contains(v)
                     || scopes.iter().any(|s| s.nested.contains(v))
@@ -929,10 +932,12 @@ fn dead_once_written(
     for name in shadowed.into_iter().flat_map(HashMap::keys) {
         env.extend((*name).to_string(), StateValue::top());
     }
+    // The names that read the slot at the guard: a name the site's body
+    // binds is that binding, not the render's read.
     let slots_of = |label: HookLabel| -> HashSet<&Var> {
         state_vals
             .iter()
-            .filter(|(_, l)| **l == label)
+            .filter(|(v, l)| **l == label && !shadowed.is_some_and(|s| s.contains_key(v.as_str())))
             .map(|(v, _)| v)
             .collect()
     };

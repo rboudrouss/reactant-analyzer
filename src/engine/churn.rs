@@ -94,7 +94,7 @@ use crate::{
     },
     ir::{
         ComponentId, QualifiedSlot, SourceRange,
-        bindings::local_bindings,
+        bindings::{local_bindings, must_slot_read},
         cfg::{CFG, Terminator},
         expr::{CompOrigin, Expr, SPREAD_KEY_PREFIX, object_member},
         hooks::HookEntry,
@@ -181,7 +181,13 @@ fn node_of(component: ComponentId, w: &SlotWriter) -> QualifiedSlot {
 pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
     // Per-component facts the proofs read.
     struct CompCtx<'a> {
+        /// The names some render binding ties to a slot's read: a may
+        /// reading, for what may move.
         state_vals: HashMap<Var, HookLabel>,
+        /// The names the render binds to a slot's read on every path
+        /// (`must_slot_read`): what the proofs may read as the slot itself
+        /// (#210, #222).
+        must_state_vals: HashMap<Var, HookLabel>,
         memo_vals: HashMap<Var, HookLabel>,
         memo_deps: HashMap<HookLabel, &'a [Expr]>,
         render_lets: HashMap<&'a str, Option<&'a Expr>>,
@@ -247,10 +253,17 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         for body in comp_result.hooks.iter().filter_map(HookEntry::body_cfg) {
             mutated.extend(mutated_roots(body));
         }
+        let state_vals = resolve_setter_aliases(cfg, &state_val_labels(cfg));
+        let must_state_vals = state_vals
+            .iter()
+            .filter(|(v, l)| must_slot_read(&Expr::Var((*v).clone()), cfg, &[]) == Some(**l))
+            .map(|(v, l)| (v.clone(), *l))
+            .collect();
         ctxs.insert(
             comp,
             CompCtx {
-                state_vals: resolve_setter_aliases(cfg, &state_val_labels(cfg)),
+                state_vals,
+                must_state_vals,
                 memo_vals: resolve_setter_aliases(cfg, &memo_val_labels(cfg)),
                 memo_deps: comp_result
                     .hooks
@@ -512,8 +525,15 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             let Some(ctx) = ctxs.get(&s.comp) else {
                 return false;
             };
+            // A name reads the slot when the render binds it to the read on
+            // every path and the write's own body does not rebind it.
+            let local = (s.row.region != WriterRegion::Render).then(|| let_bindings(s.cfg));
+            let reads_slot = |v: &Var| {
+                ctx.must_state_vals.get(v) == Some(&slot.1)
+                    && !local.as_ref().is_some_and(|b| b.contains_key(v.as_str()))
+            };
             let step = match (s.row.owner, s.row.written.expr.as_ref()) {
-                (None, Some(e)) => step_of(e, slot.1, &ctx.state_vals),
+                (None, Some(e)) => step_of(e, slot.1, &reads_slot),
                 _ => None,
             };
             match (step, way) {
@@ -527,7 +547,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
 
         /// `+1` / `-1` when `e` adds to / subtracts from `label`'s read a
         /// positive constant, directly or as an updater's only return.
-        fn step_of(e: &Expr, label: HookLabel, states: &HashMap<Var, HookLabel>) -> Option<i8> {
+        fn step_of(e: &Expr, label: HookLabel, reads_slot: &dyn Fn(&Var) -> bool) -> Option<i8> {
             let positive = |e: &Expr| match e.peel_ts() {
                 Expr::Lit(crate::ir::expr::Prim::Int(n)) => *n > 0,
                 Expr::Lit(crate::ir::expr::Prim::Float(f)) => f.is_finite() && *f > 0.0,
@@ -564,7 +584,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 }
                 other => step(other, &|x| match x.peel_ts() {
                     Expr::StateVal(l) => *l == label,
-                    Expr::Var(v) => states.get(v) == Some(&label),
+                    Expr::Var(v) => reads_slot(v),
                     _ => false,
                 }),
             }
@@ -614,7 +634,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     k,
                     peers[k].value,
                     &foreign,
-                    &ctx.state_vals,
+                    &ctx.must_state_vals,
                     &invariance,
                     ctx.props_hold,
                     &ctx.exit,
@@ -759,7 +779,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     k,
                     &own_value,
                     &foreign,
-                    &ctx.state_vals,
+                    &ctx.must_state_vals,
                     &invariance,
                     ctx.props_hold,
                     &ctx.exit,
@@ -854,11 +874,11 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 }
                 continue;
             }
+            let retrigger = || write_can_retrigger(f, &ctx.must_state_vals, w);
             for &l in &f.exact_local {
                 let x: QualifiedSlot = (f.comp, l);
                 let self_slot = x == node;
-                let dropped =
-                    !reads_slot(x) || (self_slot && !write_can_retrigger(f, &ctx.state_vals, w));
+                let dropped = !reads_slot(x) || (self_slot && !retrigger());
                 if !dropped {
                     push(x, strength, self_slot, None);
                 }
@@ -868,8 +888,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     continue; // already pushed as exact
                 }
                 let self_slot = x == node && x.0 == f.comp;
-                let dropped =
-                    !reads_slot(x) || (self_slot && !write_can_retrigger(f, &ctx.state_vals, w));
+                let dropped = !reads_slot(x) || (self_slot && !retrigger());
                 if !dropped {
                     push(x, EdgeStrength::May, self_slot, None);
                 }
@@ -1227,6 +1246,8 @@ fn named_key(key: &Symbol) -> Option<&Symbol> {
 /// The first member a dep reads off state slot `label`: `data.name.first`
 /// answers `name`. `None` when the dep is not a plain member chain on that
 /// slot — the bare slot included, since every fresh write changes it.
+/// `state_vals` must be the must-alias map: a dep rooted at a name the slot's
+/// read is bound to on one arm only reads something else on the other (#222).
 fn slot_member(
     dep: &Expr,
     label: HookLabel,
