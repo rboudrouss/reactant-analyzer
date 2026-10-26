@@ -1606,3 +1606,24 @@ export function C() {
 "#;
     assert!(!loop_severities(src, "C").is_empty());
 }
+
+// ── The convergence kills check their premises (#204, #209, #218, #222) ─────
+
+#[test]
+fn a_call_that_allocates_is_no_function_of_its_inputs() {
+    // `F.make(a)` returns a new object on every re-run, whatever `b` did:
+    // the change of `b` is an edge into `y` (#218).
+    let src = r#"
+import { useState, useEffect } from 'react';
+const F = { make: (v: number) => ({ v }) };
+export function C() {
+  const [a] = useState(0);
+  const [b, setB] = useState(false);
+  const [y, setY] = useState<any>(null);
+  useEffect(() => { setY(F.make(a)); }, [a, b]);
+  useEffect(() => { setB(!b); }, [y]);
+  return <div />;
+}
+"#;
+    assert!(!loop_severities(src, "C").is_empty());
+}

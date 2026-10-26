@@ -11,7 +11,8 @@
 //! surely as a counter. What settles a write: it stores the slot's own
 //! content; it stores one value known in advance and no other write moves
 //! the slot away; it reads neither the trigger nor its own slot
-//! (`Invariance::reads`), so the re-run stores what the last run did; every
+//! (`Invariance::reads`) and crosses no call that may allocate (#218), so
+//! the re-run stores what the last run did; every
 //! write of the slot moves it one way by a constant into a finite interval
 //! (`moves_one_way`); or the guard proofs below.
 //!
@@ -74,13 +75,13 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    domains::{AbstractEnv, StateValue},
+    domains::{AbstractEnv, Stability, StateValue},
     engine::{
         AnalysisResult, Change, ConvergedEval, EffectTrigger, ProgramAnalysisResult, SlotWriter,
         WriterPhase, WriterRegion,
         dominance::on_all_paths,
         guards::{
-            Invariance, WriteSite, converges_under_all_writes, let_bindings, mutated_roots,
+            Invariance, Reads, WriteSite, converges_under_all_writes, let_bindings, mutated_roots,
             navigates, site_guards,
         },
         render_deps::written_names,
@@ -777,7 +778,10 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 }
                 _ => None,
             }
-            .filter(|r| !(node.0 == f.comp && r.slots.contains(&node.1)));
+            .filter(|r| !(node.0 == f.comp && r.slots.contains(&node.1)))
+            // A call over the reads is a function of them only when it
+            // cannot hand back a new reference (#218).
+            .filter(|r| !r.call || !may_allocate(&w.written.value, r, f.comp));
             let reads_slot = |x: QualifiedSlot| match &reads {
                 None => true,
                 Some(r) if x.0 == f.comp => r.slots.contains(&x.1),
@@ -892,6 +896,25 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
     /// A position to rank spans by; a spanless site ranks last.
     fn pos(s: Option<SourceRange>) -> (u32, u32) {
         s.map_or((u32::MAX, u32::MAX), |r| r.pos_key())
+    }
+
+    /// May a written value that passed through a call be a reference the
+    /// call allocated? Not when it holds no reference, one stable reference,
+    /// or one only the write's reads move; a residual kind may be a fresh
+    /// symbol (#218).
+    fn may_allocate(v: &StateValue, r: &Reads, comp: ComponentId) -> bool {
+        v.other
+            || match &v.reference {
+                Stability::Bottom | Stability::Stable => false,
+                Stability::Versioned(s) => !s.iter().all(|&(c, l)| {
+                    if c == comp {
+                        r.slots.contains(&l)
+                    } else {
+                        r.props
+                    }
+                }),
+                Stability::VersionedTop | Stability::PerRender | Stability::Unknown => true,
+            }
     }
 
     /// Can a write of `w` into its own slot change any dep of this effect?

@@ -75,7 +75,11 @@ that writes it (see *Cross-file limits*).
   [#30](https://github.com/rboudrouss/reactant-analyzer/issues/30), and `redundant-set-state` on a reference: the domain
   knows a reference is stable, not which one it is, so `setV(A)` while `v` holds `A` is not
   reported, the price of not reporting `setV(B)` [#179](https://github.com/rboudrouss/reactant-analyzer/issues/179).
-- The convergence proof assumes a call over held inputs returns the same value on every run, and
+- The convergence proof assumes a call over held inputs returns the same value on every run, unless
+  the value may be a new reference: a write whose value crosses a call that may allocate is not read
+  as a function of its inputs [#218](https://github.com/rboudrouss/reactant-analyzer/issues/218). A
+  primitive is taken on trust, so a module helper over `Math.random()` is read as one value, the
+  write-side form of [#224](https://github.com/rboudrouss/reactant-analyzer/issues/224). It also assumes
   that a call it cannot see into does not navigate: a router hook's result (`useSearchParams`,
   `useParams`, `usePathname`, `useLocation`) holds still across the loop unless some render,
   effect, memo or callback body of the program visibly navigates — a call through what a summary

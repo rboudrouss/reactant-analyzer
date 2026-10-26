@@ -340,6 +340,10 @@ impl Invariance<'_> {
     /// more than once (a lowered `?:` or `&&` temp, a reassignment) also
     /// reads every branch condition of its body, which over-approximates the
     /// conditions that chose the binding: `x ? "a" : "b"` reads `x`.
+    ///
+    /// A call is read as a function of its inputs, and [`Reads::call`] says
+    /// one was crossed: whether the call may allocate is a fact about the
+    /// value it returns, which the caller holds (#218).
     pub fn reads(
         &self,
         e: &Expr,
@@ -445,12 +449,15 @@ impl Invariance<'_> {
                 seen,
             ),
             Expr::UnaryOp { arg, .. } => self.read_into(arg, scopes, free, out, seen, next),
-            Expr::Call { fn_, args } => all(
-                &mut std::iter::once(fn_.as_ref()).chain(args.iter()),
-                scopes,
-                out,
-                seen,
-            ),
+            Expr::Call { fn_, args } => {
+                out.call = true;
+                all(
+                    &mut std::iter::once(fn_.as_ref()).chain(args.iter()),
+                    scopes,
+                    out,
+                    seen,
+                )
+            }
             Expr::HookMarker(_, MarkerVal::Summary(sv)) | Expr::SummaryVal(sv) => {
                 matches!(sv, SummaryValue::Held) && !self.navigates
             }
@@ -730,6 +737,10 @@ pub struct Reads {
     pub slots: BTreeSet<HookLabel>,
     /// It reads a prop, which moves with another component's slots.
     pub props: bool,
+    /// It passes through a call. Same inputs give the same value only when
+    /// the call cannot return a new reference, a fact about the value the
+    /// caller holds (#218).
+    pub call: bool,
 }
 
 /// One scope [`Invariance::reads`] resolves names in.
