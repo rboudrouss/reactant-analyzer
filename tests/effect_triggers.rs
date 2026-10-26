@@ -159,6 +159,30 @@ fn two_stable_refs_a_state_boolean_chooses_between_are_versioned_by_it() {
 }
 
 #[test]
+fn a_primitive_a_prop_overrides_is_a_versioned_trigger_of_its_slot_not_an_exact_one() {
+    // `isOpen` is the prop when given, the slot otherwise: a change of the
+    // slot may re-run the effect, never must. The slot is a boolean, so its
+    // env value carries no label; the binding does.
+    let r = parse_and_analyze(
+        r#"
+        import { useState, useEffect } from "react";
+        export function C({ open }: { open?: boolean }) {
+          const [isOpenInternal, setIsOpenInternal] = useState(false);
+          const isOpen = open ?? isOpenInternal;
+          useEffect(() => { console.log(isOpen); }, [isOpen]);
+          return <div />;
+        }
+        "#,
+    );
+    let c = comp(&r, "C");
+    let slot = only_slot(c);
+    let rows: Vec<&EffectTrigger> = c.effect_triggers.iter().collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].slot, (c.component, slot));
+    assert!(!rows[0].exact, "the prop may hide the slot: {rows:?}");
+}
+
+#[test]
 fn a_mount_only_effect_and_an_absent_list_have_no_rows() {
     let r = parse_and_analyze(
         r#"
