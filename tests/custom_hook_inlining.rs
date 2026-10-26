@@ -326,6 +326,71 @@ fn recursive_custom_hook_terminates() {
     assert!(result.component_named("Comp").is_some());
 }
 
+#[test]
+fn mutually_recursive_custom_hooks_terminate() {
+    // useA → useB → useA: the guard is the ancestry, so the inner `useA` is cut.
+    let src = r#"
+        function useA(n) {
+            const [a, setA] = useState(n);
+            const b = useB(n);
+            return a;
+        }
+        function useB(n) {
+            const [b, setB] = useState(n);
+            const a = useA(n);
+            return b;
+        }
+        function Comp() {
+            const v = useA(3);
+            return <div/>;
+        }
+    "#;
+    let result = parse_and_analyze(src);
+    let comp = &result.components[&result.component_named("Comp").unwrap()];
+    let states = comp
+        .hooks
+        .iter()
+        .filter(|h| matches!(h, reactant::ir::hooks::HookEntry::State { .. }))
+        .count();
+    assert_eq!(states, 2, "useA and useB once each, the cycle cut");
+}
+
+#[test]
+fn a_hook_called_twice_expands_both_calls() {
+    // Two sibling calls are not recursion. The guard used to remember every
+    // name it had expanded, so the second `useTick` stayed opaque: its slot
+    // did not exist and its effect — the one that loops, its dep being fresh
+    // every render — was never analysed.
+    let src = r#"
+        function useTick(dep) {
+            const [c, setC] = useState(0);
+            useEffect(() => { setC(c + 1); }, [dep]);
+            return c;
+        }
+        function Comp() {
+            const a = useTick(1);
+            const b = useTick({ fresh: true });
+            return <div>{a}{b}</div>;
+        }
+    "#;
+    let result = parse_and_analyze(src);
+    let comp = &result.components[&result.component_named("Comp").unwrap()];
+    let states = comp
+        .hooks
+        .iter()
+        .filter(|h| matches!(h, reactant::ir::hooks::HookEntry::State { .. }))
+        .count();
+    assert_eq!(states, 2, "both calls of useTick are expanded");
+    let loops: Vec<_> = diags_for(&result, "Comp")
+        .into_iter()
+        .filter(|d| d.rule.as_ref() == "infinite-loop")
+        .collect();
+    assert!(
+        !loops.is_empty(),
+        "the second call's effect loops and must be reported"
+    );
+}
+
 // ── Test 7: members of a hook-returned object keep their own stability ────────
 
 #[test]

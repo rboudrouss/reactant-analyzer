@@ -898,11 +898,19 @@ fn alloc_span(cfg: &CFG, hooks: &[HookEntry]) -> usize {
         .unwrap_or(0)
 }
 
-/// Guard strategy: a local `expanding` set tracks every hook name whose entries
-/// have been inserted into `hooks` in this call.  Once a name is in the set, any
-/// further `Custom` entry with that name is skipped (cut to ⊤).  This is correct
-/// for self-recursive hooks and sound for the rare case of a hook called twice in
-/// the same component (second call stays opaque FN, not FP).
+/// Guard strategy: every entry carries its **ancestry** — the hook names whose
+/// expansion produced it, outermost first (empty for the component's own
+/// calls). A `Custom` entry is skipped (cut to ⊤) only when its name is in its
+/// own ancestry, which is exactly a self- or mutually-recursive call. Each
+/// expansion strictly lengthens the ancestry with a name not already in it, so
+/// the chain is bounded by the number of distinct hook names and the loop
+/// terminates.
+///
+/// The guard used to be one set of every name expanded so far in the
+/// component, never popped: a hook called twice — `useSlot(0)` then
+/// `useSlot(2)`, siblings, not recursion — had its second call left opaque, so
+/// its state slot and every write through its setter were invisible (a false
+/// `verified`, #185).
 fn expand_custom_hooks(
     hooks: &mut Vec<HookEntry>,
     hook_provenance: &mut Vec<crate::ir::hooks::HookProvenance>,
@@ -917,7 +925,8 @@ fn expand_custom_hooks(
         return;
     };
 
-    let mut expanding: HashSet<String> = HashSet::new();
+    // Ancestry by entry label; an entry with no row is the component's own.
+    let mut ancestry: HashMap<HookLabel, std::rc::Rc<Vec<String>>> = HashMap::new();
 
     let mut i = 0;
     while i < hooks.len() {
@@ -941,8 +950,9 @@ fn expand_custom_hooks(
         };
         let custom_label = hooks[i].label();
 
-        // Recursion guard: skip if we already started expanding this hook.
-        if expanding.contains(&name) {
+        // Recursion guard: skip a call of a hook this entry is already inside.
+        let chain = ancestry.get(&custom_label).cloned().unwrap_or_default();
+        if chain.contains(&name) {
             i += 1;
             continue;
         }
@@ -1146,8 +1156,18 @@ fn expand_custom_hooks(
             }
         }));
 
-        // Mark before inserting so re-encountered Custom entries for this hook are guarded.
-        expanding.insert(name.clone());
+        // The inlined entries sit one hook deeper: their ancestry is this
+        // call's plus this hook, so a call of `name` among them is recursion.
+        let inner: std::rc::Rc<Vec<String>> = std::rc::Rc::new(
+            chain
+                .iter()
+                .cloned()
+                .chain(std::iter::once(name.clone()))
+                .collect(),
+        );
+        for h in &remapped {
+            ancestry.insert(h.label(), std::rc::Rc::clone(&inner));
+        }
 
         // Replace the Custom entry with the hook's remapped sub-entries.
         hooks.remove(i);
