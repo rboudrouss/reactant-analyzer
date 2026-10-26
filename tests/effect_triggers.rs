@@ -532,6 +532,33 @@ fn a_spread_whose_source_no_slot_labels_may_rerun_the_effect_every_render() {
 }
 
 #[test]
+fn a_dep_that_is_a_new_reference_on_one_arm_may_rerun_the_effect_every_render() {
+    for decl in [
+        "const d = c ? { a: 1 } : undefined;",
+        "const d = c ? () => ref.current : undefined;",
+    ] {
+        let src = format!(
+            r#"
+            import {{ useState, useEffect, useRef }} from "react";
+            export function C({{ c }}: any) {{
+              const ref = useRef<object>({{}});
+              const [t, setT] = useState(false);
+              {decl}
+              useEffect(() => {{ setT(!t); }}, [d]);
+              return <div />;
+            }}
+            "#
+        );
+        let r = parse_and_analyze(&src);
+        assert_eq!(
+            only_effect_class(comp(&r, "C")),
+            Rerun::Always(Always::MutableDep(0)),
+            "`{decl}`"
+        );
+    }
+}
+
+#[test]
 fn a_ref_a_callback_only_captures_is_no_ref_contents_dep() {
     // #227: a callback's identity moves with its deps list, not with the ref
     // its body names; the ref's contents are read only when it is called.

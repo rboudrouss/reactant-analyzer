@@ -202,6 +202,10 @@ pub(crate) fn collect_effect_triggers(
                 } else {
                     mutable.get_or_insert(i);
                 }
+            } else if val.reference == Stability::PerRender {
+                // A new reference on some path (`c ? {} : undefined`): new at
+                // every render that takes it.
+                mutable.get_or_insert(i);
             }
             // A spread stands for elements nothing here sees: they hold only
             // when its source is a reference that moves at slot events alone.
