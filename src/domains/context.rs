@@ -127,11 +127,34 @@ pub struct AnalysisCtx<'a, D: AbstractDomain> {
     /// [`ComponentId::SYNTHETIC`].
     pub component: ComponentId,
     pub state: &'a mut StateStore<D>,
-    pub memo: &'a mut MemoStore<D>,
+    /// Read-only: a pass reads memo values, and only the fixpoint, between
+    /// passes, recomputes them.
+    pub memo: &'a MemoStore<D>,
     pub heap: &'a mut Heap,
     pub query: &'a dyn QueryContext,
     /// Optional inter-component context. `None` = intra-component analysis only.
     pub inter: Option<&'a InterCtx<'a>>,
+    /// How a loop in any body this context runs is widened — a hook body and
+    /// every closure it executes share one policy, because they share one
+    /// solver.
+    pub widening: Widening<'a>,
+}
+
+/// When a loop header stops joining and starts widening (ADR-014): after
+/// `after` arrivals over a back edge, up to the tightest of `thresholds`.
+#[derive(Debug, Clone, Copy)]
+pub struct Widening<'a> {
+    pub after: usize,
+    pub thresholds: &'a [f64],
+}
+
+impl Widening<'static> {
+    /// No thresholds harvested: a growing bound widens straight to ±∞ — the
+    /// policy of a probe evaluated outside any component's fixpoint.
+    pub const DEFAULT: Widening<'static> = Widening {
+        after: 3,
+        thresholds: &[],
+    };
 }
 
 impl<'a, D: AbstractDomain> AnalysisCtx<'a, D> {
@@ -139,7 +162,7 @@ impl<'a, D: AbstractDomain> AnalysisCtx<'a, D> {
     pub fn null(
         component: ComponentId,
         state: &'a mut StateStore<D>,
-        memo: &'a mut MemoStore<D>,
+        memo: &'a MemoStore<D>,
         heap: &'a mut Heap,
     ) -> Self {
         static NULL: NullCtx = NullCtx;
@@ -150,6 +173,7 @@ impl<'a, D: AbstractDomain> AnalysisCtx<'a, D> {
             heap,
             query: &NULL,
             inter: None,
+            widening: Widening::DEFAULT,
         }
     }
 
@@ -168,14 +192,10 @@ impl<'a, D: AbstractDomain> AnalysisCtx<'a, D> {
 
 // ── FixpointCtx ───────────────────────────────────────────────────────────────
 
-/// Mid-fixpoint context: evaluates `expr` against the current iteration's state.
-///
-/// Used by `analyze_cfg` to give Transfer methods read access to the fixpoint
-/// state accumulated so far. Local variables return `Bottom` (no per-block env
-/// threaded here conservative but sound).
+/// What a component's fixpoint knows that a body cannot read off its own
+/// syntax: the `useCallback` bodies and the `useReducer` reducers in reach.
+/// Fixed for the whole fixpoint — built once, borrowed by every pass.
 pub struct FixpointCtx<'a> {
-    pub state: &'a StateStore<StateValue>,
-    pub memo: &'a MemoStore<StateValue>,
     /// `useCallback` body CFGs by hook label (see `QueryContext::callback_body`).
     pub callbacks: &'a std::collections::HashMap<
         crate::ir::types::HookLabel,

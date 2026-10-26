@@ -255,23 +255,7 @@ fn collect_fn_bodies<'a>(cfg: &'a CFG, out: &mut Vec<&'a CFG>) {
 /// Walk every expression of `cfg`'s blocks, handing each its block id.
 fn for_each_block_expr<'a>(cfg: &'a CFG, f: &mut impl FnMut(&'a Expr, BlockId)) {
     for (bid, block) in &cfg.blocks {
-        for stmt in &block.stmts {
-            match stmt {
-                Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => f(rhs, *bid),
-                Stmt::MemberWrite { obj, key, rhs, .. } => {
-                    f(obj, *bid);
-                    if let crate::ir::stmt::MemberKey::Index(i) = key {
-                        f(i, *bid);
-                    }
-                    f(rhs, *bid);
-                }
-                Stmt::ExprStmt(e, _) => f(e, *bid),
-            }
-        }
-        match &block.term {
-            Terminator::Return(e) | Terminator::Branch { cond: e, .. } => f(e, *bid),
-            _ => {}
-        }
+        block.for_each_expr(&mut |e| f(e, *bid));
     }
 }
 

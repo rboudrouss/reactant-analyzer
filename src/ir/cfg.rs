@@ -9,6 +9,21 @@ pub struct BasicBlock {
     pub term: Terminator,
 }
 
+impl BasicBlock {
+    /// Apply `f` to every top-level expression of the block: each
+    /// statement's operands ([`Stmt::for_each_expr`]), then the `Return` or
+    /// `Branch` terminator's expression.
+    pub fn for_each_expr<'a>(&'a self, f: &mut impl FnMut(&'a Expr)) {
+        for stmt in &self.stmts {
+            stmt.for_each_expr(f);
+        }
+        match &self.term {
+            Terminator::Return(e) | Terminator::Branch { cond: e, .. } => f(e),
+            Terminator::Jump(_) | Terminator::Unreachable => {}
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Terminator {
     Jump(BlockId),
@@ -88,18 +103,7 @@ impl CFG {
     ) {
         for block in self.blocks.values() {
             for stmt in block.stmts.iter().filter(|s| keep(s)) {
-                match stmt {
-                    crate::ir::stmt::Stmt::Let { rhs, .. }
-                    | crate::ir::stmt::Stmt::Assign { rhs, .. } => f(rhs),
-                    crate::ir::stmt::Stmt::MemberWrite { obj, key, rhs, .. } => {
-                        f(obj);
-                        if let crate::ir::stmt::MemberKey::Index(idx) = key {
-                            f(idx);
-                        }
-                        f(rhs);
-                    }
-                    crate::ir::stmt::Stmt::ExprStmt(e, _) => f(e),
-                }
+                stmt.for_each_expr(f);
             }
             match &block.term {
                 Terminator::Return(e) | Terminator::Branch { cond: e, .. } => f(e),
@@ -176,6 +180,32 @@ impl CFG {
             .filter(|edge| edge.to == block_id)
             .map(|edge| edge.from)
             .collect()
+    }
+
+    /// Every block reachable from the entry, in reverse post-order: a block
+    /// comes after each of its forward predecessors. Successors are visited
+    /// in edge order, so the order is deterministic. Iterative, so a long
+    /// body cannot overflow the stack.
+    pub fn rpo(&self) -> Vec<BlockId> {
+        let mut visited = std::collections::HashSet::from([self.entry]);
+        let mut post = Vec::new();
+        let succs = |b: BlockId| self.successors(b).into_iter().rev().collect::<Vec<_>>();
+        let mut stack = vec![(self.entry, succs(self.entry))];
+        while let Some((bid, pending)) = stack.last_mut() {
+            match pending.pop() {
+                Some(next) => {
+                    if visited.insert(next) {
+                        stack.push((next, succs(next)));
+                    }
+                }
+                None => {
+                    post.push(*bid);
+                    stack.pop();
+                }
+            }
+        }
+        post.reverse();
+        post
     }
 
     /// Structural well-formedness, for `debug_assert!` after a transformation

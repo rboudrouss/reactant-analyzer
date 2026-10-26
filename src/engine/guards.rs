@@ -44,8 +44,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::{
-    domains::{AbstractDomain, StateValue, stores::AbstractEnv},
-    engine::cfg_analyzer::narrow_env_for_branch,
+    domains::{AbstractDomain, StateValue, interp::narrow_env_for_branch, stores::AbstractEnv},
     ir::{
         ComponentId, QualifiedSlot,
         bindings::local_bindings,
@@ -608,11 +607,7 @@ pub(crate) fn navigates(body: &CFG, render: &HashMap<&str, Vec<&Expr>>) -> bool 
     const BARE: &[&str] = &["navigate", "redirect"];
     const ELEMENTS: &[&str] = &["Navigate", "Redirect"];
     fn root(e: &Expr) -> Option<&str> {
-        match e.peel_ts() {
-            Expr::Var(v) => Some(v.as_str()),
-            Expr::FieldAccess { obj, .. } | Expr::IndexAccess { arr: obj, .. } => root(obj),
-            _ => None,
-        }
+        e.root_var().map(String::as_str)
     }
     struct Scan<'a> {
         body: HashMap<&'a str, Vec<&'a Expr>>,
@@ -793,16 +788,9 @@ pub fn let_bindings(cfg: &CFG) -> Bindings<'_> {
 /// The names a body mutates: the receivers of its member writes and of its
 /// mutating calls (the ADR-028 list), nested closures included.
 pub(crate) fn mutated_roots(body: &CFG) -> HashSet<Var> {
-    fn root(e: &Expr) -> Option<Var> {
-        match e.peel_ts() {
-            Expr::Var(v) => Some(v.clone()),
-            Expr::FieldAccess { obj, .. } | Expr::IndexAccess { arr: obj, .. } => root(obj),
-            _ => None,
-        }
-    }
     fn exprs(e: &Expr, out: &mut HashSet<Var>) {
-        if let Some(r) = mutation_receiver(e).and_then(root) {
-            out.insert(r);
+        if let Some(r) = mutation_receiver(e).and_then(Expr::root_var) {
+            out.insert(r.clone());
         }
         if let Expr::FnLit { body_cfg, .. } = e {
             out.extend(mutated_roots(body_cfg));
@@ -811,25 +799,14 @@ pub(crate) fn mutated_roots(body: &CFG) -> HashSet<Var> {
         e.for_each_child(&mut |c| exprs(c, out));
     }
     let mut out = HashSet::new();
-    for block in body.blocks.values() {
-        for stmt in &block.stmts {
-            match stmt {
-                Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => exprs(rhs, &mut out),
-                Stmt::MemberWrite { obj, rhs, .. } => {
-                    if let Some(r) = root(obj) {
-                        out.insert(r);
-                    }
-                    exprs(rhs, &mut out);
-                }
-                Stmt::ExprStmt(e, _) => exprs(e, &mut out),
-            }
-        }
-        match &block.term {
-            Terminator::Branch { cond, .. } => exprs(cond, &mut out),
-            Terminator::Return(e) => exprs(e, &mut out),
-            _ => {}
+    for stmt in body.blocks.values().flat_map(|b| &b.stmts) {
+        if let Stmt::MemberWrite { obj, .. } = stmt
+            && let Some(r) = obj.root_var()
+        {
+            out.insert(r.clone());
         }
     }
+    body.for_each_expr(&mut |e| exprs(e, &mut out));
     out
 }
 
@@ -1140,9 +1117,10 @@ fn written_at<'e>(written: &'e Expr, segments: &[String]) -> Option<&'e Expr> {
 /// - `t = a || b` taken FALSE  ⇒ `a` falsy ∧ `b` falsy
 /// - `t = a && b` taken TRUE   ⇒ `a` truthy ∧ `b` truthy
 ///
-/// (`??` lowers identically to `||` — the truthiness approximation is the
-/// lowering's, inherited here, not introduced.) The disjunctive polarities
-/// and anything unrecognised pass through unexpanded.
+/// `t = a ?? b` is not expanded: `!(a ?? b)` holds when `a` is a falsy
+/// non-nullish value and `b` never ran, so no conjunction over `b` follows.
+/// The disjunctive polarities and anything unrecognised pass through
+/// unexpanded.
 fn expand_guard<'a>(
     cfg: &'a CFG,
     cond: &'a Expr,
@@ -1185,29 +1163,33 @@ fn expand_guard<'a>(
                 out.push((cond, taken));
                 return;
             };
-            let diamond = !extra_bindings
-                && matches!(
-                    &cfg.blocks.get(&let_block).map(|blk| &blk.term),
-                    Some(Terminator::Branch { cond: c, then_, else_, .. })
-                        if matches!(c, Expr::Var(v) if v == t)
-                            && (*then_ == rhs_block || *else_ == rhs_block)
-                );
-            if !diamond {
+            // Which side of the branch on `t` evaluates the rhs: the true side
+            // for `&&`, the false side for `||`. (`??` branches on `t == null`,
+            // not on `t`, and is never matched here.)
+            let rhs_on_true = match &cfg.blocks.get(&let_block).map(|blk| &blk.term) {
+                Some(Terminator::Branch {
+                    cond: Expr::Var(v),
+                    then_,
+                    else_,
+                    ..
+                }) if v == t && !extra_bindings => {
+                    if *then_ == rhs_block {
+                        Some(true)
+                    } else if *else_ == rhs_block {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            let Some(rhs_on_true) = rhs_on_true else {
                 out.push((cond, taken));
                 return;
-            }
-            // Edge polarity into the rhs block: falsy evaluates the rhs for
-            // `||`/`??`, truthy for `&&`.
-            let to_rhs_kind = cfg
-                .edges
-                .iter()
-                .find(|e| e.from == let_block && e.to == rhs_block)
-                .map(|e| &e.kind);
-            let conjunctive = match to_rhs_kind {
-                Some(EdgeKind::IfFalse) => !taken, // `a || b`: guard-false ⇒ a falsy ∧ b falsy
-                Some(EdgeKind::IfTrue) => taken,   // `a && b`: guard-true  ⇒ a truthy ∧ b truthy
-                _ => false,
             };
+            // `a && b` taken true ⇒ a truthy ∧ b truthy; `a || b` taken
+            // false ⇒ a falsy ∧ b falsy.
+            let conjunctive = rhs_on_true == taken;
             if conjunctive {
                 expand_guard(cfg, a, taken, depth - 1, out);
                 expand_guard(cfg, b, taken, depth - 1, out);

@@ -29,7 +29,7 @@ pub use cfg_analyzer::analyze_cfg;
 pub use churn::{ChurnCycle, ChurnEdge, ChurnGraph, EdgeStrength};
 pub use component_cache::ComponentCache;
 pub use component_registry::{ComponentKey, ComponentRegistry};
-pub use dominance::{DominatorTree, compute_dominators, dominates, on_all_paths, rpo};
+pub use dominance::{DominatorTree, compute_dominators, dominates, on_all_paths};
 pub use eval::{ConvergedEval, Eval, eval_in_stores};
 pub use fixpoint::{
     Config, analyze_component, analyze_component_as, analyze_component_inter, analyze_program,

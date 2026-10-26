@@ -678,7 +678,7 @@ impl<'a> Analyzer<'a> {
         let mut in_env: HashMap<BlockId, Env> = HashMap::from([(cfg.entry, entry)]);
         let mut out_env: HashMap<BlockId, Env> = HashMap::new();
         let mut pc: HashMap<BlockId, Deps> = HashMap::new();
-        let order = crate::engine::rpo(cfg);
+        let order = cfg.rpo();
         let mut converged = false;
         for _ in 0..MAX_ROUNDS {
             let mut changed = false;
@@ -1110,11 +1110,7 @@ impl<'a> Analyzer<'a> {
 }
 
 fn root_var(e: &Expr) -> Option<Var> {
-    match e.peel_ts() {
-        Expr::Var(v) => Some(v.clone()),
-        Expr::FieldAccess { obj, .. } | Expr::IndexAccess { arr: obj, .. } => root_var(obj),
-        _ => None,
-    }
+    e.root_var().cloned()
 }
 
 /// The names outside a function body its writes are rooted at: an assignment
@@ -1138,34 +1134,19 @@ pub(crate) fn written_roots(params: &[Var], body: &CFG) -> HashSet<Var> {
     }
     let mut bound: HashSet<&Var> = params.iter().collect();
     let mut roots = HashSet::new();
-    for block in body.blocks.values() {
-        for stmt in &block.stmts {
-            match stmt {
-                Stmt::Let { var, rhs, .. } => {
-                    bound.insert(var);
-                    exprs(rhs, &mut roots);
-                }
-                Stmt::Assign { var, rhs, .. } => {
-                    roots.insert(var.clone());
-                    exprs(rhs, &mut roots);
-                }
-                Stmt::MemberWrite { obj, key, rhs, .. } => {
-                    if let Some(r) = root_var(obj) {
-                        roots.insert(r);
-                    }
-                    exprs(rhs, &mut roots);
-                    if let MemberKey::Index(i) = key {
-                        exprs(i, &mut roots);
-                    }
-                }
-                Stmt::ExprStmt(e, _) => exprs(e, &mut roots),
+    for stmt in body.blocks.values().flat_map(|b| &b.stmts) {
+        match stmt {
+            Stmt::Let { var, .. } => {
+                bound.insert(var);
             }
-        }
-        match &block.term {
-            Terminator::Return(e) | Terminator::Branch { cond: e, .. } => exprs(e, &mut roots),
-            _ => {}
+            Stmt::Assign { var, .. } => {
+                roots.insert(var.clone());
+            }
+            Stmt::MemberWrite { obj, .. } => roots.extend(root_var(obj)),
+            Stmt::ExprStmt(..) => {}
         }
     }
+    body.for_each_expr(&mut |e| exprs(e, &mut roots));
     roots.retain(|r| !bound.contains(r));
     roots
 }
@@ -1212,23 +1193,7 @@ pub(crate) fn param_gated_vars(params: &[Var], body: &CFG) -> HashSet<Var> {
         } else {
             &mut open
         };
-        for stmt in &block.stmts {
-            match stmt {
-                Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => collect_used_vars(rhs, out),
-                Stmt::ExprStmt(e, _) => collect_used_vars(e, out),
-                Stmt::MemberWrite { obj, key, rhs, .. } => {
-                    collect_used_vars(obj, out);
-                    collect_used_vars(rhs, out);
-                    if let MemberKey::Index(i) = key {
-                        collect_used_vars(i, out);
-                    }
-                }
-            }
-        }
-        match &block.term {
-            Terminator::Return(e) | Terminator::Branch { cond: e, .. } => collect_used_vars(e, out),
-            _ => {}
-        }
+        block.for_each_expr(&mut |e| collect_used_vars(e, out));
     }
     let free = compute_free_vars(body);
     gated

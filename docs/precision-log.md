@@ -81,6 +81,7 @@ from that session survived, and they are left as they are.
 | 2026-09-27 | the churn graph is a fold over engine rows; a write's phase decides what it can sustain | #151, #26 | 1,493 → **1,494** (0 removed, 1 added) |
 | 2026-09-27 | a convergence kill holds under every write of the slot; freshness is the reference kind's; a fresh spelling settles nothing | #154, #39, #155, #156 | 1,493 → **1,499** (0 removed, 6 added) |
 | 2026-09-27 | every write that runs is a site; a reviver that fires once revives once; `new` allocates; the URL holds still | #162, #160, #158, #161 | 1,499 → **1,498** (3 removed, 2 added; two are one line reworded) |
+| 2026-10-25 | one CFG solver for hook bodies and the closures they run; `??` branches on nullishness | #12, #21 | 1,515 → **1,518** (3 removed, 6 added; one is a line reworded) |
 
 ---
 
@@ -1507,3 +1508,45 @@ mechanism is pinned on the same shape with the hook in the file. The twenty
 line of #160 resets a jotai atom (`useAtomFamilyState`), not a state slot,
 so the co-executing write the proof needs is not a write it models. Both
 issues stay open on those residuals.
+
+## #12, #21: one CFG solver, and `??` branches on nullishness (2026-10-25)
+
+Measured on CI against the `corpus-run` artifact of main's `b5696c6` (run
+40196336463, 1,515), one run per commit: the solver (`cef8fd4`, run
+40199642003) **1,515 → 1,518, 3 removed, 6 added**; the walker and memo
+refactors (`c4c6764`, run 40215145626) and the `??` lowering (`ac7fabf`,
+run 40216025376) move nothing. Every moved line was reproduced on a sub-tree
+with both binaries, then on a synthetic file.
+
+### The claims
+
+- **One solver.** Closures, updaters, reducers and lazy initializers ran a
+  single topo-ordered pass that handed each block its predecessors' *entry*
+  envs: a binding made in the block before a branch was unbound inside it,
+  and a loop-carried value never reached the write after the loop. They now
+  run the worklist hook bodies run (`run_cfg`: RPO, narrowing, threshold
+  widening). Soundness, both directions pinned in `state_value.rs` tests.
+- **`??` is not `||`.** The kept side of `a ?? b` was narrowed truthy, so
+  `0 ?? 7` lost its `0`, and `expand_guard` read `!(a ?? b)` as "`b` falsy".
+  It branches on `t == null` now. Soundness; no corpus line rests on it.
+
+### The lines
+
+- `mantine/.../Drawer.story.tsx:227` and `Modal.story.tsx:363`,
+  `wasted-subtree-render`, **removed**: the interval writes
+  `ref.current ? 'active input ref' : 'null'`; the ternary's temp was lost
+  to the entry-env bug and the write read ⊤. Two constants re-render only on
+  a transition.
+- `twenty/.../WorkflowEditActionFilterBodyEffect.tsx` (three
+  `always-unstable-deps`, two `infinite-loop`, one of which replaces the
+  removed line-40 one with a sharper message),
+  `twenty/.../TitleInputAutoOpenEffect.tsx:26`
+  (`always-unstable-deps`), **added**: visit order. The FIFO worklist ran
+  a `??` join block first on a partial env; the child was analysed under
+  those props and the second evaluation hit `ComponentCache`, whose key
+  ignores the heap. The RPO worklist runs the block once, on the full env.
+  The first file's member read also rests on an imprecision that predates
+  this: after `filter ?? { stepFilters: [] }` the variable's sites are the
+  literal's alone, so `defaultValue.stepFilters` reads the literal's `[]`
+  and not the other path's value. Both are listed in the PR as debt to fix
+  at their root (`join_locs`, the cache key).

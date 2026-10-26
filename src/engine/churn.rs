@@ -88,7 +88,6 @@ use crate::{
         cfg::{CFG, Terminator},
         expr::{CompOrigin, Expr, SPREAD_KEY_PREFIX, object_member},
         hooks::{Arity, HookEntry},
-        stmt::Stmt,
         types::{BlockId, HookLabel, Symbol, Var},
     },
 };
@@ -423,19 +422,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     }
                 });
             };
-            for stmt in &block.stmts {
-                match stmt {
-                    Stmt::Let { rhs, .. }
-                    | Stmt::Assign { rhs, .. }
-                    | Stmt::MemberWrite { rhs, .. } => visit(rhs),
-                    Stmt::ExprStmt(e, _) => visit(e),
-                }
-            }
-            match &block.term {
-                Terminator::Return(e) => visit(e),
-                Terminator::Branch { cond, .. } => visit(cond),
-                _ => {}
-            }
+            block.for_each_expr(&mut visit);
         }
         found && ok
     }

@@ -6,7 +6,7 @@ use crate::{
     domains::{
         AbstractDomain, AnalysisCtx, Transfer,
         impls::{BoolVal, Interval, SetterVal, Stability, StateValue, StrConst},
-        interp::{exec_expr_effects, exec_stmt_with_callbacks},
+        interp::exec_stmt_with_callbacks,
         stores::{AbstractEnv, EnvVal, Heap, HeapValue, resolve_locs},
     },
     engine::component_registry::ChildLookup,
@@ -42,15 +42,6 @@ impl Transfer for StateValueTransfer {
         ctx: &mut AnalysisCtx<StateValue>,
     ) {
         exec_stmt_with_callbacks(self, stmt, env, ctx);
-    }
-
-    fn exec_expr_effects(
-        &self,
-        expr: &Expr,
-        env: &mut AbstractEnv<StateValue>,
-        ctx: &mut AnalysisCtx<StateValue>,
-    ) {
-        exec_expr_effects(self, expr, env, ctx, 0);
     }
 
     fn recompute_memo(
@@ -1069,13 +1060,13 @@ mod tests {
 
     #[test]
     fn eval_int_literal() {
-        let (env, mut state, mut memo) = empty();
+        let (env, mut state, memo) = empty();
         let mut heap = Heap::new();
         assert_eq!(
             StateValueTransfer.eval_expr(
                 &Expr::Lit(Prim::Int(5)),
                 &env,
-                &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap),
+                &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
             ),
             StateValue::number(Interval::point(5.0))
         );
@@ -1083,13 +1074,13 @@ mod tests {
 
     #[test]
     fn eval_bool_literal() {
-        let (env, mut state, mut memo) = empty();
+        let (env, mut state, memo) = empty();
         let mut heap = Heap::new();
         assert_eq!(
             StateValueTransfer.eval_expr(
                 &Expr::Lit(Prim::Bool(true)),
                 &env,
-                &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap),
+                &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
             ),
             StateValue::boolean(BoolVal::True)
         );
@@ -1097,7 +1088,7 @@ mod tests {
 
     #[test]
     fn eval_object_is_unstable_reference() {
-        let (env, mut state, mut memo) = empty();
+        let (env, mut state, memo) = empty();
         let mut heap = Heap::new();
         assert_eq!(
             StateValueTransfer.eval_expr(
@@ -1106,7 +1097,7 @@ mod tests {
                     fields: vec![]
                 },
                 &env,
-                &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap),
+                &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
             ),
             StateValue::reference(Stability::PerRender)
         );
@@ -1114,7 +1105,7 @@ mod tests {
 
     #[test]
     fn eval_binop_add_numbers() {
-        let (env, mut state, mut memo) = empty();
+        let (env, mut state, memo) = empty();
         let mut heap = Heap::new();
         let expr = Expr::BinOp {
             op: BinOp::Add,
@@ -1125,7 +1116,7 @@ mod tests {
             StateValueTransfer.eval_expr(
                 &expr,
                 &env,
-                &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap)
+                &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap)
             ),
             StateValue::number(Interval::point(7.0))
         );
@@ -1133,7 +1124,7 @@ mod tests {
 
     #[test]
     fn eval_binop_add_state_plus_one_uses_state_interval() {
-        let (env, mut state, mut memo) = empty();
+        let (env, mut state, memo) = empty();
         state.update(0, StateValue::number(Interval::point(2.0)));
         let mut heap = Heap::new();
         let expr = Expr::BinOp {
@@ -1145,7 +1136,7 @@ mod tests {
             StateValueTransfer.eval_expr(
                 &expr,
                 &env,
-                &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap)
+                &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap)
             ),
             StateValue::number(Interval::point(3.0))
         );
@@ -1366,7 +1357,7 @@ mod tests {
 
     #[test]
     fn eval_unary_not_true_is_false() {
-        let (env, mut state, mut memo) = empty();
+        let (env, mut state, memo) = empty();
         let mut heap = Heap::new();
         let expr = Expr::UnaryOp {
             op: UnaryOp::Not,
@@ -1376,7 +1367,7 @@ mod tests {
             StateValueTransfer.eval_expr(
                 &expr,
                 &env,
-                &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap)
+                &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap)
             ),
             StateValue::boolean(BoolVal::False)
         );
@@ -1384,12 +1375,12 @@ mod tests {
 
     #[test]
     fn eval_string_literal_gives_singleton() {
-        let (env, mut state, mut memo) = empty();
+        let (env, mut state, memo) = empty();
         let mut heap = Heap::new();
         let v = StateValueTransfer.eval_expr(
             &Expr::Lit(Prim::String("dark".into())),
             &env,
-            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
         );
         assert_eq!(v, StateValue::str_singleton("dark".to_string()));
     }
@@ -1443,7 +1434,7 @@ mod tests {
 
     #[test]
     fn exec_setter_call_updates_state() {
-        let (mut env, mut state, mut memo) = empty();
+        let (mut env, mut state, memo) = empty();
         let mut heap = Heap::new();
         StateValueTransfer.exec_stmt(
             &Stmt::Let {
@@ -1452,7 +1443,7 @@ mod tests {
                 span: None,
             },
             &mut env,
-            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
         );
         StateValueTransfer.exec_stmt(
             &Stmt::ExprStmt(
@@ -1463,7 +1454,7 @@ mod tests {
                 None,
             ),
             &mut env,
-            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
         );
         assert_eq!(state.get(0), StateValue::number(Interval::point(42.0)));
     }
@@ -1472,7 +1463,7 @@ mod tests {
 
     #[test]
     fn functional_updater_increments_state() {
-        let (mut env, mut state, mut memo) = empty();
+        let (mut env, mut state, memo) = empty();
         state.update(0, StateValue::number(Interval::point(5.0)));
         env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
@@ -1500,7 +1491,7 @@ mod tests {
                 None,
             ),
             &mut env,
-            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
         );
 
         assert_eq!(
@@ -1515,7 +1506,7 @@ mod tests {
 
     #[test]
     fn functional_updater_branch_joins() {
-        let (mut env, mut state, mut memo) = empty();
+        let (mut env, mut state, memo) = empty();
         state.update(0, StateValue::number(Interval::point(3.0)));
         env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
@@ -1581,7 +1572,7 @@ mod tests {
                 None,
             ),
             &mut env,
-            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
         );
 
         assert_eq!(
@@ -1595,10 +1586,10 @@ mod tests {
     }
 
     #[test]
-    fn back_edge_in_fnlit_body_returns_top() {
-        // A back edge conservatively joins the return value to Top. This empty
-        // self-loop has no statements, so it exercises the forced-Top-on-back-edge
-        // path with no side effects.
+    fn a_body_no_run_returns_from_has_no_return_value() {
+        // `while (true) {}`: no run reaches a `return`, so the body returns
+        // nothing — ⊥, the value of a call that never completes. The loop is
+        // solved like any other, not read as ⊤ because it is a loop.
         let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
             0,
@@ -1621,16 +1612,16 @@ mod tests {
         let mut entry_env = AbstractEnv::new();
         entry_env.extend("c".to_string(), StateValue::number(Interval::point(0.0)));
         let mut state = StateStore::bottom();
-        let mut memo = MemoStore::new();
+        let memo = MemoStore::new();
 
         let mut heap = Heap::new();
         let result = exec_body(
             &StateValueTransfer,
             &body_cfg,
             &entry_env,
-            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
         );
-        assert_eq!(result, StateValue::top());
+        assert_eq!(result, StateValue::bottom());
     }
 
     /// Build a `while`-shaped body CFG (`pre → header ⇄ body`; `header → exit`)
@@ -1716,7 +1707,7 @@ mod tests {
     fn setter_in_while_loop_in_body_fires() {
         // A setter inside a while-loop body must fire (side-effect traversal) even
         // though the body has a back edge; the body's return value is Top.
-        let (mut env, mut state, mut memo) = empty();
+        let (mut env, mut state, memo) = empty();
         state.update(0, StateValue::number(Interval::point(0.0)));
         env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
@@ -1735,7 +1726,7 @@ mod tests {
             &StateValueTransfer,
             &body_cfg,
             &env,
-            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
         );
 
         // setN(state[0] + 1) fired once → state[0] grew off the initial point.
@@ -1747,15 +1738,128 @@ mod tests {
                 is_int: true
             })
         );
-        // Back edge present → return value conservatively Top.
-        assert_eq!(ret, StateValue::top());
+        // The exit block returns `undefined`, loop or no loop.
+        assert_eq!(ret, StateValue::undefined());
+    }
+
+    /// `let acc = 0; while (…) acc = acc + 1; setN(acc)` in a callback: the
+    /// write after the loop stores every value the loop may leave in `acc`,
+    /// not the one a single pass computes (#21). The single-pass interpreter
+    /// stored `[0, 1]`.
+    #[test]
+    fn a_loop_carried_value_reaches_the_write_after_the_loop() {
+        let (mut env, mut state, memo) = empty();
+        env.bind_setter("setN".to_string(), 0);
+        let mut body_cfg = while_loop_body(vec![Stmt::Assign {
+            var: "acc".to_string(),
+            rhs: Expr::BinOp {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Var("acc".to_string())),
+                rhs: Box::new(Expr::Lit(Prim::Int(1))),
+            },
+            span: None,
+        }]);
+        body_cfg.blocks.get_mut(&0).unwrap().stmts = vec![Stmt::Let {
+            var: "acc".to_string(),
+            rhs: Expr::Lit(Prim::Int(0)),
+            span: None,
+        }];
+        body_cfg.blocks.get_mut(&3).unwrap().stmts =
+            vec![setter_call("setN", Expr::Var("acc".to_string()))];
+
+        let mut heap = Heap::new();
+        exec_body(
+            &StateValueTransfer,
+            &body_cfg,
+            &env,
+            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
+        );
+
+        assert_eq!(
+            state.get(0),
+            StateValue::number(Interval {
+                lo: 0.0,
+                hi: f64::INFINITY,
+                is_int: true
+            })
+        );
+    }
+
+    /// `const s = setN; if (c) s(7)` in a callback: the branch block sees the
+    /// alias its predecessor bound. The single-pass interpreter handed a
+    /// block its predecessors' *entry* envs, so `s` was unbound there and the
+    /// write vanished.
+    #[test]
+    fn a_setter_alias_bound_before_a_branch_writes_inside_it() {
+        let (mut env, mut state, memo) = empty();
+        env.bind_setter("setN".to_string(), 0);
+        let mut blocks = std::collections::BTreeMap::new();
+        blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![Stmt::Let {
+                    var: "s".to_string(),
+                    rhs: Expr::Var("setN".to_string()),
+                    span: None,
+                }],
+                term: Terminator::Branch {
+                    span: None,
+                    cond: Expr::Var("c".to_string()),
+                    then_: 1,
+                    else_: 2,
+                },
+            },
+        );
+        blocks.insert(
+            1,
+            BasicBlock {
+                id: 1,
+                stmts: vec![setter_call("s", Expr::Lit(Prim::Int(7)))],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
+        );
+        blocks.insert(
+            2,
+            BasicBlock {
+                id: 2,
+                stmts: vec![],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
+        );
+        let body_cfg = CFG {
+            entry: 0,
+            blocks,
+            edges: vec![
+                Edge {
+                    from: 0,
+                    to: 1,
+                    kind: EdgeKind::IfTrue,
+                },
+                Edge {
+                    from: 0,
+                    to: 2,
+                    kind: EdgeKind::IfFalse,
+                },
+            ],
+        };
+
+        let mut heap = Heap::new();
+        exec_body(
+            &StateValueTransfer,
+            &body_cfg,
+            &env,
+            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
+        );
+
+        assert_eq!(state.get(0), StateValue::number(Interval::point(7.0)));
     }
 
     #[test]
     fn setter_in_for_loop_in_body_fires() {
         // `for`-shaped body (pre → header ⇄ body → update → header; header → exit).
         // The setter in the body block must fire despite the back edge.
-        let (mut env, mut state, mut memo) = empty();
+        let (mut env, mut state, memo) = empty();
         state.update(0, StateValue::number(Interval::point(0.0)));
         env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
@@ -1850,7 +1954,7 @@ mod tests {
             &StateValueTransfer,
             &body_cfg,
             &env,
-            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
         );
 
         assert_eq!(
@@ -1861,15 +1965,16 @@ mod tests {
                 is_int: true
             })
         );
-        assert_eq!(ret, StateValue::top());
+        assert_eq!(ret, StateValue::undefined());
     }
 
     #[test]
-    fn functional_updater_with_loop_returns_top_and_inner_setter_fires() {
+    fn functional_updater_with_loop_returns_its_value_and_inner_setter_fires() {
         // setN(c => { while (..) { setOther(1) }; return c + 1 })
-        // The body has a back edge → the functional-updater result is Top (state 0
-        // → Top), but the inner setOther for state 1 still fires.
-        let (mut env, mut state, mut memo) = empty();
+        // The loop does not touch `c`, so the updater returns `c + 1` — the
+        // back edge is solved, not read as ⊤ — and the inner setOther for
+        // state 1 fires.
+        let (mut env, mut state, memo) = empty();
         state.update(0, StateValue::number(Interval::point(5.0)));
         env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
@@ -1901,11 +2006,18 @@ mod tests {
                 None,
             ),
             &mut env,
-            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
         );
 
-        // Functional updater body has a back edge → its return value is Top.
-        assert_eq!(state.get(0), StateValue::top());
+        // c = 5, the updater returns 6 → state[0] = join(5, 6).
+        assert_eq!(
+            state.get(0),
+            StateValue::number(Interval {
+                lo: 5.0,
+                hi: 6.0,
+                is_int: true
+            })
+        );
         // The inner setOther(1) fired during the side-effect traversal.
         assert_eq!(state.get(1), StateValue::number(Interval::point(1.0)));
     }
@@ -1914,7 +2026,7 @@ mod tests {
 
     #[test]
     fn then_callback_updates_state() {
-        let (mut env, mut state, mut memo) = empty();
+        let (mut env, mut state, memo) = empty();
         state.update(0, StateValue::number(Interval::point(0.0)));
         env.bind_setter("setUser".to_string(), 0);
         env.extend(
@@ -1953,7 +2065,7 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &stmt,
             &mut env,
-            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
         );
 
         assert_eq!(state.get(0), StateValue::top());
@@ -1961,7 +2073,7 @@ mod tests {
 
     #[test]
     fn set_timeout_callback_updates_state() {
-        let (mut env, mut state, mut memo) = empty();
+        let (mut env, mut state, memo) = empty();
         env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
 
@@ -1993,7 +2105,7 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &stmt,
             &mut env,
-            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
         );
 
         assert_eq!(state.get(0), StateValue::number(Interval::point(42.0)));
@@ -2001,7 +2113,7 @@ mod tests {
 
     #[test]
     fn then_chain_descends_both_callbacks() {
-        let (mut env, mut state, mut memo) = empty();
+        let (mut env, mut state, memo) = empty();
         env.bind_setter("setA".to_string(), 0);
         env.extend("setA".to_string(), StateValue::reference(Stability::Stable));
         env.bind_setter("setB".to_string(), 1);
@@ -2053,7 +2165,7 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &Stmt::ExprStmt(outer, None),
             &mut env,
-            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
         );
 
         assert_eq!(state.get(0), StateValue::number(Interval::point(1.0)));
@@ -2062,7 +2174,7 @@ mod tests {
 
     #[test]
     fn then_in_let_binding_descends() {
-        let (mut env, mut state, mut memo) = empty();
+        let (mut env, mut state, memo) = empty();
         env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
 
@@ -2098,7 +2210,7 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &stmt,
             &mut env,
-            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
         );
 
         assert_eq!(state.get(0), StateValue::number(Interval::point(7.0)));
@@ -2106,7 +2218,7 @@ mod tests {
 
     #[test]
     fn subscription_callback_not_descended() {
-        let (mut env, mut state, mut memo) = empty();
+        let (mut env, mut state, memo) = empty();
         env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
 
@@ -2141,7 +2253,7 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &stmt,
             &mut env,
-            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
         );
 
         assert_eq!(state.get(0), StateValue::bottom());
@@ -2149,7 +2261,7 @@ mod tests {
 
     #[test]
     fn then_both_args_descended() {
-        let (mut env, mut state, mut memo) = empty();
+        let (mut env, mut state, memo) = empty();
         env.bind_setter("setA".to_string(), 0);
         env.extend("setA".to_string(), StateValue::reference(Stability::Stable));
         env.bind_setter("setB".to_string(), 1);
@@ -2200,7 +2312,7 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &stmt,
             &mut env,
-            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
         );
 
         assert_eq!(state.get(0), StateValue::number(Interval::point(1.0)));
@@ -2209,7 +2321,7 @@ mod tests {
 
     #[test]
     fn promise_all_settled_then_cb_descended() {
-        let (mut env, mut state, mut memo) = empty();
+        let (mut env, mut state, memo) = empty();
         env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
 
@@ -2252,7 +2364,7 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &stmt,
             &mut env,
-            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
         );
 
         assert_eq!(state.get(0), StateValue::number(Interval::point(42.0)));
@@ -2262,7 +2374,7 @@ mod tests {
 
     #[test]
     fn var_callback_updates_state() {
-        let (mut env, mut state, mut memo) = empty();
+        let (mut env, mut state, memo) = empty();
         env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
 
@@ -2297,12 +2409,12 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &let_cb,
             &mut env,
-            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
         );
         StateValueTransfer.exec_stmt(
             &call,
             &mut env,
-            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
         );
 
         assert_eq!(state.get(0), StateValue::number(Interval::point(42.0)));
@@ -2310,7 +2422,7 @@ mod tests {
 
     #[test]
     fn var_callback_not_descended_without_loc() {
-        let (mut env, mut state, mut memo) = empty();
+        let (mut env, mut state, memo) = empty();
         env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
 
@@ -2345,7 +2457,7 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &call,
             &mut env,
-            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
         );
 
         assert_eq!(state.get(0), StateValue::bottom());
@@ -2355,7 +2467,7 @@ mod tests {
 
     #[test]
     fn direct_local_call_inlined() {
-        let (mut env, mut state, mut memo) = empty();
+        let (mut env, mut state, memo) = empty();
         env.bind_setter("setUser".to_string(), 0);
         env.extend(
             "setUser".to_string(),
@@ -2393,12 +2505,12 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &let_load,
             &mut env,
-            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
         );
         StateValueTransfer.exec_stmt(
             &call_load,
             &mut env,
-            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
         );
 
         assert_eq!(state.get(0), StateValue::number(Interval::point(7.0)));
@@ -2406,7 +2518,7 @@ mod tests {
 
     #[test]
     fn set_interval_var_callback_updates_state() {
-        let (mut env, mut state, mut memo) = empty();
+        let (mut env, mut state, memo) = empty();
         env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
 
@@ -2440,19 +2552,19 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &let_cb,
             &mut env,
-            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
         );
         StateValueTransfer.exec_stmt(
             &call,
             &mut env,
-            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
         );
         assert_eq!(state.get(0), StateValue::number(Interval::point(5.0)));
     }
 
     #[test]
     fn for_each_var_callback_updates_state() {
-        let (mut env, mut state, mut memo) = empty();
+        let (mut env, mut state, memo) = empty();
         env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
 
@@ -2489,19 +2601,19 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &let_update,
             &mut env,
-            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
         );
         StateValueTransfer.exec_stmt(
             &call,
             &mut env,
-            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
         );
         assert_eq!(state.get(0), StateValue::number(Interval::point(3.0)));
     }
 
     #[test]
     fn nested_var_callbacks_both_executed() {
-        let (mut env, mut state, mut memo) = empty();
+        let (mut env, mut state, memo) = empty();
         env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
 
@@ -2557,24 +2669,24 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &let_inner,
             &mut env,
-            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
         );
         StateValueTransfer.exec_stmt(
             &let_outer,
             &mut env,
-            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
         );
         StateValueTransfer.exec_stmt(
             &call_outer,
             &mut env,
-            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
         );
         assert_eq!(state.get(0), StateValue::number(Interval::point(9.0)));
     }
 
     #[test]
     fn depth_limit_stops_deep_inlining() {
-        let (mut env, mut state, mut memo) = empty();
+        let (mut env, mut state, memo) = empty();
         env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
 
@@ -2653,7 +2765,7 @@ mod tests {
             StateValueTransfer.exec_stmt(
                 stmt,
                 &mut env,
-                &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap),
+                &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
             );
         }
         assert_eq!(state.get(0), StateValue::bottom());
@@ -2665,7 +2777,7 @@ mod tests {
         // a loop (back edge). Loop bodies are traversed, so the test confirms (a) it
         // terminates and (b) MAX_INLINE_DEPTH still caps the chain: setN at depth 4
         // is never reached → state stays Bottom.
-        let (mut env, mut state, mut memo) = empty();
+        let (mut env, mut state, memo) = empty();
         env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
 
@@ -2734,7 +2846,7 @@ mod tests {
             StateValueTransfer.exec_stmt(
                 stmt,
                 &mut env,
-                &mut AnalysisCtx::null(crate::test_support::C, &mut state, &mut memo, &mut heap),
+                &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
             );
         }
         assert_eq!(state.get(0), StateValue::bottom());

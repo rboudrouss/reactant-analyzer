@@ -20,11 +20,11 @@ use std::collections::HashMap;
 use crate::{
     domains::{
         AbstractDomain, AnalysisCtx, Stability, StateValue, StateValueTransfer, Transfer,
+        interp::{entry_env_of, exit_env_of},
         stores::{AbstractEnv, Heap, MemoStore, StateStore},
     },
     engine::{
         Reducer,
-        cfg_analyzer::entry_env_of,
         setters::{Updater, WriterRegion},
     },
     ir::{
@@ -273,9 +273,8 @@ impl SiteEnvs<'_> {
         expr: &Expr,
     ) -> StateValue {
         let mut state = self.state.clone();
-        let mut memo = self.memo.clone();
         let mut heap = self.heap.clone();
-        let mut ac = AnalysisCtx::null(self.component, &mut state, &mut memo, &mut heap);
+        let mut ac = AnalysisCtx::null(self.component, &mut state, self.memo, &mut heap);
         let env = self.env_at(region, cfg, at, &mut ac);
         StateValueTransfer.eval_expr(expr, &env, &mut ac)
     }
@@ -296,7 +295,7 @@ impl SiteEnvs<'_> {
         };
         let (Some((block, stmt)), Some(exits)) = (at, exits) else {
             return exits
-                .and_then(|ex| region_exit(cfg, ex))
+                .and_then(|ex| exit_env_of(cfg, ex))
                 .unwrap_or_else(|| self.exit.clone());
         };
         let mut env = entry_env_of(cfg, block, entry, exits);
@@ -307,20 +306,6 @@ impl SiteEnvs<'_> {
         }
         env
     }
-}
-
-/// The join of a body's return blocks' exit envs — what `AnalysisResult::
-/// exit_env` computes for the render CFG, for any CFG whose exits were kept.
-fn region_exit(
-    cfg: &CFG,
-    exits: &HashMap<BlockId, AbstractEnv<StateValue>>,
-) -> Option<AbstractEnv<StateValue>> {
-    cfg.blocks
-        .values()
-        .filter(|b| matches!(b.term, Terminator::Return(_)))
-        .filter_map(|b| exits.get(&b.id))
-        .cloned()
-        .reduce(|acc, env| acc.join(&env))
 }
 
 #[cfg(test)]

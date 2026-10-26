@@ -2,8 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     domains::{
-        AbstractDomain, AnalysisCtx, AnalyzeChildFn, FixpointCtx, Heap, InterCtx, NullCtx,
-        Transfer,
+        AbstractDomain, AnalysisCtx, AnalyzeChildFn, FixpointCtx, Heap, InterCtx, Transfer,
         impls::{Stability, StateValue},
         stores::{AbstractEnv, MemoStore, StateStore},
     },
@@ -163,9 +162,9 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     // program point, so it is the only binding that may be seeded there.
     let module_env = {
         let mut seed_state = StateStore::bottom();
-        let mut seed_memo: MemoStore<StateValue> = MemoStore::new();
+        let seed_memo: MemoStore<StateValue> = MemoStore::new();
         let mut seed_heap = crate::domains::Heap::new();
-        let mut ac = AnalysisCtx::null(comp_id, &mut seed_state, &mut seed_memo, &mut seed_heap);
+        let mut ac = AnalysisCtx::null(comp_id, &mut seed_state, &seed_memo, &mut seed_heap);
         let empty_env = AbstractEnv::bottom();
         let mut env = AbstractEnv::bottom();
         for (name, init) in module_consts.iter() {
@@ -240,9 +239,9 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     let custom_arg_returns: HashMap<(HookLabel, usize), StateValue> = {
         let mut out = HashMap::new();
         let mut seed_state = StateStore::bottom();
-        let mut seed_memo: MemoStore<StateValue> = MemoStore::new();
+        let seed_memo: MemoStore<StateValue> = MemoStore::new();
         let mut seed_heap = crate::domains::Heap::new();
-        let mut ac = AnalysisCtx::null(comp_id, &mut seed_state, &mut seed_memo, &mut seed_heap);
+        let mut ac = AnalysisCtx::null(comp_id, &mut seed_state, &seed_memo, &mut seed_heap);
         for hook in &hooks {
             let HookEntry::Custom { label, args, .. } = hook else {
                 continue;
@@ -308,6 +307,41 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         inter,
     );
 
+    // Every pass below runs one body through the one solver over the stores
+    // of the current iteration. What a pass varies is the body, its entry
+    // env, the state it starts from and whether it analyses children; what
+    // the fixpoint knows beyond the body's syntax (callback bodies, reducers)
+    // and how loops widen are the same for all of them.
+    let query = FixpointCtx {
+        callbacks: &callback_bodies,
+        reducers: &reducers,
+    };
+    let widening = crate::domains::Widening {
+        after: config.widen_threshold,
+        thresholds: &thresholds,
+    };
+    let pass = |cfg: &CFG,
+                entry: AbstractEnv<StateValue>,
+                state: &StateStore<StateValue>,
+                memo: &MemoStore<StateValue>,
+                heap: &mut Heap,
+                children: bool| {
+        let mut out = state.clone();
+        let envs = {
+            let mut ac = AnalysisCtx {
+                component: comp_id,
+                state: &mut out,
+                memo,
+                heap,
+                query: &query,
+                inter: inter.filter(|_| children),
+                widening,
+            };
+            analyze_cfg(transfer, cfg, entry, &mut ac)
+        };
+        (envs, out)
+    };
+
     // Fixpoint carrier: the product StateValue tracks every JS kind per label
     // (ADR-015), so one store holds all slots — no per-type sub-store dispatch.
     let mut state: StateStore<StateValue> = StateStore::bottom();
@@ -331,19 +365,12 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     {
         let init_env = initial_env.clone();
         let init_memo = MemoStore::new();
-        let init_untyped = StateStore::bottom();
         for hook in &hooks {
             if let HookEntry::State { label, init, .. } = hook {
                 let init_val = {
-                    let mut init_untyped_mut = init_untyped.clone();
-                    let mut init_memo_mut = init_memo.clone();
+                    let mut init_state = StateStore::bottom();
                     let mut heap = crate::domains::Heap::new();
-                    let mut ac = AnalysisCtx::null(
-                        comp_id,
-                        &mut init_untyped_mut,
-                        &mut init_memo_mut,
-                        &mut heap,
-                    );
+                    let mut ac = AnalysisCtx::null(comp_id, &mut init_state, &init_memo, &mut heap);
                     // A null/undefined init needs no TS-hint override: the product
                     // value joins the null slot with whatever the setters write,
                     // and the num slot widens independently.
@@ -371,27 +398,14 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
 
         // ── Render pass ───────────────────────────────────────────────────────
         // Use initial_env as entry: child analyses start with props bound.
-        let (bs, state_from_render) = {
-            let ctx = FixpointCtx {
-                state: &state_store,
-                memo: &memo_store,
-                callbacks: &callback_bodies,
-                reducers: &reducers,
-            };
-            analyze_cfg::<T>(
-                comp_id,
-                &render_cfg,
-                initial_env.clone(),
-                &state_store,
-                &memo_store,
-                transfer,
-                config.widen_threshold,
-                &thresholds,
-                &mut heap,
-                &ctx,
-                inter,
-            )
-        };
+        let (bs, state_from_render) = pass(
+            &render_cfg,
+            initial_env.clone(),
+            &state_store,
+            &memo_store,
+            &mut heap,
+            true,
+        );
         block_states = bs;
 
         // ── Recompute memo store from exit env ────────────────────────────────
@@ -402,14 +416,14 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         // fixpoint converges any memo-to-memo dependency across iterations.
         env_exit = exit_env(&render_cfg, &block_states);
         let memo_updates: Vec<(HookLabel, StateValue)> = {
-            let null_query = NullCtx;
             let mut memo_ctx = AnalysisCtx {
                 component: comp_id,
                 state: &mut state_store,
-                memo: &mut memo_store,
+                memo: &memo_store,
                 heap: &mut heap,
-                query: &null_query,
+                query: &query,
                 inter,
+                widening,
             };
             hooks
                 .iter()
@@ -435,27 +449,14 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 label, body_cfg, ..
             } = hook
             {
-                let (eff_bs, eff_state) = {
-                    let ctx = FixpointCtx {
-                        state: &state_store,
-                        memo: &memo_store,
-                        callbacks: &callback_bodies,
-                        reducers: &reducers,
-                    };
-                    analyze_cfg::<T>(
-                        comp_id,
-                        body_cfg,
-                        env_exit.clone(),
-                        &state_store,
-                        &memo_store,
-                        transfer,
-                        config.widen_threshold,
-                        &thresholds,
-                        &mut heap,
-                        &ctx,
-                        inter,
-                    )
-                };
+                let (eff_bs, eff_state) = pass(
+                    body_cfg,
+                    env_exit.clone(),
+                    &state_store,
+                    &memo_store,
+                    &mut heap,
+                    true,
+                );
                 effect_block_states.insert(*label, eff_bs);
                 for slot in eff_state.labels() {
                     slot_writers.entry(slot).or_default().push(*label);
@@ -473,27 +474,14 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 label, body_cfg, ..
             } = hook
             {
-                let (h_bs, h_state) = {
-                    let ctx = FixpointCtx {
-                        state: &state_store,
-                        memo: &memo_store,
-                        callbacks: &callback_bodies,
-                        reducers: &reducers,
-                    };
-                    analyze_cfg::<T>(
-                        comp_id,
-                        body_cfg,
-                        env_exit.clone(),
-                        &state_store,
-                        &memo_store,
-                        transfer,
-                        config.widen_threshold,
-                        &thresholds,
-                        &mut heap,
-                        &ctx,
-                        inter,
-                    )
-                };
+                let (h_bs, h_state) = pass(
+                    body_cfg,
+                    env_exit.clone(),
+                    &state_store,
+                    &memo_store,
+                    &mut heap,
+                    true,
+                );
                 handler_block_states.insert(*label, h_bs);
                 state_from_handlers = state_from_handlers.join(&h_state);
             }
@@ -557,24 +545,13 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     // `inter` is `None`: this re-evaluates and re-allocates, it does not
     // re-analyze children (same choice as the effect re-run below).
     {
-        let refresh_ctx = FixpointCtx {
-            state: &state,
-            memo: &memo_store,
-            callbacks: &callback_bodies,
-            reducers: &reducers,
-        };
-        let (bs, _) = analyze_cfg::<T>(
-            comp_id,
+        let (bs, _) = pass(
             &render_cfg,
             initial_env.clone(),
             &state,
             &memo_store,
-            transfer,
-            config.widen_threshold,
-            &thresholds,
             &mut heap,
-            &refresh_ctx,
-            None,
+            false,
         );
         block_states = bs;
         env_exit = exit_env(&render_cfg, &block_states);
@@ -585,28 +562,17 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     // actually wrote. InfiniteLoop uses this to distinguish bounded growth (narrowing
     // held: `[1,10]`) from true divergence (`[1,+∞)`).
     let final_state = state;
-    let final_ctx = FixpointCtx {
-        state: &final_state,
-        memo: &memo_store,
-        callbacks: &callback_bodies,
-        reducers: &reducers,
-    };
     let bottom_state: StateStore<StateValue> = StateStore::bottom();
     let mut effect_setter_writes: StateStore<StateValue> = StateStore::bottom();
     for hook in &hooks {
         if let HookEntry::Effect { body_cfg, .. } = hook {
-            let (_, pure_writes) = analyze_cfg::<T>(
-                comp_id,
+            let (_, pure_writes) = pass(
                 body_cfg,
                 env_exit.clone(),
                 &bottom_state,
                 &memo_store,
-                transfer,
-                config.widen_threshold,
-                &thresholds,
                 &mut heap,
-                &final_ctx,
-                None,
+                false,
             );
             effect_setter_writes = effect_setter_writes.join(&pure_writes);
         }
@@ -646,20 +612,14 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     );
     // The seed relation rides the same slice: it folds `slot_writers` rows and
     // the effects' declared deps, so it must come after both (#106, ADR-031).
-    let slot_seeds = {
-        let mut labels = crate::engine::setters::setter_var_labels(&render_cfg);
-        for cfg in std::iter::once(&render_cfg).chain(hooks.iter().filter_map(|h| h.body_cfg())) {
-            labels = crate::engine::setters::resolve_setter_aliases(cfg, &labels);
-        }
-        crate::engine::seeds::collect_slot_seeds(
-            &render_cfg,
-            &hooks,
-            &comp_param,
-            &labels,
-            &slot_writers,
-            &effect_info,
-        )
-    };
+    let slot_seeds = crate::engine::seeds::collect_slot_seeds(
+        &render_cfg,
+        &hooks,
+        &comp_param,
+        &crate::engine::setters::setter_labels_of(&render_cfg, &hooks),
+        &slot_writers,
+        &effect_info,
+    );
     // The registration relation rides the same slice (#111, ADR-034): one
     // scan of the effect bodies, read by `stale-closure`, `missing-cleanup`
     // and the Tier-A `registrations` anchor alike.
@@ -1255,23 +1215,9 @@ fn exit_env<D: AbstractDomain>(
     cfg: &CFG,
     block_states: &HashMap<BlockId, AbstractEnv<D>>,
 ) -> AbstractEnv<D> {
-    cfg.blocks
-        .values()
-        .filter(|b| matches!(b.term, crate::ir::cfg::Terminator::Return(_)))
-        .filter_map(|b| block_states.get(&b.id))
-        .cloned()
-        .reduce(|acc, env| acc.join(&env))
-        .unwrap_or_else(AbstractEnv::bottom)
+    crate::domains::interp::exit_env_of(cfg, block_states).unwrap_or_else(AbstractEnv::bottom)
 }
 
-/// Scan `render_cfg` for hook-related expressions and build `HookCallInfo` list.
-///
-/// Every extracted hook leaves its label in the render CFG at its call site —
-/// value-bearing kinds via their binding expression (`StateVal`, `MemoVal`, …),
-/// void kinds via `Expr::HookMarker` — so `block_id` is recovered by scanning
-/// the final CFG (positions survive inlining and block renumbering). A label
-/// with no CFG occurrence (Handler entries, markers lost to a transformation)
-/// falls back to `cfg.entry`.
 /// Retag the `HookMarker(label, _)` in `cfg` as reading the given summary.
 ///
 /// Walks all blocks: the call site may be a plain binding or a bare statement,
@@ -1302,6 +1248,14 @@ fn retag_marker(cfg: &mut CFG, label: HookLabel, sv: crate::ir::expr::SummaryVal
     }
 }
 
+/// Scan `render_cfg` for hook-related expressions and build `HookCallInfo` list.
+///
+/// Every extracted hook leaves its label in the render CFG at its call site —
+/// value-bearing kinds via their binding expression (`StateVal`, `MemoVal`, …),
+/// void kinds via `Expr::HookMarker` — so `block_id` is recovered by scanning
+/// the final CFG (positions survive inlining and block renumbering). A label
+/// with no CFG occurrence (Handler entries, markers lost to a transformation)
+/// falls back to `cfg.entry`.
 fn collect_hook_calls(hooks: &[HookEntry], cfg: &CFG) -> Vec<HookCallInfo> {
     // Build label → kind and label → span maps from hook entries.
     let label_to_kind: HashMap<HookLabel, HookKind> = hooks
@@ -1317,18 +1271,8 @@ fn collect_hook_calls(hooks: &[HookEntry], cfg: &CFG) -> Vec<HookCallInfo> {
         })
         .collect();
 
-    let label_to_span: HashMap<HookLabel, Option<crate::ir::SourceRange>> = hooks
-        .iter()
-        .map(|h| match h {
-            HookEntry::State { label, span, .. } => (*label, *span),
-            HookEntry::Effect { label, span, .. } => (*label, *span),
-            HookEntry::Memo { label, span, .. } => (*label, *span),
-            HookEntry::Callback { label, span, .. } => (*label, *span),
-            HookEntry::Ref { label, span, .. } => (*label, *span),
-            HookEntry::Custom { label, span, .. } => (*label, *span),
-            HookEntry::Handler { label, span, .. } => (*label, *span),
-        })
-        .collect();
+    let label_to_span: HashMap<HookLabel, Option<crate::ir::SourceRange>> =
+        hooks.iter().map(|h| (h.label(), h.span())).collect();
 
     // Labels whose call site is an `Unknown` marker: a custom hook the engine
     // could neither inline nor summarize. `kind == Custom` no longer answers
@@ -1388,22 +1332,12 @@ fn collect_hook_calls(hooks: &[HookEntry], cfg: &CFG) -> Vec<HookCallInfo> {
 
 fn hook_labels_in_stmt(stmt: &Stmt) -> Vec<HookLabel> {
     let mut out = Vec::new();
-    match stmt {
-        Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => {
-            collect_hook_labels_expr(rhs, &mut out);
-        }
-        Stmt::MemberWrite { obj, key, rhs, .. } => {
-            collect_hook_labels_expr(obj, &mut out);
-            if let crate::ir::stmt::MemberKey::Index(idx) = key {
-                collect_hook_labels_expr(idx, &mut out);
-            }
-            collect_hook_labels_expr(rhs, &mut out);
-        }
-        Stmt::ExprStmt(e, _) => collect_hook_labels_expr(e, &mut out),
-    }
+    stmt.for_each_expr(&mut |e| collect_hook_labels_expr(e, &mut out));
     out
 }
 
+/// The hook labels `expr` reads, outside nested closures (a closure's body is
+/// not the call site of the hooks it mentions).
 fn collect_hook_labels_expr(expr: &Expr, out: &mut Vec<HookLabel>) {
     match expr {
         Expr::StateVal(l)
@@ -1413,36 +1347,8 @@ fn collect_hook_labels_expr(expr: &Expr, out: &mut Vec<HookLabel>) {
         | Expr::HookMarker(l, _) => {
             out.push(*l);
         }
-        Expr::ObjectLit { fields, .. } => fields
-            .iter()
-            .for_each(|(_, v)| collect_hook_labels_expr(v, out)),
-        Expr::ArrayLit { elems, .. } => elems.iter().for_each(|e| collect_hook_labels_expr(e, out)),
-        Expr::FnLit { .. } => {}
-        Expr::FieldAccess { obj, .. } => collect_hook_labels_expr(obj, out),
-        Expr::IndexAccess { arr, idx } => {
-            collect_hook_labels_expr(arr, out);
-            collect_hook_labels_expr(idx, out);
-        }
-        Expr::BinOp { lhs, rhs, .. } => {
-            collect_hook_labels_expr(lhs, out);
-            collect_hook_labels_expr(rhs, out);
-        }
-        Expr::UnaryOp { arg, .. } => collect_hook_labels_expr(arg, out),
-        Expr::Call { fn_, args } | Expr::New { fn_, args, .. } => {
-            collect_hook_labels_expr(fn_, out);
-            args.iter().for_each(|a| collect_hook_labels_expr(a, out));
-        }
-        Expr::CompApp { props, .. } => collect_hook_labels_expr(props, out),
-        Expr::NativeElem {
-            props, children, ..
-        } => {
-            collect_hook_labels_expr(props, out);
-            children
-                .iter()
-                .for_each(|c| collect_hook_labels_expr(c, out));
-        }
-        Expr::TSAnnotated(e) => collect_hook_labels_expr(e, out),
-        _ => {}
+        // `for_each_child` does not cross `FnLit`.
+        _ => expr.for_each_child(&mut |c| collect_hook_labels_expr(c, out)),
     }
 }
 
@@ -1552,13 +1458,6 @@ fn collect_handler_info(hooks: &[HookEntry]) -> HashMap<HookLabel, HandlerInfo> 
 
 // ── Utility-function inlining ─────────────────────────────────────────────────
 
-/// Splice every statement-level call to a known utility into the caller's
-/// CFG (and the body CFGs of its hook entries). Operates in place on
-/// `render_cfg` and `hooks`.
-///
-/// "Statement-level" means the call is the rhs of a `Let` or the entirety of
-/// an `ExprStmt` calls in expression positions (`if (util(x))`,
-/// `setState(util(x))`) stay opaque (`Top`); expression-position inlining deferred.
 /// What every round of utility inlining in one component shares: where to look
 /// callees up, the per-CFG splice budget, and the accumulators the whole
 /// component writes into.
@@ -1576,6 +1475,15 @@ struct InlineCtx<'a> {
     truncated: bool,
 }
 
+/// Splice every statement-level call to a known utility into the caller's
+/// CFG (and the body CFGs of its hook entries). Operates in place on
+/// `render_cfg` and `hooks`.
+///
+/// "Statement-level" means the call is the rhs of a `Let` or the entirety of
+/// an `ExprStmt`: calls in expression positions (`if (util(x))`,
+/// `setState(util(x))`) stay opaque (`Top`); expression-position inlining is
+/// deferred (#52).
+///
 /// Returns `true` when the splice budget cut a utility call off anywhere in the
 /// component — the caller records that as an `analysis-limit`.
 #[allow(clippy::too_many_arguments)]
@@ -1731,13 +1639,8 @@ fn utility_call_target(stmt: &Stmt) -> Option<String> {
         Stmt::ExprStmt(expr, _) => expr,
         Stmt::Assign { .. } | Stmt::MemberWrite { .. } => return None,
     };
-    let (fn_, _) = match call_expr {
-        Expr::Call { fn_, args } => (fn_, args),
-        Expr::TSAnnotated(inner) => match inner.as_ref() {
-            Expr::Call { fn_, args } => (fn_, args),
-            _ => return None,
-        },
-        _ => return None,
+    let Expr::Call { fn_, .. } = call_expr.peel_ts() else {
+        return None;
     };
     match fn_.as_ref() {
         Expr::Var(name) => Some(name.clone()),
@@ -1775,11 +1678,11 @@ fn splice_one_call(
 )> {
     let call_stmt = cfg.blocks[&block_id].stmts[stmt_idx].clone();
     let (bound_var, call_args) = match &call_stmt {
-        Stmt::Let { var, rhs, .. } => match strip_ts_annot(rhs) {
+        Stmt::Let { var, rhs, .. } => match rhs.peel_ts() {
             Expr::Call { args, .. } => (Some(var.clone()), args.clone()),
             _ => return None,
         },
-        Stmt::ExprStmt(expr, _) => match strip_ts_annot(expr) {
+        Stmt::ExprStmt(expr, _) => match expr.peel_ts() {
             Expr::Call { args, .. } => (None, args.clone()),
             _ => return None,
         },
@@ -1816,13 +1719,6 @@ fn splice_one_call(
     // The EXPORTED name (`utility.name`), not the local callee: an aliased
     // import must chain under the identity a team's rule names (ADR-027 §3).
     Some((range, utility.name, utility.file))
-}
-
-fn strip_ts_annot(expr: &Expr) -> &Expr {
-    match expr {
-        Expr::TSAnnotated(inner) => inner.as_ref(),
-        other => other,
-    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
