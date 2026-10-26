@@ -134,7 +134,18 @@ impl Rule for SetterInRender {
                 // calling the variable must provably write: a local helper that
                 // only *carries* a captured setter into a JSX handler writes
                 // nothing when called, and dominance cannot upgrade a may.
+                // A local name must be the setter by a certain binding: the
+                // alias table is a may-map (first binding wins), and a name
+                // bound to the setter on one path and to anything else on
+                // another — `if (c) set = setV`, a hook returning `[v, setV]`
+                // or `[v, noop]` — writes on some renders only.
+                let certainly_the_setter = !local_setter_info.contains_key(&call.var)
+                    || matches!(
+                        crate::ir::bindings::binding_of(&call.var, &comp_result.render_cfg),
+                        Some(Expr::StateSetter(_))
+                    );
                 let certain_write = call.class == SetterCallPhase::Sync
+                    && certainly_the_setter
                     && cs_vars.get(&call.var).is_none_or(|p| p.must_write);
                 let proof = certain_write
                     .then_some(call.block_id)
@@ -395,6 +406,42 @@ mod tests {
         assert_eq!(diags[0].rule, "setter-in-render");
         assert_eq!(diags[0].hook_label, Some(0));
         assert_eq!(diags[0].severity(), Severity::Error);
+    }
+
+    #[test]
+    fn a_name_bound_to_the_setter_and_to_something_else_is_a_warning() {
+        // `let s = setN; s = noop; s(1)`: the alias table resolves `s` to the
+        // setter, first binding wins, but a name bound twice is not certainly
+        // the setter at the call — here it is the no-op, and nothing is written.
+        let render_stmts = vec![
+            Stmt::Let {
+                var: "setN".to_string(),
+                rhs: Expr::StateSetter(0),
+                span: None,
+            },
+            Stmt::Let {
+                var: "s".to_string(),
+                rhs: Expr::Var("setN".to_string()),
+                span: None,
+            },
+            Stmt::Assign {
+                var: "s".to_string(),
+                rhs: Expr::Var("noop".to_string()),
+                span: None,
+            },
+            Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("s".to_string())),
+                    args: vec![Expr::Lit(Prim::Int(1))],
+                },
+                None,
+            ),
+        ];
+        let result = make_result(vec![], render_stmts);
+        let diags =
+            SetterInRender.check(&RuleCtx::new(&prog("C", &result), crate::test_support::C));
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].severity(), Severity::Warning);
     }
 
     #[test]
