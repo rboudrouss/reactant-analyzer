@@ -85,7 +85,11 @@ the loop, since it renders with it.
 Two things are instrumented, and neither is visible to the program: the JSX
 runtime wraps each function component to count its renders, and the timer
 functions the program sees are a virtual clock drained one callback at a time,
-each inside `act`.
+each inside `act`. The wrapper also gives the component a name unique to the
+run: React logs "Cannot update a component while rendering a different
+component" once per component name for the life of the process, and one worker
+runs many programs, so without it a program's warnings depended on the programs
+run before it in that worker.
 
 The budgets make `loop` mean "did not settle within the budget". A program
 that settles after 301 renders in one step would be read as a loop, which could

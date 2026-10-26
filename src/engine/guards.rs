@@ -292,7 +292,8 @@ fn names_unbound(
 /// render, to something that holds; a name nothing binds — a prop, a module
 /// name — while props hold. A call over held inputs holds: the standard the
 /// relational arm has always applied to an effect-local const
-/// (`searchParams.get("leadId")`).
+/// (`searchParams.get("leadId")`). So does a memo or a callback whose deps
+/// list is exact and holds: React hands back the cached value.
 ///
 /// A hook whose summary says its result moves only on navigation — the
 /// router's `useSearchParams`, `useParams`, `usePathname`, `useLocation` —
@@ -306,6 +307,8 @@ pub struct Invariance<'a> {
     pub render: &'a HashMap<&'a str, Option<&'a Expr>>,
     pub state_vals: &'a HashMap<Var, HookLabel>,
     pub memo_vals: &'a HashMap<Var, HookLabel>,
+    /// The deps of each memo and callback whose list is exact.
+    pub memo_deps: &'a HashMap<HookLabel, &'a [Expr]>,
     /// The names some body of the component writes or mutates.
     pub mutated: &'a HashSet<Var>,
     /// Some effect, memo or callback body of the program visibly navigates
@@ -469,11 +472,11 @@ impl Invariance<'_> {
         match e.peel_ts() {
             Expr::Lit(_) => true,
             Expr::Var(v) => {
-                if self.state_vals.contains_key(v)
-                    || self.memo_vals.contains_key(v)
-                    || self.mutated.contains(v)
-                {
+                if self.state_vals.contains_key(v) || self.mutated.contains(v) {
                     return false;
+                }
+                if let Some(&l) = self.memo_vals.get(v) {
+                    return self.memo_holds(l, props_hold, next);
                 }
                 match self.binding(v, body) {
                     Some((Some(rhs), scope)) => self.go(rhs, scope, props_hold, next),
@@ -481,6 +484,7 @@ impl Invariance<'_> {
                     None => props_hold,
                 }
             }
+            Expr::MemoVal(l) | Expr::CallbackVal(l) => self.memo_holds(*l, props_hold, next),
             Expr::FieldAccess { obj, field } => match self.member(obj, field, body) {
                 Some(Member::Expr(member, scope)) => self.go(member, scope, props_hold, next),
                 Some(Member::Summary(sv)) => matches!(sv, SummaryValue::Held) && !self.navigates,
@@ -515,6 +519,14 @@ impl Invariance<'_> {
             // State, memos, callbacks, other hooks, allocations, elements.
             _ => false,
         }
+    }
+
+    /// Does memo or callback `label` hand back its cached value on every run?
+    /// Its deps are read in the render.
+    fn memo_holds(&self, label: HookLabel, props_hold: bool, depth: usize) -> bool {
+        self.memo_deps
+            .get(&label)
+            .is_some_and(|deps| deps.iter().all(|d| self.go(d, None, props_hold, depth)))
     }
 
     /// What `v` is bound to, and the scope its right-hand side reads in: the

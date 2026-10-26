@@ -82,6 +82,10 @@ that writes it (see *Cross-file limits*).
   write to `location`, a bare `navigate()`/`redirect()`, a `<Navigate/>`. A navigation hidden in
   an opaque callee, or through a router object handed down as a prop, is not seen
   [#161](https://github.com/rboudrouss/reactant-analyzer/issues/161).
+- It also assumes a `useMemo` or `useCallback` with an exact deps list over held values hands back
+  its cached value. React documents the cache as a performance hint, not a guarantee: a React that
+  dropped it would recompute a fresh value the proof reads as held
+  [#188](https://github.com/rboudrouss/reactant-analyzer/issues/188).
 - A child's mount-only effect is read as firing once when the parent renders the child on every
   path, or behind guards that hold still, without a `key` that moves. A child rendered from a
   `.map` callback or reached through an intermediate component is read as remounting, the
@@ -161,6 +165,16 @@ carries an Error.
   controlled input mirrored through two slots (`setLocal(value)`, then `onChange(local)`). Never an
   Error: the Error still needs a new reference stored on all paths
   [#157](https://github.com/rboudrouss/reactant-analyzer/issues/157).
+- **An effect loop is an Error only when nothing in the batch can undo it.** React re-renders on
+  the last value a batch leaves in the slot, and the engine does not order the writes of one batch
+  (two effects, a layout effect and the passive effects React flushes before its re-render, a
+  `[]` effect at mount, a callback prop a child calls). So a fresh write proves the loop only when
+  *every* write of its slot, program-wide, stores a new reference at each of the component's own
+  renders. A prop, or a memo over props, is new at the parent's renders only, so it does not
+  count. The component must also stay mounted: every parent renders it under guards and a `key`
+  that hold. Anything else makes the loop a Warning, including real loops such as
+  `setS(s); setS({})` in one effect, or a fresh write next to `onClick={() => setS(null)}`
+  [#188](https://github.com/rboudrouss/reactant-analyzer/issues/188).
 - **The churn graph is slot-granular where a program is member-granular.** The self-churn arm reads
   the member (`[data.name]` is not re-triggered by `setData(prev => ({...prev, slug}))`, and a guard
   on `sheet.leadId` is answered by the `null` the write puts there), but the multi-effect graph

@@ -15,6 +15,7 @@ use crate::{
     },
     engine::{
         AnalysisResult,
+        dominance::on_all_paths,
         written::{self, SiteEnvs, Written},
     },
     ir::{
@@ -1377,22 +1378,28 @@ struct Found {
 }
 
 impl Found {
-    /// Splice in the rows of a body that runs AT a call site — a directly
+    /// Splice in the rows of `body`, which runs AT a call site — a directly
     /// called local helper (B6) or an IIFE. A row the inner walk classified
-    /// `Sync` runs at that site, so it takes the site's class and block id;
-    /// a row the helper deferred or nested keeps the class it earned.
+    /// `Sync` runs at that site, so it takes the site's class; it takes the
+    /// site's block id only when it runs on every path of `body`, since a
+    /// write under the helper's own `if` runs on some calls only (#188). A
+    /// row the helper deferred or nested keeps the class it earned.
     fn absorb(
         &mut self,
         inner: Found,
+        body: &CFG,
         mode: WalkClass,
         at: Option<(BlockId, usize)>,
         prov: Option<BlockId>,
     ) {
         for site in inner.setters {
             let sync = site.class == WalkClass::Sync;
+            let every_call = site
+                .at
+                .is_some_and(|(b, _)| on_all_paths(body, &HashSet::from([b])));
             self.setters.push(FoundSite {
                 class: if sync { mode } else { site.class },
-                at: if sync { at } else { None },
+                at: if sync && every_call { at } else { None },
                 prov_block: prov,
                 ..site
             });
@@ -1920,7 +1927,7 @@ impl<'a> SetterWalk<'a> {
                         prov,
                         stmt_span,
                     );
-                    found.absorb(inner, mode, at, prov);
+                    found.absorb(inner, body, mode, at, prov);
                 }
             }
             // An immediately-invoked function expression runs NOW, at this
@@ -1942,7 +1949,7 @@ impl<'a> SetterWalk<'a> {
                     prov,
                     stmt_span,
                 );
-                found.absorb(inner, mode, at, prov);
+                found.absorb(inner, body_cfg, mode, at, prov);
             }
             // The listener `FnLit` of an effect-top-level `addEventListener`
             // is exactly what `extract_subscriptions` reified as a Handler

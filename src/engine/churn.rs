@@ -20,8 +20,11 @@
 //! graph is the product of the two, per effect, program-wide. Edge strength:
 //! - `Must`: the dep on x is the exact slot (must-rerun) ∧ the fresh write to
 //!   y sits in a block on all paths of the body (must-reach) ∧ the written
-//!   value is a new reference every call (`Change::Must`). An all-must cycle
-//!   ⇒ Error.
+//!   value is a new reference every call (`Change::Must`) ∧ so is every
+//!   other write of y, program-wide: React re-renders on the batch's last
+//!   value, and a later `setY(y)` in the same batch undoes the fresh one
+//!   (#188) ∧ every parent keeps the component mounted, or it is a root.
+//!   An all-must cycle ⇒ Error.
 //! - `May`: the dep is merely versioned by x, or the write is conditional,
 //!   nested, deferred or imprecise.
 //!
@@ -171,6 +174,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
     struct CompCtx<'a> {
         state_vals: HashMap<Var, HookLabel>,
         memo_vals: HashMap<Var, HookLabel>,
+        memo_deps: HashMap<HookLabel, &'a [Expr]>,
         render_lets: HashMap<&'a str, Option<&'a Expr>>,
         mutated: HashSet<Var>,
         /// No effect of the component reacts to another component's slot, so
@@ -237,6 +241,18 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             CompCtx {
                 state_vals: resolve_setter_aliases(cfg, &state_val_labels(cfg)),
                 memo_vals: resolve_setter_aliases(cfg, &memo_val_labels(cfg)),
+                memo_deps: comp_result
+                    .hooks
+                    .iter()
+                    .filter_map(|h| match h {
+                        HookEntry::Memo { label, deps, .. }
+                        | HookEntry::Callback { label, deps, .. } => deps
+                            .list()
+                            .filter(|d| d.arity.exact().is_some())
+                            .map(|d| (*label, d.as_slice())),
+                        _ => None,
+                    })
+                    .collect(),
                 render_lets: let_bindings(cfg),
                 mutated,
                 props_hold: comp_result.effect_triggers.iter().all(|t| t.slot.0 == comp),
@@ -255,7 +271,9 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 if matches!(deps.list(), Some(d) if d.arity == Arity::Exact(0)))
         };
         // Does the owner of a slot this component writes from a mount-only
-        // effect keep this component mounted across the loop (#162)?
+        // effect keep this component mounted across the loop (#162)? An
+        // owner that renders it nowhere — the child reached through another
+        // component — fails closed.
         let stays_mounted = |owner: ComponentId| {
             let Some(child) = result.component_table.origin(comp) else {
                 return false;
@@ -264,7 +282,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             else {
                 return false;
             };
-            stays_mounted(parent, pctx, &invariance_of(pctx, navigates), child)
+            stays_mounted(parent, pctx, &invariance_of(pctx, navigates), child) == Some(true)
         };
         for w in comp_result
             .slot_writers
@@ -371,6 +389,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             render: &ctx.render_lets,
             state_vals: &ctx.state_vals,
             memo_vals: &ctx.memo_vals,
+            memo_deps: &ctx.memo_deps,
             mutated: &ctx.mutated,
             navigates,
         }
@@ -378,15 +397,14 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
     /// Does `parent` mount `child` once and keep it mounted across the
     /// loop? Every element of `child` in the parent's render sits under
     /// guards that hold still, carries no `key` or one that holds, and is
-    /// outside any closure; a parent that renders no such element — the
-    /// child reached through another component, or from a `.map` — fails
-    /// closed.
+    /// outside any closure. `None` when the parent renders no element of
+    /// `child`: whether that keeps it mounted is the caller's reading.
     fn stays_mounted(
         parent: &AnalysisResult<StateValue>,
         ctx: &CompCtx<'_>,
         invariance: &Invariance<'_>,
         child: &CompOrigin,
-    ) -> bool {
+    ) -> Option<bool> {
         /// Every node under `e`, with whether it sits inside a closure.
         fn walk(e: &Expr, closure: bool, f: &mut dyn FnMut(&Expr, bool)) {
             f(e, closure);
@@ -424,7 +442,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             };
             block.for_each_expr(&mut visit);
         }
-        found && ok
+        found.then_some(ok)
     }
     fn site_of<'a>(s: &SiteRef<'a>, convergent: bool) -> WriteSite<'a> {
         WriteSite {
@@ -592,6 +610,62 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
     let mut best: HashMap<(QualifiedSlot, QualifiedSlot, ComponentId, HookLabel), ChurnEdge> =
         HashMap::new();
     let mut one_way: HashMap<QualifiedSlot, bool> = HashMap::new();
+    // The slots some write may restore within a batch (#188): React re-renders
+    // on the batch's last value, and nothing here orders the writes of one
+    // batch — two effects, a layout effect and the passive effects flushed
+    // before its re-render, a mount-only effect, a callback prop a child
+    // calls, which is a `Handler` row — so a fresh write proves a change only
+    // when every write of its slot is fresh. Fresh at every call means a new
+    // reference (`Change::Must`) that does not hold while props hold: a prop
+    // the parent allocates is new at the parent's renders, and `setS(p)`
+    // stores the same `p` again when the component re-renders alone.
+    let mut restorable: HashSet<QualifiedSlot> = HashSet::new();
+    for (&comp, r) in &result.components {
+        let invariance = invariance_of(&ctxs[&comp]);
+        for w in &r.slot_writers {
+            let body = match w.region {
+                WriterRegion::Render => Some(&r.render_cfg),
+                WriterRegion::Effect(l)
+                | WriterRegion::Memo(l)
+                | WriterRegion::Callback(l)
+                | WriterRegion::Handler(l) => r
+                    .hooks
+                    .iter()
+                    .find(|h| h.label() == l)
+                    .and_then(HookEntry::body_cfg),
+            };
+            let fresh = w.written.change == Change::Must
+                && body.is_some_and(|b| {
+                    !w.written
+                        .expr
+                        .as_ref()
+                        .is_some_and(|e| invariance.holds(e, &let_bindings(b), true))
+                });
+            if !fresh {
+                restorable.insert(node_of(comp, w));
+            }
+        }
+    }
+    // The re-render a loop needs happens only if its component is still
+    // mounted, and a parent whose guard or key moves may unmount it in the
+    // very batch that should re-run it: every parent that renders it keeps
+    // it mounted (#162's proof), or none renders it and it is a root.
+    let mut kept_mounted: HashMap<ComponentId, bool> = HashMap::new();
+    let mut stays_mounted_everywhere = |comp: ComponentId| {
+        *kept_mounted.entry(comp).or_insert_with(|| {
+            let Some(child) = result.component_table.origin(comp) else {
+                return false;
+            };
+            result
+                .components
+                .iter()
+                .filter(|(p, _)| **p != comp)
+                .all(|(p, parent)| {
+                    let pctx = &ctxs[p];
+                    stays_mounted(parent, pctx, &invariance_of(pctx), child) != Some(false)
+                })
+        })
+    };
     for f in &facts {
         let ctx = &ctxs[&f.comp];
         let invariance = invariance_of(ctx);
@@ -694,7 +768,9 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 .collect();
             let must_write = w.written.change == Change::Must
                 && w.block.is_some()
-                && on_all_paths(f.body_cfg, &fresh_blocks);
+                && on_all_paths(f.body_cfg, &fresh_blocks)
+                && !restorable.contains(&node)
+                && stays_mounted_everywhere(f.comp);
             let strength = if must_write {
                 EdgeStrength::Must
             } else {

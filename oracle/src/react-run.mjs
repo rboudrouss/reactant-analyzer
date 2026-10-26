@@ -58,6 +58,8 @@ class RenderBudgetExceeded extends Error {
 
 /** Per-run state, reset by `runProgram`. */
 let run = null;
+/** Counts the runs of this worker; see `counted`. */
+let runs = 0;
 
 const wrappers = new WeakMap();
 function counted(type) {
@@ -65,6 +67,11 @@ function counted(type) {
   let w = wrappers.get(type);
   if (!w) {
     const name = type.displayName || type.name || "Anonymous";
+    // React warns once per component name for the life of the process
+    // ("Cannot update a component while rendering a different component"),
+    // and a worker runs many programs: the name React sees is made unique
+    // to the run, so no program's warnings depend on the ones before it.
+    const displayName = `${name}#${runs}`;
     w = function (props) {
       if (run) {
         run.renders[name] = (run.renders[name] ?? 0) + 1;
@@ -75,6 +82,7 @@ function counted(type) {
       return type(props);
     };
     Object.defineProperty(w, "name", { value: name });
+    w.displayName = displayName;
     wrappers.set(type, w);
   }
   return w;
@@ -196,6 +204,7 @@ export async function runProgram(source, { root = "App" } = {}) {
   const clock = virtualClock();
   const errors = [];
   const warnings = [];
+  runs += 1;
   run = { renders: {}, total: 0, step: 0, stepRenders: {} };
 
   const origError = console.error;
