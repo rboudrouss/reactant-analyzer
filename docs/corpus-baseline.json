@@ -1,8 +1,8 @@
 {
-  "total": 1522,
-  "digest": "efe7289a73529a3ed90123d55690b832b6cc916f2c03a8574e3de048ddc33f8b",
+  "total": 1539,
+  "digest": "ea087760b43829913ccfe4535c90fb2ea0c8ea205a97ee25e1e05bdd9f94098b",
   "by_rule": {
-    "always-unstable-deps": 389,
+    "always-unstable-deps": 392,
     "conditional-hook": 9,
     "cross-component-infinite-loop": 17,
     "cross-setter-in-render": 6,
@@ -18,7 +18,7 @@
     "state-lifted-too-high": 26,
     "state-mutation": 15,
     "unnecessary-rerender": 10,
-    "unstable-context-value": 51,
+    "unstable-context-value": 65,
     "wasted-subtree-render": 119
   },
   "by_repo": {
@@ -28,13 +28,13 @@
     "commerce": 5,
     "dub": 540,
     "excalidraw": 33,
-    "mantine": 365,
+    "mantine": 372,
     "memos": 57,
     "next-shadcn-dashboard-starter": 20,
     "novel": 6,
     "precedent": 1,
-    "shadcn-admin": 9,
-    "twenty": 443,
+    "shadcn-admin": 16,
+    "twenty": 446,
     "zustand": 3
   },
   "corpus": "00e5fa79fa000c85"
