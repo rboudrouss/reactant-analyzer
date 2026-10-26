@@ -7,7 +7,7 @@ use crate::{
         impls::StateValue,
         stores::{AbstractEnv, EnvVal, HeapValue, resolve_locs},
     },
-    engine::{Reducer, dominance::controlling_branches},
+    engine::{Reducer, dominance::selecting_branches},
     ir::{
         bindings::binding_of,
         cfg::{CFG, EdgeKind, Terminator},
@@ -88,13 +88,15 @@ pub(crate) struct Run<D: AbstractDomain> {
 /// again: every slot write is a join, so a write made under a smaller env
 /// only adds what the final run adds as well.
 ///
-/// A merge takes its condition (#197): a block only one side of a branch
-/// reaches runs under that branch's condition, and what it assigns is a
-/// selection the condition makes, so its change trace takes the condition's
-/// may bound ([`AbstractDomain::select_under`]). Charging the write rather
-/// than the merge needs no record of which predecessor is which, and it is
-/// the same bound: both arms of `c ? a : b` carry `may(c)`, so their join is
-/// `a ⊔ b ⊔ may(c)`.
+/// A merge takes its condition (#197): an arm of a branch — a block only one
+/// side reaches, on its way to a block both sides reach — runs under that
+/// branch's condition, and what it assigns is a selection the condition
+/// makes, so its change trace takes the condition's may bound
+/// ([`AbstractDomain::select_under`]). Charging the write rather than the
+/// merge needs no record of which predecessor is which, and it is the same
+/// bound: both arms of `c ? a : b` carry `may(c)`, so their join is
+/// `a ⊔ b ⊔ may(c)`. A guard whose other side exits selects nothing
+/// (`selecting_branches`).
 pub(crate) fn run_cfg<T: Transfer>(
     transfer: &T,
     cfg: &CFG,
@@ -118,7 +120,7 @@ pub(crate) fn run_cfg<T: Transfer>(
 
     // Block → the branches whose condition selects what it assigns, and the
     // inverse, for re-queueing when a condition's bound grows.
-    let selecting = controlling_branches(cfg);
+    let selecting = selecting_branches(cfg);
     let mut selected: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
     for (b, branches) in &selecting {
         for br in branches {

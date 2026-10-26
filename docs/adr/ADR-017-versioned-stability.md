@@ -258,13 +258,16 @@ join gives that. It gives the wrong answer for `cond ? r1 : r2` with two
 refs (`Stable ⊔ Stable = Stable`) and for `cond ? obj : null`
 (`Versioned({obj})`): the selection also changes whenever `cond` flips.
 `Stability` abstracts a change trace, and for `v = c ? a : b`,
-`Δ(v) ⊆ Δ(a) ∪ Δ(b) ∪ Δ(c)`. So a value assigned in a block that only one
-side of a branch reaches takes the condition's may bound
-(`Stability::under_condition`): `a ⊔ b ⊔ may(c)` on the may side, the must
-side of `a ⊔ b` alone (`PerRender` in both arms stays `PerRender`). Abstract
-equality of the arms is not a shortcut; a name neither arm assigns is the
-only one. The CFG analyser charges the write, not the merge: both arms carry
-`may(c)`, so their join does. `may(c)` is `Versioned({l})` for a state slot of
+`Δ(v) ⊆ Δ(a) ∪ Δ(b) ∪ Δ(c)`. So a value assigned in an arm of a branch —
+a block only one side reaches, from which a block both sides reach is
+reachable — takes the condition's may bound (`Stability::under_condition`):
+`a ⊔ b ⊔ may(c)` on the may side, the must side of `a ⊔ b` alone
+(`PerRender` in both arms stays `PerRender`). Abstract equality of the arms
+is not a shortcut; a name neither arm assigns is the only one. The CFG
+analyser charges the write, not the merge: both arms carry `may(c)`, so
+their join does (`dominance::selecting_branches`). A guard whose other side
+exits the body (`if (!ctx) throw`, an early `return`) selects nothing: the
+continuation's values meet no other arm. `may(c)` is `Versioned({l})` for a state slot of
 any kind (the same projection `recompute_memo` applies), the join of the
 operands for an operator, and the value's own bound otherwise — `Unknown`
 for a boolean prop or an opaque call. A selection between primitives has no

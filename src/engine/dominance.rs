@@ -96,10 +96,44 @@ pub fn on_all_paths(cfg: &CFG, blocks: &HashSet<BlockId>) -> bool {
 
 /// For every block, the branch blocks that control it: exactly one side of the
 /// branch reaches it (the reachability definition `MountIndex` already uses).
-/// Shared by render dependence (ADR-041), which charges a block's writes to
-/// its conditions, and by the CFG analyser, which charges them to the
-/// conditions' change traces (#197).
+/// Render dependence (ADR-041) charges a block's writes and returns to these
+/// conditions.
 pub(crate) fn controlling_branches(cfg: &CFG) -> HashMap<BlockId, Vec<BlockId>> {
+    branches_over(cfg, |_, controlled, _| controlled)
+}
+
+/// For every block, the branch blocks whose condition *selects* what the
+/// block assigns: one side of the branch reaches the block, and the block
+/// reaches a point both sides reach — the merge where the two arms' values
+/// meet (#197). A guard whose other side exits the body (`if (!ctx) throw`,
+/// an early `return`) controls everything after it but selects nothing: no
+/// render compares the continuation's values with the exiting arm's.
+pub(crate) fn selecting_branches(cfg: &CFG) -> HashMap<BlockId, Vec<BlockId>> {
+    branches_over(cfg, |cfg, controlled, merge| {
+        if merge.is_empty() {
+            return HashSet::new();
+        }
+        // Backward reachability from the merge points.
+        let mut reaches_merge: HashSet<BlockId> = merge.clone();
+        let mut stack: Vec<BlockId> = merge.iter().copied().collect();
+        while let Some(b) = stack.pop() {
+            for p in cfg.predecessors(b) {
+                if reaches_merge.insert(p) {
+                    stack.push(p);
+                }
+            }
+        }
+        controlled.intersection(&reaches_merge).copied().collect()
+    })
+}
+
+/// For each branch, the blocks `pick` chooses from the blocks exactly one
+/// side reaches (`controlled`) and the blocks both sides reach (`merge`),
+/// inverted into "block → branches".
+fn branches_over(
+    cfg: &CFG,
+    pick: impl Fn(&CFG, HashSet<BlockId>, HashSet<BlockId>) -> HashSet<BlockId>,
+) -> HashMap<BlockId, Vec<BlockId>> {
     let branches: Vec<(BlockId, BlockId, BlockId)> = cfg
         .blocks
         .iter()
@@ -128,8 +162,10 @@ pub(crate) fn controlling_branches(cfg: &CFG) -> HashMap<BlockId, Vec<BlockId>> 
     for (br, t, e) in branches {
         let rt = reach(t);
         let re = reach(e);
-        for b in rt.symmetric_difference(&re) {
-            out.entry(*b).or_default().push(br);
+        let controlled: HashSet<BlockId> = rt.symmetric_difference(&re).copied().collect();
+        let merge: HashSet<BlockId> = rt.intersection(&re).copied().collect();
+        for b in pick(cfg, controlled, merge) {
+            out.entry(b).or_default().push(br);
         }
     }
     out

@@ -533,6 +533,76 @@ mod tests {
     }
 
     #[test]
+    fn a_guard_whose_other_side_exits_selects_nothing() {
+        // block 0: let a = StateVal(0); branch a → 1 / 2
+        // block 1: return            (the guard's exit: `if (a) return null`)
+        // block 2: let x = r1; return
+        // Nothing merges after the branch, so `x` is `r1` in every render that
+        // computes it: Stable, not Versioned({a}).
+        use crate::domains::BoolVal;
+        let mut blocks = std::collections::BTreeMap::new();
+        blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![Stmt::Let {
+                    var: "a".to_string(),
+                    rhs: Expr::StateVal(0),
+                    span: None,
+                }],
+                term: Terminator::Branch {
+                    span: None,
+                    cond: Expr::Var("a".to_string()),
+                    then_: 1,
+                    else_: 2,
+                },
+            },
+        );
+        blocks.insert(
+            1,
+            BasicBlock {
+                id: 1,
+                stmts: vec![],
+                term: Terminator::Return(Expr::Lit(Prim::Null)),
+            },
+        );
+        blocks.insert(
+            2,
+            BasicBlock {
+                id: 2,
+                stmts: vec![Stmt::Let {
+                    var: "x".to_string(),
+                    rhs: Expr::Var("r1".to_string()),
+                    span: None,
+                }],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
+        );
+        let cfg = CFG {
+            entry: 0,
+            blocks,
+            edges: vec![
+                Edge {
+                    from: 0,
+                    to: 1,
+                    kind: EdgeKind::IfTrue,
+                },
+                Edge {
+                    from: 0,
+                    to: 2,
+                    kind: EdgeKind::IfFalse,
+                },
+            ],
+        };
+        let mut env = AbstractEnv::new();
+        env.extend("r1".to_string(), StateValue::reference(Stability::Stable));
+        let mut state = StateStore::bottom();
+        state.update(0, StateValue::boolean(BoolVal::Top));
+        let (exit_envs, _) = run(&cfg, env, &state, &[]);
+        assert_eq!(exit_envs[&2].lookup("x").reference, Stability::Stable);
+    }
+
+    #[test]
     fn branch_narrowing_restricts_then_env() {
         use crate::domains::{Interval, StateValue};
         use crate::ir::expr::BinOp;
