@@ -1,11 +1,12 @@
 //! Collect the per-file [`ModuleFacts`] — directive prologue and resolved
 //! import edges (ADR-026 §1).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use oxc_ast::ast::{ImportOrExportKind, Program, Statement};
 
 use crate::ir::ModuleFacts;
+use crate::ir::module::ReExports;
 use crate::resolver::ImportResolver;
 
 /// Read `file`'s directive prologue and its resolved module edges.
@@ -26,13 +27,16 @@ pub fn collect_module_facts(
         .collect();
 
     let mut imports = Vec::new();
-    let mut push = |specifier: &str| {
-        if let Some(resolved) = resolver.resolve(file, specifier)
-            && !imports.contains(&resolved)
-        {
-            imports.push(resolved);
+    let mut push = |specifier: &str| -> Option<PathBuf> {
+        let resolved = resolver.resolve(file, specifier)?;
+        if !imports.contains(&resolved) {
+            imports.push(resolved.clone());
         }
+        Some(resolved)
     };
+    // `import { a } from "./x"; export { a }` re-exports `./x`'s `a`.
+    let bindings = super::build_resolved_imports(program, file, resolver);
+    let mut re_exports = ReExports::default();
 
     for stmt in &program.body {
         match stmt {
@@ -45,22 +49,54 @@ pub fn collect_module_facts(
             Statement::ExportNamedDeclaration(decl)
                 if decl.export_kind == ImportOrExportKind::Value =>
             {
-                if let Some(source) = &decl.source {
-                    push(source.value.as_str());
+                let from = decl.source.as_ref().map(|s| push(s.value.as_str()));
+                for spec in &decl.specifiers {
+                    if spec.export_kind != ImportOrExportKind::Value {
+                        continue;
+                    }
+                    let exported = spec.exported.name().to_string();
+                    let local = spec.local.name().to_string();
+                    let origin = match &from {
+                        Some(Some(file)) => Some((file.clone(), local)),
+                        Some(None) => None,
+                        None => bindings
+                            .get(&local)
+                            .map(|r| (r.file.clone(), r.imported.clone())),
+                    };
+                    if let Some((file, imported)) = origin {
+                        let imported = if imported == "default" {
+                            exported.clone()
+                        } else {
+                            imported
+                        };
+                        re_exports.named.push((exported, file, imported));
+                    }
                 }
             }
             Statement::ExportAllDeclaration(decl)
                 if decl.export_kind == ImportOrExportKind::Value =>
             {
-                push(decl.source.value.as_str());
+                let from = push(decl.source.value.as_str());
+                // `export * as ns from` exports one namespace object, not names.
+                if let Some(from) = from
+                    && decl.exported.is_none()
+                {
+                    re_exports.star.push(from);
+                }
             }
             _ => {}
         }
+    }
+    if !re_exports.star.is_empty() {
+        re_exports.declared = super::top_level_binding_names(program)
+            .into_iter()
+            .collect();
     }
 
     ModuleFacts {
         directives,
         imports,
+        re_exports,
     }
 }
 
@@ -153,6 +189,37 @@ mod tests {
             .map(|p| p.file_stem().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, ["real"]);
+    }
+
+    #[test]
+    fn collects_the_re_exports_a_barrel_is_made_of() {
+        let f = facts_of(
+            r#"
+            import { useA } from "./a";
+            export { useA as useAA };
+            export { useB, default as useC } from "./b";
+            export * from "./star";
+            export * as ns from "./ns";
+            export { useP } from "some-package";
+            export function local() {}
+        "#,
+        );
+        let r = &f.re_exports;
+        let at = |n: &str| PathBuf::from(format!("/root/{n}.tsx"));
+        assert_eq!(
+            r.named,
+            vec![
+                ("useAA".to_string(), at("a"), "useA".to_string()),
+                ("useB".to_string(), at("b"), "useB".to_string()),
+                ("useC".to_string(), at("b"), "useC".to_string()),
+            ]
+        );
+        assert_eq!(
+            r.star,
+            vec![at("star")],
+            "a namespace re-export is not a star"
+        );
+        assert!(r.declared.contains("local"));
     }
 
     #[test]

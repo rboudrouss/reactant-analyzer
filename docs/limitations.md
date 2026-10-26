@@ -336,7 +336,8 @@ with no position of its own takes the first one its witness chain names
 
 Aliases declared only in `vite.config.*`, `next.config.*` or `jsconfig.json`
 [#47](https://github.com/rboudrouss/reactant-analyzer/issues/47); monorepo `@workspace/*` specifiers [#48](https://github.com/rboudrouss/reactant-analyzer/issues/48); re-export
-chains beyond one level [#49](https://github.com/rboudrouss/reactant-analyzer/issues/49); a third-party hook re-exported under a
+chains beyond one level for components, contexts and utilities [#49](https://github.com/rboudrouss/reactant-analyzer/issues/49)
+(a custom hook's import follows the chain to its end); a third-party hook re-exported under a
 local alias [#50](https://github.com/rboudrouss/reactant-analyzer/issues/50). `node_modules` is never lowered, and the
 `SummaryRegistry` is the supported extension point [#51](https://github.com/rboudrouss/reactant-analyzer/issues/51).
 
@@ -364,6 +365,14 @@ that happens to sort first: props and setters stop flowing into it, and
 cross-component findings through that reference are missed. The run says so, as
 an `analysis-limit` on the parent (`--info`), and an explicit import from the
 defining file resolves it [#7](https://github.com/rboudrouss/reactant-analyzer/issues/7).
+
+A custom hook call is resolved the same way, through its import. A hook
+imported from a specifier the resolver cannot map (a package, an unknown alias)
+is never bound to a same-named hook of the analysed tree: it takes its
+`SummaryRegistry` entry, or stays opaque. Only a call with no import at all falls
+back to the name, first file by path on a collision
+([ADR-013](adr/ADR-013-cross-file-analysis.md),
+[#226](https://github.com/rboudrouss/reactant-analyzer/issues/226)).
 
 Discovery is the sole producer of analyzed files, so on a **narrowed** run
 (`reactant check src/features`) an import resolved outside the named paths is

@@ -947,16 +947,10 @@ fn expand_custom_hooks(
             continue;
         }
 
-        // Prefer the resolved-file key; fall back to name-only when the import
-        // wasn't resolved OR the resolved file doesn't define the hook under
-        // that name (a one-level re-export: `./a` resolves but `useX` lives in
-        // `./b`). Same first-match caveat as the rest of `get_by_name`.
-        let hook_ir_opt = match &resolved_file {
-            Some(file) => reg
-                .get(&(file.clone(), name.clone()))
-                .or_else(|| reg.get_by_name(&name)),
-            None => reg.get_by_name(&name),
-        };
+        // The call's own import settles the body, through re-exports; only
+        // an unimported name falls back to the name (ADR-013, #226).
+        let hook_ir_opt =
+            reg.resolve_call(&name, import_source.as_deref(), resolved_file.as_deref());
         let Some(hook_ir) = hook_ir_opt else {
             // Not in HookRegistry check SummaryRegistry as fallback.
             // Known library hooks (TanStack, React Router, etc.) are removed from the

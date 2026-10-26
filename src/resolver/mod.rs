@@ -444,7 +444,8 @@ pub fn analyze_lowered(
     config.function_registry =
         FunctionRegistry::from_functions_and_imports(lowered.utilities, lowered.utility_imports);
     let registry = ComponentRegistry::from_components(lowered.components);
-    let hook_registry = HookRegistry::from_hooks(lowered.hooks);
+    let hook_registry = HookRegistry::from_hooks(lowered.hooks)
+        .with_re_exports(lowered.module_table.re_export_graph());
     let mut result = analyze_program(registry, hook_registry, strategy, &config);
     result.file_table = lowered.file_table;
     result.module_table = lowered.module_table;
