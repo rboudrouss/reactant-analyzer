@@ -530,3 +530,53 @@ fn a_spread_whose_source_no_slot_labels_may_rerun_the_effect_every_render() {
         assert_eq!(only_effect_class(comp(&r, "C")), class, "`{decl}`");
     }
 }
+
+#[test]
+fn a_ref_a_callback_only_captures_is_no_ref_contents_dep() {
+    // #227: a callback's identity moves with its deps list, not with the ref
+    // its body names; the ref's contents are read only when it is called.
+    // Read in the render — in a memo body, a deps list, or through a call
+    // that may run the function — they still move the dep.
+    for (decl, class) in [
+        (
+            "const d = useCallback(() => ref.current, [p]);",
+            Rerun::OnSlots,
+        ),
+        (
+            "const d = useCallback(() => ref.current, [p, ref.current]);",
+            Rerun::Always(Always::MutableDep(0)),
+        ),
+        (
+            "const d = useCallback(() => ref.current, P);",
+            Rerun::Always(Always::MutableDep(0)),
+        ),
+        (
+            "const d = useMemo(() => ref.current, [p]);",
+            Rerun::Always(Always::MutableDep(0)),
+        ),
+        (
+            "const d = compute(() => ref.current);",
+            Rerun::Always(Always::MutableDep(0)),
+        ),
+        (
+            "const d = c ? p : (() => ref.current)();",
+            Rerun::Always(Always::MutableDep(0)),
+        ),
+    ] {
+        let src = format!(
+            r#"
+            import {{ useState, useEffect, useRef, useCallback, useMemo }} from "react";
+            const P: unknown[] = [];
+            export function C({{ p, c }}: any) {{
+              const ref = useRef<object>({{}});
+              const [t, setT] = useState(false);
+              {decl}
+              useEffect(() => {{ ref.current = {{}}; setT(!t); }}, [d]);
+              return <div />;
+            }}
+            "#
+        );
+        let r = parse_and_analyze(&src);
+        assert_eq!(only_effect_class(comp(&r, "C")), class, "`{decl}`");
+    }
+}

@@ -238,11 +238,13 @@ pub(crate) fn collect_effect_triggers(
                         .entry(l)
                         .or_insert_with(|| ref_may_move(l, render_cfg, hooks))
                 };
+                // A ref a function value only captures is not read here: the
+                // function's identity, not the ref's contents, is compared.
                 if src.top
-                    || src
-                        .set
-                        .iter()
-                        .any(|s| matches!(s, Source::Ref(l) if moving_ref(*l)))
+                    || src.set.iter().any(|s| {
+                        matches!(s, Source::Ref(l)
+                            if !src.captured.contains(s) && moving_ref(*l))
+                    })
                 {
                     mutable.get_or_insert(i);
                 }

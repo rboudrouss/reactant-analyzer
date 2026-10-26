@@ -126,8 +126,29 @@ pub struct Deps {
     /// has `f` here). A must-fact: one ungated contributor takes a source
     /// out.
     pub gated: BTreeSet<Source>,
+    /// The part of `set` a function value only captures: named in its body,
+    /// not read when the value is computed (`() => ref.current` holds the
+    /// ref's contents here, unread until a call). A must-fact like `gated`.
+    pub captured: BTreeSet<Source>,
     /// For a function value: what calling it writes besides state.
     pub writes: Writes,
+}
+
+/// `mine ∪ theirs` restricted to the sources no contributor holds outside
+/// its own tag: the join of two must-tags over `set`s.
+fn join_must_tag(
+    mine: &mut BTreeSet<Source>,
+    my_set: &BTreeSet<Source>,
+    theirs: &BTreeSet<Source>,
+    their_set: &BTreeSet<Source>,
+) {
+    let untagged: BTreeSet<Source> = my_set
+        .difference(mine)
+        .chain(their_set.difference(theirs))
+        .cloned()
+        .collect();
+    mine.extend(theirs.iter().cloned());
+    mine.retain(|s| !untagged.contains(s));
 }
 
 impl Deps {
@@ -156,26 +177,22 @@ impl Deps {
         if self.top {
             self.set.clear();
             self.gated.clear();
+            self.captured.clear();
             return;
         }
-        let ungated: BTreeSet<Source> = self
-            .set
-            .difference(&self.gated)
-            .chain(other.set.difference(&other.gated))
-            .cloned()
-            .collect();
-        self.gated.extend(other.gated.iter().cloned());
-        self.gated.retain(|s| !ungated.contains(s));
+        join_must_tag(&mut self.gated, &self.set, &other.gated, &other.set);
+        join_must_tag(&mut self.captured, &self.set, &other.captured, &other.set);
         self.set.extend(other.set.iter().cloned());
     }
 
-    /// The same sources, none of them gated: the value is no longer the
-    /// function whose calls the gating described. Its writes stay: a call
-    /// may return a function that calls its arguments (`debounce(fn)`, a
-    /// hook handed a callback), and a may-fact survives what a must-fact
-    /// cannot.
+    /// The same sources, none of them gated or merely captured: the value is
+    /// no longer the function those tags described — a call may have run it,
+    /// reading what it captures. Its writes stay: a call may return a
+    /// function that calls its arguments (`debounce(fn)`, a hook handed a
+    /// callback), and a may-fact survives what a must-fact cannot.
     fn ungated(mut self) -> Self {
         self.gated.clear();
+        self.captured.clear();
         self
     }
 
@@ -567,8 +584,8 @@ impl<'a> Analyzer<'a> {
         f
     }
 
-    /// A function value: what its body captures, with the captures it reaches
-    /// only behind a test of `params` gated.
+    /// A function value: what its body captures, all of it `captured`, with
+    /// the captures it reaches only behind a test of `params` gated.
     fn closure(&self, params: &[Var], body: &CFG, env: &Env) -> Deps {
         let key = body as *const CFG as usize;
         let cached = self.gated.borrow().get(&key).cloned();
@@ -588,6 +605,7 @@ impl<'a> Analyzer<'a> {
             }
             d.union_with(&c);
         }
+        d.captured = d.set.clone();
         d.writes.union_with(&self.writes_of(params, body, env));
         d
     }
@@ -852,13 +870,18 @@ impl<'a> Analyzer<'a> {
                 _ => DVal::empty(),
             },
             // A memoised value or callback is computed from what its body
-            // reads and what its deps list names.
+            // reads and what its deps list names. A memo's body runs in the
+            // render, so what it names is read (a function it names may be
+            // called); a callback's body only captures, and a readable deps
+            // list is what its identity changes with.
             Expr::MemoVal(l) | Expr::CallbackVal(l) => {
                 let mut d = Deps::default();
                 match self.hooks.get(l) {
                     Some(HookEntry::Memo { body_cfg, deps, .. }) => {
                         for v in self.free_vars(body_cfg).iter() {
-                            d.union_with(&self.var(env, v).deps);
+                            let mut read = self.var(env, v).deps;
+                            read.captured.clear();
+                            d.union_with(&read);
                         }
                         for e in deps.list().map(|l| l.elems.as_slice()).unwrap_or(&[]) {
                             d.union_with(&self.eval(e, env).deps);
@@ -871,8 +894,13 @@ impl<'a> Analyzer<'a> {
                         ..
                     }) => {
                         d = self.closure(params, body_cfg, env);
-                        for e in deps.list().map(|l| l.elems.as_slice()).unwrap_or(&[]) {
-                            d.union_with(&self.eval(e, env).deps);
+                        match deps.list() {
+                            Some(list) => {
+                                for e in &list.elems {
+                                    d.union_with(&self.eval(e, env).deps);
+                                }
+                            }
+                            None => d.captured.clear(),
                         }
                     }
                     _ => d = Deps::top(),
