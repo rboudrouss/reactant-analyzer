@@ -1154,6 +1154,7 @@ pub(crate) fn collect_slot_writers(
                     site.arg.as_ref(),
                     &site.updater,
                     owner.is_none().then_some(slot),
+                    class_phase(site.class, region),
                     must_read,
                     |e| envs.eval(region, cfg, at, e),
                 ),

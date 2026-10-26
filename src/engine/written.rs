@@ -25,7 +25,7 @@ use crate::{
     },
     engine::{
         Reducer,
-        setters::{Updater, WriterRegion},
+        setters::{Updater, WriterPhase, WriterRegion},
     },
     ir::{
         ComponentId,
@@ -77,18 +77,22 @@ pub struct Written {
 /// scope). A bound updater the walk proved a function literal is read the
 /// same way; a bound name it could not prove stays on the value path, where
 /// a function value reads as an opaque reference. `own_slot` is the written
-/// slot when it is the writer's own (`None` for another component's), and
+/// slot when it is the writer's own (`None` for another component's),
 /// `must_read` the slot an expression reads on every path
-/// ([`must_slot_read`](crate::ir::bindings::must_slot_read)): together they
-/// say whether the write stores the slot's own content.
+/// ([`must_slot_read`](crate::ir::bindings::must_slot_read)), and `phase` when
+/// the write runs: together they say whether the write stores the slot's own
+/// content.
 pub fn classify(
     arg: Option<&Expr>,
     updater: &Updater,
     own_slot: Option<HookLabel>,
+    phase: WriterPhase,
     must_read: impl Fn(&Expr) -> Option<HookLabel>,
     value_of: impl FnOnce(&Expr) -> StateValue,
 ) -> Written {
-    let identity = own_slot.is_some_and(|slot| stores_own_content(arg, slot, &must_read));
+    let identity = own_slot.is_some_and(|slot| {
+        reads_committed_state(phase) && stores_own_content(arg, slot, &must_read)
+    });
     // A bare `setX()` stores `undefined`, one value known in advance.
     let Some(arg) = arg else {
         return Written {
@@ -208,6 +212,23 @@ fn stores_own_content(
     must_read: impl Fn(&Expr) -> Option<HookLabel>,
 ) -> bool {
     arg.is_some_and(|e| must_read(e) == Some(slot))
+}
+
+/// Does a closure running in `phase` read the state the slot holds when it
+/// writes? A render reads its own state, and an effect or a memo body runs
+/// in the batch of the render that built it. A cleanup, a deferred
+/// continuation, a handler or a callback is the closure of an older render:
+/// `setX(x)` there stores the `x` of that render, which another write may
+/// have moved since (#205). ⊤ (`Unknown`) may be any of them.
+fn reads_committed_state(phase: WriterPhase) -> bool {
+    match phase {
+        WriterPhase::Render | WriterPhase::Effect | WriterPhase::Memo => true,
+        WriterPhase::Callback
+        | WriterPhase::Handler
+        | WriterPhase::Deferred
+        | WriterPhase::Cleanup
+        | WriterPhase::Unknown => false,
+    }
 }
 
 /// May a stored value change the slot? It does on every call when it is a
@@ -330,6 +351,9 @@ mod tests {
     /// The slot the tests write, the writer's own.
     const T: Option<HookLabel> = Some(0);
 
+    /// The tests' writes run synchronously in an effect body.
+    const FX: WriterPhase = WriterPhase::Effect;
+
     /// `x` reads slot 0 on every path, `y` slot 1.
     fn states(e: &Expr) -> Option<HookLabel> {
         match e.peel_ts() {
@@ -342,7 +366,7 @@ mod tests {
 
     #[test]
     fn no_argument_stores_undefined_once() {
-        let w = classify(None, &Updater::Unknown, T, states, opaque);
+        let w = classify(None, &Updater::Unknown, T, FX, states, opaque);
         assert_eq!(w.change, Change::Once);
         assert_eq!(w.value, StateValue::undefined());
         assert!(w.expr.is_none());
@@ -357,7 +381,7 @@ mod tests {
             },
             "p",
         );
-        let w = classify(Some(&e), &Updater::Unknown, T, states, opaque);
+        let w = classify(Some(&e), &Updater::Unknown, T, FX, states, opaque);
         assert_eq!(w.change, Change::Must);
         assert_eq!(w.value.reference, Stability::PerRender);
     }
@@ -373,7 +397,7 @@ mod tests {
             },
             "p",
         );
-        let w = classify(Some(&e), &Updater::Unknown, T, states, opaque);
+        let w = classify(Some(&e), &Updater::Unknown, T, FX, states, opaque);
         assert_eq!(w.change, Change::Must);
         assert_eq!(w.value.reference, Stability::PerRender);
     }
@@ -382,12 +406,12 @@ mod tests {
     fn the_identity_updater_never_changes_the_slot_a_literal_reset_once() {
         let id = updater(Expr::Var("p".into()), "p");
         assert_eq!(
-            classify(Some(&id), &Updater::Unknown, T, states, opaque).change,
+            classify(Some(&id), &Updater::Unknown, T, FX, states, opaque).change,
             Change::Never
         );
         let reset = updater(Expr::Lit(Prim::Int(0)), "p");
         assert_eq!(
-            classify(Some(&reset), &Updater::Unknown, T, states, opaque).change,
+            classify(Some(&reset), &Updater::Unknown, T, FX, states, opaque).change,
             Change::Once
         );
     }
@@ -404,7 +428,7 @@ mod tests {
             "p",
         );
         assert_eq!(
-            classify(Some(&not), &Updater::Unknown, T, states, opaque).change,
+            classify(Some(&not), &Updater::Unknown, T, FX, states, opaque).change,
             Change::May
         );
         let inc = updater(
@@ -416,7 +440,7 @@ mod tests {
             "p",
         );
         assert_eq!(
-            classify(Some(&inc), &Updater::Unknown, T, states, opaque).change,
+            classify(Some(&inc), &Updater::Unknown, T, FX, states, opaque).change,
             Change::May
         );
     }
@@ -427,12 +451,12 @@ mod tests {
     #[test]
     fn an_updater_stores_what_it_returns() {
         let reset = updater(Expr::Lit(Prim::Null), "p");
-        let w = classify(Some(&reset), &Updater::Unknown, T, states, opaque);
+        let w = classify(Some(&reset), &Updater::Unknown, T, FX, states, opaque);
         assert!(w.value.null);
         assert_eq!(w.value.reference, Stability::Bottom);
         let id = updater(Expr::Var("p".into()), "p");
         assert!(
-            classify(Some(&id), &Updater::Unknown, T, states, opaque)
+            classify(Some(&id), &Updater::Unknown, T, FX, states, opaque)
                 .value
                 .is_top_value()
         );
@@ -441,7 +465,7 @@ mod tests {
     #[test]
     fn a_value_argument_changes_the_slot_unless_it_is_one_known_value() {
         let arg = Expr::Var("next".into());
-        let change = |v: StateValue| classify(Some(&arg), &Updater::Unknown, T, states, |_| v);
+        let change = |v: StateValue| classify(Some(&arg), &Updater::Unknown, T, FX, states, |_| v);
         assert_eq!(
             change(StateValue::reference(Stability::PerRender)).change,
             Change::Must
@@ -495,20 +519,48 @@ mod tests {
             v
         };
         let x = Expr::Var("x".into());
-        let own = classify(Some(&x), &Updater::Unknown, T, states, |_| read());
+        let own = classify(Some(&x), &Updater::Unknown, T, FX, states, |_| read());
         assert_eq!(own.change, Change::Never);
         let direct = classify(
             Some(&Expr::StateVal(0)),
             &Updater::Unknown,
             T,
+            FX,
             states,
             |_| read(),
         );
         assert_eq!(direct.change, Change::Never);
-        let copy = classify(Some(&x), &Updater::Unknown, Some(1), states, |_| read());
+        let copy = classify(Some(&x), &Updater::Unknown, Some(1), FX, states, |_| read());
         assert_eq!(copy.change, Change::May);
-        let foreign = classify(Some(&x), &Updater::Unknown, None, states, |_| read());
+        let foreign = classify(Some(&x), &Updater::Unknown, None, FX, states, |_| read());
         assert_eq!(foreign.change, Change::May);
+    }
+
+    /// A cleanup, a deferred continuation, a handler or a callback is the
+    /// closure of an older render: the read it writes back is that render's,
+    /// not the slot's content (#205). The identity updater reads the queue,
+    /// whatever closure runs it, and stays `Never`.
+    #[test]
+    fn the_own_read_is_the_slots_content_only_in_a_closure_of_the_current_render() {
+        let read = || StateValue::reference(Stability::versioned_by(crate::test_support::C, 0));
+        let x = Expr::Var("x".into());
+        let id = updater(Expr::Var("p".into()), "p");
+        for phase in [WriterPhase::Render, WriterPhase::Effect, WriterPhase::Memo] {
+            let w = classify(Some(&x), &Updater::Unknown, T, phase, states, |_| read());
+            assert_eq!(w.change, Change::Never, "{phase:?}");
+        }
+        for phase in [
+            WriterPhase::Cleanup,
+            WriterPhase::Deferred,
+            WriterPhase::Handler,
+            WriterPhase::Callback,
+            WriterPhase::Unknown,
+        ] {
+            let w = classify(Some(&x), &Updater::Unknown, T, phase, states, |_| read());
+            assert_eq!(w.change, Change::May, "{phase:?}");
+            let w = classify(Some(&id), &Updater::Unknown, T, phase, states, opaque);
+            assert_eq!(w.change, Change::Never, "updater in {phase:?}");
+        }
     }
 
     /// A memo over the slot, or a field of it, is a value derived from the
@@ -526,7 +578,7 @@ mod tests {
                 field: "inner".into(),
             },
         ] {
-            let w = classify(Some(&arg), &Updater::Unknown, T, states, |_| derived());
+            let w = classify(Some(&arg), &Updater::Unknown, T, FX, states, |_| derived());
             assert_eq!(w.change, Change::May, "{arg:?}");
         }
     }

@@ -251,6 +251,38 @@ fn the_own_read_or_a_name_bound_once_to_it_never_changes_the_slot() {
     }
 }
 
+/// A cleanup and a deferred continuation are closures of an older render:
+/// `setX(x)` there stores that render's `x`, which a later write may have
+/// moved, so it may change the slot (#205). Run synchronously in the effect,
+/// the same write stores the committed value.
+#[test]
+fn the_own_read_written_back_by_a_cleanup_or_a_timer_may_change_the_slot() {
+    for (effect, never) in [
+        ("setX(x);", true),
+        ("return () => { setX(x); };", false),
+        ("setTimeout(() => setX(x), 0);", false),
+        ("Promise.resolve().then(() => setX(x));", false),
+    ] {
+        let src = format!(
+            r#"
+            import {{ useState, useEffect }} from "react";
+            export function C() {{
+              const [x, setX] = useState(0);
+              useEffect(() => {{
+                {effect}
+              }}, [x]);
+              return <div />;
+            }}
+            "#
+        );
+        assert_eq!(
+            effect_change(&src, "setX") == Change::Never,
+            never,
+            "{effect}"
+        );
+    }
+}
+
 /// `Never` is decided from a must-alias, not from the alias table, where a
 /// name *some* binding ties to the slot counts (#210): the ternary's temporary
 /// is the read on one arm only, `d` is reassigned on a path, an effect
