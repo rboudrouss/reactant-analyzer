@@ -10,7 +10,8 @@
 //!   ⊥, the branch is dead in every later run;
 //! - **relational** — the guard compares the slot against the very expression
 //!   the write stores there, so the two sides are equal next render whatever
-//!   they evaluate to (`write_settles_comparison`);
+//!   they evaluate to (`write_settles_comparison`), and stay equal when that
+//!   expression holds still across the loop (#209);
 //! - **member** — the guard tests a member of the slot, and the literal the
 //!   write puts at that member contradicts it (`write_settles_member_truth`).
 //!
@@ -77,11 +78,15 @@ pub fn converges_once_written(
     if guards.is_empty() {
         return false;
     }
+    // Between two passes of a render-phase loop only render writes run, and
+    // each of them is a site the caller judges on its own: the written
+    // expression is read as holding across the passes this site sees.
     let own = Rewrite {
         label,
         value: written.clone(),
         expr: written_expr,
         scope: Some(cfg),
+        held: &|_| true,
     };
     // `exit_env` is this body's own env: nothing is shadowed.
     dead_once_written(&guards, None, state_vals, &[own], exit_env, eval)
@@ -169,11 +174,16 @@ pub fn converges_under_all_writes(
                 && p.block.is_some_and(|b| chain.contains(&b))
         })
         .collect();
+    let mine = let_bindings(site.cfg);
+    // Does a part of a written expression of this body denote one value on
+    // every run (#209)?
+    let held_here = |e: &Expr| invariance.holds(e, &mine, props_hold);
     let mut kill: Vec<Rewrite> = vec![Rewrite {
         label: site.slot.1,
         value: own_value.clone(),
         expr: site.expr,
         scope: Some(site.cfg),
+        held: &held_here,
     }];
     for &j in &co {
         let p = &peers[j];
@@ -187,10 +197,10 @@ pub fn converges_under_all_writes(
                 value: p.value.clone(),
                 expr: p.expr,
                 scope: Some(site.cfg),
+                held: &held_here,
             }),
         }
     }
-    let mine = let_bindings(site.cfg);
     if !dead_once_written(&guards, Some(&mine), state_vals, &kill, exit_env, eval) {
         return false;
     }
@@ -247,7 +257,9 @@ pub fn converges_under_all_writes(
                 label: k.label,
                 value: other.value.clone(),
                 expr: other.expr,
+                // The relational arm reads it in this body only (`scope`).
                 scope: same.then_some(site.cfg),
+                held: &held_here,
             });
             if !dead_once_written(&guards, Some(&mine), state_vals, &rewrites, &env, eval) {
                 return false;
@@ -890,6 +902,11 @@ struct Rewrite<'a> {
     /// when the write sits in another body, whose names mean something else
     /// at the guard.
     scope: Option<&'a CFG>,
+    /// Does a part of `expr` denote the same value on every run of the loop?
+    /// The relational arm's "both sides are one value next render" is a fact
+    /// about the render after the write only: a written `t` another write
+    /// moves makes `s !== t` true again (#209).
+    held: &'a dyn Fn(&Expr) -> bool,
 }
 
 /// True when `guards`, the conjuncts of one site, are all dead once every
@@ -930,12 +947,13 @@ fn dead_once_written(
             let slots = slots_of(rewrite.label);
             // Relational arm: the guard compares the slot against an
             // expression the write puts *into* the slot, so the two sides
-            // are the same value on the next render whatever that value is.
+            // are the same value on the next render whatever that value is
+            // — and on every later one only while that expression holds.
             // An interval domain cannot say that — `x < y` after `x := y`
             // needs the two to be related, not bounded — but the spellings
             // can.
             if let (Some(arg), Some(scope)) = (rewrite.expr, rewrite.scope)
-                && write_settles_comparison(cond, taken, &slots, arg, scope, eval)
+                && write_settles_comparison(cond, taken, &slots, arg, scope, rewrite.held, eval)
             {
                 return true;
             }
@@ -971,12 +989,15 @@ fn dead_once_written(
 ///
 /// Verbatim is checked with [`call_free_key`]: a call may not return the same
 /// thing twice, so a claim that two spellings are one value cannot cross one.
+/// And the stored expression must hold still (`held`): the guard is dead on
+/// every later render only while the slot and it stay one value (#209).
 fn write_settles_comparison(
     cond: &Expr,
     taken: bool,
     slots: &HashSet<&Var>,
     written_expr: &Expr,
     cfg: &CFG,
+    held: &dyn Fn(&Expr) -> bool,
     eval: &mut dyn FnMut(&Expr) -> StateValue,
 ) -> bool {
     use crate::ir::expr::BinOp::*;
@@ -1007,7 +1028,7 @@ fn write_settles_comparison(
         // `const x = {}; if (s !== x) setS(x)` holds again after every write
         // (#156). The claim below is about two spellings being one value
         // across runs, so neither side may be one.
-        if fresh_spelling(at, cfg, eval) || fresh_spelling(other, cfg, eval) {
+        if fresh_spelling(at, cfg, eval) || fresh_spelling(other, cfg, eval) || !held(at) {
             return false;
         }
         let keys = value_keys(at, cfg);

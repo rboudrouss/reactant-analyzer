@@ -1627,3 +1627,19 @@ export function C() {
 "#;
     assert!(!loop_severities(src, "C").is_empty());
 }
+
+#[test]
+fn a_relational_guard_settles_only_while_the_written_expression_holds() {
+    // `s === t` after the write, until the second effect moves `t` (#209).
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [s, setS] = useState(false);
+  const [t, setT] = useState(false);
+  useEffect(() => { if (s !== t) setS(t); }, [s, t]);
+  useEffect(() => { setT(!s); }, [s]);
+  return <div />;
+}
+"#;
+    assert!(!loop_severities(src, "C").is_empty());
+}
