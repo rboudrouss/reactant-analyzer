@@ -159,6 +159,40 @@ fn two_stable_refs_a_state_boolean_chooses_between_are_versioned_by_it() {
 }
 
 #[test]
+fn a_value_a_local_function_selects_is_versioned_by_the_captured_slot_it_reads() {
+    // `v` is what `pick()` returns, and `pick` chooses by `flag`, a slot
+    // read it closed over: the call's value is the closure's return, and
+    // the closure's condition is the slot (#197). Two spellings, two
+    // merges: a ternary in the body, and two `return`s meeting at its exit.
+    for pick in [
+        "const pick = () => (flag ? r1 : r2);",
+        "const pick = () => { if (flag) return r1; return r2; };",
+    ] {
+        let src = format!(
+            r#"
+            import {{ useState, useEffect, useRef }} from "react";
+            export function C() {{
+              const [flag, setFlag] = useState(false);
+              const r1 = useRef(1);
+              const r2 = useRef(2);
+              {pick}
+              const v = pick();
+              useEffect(() => {{ console.log(v.current); }}, [v]);
+              return <div />;
+            }}
+            "#
+        );
+        let r = parse_and_analyze(&src);
+        let c = comp(&r, "C");
+        let flag = only_slot(c);
+        let rows: Vec<&EffectTrigger> = c.effect_triggers.iter().collect();
+        assert_eq!(rows.len(), 1, "{pick}: {rows:?}");
+        assert_eq!(rows[0].slot, (c.component, flag), "{pick}");
+        assert!(!rows[0].exact, "{pick}");
+    }
+}
+
+#[test]
 fn a_primitive_a_prop_overrides_is_a_versioned_trigger_of_its_slot_not_an_exact_one() {
     // `isOpen` is the prop when given, the slot otherwise: a change of the
     // slot may re-run the effect, never must. The slot is a boolean, so its

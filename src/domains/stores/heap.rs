@@ -6,7 +6,7 @@ use crate::{
         cfg::CFG,
         expr::Expr,
         free_vars::compute_free_vars,
-        types::{ExprId, Symbol, Var},
+        types::{ExprId, HookLabel, Symbol, Var},
     },
 };
 
@@ -23,6 +23,10 @@ pub enum HeapValue {
         body_cfg: Arc<CFG>,
         /// Free variables captured from the enclosing scope when this function was created.
         captured: HashMap<Symbol, StateValue>,
+        /// The captured names that were a state slot's read value at
+        /// creation (`AbstractEnv::slot_label`): what the body's conditions
+        /// on them change with (#197).
+        captured_slots: HashMap<Symbol, HookLabel>,
     },
     /// An abstract object: fields may be plain values or heap locations (for FnLit props).
     Obj(HashMap<Symbol, EnvVal<StateValue>>),
@@ -59,12 +63,17 @@ impl Heap {
             .iter()
             .filter_map(|v| env.lookup(v).as_state_value().map(|sv| (v.clone(), sv)))
             .collect();
+        let captured_slots = free
+            .iter()
+            .filter_map(|v| env.slot_label(v).map(|l| (v.clone(), l)))
+            .collect();
         self.insert(
             id,
             HeapValue::Fn {
                 params: params.to_vec(),
                 body_cfg: Arc::clone(body_cfg),
                 captured,
+                captured_slots,
             },
         );
     }
@@ -91,9 +100,11 @@ impl Heap {
                     params,
                     body_cfg,
                     captured: cap_self,
+                    captured_slots: slots_self,
                 }) => {
                     if let HeapValue::Fn {
                         captured: cap_other,
+                        captured_slots: slots_other,
                         ..
                     } = val
                     {
@@ -102,12 +113,19 @@ impl Heap {
                             let cur = map_get_or(&joined_cap, k, StateValue::bottom);
                             joined_cap.insert(k.clone(), cur.join(v));
                         }
+                        // A certificate survives only where both agree.
+                        let joined_slots = slots_self
+                            .iter()
+                            .filter(|(k, l)| slots_other.get(*k) == Some(*l))
+                            .map(|(k, l)| (k.clone(), *l))
+                            .collect();
                         result.insert(
                             *id,
                             HeapValue::Fn {
                                 params: params.clone(),
                                 body_cfg: Arc::clone(body_cfg),
                                 captured: joined_cap,
+                                captured_slots: joined_slots,
                             },
                         );
                     }

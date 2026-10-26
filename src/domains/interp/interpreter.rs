@@ -167,7 +167,7 @@ pub(crate) fn run_cfg<T: Transfer>(
                     && env.contains(var)
                 {
                     let selected = env.lookup(var).select_under(&pc);
-                    env.extend(var.clone(), selected);
+                    env.refine(var.clone(), selected);
                 }
             }
             match &block.term {
@@ -253,9 +253,13 @@ fn condition_bound<T: Transfer>(
         Expr::Lit(_) => Stability::Stable,
         Expr::StateVal(l) => Stability::versioned_by(component, *l),
         Expr::MemoVal(l) | Expr::CallbackVal(l) => ctx.memo.get(*l).change_bound(),
-        Expr::Var(v) => match binding_of(v, cfg) {
-            Some(Expr::StateVal(l)) => Stability::versioned_by(component, *l),
-            Some(Expr::MemoVal(l) | Expr::CallbackVal(l)) => ctx.memo.get(*l).change_bound(),
+        Expr::Var(v) => match (env.slot_label(v), binding_of(v, cfg)) {
+            (Some(l), _) | (None, Some(&Expr::StateVal(l))) => {
+                Stability::versioned_by(component, l)
+            }
+            (None, Some(Expr::MemoVal(l) | Expr::CallbackVal(l))) => {
+                ctx.memo.get(*l).change_bound()
+            }
             _ => transfer.eval_expr(cond, env, ctx).change_bound(),
         },
         Expr::UnaryOp { arg, .. } => condition_bound(transfer, arg, cfg, env, ctx),
@@ -496,8 +500,18 @@ fn bind_rhs<T: Transfer>(
             env.extend_loc(var.to_string(), id);
         }
     }
+    // A slot read, or a rename of one, certifies the name (#197); any
+    // other right-hand side revokes what the name had.
+    let slot = match rhs.peel_ts() {
+        Expr::StateVal(label) => Some(*label),
+        Expr::Var(src) => env.slot_label(src),
+        _ => None,
+    };
     let val = transfer.eval_expr(rhs, env, ctx);
     env.extend(var.to_string(), val);
+    if let Some(label) = slot {
+        env.bind_slot(var.to_string(), label);
+    }
 }
 
 /// Per-member `EnvVal`s of an object literal, for the heap `Obj` entry.
@@ -724,14 +738,21 @@ fn exec_var_callback<T: Transfer>(
                 params,
                 body_cfg,
                 captured,
+                captured_slots,
             }) = ctx.heap.get(id)
             {
                 let params = params.clone();
                 let body_cfg = Arc::clone(body_cfg);
                 let captured = captured.clone();
+                let captured_slots = captured_slots.clone();
                 let mut sub_env = env.clone();
                 for (var, val) in captured {
                     sub_env.extend(var, T::Domain::from_state_value(val));
+                }
+                // The creation-time certificates, not the call site's: the
+                // body's `a` is the one it closed over.
+                for (var, label) in captured_slots {
+                    sub_env.bind_slot(var, label);
                 }
                 for p in &params {
                     sub_env.extend(p.clone(), T::Domain::top());

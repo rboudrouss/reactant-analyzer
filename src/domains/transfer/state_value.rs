@@ -2551,6 +2551,7 @@ mod tests {
                 params: vec![],
                 body_cfg: Arc::new(cb_body),
                 captured: std::collections::HashMap::new(),
+                captured_slots: std::collections::HashMap::new(),
             },
         );
         StateValueTransfer.exec_stmt(

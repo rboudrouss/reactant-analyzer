@@ -1162,3 +1162,54 @@ export function RefSwitch() {
         "two refs selected by a moving boolean are not a stable dep: {diags:?}"
     );
 }
+
+#[test]
+fn a_selection_a_local_function_makes_in_a_ternary_still_loops() {
+    // The ternary sits in a closure the render calls: the merge is in the
+    // closure's body, `a` is a captured slot read, and `v` is what the call
+    // returns — none of which the render body shows syntactically.
+    let src = r#"
+import { useEffect, useRef, useState } from 'react';
+export function TernSelect() {
+  const [a, setA] = useState(false);
+  const r1 = useRef(1);
+  const r2 = useRef(2);
+  const pick = () => (a ? r1 : r2);
+  const v = pick();
+  useEffect(() => { setA((x) => !x); }, [v]);
+  return <div>{String(a)}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "TernSelect");
+    assert!(
+        diags
+            .iter()
+            .any(|(rule, sev, _)| rule == "infinite-loop" && *sev == Severity::Warning),
+        "a closure's selection is the call's value, and takes `a`: {diags:?}"
+    );
+}
+
+#[test]
+fn a_selection_a_local_function_makes_with_two_returns_still_loops() {
+    // Two `return`s in two blocks have no merge block: the function's exit
+    // is where they meet, so the returned value takes the guard's condition.
+    let src = r#"
+import { useEffect, useRef, useState } from 'react';
+export function RetSelect() {
+  const [a, setA] = useState(false);
+  const r1 = useRef(1);
+  const r2 = useRef(2);
+  const pick = () => { if (a) return r1; return r2; };
+  const v = pick();
+  useEffect(() => { setA((x) => !x); }, [v]);
+  return <div>{String(a)}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "RetSelect");
+    assert!(
+        diags
+            .iter()
+            .any(|(rule, sev, _)| rule == "infinite-loop" && *sev == Severity::Warning),
+        "a return the other side answers with its own takes `a`: {diags:?}"
+    );
+}

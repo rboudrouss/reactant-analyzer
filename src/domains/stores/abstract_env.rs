@@ -57,6 +57,13 @@ pub struct AbstractEnv<D: AbstractDomain> {
     /// entry (`QueryContext::callback_body`), not the heap, so calls through
     /// the variable can still be executed for side effects.
     callback_bindings: HashMap<Var, HookLabel>,
+    /// The names that are, at this point, the value a state slot was read
+    /// as in this render: `a = StateVal(l)` and its renames. A primitive
+    /// slot's value carries no label (ADR-017, #203), so this is the only
+    /// record a condition on it leaves (#197). A certificate, so it fails
+    /// closed: any other binding of the name drops it, and a join keeps it
+    /// only where both sides agree.
+    slot_bindings: HashMap<Var, HookLabel>,
 }
 
 impl<D: AbstractDomain> Default for AbstractEnv<D> {
@@ -66,8 +73,20 @@ impl<D: AbstractDomain> Default for AbstractEnv<D> {
             locs: HashMap::new(),
             setter_bindings: HashMap::new(),
             callback_bindings: HashMap::new(),
+            slot_bindings: HashMap::new(),
         }
     }
+}
+
+/// The slot certificates both sides agree on.
+fn agreed_slots(
+    a: &HashMap<Var, HookLabel>,
+    b: &HashMap<Var, HookLabel>,
+) -> HashMap<Var, HookLabel> {
+    a.iter()
+        .filter(|(k, l)| b.get(*k) == Some(*l))
+        .map(|(k, l)| (k.clone(), *l))
+        .collect()
 }
 
 impl<D: AbstractDomain> AbstractEnv<D> {
@@ -97,9 +116,28 @@ impl<D: AbstractDomain> AbstractEnv<D> {
         self.stabs.contains_key(var)
     }
 
-    /// Bind (or update) a variable to a domain value. Preserves any Loc.
+    /// Bind (or rebind) a variable to a domain value. Preserves any Loc;
+    /// drops the slot certificate, which the new binding must earn again.
     pub fn extend(&mut self, var: Var, val: D) {
+        self.slot_bindings.remove(&var);
         self.stabs.insert(var, val);
+    }
+
+    /// Replace the value of a variable without rebinding it — a narrowing
+    /// on a branch, a selection taint — so what is known of the name's
+    /// origin stays.
+    pub fn refine(&mut self, var: Var, val: D) {
+        self.stabs.insert(var, val);
+    }
+
+    /// Record that `var` is the value slot `label` was read as.
+    pub fn bind_slot(&mut self, var: Var, label: HookLabel) {
+        self.slot_bindings.insert(var, label);
+    }
+
+    /// The slot `var` is the read value of, if that is certain here.
+    pub fn slot_label(&self, var: &str) -> Option<HookLabel> {
+        self.slot_bindings.get(var).copied()
     }
 
     /// Record that `var` is bound to an allocation site. Independent of `extend`.
@@ -169,6 +207,7 @@ impl<D: AbstractDomain> AbstractEnv<D> {
             locs,
             setter_bindings,
             callback_bindings,
+            slot_bindings: agreed_slots(&self.slot_bindings, &other.slot_bindings),
         }
     }
 
@@ -204,6 +243,7 @@ impl<D: AbstractDomain> AbstractEnv<D> {
             locs,
             setter_bindings,
             callback_bindings,
+            slot_bindings: agreed_slots(&self.slot_bindings, &other.slot_bindings),
         }
     }
 
@@ -283,6 +323,41 @@ mod tests {
         let mut b = Env::new();
         b.extend("x".to_string(), Stability::Stable);
         assert_eq!(a.join(&b).lookup("x"), Stability::Stable);
+    }
+
+    #[test]
+    fn a_rebinding_drops_the_slot_certificate_and_a_refinement_keeps_it() {
+        let mut env = Env::new();
+        env.extend("a".to_string(), Stability::Unknown);
+        env.bind_slot("a".to_string(), 0);
+        env.refine("a".to_string(), Stability::Stable);
+        assert_eq!(env.slot_label("a"), Some(0), "narrowing is not rebinding");
+        env.extend("a".to_string(), Stability::Unknown);
+        assert_eq!(
+            env.slot_label("a"),
+            None,
+            "a new binding must earn it again"
+        );
+    }
+
+    #[test]
+    fn a_join_keeps_a_slot_certificate_only_where_both_sides_agree() {
+        let mut a = Env::new();
+        a.bind_slot("x".to_string(), 0);
+        a.bind_slot("y".to_string(), 1);
+        a.bind_slot("z".to_string(), 2);
+        let mut b = Env::new();
+        b.bind_slot("x".to_string(), 0);
+        b.bind_slot("y".to_string(), 3);
+        let joined = a.join(&b);
+        assert_eq!(joined.slot_label("x"), Some(0));
+        assert_eq!(joined.slot_label("y"), None, "two slots: no certificate");
+        assert_eq!(
+            joined.slot_label("z"),
+            None,
+            "one side only: no certificate"
+        );
+        assert_eq!(a.widen_to(&b, &[]).slot_label("y"), None);
     }
 
     #[test]
