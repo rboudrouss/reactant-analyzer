@@ -179,7 +179,7 @@ on parent slots; a prop read that is no dep has no node of its own (#207).
 | `from`, `to` | qualified slots | exact |
 | `component`, `effect_label`, `write_span` | the carrying effect and its write | exact |
 | `strength` | `Must`: (exact-slot dep, or a certain every-render re-run) ∧ `Fresh` write on all paths of the body. `May`: everything else | must / may |
-| `always` | the edge exists because the carrying effect re-runs after every render (its re-run class), and why | exact |
+| `always` | the edge exists because the carrying effect re-runs after every render (its re-run class), why, and whether surely (a fresh dep the parent allocates is new only at the parent's renders) | exact |
 | `self_slot` | a dep-driven edge from a slot into itself: the self-churn arm's partition, never part of a reported cycle | exact |
 
 A cycle (`ChurnCycle`) is a simple cycle of one strongly connected component

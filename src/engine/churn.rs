@@ -121,8 +121,10 @@ pub struct ChurnEdge {
     pub write_span: Option<SourceRange>,
     /// The edge exists because the carrying effect re-runs after every render
     /// (its re-run class, `engine::triggers::Rerun::Always`), and why: no
-    /// dependency array, a dep that is a new reference every render, …
-    pub always: Option<Always>,
+    /// dependency array, a dep that is a new reference every render, … —
+    /// and whether it surely does: a fresh dep the parent allocates is new
+    /// only when the parent re-renders.
+    pub always: Option<(Always, bool)>,
     /// A dep-driven edge from a slot into itself: the self-churn arm's
     /// partition (ADR-020 item 2). Never part of a cycle the graph reports.
     pub self_slot: bool,
@@ -829,7 +831,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             let mut push = |from: QualifiedSlot,
                             strength: EdgeStrength,
                             self_slot: bool,
-                            always: Option<Always>| {
+                            always: Option<(Always, bool)>| {
                 let key = (from, node, f.comp, f.effect_label);
                 let edge = ChurnEdge {
                     from,
@@ -868,9 +870,9 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 None => vec![node],
             };
             // A certain re-run reads every row already.
-            if let Some((why, true)) = f.always {
+            if let Some((_, true)) = f.always {
                 for &x in &every_render {
-                    push(x, strength, false, Some(why));
+                    push(x, strength, false, f.always);
                 }
                 continue;
             }
@@ -895,9 +897,9 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             }
             // A re-run that is only possible adds May edges beside the rows'
             // own, which keep their partition on a tie (pushed first).
-            if let Some((why, false)) = f.always {
+            if let Some((_, false)) = f.always {
                 for &x in &every_render {
-                    push(x, EdgeStrength::May, false, Some(why));
+                    push(x, EdgeStrength::May, false, f.always);
                 }
             }
             // The reads-kill says a re-run stores what the last run stored,

@@ -1487,6 +1487,47 @@ function C({ opts }: { opts: object }) {
 }
 
 #[test]
+fn a_fresh_prop_dep_is_worded_as_new_at_the_parent_s_renders() {
+    // #229: the engine's certainty, not the reason's, picks the verb.
+    for (params, decl, clause, verb) in [
+        (
+            "{ data }: { data: object }",
+            "",
+            "a new reference whenever its parent re-renders",
+            "so it may re-run after every render",
+        ),
+        (
+            "",
+            "const data = {};",
+            "a new reference every render",
+            "so it re-runs after every render",
+        ),
+    ] {
+        let src = format!(
+            r#"
+import {{ useState, useEffect }} from 'react';
+export function Parent() {{
+  return <C data={{{{}}}} />;
+}}
+function C({params}) {{
+  {decl}
+  const [n, setN] = useState(false);
+  useEffect(() => {{ setN(!n); }}, [data]);
+  return <div>{{String(n)}}</div>;
+}}
+"#
+        );
+        let diags = infinite_loop_diags(&src, "C");
+        assert!(
+            diags
+                .iter()
+                .any(|(_, _, m)| m.contains(clause) && m.contains(verb)),
+            "`{decl}`: {diags:?}"
+        );
+    }
+}
+
+#[test]
 fn a_fresh_dep_bound_on_two_paths_is_a_possible_loop() {
     // `o` is a new object on either path, so React re-runs the effect after
     // every commit; a name bound twice is not certified fresh at the call, so

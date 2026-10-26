@@ -316,10 +316,14 @@ fn check_multi_effect_cycles(
                     })
             };
             // Why a length-1 cycle re-runs its own effect after every render.
-            let always = e
-                .always
-                .filter(|_| cyc.len() == 1)
-                .map(|why| always_clause(why, &result.components[&e.component], e.effect_label));
+            let always = e.always.filter(|_| cyc.len() == 1).map(|(why, surely)| {
+                always_clause(
+                    why,
+                    surely,
+                    &result.components[&e.component],
+                    e.effect_label,
+                )
+            });
             let msg = if !certain && !cyc.iter().all(|e| allocates(e)) {
                 if let Some((why, reruns)) = &always {
                     format!(
@@ -429,9 +433,11 @@ fn check_multi_effect_cycles(
 }
 
 /// Why effect `label` re-runs after every render, as a clause of the
-/// message, and whether it surely does (`re-runs`) or only may (`may re-run`).
+/// message, and whether it surely does (`re-runs`) or only may (`may re-run`)
+/// — `surely` as the engine computed it on the edge.
 fn always_clause(
     why: Always,
+    surely: bool,
     comp: &crate::engine::AnalysisResult<crate::domains::StateValue>,
     label: HookLabel,
 ) -> (String, &'static str) {
@@ -449,21 +455,21 @@ fn always_clause(
     };
     let clause = match why {
         Always::NoDeps => "has no dependency array".to_string(),
-        Always::FreshDep(i) => format!("depends on `{}`, a new reference every render,", dep(i)),
+        Always::FreshDep(i) if surely => {
+            format!("depends on `{}`, a new reference every render,", dep(i))
+        }
+        // Fresh while the props hold: a prop the parent allocates.
+        Always::FreshDep(i) => format!(
+            "depends on `{}`, a new reference whenever its parent re-renders,",
+            dep(i)
+        ),
         Always::OpaqueDeps => "is gated by a deps argument the analysis cannot read".to_string(),
         Always::MutableDep(i) => format!(
             "depends on `{}`, which may differ at any render without a state change,",
             dep(i)
         ),
     };
-    (
-        clause,
-        if why.certain() {
-            "re-runs"
-        } else {
-            "may re-run"
-        },
-    )
+    (clause, if surely { "re-runs" } else { "may re-run" })
 }
 
 // ── Object-churn arm (ADR-017) ────────────────────────────────────────────────
