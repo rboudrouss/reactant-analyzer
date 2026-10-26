@@ -23,7 +23,7 @@ use crate::{
     engine::setters::{memo_val_labels, resolve_setter_aliases},
     ir::{
         ComponentId, QualifiedSlot,
-        bindings::{binding_of, local_bindings},
+        bindings::{local_bindings, must_slot_read},
         cfg::CFG,
         expr::Expr,
         hooks::HookEntry,
@@ -68,19 +68,13 @@ pub(crate) fn collect_effect_triggers(
         };
         for (i, dep) in list.as_slice().iter().enumerate() {
             // The must-rerun bit is a certificate: a name is the slot's value
-            // only when its sole binding chain ends at the slot (`binding_of`
+            // only when its sole binding chain ends at the slot (`must_slot_read`
             // fails closed on a name bound twice — `c ? obj : null` and
             // `open ?? isOpenInternal` both lower to two bindings of one
             // temporary). The first-wins alias map used to claim exactness
             // there, and the versioned rows below were never computed (#197).
-            let exact_local = match dep.peel_ts() {
-                Expr::StateVal(l) => Some(*l),
-                Expr::Var(v) => match binding_of(v, render_cfg) {
-                    Some(Expr::StateVal(l)) => Some(*l),
-                    _ => None,
-                },
-                _ => None,
-            };
+            // A dep is read at render, so no other body can rebind it first.
+            let exact_local = must_slot_read(dep, render_cfg, &[]);
             if let Some(l) = exact_local {
                 out.push(EffectTrigger {
                     hook: *label,

@@ -217,3 +217,70 @@ fn a_parent_setter_called_in_the_child_is_an_owner_qualified_row() {
             .all(|w| w.owner.is_none())
     );
 }
+
+// ── `Change::Never` is a must fact ───────────────────────────────────────────
+
+/// The `written.change` of the only effect write through `setter` in `src`.
+fn effect_change(src: &str, setter: &str) -> Change {
+    let r = parse_and_analyze(src);
+    let c = comp(&r, "C");
+    let rows = effect_rows(c, setter);
+    assert_eq!(rows.len(), 1, "{:?}", c.slot_writers);
+    rows[0].written.change
+}
+
+/// The slot's read, written back directly or through a name bound to it once,
+/// stores the slot's own content.
+#[test]
+fn the_own_read_or_a_name_bound_once_to_it_never_changes_the_slot() {
+    for arg in ["s", "t"] {
+        let src = format!(
+            r#"
+            import {{ useState, useEffect }} from "react";
+            export function C() {{
+              const [s, setS] = useState({{ n: 0 }});
+              const t = s;
+              useEffect(() => {{
+                setS({arg});
+              }}, [s]);
+              return <div />;
+            }}
+            "#
+        );
+        assert_eq!(effect_change(&src, "setS"), Change::Never, "setS({arg})");
+    }
+}
+
+/// `Never` is decided from a must-alias, not from the alias table, where a
+/// name *some* binding ties to the slot counts (#210): the ternary's temporary
+/// is the read on one arm only, `d` is reassigned on a path, an effect
+/// reassigns `e`, and a callback parameter shadows `s`.
+#[test]
+fn a_name_the_read_is_bound_to_on_some_path_only_may_change_the_slot() {
+    let cases = [
+        ("", "setS(s.n >= 0 ? { n: s.n } : s);"),
+        ("let d = s; if (s.n === 0) d = { n: 0 };", "setS(d);"),
+        ("let e = s; useEffect(() => { e = { n: 1 }; });", "setS(e);"),
+        ("", "[{ n: 1 }].forEach((s) => setS(s));"),
+    ];
+    for (render, effect) in cases {
+        let src = format!(
+            r#"
+            import {{ useState, useEffect }} from "react";
+            export function C() {{
+              const [s, setS] = useState({{ n: 0 }});
+              {render}
+              useEffect(() => {{
+                {effect}
+              }}, [s]);
+              return <div />;
+            }}
+            "#
+        );
+        assert_ne!(
+            effect_change(&src, "setS"),
+            Change::Never,
+            "{render} {effect}"
+        );
+    }
+}

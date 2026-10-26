@@ -78,16 +78,17 @@ pub struct Written {
 /// same way; a bound name it could not prove stays on the value path, where
 /// a function value reads as an opaque reference. `own_slot` is the written
 /// slot when it is the writer's own (`None` for another component's), and
-/// `states` the render bindings of state reads (aliases resolved): together
-/// they say whether the write stores the slot's own content.
+/// `must_read` the slot an expression reads on every path
+/// ([`must_slot_read`](crate::ir::bindings::must_slot_read)): together they
+/// say whether the write stores the slot's own content.
 pub fn classify(
     arg: Option<&Expr>,
     updater: &Updater,
     own_slot: Option<HookLabel>,
-    states: &HashMap<Var, HookLabel>,
+    must_read: impl Fn(&Expr) -> Option<HookLabel>,
     value_of: impl FnOnce(&Expr) -> StateValue,
 ) -> Written {
-    let identity = own_slot.is_some_and(|slot| stores_own_content(arg, slot, states));
+    let identity = own_slot.is_some_and(|slot| stores_own_content(arg, slot, &must_read));
     // A bare `setX()` stores `undefined`, one value known in advance.
     let Some(arg) = arg else {
         return Written {
@@ -196,19 +197,17 @@ fn returns_change(body: &CFG, params: &[Var]) -> Change {
 }
 
 /// Does argument 0 store the slot's own content: the slot's state read, or a
-/// name bound to it (`states`, aliases resolved)? React bails out on it.
-/// Only the read itself counts — a field of it, a memo over it, a copy
+/// name bound to it on every path? React bails out on it. A must fact, so a
+/// must-alias: a name *some* binding ties to the slot — one arm of a lowered
+/// `c ? {…} : s`, a `let d = s` reassigned on a path — may store another value
+/// (#210). Only the read itself counts — a field of it, a memo over it, a copy
 /// carried through another slot are values derived from the slot.
 fn stores_own_content(
     arg: Option<&Expr>,
     slot: HookLabel,
-    states: &HashMap<Var, HookLabel>,
+    must_read: impl Fn(&Expr) -> Option<HookLabel>,
 ) -> bool {
-    match arg.map(Expr::peel_ts) {
-        Some(Expr::StateVal(l)) => *l == slot,
-        Some(Expr::Var(v)) => states.get(v) == Some(&slot),
-        _ => false,
-    }
+    arg.is_some_and(|e| must_read(e) == Some(slot))
 }
 
 /// May a stored value change the slot? It does on every call when it is a
@@ -331,14 +330,19 @@ mod tests {
     /// The slot the tests write, the writer's own.
     const T: Option<HookLabel> = Some(0);
 
-    /// `x` reads slot 0, `y` reads slot 1.
-    fn states() -> HashMap<Var, HookLabel> {
-        HashMap::from([("x".to_string(), 0), ("y".to_string(), 1)])
+    /// `x` reads slot 0 on every path, `y` slot 1.
+    fn states(e: &Expr) -> Option<HookLabel> {
+        match e.peel_ts() {
+            Expr::StateVal(l) => Some(*l),
+            Expr::Var(v) if v == "x" => Some(0),
+            Expr::Var(v) if v == "y" => Some(1),
+            _ => None,
+        }
     }
 
     #[test]
     fn no_argument_stores_undefined_once() {
-        let w = classify(None, &Updater::Unknown, T, &states(), opaque);
+        let w = classify(None, &Updater::Unknown, T, states, opaque);
         assert_eq!(w.change, Change::Once);
         assert_eq!(w.value, StateValue::undefined());
         assert!(w.expr.is_none());
@@ -353,7 +357,7 @@ mod tests {
             },
             "p",
         );
-        let w = classify(Some(&e), &Updater::Unknown, T, &states(), opaque);
+        let w = classify(Some(&e), &Updater::Unknown, T, states, opaque);
         assert_eq!(w.change, Change::Must);
         assert_eq!(w.value.reference, Stability::PerRender);
     }
@@ -369,7 +373,7 @@ mod tests {
             },
             "p",
         );
-        let w = classify(Some(&e), &Updater::Unknown, T, &states(), opaque);
+        let w = classify(Some(&e), &Updater::Unknown, T, states, opaque);
         assert_eq!(w.change, Change::Must);
         assert_eq!(w.value.reference, Stability::PerRender);
     }
@@ -378,12 +382,12 @@ mod tests {
     fn the_identity_updater_never_changes_the_slot_a_literal_reset_once() {
         let id = updater(Expr::Var("p".into()), "p");
         assert_eq!(
-            classify(Some(&id), &Updater::Unknown, T, &states(), opaque).change,
+            classify(Some(&id), &Updater::Unknown, T, states, opaque).change,
             Change::Never
         );
         let reset = updater(Expr::Lit(Prim::Int(0)), "p");
         assert_eq!(
-            classify(Some(&reset), &Updater::Unknown, T, &states(), opaque).change,
+            classify(Some(&reset), &Updater::Unknown, T, states, opaque).change,
             Change::Once
         );
     }
@@ -400,7 +404,7 @@ mod tests {
             "p",
         );
         assert_eq!(
-            classify(Some(&not), &Updater::Unknown, T, &states(), opaque).change,
+            classify(Some(&not), &Updater::Unknown, T, states, opaque).change,
             Change::May
         );
         let inc = updater(
@@ -412,7 +416,7 @@ mod tests {
             "p",
         );
         assert_eq!(
-            classify(Some(&inc), &Updater::Unknown, T, &states(), opaque).change,
+            classify(Some(&inc), &Updater::Unknown, T, states, opaque).change,
             Change::May
         );
     }
@@ -423,12 +427,12 @@ mod tests {
     #[test]
     fn an_updater_stores_what_it_returns() {
         let reset = updater(Expr::Lit(Prim::Null), "p");
-        let w = classify(Some(&reset), &Updater::Unknown, T, &states(), opaque);
+        let w = classify(Some(&reset), &Updater::Unknown, T, states, opaque);
         assert!(w.value.null);
         assert_eq!(w.value.reference, Stability::Bottom);
         let id = updater(Expr::Var("p".into()), "p");
         assert!(
-            classify(Some(&id), &Updater::Unknown, T, &states(), opaque)
+            classify(Some(&id), &Updater::Unknown, T, states, opaque)
                 .value
                 .is_top_value()
         );
@@ -437,7 +441,7 @@ mod tests {
     #[test]
     fn a_value_argument_changes_the_slot_unless_it_is_one_known_value() {
         let arg = Expr::Var("next".into());
-        let change = |v: StateValue| classify(Some(&arg), &Updater::Unknown, T, &states(), |_| v);
+        let change = |v: StateValue| classify(Some(&arg), &Updater::Unknown, T, states, |_| v);
         assert_eq!(
             change(StateValue::reference(Stability::PerRender)).change,
             Change::Must
@@ -491,19 +495,19 @@ mod tests {
             v
         };
         let x = Expr::Var("x".into());
-        let own = classify(Some(&x), &Updater::Unknown, T, &states(), |_| read());
+        let own = classify(Some(&x), &Updater::Unknown, T, states, |_| read());
         assert_eq!(own.change, Change::Never);
         let direct = classify(
             Some(&Expr::StateVal(0)),
             &Updater::Unknown,
             T,
-            &states(),
+            states,
             |_| read(),
         );
         assert_eq!(direct.change, Change::Never);
-        let copy = classify(Some(&x), &Updater::Unknown, Some(1), &states(), |_| read());
+        let copy = classify(Some(&x), &Updater::Unknown, Some(1), states, |_| read());
         assert_eq!(copy.change, Change::May);
-        let foreign = classify(Some(&x), &Updater::Unknown, None, &states(), |_| read());
+        let foreign = classify(Some(&x), &Updater::Unknown, None, states, |_| read());
         assert_eq!(foreign.change, Change::May);
     }
 
@@ -522,7 +526,7 @@ mod tests {
                 field: "inner".into(),
             },
         ] {
-            let w = classify(Some(&arg), &Updater::Unknown, T, &states(), |_| derived());
+            let w = classify(Some(&arg), &Updater::Unknown, T, states, |_| derived());
             assert_eq!(w.change, Change::May, "{arg:?}");
         }
     }

@@ -120,6 +120,54 @@ pub fn binding_of<'c>(var: &str, cfg: &'c CFG) -> Option<&'c Expr> {
     Some(cur)
 }
 
+/// The state slot `expr` reads on every path: `StateVal(l)` itself, or a name
+/// whose sole binding in `scope`, through renames that are sole bindings too,
+/// is `StateVal(l)`. A must-alias, where `resolve_setter_aliases` keeps every
+/// name *some* binding ties to a slot (#210). `elsewhere` lists every other
+/// body a read of the name may sit in or be reached from, each with its
+/// parameters (nested ones included: see [`nested_bodies`]): a binder of a
+/// chain name in one of them (a reassignment, a same-named local or
+/// parameter) refuses the certificate, since the name a read there sees may
+/// be another value.
+pub fn must_slot_read(expr: &Expr, scope: &CFG, elsewhere: &[(&[Var], &CFG)]) -> Option<HookLabel> {
+    let mut cur = expr.peel_ts();
+    // The name's own binding, then the hops `binding_of` follows.
+    for _ in 0..MAX_ALIAS_HOPS + 2 {
+        match cur {
+            Expr::StateVal(l) => return Some(*l),
+            Expr::Var(v) => {
+                if elsewhere
+                    .iter()
+                    .any(|(params, body)| params.contains(v) || binds(v, body))
+                {
+                    return None;
+                }
+                cur = sole_binding_in(v, scope)?;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Every function body nested under `cfg`, at any depth, with its parameters.
+pub fn nested_bodies(cfg: &CFG) -> Vec<(&[Var], &CFG)> {
+    fn walk<'c>(e: &'c Expr, out: &mut Vec<(&'c [Var], &'c CFG)>) {
+        if let Expr::FnLit {
+            params, body_cfg, ..
+        } = e
+        {
+            out.push((params, body_cfg));
+            body_cfg.for_each_expr(&mut |c| walk(c, out));
+            return;
+        }
+        e.for_each_child(&mut |c| walk(c, out));
+    }
+    let mut out = Vec::new();
+    cfg.for_each_expr(&mut |e| walk(e, &mut out));
+    out
+}
+
 /// Alias hops a chase will follow. A real chain is one or two (`{ bump }`, a
 /// destructuring preamble); the bound only stops a cycle, and stopping leaves
 /// the name itself — which no caller mistakes for a value.

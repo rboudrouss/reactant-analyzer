@@ -1014,12 +1014,22 @@ pub(crate) fn collect_slot_writers(
             .or_insert((Some(prop.component), prop.label));
     }
     let setter_vars: HashSet<Var> = targets.keys().cloned().collect();
-    // State-read bindings, aliases resolved the same way: a write of one
-    // into its own slot stores the slot's content (`written::classify`).
-    let mut states = state_val_labels(render_cfg);
-    for cfg in std::iter::once(render_cfg).chain(hooks.iter().filter_map(|h| h.body_cfg())) {
-        states = resolve_setter_aliases(cfg, &states);
+    // A write of the slot's own read stores its content (`written::classify`),
+    // a must fact: the name is bound once, in render, to the read, and no
+    // other body — a hook body, a closure, a callback's parameter — binds it
+    // (#210). The alias map above stays the may reading that finds writes.
+    let mut elsewhere = crate::ir::bindings::nested_bodies(render_cfg);
+    for hook in hooks {
+        let params: &[Var] = match hook {
+            HookEntry::Callback { params, .. } => params,
+            _ => &[],
+        };
+        if let Some(body) = hook.body_cfg() {
+            elsewhere.push((params, body));
+            elsewhere.extend(crate::ir::bindings::nested_bodies(body));
+        }
     }
+    let must_read = |e: &Expr| crate::ir::bindings::must_slot_read(e, render_cfg, &elsewhere);
     // Any local binding of a deferring global's name disables its summary,
     // wherever the call sits (fail-closed across every body, nested `FnLit`
     // scopes included).
@@ -1144,7 +1154,7 @@ pub(crate) fn collect_slot_writers(
                     site.arg.as_ref(),
                     &site.updater,
                     owner.is_none().then_some(slot),
-                    &states,
+                    must_read,
                     |e| envs.eval(region, cfg, at, e),
                 ),
             };
