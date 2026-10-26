@@ -60,6 +60,16 @@ that writes it (see *Cross-file limits*).
   through an index or a returned function [#46](https://github.com/rboudrouss/reactant-analyzer/issues/46). A setter or `dispatch` *call* in any expression
   position, `wrap(setN(1))`, a `&&` or ternary arm, a branch condition, a JSX prop, writes its slot
   [#169](https://github.com/rboudrouss/reactant-analyzer/issues/169); it is the callee's *inlining* that is not.
+- **What a custom hook returns reaches the caller when it is destructured.** A setter, a slot
+  value or a closure a hook returns in a literal (`return [v, setV]`, `return { v, setV, inc }`)
+  is the caller's own alias of it once the hook is spliced (#185). It is not when the caller keeps
+  the container under a name (`const t = useSlot(); t[1](0)`, `api.setV(0)`)
+  [#216](https://github.com/rboudrouss/reactant-analyzer/issues/216), when the hook returns
+  something else than a literal on some path (`return useMemo(() => [v, setV], [v])`, `return c ? [a,
+  setA] : [b, setB]`, a returned variable), one level of destructuring below the first
+  (`const [{ setV }] = useSlot()`), an array with a spread, or an object member a spread may
+  overwrite. A hook whose returns pick different setters is forwarded on every path, but the
+  setter binding keeps one of them [#202](https://github.com/rboudrouss/reactant-analyzer/issues/202).
 - `useContext` is unmodelled, so a context value reads ⊤. This is the single largest source of
   analysis limits, 363 sites across the eight corpora [#28](https://github.com/rboudrouss/reactant-analyzer/issues/28).
 - Seven React hooks are unmodelled and emit an Info rather than a summary: `useActionState`,

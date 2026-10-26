@@ -531,3 +531,288 @@ fn a_member_two_levels_deep_resolves() {
         "a two-level member chain must resolve to the member's own value: {noisy:?}"
     );
 }
+
+// ── A setter or closure a hook returns is the caller's to call (#185) ─────────
+
+/// The rules `diags_for` reports on `comp`, with their severity.
+fn rules_for(src: &str, comp: &str) -> Vec<(String, reactant::rules::Severity)> {
+    let result = parse_and_analyze(src);
+    diags_for(&result, comp)
+        .into_iter()
+        .map(|d| (d.rule.to_string(), d.severity()))
+        .collect()
+}
+
+fn fires(found: &[(String, reactant::rules::Severity)], rule: &str) -> bool {
+    found.iter().any(|(r, _)| r == rule)
+}
+
+#[test]
+fn a_tuple_setter_from_a_hook_loops_in_a_no_deps_effect() {
+    let found = rules_for(
+        r#"
+        function useSlot() {
+            const [v, setV] = useState(0);
+            return [v, setV];
+        }
+        function App() {
+            const [s0, setS0] = useSlot();
+            useEffect(() => { setS0(s0 + 1); });
+            return <div>{s0}</div>;
+        }
+        "#,
+        "App",
+    );
+    assert!(fires(&found, "infinite-loop"), "{found:?}");
+}
+
+#[test]
+fn an_object_setter_from_a_hook_loops_in_an_effect() {
+    let found = rules_for(
+        r#"
+        function useSlot() {
+            const [v, setV] = useState(0);
+            return { v, setV };
+        }
+        function App() {
+            const { v, setV } = useSlot();
+            useEffect(() => { setV(v + 1); }, [v]);
+            return <div>{v}</div>;
+        }
+        "#,
+        "App",
+    );
+    assert!(fires(&found, "infinite-loop"), "{found:?}");
+}
+
+#[test]
+fn a_hook_setter_called_in_render_is_setter_in_render() {
+    // Unconditional render-phase write: certain, so Error — the same tier the
+    // inline `useState` form gets.
+    for (ret, pat) in [("[v, setV]", "[v, setV]"), ("{ v, setV }", "{ v, setV }")] {
+        let found = rules_for(
+            &format!(
+                r#"
+                function useSlot() {{
+                    const [v, setV] = useState(0);
+                    return {ret};
+                }}
+                function App() {{
+                    const {pat} = useSlot();
+                    setV(0);
+                    return <div>{{v}}</div>;
+                }}
+                "#
+            ),
+            "App",
+        );
+        assert!(
+            found
+                .iter()
+                .any(|(r, s)| r == "setter-in-render" && *s == reactant::rules::Severity::Error),
+            "{ret}: {found:?}"
+        );
+    }
+}
+
+#[test]
+fn an_alias_and_a_helper_of_a_hook_setter_are_writes() {
+    let alias = rules_for(
+        r#"
+        function useSlot() {
+            const [v, setV] = useState(0);
+            return [v, setV];
+        }
+        function App() {
+            const [s0, setS0] = useSlot();
+            const a = setS0;
+            a(s0 + 2);
+            return <div>{s0}</div>;
+        }
+        "#,
+        "App",
+    );
+    assert!(fires(&alias, "setter-in-render"), "{alias:?}");
+
+    // The helper is a module utility, spliced like the hook.
+    use oxc_allocator::Allocator;
+    use oxc_parser::{ParseOptions, Parser};
+    use oxc_span::SourceType;
+    let src = r#"
+        function bump0(set, n) { set(n + 1); }
+        function useSlot() {
+            const [v, setV] = useState(0);
+            return [v, setV];
+        }
+        function App() {
+            const [s0, setS0] = useSlot();
+            bump0(setS0, 0);
+            return <div>{s0}</div>;
+        }
+    "#;
+    let alloc = Allocator::default();
+    let ret = Parser::new(&alloc, src, SourceType::tsx())
+        .with_options(ParseOptions::default())
+        .parse();
+    let path = std::path::Path::new("test.tsx");
+    let config = Config {
+        function_registry: reactant::engine::FunctionRegistry::from_functions(
+            reactant::lowering::lower_utilities(&ret.program, src, path, &mut Default::default()),
+        ),
+        ..Default::default()
+    };
+    let result = analyze_program(
+        ComponentRegistry::from_components(lower_program(
+            &ret.program,
+            src,
+            path,
+            &mut Default::default(),
+        )),
+        HookRegistry::from_hooks(lower_custom_hooks(
+            &ret.program,
+            src,
+            path,
+            &mut Default::default(),
+        )),
+        RootStrategy::AllComponents,
+        &config,
+    );
+    let helper: Vec<_> = diags_for(&result, "App")
+        .into_iter()
+        .map(|d| d.rule.to_string())
+        .collect();
+    assert!(helper.iter().any(|r| r == "setter-in-render"), "{helper:?}");
+}
+
+#[test]
+fn a_wrapper_closure_returned_by_a_hook_is_executed() {
+    for hook in [
+        "const [v, setV] = useState(0); return { v, inc: () => setV(v + 1) };",
+        "const [v, setV] = useState(0); return [v, () => setV(v + 1)];",
+        "const [v, setV] = useState(0); \
+         const inc = useCallback(() => setV((c) => c + 1), []); \
+         return { v, inc };",
+    ] {
+        let pat = if hook.contains("return [") {
+            "[v, inc]"
+        } else {
+            "{ v, inc }"
+        };
+        let found = rules_for(
+            &format!(
+                r#"
+                function useCounter() {{ {hook} }}
+                function App() {{
+                    const {pat} = useCounter();
+                    useEffect(() => {{ inc(); }});
+                    return <div>{{v}}</div>;
+                }}
+                "#
+            ),
+            "App",
+        );
+        assert!(fires(&found, "infinite-loop"), "{hook}: {found:?}");
+    }
+}
+
+#[test]
+fn a_hook_setter_written_only_by_a_handler_is_clean() {
+    // Precision: the forwarded setter is the hook's setter, nothing more. A
+    // click handler writing it is not a loop and not a render-phase write.
+    for (ret, pat) in [("[v, setV]", "[v, setV]"), ("{ v, setV }", "{ v, setV }")] {
+        let found = rules_for(
+            &format!(
+                r#"
+                function useSlot() {{
+                    const [v, setV] = useState(0);
+                    return {ret};
+                }}
+                function App() {{
+                    const {pat} = useSlot();
+                    return <button onClick={{() => setV(v + 1)}}>{{v}}</button>;
+                }}
+                "#
+            ),
+            "App",
+        );
+        assert!(
+            !fires(&found, "infinite-loop") && !fires(&found, "setter-in-render"),
+            "{ret}: {found:?}"
+        );
+    }
+}
+
+#[test]
+fn a_tuple_hook_whose_setter_is_never_called_does_not_widen() {
+    let src = r#"
+        function useCounter(initial) {
+            const [count, setCount] = useState(initial);
+            return [count, setCount];
+        }
+        function Counter() {
+            const [count] = useCounter(0);
+            return <div>{count}</div>;
+        }
+    "#;
+    let result = parse_and_analyze(src);
+    let counter = &result.components[&result.component_named("Counter").unwrap()];
+    assert!(counter.widen_trace.is_empty(), "{:?}", counter.widen_trace);
+}
+
+#[test]
+fn a_hook_returning_its_setter_on_one_path_only_is_not_a_certain_write() {
+    // Both returns are forwarded, so `set` is the setter on some renders and
+    // a no-op on others: a possible render loop, never a certain one.
+    let found = rules_for(
+        r#"
+        function useMaybe(c) {
+            const [v, setV] = useState(0);
+            const noop = (n) => {};
+            if (c) {
+                return [v, setV];
+            }
+            return [v, noop];
+        }
+        function App({ c }) {
+            const [v, set] = useMaybe(c);
+            set(1);
+            return <div>{v}</div>;
+        }
+        "#,
+        "App",
+    );
+    assert!(
+        found
+            .iter()
+            .all(|(r, s)| r != "setter-in-render" || *s != reactant::rules::Severity::Error),
+        "{found:?}"
+    );
+}
+
+#[test]
+#[ignore = "#202: a setter binding is one label, the join of two keeps the first"]
+fn a_hook_returning_a_branch_chosen_setter_writes_both() {
+    // Each return is forwarded, so `s` is bound on both paths; what is lost
+    // is the join: a setter binding holds one label and the alias pass is
+    // first-wins, so `s` reads as `setA` and the write of `b` under `[b]` —
+    // the loop, when `c` is falsy — is never seen.
+    let found = rules_for(
+        r#"
+        function usePick(c) {
+            const [a, setA] = useState(0);
+            const [b, setB] = useState(0);
+            if (c) {
+                return [b, setA];
+            }
+            return [b, setB];
+        }
+        function App({ c }) {
+            const [b, s] = usePick(c);
+            useEffect(() => { s(b + 1); }, [b]);
+            return <div>{b}</div>;
+        }
+        "#,
+        "App",
+    );
+    assert!(fires(&found, "infinite-loop"), "{found:?}");
+}

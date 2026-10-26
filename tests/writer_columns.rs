@@ -337,3 +337,114 @@ fn a_name_the_read_is_bound_to_on_some_path_only_may_change_the_slot() {
         );
     }
 }
+
+// ── Setters and closures a custom hook returns (#185) ─────────────────────────
+
+/// [`parse_and_analyze`], with the file's custom hooks registered so they are
+/// spliced into their callers.
+fn parse_and_analyze_with_hooks(src: &str) -> ProgramAnalysisResult {
+    use oxc_allocator::Allocator;
+    use oxc_parser::{ParseOptions, Parser};
+    use oxc_span::SourceType;
+    use reactant::lowering::{lower_custom_hooks, lower_program};
+
+    let alloc = Allocator::default();
+    let ret = Parser::new(&alloc, src, SourceType::tsx())
+        .with_options(ParseOptions::default())
+        .parse();
+    assert!(ret.diagnostics.is_empty(), "{:?}", ret.diagnostics);
+    let path = std::path::Path::new("test.tsx");
+    let components = lower_program(&ret.program, src, path, &mut Default::default());
+    let hooks = lower_custom_hooks(&ret.program, src, path, &mut Default::default());
+    analyze_program(
+        ComponentRegistry::from_components(components),
+        HookRegistry::from_hooks(hooks),
+        RootStrategy::Heuristic,
+        &Config::default(),
+    )
+}
+
+#[test]
+fn a_setter_returned_by_a_custom_hook_is_a_row_of_the_hook_slot() {
+    // The tuple and the object shape both hand the caller the setter itself;
+    // the call is the component's own, so the row is direct.
+    for (ret, pat) in [
+        ("[v, setV]", "[s0, setS0]"),
+        ("{ v, setV }", "{ v: s0, setV: setS0 }"),
+    ] {
+        let src = format!(
+            r#"
+            import {{ useState, useEffect }} from "react";
+            function useSlot() {{
+              const [v, setV] = useState(0);
+              return {ret};
+            }}
+            export function App() {{
+              const {pat} = useSlot();
+              useEffect(() => {{ setS0(s0 + 1); }});
+              return <div>{{s0}}</div>;
+            }}
+            "#
+        );
+        let r = parse_and_analyze_with_hooks(&src);
+        let c = comp(&r, "App");
+        let rows = effect_rows(c, "setS0");
+        assert_eq!(rows.len(), 1, "{ret}: {:?}", c.slot_writers);
+        let slot = c
+            .hooks
+            .iter()
+            .find_map(|h| match h {
+                reactant::ir::hooks::HookEntry::State { label, .. } => Some(*label),
+                _ => None,
+            })
+            .expect("the hook's useState is inlined");
+        assert_eq!(rows[0].slot, slot, "{ret}");
+        assert_eq!(rows[0].owner, None, "{ret}");
+        assert_eq!(
+            rows[0].via,
+            reactant::engine::setters::WriteProvenance::Direct,
+            "{ret}"
+        );
+    }
+}
+
+#[test]
+fn a_write_through_a_hook_closure_is_not_direct() {
+    // `inc` is called by the component, but the write is the hook's: the
+    // closure is written in `useCounter`, and a name carried it out (ADR-027
+    // §4). Claiming `Direct` would let `must_direct_write` certify it.
+    for ret in ["{ v, inc: () => setV(v + 1) }", "[v, () => setV(v + 1)]"] {
+        let pat = if ret.starts_with('[') {
+            "[v, inc]"
+        } else {
+            "{ v, inc }"
+        };
+        let src = format!(
+            r#"
+            import {{ useState, useEffect }} from "react";
+            function useCounter() {{
+              const [v, setV] = useState(0);
+              return {ret};
+            }}
+            export function App() {{
+              const {pat} = useCounter();
+              useEffect(() => {{ inc(); }});
+              return <div>{{v}}</div>;
+            }}
+            "#
+        );
+        let r = parse_and_analyze_with_hooks(&src);
+        let c = comp(&r, "App");
+        let rows: Vec<&SlotWriter> = c
+            .slot_writers
+            .iter()
+            .filter(|w| matches!(w.region, WriterRegion::Effect(_)))
+            .collect();
+        assert_eq!(rows.len(), 1, "{ret}: {:?}", c.slot_writers);
+        assert_eq!(
+            rows[0].via,
+            reactant::engine::setters::WriteProvenance::Via(vec!["useCounter".to_string()]),
+            "{ret}"
+        );
+    }
+}

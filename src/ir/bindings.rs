@@ -24,7 +24,7 @@ use crate::ir::{
     cfg::CFG,
     expr::{Expr, object_member},
     stmt::Stmt,
-    types::{HookLabel, Var},
+    types::{BlockId, HookLabel, Var},
 };
 
 /// Every `let`/assignment right-hand side in `cfg`, by name — the bindings a
@@ -109,9 +109,16 @@ pub fn fn_binding_in<'c>(var: &str, cfg: &'c CFG) -> Option<(&'c [Var], &'c CFG)
 /// right-hand side, and bounded because a certain binding chain is finite
 /// anyway.
 pub fn binding_of<'c>(var: &str, cfg: &'c CFG) -> Option<&'c Expr> {
+    binding_site_of(var, cfg).map(|(_, rhs)| rhs)
+}
+
+/// [`binding_of`], with the block of `cfg` the value is bound in — where the
+/// chase ended, not where `var` itself is bound. A closure is authored where
+/// its literal sits, whatever names it is later read through.
+pub fn binding_site_of<'c>(var: &str, cfg: &'c CFG) -> Option<(BlockId, &'c Expr)> {
     let mut cur = sole_binding_in(var, cfg)?;
     for _ in 0..MAX_ALIAS_HOPS {
-        let Expr::Var(next) = cur else { break };
+        let Expr::Var(next) = cur.1 else { break };
         let Some(deeper) = sole_binding_in(next, cfg) else {
             break;
         };
@@ -142,7 +149,7 @@ pub fn must_slot_read(expr: &Expr, scope: &CFG, elsewhere: &[(&[Var], &CFG)]) ->
                 {
                     return None;
                 }
-                cur = sole_binding_in(v, scope)?;
+                cur = sole_binding_in(v, scope)?.1;
             }
             _ => return None,
         }
@@ -171,15 +178,16 @@ pub fn nested_bodies(cfg: &CFG) -> Vec<(&[Var], &CFG)> {
 /// Alias hops a chase will follow. A real chain is one or two (`{ bump }`, a
 /// destructuring preamble); the bound only stops a cycle, and stopping leaves
 /// the name itself — which no caller mistakes for a value.
-const MAX_ALIAS_HOPS: usize = 8;
+pub const MAX_ALIAS_HOPS: usize = 8;
 
-/// The single right-hand side `var` is bound to in `cfg`, `None` when it is
-/// bound zero times or more than once. Conditional or repeated re-binding is
-/// not "some value we haven't found" — it is a name whose captured environment
-/// is no longer syntactically certain, so the readers above fail closed.
-fn sole_binding_in<'c>(var: &str, cfg: &'c CFG) -> Option<&'c Expr> {
-    let mut found: Option<&Expr> = None;
-    for block in cfg.blocks.values() {
+/// The single right-hand side `var` is bound to in `cfg`, and its block;
+/// `None` when it is bound zero times or more than once. Conditional or
+/// repeated re-binding is not "some value we haven't found" — it is a name
+/// whose captured environment is no longer syntactically certain, so the
+/// readers above fail closed.
+fn sole_binding_in<'c>(var: &str, cfg: &'c CFG) -> Option<(BlockId, &'c Expr)> {
+    let mut found: Option<(BlockId, &Expr)> = None;
+    for (&bid, block) in &cfg.blocks {
         for stmt in &block.stmts {
             let (Stmt::Let { var: v, rhs, .. } | Stmt::Assign { var: v, rhs, .. }) = stmt else {
                 continue;
@@ -190,7 +198,7 @@ fn sole_binding_in<'c>(var: &str, cfg: &'c CFG) -> Option<&'c Expr> {
             if found.is_some() {
                 return None;
             }
-            found = Some(rhs.peel_ts());
+            found = Some((bid, rhs.peel_ts()));
         }
     }
     found

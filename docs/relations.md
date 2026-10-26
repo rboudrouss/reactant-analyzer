@@ -38,11 +38,11 @@ params included. Two `setX(…)` calls in one body are two rows.
 |---|---|---|
 | `slot` | the slot written, as a `HookLabel` of the **owner** | exact |
 | `owner` | `None`: this component's slot. `Some(parent)`: a write through a `ComponentSetter` prop, whose `slot` is the parent's label; the prop may be a closure that merely carries the setter, so the write itself is a may-fact | exact / may |
-| `setter` | the setter variable at the call site, alias chains resolved | exact |
+| `setter` | the setter variable at the call site, alias chains resolved — a member of a spliced callee's returned literal (`const [v, setV] = useSlot()`) included (#185) | exact |
 | `span` | the witness call site | exact, `None` when unplaceable |
 | `region` | the lexical body the write sits in (render, effect, memo, callback, handler) | exact |
 | `phase` | when the write executes: its body's phase for a synchronous write, `Deferred` / `Handler` / `Cleanup` from a callee summary, `Unknown` under an unresolved callee | may, ⊤-bearing |
-| `via` | caller-authored (`Direct`) or reached through inlined wrappers (`Via`); `Unknown` when the site could not be placed | exact; `Direct` is certifiable |
+| `via` | caller-authored (`Direct`) or reached through inlined wrappers (`Via`); `Unknown` when the site could not be placed. A write inside a closure reached by name is authored where the closure is defined (a hook's returned `inc` is `Via` the hook) | exact; `Direct` is certifiable |
 | `updater` | argument 0 proven a function literal (`Functional`, body kept) or ⊤ | must for `Functional` |
 | `same_tick` | another write of the same slot in this region is CFG-reachable from this one | may, one-directional: `false` is not a promise |
 | `block` | the region block a write that runs synchronously, once per pass, sits in — what `must_on_all_paths` takes | exact; `None` for nested, deferred, cleanup and repeating sites |

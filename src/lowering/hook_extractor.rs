@@ -389,8 +389,8 @@ fn process_stmt(
                 // Record the binding variable on Custom hooks (their import
                 // source and resolved file come from the classification).
                 if let Some(HookEntry::Custom { binding, .. }) = hooks.last_mut() {
-                    // `__arr_N` is a lowering temp, never a source name.
-                    if !is_arr_temp {
+                    // `__arr_N` / `__obj_N` is a lowering temp, never a source name.
+                    if !crate::ir::splice::is_destructuring_temp(&var) {
                         *binding = Some(var.clone());
                     }
                 }

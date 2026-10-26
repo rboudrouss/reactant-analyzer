@@ -22,6 +22,17 @@ impl BasicBlock {
             Terminator::Jump(_) | Terminator::Unreachable => {}
         }
     }
+
+    /// [`Self::for_each_expr`], mutably — the same expressions.
+    pub fn for_each_expr_mut(&mut self, f: &mut impl FnMut(&mut Expr)) {
+        for stmt in &mut self.stmts {
+            stmt.for_each_expr_mut(f);
+        }
+        match &mut self.term {
+            Terminator::Return(e) | Terminator::Branch { cond: e, .. } => f(e),
+            Terminator::Jump(_) | Terminator::Unreachable => {}
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

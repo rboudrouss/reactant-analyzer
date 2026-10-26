@@ -510,6 +510,58 @@ impl Expr {
         }
     }
 
+    /// [`Self::for_each_child`], mutably: the same children, `FnLit` bodies
+    /// again not crossed.
+    pub fn for_each_child_mut(&mut self, f: &mut impl FnMut(&mut Expr)) {
+        match self {
+            Expr::Lit(_)
+            | Expr::Var(_)
+            | Expr::FnLit { .. }
+            | Expr::StateVal(_)
+            | Expr::StateSetter(_)
+            | Expr::MemoVal(_)
+            | Expr::CallbackVal(_)
+            | Expr::HookMarker(..)
+            | Expr::SummaryVal(_) => {}
+            Expr::ObjectLit { fields, .. } => {
+                for (_, v) in fields {
+                    f(v);
+                }
+            }
+            Expr::ArrayLit { elems, .. } => {
+                for e in elems {
+                    f(e);
+                }
+            }
+            Expr::FieldAccess { obj, .. } => f(obj),
+            Expr::IndexAccess { arr, idx } => {
+                f(arr);
+                f(idx);
+            }
+            Expr::BinOp { lhs, rhs, .. } => {
+                f(lhs);
+                f(rhs);
+            }
+            Expr::UnaryOp { arg, .. } => f(arg),
+            Expr::Call { fn_, args } | Expr::New { fn_, args, .. } => {
+                f(fn_);
+                for a in args {
+                    f(a);
+                }
+            }
+            Expr::CompApp { props, .. } => f(props),
+            Expr::NativeElem {
+                props, children, ..
+            } => {
+                f(props);
+                for c in children {
+                    f(c);
+                }
+            }
+            Expr::TSAnnotated(inner) => f(inner),
+        }
+    }
+
     /// Returns `true` iff the expression tree contains no `Call`, `New` or
     /// `CompApp` node. `FnLit` bodies are not crossed (they are leaves for
     /// `for_each_child`).

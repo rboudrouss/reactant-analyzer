@@ -132,6 +132,7 @@ pub fn collect_setter_calls_with_extra(
         collect_calls: false,
         read_vars: &NO_VARS,
         wrappers: &wrappers,
+        path: Vec::new(),
     };
     walk.cfg(cfg, max_depth, &mut found, WalkClass::Sync, None, None);
     let mut found = found.setters;
@@ -176,6 +177,9 @@ pub(crate) struct WriteSite {
     pub updater: Updater,
     /// Argument 0 as written, `None` for a bare `setX()`.
     pub arg: Option<Expr>,
+    /// The function names the walk went through to reach the site, outermost
+    /// first — where the write is authored is where they are defined.
+    pub through: Vec<Var>,
 }
 
 /// Every write site in `cfg`, one row per call site — no collapse of any
@@ -211,6 +215,9 @@ pub(crate) fn collect_write_sites(
             .or_insert_with(|| Arc::clone(body));
         certified.insert(v.clone());
     }
+    // A body's own rename of an outer function (`const run = inc` in an
+    // effect) only resolves once the outer names are in.
+    let fn_bindings = resolve_aliases(cfg, &fn_bindings);
     let mut walk = SetterWalk {
         setter_vars,
         fn_bindings: &fn_bindings,
@@ -224,6 +231,7 @@ pub(crate) fn collect_write_sites(
         collect_calls: false,
         read_vars: &NO_VARS,
         wrappers: &wrappers,
+        path: Vec::new(),
     };
     walk.cfg(cfg, max_depth, &mut found, WalkClass::Sync, None, None);
     found
@@ -238,6 +246,7 @@ pub(crate) fn collect_write_sites(
             repeats: s.repeats,
             updater: s.updater,
             arg: s.arg,
+            through: s.through,
         })
         .collect()
 }
@@ -455,7 +464,13 @@ fn certified_fn_names(cfg: &CFG, bindings: &HashMap<Var, Arc<CFG>>) -> HashSet<V
         .collect()
 }
 
-/// Scan all Let stmts in `cfg` for `let X = FnLit{...}` and return X → body_cfg.
+/// Every `let X = FnLit{...}` in `cfg`, X → body_cfg, closed over the
+/// aliases of those names (`const run = inc`) the way setter names are.
+///
+/// The aliases are not a nicety: a closure a custom hook returns reaches its
+/// caller only through one — `const { inc } = useCounter()` is
+/// `let inc = __obj_N.inc` once the hook is spliced (#185) — so without them a
+/// call of `inc` was a call of nothing.
 pub(crate) fn collect_fn_bindings(cfg: &CFG) -> HashMap<Var, Arc<CFG>> {
     let mut map: HashMap<Var, Arc<CFG>> = HashMap::new();
     for block in cfg.blocks.values() {
@@ -470,7 +485,7 @@ pub(crate) fn collect_fn_bindings(cfg: &CFG) -> HashMap<Var, Arc<CFG>> {
             }
         }
     }
-    map
+    resolve_aliases(cfg, &map)
 }
 
 /// Every name bound by a `Let`/`Assign` or an `FnLit` parameter anywhere in
@@ -570,12 +585,19 @@ pub(crate) fn resolve_setter_aliases(
     cfg: &CFG,
     base: &HashMap<Var, HookLabel>,
 ) -> HashMap<Var, HookLabel> {
+    resolve_aliases(cfg, base)
+}
+
+/// The alias closure itself, for any fact keyed by a name: `let a = b` / `a = b`
+/// with `b` in the map gives `a` the same entry, chains included. A name
+/// already in the map keeps its own entry.
+fn resolve_aliases<T: Clone>(cfg: &CFG, base: &HashMap<Var, T>) -> HashMap<Var, T> {
     let mut map = base.clone();
     loop {
         let mut changed = false;
         for block in cfg.blocks.values() {
             for stmt in &block.stmts {
-                // `let s = setX` and `s = setX` both alias the setter — mirror
+                // `let s = setX` and `s = setX` both alias the name — mirror
                 // the interpreter's `bind_rhs`, which treats Let/Assign alike.
                 let alias = match stmt {
                     Stmt::Let {
@@ -592,9 +614,9 @@ pub(crate) fn resolve_setter_aliases(
                 };
                 if let Some((var, src)) = alias
                     && !map.contains_key(var)
-                    && let Some(&label) = map.get(src)
+                    && let Some(fact) = map.get(src).cloned()
                 {
-                    map.insert(var.clone(), label);
+                    map.insert(var.clone(), fact);
                     changed = true;
                 }
             }
@@ -883,11 +905,23 @@ fn callback_bound_vars(
     for cfg in also {
         scan(cfg, &mut binds);
     }
+    // A rename hop (`const run = inc`, a hook's forwarded `{ inc }`) is held
+    // to the same bar: every name on the chain is bound exactly once.
+    let sole = |name: &str| -> Option<&Expr> {
+        match binds.get(name)?.as_slice() {
+            [only] => Some(only.peel_ts()),
+            _ => None,
+        }
+    };
     binds
-        .into_iter()
-        .filter_map(|(name, rhs)| {
-            let [only] = rhs.as_slice() else { return None };
-            let Expr::CallbackVal(label) = only.peel_ts() else {
+        .keys()
+        .filter_map(|&name| {
+            let mut cur = sole(name)?;
+            for _ in 0..crate::ir::bindings::MAX_ALIAS_HOPS {
+                let Expr::Var(next) = cur else { break };
+                cur = sole(next)?;
+            }
+            let Expr::CallbackVal(label) = cur else {
                 return None;
             };
             callback_bodies
@@ -1076,6 +1110,34 @@ pub(crate) fn collect_slot_writers(
         &callback_bodies,
     ));
 
+    // A write reached through a function name is authored where that function
+    // is defined, and a name can carry a closure out of the region it was
+    // written in (`const { inc } = useCounter()`, #185). The row stays Direct
+    // only when every name on the way is defined outside every region; a
+    // definition that cannot be placed certifies nothing (ADR-027 §4,
+    // fail-closed).
+    let authored = |cfg: &CFG, cfg_key: Option<HookLabel>, through: &[Var]| {
+        for name in through {
+            let def = match crate::ir::bindings::binding_site_of(name, cfg) {
+                Some(site) => Some((cfg_key, site)),
+                None => {
+                    crate::ir::bindings::binding_site_of(name, render_cfg).map(|site| (None, site))
+                }
+            };
+            let Some((key, (block, Expr::FnLit { .. } | Expr::CallbackVal(_)))) = def else {
+                return WriteProvenance::Unknown;
+            };
+            if key.is_none() && regions.render_poisoned {
+                return WriteProvenance::Unknown;
+            }
+            let chain = regions.chain(key, block);
+            if !chain.is_empty() {
+                return WriteProvenance::Via(chain);
+            }
+        }
+        WriteProvenance::Direct
+    };
+
     let mut out: Vec<SlotWriter> = Vec::new();
     let push_sites = |region: WriterRegion, cfg: &CFG, out: &mut Vec<SlotWriter>| {
         let (cfg_key, hook_origin) = match region {
@@ -1189,7 +1251,7 @@ pub(crate) fn collect_slot_writers(
                     if cfg_key.is_none() && regions.render_poisoned {
                         WriteProvenance::Unknown
                     } else {
-                        WriteProvenance::Direct
+                        authored(cfg, cfg_key, &site.through)
                     }
                 } else {
                     WriteProvenance::Via(chain)
@@ -1298,6 +1360,11 @@ struct SetterWalk<'a> {
     /// resolve summaries, which reads as "no wrapper is proven": ⊤, the
     /// fire-more direction.
     wrappers: &'a HashSet<String>,
+    /// The function names the walk descended through to get here, outermost
+    /// first — a stack, pushed on entering a name's body and popped on leaving
+    /// it. Each site keeps a copy: a write inside a closure is authored where
+    /// the closure is defined, which a name can carry out of its region.
+    path: Vec<Var>,
 }
 
 /// No bindings to record reads for — every setter consumer.
@@ -1472,6 +1539,9 @@ struct FoundSite {
     updater: Updater,
     /// Argument 0 as written, for the value the row stores (ADR-042 §2).
     arg: Option<Expr>,
+    /// The function names the walk went through to reach the site
+    /// ([`SetterWalk::path`]).
+    through: Vec<Var>,
 }
 
 /// `Array.prototype` HOFs that call their function argument synchronously —
@@ -1747,14 +1817,17 @@ impl<'a> SetterWalk<'a> {
                         // or bound to a variable. Without this the cleanup's
                         // writes are invisible to the relation.
                         if self.effect_body && at_root && mode == WalkClass::Sync {
-                            let body = match expr {
-                                Expr::FnLit { body_cfg, .. } => Some(&**body_cfg),
-                                Expr::Var(name) => self.fn_bindings.get(name).map(|b| &**b),
-                                _ => None,
+                            let (body, name) = match expr {
+                                Expr::FnLit { body_cfg, .. } => (Some(&**body_cfg), None),
+                                Expr::Var(name) => {
+                                    (self.fn_bindings.get(name).map(|b| &**b), Some(name))
+                                }
+                                _ => (None, None),
                             };
                             if let Some(body) = body
                                 && depth > 0
                             {
+                                self.path.extend(name.cloned());
                                 self.cfg(
                                     body,
                                     depth - 1,
@@ -1763,6 +1836,9 @@ impl<'a> SetterWalk<'a> {
                                     prov_block,
                                     witness,
                                 );
+                                if name.is_some() {
+                                    self.path.pop();
+                                }
                             }
                         }
                         self.expr(expr, witness, at, depth, found, mode, at_root, prov_block);
@@ -1915,6 +1991,7 @@ impl<'a> SetterWalk<'a> {
                         repeats: self.repeating,
                         updater: self.updater_of(args),
                         arg: args.first().map(|a| a.peel_ts().clone()),
+                        through: self.path.clone(),
                     });
                 }
                 // B6: direct call to a locally-bound function — its body runs
@@ -1926,10 +2003,12 @@ impl<'a> SetterWalk<'a> {
                 if depth > 0
                     && let Some(body) = self.fn_bindings.get(name)
                 {
-                    // Inner rows' provenance is this call site: the local
-                    // helper's definition is only reachable from code that
-                    // shares its region (salted names stay region-local).
+                    // Inner rows' provenance block is this call site. Where
+                    // the helper is *defined* is the relation's question: an
+                    // alias can carry a name out of its region (a hook's
+                    // returned closure), so the name rides on `path`.
                     let mut inner = Found::default();
+                    self.path.push(name.clone());
                     self.cfg(
                         body,
                         depth - 1,
@@ -1938,6 +2017,7 @@ impl<'a> SetterWalk<'a> {
                         prov,
                         stmt_span,
                     );
+                    self.path.pop();
                     found.absorb(inner, body, mode, at, prov);
                 }
             }
@@ -2000,7 +2080,9 @@ impl<'a> SetterWalk<'a> {
                     // `walking` stack is what terminates it.
                     Expr::Var(name) => {
                         if let Some(body) = self.fn_bindings.get(name) {
+                            self.path.push(name.clone());
                             self.cfg(body, depth, found, class, prov, stmt_span);
+                            self.path.pop();
                         }
                     }
                     _ => {}
@@ -2106,6 +2188,7 @@ pub fn collect_slot_reads(render_cfg: &CFG, hooks: &[HookEntry]) -> Vec<SlotRead
             collect_calls: false,
             read_vars: &vars,
             wrappers: &NO_WRAPPERS,
+            path: Vec::new(),
         };
         walk.cfg(cfg, 2, &mut found, WalkClass::Sync, None, None);
         for r in found.reads {
@@ -2184,6 +2267,7 @@ pub fn collect_body_calls(cfg: &CFG, region: WriterRegion, max_depth: usize) -> 
         collect_calls: true,
         read_vars: &NO_VARS,
         wrappers: &NO_WRAPPERS,
+        path: Vec::new(),
     };
     walk.cfg(cfg, max_depth, &mut found, WalkClass::Sync, None, None);
     let mut rows: Vec<BodyCall> = found

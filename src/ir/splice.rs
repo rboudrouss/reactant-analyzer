@@ -18,6 +18,16 @@
 //! untouched — several are recognised by name downstream. Renaming is
 //! capture-aware: descending into a nested `FnLit` drops that closure's own
 //! params from the active map (they shadow), matching [`crate::ir::free_vars`].
+//!
+//! # Return forwarding
+//!
+//! A callee that returns a literal the caller destructures —
+//! `const [v, setV] = useSlot()`, `const { v, inc } = useCounter()` — hands
+//! back its members, not a container: each member is bound to a name of its
+//! own and the caller's `[k]` / `.f` reads become reads of that name (#185).
+//! The setter, slot value or closure then reaches the caller as an ordinary
+//! alias, which every consumer already follows. See `ReturnForwarding` for the
+//! shapes it covers and why the rewrite is exact.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -135,7 +145,9 @@ pub fn splice_callee_into_cfg(
         .collect();
 
     // 5. Offset callee blocks; rewrite each `Return(e)` into
-    //    `[bound_var = e;] Jump(join)`.
+    //    `[bound_var = e;] Jump(join)`. A returned literal destructured by the
+    //    caller has its members forwarded (see [`ReturnForwarding`]).
+    let forwarding = bound_var.and_then(|temp| ReturnForwarding::of(temp, &callee_block_map));
     let mut callee_blocks: Vec<(BlockId, BasicBlock)> = callee_block_map
         .into_iter()
         .map(|(bid, block)| (bid + block_offset, block))
@@ -143,6 +155,9 @@ pub fn splice_callee_into_cfg(
     let mut return_blocks: Vec<BlockId> = Vec::new();
     for (new_id, block) in callee_blocks.iter_mut() {
         block.id = *new_id;
+        if let (Some(fw), Terminator::Return(ret)) = (&forwarding, &mut block.term) {
+            block.stmts.extend(fw.hoist(ret, call_span));
+        }
         block.term = match std::mem::replace(&mut block.term, Terminator::Unreachable) {
             Terminator::Jump(t) => Terminator::Jump(t + block_offset),
             Terminator::Branch {
@@ -251,6 +266,12 @@ pub fn splice_callee_into_cfg(
         });
     }
 
+    // 11. The caller's destructuring reads of a forwarded member now read the
+    //     member's own name.
+    if let Some(fw) = &forwarding {
+        fw.rewrite_reads(caller);
+    }
+
     // A splice rewrites blocks, terminators and edges at once; a target left
     // without its edge is code the worklist never enters, and nothing else in
     // the pipeline would report it.
@@ -260,6 +281,170 @@ pub fn splice_callee_into_cfg(
         caller.validate().unwrap_err()
     );
     Some(block_offset..join_block_id)
+}
+
+/// Is `var` a destructuring temp — the name lowering binds the source of
+/// `const [a, b] = rhs` / `const { a } = rhs` to before it reads each element
+/// off it (`__arr_{offset}` / `__obj_{offset}`, salted or not; the prefix is
+/// load-bearing, ADR-020 item 11)? A member forwarded out of one is not.
+pub fn is_destructuring_temp(var: &str) -> bool {
+    (var.starts_with("__arr_") || var.starts_with("__obj_")) && !var.contains(FORWARD_MARK)
+}
+
+/// Separates a destructuring temp from a member forwarded out of it
+/// (`__arr_7.1`, `__obj_7.setV`). A JS identifier never contains it, so a
+/// forwarded name is never a source name, and the `__` prefix keeps it out of
+/// every display name.
+const FORWARD_MARK: char = '.';
+
+/// The members of a callee's returned literal, forwarded to the caller's
+/// destructuring (#185).
+///
+/// `const [v, setV] = useSlot()` lowers to `let __arr_N = useSlot()` then
+/// `let v = __arr_N[0]; let setV = __arr_N[1]`. Spliced, the temp is bound to
+/// the hook's `return [v#s, setV#s]`, a container, and every consumer that
+/// follows a setter, a slot or a function by name (`bind_rhs`, the alias
+/// passes, `binding_of`) stops at the member read. Forwarding binds each
+/// member of the literal to a name of its own, in source order, right before
+/// the literal (which then reads those names), and rewrites `__arr_N[k]` /
+/// `__obj_N.f` in the caller to that name — an ordinary alias.
+///
+/// Exact, not an approximation: the temp is a lowering name nothing can
+/// reassign or write a member of, so on every path its `[k]` is the value the
+/// literal put there, the one bound to the member's name on that same path.
+/// It applies only when every `return` of the callee is such a literal, all of
+/// one kind, and a key is forwarded only when every return has it. An array
+/// with a spread or an elision is refused (an index no longer names one
+/// element); an object forwards only the members after its last spread, which
+/// no spread can overwrite — the spread's own entries are unmodelled anyway.
+struct ReturnForwarding {
+    temp: Var,
+    keys: ForwardedKeys,
+}
+
+enum ForwardedKeys {
+    /// Indices `0..n`.
+    Array(usize),
+    Object(HashSet<String>),
+}
+
+impl ReturnForwarding {
+    fn of(temp: &Var, callee: &std::collections::BTreeMap<BlockId, BasicBlock>) -> Option<Self> {
+        if !is_destructuring_temp(temp) {
+            return None;
+        }
+        let mut keys: Option<ForwardedKeys> = None;
+        for block in callee.values() {
+            let Terminator::Return(ret) = &block.term else {
+                continue;
+            };
+            let here = match ret.peel_ts() {
+                Expr::ArrayLit {
+                    elems,
+                    arity,
+                    spread_at,
+                    ..
+                } if spread_at.is_empty() && arity.exact() == Some(elems.len()) => {
+                    ForwardedKeys::Array(elems.len())
+                }
+                Expr::ObjectLit { fields, .. } => ForwardedKeys::Object(
+                    crate::ir::expr::members_after_last_spread(fields)
+                        .iter()
+                        .map(|(k, _)| k.clone())
+                        .collect(),
+                ),
+                _ => return None,
+            };
+            keys = Some(match (keys, here) {
+                (None, here) => here,
+                (Some(ForwardedKeys::Array(a)), ForwardedKeys::Array(b)) => {
+                    ForwardedKeys::Array(a.min(b))
+                }
+                (Some(ForwardedKeys::Object(a)), ForwardedKeys::Object(b)) => {
+                    ForwardedKeys::Object(a.intersection(&b).cloned().collect())
+                }
+                _ => return None,
+            });
+        }
+        keys.map(|keys| ReturnForwarding {
+            temp: temp.clone(),
+            keys,
+        })
+    }
+
+    fn member_name(&self, key: &str) -> Var {
+        format!("{}{FORWARD_MARK}{key}", self.temp)
+    }
+
+    /// Bind every member of the returned literal `ret` to its name, in source
+    /// order, and make the literal read the names. Every member, forwarded or
+    /// not: binding only some would run them before the rest.
+    fn hoist(&self, ret: &mut Expr, span: Option<crate::ir::SourceRange>) -> Vec<Stmt> {
+        fn peel_ts_mut(e: &mut Expr) -> &mut Expr {
+            match e {
+                Expr::TSAnnotated(inner) => peel_ts_mut(inner),
+                other => other,
+            }
+        }
+        let members: Vec<(String, &mut Expr)> = match peel_ts_mut(ret) {
+            Expr::ArrayLit { elems, .. } => elems
+                .iter_mut()
+                .enumerate()
+                .map(|(i, e)| (i.to_string(), e))
+                .collect(),
+            Expr::ObjectLit { fields, .. } => {
+                fields.iter_mut().map(|(k, e)| (k.clone(), e)).collect()
+            }
+            _ => return Vec::new(),
+        };
+        members
+            .into_iter()
+            .map(|(key, member)| {
+                let var = self.member_name(&key);
+                let rhs = std::mem::replace(member, Expr::Var(var.clone()));
+                Stmt::Let { var, rhs, span }
+            })
+            .collect()
+    }
+
+    /// The forwarded name `expr` reads, when it is `temp[k]` / `temp.f` of a
+    /// forwarded key.
+    fn forwarded_read(&self, expr: &Expr) -> Option<Var> {
+        match (expr, &self.keys) {
+            (Expr::IndexAccess { arr, idx }, ForwardedKeys::Array(n)) => match (&**arr, &**idx) {
+                (Expr::Var(v), Expr::Lit(crate::ir::Prim::Int(k)))
+                    if *v == self.temp && usize::try_from(*k).is_ok_and(|k| k < *n) =>
+                {
+                    Some(self.member_name(&k.to_string()))
+                }
+                _ => None,
+            },
+            (Expr::FieldAccess { obj, field }, ForwardedKeys::Object(keys)) => match &**obj {
+                Expr::Var(v) if *v == self.temp && keys.contains(field) => {
+                    Some(self.member_name(field))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Rewrite every forwarded member read in `cfg`. Closures are not entered:
+    /// lowering reads a destructuring temp only in the statements right after
+    /// it, never from a nested function, and a spliced closure may hold an
+    /// unrelated temp of the same offset from another file.
+    fn rewrite_reads(&self, cfg: &mut CFG) {
+        fn rewrite(fw: &ReturnForwarding, e: &mut Expr) {
+            if let Some(name) = fw.forwarded_read(e) {
+                *e = Expr::Var(name);
+                return;
+            }
+            e.for_each_child_mut(&mut |c| rewrite(fw, c));
+        }
+        for block in cfg.blocks.values_mut() {
+            block.for_each_expr_mut(&mut |e| rewrite(self, e));
+        }
+    }
 }
 
 /// Every variable bound inside `cfg`: `params` plus every `let` target.
@@ -1134,6 +1319,286 @@ mod tests {
             matches!(&args[0], Expr::Lit(Prim::Int(42))),
             "param `p` nested in ObjectLit→Call must be substituted: {:?}",
             args[0]
+        );
+    }
+
+    // ── Return forwarding (#185) ─────────────────────────────────────────────
+
+    fn arr(elems: Vec<Expr>) -> Expr {
+        let n = elems.len();
+        Expr::ArrayLit {
+            id: ExprId(50),
+            elems,
+            arity: crate::ir::hooks::Arity::Exact(n),
+            spread_at: vec![],
+        }
+    }
+
+    fn obj(fields: Vec<(&str, Expr)>) -> Expr {
+        Expr::ObjectLit {
+            id: ExprId(51),
+            fields: fields
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+        }
+    }
+
+    fn var(v: &str) -> Expr {
+        Expr::Var(v.to_string())
+    }
+
+    /// A callee binding `v` and `setV`, then returning each of `rets` on its
+    /// own path (a branch on the free `c` when there are two), spliced at
+    /// `let <temp> = marker` followed by `reads`. Returns the caller.
+    fn splice_returning(rets: Vec<Expr>, temp: &str, reads: Vec<Stmt>) -> CFG {
+        let mut cblocks = std::collections::BTreeMap::new();
+        let prelude = vec![
+            let_("v", Expr::Lit(Prim::Int(0))),
+            let_("setV", Expr::StateSetter(0)),
+        ];
+        let mut edges = vec![];
+        if let [only] = rets.as_slice() {
+            let (id, b) = one_block(0, prelude, Terminator::Return(only.clone()));
+            cblocks.insert(id, b);
+        } else {
+            let (id, b) = one_block(
+                0,
+                prelude,
+                Terminator::Branch {
+                    cond: var("c"),
+                    then_: 1,
+                    else_: 2,
+                    span: None,
+                },
+            );
+            cblocks.insert(id, b);
+            for (i, ret) in rets.into_iter().enumerate() {
+                let (id, b) = one_block(i + 1, vec![], Terminator::Return(ret));
+                cblocks.insert(id, b);
+                edges.push(Edge {
+                    from: 0,
+                    to: i + 1,
+                    kind: if i == 0 {
+                        EdgeKind::IfTrue
+                    } else {
+                        EdgeKind::IfFalse
+                    },
+                });
+            }
+        }
+        let callee = CFG {
+            entry: 0,
+            blocks: cblocks,
+            edges,
+        };
+        let rename = callee_rename_map(&callee, &[], &[], 4, &HashSet::new());
+        let temp = temp.to_string();
+        let mut stmts = vec![let_(&temp, Expr::HookMarker(0, MarkerVal::Unknown))];
+        stmts.extend(reads);
+        let mut caller = caller(stmts);
+        splice_callee_into_cfg(
+            &mut caller,
+            0,
+            0,
+            Splice {
+                callee,
+                params: &[],
+                args: &[],
+                bound_var: Some(&temp),
+                rename: &rename,
+            },
+        );
+        assert!(caller.validate().is_ok(), "{:?}", caller.validate());
+        caller
+    }
+
+    fn index(temp: &str, k: i32) -> Expr {
+        Expr::IndexAccess {
+            arr: Box::new(var(temp)),
+            idx: Box::new(Expr::Lit(Prim::Int(k))),
+        }
+    }
+
+    fn field(temp: &str, f: &str) -> Expr {
+        Expr::FieldAccess {
+            obj: Box::new(var(temp)),
+            field: f.to_string(),
+        }
+    }
+
+    /// `let <name> = <rhs>` among the caller's statements, rhs as a string.
+    fn bound_to(cfg: &CFG, name: &str) -> Vec<String> {
+        all_stmts(cfg)
+            .into_iter()
+            .filter_map(|s| match s {
+                Stmt::Let { var, rhs, .. } if var == name => Some(format!("{rhs:?}")),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_returned_tuple_forwards_each_member_to_the_destructuring() {
+        let caller = splice_returning(
+            vec![arr(vec![var("v"), var("setV")])],
+            "__arr_9",
+            vec![
+                let_("s0", index("__arr_9", 0)),
+                let_("setS0", index("__arr_9", 1)),
+            ],
+        );
+        assert_eq!(
+            bound_to(&caller, "setS0"),
+            vec![format!("{:?}", var("__arr_9.1"))]
+        );
+        assert_eq!(
+            bound_to(&caller, "s0"),
+            vec![format!("{:?}", var("__arr_9.0"))]
+        );
+        assert_eq!(
+            bound_to(&caller, "__arr_9.1"),
+            vec![format!("{:?}", var("setV#4"))]
+        );
+        // The container stays, reading the members' names.
+        assert_eq!(
+            bound_to(&caller, "__arr_9"),
+            vec![format!(
+                "{:?}",
+                arr(vec![var("__arr_9.0"), var("__arr_9.1")])
+            )]
+        );
+    }
+
+    #[test]
+    fn a_returned_object_forwards_each_member_to_the_destructuring() {
+        let caller = splice_returning(
+            vec![obj(vec![("v", var("v")), ("setV", var("setV"))])],
+            "__obj_3#2",
+            vec![let_("set", field("__obj_3#2", "setV"))],
+        );
+        assert_eq!(
+            bound_to(&caller, "set"),
+            vec![format!("{:?}", var("__obj_3#2.setV"))]
+        );
+        assert_eq!(
+            bound_to(&caller, "__obj_3#2.setV"),
+            vec![format!("{:?}", var("setV#4"))]
+        );
+    }
+
+    #[test]
+    fn every_return_binds_the_members_on_its_own_path() {
+        let caller = splice_returning(
+            vec![
+                arr(vec![var("v"), var("setV")]),
+                arr(vec![Expr::Lit(Prim::Int(1)), var("setV")]),
+            ],
+            "__arr_9",
+            vec![let_("setS0", index("__arr_9", 1))],
+        );
+        assert_eq!(bound_to(&caller, "__arr_9.1").len(), 2);
+        assert_eq!(bound_to(&caller, "__arr_9").len(), 2);
+        assert_eq!(
+            bound_to(&caller, "setS0"),
+            vec![format!("{:?}", var("__arr_9.1"))]
+        );
+    }
+
+    #[test]
+    fn a_key_missing_from_one_return_is_not_forwarded() {
+        let caller = splice_returning(
+            vec![
+                obj(vec![("v", var("v")), ("setV", var("setV"))]),
+                obj(vec![("v", var("v"))]),
+            ],
+            "__obj_3",
+            vec![
+                let_("set", field("__obj_3", "setV")),
+                let_("x", field("__obj_3", "v")),
+            ],
+        );
+        assert_eq!(
+            bound_to(&caller, "set"),
+            vec![format!("{:?}", field("__obj_3", "setV"))]
+        );
+        assert_eq!(
+            bound_to(&caller, "x"),
+            vec![format!("{:?}", var("__obj_3.v"))]
+        );
+    }
+
+    #[test]
+    fn an_object_spread_forwards_only_the_members_after_it() {
+        let caller = splice_returning(
+            vec![obj(vec![
+                ("v", var("v")),
+                ("...7", var("rest")),
+                ("setV", var("setV")),
+            ])],
+            "__obj_3",
+            vec![
+                let_("set", field("__obj_3", "setV")),
+                let_("x", field("__obj_3", "v")),
+            ],
+        );
+        assert_eq!(
+            bound_to(&caller, "set"),
+            vec![format!("{:?}", var("__obj_3.setV"))]
+        );
+        // `v` may have been overwritten by the spread: still a member read.
+        assert_eq!(
+            bound_to(&caller, "x"),
+            vec![format!("{:?}", field("__obj_3", "v"))]
+        );
+        // The spread's argument is evaluated in its place, before `setV`.
+        let names: Vec<&str> = all_stmts(&caller)
+            .into_iter()
+            .filter_map(|s| match s {
+                Stmt::Let { var, .. } if var.starts_with("__obj_3.") => Some(var.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, ["__obj_3.v", "__obj_3....7", "__obj_3.setV"]);
+    }
+
+    #[test]
+    fn no_forwarding_without_a_literal_a_temp_or_an_exact_shape() {
+        let read = || vec![let_("set", index("__arr_9", 1))];
+        let untouched = format!("{:?}", index("__arr_9", 1));
+        let spread = Expr::ArrayLit {
+            id: ExprId(50),
+            elems: vec![var("v"), var("setV")],
+            arity: crate::ir::hooks::Arity::AtLeast(1),
+            spread_at: vec![0],
+        };
+        let elision = Expr::ArrayLit {
+            id: ExprId(50),
+            elems: vec![var("v"), var("setV")],
+            arity: crate::ir::hooks::Arity::Exact(3),
+            spread_at: vec![],
+        };
+        for ret in [var("v"), spread, elision] {
+            let caller = splice_returning(vec![ret.clone()], "__arr_9", read());
+            assert_eq!(bound_to(&caller, "set"), vec![untouched.clone()], "{ret:?}");
+        }
+        // Two kinds of literal: nothing is forwarded.
+        let mixed = splice_returning(
+            vec![arr(vec![var("v"), var("setV")]), obj(vec![("v", var("v"))])],
+            "__arr_9",
+            read(),
+        );
+        assert_eq!(bound_to(&mixed, "set"), vec![untouched.clone()]);
+        // A user-named receiver is not a destructuring temp.
+        let named = splice_returning(
+            vec![arr(vec![var("v"), var("setV")])],
+            "pair",
+            vec![let_("set", index("pair", 1))],
+        );
+        assert!(bound_to(&named, "pair.1").is_empty());
+        assert_eq!(
+            bound_to(&named, "set"),
+            vec![format!("{:?}", index("pair", 1))]
         );
     }
 
