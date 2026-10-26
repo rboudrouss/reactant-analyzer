@@ -145,31 +145,50 @@ impl Interval {
         }
     }
 
-    pub fn add(&self, other: &Self) -> Self {
+    /// Does the interval hold `v`? A closed bound is a member: an infinite one
+    /// is the value `±Infinity`, which JS arithmetic reaches.
+    fn holds(&self, v: f64) -> bool {
+        self.lo <= v && v <= self.hi
+    }
+
+    /// Is one of the bounds infinite?
+    fn unbounded(&self) -> bool {
+        self.lo.is_infinite() || self.hi.is_infinite()
+    }
+
+    /// `self + other`. `None` when the sum may be `NaN` — `+∞` on one side and
+    /// `−∞` on the other — which no interval holds (#217): a `NaN` bound
+    /// would read as ⊥ and kill every value computed from it.
+    pub fn add(&self, other: &Self) -> Option<Self> {
         if self.is_bottom() || other.is_bottom() {
-            return Interval::bottom();
+            return Some(Interval::bottom());
         }
-        Interval {
+        if (self.holds(f64::INFINITY) && other.holds(f64::NEG_INFINITY))
+            || (self.holds(f64::NEG_INFINITY) && other.holds(f64::INFINITY))
+        {
+            return None;
+        }
+        Some(Interval {
             lo: self.lo + other.lo,
             hi: self.hi + other.hi,
             is_int: self.is_int && other.is_int,
-        }
+        })
     }
 
-    pub fn sub(&self, other: &Self) -> Self {
-        if self.is_bottom() || other.is_bottom() {
-            return Interval::bottom();
-        }
-        Interval {
-            lo: self.lo - other.hi,
-            hi: self.hi - other.lo,
-            is_int: self.is_int && other.is_int,
-        }
+    /// `self - other`, `None` when it may be `∞ − ∞`, as in [`Self::add`].
+    pub fn sub(&self, other: &Self) -> Option<Self> {
+        self.add(&other.neg())
     }
 
-    pub fn mul(&self, other: &Self) -> Self {
+    /// `self * other`: the extremes sit at the corners. `None` when the
+    /// product may be `0 × ∞`, which is `NaN` (#217): the corner folds skip a
+    /// `NaN`, and `[0,0] × [−∞,+∞]` used to come out ⊥.
+    pub fn mul(&self, other: &Self) -> Option<Self> {
         if self.is_bottom() || other.is_bottom() {
-            return Interval::bottom();
+            return Some(Interval::bottom());
+        }
+        if (self.holds(0.0) && other.unbounded()) || (other.holds(0.0) && self.unbounded()) {
+            return None;
         }
         let products = [
             self.lo * other.lo,
@@ -179,11 +198,11 @@ impl Interval {
         ];
         let lo = products.iter().cloned().fold(f64::INFINITY, f64::min);
         let hi = products.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        Interval {
+        Some(Interval {
             lo,
             hi,
             is_int: self.is_int && other.is_int,
-        }
+        })
     }
 
     pub fn neg(&self) -> Self {
@@ -507,9 +526,61 @@ mod tests {
     fn interval_add() {
         let a = Interval::point(0.0).hull(&Interval::point(3.0));
         let b = Interval::point(1.0);
-        let r = a.add(&b);
+        let r = a.add(&b).unwrap();
         assert_eq!(r.lo, 1.0);
         assert_eq!(r.hi, 4.0);
+    }
+
+    /// `0 × ∞` is `NaN`: the corner folds used to skip it and return ⊥ for
+    /// `[0,0] × [−∞,+∞]`, killing every value computed from it (#217).
+    #[test]
+    fn mul_by_a_possible_zero_times_infinity_is_unrepresentable() {
+        let zero = ints(0.0, 0.0);
+        assert_eq!(zero.mul(&Interval::top()), None);
+        assert_eq!(Interval::top().mul(&zero), None);
+        assert_eq!(
+            ints(-1.0, 1.0).mul(&ints(1.0, f64::INFINITY)),
+            None,
+            "0 is inside the left operand, +∞ a bound of the right one"
+        );
+        assert_eq!(
+            ints(f64::INFINITY, f64::INFINITY).mul(&ints(0.0, 0.0)),
+            None
+        );
+        // No zero against an unbounded side, or nothing unbounded: exact.
+        assert_eq!(
+            ints(2.0, 2.0).mul(&ints(1.0, f64::INFINITY)),
+            Some(ints(2.0, f64::INFINITY))
+        );
+        assert_eq!(ints(0.0, 3.0).mul(&ints(-2.0, 2.0)), Some(ints(-6.0, 6.0)));
+        assert_eq!(
+            Interval::bottom().mul(&Interval::top()),
+            Some(Interval::bottom())
+        );
+    }
+
+    /// `∞ − ∞` is `NaN`, whichever of `+` and `-` spells it (#217).
+    #[test]
+    fn opposite_infinities_add_to_an_unrepresentable_value() {
+        let pos = ints(f64::INFINITY, f64::INFINITY);
+        let neg = ints(f64::NEG_INFINITY, f64::NEG_INFINITY);
+        assert_eq!(pos.add(&neg), None);
+        assert_eq!(pos.sub(&pos), None);
+        assert_eq!(Interval::top().add(&Interval::top()), None);
+        assert_eq!(
+            ints(0.0, f64::INFINITY).sub(&ints(1.0, f64::INFINITY)),
+            None
+        );
+        // One side bounded: the widened counter `x + 1` and `x - 1` stay exact.
+        assert_eq!(
+            ints(0.0, f64::INFINITY).add(&ints(1.0, 1.0)),
+            Some(ints(1.0, f64::INFINITY))
+        );
+        assert_eq!(Interval::top().sub(&ints(1.0, 1.0)), Some(Interval::top()));
+        assert_eq!(
+            ints(0.0, f64::INFINITY).sub(&ints(f64::NEG_INFINITY, 0.0)),
+            Some(ints(0.0, f64::INFINITY))
+        );
     }
 
     #[test]
@@ -609,6 +680,6 @@ mod tests {
         // int ⊕ non-int ⟹ result is no longer proven-integer.
         let i = Interval::point(3.0);
         let f = Interval::point(0.5);
-        assert!(!i.add(&f).is_int);
+        assert!(!i.add(&f).unwrap().is_int);
     }
 }

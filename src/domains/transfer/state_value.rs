@@ -737,7 +737,10 @@ fn eval_binop(op: &BinOp, lhs: StateValue, rhs: StateValue) -> StateValue {
     match op {
         BinOp::Add => {
             if let (Some(a), Some(b)) = (as_arith(&lhs), as_arith(&rhs)) {
-                return StateValue::number(a.add(&b));
+                return a
+                    .add(&b)
+                    .map(StateValue::number)
+                    .unwrap_or_else(StateValue::top);
             }
             match (as_str_only(&lhs), as_str_only(&rhs)) {
                 (Some(StrConst::Set(a)), Some(StrConst::Set(b))) => {
@@ -751,18 +754,24 @@ fn eval_binop(op: &BinOp, lhs: StateValue, rhs: StateValue) -> StateValue {
                 _ => StateValue::top(),
             }
         }
+        // Exact on the numeric operands the interval domain can follow; where
+        // the result may be `NaN` (`∞ − ∞`, `0 × ∞`, `x % 0`, `(−1) ** 0.5`),
+        // which no interval holds, it is ⊤ like `/`.
         BinOp::Sub => match (as_arith(&lhs), as_arith(&rhs)) {
-            (Some(a), Some(b)) => StateValue::number(a.sub(&b)),
+            (Some(a), Some(b)) => a
+                .sub(&b)
+                .map(StateValue::number)
+                .unwrap_or_else(StateValue::top),
             _ => StateValue::top(),
         },
         BinOp::Mul => match (as_arith(&lhs), as_arith(&rhs)) {
-            (Some(a), Some(b)) => StateValue::number(a.mul(&b)),
+            (Some(a), Some(b)) => a
+                .mul(&b)
+                .map(StateValue::number)
+                .unwrap_or_else(StateValue::top),
             _ => StateValue::top(),
         },
         BinOp::Div => StateValue::top(),
-        // `%` and `**` are exact on the numeric operands the interval domain
-        // can follow (`Interval::rem`, `Interval::pow`); where the result may
-        // be `NaN`, which no interval holds, they are ⊤ like `/`.
         BinOp::Mod => match (as_arith(&lhs), as_arith(&rhs)) {
             (Some(a), Some(b)) => a
                 .rem(&b)
@@ -1186,6 +1195,30 @@ mod tests {
         assert_eq!(
             eval_binop(&BinOp::Pow, num(-2.0, 3.0), num(2.0, 2.0)),
             StateValue::top()
+        );
+    }
+
+    /// `0 × ∞` and `∞ − ∞` are `NaN`: ⊤, never the ⊥ the corner folds used to
+    /// give, which silently killed every value computed from it (#217).
+    #[test]
+    fn eval_binop_nan_from_infinite_bounds_is_top_not_bottom() {
+        let widened = num(f64::NEG_INFINITY, f64::INFINITY);
+        assert_eq!(
+            eval_binop(&BinOp::Mul, num(0.0, 0.0), widened.clone()),
+            StateValue::top()
+        );
+        assert_eq!(
+            eval_binop(&BinOp::Add, widened.clone(), widened.clone()),
+            StateValue::top()
+        );
+        assert_eq!(
+            eval_binop(&BinOp::Sub, widened.clone(), widened.clone()),
+            StateValue::top()
+        );
+        // One bounded side keeps the widened counter a number.
+        assert_eq!(
+            eval_binop(&BinOp::Add, num(0.0, f64::INFINITY), num(1.0, 1.0)),
+            num(1.0, f64::INFINITY)
         );
     }
 

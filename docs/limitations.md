@@ -96,7 +96,8 @@ that writes it (see *Cross-file limits*).
   method on a string returns a primitive and the proof would be false [#22](https://github.com/rboudrouss/reactant-analyzer/issues/22).
 - Intervals never hold `NaN`, so an arithmetic result that may be `NaN` is ⊤: every `/`, a `%` whose
   divisor may be zero (`i % items.length` with an unknown length), a `**` with a negative base or a
-  negative exponent. `in` and `instanceof` are known to be booleans and nothing more
+  negative exponent, and a `+`, `-` or `*` that may meet `∞ − ∞` or `0 × ∞` on operands widened
+  to an infinite bound [#217](https://github.com/rboudrouss/reactant-analyzer/issues/217). `in` and `instanceof` are known to be booleans and nothing more
   [#73](https://github.com/rboudrouss/reactant-analyzer/issues/73).
 - A spread or computed key is kept for its reads but not modeled, so `{ ...opts }.foo` does not
   resolve and a setter forwarded through `f(...handlers)` is not seen [#76](https://github.com/rboudrouss/reactant-analyzer/issues/76).
