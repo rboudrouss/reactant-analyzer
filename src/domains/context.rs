@@ -130,6 +130,12 @@ pub struct AnalysisCtx<'a, D: AbstractDomain> {
     /// Read-only: a pass reads memo values, and only the fixpoint, between
     /// passes, recomputes them.
     pub memo: &'a MemoStore<D>,
+    /// Read-only: the component's own state when this pass began, which an
+    /// updater or a reducer reads as its current value along with `state`.
+    /// A pass that starts from ⊥ to collect only its writes (the pure-writes
+    /// re-run) still reads the converged state here. `None`: `state` is all
+    /// the pass knows.
+    pub start: Option<&'a StateStore<D>>,
     pub heap: &'a mut Heap,
     pub query: &'a dyn QueryContext,
     /// Optional inter-component context. `None` = intra-component analysis only.
@@ -170,6 +176,7 @@ impl<'a, D: AbstractDomain> AnalysisCtx<'a, D> {
             component,
             state,
             memo,
+            start: None,
             heap,
             query: &NULL,
             inter: None,

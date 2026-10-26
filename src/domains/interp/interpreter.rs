@@ -590,8 +590,15 @@ fn exec_slot_write<T: Transfer>(
     let Some((owner, label)) = target else {
         return;
     };
+    // The pass's store, joined with the slot's value at the start of the
+    // pass: a re-run from ⊥ would otherwise hand the updater ⊥, and a ⊥
+    // write vanishes in the join with any other write of the slot.
     let current = if owner == ctx.component {
-        ctx.state.get(label)
+        let own = ctx.state.get(label);
+        match ctx.start {
+            Some(start) => own.join(&start.get(label)),
+            None => own,
+        }
     } else {
         T::Domain::top()
     };
@@ -684,14 +691,12 @@ fn exec_callbacks_depth<T: Transfer>(
                     }
                 }
             }
-            // B6: direct local call inlining Unknown callee that resolves to a heap Fn.
+            // B6: direct local call inlining — an Unknown callee that resolves
+            // to a heap Fn, or a literal called where it is written (#186).
             // External/imported functions have no Loc → skipped (no FP).
             let mut returned = None;
-            if class == TriggerClass::Unknown
-                && !capped
-                && let Expr::Var(name) = fn_.as_ref()
-            {
-                returned = exec_var_callback(transfer, name, env, ctx, depth);
+            if class == TriggerClass::Unknown && !capped {
+                returned = exec_fn_value(transfer, fn_, env, ctx, depth);
             }
             // Arguments first, then the call itself.
             exec_slot_write(transfer, fn_, args, env, ctx, depth);
@@ -714,6 +719,40 @@ fn exec_callbacks_depth<T: Transfer>(
             });
             None
         }
+    }
+}
+
+/// Run a function value for its effects, as calling it does: a literal's body
+/// directly (an IIFE, `(() => setN(1))()`, #186), a name through the heap
+/// ([`exec_var_callback`]). Parameters are ⊤. Also how an effect's returned
+/// cleanup runs, which React calls (#171). Returns what the call returns, as
+/// [`exec_var_callback`] does; `None` when no body ran whole.
+pub(crate) fn exec_fn_value<T: Transfer>(
+    transfer: &T,
+    callee: &Expr,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+    depth: usize,
+) -> Option<T::Domain> {
+    match callee.peel_ts() {
+        Expr::FnLit {
+            params, body_cfg, ..
+        } => {
+            let mut sub_env = env.clone();
+            for p in params {
+                sub_env.extend(p.clone(), T::Domain::top());
+            }
+            Some(exec_body_depth(
+                transfer,
+                body_cfg,
+                &sub_env,
+                ctx,
+                depth + 1,
+            ))
+            .filter(|v| !v.is_bottom())
+        }
+        Expr::Var(name) => exec_var_callback(transfer, name, env, ctx, depth),
+        _ => None,
     }
 }
 

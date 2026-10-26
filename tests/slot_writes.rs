@@ -217,3 +217,129 @@ export function Parent() {
         "the updater's return, not the closure"
     );
 }
+
+// ── A function value that runs writes as it runs ───────────────────────────
+
+/// `return set(n + 1)` in a spliced helper called bare: the value is
+/// discarded, the evaluation is not (#174).
+#[test]
+fn a_returned_call_of_a_bare_helper_call_still_runs() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+function bump(set: (n: number) => void, n: number) {
+  return set(n + 1);
+}
+function push(set: (n: number) => void, n: number) {
+  set(n + 1);
+}
+export function Ret() {
+  const [n, setN] = useState(0);
+  useEffect(() => { bump(setN, n); });
+  return <div />;
+}
+export function Bare() {
+  const [n, setN] = useState(0);
+  useEffect(() => { push(setN, n); });
+  return <div />;
+}
+"#;
+    let result = analyze(src);
+    assert_eq!(loops(&result, "Ret"), loops(&result, "Bare"));
+    assert!(!loops(&result, "Ret").is_empty());
+}
+
+/// A literal called where it is written runs there (#186).
+#[test]
+fn an_immediately_invoked_literal_runs() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function Iife() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    (() => setN(n + 1))();
+  });
+  return <div>{n}</div>;
+}
+export function AsyncIife() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    (async () => { setN(n + 1); })();
+  });
+  return <div>{n}</div>;
+}
+export function Direct() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    setN(n + 1);
+  });
+  return <div>{n}</div>;
+}
+"#;
+    let result = analyze(src);
+    let direct = loops(&result, "Direct");
+    assert!(!direct.is_empty());
+    assert_eq!(loops(&result, "Iife"), direct);
+    assert_eq!(loops(&result, "AsyncIife"), direct);
+}
+
+/// An updater reads the slot's converged value, also in the pure-writes
+/// re-run from ⊥: given ⊥, `prev * 2` wrote ⊥, and a ⊥ write vanished in the
+/// join with any bounded write of the slot (`setS0(3)` here), which hid the
+/// growth (oracle fuzz seed 1, program 439).
+#[test]
+fn a_growing_updater_is_not_hidden_by_a_bounded_write() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function InBody({ flag }: { flag: boolean }) {
+  const [s0, setS0] = useState(2);
+  useEffect(() => {
+    setS0((prev) => prev * 2);
+    if (flag) setS0(3);
+  });
+  return <div>{s0}</div>;
+}
+export function InCleanup() {
+  const [s0, setS0] = useState(2);
+  useEffect(() => {
+    setS0((prev) => prev * 2);
+    return () => { setS0(3); };
+  });
+  return <div>{s0}</div>;
+}
+"#;
+    let result = analyze(src);
+    for c in ["InBody", "InCleanup"] {
+        let id = result.component_named(c).unwrap();
+        assert!(result.components[&id].diverges(0).is_some(), "{c}");
+        assert_eq!(loops(&result, c), vec![Severity::Warning], "{c}");
+    }
+}
+
+/// The cleanup an effect returns is a body React runs: its writes reach the
+/// store, whether it is written inline or bound to a name first (#171).
+#[test]
+fn an_effect_cleanup_writes_its_slot() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function Inline({ id }: { id: number }) {
+  const [n, setN] = useState(0);
+  useEffect(() => { return () => setN(7); }, [id]);
+  return <div>{n}</div>;
+}
+export function Named({ id }: { id: number }) {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    const off = () => { setN(7); };
+    return off;
+  }, [id]);
+  return <div>{n}</div>;
+}
+"#;
+    let result = analyze(src);
+    for c in ["Inline", "Named"] {
+        let id = result.component_named(c).unwrap();
+        let slot = result.components[&id].state_store.get(0);
+        let seven = StateValue::number(Interval::point(7.0));
+        assert_eq!(slot.join(&seven), slot, "{c}: 7 is not in {slot:?}");
+    }
+}

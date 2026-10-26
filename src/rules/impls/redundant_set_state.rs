@@ -10,9 +10,10 @@ use crate::{
 use crate::ir::ComponentId;
 use crate::rules::{Diagnostic, Rule};
 
-/// Fires when `setState` is called with a stable value when the state is already stable.
+/// Fires when `setState` is called with the one value the state ever holds.
 /// Checked in both render body and effect bodies.
-/// Only fires when BOTH argument and current state are stable.
+/// Only fires when argument and current state are provably the same value
+/// ([`StateValue::is_same_value`]).
 pub struct RedundantSetState;
 
 impl RedundantSetState {
@@ -266,7 +267,9 @@ fn check_setter_calls(
 
             let current_val = state.get(label);
 
-            if arg_val.is_stable() && current_val.is_stable() {
+            // Equality, not stability: two stable references are not the
+            // same reference (#179).
+            if arg_val.is_same_value(&current_val) {
                 diags.push(
                     Diagnostic::warn(
                         "redundant-set-state",
@@ -302,7 +305,7 @@ mod tests {
     use crate::ir::hooks::{DepsArg, DepsList};
     use crate::{
         domains::{
-            Stability, StateValue,
+            Interval, Stability, StateValue,
             stores::{AbstractEnv, StateStore},
         },
         engine::{AnalysisResult, ProgramAnalysisResult},
@@ -385,11 +388,40 @@ mod tests {
         let result = make_result(
             vec![(0, stmts)],
             vec![("setN", StateValue::reference(Stability::Stable), Some(0))],
-            vec![(0, StateValue::reference(Stability::Stable))],
+            vec![(0, StateValue::number(Interval::point(42.0)))],
         );
         let diags = RedundantSetState.check(&RuleCtx::new(&prog(&result), crate::test_support::C));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].hook_label, Some(0));
+    }
+
+    #[test]
+    fn other_point_than_the_state_no_warning() {
+        // setN(42) while the state is the point 7: a change, not a redundancy.
+        let stmts = vec![
+            Stmt::Let {
+                var: "setN".to_string(),
+                rhs: Expr::StateSetter(0),
+                span: None,
+            },
+            Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::Lit(Prim::Int(42))],
+                },
+                None,
+            ),
+        ];
+        let result = make_result(
+            vec![(0, stmts)],
+            vec![("setN", StateValue::reference(Stability::Stable), Some(0))],
+            vec![(0, StateValue::number(Interval::point(7.0)))],
+        );
+        assert!(
+            RedundantSetState
+                .check(&RuleCtx::new(&prog(&result), crate::test_support::C))
+                .is_empty()
+        );
     }
 
     #[test]
@@ -471,31 +503,35 @@ mod tests {
     }
 
     #[test]
-    fn setter_arg_is_stable_reference() {
+    fn two_stable_references_no_warning() {
+        // `useState(A)` then `setV(B)`: both stable, never the same object
+        // (#179).
         let stmts = vec![
             Stmt::Let {
-                var: "setN".to_string(),
+                var: "setV".to_string(),
                 rhs: Expr::StateSetter(0),
                 span: None,
             },
             Stmt::ExprStmt(
                 Expr::Call {
-                    fn_: Box::new(Expr::Var("setN".to_string())),
-                    args: vec![Expr::StateSetter(0)],
+                    fn_: Box::new(Expr::Var("setV".to_string())),
+                    args: vec![Expr::Var("B".to_string())],
                 },
                 None,
             ),
         ];
         let result = make_result(
             vec![(0, stmts)],
-            vec![("setN", StateValue::reference(Stability::Stable), Some(0))],
+            vec![
+                ("setV", StateValue::reference(Stability::Stable), Some(0)),
+                ("B", StateValue::reference(Stability::Stable), None),
+            ],
             vec![(0, StateValue::reference(Stability::Stable))],
         );
-        assert_eq!(
+        assert!(
             RedundantSetState
                 .check(&RuleCtx::new(&prog(&result), crate::test_support::C))
-                .len(),
-            1
+                .is_empty()
         );
     }
 
@@ -558,7 +594,7 @@ mod tests {
             render_stmts,
             effect_stmts,
             vec![("setN", StateValue::reference(Stability::Stable), Some(0))],
-            vec![(0, StateValue::reference(Stability::Stable))],
+            vec![(0, StateValue::number(Interval::point(42.0)))],
         );
         let diags = RedundantSetState.check(&RuleCtx::new(&prog(&result), crate::test_support::C));
         assert_eq!(diags.len(), 1, "effect body setter should be checked");

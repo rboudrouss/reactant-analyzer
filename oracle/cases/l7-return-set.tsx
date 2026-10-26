@@ -1,6 +1,6 @@
 // oracle: react=loop
-// oracle: known=fn #174
-// L7: the splice drops the expression of `return set(..)` when the call is not bound.
+// L7: the splice dropped the expression of `return set(..)` when the call was
+// not bound (#174).
 import { useEffect, useState } from "react";
 
 function bump(set: (n: number) => void, n: number) {

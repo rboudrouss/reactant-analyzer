@@ -1,7 +1,7 @@
 // oracle: react=loop
-// oracle: known=fn #186
 // Found by `oracle fuzz --seed 2` (programs 163, 348, 1232, shrunk). A setter
-// called inside an immediately invoked arrow is not executed by the effect pass.
+// called inside an immediately invoked arrow was not executed by the effect
+// pass (#186).
 import { useEffect, useState } from "react";
 
 export function App() {

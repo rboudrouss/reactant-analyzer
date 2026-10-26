@@ -1,6 +1,8 @@
-//! The context-provider relation: `<Ctx.Provider value={…}>` elements whose
-//! `Ctx` is a **proven** React context, each with the identity verdict of the
-//! value it hands its consumers.
+//! The context-provider relation: `<Ctx.Provider value={…}>` elements (and the
+//! React 19 `<Ctx value={…}>`, spelled by
+//! [`crate::engine::render_deps::provided_context_name`]) whose `Ctx` is a
+//! **proven** React context, each with the identity verdict of the value it
+//! hands its consumers.
 //!
 //! Proof comes from [`ModuleConstInit::Context`] — a module-level
 //! `const Ctx = createContext(…)` whose callee reached React by its import
@@ -33,6 +35,9 @@ pub(crate) struct ProviderSite<'a> {
     /// The context binding the element hangs off (`TabsContext`) — the LOCAL
     /// name, which is what a message should show.
     pub context: &'a Var,
+    /// The element as written: `TabsContext.Provider`, or `TabsContext` in
+    /// the React 19 form.
+    pub element: &'a str,
     /// Canonical identity of the cell that name resolves to (#109). Two files
     /// importing the same context under different local names share this; the
     /// local name identifies nothing across files, which is why the
@@ -73,6 +78,7 @@ pub(crate) fn collect_provider_sites(comp: &AnalysisResult<StateValue>) -> Vec<P
                     (block_id, idx),
                     ProviderSite {
                         context,
+                        element: name,
                         context_id,
                         identity: site_identity(prop_value(props), env, &bindings, comp),
                         span,
@@ -85,13 +91,13 @@ pub(crate) fn collect_provider_sites(comp: &AnalysisResult<StateValue>) -> Vec<P
     found.into_iter().map(|(_, site)| site).collect()
 }
 
-/// `"TabsContext.Provider"` → the proven context binding it names, with the
-/// cell that binding resolves to.
+/// `"TabsContext.Provider"`, or `"TabsContext"` in the React 19 form → the
+/// proven context binding it names, with the cell that binding resolves to.
 fn provider_context<'a>(
     name: &str,
     contexts: &HashMap<&'a Var, &'a ContextId>,
 ) -> Option<(&'a Var, &'a ContextId)> {
-    let base = name.strip_suffix(".Provider")?;
+    let base = crate::engine::render_deps::provided_context_name(name);
     contexts
         .iter()
         .find(|(c, _)| c.as_str() == base)

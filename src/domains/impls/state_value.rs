@@ -454,6 +454,17 @@ impl StateValue {
         }
     }
 
+    /// True if `self` and `other` are provably the same concrete value,
+    /// `Object.is`-equal: one and the same single value. A reference never
+    /// qualifies — stability says a reference does not change, not which one
+    /// it is, and two distinct stable constants are both `Stable` (#179).
+    pub fn is_same_value(&self, other: &Self) -> bool {
+        self == other
+            && !self.is_bottom_value()
+            && self.reference == Stability::Bottom
+            && self.is_single_value()
+    }
+
     /// True if the value ranges over a few primitives only: booleans,
     /// `null`/`undefined`, a finite set of string constants, a narrow integer
     /// range. A state holding such a value re-renders only when a write

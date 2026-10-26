@@ -4,11 +4,12 @@ use crate::{
     domains::{
         AbstractDomain, AnalysisCtx, AnalyzeChildFn, FixpointCtx, Heap, InterCtx, Transfer,
         impls::{Stability, StateValue},
+        interp::exec_fn_value,
         stores::{AbstractEnv, MemoStore, StateStore},
     },
     ir::{
         ComponentId,
-        cfg::CFG,
+        cfg::{CFG, Terminator},
         component::{ComponentIR, ModuleConstInit},
         expr::{Expr, SummaryValue},
         free_vars::{compute_free_vars, free_paths_and_pinned},
@@ -309,9 +310,11 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
 
     // Every pass below runs one body through the one solver over the stores
     // of the current iteration. What a pass varies is the body, its entry
-    // env, the state it starts from and whether it analyses children; what
-    // the fixpoint knows beyond the body's syntax (callback bodies, reducers)
-    // and how loops widen are the same for all of them.
+    // env, the store its writes join into, the state it reads as the slots'
+    // current values (`start`), whether it analyses children and whether the
+    // body is an effect's, whose returned cleanup React calls too (#171);
+    // what the fixpoint knows beyond the body's syntax (callback bodies,
+    // reducers) and how loops widen are the same for all of them.
     let query = FixpointCtx {
         callbacks: &callback_bodies,
         reducers: &reducers,
@@ -322,22 +325,35 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     };
     let pass = |cfg: &CFG,
                 entry: AbstractEnv<StateValue>,
-                state: &StateStore<StateValue>,
+                writes: &StateStore<StateValue>,
+                start: &StateStore<StateValue>,
                 memo: &MemoStore<StateValue>,
                 heap: &mut Heap,
-                children: bool| {
-        let mut out = state.clone();
+                children: bool,
+                effect: bool| {
+        let mut out = writes.clone();
         let envs = {
             let mut ac = AnalysisCtx {
                 component: comp_id,
                 state: &mut out,
                 memo,
+                start: Some(start),
                 heap,
                 query: &query,
                 inter: inter.filter(|_| children),
                 widening,
             };
-            analyze_cfg(transfer, cfg, entry, &mut ac)
+            let envs = analyze_cfg(transfer, cfg, entry, &mut ac);
+            if effect {
+                for (bid, block) in &cfg.blocks {
+                    if let Terminator::Return(ret) = &block.term
+                        && let Some(env) = envs.get(bid)
+                    {
+                        let _ = exec_fn_value(transfer, ret, env, &mut ac, 0);
+                    }
+                }
+            }
+            envs
         };
         (envs, out)
     };
@@ -402,9 +418,11 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             &render_cfg,
             initial_env.clone(),
             &state_store,
+            &state_store,
             &memo_store,
             &mut heap,
             true,
+            false,
         );
         block_states = bs;
 
@@ -420,6 +438,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 component: comp_id,
                 state: &mut state_store,
                 memo: &memo_store,
+                start: None,
                 heap: &mut heap,
                 query: &query,
                 inter,
@@ -453,8 +472,10 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                     body_cfg,
                     env_exit.clone(),
                     &state_store,
+                    &state_store,
                     &memo_store,
                     &mut heap,
+                    true,
                     true,
                 );
                 effect_block_states.insert(*label, eff_bs);
@@ -478,9 +499,11 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                     body_cfg,
                     env_exit.clone(),
                     &state_store,
+                    &state_store,
                     &memo_store,
                     &mut heap,
                     true,
+                    false,
                 );
                 handler_block_states.insert(*label, h_bs);
                 state_from_handlers = state_from_handlers.join(&h_state);
@@ -549,8 +572,10 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             &render_cfg,
             initial_env.clone(),
             &state,
+            &state,
             &memo_store,
             &mut heap,
+            false,
             false,
         );
         block_states = bs;
@@ -570,9 +595,11 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 body_cfg,
                 env_exit.clone(),
                 &bottom_state,
+                &final_state,
                 &memo_store,
                 &mut heap,
                 false,
+                true,
             );
             effect_setter_writes = effect_setter_writes.join(&pure_writes);
         }

@@ -71,6 +71,29 @@ fn inline_object_value_warns() {
     assert_eq!(d[0].range.map(|r| r.line), Some(6));
 }
 
+/// Since React 19 `<Ctx value>` is a provider, with the cost of
+/// `<Ctx.Provider value>` (#177).
+#[test]
+fn the_react_19_provider_form_warns() {
+    let d = findings(
+        r#"
+        import { createContext, useState } from "react";
+        const Ctx = createContext(null);
+        export function P({ children }) {
+          const [user, setUser] = useState(null);
+          return <Ctx value={{ user, setUser }}>{children}</Ctx>;
+        }
+        "#,
+    );
+    assert_eq!(d.len(), 1, "{d:?}");
+    // The element as written, not a `.Provider` the source never spelled.
+    assert!(
+        d[0].message.starts_with("`Ctx` is given"),
+        "{}",
+        d[0].message
+    );
+}
+
 #[test]
 fn inline_array_value_warns() {
     assert_eq!(
