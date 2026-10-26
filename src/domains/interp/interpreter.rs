@@ -7,7 +7,10 @@ use crate::{
         impls::StateValue,
         stores::{AbstractEnv, EnvVal, HeapValue, resolve_locs},
     },
-    engine::{Reducer, dominance::selecting_branches},
+    engine::{
+        Reducer,
+        dominance::{returning_branches, selecting_branches},
+    },
     ir::{
         bindings::binding_of,
         cfg::{CFG, EdgeKind, Terminator},
@@ -118,16 +121,29 @@ pub(crate) fn run_cfg<T: Transfer>(
         .collect();
     let rank = |b: BlockId| order.get(&b).copied().unwrap_or(usize::MAX);
 
-    // Block → the branches whose condition selects what it assigns, and the
-    // inverse, for re-queueing when a condition's bound grows.
+    // Block → the branches whose condition selects what it assigns, or what
+    // it returns; and the inverse, for re-queueing when a condition's bound
+    // grows.
     let selecting = selecting_branches(cfg);
+    let returning = returning_branches(cfg);
     let mut selected: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
-    for (b, branches) in &selecting {
+    for (b, branches) in selecting.iter().chain(&returning) {
         for br in branches {
             selected.entry(*br).or_default().push(*b);
         }
     }
     let mut cond_bounds: HashMap<BlockId, Stability> = HashMap::new();
+    // The join of the change bounds of `branches`, those not yet run
+    // contributing nothing: they re-queue the block when they do.
+    let bound_under = |branches: Option<&Vec<BlockId>>,
+                       cond_bounds: &HashMap<BlockId, Stability>| {
+        branches
+            .into_iter()
+            .flatten()
+            .filter_map(|br| cond_bounds.get(br))
+            .fold(Stability::Bottom, |acc, s| acc.join(s))
+    };
+    let under_condition = |pc: &Stability| !matches!(pc, Stability::Bottom | Stability::Stable);
 
     let mut entries: HashMap<BlockId, AbstractEnv<T::Domain>> = HashMap::new();
     let mut exits: HashMap<BlockId, AbstractEnv<T::Domain>> = HashMap::new();
@@ -141,20 +157,12 @@ pub(crate) fn run_cfg<T: Transfer>(
 
     while let Some((_, b)) = pending.pop_first() {
         let mut env = entries[&b].clone();
-        // The change bound of the conditions this block runs under. A branch
-        // not yet run contributes nothing now and re-queues this block when
-        // it does.
-        let pc = selecting
-            .get(&b)
-            .into_iter()
-            .flatten()
-            .filter_map(|br| cond_bounds.get(br))
-            .fold(Stability::Bottom, |acc, s| acc.join(s));
-        let under_condition = !matches!(pc, Stability::Bottom | Stability::Stable);
+        // The change bound of the conditions this block's writes run under.
+        let pc = bound_under(selecting.get(&b), &cond_bounds);
         if let Some(block) = cfg.blocks.get(&b) {
             for stmt in &block.stmts {
                 exec_full_stmt(transfer, stmt, &mut env, ctx, depth);
-                if under_condition
+                if under_condition(&pc)
                     && let Stmt::Let { var, .. } | Stmt::Assign { var, .. } = stmt
                     && env.contains(var)
                 {
@@ -166,10 +174,17 @@ pub(crate) fn run_cfg<T: Transfer>(
                 // A concise arrow body (`() => EXPR`) lowers EXPR to this
                 // Return. EXPR may carry side effects (`() => setN(c => c+1)`,
                 // `() => arr.map(cb)`): fire them as a statement would, then
-                // take EXPR's value as the return (ADR-020 item 7).
+                // take EXPR's value as the return (ADR-020 item 7). The
+                // body's exit is a merge too: a return the other side of a
+                // branch answers with its own takes the branch's condition.
                 Terminator::Return(expr) => {
                     exec_callbacks_depth(transfer, expr, &env, ctx, depth);
-                    ret = ret.join(&transfer.eval_expr(expr, &env, ctx));
+                    let mut val = transfer.eval_expr(expr, &env, ctx);
+                    let pc_ret = bound_under(returning.get(&b), &cond_bounds);
+                    if under_condition(&pc_ret) {
+                        val = val.select_under(&pc_ret);
+                    }
+                    ret = ret.join(&val);
                 }
                 // A condition is evaluated, so its calls run; its change
                 // bound is what the blocks it selects run under.

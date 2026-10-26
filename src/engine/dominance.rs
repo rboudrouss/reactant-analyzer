@@ -99,7 +99,9 @@ pub fn on_all_paths(cfg: &CFG, blocks: &HashSet<BlockId>) -> bool {
 /// Render dependence (ADR-041) charges a block's writes and returns to these
 /// conditions.
 pub(crate) fn controlling_branches(cfg: &CFG) -> HashMap<BlockId, Vec<BlockId>> {
-    branches_over(cfg, |_, controlled, _| controlled)
+    branches_over(cfg, |_, rt, re| {
+        rt.symmetric_difference(re).copied().collect()
+    })
 }
 
 /// For every block, the branch blocks whose condition *selects* what the
@@ -109,7 +111,8 @@ pub(crate) fn controlling_branches(cfg: &CFG) -> HashMap<BlockId, Vec<BlockId>> 
 /// an early `return`) controls everything after it but selects nothing: no
 /// render compares the continuation's values with the exiting arm's.
 pub(crate) fn selecting_branches(cfg: &CFG) -> HashMap<BlockId, Vec<BlockId>> {
-    branches_over(cfg, |cfg, controlled, merge| {
+    branches_over(cfg, |cfg, rt, re| {
+        let merge: HashSet<BlockId> = rt.intersection(re).copied().collect();
         if merge.is_empty() {
             return HashSet::new();
         }
@@ -123,16 +126,47 @@ pub(crate) fn selecting_branches(cfg: &CFG) -> HashMap<BlockId, Vec<BlockId>> {
                 }
             }
         }
-        controlled.intersection(&reaches_merge).copied().collect()
+        rt.symmetric_difference(re)
+            .filter(|b| reaches_merge.contains(b))
+            .copied()
+            .collect()
     })
 }
 
-/// For each branch, the blocks `pick` chooses from the blocks exactly one
-/// side reaches (`controlled`) and the blocks both sides reach (`merge`),
-/// inverted into "block → branches".
+/// For every `return` block, the branch blocks whose condition *selects*
+/// what it returns: one side of the branch reaches it, and the other side
+/// reaches a `return` of its own (#197). The body's exit is where those two
+/// values meet — the merge [`selecting_branches`] looks for inside the body —
+/// so `() => { if (c) return a; return b; }` returns `a ⊔ b ⊔ may(c)`. A
+/// guard whose other side throws selects nothing here either.
+pub(crate) fn returning_branches(cfg: &CFG) -> HashMap<BlockId, Vec<BlockId>> {
+    let returns: HashSet<BlockId> = cfg
+        .blocks
+        .values()
+        .filter(|b| matches!(b.term, Terminator::Return(_)))
+        .map(|b| b.id)
+        .collect();
+    branches_over(cfg, |_, rt, re| {
+        let mut out = HashSet::new();
+        for (side, other) in [(rt, re), (re, rt)] {
+            if other.iter().any(|b| returns.contains(b)) {
+                out.extend(
+                    side.difference(other)
+                        .filter(|b| returns.contains(b))
+                        .copied(),
+                );
+            }
+        }
+        out
+    })
+}
+
+/// For each branch, the blocks `pick` chooses from the blocks its two sides
+/// reach (`rt` from the `then` side, `re` from the `else` side), inverted
+/// into "block → branches".
 fn branches_over(
     cfg: &CFG,
-    pick: impl Fn(&CFG, HashSet<BlockId>, HashSet<BlockId>) -> HashSet<BlockId>,
+    pick: impl Fn(&CFG, &HashSet<BlockId>, &HashSet<BlockId>) -> HashSet<BlockId>,
 ) -> HashMap<BlockId, Vec<BlockId>> {
     let branches: Vec<(BlockId, BlockId, BlockId)> = cfg
         .blocks
@@ -162,9 +196,7 @@ fn branches_over(
     for (br, t, e) in branches {
         let rt = reach(t);
         let re = reach(e);
-        let controlled: HashSet<BlockId> = rt.symmetric_difference(&re).copied().collect();
-        let merge: HashSet<BlockId> = rt.intersection(&re).copied().collect();
-        for b in pick(cfg, controlled, merge) {
+        for b in pick(cfg, &rt, &re) {
             out.entry(b).or_default().push(br);
         }
     }

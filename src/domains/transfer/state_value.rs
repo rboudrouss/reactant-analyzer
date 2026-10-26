@@ -1504,6 +1504,105 @@ mod tests {
         );
     }
 
+    /// `() => { if (a) return r1; return r2; }`, or with the `then` side
+    /// ending as `then_term` says: `a` is the state boolean of slot 0, `r1`
+    /// and `r2` two stable refs.
+    fn two_returns_body(then_term: Terminator) -> (CFG, AbstractEnv<StateValue>) {
+        let mut blocks = std::collections::BTreeMap::new();
+        blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![Stmt::Let {
+                    var: "a".to_string(),
+                    rhs: Expr::StateVal(0),
+                    span: None,
+                }],
+                term: Terminator::Branch {
+                    span: None,
+                    cond: Expr::Var("a".to_string()),
+                    then_: 1,
+                    else_: 2,
+                },
+            },
+        );
+        blocks.insert(
+            1,
+            BasicBlock {
+                id: 1,
+                stmts: vec![],
+                term: then_term,
+            },
+        );
+        blocks.insert(
+            2,
+            BasicBlock {
+                id: 2,
+                stmts: vec![],
+                term: Terminator::Return(Expr::Var("r2".to_string())),
+            },
+        );
+        let cfg = CFG {
+            entry: 0,
+            blocks,
+            edges: vec![
+                Edge {
+                    from: 0,
+                    to: 1,
+                    kind: EdgeKind::IfTrue,
+                },
+                Edge {
+                    from: 0,
+                    to: 2,
+                    kind: EdgeKind::IfFalse,
+                },
+            ],
+        };
+        let mut env = AbstractEnv::new();
+        env.extend("r1".to_string(), StateValue::reference(Stability::Stable));
+        env.extend("r2".to_string(), StateValue::reference(Stability::Stable));
+        (cfg, env)
+    }
+
+    #[test]
+    fn a_return_the_other_side_answers_with_its_own_takes_the_condition() {
+        // The body's exit is where the two returns meet: `Stable ⊔ Stable`
+        // under a choice `a` makes is `Versioned({a})` (#197).
+        let (cfg, env) = two_returns_body(Terminator::Return(Expr::Var("r1".to_string())));
+        let mut state = StateStore::bottom();
+        state.update(0, StateValue::boolean(BoolVal::Top));
+        let memo = MemoStore::new();
+        let mut heap = Heap::new();
+        let ret = exec_body(
+            &StateValueTransfer,
+            &cfg,
+            &env,
+            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
+        );
+        assert_eq!(
+            ret.reference,
+            Stability::versioned_by(crate::test_support::C, 0)
+        );
+    }
+
+    #[test]
+    fn a_return_whose_other_side_throws_is_not_selected() {
+        // `if (a) throw …; return r2;`: no other value ever comes back, so
+        // the return is `r2` in every run that returns — Stable.
+        let (cfg, env) = two_returns_body(Terminator::Unreachable);
+        let mut state = StateStore::bottom();
+        state.update(0, StateValue::boolean(BoolVal::Top));
+        let memo = MemoStore::new();
+        let mut heap = Heap::new();
+        let ret = exec_body(
+            &StateValueTransfer,
+            &cfg,
+            &env,
+            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
+        );
+        assert_eq!(ret.reference, Stability::Stable);
+    }
+
     #[test]
     fn functional_updater_branch_joins() {
         let (mut env, mut state, memo) = empty();
