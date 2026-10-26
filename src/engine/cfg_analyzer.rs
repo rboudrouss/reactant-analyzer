@@ -603,6 +603,50 @@ mod tests {
     }
 
     #[test]
+    fn a_call_of_a_local_function_binds_what_it_returns() {
+        // `const pick = () => r1; const v = pick(); const w = extern();`:
+        // `v` is the stable ref `pick` returns; `w` is a call the walk
+        // cannot resolve and stays ⊤ (ADR-009).
+        use crate::ir::types::ExprId;
+        let body = crate::test_support::single_block_cfg_term(
+            vec![],
+            Terminator::Return(Expr::Var("r1".to_string())),
+        );
+        let cfg = single_block_cfg(vec![
+            Stmt::Let {
+                var: "pick".to_string(),
+                rhs: Expr::FnLit {
+                    id: ExprId(7),
+                    params: vec![],
+                    body_cfg: std::sync::Arc::new(body),
+                },
+                span: None,
+            },
+            Stmt::Let {
+                var: "v".to_string(),
+                rhs: Expr::Call {
+                    fn_: Box::new(Expr::Var("pick".to_string())),
+                    args: vec![],
+                },
+                span: None,
+            },
+            Stmt::Let {
+                var: "w".to_string(),
+                rhs: Expr::Call {
+                    fn_: Box::new(Expr::Var("extern".to_string())),
+                    args: vec![],
+                },
+                span: None,
+            },
+        ]);
+        let mut env = AbstractEnv::new();
+        env.extend("r1".to_string(), StateValue::reference(Stability::Stable));
+        let (exit_envs, _) = run(&cfg, env, &StateStore::bottom(), &[]);
+        assert_eq!(exit_envs[&0].lookup("v").reference, Stability::Stable);
+        assert!(exit_envs[&0].lookup("w").is_top_value());
+    }
+
+    #[test]
     fn branch_narrowing_restricts_then_env() {
         use crate::domains::{Interval, StateValue};
         use crate::ir::expr::BinOp;
