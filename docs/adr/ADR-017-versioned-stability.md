@@ -250,3 +250,28 @@ if evaluation is too imprecise the case degrades to Warning, never silence.
 - Labels flow through memo chains and across components, enabling later
   context-provider precision (the remaining memos FP family) without
   further domain changes.
+
+## Amendment (2026-10-26, #197): a merge takes its condition
+
+The table above reads `cond ? freshObj : stateObj` as `Unknown`, and the
+join gives that. It gives the wrong answer for `cond ? r1 : r2` with two
+refs (`Stable ⊔ Stable = Stable`) and for `cond ? obj : null`
+(`Versioned({obj})`): the selection also changes whenever `cond` flips.
+`Stability` abstracts a change trace, and for `v = c ? a : b`,
+`Δ(v) ⊆ Δ(a) ∪ Δ(b) ∪ Δ(c)`. So a value assigned in a block that only one
+side of a branch reaches takes the condition's may bound
+(`Stability::under_condition`): `a ⊔ b ⊔ may(c)` on the may side, the must
+side of `a ⊔ b` alone (`PerRender` in both arms stays `PerRender`). Abstract
+equality of the arms is not a shortcut; a name neither arm assigns is the
+only one. The CFG analyser charges the write, not the merge: both arms carry
+`may(c)`, so their join does. `may(c)` is `Versioned({l})` for a state slot of
+any kind (the same projection `recompute_memo` applies), the join of the
+operands for an operator, and the value's own bound otherwise — `Unknown`
+for a boolean prop or an opaque call. A selection between primitives has no
+change component to record the condition on; the whole-value change
+component is #203.
+
+The must-rerun bit of an effect trigger is read from the sole binding chain
+of the dep name (`ir::bindings::binding_of`), not from the first-wins alias
+map: a temporary a ternary binds once per arm is no exact alias of either
+arm.

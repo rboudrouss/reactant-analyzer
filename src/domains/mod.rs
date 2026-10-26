@@ -54,6 +54,25 @@ pub trait AbstractDomain: Clone + PartialEq + PartialOrd + std::fmt::Debug {
         Self::bottom()
     }
 
+    // The change trace (ADR-017) across a CFG merge (#197).
+
+    /// The may bound on this value's change trace when it is read as a
+    /// branch condition: `Stable` for a value that is one constant, the
+    /// version labels when it carries them, `Unknown` otherwise. Default:
+    /// `Unknown`, the bound that assumes nothing.
+    fn change_bound(&self) -> Stability {
+        Stability::Unknown
+    }
+
+    /// This value as what a branch assigns under a condition whose change
+    /// bound is `cond`: its change component takes
+    /// [`Stability::under_condition`]. Default: identity, for a domain that
+    /// carries no change component.
+    fn select_under(&self, cond: &Stability) -> Self {
+        let _ = cond;
+        self.clone()
+    }
+
     // Branch narrowing: default = identity (sound, imprecise).
     // Override for numeric domains to refine interval bounds on branch conditions.
 

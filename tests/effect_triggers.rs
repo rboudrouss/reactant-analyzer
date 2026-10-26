@@ -98,6 +98,67 @@ fn a_field_read_and_a_memo_are_versioned_triggers_not_exact_ones() {
 }
 
 #[test]
+fn a_value_a_branch_selects_is_versioned_by_the_condition_and_never_exact() {
+    // `v` is `obj` or `null` as `a` says: a change of `a` flips it, so `a`
+    // moves the dep too (#197). The ternary lowers to a temporary bound once
+    // per arm; a name bound twice is no exact alias of either binding.
+    let r = parse_and_analyze(
+        r#"
+        import { useState, useEffect } from "react";
+        export function C() {
+          const [a, setA] = useState(false);
+          const [obj, setObj] = useState({ k: 1 });
+          const v = a ? obj : null;
+          useEffect(() => { console.log(v); }, [v]);
+          return <div />;
+        }
+        "#,
+    );
+    let c = comp(&r, "C");
+    let mut slots: Vec<usize> = c.state_store.labels();
+    slots.sort_unstable();
+    let [a, obj] = slots[..] else {
+        panic!("two slots expected: {slots:?}");
+    };
+    let rows: Vec<&EffectTrigger> = c.effect_triggers.iter().collect();
+    assert!(
+        rows.iter().any(|t| t.slot == (c.component, a) && !t.exact),
+        "the condition `a` moves `v`: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|t| t.slot == (c.component, obj) && !t.exact),
+        "the arm `obj` moves `v`: {rows:?}"
+    );
+    assert!(rows.iter().all(|t| !t.exact), "{rows:?}");
+}
+
+#[test]
+fn two_stable_refs_a_state_boolean_chooses_between_are_versioned_by_it() {
+    // `Stable ⊔ Stable` is not `Stable` when a moving condition picks the
+    // arm: `r` switches with `flag` (#197).
+    let r = parse_and_analyze(
+        r#"
+        import { useState, useEffect, useRef } from "react";
+        export function C() {
+          const [flag, setFlag] = useState(false);
+          const r1 = useRef(1);
+          const r2 = useRef(2);
+          const r = flag ? r1 : r2;
+          useEffect(() => { console.log(r.current); }, [r]);
+          return <div />;
+        }
+        "#,
+    );
+    let c = comp(&r, "C");
+    let flag = only_slot(c);
+    let rows: Vec<&EffectTrigger> = c.effect_triggers.iter().collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].slot, (c.component, flag));
+    assert!(!rows[0].exact);
+}
+
+#[test]
 fn a_mount_only_effect_and_an_absent_list_have_no_rows() {
     let r = parse_and_analyze(
         r#"

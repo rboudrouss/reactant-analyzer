@@ -3,12 +3,13 @@ use std::sync::Arc;
 
 use crate::{
     domains::{
-        AbstractDomain, AnalysisCtx, Transfer,
+        AbstractDomain, AnalysisCtx, Stability, Transfer,
         impls::StateValue,
         stores::{AbstractEnv, EnvVal, HeapValue, resolve_locs},
     },
-    engine::Reducer,
+    engine::{Reducer, dominance::controlling_branches},
     ir::{
+        bindings::binding_of,
         cfg::{CFG, EdgeKind, Terminator},
         expr::{Expr, MarkerVal, SummaryValue},
         stmt::{MemberKey, Stmt},
@@ -86,6 +87,14 @@ pub(crate) struct Run<D: AbstractDomain> {
 /// A block re-runs when its entry env grows, and each run fires its writes
 /// again: every slot write is a join, so a write made under a smaller env
 /// only adds what the final run adds as well.
+///
+/// A merge takes its condition (#197): a block only one side of a branch
+/// reaches runs under that branch's condition, and what it assigns is a
+/// selection the condition makes, so its change trace takes the condition's
+/// may bound ([`AbstractDomain::select_under`]). Charging the write rather
+/// than the merge needs no record of which predecessor is which, and it is
+/// the same bound: both arms of `c ? a : b` carry `may(c)`, so their join is
+/// `a ⊔ b ⊔ may(c)`.
 pub(crate) fn run_cfg<T: Transfer>(
     transfer: &T,
     cfg: &CFG,
@@ -107,6 +116,17 @@ pub(crate) fn run_cfg<T: Transfer>(
         .collect();
     let rank = |b: BlockId| order.get(&b).copied().unwrap_or(usize::MAX);
 
+    // Block → the branches whose condition selects what it assigns, and the
+    // inverse, for re-queueing when a condition's bound grows.
+    let selecting = controlling_branches(cfg);
+    let mut selected: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    for (b, branches) in &selecting {
+        for br in branches {
+            selected.entry(*br).or_default().push(*b);
+        }
+    }
+    let mut cond_bounds: HashMap<BlockId, Stability> = HashMap::new();
+
     let mut entries: HashMap<BlockId, AbstractEnv<T::Domain>> = HashMap::new();
     let mut exits: HashMap<BlockId, AbstractEnv<T::Domain>> = HashMap::new();
     let mut arrivals: HashMap<BlockId, usize> = HashMap::new();
@@ -119,9 +139,26 @@ pub(crate) fn run_cfg<T: Transfer>(
 
     while let Some((_, b)) = pending.pop_first() {
         let mut env = entries[&b].clone();
+        // The change bound of the conditions this block runs under. A branch
+        // not yet run contributes nothing now and re-queues this block when
+        // it does.
+        let pc = selecting
+            .get(&b)
+            .into_iter()
+            .flatten()
+            .filter_map(|br| cond_bounds.get(br))
+            .fold(Stability::Bottom, |acc, s| acc.join(s));
+        let under_condition = !matches!(pc, Stability::Bottom | Stability::Stable);
         if let Some(block) = cfg.blocks.get(&b) {
             for stmt in &block.stmts {
                 exec_full_stmt(transfer, stmt, &mut env, ctx, depth);
+                if under_condition
+                    && let Stmt::Let { var, .. } | Stmt::Assign { var, .. } = stmt
+                    && env.contains(var)
+                {
+                    let selected = env.lookup(var).select_under(&pc);
+                    env.extend(var.clone(), selected);
+                }
             }
             match &block.term {
                 // A concise arrow body (`() => EXPR`) lowers EXPR to this
@@ -132,9 +169,20 @@ pub(crate) fn run_cfg<T: Transfer>(
                     exec_callbacks_depth(transfer, expr, &env, ctx, depth);
                     ret = ret.join(&transfer.eval_expr(expr, &env, ctx));
                 }
-                // A condition is evaluated, so its calls run.
+                // A condition is evaluated, so its calls run; its change
+                // bound is what the blocks it selects run under.
                 Terminator::Branch { cond, .. } => {
                     exec_expr_effects(transfer, cond, &mut env, ctx, depth);
+                    let bound = condition_bound(transfer, cond, cfg, &env, ctx);
+                    if cond_bounds.get(&b) != Some(&bound) {
+                        cond_bounds.insert(b, bound);
+                        // The blocks already run under the previous bound.
+                        for c in selected.get(&b).into_iter().flatten() {
+                            if entries.contains_key(c) {
+                                pending.insert((rank(*c), *c));
+                            }
+                        }
+                    }
                 }
                 Terminator::Jump(_) | Terminator::Unreachable => {}
             }
@@ -162,6 +210,42 @@ pub(crate) fn run_cfg<T: Transfer>(
         exits.insert(b, env);
     }
     Run { exits, ret }
+}
+
+/// The may bound on the change trace of a branch condition: the renders at
+/// which the choice it makes can flip (#197).
+///
+/// A literal never flips. A state slot, whatever its kind, changes only at
+/// its setter events (the ADR-017 read-side fact, which the env value of a
+/// primitive slot cannot carry — the same projection `recompute_memo`
+/// applies to a dep); a name whose sole binding chain in this body ends at a
+/// slot or a memo is that slot or memo (`binding_of` fails closed on a name
+/// bound twice, and on a captured name, whose env value then answers,
+/// condition taint included). An operator flips only when an operand
+/// changes, so it takes the join of its operands. Anything else is read from
+/// its value through the transfer.
+fn condition_bound<T: Transfer>(
+    transfer: &T,
+    cond: &Expr,
+    cfg: &CFG,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+) -> Stability {
+    let component = ctx.component;
+    match cond.peel_ts() {
+        Expr::Lit(_) => Stability::Stable,
+        Expr::StateVal(l) => Stability::versioned_by(component, *l),
+        Expr::MemoVal(l) | Expr::CallbackVal(l) => ctx.memo.get(*l).change_bound(),
+        Expr::Var(v) => match binding_of(v, cfg) {
+            Some(Expr::StateVal(l)) => Stability::versioned_by(component, *l),
+            Some(Expr::MemoVal(l) | Expr::CallbackVal(l)) => ctx.memo.get(*l).change_bound(),
+            _ => transfer.eval_expr(cond, env, ctx).change_bound(),
+        },
+        Expr::UnaryOp { arg, .. } => condition_bound(transfer, arg, cfg, env, ctx),
+        Expr::BinOp { lhs, rhs, .. } => condition_bound(transfer, lhs, cfg, env, ctx)
+            .join(&condition_bound(transfer, rhs, cfg, env, ctx)),
+        other => transfer.eval_expr(other, env, ctx).change_bound(),
+    }
 }
 
 // ── Internal ──────────────────────────────────────────────────────────────────

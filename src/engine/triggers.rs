@@ -20,9 +20,10 @@ use std::collections::HashMap;
 
 use crate::{
     domains::{StateValue, impls::Stability, stores::MemoStore},
-    engine::setters::{memo_val_labels, resolve_setter_aliases, state_val_labels},
+    engine::setters::{memo_val_labels, resolve_setter_aliases},
     ir::{
         ComponentId, QualifiedSlot,
+        bindings::binding_of,
         cfg::CFG,
         expr::Expr,
         hooks::HookEntry,
@@ -54,8 +55,6 @@ pub(crate) fn collect_effect_triggers(
     memo: &MemoStore<StateValue>,
     mut eval: impl FnMut(&Expr) -> StateValue,
 ) -> Vec<EffectTrigger> {
-    let state_vals: HashMap<Var, HookLabel> =
-        resolve_setter_aliases(render_cfg, &state_val_labels(render_cfg));
     let memo_vals: HashMap<Var, HookLabel> =
         resolve_setter_aliases(render_cfg, &memo_val_labels(render_cfg));
     let mut out = Vec::new();
@@ -67,9 +66,18 @@ pub(crate) fn collect_effect_triggers(
             continue;
         };
         for (i, dep) in list.as_slice().iter().enumerate() {
+            // The must-rerun bit is a certificate: a name is the slot's value
+            // only when its sole binding chain ends at the slot. The alias
+            // map `resolve_setter_aliases` keeps the first binding of a name
+            // bound twice (`c ? obj : null` lowers to two `Let`s of one
+            // temporary), a may fact that claimed exactness and hid the
+            // versioned rows the eval below finds (#197).
             let exact_local = match dep.peel_ts() {
                 Expr::StateVal(l) => Some(*l),
-                Expr::Var(v) => state_vals.get(v).copied(),
+                Expr::Var(v) => match binding_of(v, render_cfg) {
+                    Some(Expr::StateVal(l)) => Some(*l),
+                    _ => None,
+                },
                 _ => None,
             };
             if let Some(l) = exact_local {

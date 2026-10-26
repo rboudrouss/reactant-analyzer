@@ -607,6 +607,30 @@ impl AbstractDomain for StateValue {
         sv
     }
 
+    /// The change labels live on the reference slot (ADR-017), so a sole
+    /// versioned reference answers its labels and a single constant of any
+    /// kind answers `Stable`; a value in motion, a union of kinds or an
+    /// opaque value answers `Unknown` (`PerRender` is a must fact about an
+    /// allocation, not a may bound on a choice).
+    fn change_bound(&self) -> Stability {
+        match self.to_stability() {
+            Stability::Bottom => Stability::Bottom,
+            Stability::Stable => Stability::Stable,
+            v @ (Stability::Versioned(_) | Stability::VersionedTop) => v,
+            Stability::PerRender | Stability::Unknown => Stability::Unknown,
+        }
+    }
+
+    /// Only the reference slot carries a change component today (ADR-017):
+    /// a `⊥` reference is not a reference and stays `⊥`; a primitive-only
+    /// value has nowhere to record the condition (#203).
+    fn select_under(&self, cond: &Stability) -> Self {
+        StateValue {
+            reference: self.reference.under_condition(cond),
+            ..self.clone()
+        }
+    }
+
     // ── Nullability narrowing (branch guards on null/undefined) ───────────────
 
     /// Taken `x !== null` guard: the null slot dies.

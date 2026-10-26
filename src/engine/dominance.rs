@@ -1,6 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::ir::{cfg::CFG, types::BlockId};
+use crate::ir::{
+    cfg::{CFG, Terminator},
+    types::BlockId,
+};
 
 /// Compute dominator sets iteratively. Returns `dom[b]` = set of blocks dominating `b`.
 pub fn compute_dominators(cfg: &CFG) -> HashMap<BlockId, HashSet<BlockId>> {
@@ -89,6 +92,47 @@ pub fn on_all_paths(cfg: &CFG, blocks: &HashSet<BlockId>) -> bool {
         }
     }
     true
+}
+
+/// For every block, the branch blocks that control it: exactly one side of the
+/// branch reaches it (the reachability definition `MountIndex` already uses).
+/// Shared by render dependence (ADR-041), which charges a block's writes to
+/// its conditions, and by the CFG analyser, which charges them to the
+/// conditions' change traces (#197).
+pub(crate) fn controlling_branches(cfg: &CFG) -> HashMap<BlockId, Vec<BlockId>> {
+    let branches: Vec<(BlockId, BlockId, BlockId)> = cfg
+        .blocks
+        .iter()
+        .filter_map(|(id, b)| match b.term {
+            Terminator::Branch { then_, else_, .. } => Some((*id, then_, else_)),
+            _ => None,
+        })
+        .collect();
+    let mut out: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    if branches.is_empty() {
+        return out;
+    }
+    // Forward reachability from each branch side, once per side.
+    let reach = |from: BlockId| -> HashSet<BlockId> {
+        let mut seen = HashSet::from([from]);
+        let mut stack = vec![from];
+        while let Some(b) = stack.pop() {
+            for s in cfg.successors(b) {
+                if seen.insert(s) {
+                    stack.push(s);
+                }
+            }
+        }
+        seen
+    };
+    for (br, t, e) in branches {
+        let rt = reach(t);
+        let re = reach(e);
+        for b in rt.symmetric_difference(&re) {
+            out.entry(*b).or_default().push(br);
+        }
+    }
+    out
 }
 
 /// Precomputed dominator relation for one CFG. Build once, query in O(1)·set —
