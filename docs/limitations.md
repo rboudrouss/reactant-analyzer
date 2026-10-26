@@ -82,6 +82,10 @@ that writes it (see *Cross-file limits*).
   write to `location`, a bare `navigate()`/`redirect()`, a `<Navigate/>`. A navigation hidden in
   an opaque callee, or through a router object handed down as a prop, is not seen
   [#161](https://github.com/rboudrouss/reactant-analyzer/issues/161).
+- It also assumes a `useMemo` or `useCallback` with an exact deps list over held values hands back
+  its cached value. React documents the cache as a performance hint, not a guarantee: a React that
+  dropped it would recompute a fresh value the proof reads as held
+  [#188](https://github.com/rboudrouss/reactant-analyzer/issues/188).
 - A child's mount-only effect is read as firing once when the parent renders the child on every
   path, or behind guards that hold still, without a `key` that moves. A child rendered from a
   `.map` callback or reached through an intermediate component is read as remounting, the
