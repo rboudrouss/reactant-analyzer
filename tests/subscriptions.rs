@@ -174,7 +174,8 @@ fn addeventlistener_handler_lifted_and_analyzed() {
         StateValue::number(Interval {
             lo: 0.0,
             hi: 99.0,
-            is_int: true
+            is_int: true,
+            may_neg_zero: false
         }),
         "handler's setN(99) must be joined into state_store"
     );

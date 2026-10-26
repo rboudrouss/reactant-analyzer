@@ -1416,3 +1416,52 @@ export function C() {
         "every write stores a new reference: {sevs:?}"
     );
 }
+
+// ── `Change::Never` / `Once` are must facts (#205, #208, #210) ───────────────
+
+#[test]
+fn a_cleanup_writing_back_its_own_read_alternates_with_a_mount_write() {
+    // The cleanup of render `j` stores `x_j` over the mount write's 1: 0, 1,
+    // 0… React loops (#205).
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [x, setX] = useState(0);
+  useEffect(() => { setX(1); }, []);
+  useEffect(() => { return () => { setX(x); }; }, [x]);
+  return <div>{x}</div>;
+}
+"#;
+    assert!(!loop_severities(src, "C").is_empty());
+}
+
+#[test]
+fn a_name_bound_to_the_read_on_one_path_is_not_an_identity_write() {
+    // `d` is `s` only when the guard fails; it never does (#210).
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [s, setS] = useState({ n: 0 });
+  let d = s;
+  if (s.n === 0) d = { n: 0 };
+  useEffect(() => { setS(d); }, [s]);
+  return <div />;
+}
+"#;
+    assert!(!loop_severities(src, "C").is_empty());
+}
+
+#[test]
+fn zero_and_negative_zero_alternate() {
+    // `Object.is(0, -0)` is false: each write moves the slot off the other's
+    // value, and React loops (#208).
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [s, setS] = useState(1);
+  useEffect(() => { if (Object.is(s, 0)) setS(-0); else setS(0); }, [s]);
+  return <div>{s}</div>;
+}
+"#;
+    assert!(!loop_severities(src, "C").is_empty());
+}

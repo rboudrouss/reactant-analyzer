@@ -1909,7 +1909,8 @@ mod tests {
             StateValue::number(Interval {
                 lo: 0.0,
                 hi: 42.0,
-                is_int: true
+                is_int: true,
+                may_neg_zero: false
             })
         );
         assert!(result.widen_trace.is_empty());
@@ -2516,7 +2517,8 @@ mod tests {
             StateValue::number(Interval {
                 lo: 0.0,
                 hi: 99.0,
-                is_int: true
+                is_int: true,
+                may_neg_zero: false
             }),
             "handler's setN(99) must be joined into state_store"
         );

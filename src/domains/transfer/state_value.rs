@@ -807,23 +807,26 @@ const I32_MIN: f64 = i32::MIN as f64;
 const I32_MAX: f64 = i32::MAX as f64;
 const U32_MAX: f64 = u32::MAX as f64;
 
+/// The integers in `[lo, hi]`, none of them `-0`: what a bitwise or shift
+/// operator returns (`ToInt32(-0)` is `+0`), or a boolean's `ToNumber`.
+fn int_range(lo: f64, hi: f64) -> Interval {
+    Interval {
+        lo,
+        hi,
+        is_int: true,
+        may_neg_zero: false,
+    }
+}
+
 /// Every value `x` such that `x = ToInt32(_)` — the range every bitwise and
 /// shift operator but `>>>` lands in.
 fn int32_range() -> Interval {
-    Interval {
-        lo: I32_MIN,
-        hi: I32_MAX,
-        is_int: true,
-    }
+    int_range(I32_MIN, I32_MAX)
 }
 
 /// The `>>>` range: unsigned, so a uint32.
 fn uint32_range() -> Interval {
-    Interval {
-        lo: 0.0,
-        hi: U32_MAX,
-        is_int: true,
-    }
+    int_range(0.0, U32_MAX)
 }
 
 /// The constant an operand denotes, when it denotes exactly one number.
@@ -860,20 +863,12 @@ fn eval_bitwise(op: &BinOp, lhs: &StateValue, rhs: &StateValue) -> StateValue {
         BinOp::BitAnd => const_of(&r)
             .or_else(|| const_of(&l))
             .filter(|m| (0.0..=I32_MAX).contains(m))
-            .map(|m| Interval {
-                lo: 0.0,
-                hi: m,
-                is_int: true,
-            }),
+            .map(|m| int_range(0.0, m)),
         // `x | y` and `x ^ y` on non-negative operands cannot set a bit above
         // the highest one either operand could have.
         BinOp::BitOr | BinOp::BitXor => match (&l, &r) {
             (Some(a), Some(b)) if in_i32(a) && in_i32(b) && a.lo >= 0.0 && b.lo >= 0.0 => {
-                Some(Interval {
-                    lo: 0.0,
-                    hi: all_ones_above(a.hi.max(b.hi)),
-                    is_int: true,
-                })
+                Some(int_range(0.0, all_ones_above(a.hi.max(b.hi))))
             }
             _ => None,
         },
@@ -884,11 +879,7 @@ fn eval_bitwise(op: &BinOp, lhs: &StateValue, rhs: &StateValue) -> StateValue {
             (Some(a), Some(k)) if in_i32(a) => {
                 let f = (1u64 << k) as f64;
                 let (lo, hi) = (a.lo * f, a.hi * f);
-                (lo >= I32_MIN && hi <= I32_MAX).then_some(Interval {
-                    lo,
-                    hi,
-                    is_int: true,
-                })
+                (lo >= I32_MIN && hi <= I32_MAX).then_some(int_range(lo, hi))
             }
             _ => None,
         },
@@ -897,21 +888,15 @@ fn eval_bitwise(op: &BinOp, lhs: &StateValue, rhs: &StateValue) -> StateValue {
         BinOp::Shr => match (&l, const_of(&r).and_then(shift_amount)) {
             (Some(a), Some(k)) if in_i32(a) => {
                 let f = (1u64 << k) as f64;
-                Some(Interval {
-                    lo: (a.lo / f).floor(),
-                    hi: (a.hi / f).floor(),
-                    is_int: true,
-                })
+                Some(int_range((a.lo / f).floor(), (a.hi / f).floor()))
             }
             _ => None,
         },
         // `x >>> k` is unsigned: whatever `x` is, the result fits in the low
         // `32 - k` bits.
-        BinOp::UShr => const_of(&r).and_then(shift_amount).map(|k| Interval {
-            lo: 0.0,
-            hi: (u32::MAX >> k) as f64,
-            is_int: true,
-        }),
+        BinOp::UShr => const_of(&r)
+            .and_then(shift_amount)
+            .map(|k| int_range(0.0, (u32::MAX >> k) as f64)),
         _ => None,
     };
 
@@ -976,11 +961,8 @@ fn eval_unary(op: &UnaryOp, val: StateValue) -> StateValue {
                 return StateValue::bottom();
             }
             let refined = as_arith(&val).filter(|i| !i.is_bottom()).and_then(|i| {
-                (i.lo >= I32_MIN && i.hi <= I32_MAX).then_some(Interval {
-                    lo: -i.hi.ceil() - 1.0,
-                    hi: -i.lo.floor() - 1.0,
-                    is_int: true,
-                })
+                (i.lo >= I32_MIN && i.hi <= I32_MAX)
+                    .then_some(int_range(-i.hi.ceil() - 1.0, -i.lo.floor() - 1.0))
             });
             StateValue::number(refined.unwrap_or_else(int32_range))
         }
@@ -1007,11 +989,7 @@ fn coerce_to_number(val: &StateValue) -> Option<StateValue> {
         return Some(StateValue::number(match val.boolean {
             BoolVal::True => Interval::point(1.0),
             BoolVal::False => Interval::point(0.0),
-            _ => Interval {
-                lo: 0.0,
-                hi: 1.0,
-                is_int: true,
-            },
+            _ => int_range(0.0, 1.0),
         }));
     }
     if let Some(StrConst::Set(set)) = as_str_only(val) {
@@ -1159,11 +1137,25 @@ mod tests {
             eval_binop(&BinOp::Mod, num(0.0, f64::INFINITY), num(3.0, 3.0)),
             num(0.0, 2.0)
         );
-        // Sign follows the dividend, and a small dividend bounds it further.
-        assert_eq!(
-            eval_binop(&BinOp::Mod, num(-5.0, 1.0), num(4.0, 4.0)),
-            num(-3.0, 1.0)
-        );
+        // Sign follows the dividend, and a small dividend bounds it further:
+        // `-4 % 4` is `-0` (#208).
+        let r = eval_binop(&BinOp::Mod, num(-5.0, 1.0), num(4.0, 4.0));
+        assert_eq!((r.num.lo, r.num.hi), (-3.0, 1.0));
+        assert!(r.num.neg_zero());
+    }
+
+    /// `-0` is the negation of `0`, which `Object.is` tells from `0`: a
+    /// negated zero is not the single value a literal `0` is (#208).
+    #[test]
+    fn a_negated_zero_is_not_a_single_value() {
+        let zero = StateValue::number(Interval::point(0.0));
+        assert!(zero.is_single_value());
+        let neg = eval_unary(&UnaryOp::Neg, zero.clone());
+        assert!(!neg.is_single_value());
+        assert_ne!(neg, zero);
+        assert!(!neg.is_same_value(&neg));
+        assert!(!neg.varying_primitives().is_bottom_value());
+        assert_eq!(neg.to_stability(), Stability::PerRender);
     }
 
     /// A divisor that may be zero makes the result `NaN`, which no interval
@@ -1248,6 +1240,7 @@ mod tests {
             lo,
             hi,
             is_int: true,
+            may_neg_zero: false,
         })
     }
 
@@ -1532,7 +1525,8 @@ mod tests {
             StateValue::number(Interval {
                 lo: 5.0,
                 hi: 6.0,
-                is_int: true
+                is_int: true,
+                may_neg_zero: false
             })
         );
     }
@@ -1712,7 +1706,8 @@ mod tests {
             StateValue::number(Interval {
                 lo: 0.0,
                 hi: 3.0,
-                is_int: true
+                is_int: true,
+                may_neg_zero: false
             })
         );
     }
@@ -1867,7 +1862,8 @@ mod tests {
             StateValue::number(Interval {
                 lo: 0.0,
                 hi: 1.0,
-                is_int: true
+                is_int: true,
+                may_neg_zero: false
             })
         );
         // The exit block returns `undefined`, loop or no loop.
@@ -1912,7 +1908,8 @@ mod tests {
             StateValue::number(Interval {
                 lo: 0.0,
                 hi: f64::INFINITY,
-                is_int: true
+                is_int: true,
+                may_neg_zero: false
             })
         );
     }
@@ -2094,7 +2091,8 @@ mod tests {
             StateValue::number(Interval {
                 lo: 0.0,
                 hi: 1.0,
-                is_int: true
+                is_int: true,
+                may_neg_zero: false
             })
         );
         assert_eq!(ret, StateValue::undefined());
@@ -2147,7 +2145,8 @@ mod tests {
             StateValue::number(Interval {
                 lo: 5.0,
                 hi: 6.0,
-                is_int: true
+                is_int: true,
+                may_neg_zero: false
             })
         );
         // The inner setOther(1) fired during the side-effect traversal.

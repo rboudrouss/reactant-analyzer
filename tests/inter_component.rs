@@ -772,7 +772,8 @@ fn nativeelem_children_compapps_are_analyzed() {
         StateValue::number(Interval {
             lo: 1.0,
             hi: 2.0,
-            is_int: true
+            is_int: true,
+            may_neg_zero: false
         }),
         "Both CompApp children inside NativeElem should be analyzed; \
          SharedStateStore[(App,0)] = join(1,2) = [1,2]"

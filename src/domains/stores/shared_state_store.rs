@@ -100,7 +100,8 @@ mod tests {
             StateValue::number(Interval {
                 lo: 1.0,
                 hi: 2.0,
-                is_int: true
+                is_int: true,
+                may_neg_zero: false
             })
         );
     }
@@ -180,7 +181,8 @@ mod tests {
             StateValue::number(Interval {
                 lo: 1.0,
                 hi: 2.0,
-                is_int: true
+                is_int: true,
+                may_neg_zero: false
             })
         );
         assert_eq!(

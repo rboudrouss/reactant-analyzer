@@ -283,6 +283,27 @@ fn the_own_read_written_back_by_a_cleanup_or_a_timer_may_change_the_slot() {
     }
 }
 
+/// `Object.is(0, -0)` is false: a write of `-0` is not the single value a
+/// write of `0` is, while the ordinary `setX(0)` keeps its `Once` (#208).
+#[test]
+fn a_zero_write_is_once_a_negated_zero_write_is_not() {
+    for (arg, once) in [("0", true), ("-0", false), ("0 * -1", false), ("-x", false)] {
+        let src = format!(
+            r#"
+            import {{ useState, useEffect }} from "react";
+            export function C() {{
+              const [x, setX] = useState(0);
+              useEffect(() => {{
+                setX({arg});
+              }}, [x]);
+              return <div />;
+            }}
+            "#
+        );
+        assert_eq!(effect_change(&src, "setX") == Change::Once, once, "{arg}");
+    }
+}
+
 /// `Never` is decided from a must-alias, not from the alias table, where a
 /// name *some* binding ties to the slot counts (#210): the ternary's temporary
 /// is the read on one arm only, `d` is reassigned on a path, an effect

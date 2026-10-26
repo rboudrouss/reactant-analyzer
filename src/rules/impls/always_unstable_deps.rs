@@ -423,6 +423,7 @@ mod tests {
                 lo: 0.0,
                 hi: 10.0,
                 is_int: true,
+                may_neg_zero: false,
             }),
         );
         let memo = MemoStore::<StateValue>::new();

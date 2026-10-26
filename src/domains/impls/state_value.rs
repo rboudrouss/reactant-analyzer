@@ -194,6 +194,7 @@ impl StateValue {
                 lo: f64::INFINITY,
                 hi: f64::NEG_INFINITY,
                 is_int: true,
+                may_neg_zero: false,
             },
             boolean: BoolVal::Bottom,
             str: StrConst::Bottom,
@@ -324,7 +325,8 @@ impl StateValue {
         let mut acc = Stability::Bottom;
         let mut in_motion = false;
         if !self.num.is_bottom() {
-            if self.num.is_point() {
+            // A `0` that may be `-0` is two values under `Object.is` (#208).
+            if self.num.is_one_value() {
                 acc = acc.join(&Stability::Stable);
             } else {
                 in_motion = true;
@@ -402,12 +404,12 @@ impl StateValue {
     }
 
     /// The primitive kinds of this value that hold more than one concrete
-    /// value (a non-point interval, either boolean, several or any strings),
-    /// alone. A kind with one value, `null` and `undefined` included, is
-    /// dropped: two writes of it are `Object.is`-equal.
+    /// value (a non-point interval, a `0` that may be `-0`, either boolean,
+    /// several or any strings), alone. A kind with one value, `null` and
+    /// `undefined` included, is dropped: two writes of it are
+    /// `Object.is`-equal.
     pub fn varying_primitives(&self) -> StateValue {
-        let num_varies =
-            !self.num.is_bottom() && !(self.num.lo == self.num.hi && self.num.lo.is_finite());
+        let num_varies = !self.num.is_bottom() && !self.num_is_one_value();
         StateValue {
             num: if num_varies {
                 self.num
@@ -430,9 +432,8 @@ impl StateValue {
     /// True if the value is one concrete value, the same on every evaluation:
     /// one kind, and within it a point number, one boolean, one string
     /// constant, `null`, `undefined`, a stable reference or one setter. Two
-    /// writes of it are `Object.is`-equal (the interval domain does not tell
-    /// `-0` from `0`, the one point it conflates). ⊥ holds too: no value is
-    /// ever stored.
+    /// writes of it are `Object.is`-equal, so a `0` that may be `-0` does not
+    /// count (#208). ⊥ holds too: no value is ever stored.
     pub fn is_single_value(&self) -> bool {
         let kinds = self.populated_kinds();
         if kinds.is_empty() {
@@ -441,10 +442,9 @@ impl StateValue {
         if kinds.count() != 1 {
             return false;
         }
-        let num_point = self.num.lo == self.num.hi && self.num.lo.is_finite();
         let one_str = matches!(&self.str, StrConst::Set(s) if s.len() == 1);
         match kinds.0 {
-            KindMask::NUM => num_point,
+            KindMask::NUM => self.num_is_one_value(),
             KindMask::BOOL => matches!(self.boolean, BoolVal::True | BoolVal::False),
             KindMask::STR => one_str,
             KindMask::REF => self.reference == Stability::Stable,
@@ -452,6 +452,11 @@ impl StateValue {
             KindMask::SETTER => self.setter.as_one().is_some(),
             _ => false,
         }
+    }
+
+    /// The number kind is one finite value under `Object.is`.
+    fn num_is_one_value(&self) -> bool {
+        self.num.is_one_value() && self.num.lo.is_finite()
     }
 
     /// True if `self` and `other` are provably the same concrete value,
@@ -824,7 +829,8 @@ mod tests {
             StateValue::number(Interval {
                 lo: 0.0,
                 hi: 1.0,
-                is_int: true
+                is_int: true,
+                may_neg_zero: false
             })
         );
     }
@@ -885,7 +891,8 @@ mod tests {
             StateValue::number(Interval {
                 lo: 0.0,
                 hi: 5.0,
-                is_int: true
+                is_int: true,
+                may_neg_zero: false
             })
             .to_stability(),
             Stability::PerRender
@@ -920,7 +927,8 @@ mod tests {
             StateValue::number(Interval {
                 lo: 0.0,
                 hi: f64::INFINITY,
-                is_int: true
+                is_int: true,
+                may_neg_zero: false
             })
             .is_unbounded()
         );
@@ -978,6 +986,7 @@ mod tests {
             lo: 0.0,
             hi: f64::INFINITY,
             is_int: true,
+            may_neg_zero: false,
         };
         let n = i.narrow_lt(10.0);
         assert_eq!(n.lo, 0.0);
@@ -990,6 +999,7 @@ mod tests {
             lo: 0.0,
             hi: f64::INFINITY,
             is_int: true,
+            may_neg_zero: false,
         };
         let n = i.narrow_geq(10.0);
         assert_eq!(n.lo, 10.0);
@@ -1002,6 +1012,7 @@ mod tests {
             lo: 0.0,
             hi: 5.0,
             is_int: true,
+            may_neg_zero: false,
         };
         assert_eq!(i.narrow_eq(3.0), Interval::point(3.0));
     }
@@ -1012,6 +1023,7 @@ mod tests {
             lo: 0.0,
             hi: 5.0,
             is_int: true,
+            may_neg_zero: false,
         };
         assert!(i.narrow_eq(7.0).is_bottom());
     }
@@ -1022,6 +1034,7 @@ mod tests {
             lo: 0.0,
             hi: f64::INFINITY,
             is_int: true,
+            may_neg_zero: false,
         });
         let n = v.narrow_lt(10.0);
         assert_eq!(
@@ -1029,7 +1042,8 @@ mod tests {
             StateValue::number(Interval {
                 lo: 0.0,
                 hi: 9.0,
-                is_int: true
+                is_int: true,
+                may_neg_zero: false
             })
         );
     }
@@ -1041,6 +1055,7 @@ mod tests {
             lo: 0.0,
             hi: f64::INFINITY,
             is_int: true,
+            may_neg_zero: false,
         }));
         let n = v.narrow_lt(10.0);
         assert!(n.null);
@@ -1049,7 +1064,8 @@ mod tests {
             Interval {
                 lo: 0.0,
                 hi: 9.0,
-                is_int: true
+                is_int: true,
+                may_neg_zero: false
             }
         );
     }
@@ -1106,6 +1122,7 @@ mod tests {
             lo: 0.0,
             hi: 5.0,
             is_int: true,
+            may_neg_zero: false,
         })
         .join(&StateValue::boolean(BoolVal::Top));
         let tw = w.narrow_truthy();
@@ -1114,7 +1131,8 @@ mod tests {
             Interval {
                 lo: 0.0,
                 hi: 5.0,
-                is_int: true
+                is_int: true,
+                may_neg_zero: false
             },
             "can't split [0,5]"
         );
@@ -1129,6 +1147,7 @@ mod tests {
                 lo: 0.0,
                 hi: 5.0,
                 is_int: true,
+                may_neg_zero: false,
             }))
             .join(&StateValue::str_set(
                 ["a".to_string(), String::new()].into_iter().collect(),
@@ -1218,6 +1237,7 @@ mod tests {
             lo: 0.0,
             hi: 5.0,
             is_int: true,
+            may_neg_zero: false,
         });
         let b = num_point(1.0).join(&str_singleton("s"));
         assert!(a.partial_cmp(&b).is_none());
@@ -1298,6 +1318,7 @@ mod tests {
             lo: 0.0,
             hi: f64::INFINITY,
             is_int: true,
+            may_neg_zero: false,
         }));
         assert_eq!(v.to_stability(), Stability::PerRender);
         // Top stays Unknown: opaque values never claim definite instability.
