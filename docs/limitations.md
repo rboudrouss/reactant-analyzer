@@ -126,10 +126,20 @@ that writes it (see *Cross-file limits*).
   field written under a condition, `if (c) obj.f = x`, keeps the field's own trace: the
   container's identity is untouched and the field is not a name the rule can charge. A selection
   between primitives has no change component to carry `c`, so `const n = c ? 1 : 2` reads as a
-  number and nothing more [#203](https://github.com/rboudrouss/reactant-analyzer/issues/203); a
-  condition the analysis cannot bound, a boolean prop or an opaque call, makes the selection
-  `Unknown`, which names no slot and so triggers no effect
+  number and nothing more in the value domain
+  [#203](https://github.com/rboudrouss/reactant-analyzer/issues/203). An effect's deps are read
+  past that: a dep that may be a primitive re-runs the effect on any slot it is computed from
+  (`[!on]`, `[n]` above), but a primitive prop the parent computes from its slot, or a written
+  value, still carries no `c`. A condition the analysis cannot bound, a boolean prop or an opaque
+  call, names no slot and so triggers no effect
   [#206](https://github.com/rboudrouss/reactant-analyzer/issues/206).
+- **What an effect's deps can move without a slot.** An effect re-runs after every render when it
+  has no deps array or a dep that is a new reference every render, and may when its deps argument
+  is not a written array or a dep reads a ref's contents some body can replace (#189, #201,
+  #212). A dep that moves for another reason reads as held: a module binding some function
+  mutates (`[cache.size]`), a call the analysis cannot see into (`[Math.random()]`,
+  `[Date.now()]`), and, by decision, a hook's or a context's result
+  [#161](https://github.com/rboudrouss/reactant-analyzer/issues/161).
 
 ## Why reactant may warn wrongly (false positives)
 

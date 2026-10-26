@@ -311,6 +311,11 @@ pub struct RenderDeps {
     /// Per effect, the module names its body (callbacks it registers
     /// included) may write: what a write it makes to a slot travels with.
     pub effect_writes: BTreeMap<HookLabel, Writes>,
+    /// Per effect with a written deps list, what each element (in `elems`
+    /// order) may be computed from, read where the effect is called: what the
+    /// re-run class of a dep the value domain cannot label is read off
+    /// (`engine::triggers`).
+    pub effect_deps: BTreeMap<HookLabel, Vec<Deps>>,
 }
 
 impl RenderDeps {
@@ -484,9 +489,11 @@ pub fn render_deps(
                     used.union_with(&a.var(&env, v).deps);
                 }
                 if let Some(l) = deps.list() {
-                    for e in &l.elems {
-                        used.union_with(&a.eval(e, &env).deps);
+                    let per_dep: Vec<Deps> = l.elems.iter().map(|e| a.eval(e, &env).deps).collect();
+                    for d in &per_dep {
+                        used.union_with(d);
                     }
+                    a.out.effect_deps.insert(call.label, per_dep);
                 }
                 let writes = a.writes_of(&[], body_cfg, &env);
                 a.out.effect_writes.insert(call.label, writes);
@@ -505,6 +512,9 @@ pub fn render_deps(
     }
     if a.top {
         a.out.genuine = Deps::top();
+        for d in a.out.effect_deps.values_mut().flatten() {
+            *d = Deps::top();
+        }
     }
     a.out.any_context |= a.inline_hook.get();
     a.out

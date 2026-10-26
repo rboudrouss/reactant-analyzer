@@ -651,30 +651,9 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     // scan of the effect bodies, read by `stale-closure`, `missing-cleanup`
     // and the Tier-A `registrations` anchor alike.
     let registrations = crate::engine::registrations::collect_registrations(&render_cfg, &hooks);
-    // The effect-trigger relation (ADR-042 §3): a dep evaluated in the render
-    // exit env, the one every hook body starts from.
-    let effect_triggers = {
-        let mut scratch = heap.clone();
-        crate::engine::triggers::collect_effect_triggers(
-            comp_id,
-            &render_cfg,
-            &hooks,
-            &memo_store,
-            |e| {
-                crate::engine::eval::eval_in_stores(
-                    e,
-                    &env_exit,
-                    comp_id,
-                    &final_state,
-                    &memo_store,
-                    &mut scratch,
-                )
-            },
-        )
-    };
     let hooks_clone = hooks.clone();
 
-    AnalysisResult {
+    let mut result = AnalysisResult {
         component: comp_id,
         file: comp_file,
         param: comp_param,
@@ -698,10 +677,39 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         slot_writers,
         slot_seeds,
         registrations,
-        effect_triggers,
+        effect_triggers: Vec::new(),
+        effect_reruns: HashMap::new(),
         iterations: iteration,
         heap,
-    }
+    };
+    // The effect-trigger relation (ADR-042 §3): a dep evaluated in the render
+    // exit env, the one every hook body starts from, and what it is computed
+    // from where the effect is called. Only the slot and ref sources are
+    // read, so no module name needs to be known as written.
+    let sources = crate::engine::render_deps::render_deps(&result, &HashSet::new()).effect_deps;
+    let relation = {
+        let mut scratch = result.heap.clone();
+        crate::engine::triggers::collect_effect_triggers(
+            comp_id,
+            &result.render_cfg,
+            &result.hooks,
+            &result.memo_store,
+            &sources,
+            |e| {
+                crate::engine::eval::eval_in_stores(
+                    e,
+                    &env_exit,
+                    comp_id,
+                    &result.state_store,
+                    &result.memo_store,
+                    &mut scratch,
+                )
+            },
+        )
+    };
+    result.effect_triggers = relation.rows;
+    result.effect_reruns = relation.reruns;
+    result
 }
 
 // ── Program-level analysis ────────────────────────────────────────────────────

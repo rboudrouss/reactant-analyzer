@@ -17,8 +17,11 @@
 //!
 //! Nothing is walked here. The writes are the effect-region rows of
 //! `slot_writers`, the re-run triggers the rows of `effect_triggers`, and the
-//! graph is the product of the two, per effect, program-wide. Edge strength:
-//! - `Must`: the dep on x is the exact slot (must-rerun) ∧ the fresh write to
+//! graph is the product of the two, per effect, program-wide. An effect whose
+//! re-run class (`triggers::Rerun`) is `Always` is read as one with no
+//! dependency array: an edge from every slot its write reads. Edge strength:
+//! - `Must`: the dep on x is the exact slot (must-rerun), or the effect
+//!   surely re-runs after every render (no deps array, a fresh dep) ∧ the fresh write to
 //!   y sits in a block on all paths of the body (must-reach) ∧ the written
 //!   value is a new reference every call (`Change::Must`) ∧ so is every
 //!   other write of y, program-wide: React re-renders on the batch's last
@@ -82,6 +85,7 @@ use crate::{
         },
         render_deps::written_names,
         setters::{memo_val_labels, resolve_setter_aliases, state_val_labels},
+        triggers::{Always, Rerun},
         triggers_of,
         written::churning_part,
     },
@@ -90,7 +94,7 @@ use crate::{
         bindings::local_bindings,
         cfg::{CFG, Terminator},
         expr::{CompOrigin, Expr, SPREAD_KEY_PREFIX, object_member},
-        hooks::{Arity, HookEntry},
+        hooks::HookEntry,
         types::{BlockId, HookLabel, Symbol, Var},
     },
 };
@@ -112,8 +116,10 @@ pub struct ChurnEdge {
     pub component: ComponentId,
     pub effect_label: HookLabel,
     pub write_span: Option<SourceRange>,
-    /// The carrying effect has no dependency array.
-    pub no_deps: bool,
+    /// The edge exists because the carrying effect re-runs after every render
+    /// (its re-run class, `engine::triggers::Rerun::Always`), and why: no
+    /// dependency array, a dep that is a new reference every render, …
+    pub always: Option<Always>,
     /// A dep-driven edge from a slot into itself: the self-churn arm's
     /// partition (ADR-020 item 2). Never part of a cycle the graph reports.
     pub self_slot: bool,
@@ -194,7 +200,9 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         comp_result: &'a AnalysisResult<StateValue>,
         body_cfg: &'a CFG,
         effect_label: HookLabel,
-        no_deps: bool,
+        /// The effect re-runs after every render, and whether that is
+        /// certain: what its no-dependency-array path reads.
+        always: Option<(Always, bool)>,
         deps: &'a [Expr],
         triggers: Vec<&'a EffectTrigger>,
         exact_local: HashSet<HookLabel>,
@@ -266,10 +274,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         let hook = |label: HookLabel| comp_result.hooks.iter().find(|h| h.label() == label);
         // Mount-only effects fire once for a component that stays mounted —
         // but only an array the engine knows is empty says so.
-        let mount_only = |label: HookLabel| {
-            matches!(hook(label), Some(HookEntry::Effect { deps, .. })
-                if matches!(deps.list(), Some(d) if d.arity == Arity::Exact(0)))
-        };
+        let mount_only = |label: HookLabel| comp_result.rerun(label) == Some(Rerun::MountOnly);
         // Does the owner of a slot this component writes from a mount-only
         // effect keep this component mounted across the loop (#162)? An
         // owner that renders it nowhere — the child reached through another
@@ -349,16 +354,34 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     versioned.insert(t.slot);
                 }
             }
+            let deps = deps.list().map_or(&[][..], |d| d.as_slice());
+            // An effect that re-runs after every render is read the way one
+            // with no deps array is. Certain when it has none, or when a dep
+            // is a new reference at every render — the same reading of
+            // "fresh" as a write's (`restorable` below): a reference that
+            // holds while props hold is a prop the parent allocated, the same
+            // when the component re-renders alone. An unreadable deps
+            // argument or a ref's contents only may re-run it (#212, #201).
+            let always = comp_result.rerun(*label).and_then(Rerun::always).map(|a| {
+                let certain = match a {
+                    Always::FreshDep(i) => deps.get(i).is_some_and(|d| {
+                        !invariance_of(&ctxs[&comp], navigates).holds(
+                            d,
+                            &ctxs[&comp].render_lets,
+                            true,
+                        )
+                    }),
+                    _ => a.certain(),
+                };
+                (a, certain)
+            });
             facts.push(EffectFacts {
                 comp,
                 comp_result,
                 body_cfg,
                 effect_label: *label,
-                // An unreadable deps argument gates the effect by a list the
-                // engine cannot use, so it is read the same way as no list at
-                // all: the self-edge stays, which is the fire-more direction.
-                no_deps: deps.list().is_none(),
-                deps: deps.list().map_or(&[][..], |d| d.as_slice()),
+                always,
+                deps,
                 triggers,
                 exact_local,
                 versioned,
@@ -545,7 +568,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         }
     }
     /// Can the loop re-run the body `s` sits in? A render or memo body, an
-    /// effect with no dependency array, or one with a slot among its
+    /// effect that re-runs after every render, or one with a slot among its
     /// triggers. An effect whose deps no slot moves re-runs only when
     /// something outside the loop changes.
     fn reruns_in_loop(s: &SiteRef<'_>, result: &ProgramAnalysisResult) -> bool {
@@ -555,11 +578,11 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         let Some(r) = result.components.get(&s.comp) else {
             return true;
         };
-        let no_deps = r
-            .hooks
-            .iter()
-            .any(|h| matches!(h, HookEntry::Effect { label, deps, .. } if *label == l && deps.list().is_none()));
-        no_deps || triggers_of(&r.effect_triggers, l).next().is_some()
+        match r.rerun(l) {
+            Some(Rerun::Always(_)) => true,
+            Some(Rerun::MountOnly) => false,
+            Some(Rerun::OnSlots) | None => triggers_of(&r.effect_triggers, l).next().is_some(),
+        }
     }
     let invariance_of = |ctx| invariance_of(ctx, navigates);
 
@@ -777,7 +800,10 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 EdgeStrength::May
             };
 
-            let mut push = |from: QualifiedSlot, strength: EdgeStrength, self_slot: bool| {
+            let mut push = |from: QualifiedSlot,
+                            strength: EdgeStrength,
+                            self_slot: bool,
+                            always: Option<Always>| {
                 let key = (from, node, f.comp, f.effect_label);
                 let edge = ChurnEdge {
                     from,
@@ -786,7 +812,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     component: f.comp,
                     effect_label: f.effect_label,
                     write_span: w.span,
-                    no_deps: f.no_deps,
+                    always,
                     self_slot,
                 };
                 best.entry(key)
@@ -800,36 +826,35 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     .or_insert(edge);
             };
 
-            if f.no_deps {
-                // Re-runs after every render → a change of anything the
-                // write reads re-runs it (a handler row was dropped above):
-                // each slot it reads is an edge into its own, and a write
-                // that reads everything or a prop re-triggers itself,
-                // whichever turn it runs on.
-                if killed {
-                    continue;
+            if killed {
+                continue;
+            }
+            // An effect that re-runs after every render: a change of anything
+            // the write reads re-runs it (a handler row was dropped above), so
+            // each slot it reads is an edge into its own, and a write that
+            // reads everything or a prop re-triggers itself, whichever turn
+            // it runs on.
+            let every_render: Vec<QualifiedSlot> = match &reads {
+                Some(r) => {
+                    let props = r.props.then_some(node);
+                    r.slots.iter().map(|&l| (f.comp, l)).chain(props).collect()
                 }
-                match &reads {
-                    Some(r) => {
-                        for &l in &r.slots {
-                            push((f.comp, l), strength, false);
-                        }
-                        if r.props {
-                            push(node, strength, false);
-                        }
-                    }
-                    None => push(node, strength, false),
+                None => vec![node],
+            };
+            // A certain re-run reads every row already.
+            if let Some((why, true)) = f.always {
+                for &x in &every_render {
+                    push(x, strength, false, Some(why));
                 }
                 continue;
             }
             for &l in &f.exact_local {
                 let x: QualifiedSlot = (f.comp, l);
                 let self_slot = x == node;
-                let dropped = killed
-                    || !reads_slot(x)
-                    || (self_slot && !write_can_retrigger(f, &ctx.state_vals, w));
+                let dropped =
+                    !reads_slot(x) || (self_slot && !write_can_retrigger(f, &ctx.state_vals, w));
                 if !dropped {
-                    push(x, strength, self_slot);
+                    push(x, strength, self_slot, None);
                 }
             }
             for &x in &f.versioned {
@@ -837,11 +862,17 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     continue; // already pushed as exact
                 }
                 let self_slot = x == node && x.0 == f.comp;
-                let dropped = killed
-                    || !reads_slot(x)
-                    || (self_slot && !write_can_retrigger(f, &ctx.state_vals, w));
+                let dropped =
+                    !reads_slot(x) || (self_slot && !write_can_retrigger(f, &ctx.state_vals, w));
                 if !dropped {
-                    push(x, EdgeStrength::May, self_slot);
+                    push(x, EdgeStrength::May, self_slot, None);
+                }
+            }
+            // A re-run that is only possible adds May edges beside the rows'
+            // own, which keep their partition on a tie (pushed first).
+            if let Some((why, false)) = f.always {
+                for &x in &every_render {
+                    push(x, EdgeStrength::May, false, Some(why));
                 }
             }
         }

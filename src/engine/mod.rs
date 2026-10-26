@@ -47,5 +47,5 @@ pub use setters::{
     collect_slot_reads,
 };
 pub use symbol_graph::{SymbolGraph, SymbolKind, SymbolNode};
-pub use triggers::{EffectTrigger, triggers_of};
+pub use triggers::{Always, EffectTrigger, Rerun, triggers_of};
 pub use written::{Change, SiteEnvs, Written};

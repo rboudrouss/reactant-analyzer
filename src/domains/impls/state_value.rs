@@ -287,6 +287,13 @@ impl StateValue {
         self.reference == Stability::PerRender && self.populated_kinds().only(KindMask::REF)
     }
 
+    /// True when the value can only be a reference: `Object.is` then compares
+    /// identities, and the reference's change component is the whole story of
+    /// when the value differs. Anything else is compared by value.
+    pub fn is_reference_only(&self) -> bool {
+        !self.is_bottom_value() && self.populated_kinds().only(KindMask::REF)
+    }
+
     /// Derive the best initial abstract value from a `useState(init)` expression.
     pub fn from_init(init: &Expr) -> Self {
         match init {

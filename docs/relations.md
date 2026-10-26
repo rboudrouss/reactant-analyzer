@@ -54,7 +54,8 @@ params included. Two `setX(…)` calls in one body are two rows.
 ### `effect_triggers` — `EffectTrigger` (ADR-042 §3)
 
 One row per `(effect, dep index, qualified slot)`: the slot moves that dep.
-An effect with no deps list, or an empty one, has no rows.
+An effect with no deps list, or an empty one, has no rows; its re-run class
+(below) says when it runs.
 
 | column | claim | polarity |
 |---|---|---|
@@ -64,7 +65,37 @@ An effect with no deps list, or an empty one, has no rows.
 | `exact` | `true`: the dep **is** the slot value, so a fresh value in the slot re-runs the effect. `false`: the dep is versioned by the slot, the effect may re-run | must when `true`, may when `false` |
 
 This answers identity, not dependence: `render_deps` says what a value flows
-from, this says whether the dep changes exactly when the slot does.
+from, this says whether the dep changes exactly when the slot does. The two
+meet where identity is dependence: a dep that may be a primitive (or a
+reference whose change the domain cannot bound) is compared by value, so its
+may rows are the `Slot` sources `render_deps` gives it where the effect is
+called — `[!on]`, `[count * 2]`, a ternary's condition (#203).
+
+**The re-run class** — `effect_reruns`, read through `AnalysisResult::rerun`.
+One `Rerun` per effect, computed with the rows, and the first thing every
+reader asks (the churn graph, the fixpoint arm of `infinite-loop`): `MountOnly`
+(a readable `[]`), `OnSlots` (re-runs when a slot of its rows moves, never in
+the loop without one), or `Always(why)` (re-runs after every render). `why` is
+certain for `NoDeps` (no deps argument) and `FreshDep(i)` (dep `i` is a new
+reference every render, `is_unstable_reference_only`, the fact
+`always-unstable-deps` reports), and possible for `OpaqueDeps` (a deps argument
+that is not a written array, #212) and `MutableDep(i)` (dep `i` reads a ref's
+contents a body can replace or a source the dependence analysis lost, #201;
+or it is a fresh reference not certified fresh at the call — a name bound on
+two paths — or a spread whose source is not a reference only slots move). The churn graph reads `Always` the way it
+reads no deps array, at strength `min(why, must(write))`; for `FreshDep` it
+also asks that the dep does not hold while props hold — a prop the parent
+allocates is the same when the component re-renders alone, the reading a
+fresh *write* gets too. A hook's or a context's result is held (#161), so it
+makes no effect `Always`.
+
+| column | claim | polarity |
+|---|---|---|
+| `Rerun::MountOnly` | the list is known to be empty | exact |
+| `Rerun::Always(NoDeps)`, `Always(OpaqueDeps)` | the deps argument is absent / not a written array | exact |
+| `Rerun::Always(FreshDep(i))` | dep `i` fails `Object.is` at every render | must (the value domain's must bound) |
+| `Rerun::Always(MutableDep(i))` | dep `i` may change with no slot moving | may |
+| `Rerun::OnSlots` | none of the above: the rows say when it re-runs | may (absence of a row is not a proof beyond the sources the analysis sees) |
 
 ### `slot_seeds` — `SlotSeed` (ADR-031)
 
@@ -113,6 +144,7 @@ variable maps to a may-set of sources (`Slot`, `Setter`, `Prop`, `AllProps`,
 | `handlers` | host handlers and their sources | may-set |
 | `any_context` | some context the analysis cannot name may be read | may |
 | `effect_writes` | per effect, the slots its writes may reach | may |
+| `effect_deps` | per effect with a written list, what each element may be computed from where the effect is called | may-sets |
 | `Deps::gated` | the sources a function value reaches only behind a test of its own arguments | must: one ungated contributor takes a source out |
 
 Absence of a use is a proof here, so every unknown counts as a use.
@@ -138,8 +170,8 @@ interval; or the guard proofs.
 |---|---|---|
 | `from`, `to` | qualified slots | exact |
 | `component`, `effect_label`, `write_span` | the carrying effect and its write | exact |
-| `strength` | `Must`: exact-slot dep ∧ `Fresh` write on all paths of the body. `May`: everything else | must / may |
-| `no_deps` | the carrying effect has no dependency array | exact |
+| `strength` | `Must`: (exact-slot dep, or a certain every-render re-run) ∧ `Fresh` write on all paths of the body. `May`: everything else | must / may |
+| `always` | the edge exists because the carrying effect re-runs after every render (its re-run class), and why | exact |
 | `self_slot` | a dep-driven edge from a slot into itself: the self-churn arm's partition, never part of a reported cycle | exact |
 
 A cycle (`ChurnCycle`) is a simple cycle of one strongly connected component

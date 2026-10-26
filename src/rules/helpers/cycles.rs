@@ -161,7 +161,7 @@ mod row_tests {
             component: crate::test_support::named(carrier),
             effect_label: effect,
             write_span,
-            no_deps: false,
+            always: None,
             self_slot: false,
         }
     }

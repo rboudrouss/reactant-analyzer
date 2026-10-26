@@ -1398,6 +1398,147 @@ export function C() {
     );
 }
 
+// ── The re-run class (#189, #201, #203, #212) ────────────────────────────────
+
+#[test]
+fn an_unreadable_deps_argument_is_a_possible_loop_never_a_certain_one() {
+    // #212: the list is empty, the effect runs once and React settles. The
+    // engine cannot read it, so the effect only may re-run after every render.
+    let src = r#"
+import { useState, useEffect } from 'react';
+const DEPS: unknown[] = [];
+export function C() {
+  const [s, setS] = useState({});
+  useEffect(() => { setS({}); }, DEPS);
+  return <div />;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags.iter().all(|(_, s, _)| *s != Severity::Error),
+        "an unreadable list proves no re-run: {diags:?}"
+    );
+    assert!(
+        diags.iter().any(|(r, s, m)| r == "infinite-loop"
+            && *s == Severity::Warning
+            && m.contains("deps argument the analysis cannot read")
+            && !m.contains("no dependency array")),
+        "it may still re-run after every render: {diags:?}"
+    );
+}
+
+#[test]
+fn a_fresh_dep_and_a_fresh_write_are_the_no_deps_error() {
+    // #189: `opts` is a new object at every render, so the effect runs after
+    // every commit, as surely as with no deps array, and every run stores a
+    // new reference.
+    for deps in ["", ", [opts]", ", [s, opts]"] {
+        let src = format!(
+            r#"
+import {{ useState, useEffect }} from 'react';
+export function C() {{
+  const [s, setS] = useState<any>(0);
+  const opts = {{ v: 0 }};
+  useEffect(() => {{ setS([]); }}{deps});
+  return <div>{{String(s)}}</div>;
+}}
+"#
+        );
+        let sevs = loop_severities(&src, "C");
+        assert!(sevs.contains(&Severity::Error), "deps `{deps}`: {sevs:?}");
+    }
+}
+
+#[test]
+fn a_fresh_dep_and_a_conditional_fresh_write_are_a_warning() {
+    // The re-run is certain, the write is not on all paths.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C({ flag }) {
+  const [s, setS] = useState({});
+  const opts = { v: 0 };
+  useEffect(() => { if (flag) setS({}); }, [opts]);
+  return <div />;
+}
+"#;
+    let sevs = loop_severities(src, "C");
+    assert!(sevs.contains(&Severity::Warning), "{sevs:?}");
+    assert!(!sevs.contains(&Severity::Error), "{sevs:?}");
+}
+
+#[test]
+fn a_fresh_prop_dep_is_no_certain_rerun() {
+    // The parent allocates `opts`, but the child re-renders alone on its own
+    // write with the same props: the dep holds, the effect runs once. The
+    // value domain reads the prop as fresh (#199), so the re-run is possible.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function Parent() {
+  return <C opts={{ a: 1 }} />;
+}
+function C({ opts }: { opts: object }) {
+  const [s, setS] = useState({});
+  useEffect(() => { setS({}); }, [opts]);
+  return <div />;
+}
+"#;
+    let sevs = loop_severities(src, "C");
+    assert!(!sevs.contains(&Severity::Error), "{sevs:?}");
+}
+
+#[test]
+fn a_fresh_dep_bound_on_two_paths_is_a_possible_loop() {
+    // `o` is a new object on either path, so React re-runs the effect after
+    // every commit; a name bound twice is not certified fresh at the call, so
+    // the loop is a Warning rather than silence.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C({ c }) {
+  const [s, setS] = useState<any>(0);
+  let o;
+  if (c) { o = { a: 1 }; } else { o = { b: 1 }; }
+  useEffect(() => { setS([]); }, [o]);
+  return <div>{String(s)}</div>;
+}
+"#;
+    let sevs = loop_severities(src, "C");
+    assert!(sevs.contains(&Severity::Warning), "{sevs:?}");
+    assert!(!sevs.contains(&Severity::Error), "{sevs:?}");
+}
+
+#[test]
+fn a_ref_contents_dep_the_effect_reassigns_is_a_possible_loop() {
+    // #201: the effect stores a new object in `ref.current` and flips `t`:
+    // the dep differs after every commit.
+    let src = r#"
+import { useState, useEffect, useRef } from 'react';
+export function C() {
+  const ref = useRef<object>({});
+  const [t, setT] = useState(false);
+  useEffect(() => { ref.current = {}; setT(!t); }, [ref.current]);
+  return <div>{String(t)}</div>;
+}
+"#;
+    let sevs = loop_severities(src, "C");
+    assert!(sevs.contains(&Severity::Warning), "{sevs:?}");
+    assert!(!sevs.contains(&Severity::Error), "{sevs:?}");
+}
+
+#[test]
+fn a_primitive_dep_computed_from_the_written_slot_is_a_possible_loop() {
+    // #203: `!on` moves with `on`, which the effect flips at every run.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [on, setOn] = useState(false);
+  useEffect(() => { setOn(!on); }, [!on]);
+  return <div>{String(on)}</div>;
+}
+"#;
+    let sevs = loop_severities(src, "C");
+    assert!(sevs.contains(&Severity::Warning), "{sevs:?}");
+}
+
 #[test]
 fn every_write_fresh_keeps_the_error() {
     // Two fresh writes: whichever runs last, the slot changes.

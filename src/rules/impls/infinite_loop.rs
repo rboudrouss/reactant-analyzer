@@ -7,13 +7,13 @@ use crate::{
     ir::{
         SourceRange,
         cfg::CFG,
-        hooks::{Arity, HookEntry},
+        hooks::HookEntry,
         types::{BlockId, HookLabel, Var},
     },
 };
 
 use crate::engine::setters::SetterCallPhase;
-use crate::engine::{Change, ChurnEdge, ChurnGraph, EdgeStrength, WriterRegion};
+use crate::engine::{Always, Change, ChurnEdge, ChurnGraph, EdgeStrength, Rerun, WriterRegion};
 use crate::ir::ComponentId;
 use crate::rules::api::query::must_effect_cycle;
 use crate::rules::helpers::cycles::{NodeNames, cycle_path, node_display};
@@ -94,8 +94,8 @@ impl Rule for InfiniteLoop {
             };
 
             // Mount-only: fires once, no loop. Only an array the engine knows
-            // is empty says so.
-            if matches!(deps.list(), Some(d) if d.arity == Arity::Exact(0)) {
+            // is empty says so (the re-run class).
+            if comp_result.rerun(*eff_label) == Some(Rerun::MountOnly) {
                 continue;
             }
             // A deps array gates the effect for good only when EVERY dep is
@@ -315,12 +315,17 @@ fn check_multi_effect_cycles(
                             && w.written.change == Change::Must
                     })
             };
+            // Why a length-1 cycle re-runs its own effect after every render.
+            let always = e
+                .always
+                .filter(|_| cyc.len() == 1)
+                .map(|why| always_clause(why, &result.components[&e.component], e.effect_label));
             let msg = if !certain && !cyc.iter().all(|e| allocates(e)) {
-                if cyc.len() == 1 && e.no_deps {
+                if let Some((why, reruns)) = &always {
                     format!(
-                        "this effect has no dependency array and may change state \
-                         {to_name}, so it re-runs after every render and no write of \
-                         it is proven to settle: possible infinite render loop"
+                        "this effect {why} and may change state {to_name}, so it \
+                         {reruns} after every render and no write of it is proven to \
+                         settle: possible infinite render loop"
                     )
                 } else if cyc.len() == 1 {
                     format!(
@@ -334,17 +339,17 @@ fn check_multi_effect_cycles(
                          no step is proven to settle: possible infinite render loop"
                     )
                 }
-            } else if cyc.len() == 1 && e.no_deps && certain {
+            } else if let (Some((why, _)), true) = (&always, certain) {
                 format!(
-                    "this effect has no dependency array and stores a fresh \
-                     reference into state {to_name}, so it re-runs after every \
-                     render and re-triggers itself: infinite render loop"
+                    "this effect {why} and stores a fresh reference into state \
+                     {to_name}, so it re-runs after every render and re-triggers \
+                     itself: infinite render loop"
                 )
-            } else if cyc.len() == 1 && e.no_deps {
+            } else if let Some((why, reruns)) = &always {
                 format!(
-                    "this effect has no dependency array and may store a fresh \
-                     reference into state {to_name}, so it re-runs after every \
-                     render and can re-trigger itself: possible infinite render loop"
+                    "this effect {why} and may store a fresh reference into state \
+                     {to_name}, so it {reruns} after every render and can \
+                     re-trigger itself: possible infinite render loop"
                 )
             } else if cyc.len() == 1 && certain {
                 format!(
@@ -423,6 +428,44 @@ fn check_multi_effect_cycles(
     (diags, covered)
 }
 
+/// Why effect `label` re-runs after every render, as a clause of the
+/// message, and whether it surely does (`re-runs`) or only may (`may re-run`).
+fn always_clause(
+    why: Always,
+    comp: &crate::engine::AnalysisResult<crate::domains::StateValue>,
+    label: HookLabel,
+) -> (String, &'static str) {
+    let dep = |i: usize| {
+        comp.hooks
+            .iter()
+            .find_map(|h| match h {
+                HookEntry::Effect { label: l, deps, .. } if *l == label => deps
+                    .list()
+                    .and_then(|d| d.as_slice().get(i))
+                    .map(|e| e.describe()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "a dep".to_string())
+    };
+    let clause = match why {
+        Always::NoDeps => "has no dependency array".to_string(),
+        Always::FreshDep(i) => format!("depends on `{}`, a new reference every render,", dep(i)),
+        Always::OpaqueDeps => "is gated by a deps argument the analysis cannot read".to_string(),
+        Always::MutableDep(i) => format!(
+            "depends on `{}`, which may differ at any render without a state change,",
+            dep(i)
+        ),
+    };
+    (
+        clause,
+        if why.certain() {
+            "re-runs"
+        } else {
+            "may re-run"
+        },
+    )
+}
+
 // ── Object-churn arm (ADR-017) ────────────────────────────────────────────────
 //
 // `useEffect(() => setObj({...obj}), [obj])` never widens: the reference slot
@@ -459,7 +502,7 @@ fn check_object_churn(
             continue;
         };
         if deps.list().is_none() {
-            continue; // no dependency array: the graph arm's self-edge
+            continue; // no readable dependency array: the graph arm's self-edge
         }
 
         // This arm's partition of the relation (ADR-020 item 2, ADR-042 §4):
@@ -467,11 +510,12 @@ fn check_object_churn(
         // this component's own slots. A `self_slot` edge is the loop; every
         // other one feeds the Info branch. The change leg, the convergence kill and
         // the field-sensitive re-trigger test (#90) were applied by the engine
-        // when it built the edge.
+        // when it built the edge. An edge an every-render re-run carries is
+        // the graph arm's, like the self-edge of an effect with no array.
         let edges = graph.edges.iter().filter(|e| {
             e.component == component
                 && e.effect_label == *eff_label
-                && !e.no_deps
+                && e.always.is_none()
                 && e.from.0 == component
                 && e.to.0 == component
         });
