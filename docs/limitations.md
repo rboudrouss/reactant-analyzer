@@ -113,6 +113,16 @@ that writes it (see *Cross-file limits*).
   A setter handed to a child is a trigger where it lands on a host element's handler, or on an
   `onX` prop of an element the analysis cannot see into. One passed under another name to such an
   element, called by the child outside any handler, or read from a context, is not a trigger.
+- **A merge takes its condition, a field write under one does not.** A value a branch selects
+  (`c ? a : b`, a `let` in an arm, a `return` the other side answers with its own) changes
+  whenever `c` does, and reads so ([ADR-017](adr/ADR-017-versioned-stability.md), #197). A
+  field written under a condition, `if (c) obj.f = x`, keeps the field's own trace: the
+  container's identity is untouched and the field is not a name the rule can charge. A selection
+  between primitives has no change component to carry `c`, so `const n = c ? 1 : 2` reads as a
+  number and nothing more [#203](https://github.com/rboudrouss/reactant-analyzer/issues/203); a
+  condition the analysis cannot bound, a boolean prop or an opaque call, makes the selection
+  `Unknown`, which names no slot and so triggers no effect
+  [#206](https://github.com/rboudrouss/reactant-analyzer/issues/206).
 
 ## Why reactant may warn wrongly (false positives)
 

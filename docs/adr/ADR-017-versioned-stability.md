@@ -263,16 +263,35 @@ a block only one side reaches, from which a block both sides reach is
 reachable — takes the condition's may bound (`Stability::under_condition`):
 `a ⊔ b ⊔ may(c)` on the may side, the must side of `a ⊔ b` alone
 (`PerRender` in both arms stays `PerRender`). Abstract equality of the arms
-is not a shortcut; a name neither arm assigns is the only one. The CFG
-analyser charges the write, not the merge: both arms carry `may(c)`, so
-their join does (`dominance::selecting_branches`). A guard whose other side
-exits the body (`if (!ctx) throw`, an early `return`) selects nothing: the
-continuation's values meet no other arm. `may(c)` is `Versioned({l})` for a state slot of
-any kind (the same projection `recompute_memo` applies), the join of the
-operands for an operator, and the value's own bound otherwise — `Unknown`
-for a boolean prop or an opaque call. A selection between primitives has no
-change component to record the condition on; the whole-value change
-component is #203.
+is not a shortcut; a name neither arm assigns is the only one. The one CFG
+solver (`run_cfg`, so every body: a hook's and every closure it runs)
+charges the write, not the merge: both arms carry `may(c)`, so their join
+does (`dominance::selecting_branches`). A guard whose other side exits the
+body (`if (!ctx) throw`, an early `return`) selects nothing: the
+continuation's values meet no other arm. A body's exit is a merge too: a
+`return` the other side of a branch answers with a `return` of its own
+takes the branch's condition (`dominance::returning_branches`), which is
+what `() => { if (c) return a; return b; }` needs — a hook inlined through
+`splice` has its returns rewritten as assignments to a join block, and the
+write rule covers it.
+
+`may(c)` is `Versioned({l})` for a state slot of any kind (the same
+projection `recompute_memo` applies), the join of the operands for an
+operator, and the value's own bound otherwise — `Unknown` for a boolean
+prop or an opaque call. A primitive slot's value carries no label, so the
+slot is read off the name: its sole binding chain in the body
+(`ir::bindings::binding_of`), or the env's slot certificate
+(`AbstractEnv::slot_label`) — a name bound to `StateVal(l)` or a rename of
+one, revoked by any other binding, kept across a join only where both sides
+agree, and carried into a closure with its captured values so the body's
+`c` is the one it closed over. A selection between primitives has no change
+component to record the condition on; the whole-value change component is
+#203.
+
+For the selection to reach the dep, a call of a local function binds what
+its bodies returned (the join over every location the name may hold, when
+each is a body the effect walk ran) rather than the evaluator's ⊤
+(ADR-009), which only ever met the side effects.
 
 The must-rerun bit of an effect trigger is read from the sole binding chain
 of the dep name (`ir::bindings::binding_of`), not from the first-wins alias
