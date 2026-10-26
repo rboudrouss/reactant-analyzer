@@ -1112,3 +1112,104 @@ export function Parent() {
         "a mapped child mounts once per item the loop adds: {diags:?}"
     );
 }
+
+// ── a merge takes its condition (#197) ──────────────────────────────────────
+
+#[test]
+fn a_dep_a_state_boolean_selects_closes_the_loop_through_that_boolean() {
+    // `v` is `obj` or `null` as `a` says, so toggling `a` moves `v` and the
+    // effect re-runs: an infinite loop in React. Read as `Versioned({obj})`
+    // alone, the effect had no edge into `a` and the program was an Info.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function ToggleViaCond() {
+  const [a, setA] = useState(false);
+  const [obj, setObj] = useState({ k: 1 });
+  const v = a ? obj : null;
+  useEffect(() => { setA((x) => !x); }, [v]);
+  return <div onClick={() => setObj({ k: 2 })}>{String(a)}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "ToggleViaCond");
+    assert!(
+        diags
+            .iter()
+            .any(|(rule, sev, _)| rule == "infinite-loop" && *sev == Severity::Warning),
+        "the condition of a merge is a trigger of what it selects: {diags:?}"
+    );
+}
+
+#[test]
+fn two_stable_refs_a_state_boolean_chooses_between_still_loop() {
+    // `Stable ⊔ Stable` with the choice made by `flag`: `r` switches on
+    // every toggle. Abstract equality of the arms is not a shortcut.
+    let src = r#"
+import { useEffect, useRef, useState } from 'react';
+export function RefSwitch() {
+  const [flag, setFlag] = useState(false);
+  const r1 = useRef(1);
+  const r2 = useRef(2);
+  const r = flag ? r1 : r2;
+  useEffect(() => { setFlag(!flag); }, [r]);
+  return <div>{String(flag)}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "RefSwitch");
+    assert!(
+        diags
+            .iter()
+            .any(|(rule, sev, _)| rule == "infinite-loop" && *sev == Severity::Warning),
+        "two refs selected by a moving boolean are not a stable dep: {diags:?}"
+    );
+}
+
+#[test]
+fn a_selection_a_local_function_makes_in_a_ternary_still_loops() {
+    // The ternary sits in a closure the render calls: the merge is in the
+    // closure's body, `a` is a captured slot read, and `v` is what the call
+    // returns — none of which the render body shows syntactically.
+    let src = r#"
+import { useEffect, useRef, useState } from 'react';
+export function TernSelect() {
+  const [a, setA] = useState(false);
+  const r1 = useRef(1);
+  const r2 = useRef(2);
+  const pick = () => (a ? r1 : r2);
+  const v = pick();
+  useEffect(() => { setA((x) => !x); }, [v]);
+  return <div>{String(a)}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "TernSelect");
+    assert!(
+        diags
+            .iter()
+            .any(|(rule, sev, _)| rule == "infinite-loop" && *sev == Severity::Warning),
+        "a closure's selection is the call's value, and takes `a`: {diags:?}"
+    );
+}
+
+#[test]
+fn a_selection_a_local_function_makes_with_two_returns_still_loops() {
+    // Two `return`s in two blocks have no merge block: the function's exit
+    // is where they meet, so the returned value takes the guard's condition.
+    let src = r#"
+import { useEffect, useRef, useState } from 'react';
+export function RetSelect() {
+  const [a, setA] = useState(false);
+  const r1 = useRef(1);
+  const r2 = useRef(2);
+  const pick = () => { if (a) return r1; return r2; };
+  const v = pick();
+  useEffect(() => { setA((x) => !x); }, [v]);
+  return <div>{String(a)}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "RetSelect");
+    assert!(
+        diags
+            .iter()
+            .any(|(rule, sev, _)| rule == "infinite-loop" && *sev == Severity::Warning),
+        "a return the other side answers with its own takes `a`: {diags:?}"
+    );
+}

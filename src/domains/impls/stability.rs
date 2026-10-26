@@ -144,6 +144,24 @@ impl Stability {
     pub fn widen(&self, other: &Self) -> Self {
         self.join(other)
     }
+
+    /// The bound of a value a condition selects (#197): `self` is the join
+    /// of the arms, `cond` the may bound of the condition's own change trace.
+    ///
+    /// A selection `c ? a : b` changes whenever the chosen arm changes *or
+    /// the choice flips*: `Δ(v) ⊆ Δ(a) ∪ Δ(b) ∪ Δ(c)`. So the may side of
+    /// the result is `a ⊔ b ⊔ may(c)` — two `Stable` refs selected by a
+    /// state boolean are `Versioned` by that state, not `Stable`. The must
+    /// side is that of `a ⊔ b` alone: two arms that are each fresh every
+    /// render give a fresh selection, so `PerRender` stays `PerRender`
+    /// (a plain join with `may(c)` would weaken it to `Unknown`). `Unknown`
+    /// cannot grow and `Bottom` is unreachable code.
+    pub fn under_condition(&self, cond: &Self) -> Self {
+        match self {
+            Stability::Bottom | Stability::PerRender | Stability::Unknown => self.clone(),
+            _ => self.join(cond),
+        }
+    }
 }
 
 impl AbstractDomain for Stability {
@@ -273,6 +291,50 @@ mod tests {
                 assert!(a <= j, "{a:?} ⋢ join({a:?},{b:?})={j:?}");
                 assert!(b <= j, "{b:?} ⋢ join({a:?},{b:?})={j:?}");
             }
+        }
+    }
+
+    // ── under_condition (#197) ───────────────────────────────────────────────
+
+    #[test]
+    fn under_condition_two_stable_arms_take_the_condition() {
+        // `flag ? r1 : r2` with two refs: the selection changes with `flag`.
+        assert_eq!(
+            Stability::Stable.under_condition(&v(&[("A", 0)])),
+            v(&[("A", 0)])
+        );
+        assert_eq!(
+            v(&[("A", 1)]).under_condition(&v(&[("A", 0)])),
+            v(&[("A", 0), ("A", 1)])
+        );
+        assert_eq!(
+            Stability::Stable.under_condition(&Stability::Unknown),
+            Stability::Unknown
+        );
+    }
+
+    #[test]
+    fn under_condition_keeps_the_must_side_of_fresh_arms() {
+        // Both arms fresh ⇒ the selection is fresh: PerRender is not weakened.
+        for c in all_points() {
+            assert_eq!(
+                Stability::PerRender.under_condition(&c),
+                Stability::PerRender
+            );
+            assert_eq!(Stability::Unknown.under_condition(&c), Stability::Unknown);
+            assert_eq!(Stability::Bottom.under_condition(&c), Stability::Bottom);
+        }
+    }
+
+    #[test]
+    fn under_condition_is_extensive_and_trivial_for_a_constant() {
+        for a in all_points() {
+            for c in all_points() {
+                let r = a.under_condition(&c);
+                assert!(a <= r, "{a:?} ⋢ under_condition({a:?},{c:?})={r:?}");
+            }
+            assert_eq!(a.under_condition(&Stability::Stable), a);
+            assert_eq!(a.under_condition(&Stability::Bottom), a);
         }
     }
 

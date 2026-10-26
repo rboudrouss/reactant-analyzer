@@ -410,6 +410,243 @@ mod tests {
     }
 
     #[test]
+    fn a_merge_takes_the_change_set_of_its_condition() {
+        // block 0: let a = StateVal(0); branch a → 1 / 2
+        // block 1: let x = r1; let n = n1; let o = {}   (r1 Stable, n1 = 1)
+        // block 2: let x = r2; let n = n2; let o = {}   (r2 Stable, n2 = 2)
+        // block 3: merge. `x` selects between two stable refs by a state
+        // boolean: Versioned({a}), not Stable (#197). `n` is a primitive and
+        // carries no change component; `o` is fresh in both arms and stays so.
+        use crate::domains::BoolVal;
+        use crate::ir::types::ExprId;
+        let mut blocks = std::collections::BTreeMap::new();
+        blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![Stmt::Let {
+                    var: "a".to_string(),
+                    rhs: Expr::StateVal(0),
+                    span: None,
+                }],
+                term: Terminator::Branch {
+                    span: None,
+                    cond: Expr::Var("a".to_string()),
+                    then_: 1,
+                    else_: 2,
+                },
+            },
+        );
+        let arm = |id: BlockId, r: &str, n: &str, alloc: usize| BasicBlock {
+            id,
+            stmts: vec![
+                Stmt::Let {
+                    var: "x".to_string(),
+                    rhs: Expr::Var(r.to_string()),
+                    span: None,
+                },
+                Stmt::Let {
+                    var: "n".to_string(),
+                    rhs: Expr::Var(n.to_string()),
+                    span: None,
+                },
+                Stmt::Let {
+                    var: "o".to_string(),
+                    rhs: Expr::ObjectLit {
+                        id: ExprId(alloc),
+                        fields: vec![],
+                    },
+                    span: None,
+                },
+            ],
+            term: Terminator::Jump(3),
+        };
+        blocks.insert(1, arm(1, "r1", "n1", 10));
+        blocks.insert(2, arm(2, "r2", "n2", 11));
+        blocks.insert(
+            3,
+            BasicBlock {
+                id: 3,
+                stmts: vec![],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
+        );
+        let cfg = CFG {
+            entry: 0,
+            blocks,
+            edges: vec![
+                Edge {
+                    from: 0,
+                    to: 1,
+                    kind: EdgeKind::IfTrue,
+                },
+                Edge {
+                    from: 0,
+                    to: 2,
+                    kind: EdgeKind::IfFalse,
+                },
+                Edge {
+                    from: 1,
+                    to: 3,
+                    kind: EdgeKind::Unconditional,
+                },
+                Edge {
+                    from: 2,
+                    to: 3,
+                    kind: EdgeKind::Unconditional,
+                },
+            ],
+        };
+        let mut env = AbstractEnv::new();
+        env.extend("r1".to_string(), StateValue::reference(Stability::Stable));
+        env.extend("r2".to_string(), StateValue::reference(Stability::Stable));
+        env.extend("n1".to_string(), StateValue::number(Interval::point(1.0)));
+        env.extend("n2".to_string(), StateValue::number(Interval::point(2.0)));
+        let mut state = StateStore::bottom();
+        state.update(0, StateValue::boolean(BoolVal::Top));
+        let (exit_envs, _) = run(&cfg, env, &state, &[]);
+        let merged = &exit_envs[&3];
+        assert_eq!(
+            merged.lookup("x").reference,
+            Stability::versioned_by(crate::test_support::C, 0),
+            "two stable refs a state boolean chooses between"
+        );
+        let n = merged.lookup("n");
+        assert_eq!(
+            n.reference,
+            Stability::Bottom,
+            "a number is not a reference"
+        );
+        assert_eq!(
+            n.num,
+            Interval {
+                lo: 1.0,
+                hi: 2.0,
+                is_int: true
+            }
+        );
+        assert_eq!(
+            merged.lookup("o").reference,
+            Stability::PerRender,
+            "fresh in both arms: the selection is fresh"
+        );
+    }
+
+    #[test]
+    fn a_guard_whose_other_side_exits_selects_nothing() {
+        // block 0: let a = StateVal(0); branch a → 1 / 2
+        // block 1: return            (the guard's exit: `if (a) return null`)
+        // block 2: let x = r1; return
+        // Nothing merges after the branch, so `x` is `r1` in every render that
+        // computes it: Stable, not Versioned({a}).
+        use crate::domains::BoolVal;
+        let mut blocks = std::collections::BTreeMap::new();
+        blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![Stmt::Let {
+                    var: "a".to_string(),
+                    rhs: Expr::StateVal(0),
+                    span: None,
+                }],
+                term: Terminator::Branch {
+                    span: None,
+                    cond: Expr::Var("a".to_string()),
+                    then_: 1,
+                    else_: 2,
+                },
+            },
+        );
+        blocks.insert(
+            1,
+            BasicBlock {
+                id: 1,
+                stmts: vec![],
+                term: Terminator::Return(Expr::Lit(Prim::Null)),
+            },
+        );
+        blocks.insert(
+            2,
+            BasicBlock {
+                id: 2,
+                stmts: vec![Stmt::Let {
+                    var: "x".to_string(),
+                    rhs: Expr::Var("r1".to_string()),
+                    span: None,
+                }],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
+        );
+        let cfg = CFG {
+            entry: 0,
+            blocks,
+            edges: vec![
+                Edge {
+                    from: 0,
+                    to: 1,
+                    kind: EdgeKind::IfTrue,
+                },
+                Edge {
+                    from: 0,
+                    to: 2,
+                    kind: EdgeKind::IfFalse,
+                },
+            ],
+        };
+        let mut env = AbstractEnv::new();
+        env.extend("r1".to_string(), StateValue::reference(Stability::Stable));
+        let mut state = StateStore::bottom();
+        state.update(0, StateValue::boolean(BoolVal::Top));
+        let (exit_envs, _) = run(&cfg, env, &state, &[]);
+        assert_eq!(exit_envs[&2].lookup("x").reference, Stability::Stable);
+    }
+
+    #[test]
+    fn a_call_of_a_local_function_binds_what_it_returns() {
+        // `const pick = () => r1; const v = pick(); const w = extern();`:
+        // `v` is the stable ref `pick` returns; `w` is a call the walk
+        // cannot resolve and stays ⊤ (ADR-009).
+        use crate::ir::types::ExprId;
+        let body = crate::test_support::single_block_cfg_term(
+            vec![],
+            Terminator::Return(Expr::Var("r1".to_string())),
+        );
+        let cfg = single_block_cfg(vec![
+            Stmt::Let {
+                var: "pick".to_string(),
+                rhs: Expr::FnLit {
+                    id: ExprId(7),
+                    params: vec![],
+                    body_cfg: std::sync::Arc::new(body),
+                },
+                span: None,
+            },
+            Stmt::Let {
+                var: "v".to_string(),
+                rhs: Expr::Call {
+                    fn_: Box::new(Expr::Var("pick".to_string())),
+                    args: vec![],
+                },
+                span: None,
+            },
+            Stmt::Let {
+                var: "w".to_string(),
+                rhs: Expr::Call {
+                    fn_: Box::new(Expr::Var("extern".to_string())),
+                    args: vec![],
+                },
+                span: None,
+            },
+        ]);
+        let mut env = AbstractEnv::new();
+        env.extend("r1".to_string(), StateValue::reference(Stability::Stable));
+        let (exit_envs, _) = run(&cfg, env, &StateStore::bottom(), &[]);
+        assert_eq!(exit_envs[&0].lookup("v").reference, Stability::Stable);
+        assert!(exit_envs[&0].lookup("w").is_top_value());
+    }
+
+    #[test]
     fn branch_narrowing_restricts_then_env() {
         use crate::domains::{Interval, StateValue};
         use crate::ir::expr::BinOp;

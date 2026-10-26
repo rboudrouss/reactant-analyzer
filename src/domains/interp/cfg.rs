@@ -109,7 +109,7 @@ pub(crate) fn narrow_env_for_branch<D: AbstractDomain>(
 ) -> AbstractEnv<D> {
     let with_refined = |x: &str, refined: D| {
         let mut narrowed = env.clone();
-        narrowed.extend(x.to_string(), refined);
+        narrowed.refine(x.to_string(), refined);
         narrowed
     };
 

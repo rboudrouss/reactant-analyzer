@@ -98,6 +98,125 @@ fn a_field_read_and_a_memo_are_versioned_triggers_not_exact_ones() {
 }
 
 #[test]
+fn a_value_a_branch_selects_is_versioned_by_the_condition_and_never_exact() {
+    // `v` is `obj` or `null` as `a` says: a change of `a` flips it, so `a`
+    // moves the dep too (#197). The ternary lowers to a temporary bound once
+    // per arm; a name bound twice is no exact alias of either binding.
+    let r = parse_and_analyze(
+        r#"
+        import { useState, useEffect } from "react";
+        export function C() {
+          const [a, setA] = useState(false);
+          const [obj, setObj] = useState({ k: 1 });
+          const v = a ? obj : null;
+          useEffect(() => { console.log(v); }, [v]);
+          return <div />;
+        }
+        "#,
+    );
+    let c = comp(&r, "C");
+    let mut slots: Vec<usize> = c.state_store.labels();
+    slots.sort_unstable();
+    let [a, obj] = slots[..] else {
+        panic!("two slots expected: {slots:?}");
+    };
+    let rows: Vec<&EffectTrigger> = c.effect_triggers.iter().collect();
+    assert!(
+        rows.iter().any(|t| t.slot == (c.component, a) && !t.exact),
+        "the condition `a` moves `v`: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|t| t.slot == (c.component, obj) && !t.exact),
+        "the arm `obj` moves `v`: {rows:?}"
+    );
+    assert!(rows.iter().all(|t| !t.exact), "{rows:?}");
+}
+
+#[test]
+fn two_stable_refs_a_state_boolean_chooses_between_are_versioned_by_it() {
+    // `Stable ⊔ Stable` is not `Stable` when a moving condition picks the
+    // arm: `r` switches with `flag` (#197).
+    let r = parse_and_analyze(
+        r#"
+        import { useState, useEffect, useRef } from "react";
+        export function C() {
+          const [flag, setFlag] = useState(false);
+          const r1 = useRef(1);
+          const r2 = useRef(2);
+          const r = flag ? r1 : r2;
+          useEffect(() => { console.log(r.current); }, [r]);
+          return <div />;
+        }
+        "#,
+    );
+    let c = comp(&r, "C");
+    let flag = only_slot(c);
+    let rows: Vec<&EffectTrigger> = c.effect_triggers.iter().collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].slot, (c.component, flag));
+    assert!(!rows[0].exact);
+}
+
+#[test]
+fn a_value_a_local_function_selects_is_versioned_by_the_captured_slot_it_reads() {
+    // `v` is what `pick()` returns, and `pick` chooses by `flag`, a slot
+    // read it closed over: the call's value is the closure's return, and
+    // the closure's condition is the slot (#197). Two spellings, two
+    // merges: a ternary in the body, and two `return`s meeting at its exit.
+    for pick in [
+        "const pick = () => (flag ? r1 : r2);",
+        "const pick = () => { if (flag) return r1; return r2; };",
+    ] {
+        let src = format!(
+            r#"
+            import {{ useState, useEffect, useRef }} from "react";
+            export function C() {{
+              const [flag, setFlag] = useState(false);
+              const r1 = useRef(1);
+              const r2 = useRef(2);
+              {pick}
+              const v = pick();
+              useEffect(() => {{ console.log(v.current); }}, [v]);
+              return <div />;
+            }}
+            "#
+        );
+        let r = parse_and_analyze(&src);
+        let c = comp(&r, "C");
+        let flag = only_slot(c);
+        let rows: Vec<&EffectTrigger> = c.effect_triggers.iter().collect();
+        assert_eq!(rows.len(), 1, "{pick}: {rows:?}");
+        assert_eq!(rows[0].slot, (c.component, flag), "{pick}");
+        assert!(!rows[0].exact, "{pick}");
+    }
+}
+
+#[test]
+fn a_primitive_a_prop_overrides_is_a_versioned_trigger_of_its_slot_not_an_exact_one() {
+    // `isOpen` is the prop when given, the slot otherwise: a change of the
+    // slot may re-run the effect, never must. The slot is a boolean, so its
+    // env value carries no label; the binding does.
+    let r = parse_and_analyze(
+        r#"
+        import { useState, useEffect } from "react";
+        export function C({ open }: { open?: boolean }) {
+          const [isOpenInternal, setIsOpenInternal] = useState(false);
+          const isOpen = open ?? isOpenInternal;
+          useEffect(() => { console.log(isOpen); }, [isOpen]);
+          return <div />;
+        }
+        "#,
+    );
+    let c = comp(&r, "C");
+    let slot = only_slot(c);
+    let rows: Vec<&EffectTrigger> = c.effect_triggers.iter().collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].slot, (c.component, slot));
+    assert!(!rows[0].exact, "the prop may hide the slot: {rows:?}");
+}
+
+#[test]
 fn a_mount_only_effect_and_an_absent_list_have_no_rows() {
     let r = parse_and_analyze(
         r#"

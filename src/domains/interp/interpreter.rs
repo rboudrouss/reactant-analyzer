@@ -3,12 +3,16 @@ use std::sync::Arc;
 
 use crate::{
     domains::{
-        AbstractDomain, AnalysisCtx, Transfer,
+        AbstractDomain, AnalysisCtx, Stability, Transfer,
         impls::StateValue,
         stores::{AbstractEnv, EnvVal, HeapValue, resolve_locs},
     },
-    engine::Reducer,
+    engine::{
+        Reducer,
+        dominance::{returning_branches, selecting_branches},
+    },
     ir::{
+        bindings::binding_of,
         cfg::{CFG, EdgeKind, Terminator},
         expr::{Expr, MarkerVal, SummaryValue},
         stmt::{MemberKey, Stmt},
@@ -86,6 +90,16 @@ pub(crate) struct Run<D: AbstractDomain> {
 /// A block re-runs when its entry env grows, and each run fires its writes
 /// again: every slot write is a join, so a write made under a smaller env
 /// only adds what the final run adds as well.
+///
+/// A merge takes its condition (#197): an arm of a branch — a block only one
+/// side reaches, on its way to a block both sides reach — runs under that
+/// branch's condition, and what it assigns is a selection the condition
+/// makes, so its change trace takes the condition's may bound
+/// ([`AbstractDomain::select_under`]). Charging the write rather than the
+/// merge needs no record of which predecessor is which, and it is the same
+/// bound: both arms of `c ? a : b` carry `may(c)`, so their join is
+/// `a ⊔ b ⊔ may(c)`. A guard whose other side exits selects nothing
+/// (`selecting_branches`).
 pub(crate) fn run_cfg<T: Transfer>(
     transfer: &T,
     cfg: &CFG,
@@ -107,6 +121,30 @@ pub(crate) fn run_cfg<T: Transfer>(
         .collect();
     let rank = |b: BlockId| order.get(&b).copied().unwrap_or(usize::MAX);
 
+    // Block → the branches whose condition selects what it assigns, or what
+    // it returns; and the inverse, for re-queueing when a condition's bound
+    // grows.
+    let selecting = selecting_branches(cfg);
+    let returning = returning_branches(cfg);
+    let mut selected: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    for (b, branches) in selecting.iter().chain(&returning) {
+        for br in branches {
+            selected.entry(*br).or_default().push(*b);
+        }
+    }
+    let mut cond_bounds: HashMap<BlockId, Stability> = HashMap::new();
+    // The join of the change bounds of `branches`, those not yet run
+    // contributing nothing: they re-queue the block when they do.
+    let bound_under = |branches: Option<&Vec<BlockId>>,
+                       cond_bounds: &HashMap<BlockId, Stability>| {
+        branches
+            .into_iter()
+            .flatten()
+            .filter_map(|br| cond_bounds.get(br))
+            .fold(Stability::Bottom, |acc, s| acc.join(s))
+    };
+    let under_condition = |pc: &Stability| !matches!(pc, Stability::Bottom | Stability::Stable);
+
     let mut entries: HashMap<BlockId, AbstractEnv<T::Domain>> = HashMap::new();
     let mut exits: HashMap<BlockId, AbstractEnv<T::Domain>> = HashMap::new();
     let mut arrivals: HashMap<BlockId, usize> = HashMap::new();
@@ -119,22 +157,49 @@ pub(crate) fn run_cfg<T: Transfer>(
 
     while let Some((_, b)) = pending.pop_first() {
         let mut env = entries[&b].clone();
+        // The change bound of the conditions this block's writes run under.
+        let pc = bound_under(selecting.get(&b), &cond_bounds);
         if let Some(block) = cfg.blocks.get(&b) {
             for stmt in &block.stmts {
                 exec_full_stmt(transfer, stmt, &mut env, ctx, depth);
+                if under_condition(&pc)
+                    && let Stmt::Let { var, .. } | Stmt::Assign { var, .. } = stmt
+                    && env.contains(var)
+                {
+                    let selected = env.lookup(var).select_under(&pc);
+                    env.refine(var.clone(), selected);
+                }
             }
             match &block.term {
                 // A concise arrow body (`() => EXPR`) lowers EXPR to this
                 // Return. EXPR may carry side effects (`() => setN(c => c+1)`,
                 // `() => arr.map(cb)`): fire them as a statement would, then
-                // take EXPR's value as the return (ADR-020 item 7).
+                // take EXPR's value as the return (ADR-020 item 7). The
+                // body's exit is a merge too: a return the other side of a
+                // branch answers with its own takes the branch's condition.
                 Terminator::Return(expr) => {
-                    exec_callbacks_depth(transfer, expr, &env, ctx, depth);
-                    ret = ret.join(&transfer.eval_expr(expr, &env, ctx));
+                    let returned = exec_callbacks_depth(transfer, expr, &env, ctx, depth);
+                    let mut val = returned.unwrap_or_else(|| transfer.eval_expr(expr, &env, ctx));
+                    let pc_ret = bound_under(returning.get(&b), &cond_bounds);
+                    if under_condition(&pc_ret) {
+                        val = val.select_under(&pc_ret);
+                    }
+                    ret = ret.join(&val);
                 }
-                // A condition is evaluated, so its calls run.
+                // A condition is evaluated, so its calls run; its change
+                // bound is what the blocks it selects run under.
                 Terminator::Branch { cond, .. } => {
                     exec_expr_effects(transfer, cond, &mut env, ctx, depth);
+                    let bound = condition_bound(transfer, cond, cfg, &env, ctx);
+                    if cond_bounds.get(&b) != Some(&bound) {
+                        cond_bounds.insert(b, bound);
+                        // The blocks already run under the previous bound.
+                        for c in selected.get(&b).into_iter().flatten() {
+                            if entries.contains_key(c) {
+                                pending.insert((rank(*c), *c));
+                            }
+                        }
+                    }
                 }
                 Terminator::Jump(_) | Terminator::Unreachable => {}
             }
@@ -164,6 +229,46 @@ pub(crate) fn run_cfg<T: Transfer>(
     Run { exits, ret }
 }
 
+/// The may bound on the change trace of a branch condition: the renders at
+/// which the choice it makes can flip (#197).
+///
+/// A literal never flips. A state slot, whatever its kind, changes only at
+/// its setter events (the ADR-017 read-side fact, which the env value of a
+/// primitive slot cannot carry — the same projection `recompute_memo`
+/// applies to a dep); a name whose sole binding chain in this body ends at a
+/// slot or a memo is that slot or memo (`binding_of` fails closed on a name
+/// bound twice, and on a captured name, whose env value then answers,
+/// condition taint included). An operator flips only when an operand
+/// changes, so it takes the join of its operands. Anything else is read from
+/// its value through the transfer.
+fn condition_bound<T: Transfer>(
+    transfer: &T,
+    cond: &Expr,
+    cfg: &CFG,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+) -> Stability {
+    let component = ctx.component;
+    match cond.peel_ts() {
+        Expr::Lit(_) => Stability::Stable,
+        Expr::StateVal(l) => Stability::versioned_by(component, *l),
+        Expr::MemoVal(l) | Expr::CallbackVal(l) => ctx.memo.get(*l).change_bound(),
+        Expr::Var(v) => match (env.slot_label(v), binding_of(v, cfg)) {
+            (Some(l), _) | (None, Some(&Expr::StateVal(l))) => {
+                Stability::versioned_by(component, l)
+            }
+            (None, Some(Expr::MemoVal(l) | Expr::CallbackVal(l))) => {
+                ctx.memo.get(*l).change_bound()
+            }
+            _ => transfer.eval_expr(cond, env, ctx).change_bound(),
+        },
+        Expr::UnaryOp { arg, .. } => condition_bound(transfer, arg, cfg, env, ctx),
+        Expr::BinOp { lhs, rhs, .. } => condition_bound(transfer, lhs, cfg, env, ctx)
+            .join(&condition_bound(transfer, rhs, cfg, env, ctx)),
+        other => transfer.eval_expr(other, env, ctx).change_bound(),
+    }
+}
+
 // ── Internal ──────────────────────────────────────────────────────────────────
 
 /// Callback pre-pass + domain core for a single statement.
@@ -187,10 +292,15 @@ fn exec_full_stmt<T: Transfer>(
         }
         // Binding statements: the effects of every call in the RHS parts —
         // a slot write included, `x = flag && setA(1)` is one (#169) — then
-        // the binding core.
-        Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => {
-            exec_callbacks_depth(transfer, rhs, env, ctx, depth);
+        // the binding core. A call of a local function binds what its
+        // bodies returned, which the effect walk just computed; the
+        // evaluator alone reads any call as ⊤ (ADR-009).
+        Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. } => {
+            let returned = exec_callbacks_depth(transfer, rhs, env, ctx, depth);
             exec_stmt_core(transfer, stmt, env, ctx);
+            if let Some(val) = returned {
+                env.extend(var.clone(), val);
+            }
         }
         Stmt::MemberWrite { obj, key, rhs, .. } => {
             exec_callbacks_depth(transfer, obj, env, ctx, depth);
@@ -390,8 +500,18 @@ fn bind_rhs<T: Transfer>(
             env.extend_loc(var.to_string(), id);
         }
     }
+    // A slot read, or a rename of one, certifies the name (#197); any
+    // other right-hand side revokes what the name had.
+    let slot = match rhs.peel_ts() {
+        Expr::StateVal(label) => Some(*label),
+        Expr::Var(src) => env.slot_label(src),
+        _ => None,
+    };
     let val = transfer.eval_expr(rhs, env, ctx);
     env.extend(var.to_string(), val);
+    if let Some(label) = slot {
+        env.bind_slot(var.to_string(), label);
+    }
 }
 
 /// Per-member `EnvVal`s of an object literal, for the heap `Obj` entry.
@@ -516,13 +636,18 @@ fn exec_slot_write<T: Transfer>(
 /// Invariant: never recurse INTO a `FnLit` body here bodies run only via
 /// `exec_body_depth`; otherwise `run_cfg → exec_full_stmt → exec_callbacks_depth`
 /// would double-execute. Nesting is handled naturally by that recursion.
+///
+/// Returns the value of `expr` when it is a call of a local function whose
+/// every body this walk ran (B6): the join of what they returned. `None`
+/// for any other expression, and for a call the walk could not resolve
+/// whole or skipped at the depth cap — the evaluator's ⊤ stands.
 fn exec_callbacks_depth<T: Transfer>(
     transfer: &T,
     expr: &Expr,
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
-) {
+) -> Option<T::Domain> {
     let capped = depth >= MAX_INLINE_DEPTH;
     if capped && let Some(inter) = ctx.inter {
         inter
@@ -561,14 +686,16 @@ fn exec_callbacks_depth<T: Transfer>(
             }
             // B6: direct local call inlining Unknown callee that resolves to a heap Fn.
             // External/imported functions have no Loc → skipped (no FP).
+            let mut returned = None;
             if class == TriggerClass::Unknown
                 && !capped
                 && let Expr::Var(name) = fn_.as_ref()
             {
-                exec_var_callback(transfer, name, env, ctx, depth);
+                returned = exec_var_callback(transfer, name, env, ctx, depth);
             }
             // Arguments first, then the call itself.
             exec_slot_write(transfer, fn_, args, env, ctx, depth);
+            returned
         }
         Expr::CompApp { props, .. } => {
             exec_callbacks_depth(transfer, props, env, ctx, depth);
@@ -576,47 +703,67 @@ fn exec_callbacks_depth<T: Transfer>(
             if !capped {
                 transfer.eval_expr(expr, env, ctx);
             }
+            None
         }
+        Expr::TSAnnotated(inner) => exec_callbacks_depth(transfer, inner, env, ctx, depth),
         // Bare FnLit outside a call: never runs by itself — not descended.
         // Everything else: generic child descent.
         other => {
-            other.for_each_child(&mut |c| exec_callbacks_depth(transfer, c, env, ctx, depth));
+            other.for_each_child(&mut |c| {
+                exec_callbacks_depth(transfer, c, env, ctx, depth);
+            });
+            None
         }
     }
 }
 
 /// Resolve a variable to its heap-stored Fn bodies and execute each for side effects.
 /// Used for B5 (variable callbacks: `setTimeout(cb)`) and B6 (direct calls: `load()`).
+///
+/// Returns the join of what the bodies returned when every target was a
+/// body that ran: a name whose locations include anything else, or that
+/// resolves to no body, answers `None`; so does a body no run returns from.
 fn exec_var_callback<T: Transfer>(
     transfer: &T,
     name: &str,
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
-) {
+) -> Option<T::Domain> {
     if let Some(EnvVal::Loc { ids, .. }) = env.lookup_env_val(name) {
         let ids: Vec<_> = ids.iter().copied().collect();
+        let mut returned = Some(T::Domain::bottom());
         for id in ids {
             if let Some(HeapValue::Fn {
                 params,
                 body_cfg,
                 captured,
+                captured_slots,
             }) = ctx.heap.get(id)
             {
                 let params = params.clone();
                 let body_cfg = Arc::clone(body_cfg);
                 let captured = captured.clone();
+                let captured_slots = captured_slots.clone();
                 let mut sub_env = env.clone();
                 for (var, val) in captured {
                     sub_env.extend(var, T::Domain::from_state_value(val));
                 }
+                // The creation-time certificates, not the call site's: the
+                // body's `a` is the one it closed over.
+                for (var, label) in captured_slots {
+                    sub_env.bind_slot(var, label);
+                }
                 for p in &params {
                     sub_env.extend(p.clone(), T::Domain::top());
                 }
-                let _ = exec_body_depth(transfer, &body_cfg, &sub_env, ctx, depth + 1);
+                let ret = exec_body_depth(transfer, &body_cfg, &sub_env, ctx, depth + 1);
+                returned = returned.map(|acc| acc.join(&ret));
+            } else {
+                returned = None;
             }
         }
-        return;
+        return returned.filter(|v| !v.is_bottom());
     }
     // useCallback binding: the body lives in the hook entry, not the heap
     // (the rewrite to `CallbackVal` moved it out of the expression tree).
@@ -624,6 +771,8 @@ fn exec_var_callback<T: Transfer>(
     if let Some(label) = env.callback_label(name)
         && let Some(body_cfg) = ctx.query.callback_body(label)
     {
-        let _ = exec_body_depth(transfer, &body_cfg, env, ctx, depth + 1);
+        let ret = exec_body_depth(transfer, &body_cfg, env, ctx, depth + 1);
+        return Some(ret).filter(|v| !v.is_bottom());
     }
+    None
 }

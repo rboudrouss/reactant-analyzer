@@ -36,7 +36,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::domains::AbstractDomain;
-use crate::engine::{AnalysisResult, HookKind};
+use crate::engine::{AnalysisResult, HookKind, dominance::controlling_branches};
 use crate::ir::{
     cfg::{CFG, Terminator},
     expr::{CompOrigin, Expr, Prim, SPREAD_KEY_PREFIX, mutation_receiver},
@@ -1200,42 +1200,4 @@ pub(crate) fn param_gated_vars(params: &[Var], body: &CFG) -> HashSet<Var> {
         .into_iter()
         .filter(|v| !open.contains(v) && free.contains(v) && !params.contains(v))
         .collect()
-}
-
-/// For every block, the branch blocks that control it: exactly one side of the
-/// branch reaches it (the reachability definition `MountIndex` already uses).
-fn controlling_branches(cfg: &CFG) -> HashMap<BlockId, Vec<BlockId>> {
-    let branches: Vec<(BlockId, BlockId, BlockId)> = cfg
-        .blocks
-        .iter()
-        .filter_map(|(id, b)| match b.term {
-            Terminator::Branch { then_, else_, .. } => Some((*id, then_, else_)),
-            _ => None,
-        })
-        .collect();
-    let mut out: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
-    if branches.is_empty() {
-        return out;
-    }
-    // Forward reachability from each branch side, once per side.
-    let reach = |from: BlockId| -> HashSet<BlockId> {
-        let mut seen = HashSet::from([from]);
-        let mut stack = vec![from];
-        while let Some(b) = stack.pop() {
-            for s in cfg.successors(b) {
-                if seen.insert(s) {
-                    stack.push(s);
-                }
-            }
-        }
-        seen
-    };
-    for (br, t, e) in branches {
-        let rt = reach(t);
-        let re = reach(e);
-        for b in rt.symmetric_difference(&re) {
-            out.entry(*b).or_default().push(br);
-        }
-    }
-    out
 }

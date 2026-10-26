@@ -16,13 +16,14 @@
 //! Computed at convergence in the `slot_seeds` slice and stored on
 //! `AnalysisResult`. Both arms of `infinite-loop` read it.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::{
     domains::{StateValue, impls::Stability, stores::MemoStore},
-    engine::setters::{memo_val_labels, resolve_setter_aliases, state_val_labels},
+    engine::setters::{memo_val_labels, resolve_setter_aliases},
     ir::{
         ComponentId, QualifiedSlot,
+        bindings::{binding_of, local_bindings},
         cfg::CFG,
         expr::Expr,
         hooks::HookEntry,
@@ -54,10 +55,9 @@ pub(crate) fn collect_effect_triggers(
     memo: &MemoStore<StateValue>,
     mut eval: impl FnMut(&Expr) -> StateValue,
 ) -> Vec<EffectTrigger> {
-    let state_vals: HashMap<Var, HookLabel> =
-        resolve_setter_aliases(render_cfg, &state_val_labels(render_cfg));
     let memo_vals: HashMap<Var, HookLabel> =
         resolve_setter_aliases(render_cfg, &memo_val_labels(render_cfg));
+    let bindings = local_bindings(render_cfg);
     let mut out = Vec::new();
     for hook in hooks {
         let HookEntry::Effect { label, deps, .. } = hook else {
@@ -67,9 +67,18 @@ pub(crate) fn collect_effect_triggers(
             continue;
         };
         for (i, dep) in list.as_slice().iter().enumerate() {
+            // The must-rerun bit is a certificate: a name is the slot's value
+            // only when its sole binding chain ends at the slot (`binding_of`
+            // fails closed on a name bound twice — `c ? obj : null` and
+            // `open ?? isOpenInternal` both lower to two bindings of one
+            // temporary). The first-wins alias map used to claim exactness
+            // there, and the versioned rows below were never computed (#197).
             let exact_local = match dep.peel_ts() {
                 Expr::StateVal(l) => Some(*l),
-                Expr::Var(v) => state_vals.get(v).copied(),
+                Expr::Var(v) => match binding_of(v, render_cfg) {
+                    Some(Expr::StateVal(l)) => Some(*l),
+                    _ => None,
+                },
                 _ => None,
             };
             if let Some(l) = exact_local {
@@ -81,20 +90,57 @@ pub(crate) fn collect_effect_triggers(
                 });
                 continue;
             }
+            // May rows: every slot one of the name's bindings is, through
+            // any chain of renames — a primitive slot's env value carries no
+            // labels (ADR-017), so the syntax is the only record of it — and
+            // every slot the evaluated value is versioned by.
+            let mut slots: BTreeSet<QualifiedSlot> = BTreeSet::new();
+            if let Expr::Var(v) = dep.peel_ts() {
+                slots.extend(
+                    bound_slots(v, &bindings)
+                        .into_iter()
+                        .map(|l| (component, l)),
+                );
+            }
             let val = match dep.peel_ts() {
                 Expr::MemoVal(l) | Expr::CallbackVal(l) => memo.get(*l),
                 Expr::Var(v) if memo_vals.contains_key(v) => memo.get(memo_vals[v]),
                 other => eval(other),
             };
             if let Stability::Versioned(labels) = &val.reference {
-                for &slot in labels {
-                    out.push(EffectTrigger {
-                        hook: *label,
-                        dep: i,
-                        slot,
-                        exact: false,
-                    });
+                slots.extend(labels.iter().copied());
+            }
+            for slot in slots {
+                out.push(EffectTrigger {
+                    hook: *label,
+                    dep: i,
+                    slot,
+                    exact: false,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The state slots `var` may be bound to: the `StateVal` right-hand sides of
+/// every binding of the name, renames followed through every binding of the
+/// intermediate names.
+fn bound_slots(var: &str, bindings: &HashMap<&str, Vec<&Expr>>) -> BTreeSet<HookLabel> {
+    let mut out = BTreeSet::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut stack = vec![var];
+    while let Some(v) = stack.pop() {
+        if !seen.insert(v) {
+            continue;
+        }
+        for rhs in bindings.get(v).into_iter().flatten() {
+            match rhs.peel_ts() {
+                Expr::StateVal(l) => {
+                    out.insert(*l);
                 }
+                Expr::Var(w) => stack.push(w.as_str()),
+                _ => {}
             }
         }
     }

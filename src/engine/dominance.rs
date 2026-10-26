@@ -1,6 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::ir::{cfg::CFG, types::BlockId};
+use crate::ir::{
+    cfg::{CFG, Terminator},
+    types::BlockId,
+};
 
 /// Compute dominator sets iteratively. Returns `dom[b]` = set of blocks dominating `b`.
 pub fn compute_dominators(cfg: &CFG) -> HashMap<BlockId, HashSet<BlockId>> {
@@ -89,6 +92,115 @@ pub fn on_all_paths(cfg: &CFG, blocks: &HashSet<BlockId>) -> bool {
         }
     }
     true
+}
+
+/// For every block, the branch blocks that control it: exactly one side of the
+/// branch reaches it (the reachability definition `MountIndex` already uses).
+/// Render dependence (ADR-041) charges a block's writes and returns to these
+/// conditions.
+pub(crate) fn controlling_branches(cfg: &CFG) -> HashMap<BlockId, Vec<BlockId>> {
+    branches_over(cfg, |_, rt, re| {
+        rt.symmetric_difference(re).copied().collect()
+    })
+}
+
+/// For every block, the branch blocks whose condition *selects* what the
+/// block assigns: one side of the branch reaches the block, and the block
+/// reaches a point both sides reach — the merge where the two arms' values
+/// meet (#197). A guard whose other side exits the body (`if (!ctx) throw`,
+/// an early `return`) controls everything after it but selects nothing: no
+/// render compares the continuation's values with the exiting arm's.
+pub(crate) fn selecting_branches(cfg: &CFG) -> HashMap<BlockId, Vec<BlockId>> {
+    branches_over(cfg, |cfg, rt, re| {
+        let merge: HashSet<BlockId> = rt.intersection(re).copied().collect();
+        if merge.is_empty() {
+            return HashSet::new();
+        }
+        // Backward reachability from the merge points.
+        let mut reaches_merge: HashSet<BlockId> = merge.clone();
+        let mut stack: Vec<BlockId> = merge.iter().copied().collect();
+        while let Some(b) = stack.pop() {
+            for p in cfg.predecessors(b) {
+                if reaches_merge.insert(p) {
+                    stack.push(p);
+                }
+            }
+        }
+        rt.symmetric_difference(re)
+            .filter(|b| reaches_merge.contains(b))
+            .copied()
+            .collect()
+    })
+}
+
+/// For every `return` block, the branch blocks whose condition *selects*
+/// what it returns: one side of the branch reaches it, and the other side
+/// reaches a `return` of its own (#197). The body's exit is where those two
+/// values meet — the merge [`selecting_branches`] looks for inside the body —
+/// so `() => { if (c) return a; return b; }` returns `a ⊔ b ⊔ may(c)`. A
+/// guard whose other side throws selects nothing here either.
+pub(crate) fn returning_branches(cfg: &CFG) -> HashMap<BlockId, Vec<BlockId>> {
+    let returns: HashSet<BlockId> = cfg
+        .blocks
+        .values()
+        .filter(|b| matches!(b.term, Terminator::Return(_)))
+        .map(|b| b.id)
+        .collect();
+    branches_over(cfg, |_, rt, re| {
+        let mut out = HashSet::new();
+        for (side, other) in [(rt, re), (re, rt)] {
+            if other.iter().any(|b| returns.contains(b)) {
+                out.extend(
+                    side.difference(other)
+                        .filter(|b| returns.contains(b))
+                        .copied(),
+                );
+            }
+        }
+        out
+    })
+}
+
+/// For each branch, the blocks `pick` chooses from the blocks its two sides
+/// reach (`rt` from the `then` side, `re` from the `else` side), inverted
+/// into "block → branches".
+fn branches_over(
+    cfg: &CFG,
+    pick: impl Fn(&CFG, &HashSet<BlockId>, &HashSet<BlockId>) -> HashSet<BlockId>,
+) -> HashMap<BlockId, Vec<BlockId>> {
+    let branches: Vec<(BlockId, BlockId, BlockId)> = cfg
+        .blocks
+        .iter()
+        .filter_map(|(id, b)| match b.term {
+            Terminator::Branch { then_, else_, .. } => Some((*id, then_, else_)),
+            _ => None,
+        })
+        .collect();
+    let mut out: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    if branches.is_empty() {
+        return out;
+    }
+    // Forward reachability from each branch side, once per side.
+    let reach = |from: BlockId| -> HashSet<BlockId> {
+        let mut seen = HashSet::from([from]);
+        let mut stack = vec![from];
+        while let Some(b) = stack.pop() {
+            for s in cfg.successors(b) {
+                if seen.insert(s) {
+                    stack.push(s);
+                }
+            }
+        }
+        seen
+    };
+    for (br, t, e) in branches {
+        let rt = reach(t);
+        let re = reach(e);
+        for b in pick(cfg, &rt, &re) {
+            out.entry(b).or_default().push(br);
+        }
+    }
+    out
 }
 
 /// Precomputed dominator relation for one CFG. Build once, query in O(1)·set —
