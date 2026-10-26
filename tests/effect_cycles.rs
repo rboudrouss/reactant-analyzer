@@ -1643,3 +1643,21 @@ export function C() {
 "#;
     assert!(!loop_severities(src, "C").is_empty());
 }
+
+#[test]
+fn a_read_that_is_not_a_dep_carries_its_own_edge() {
+    // `a` moves without re-running the first effect, and the re-run `b`
+    // causes stores the new `a` (#204).
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [a, setA] = useState(false);
+  const [b, setB] = useState(false);
+  const [y, setY] = useState<boolean | null>(null);
+  useEffect(() => { setY(a); }, [b]);
+  useEffect(() => { setA(!a); setB(!b); }, [y]);
+  return <div />;
+}
+"#;
+    assert!(!loop_severities(src, "C").is_empty());
+}

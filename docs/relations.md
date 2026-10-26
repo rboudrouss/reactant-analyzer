@@ -162,9 +162,17 @@ of `x` re-runs an effect whose write may change `y`. Nothing is walked. The
 graph warns unless convergence is proven instead of looking for growth, and
 four proofs settle a write: `written.change` is `Never`, or `Once` with no
 other write moving the slot away; the write reads neither `x` nor its own
-slot (`Invariance::reads`), so a change of `x` re-runs it to the same value;
-every write of the slot moves it one way by a constant into a finite
-interval; or the guard proofs.
+slot (`Invariance::reads`) and crosses no call that may allocate, so a
+change of `x` re-runs it to the same value; every write of the slot moves
+it one way by a constant into a finite interval; or the guard proofs.
+
+The third proof moves the edge rather than deleting it. "The same value"
+holds only if nothing the write reads moved since its last run, and a read
+that is not a trigger moves without re-running the effect: the next re-run
+stores its new value. So for such a write the edge sources are the slots
+it reads, trigger or not, and the triggers it does not read carry none
+(#204). A prop it reads is a source only through the effect's trigger rows
+on parent slots; a prop read that is no dep has no node of its own (#207).
 
 | column | claim | polarity |
 |---|---|---|

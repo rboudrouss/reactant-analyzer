@@ -12,7 +12,9 @@
 //! content; it stores one value known in advance and no other write moves
 //! the slot away; it reads neither the trigger nor its own slot
 //! (`Invariance::reads`) and crosses no call that may allocate (#218), so
-//! the re-run stores what the last run did; every
+//! the re-run stores what the last run did — unless a read moved in
+//! between, which is why every slot such a write reads is an edge into its
+//! slot, trigger or not (#204); every
 //! write of the slot moves it one way by a constant into a finite interval
 //! (`moves_one_way`); or the guard proofs below.
 //!
@@ -877,6 +879,18 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             if let Some((why, false)) = f.always {
                 for &x in &every_render {
                     push(x, EdgeStrength::May, false, Some(why));
+                }
+            }
+            // The reads-kill says a re-run stores what the last run stored,
+            // which holds only if nothing the write reads moved in between. A
+            // read that is no trigger moves without re-running the effect,
+            // and the next re-run a trigger causes stores its new value: the
+            // write's edges come from what it reads, trigger or not (#204).
+            if let Some(r) = &reads
+                && !f.triggers.is_empty()
+            {
+                for &l in &r.slots {
+                    push((f.comp, l), EdgeStrength::May, false, None);
                 }
             }
         }
