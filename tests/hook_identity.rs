@@ -171,6 +171,27 @@ fn a_barrel_import_reaches_the_re_exported_definition() {
     }
 }
 
+/// A default import of a barrel that forwards its default
+/// (`export { default } from "./useThing"`) reaches that file's default
+/// export.
+#[test]
+fn a_default_import_reaches_a_forwarded_default() {
+    let tmp = Tmp::new("default-barrel");
+    tmp.write("App.tsx", &app(r#"import useThing from "./lib";"#));
+    tmp.write("a/useThing.ts", CLEAN);
+    tmp.write("lib/index.ts", r#"export { default } from "./useThing";"#);
+    tmp.write(
+        "lib/useThing.ts",
+        &BUGGY.replace("export function", "export default function"),
+    );
+
+    let found = findings(&tmp);
+    assert!(
+        app_defect(&found),
+        "`./lib` forwards the default of `lib/useThing.ts`; got {found:?}"
+    );
+}
+
 /// The mirror image: the barrel's target is clean and the first homonym by
 /// path is buggy. Following the name instead of the chain reports a defect the
 /// program cannot have.

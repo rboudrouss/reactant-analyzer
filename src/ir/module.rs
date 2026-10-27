@@ -116,7 +116,14 @@ impl ReExportGraph {
                 found = Some(hit);
             }
         }
-        found
+        // A default import is asked for under its local name. A name the
+        // module neither exports, declares nor reaches through a star would
+        // not link as a named import, so it is the default: `export { default
+        // } from "./x"` forwards it to `./x`, under the same name.
+        found.or_else(|| {
+            let (_, from, _) = edges.named.iter().find(|(e, _, _)| e == "default")?;
+            self.walk(from, name, defines, seen)
+        })
     }
 }
 
@@ -290,6 +297,37 @@ mod tests {
         let g = graph(&[("/index.ts", r)]);
         let defines = |f: &Path, _: &str| f == Path::new("/a.ts");
         assert_eq!(g.origin(Path::new("/index.ts"), "useA", &defines), None);
+    }
+
+    /// `export { default } from "./def"` forwards the default import, which
+    /// is asked for under its local name.
+    #[test]
+    fn a_default_import_follows_a_forwarded_default() {
+        let g = graph(&[(
+            "/index.ts",
+            ReExports {
+                named: vec![named("default", "/def.ts", "default")],
+                ..Default::default()
+            },
+        )]);
+        let defines = |f: &Path, n: &str| f == Path::new("/def.ts") && n == "useA";
+        assert_eq!(
+            g.origin(Path::new("/index.ts"), "useA", &defines),
+            Some((PathBuf::from("/def.ts"), "useA".to_string()))
+        );
+    }
+
+    /// A name a star re-export provides is that named export, not the default.
+    #[test]
+    fn a_star_provided_name_is_not_the_forwarded_default() {
+        let mut r = star(&["/named.ts"]);
+        r.named.push(named("default", "/def.ts", "default"));
+        let g = graph(&[("/index.ts", r)]);
+        let defines = |f: &Path, n: &str| f != Path::new("/index.ts") && n == "useA";
+        assert_eq!(
+            g.origin(Path::new("/index.ts"), "useA", &defines),
+            Some((PathBuf::from("/named.ts"), "useA".to_string()))
+        );
     }
 
     #[test]
