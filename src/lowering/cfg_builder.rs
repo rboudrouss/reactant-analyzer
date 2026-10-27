@@ -774,7 +774,13 @@ fn lower_iter_loop(
 fn lower_switch(sw: &SwitchStatement, builder: &mut BlockBuilder) {
     let exit_block = builder.new_block();
     let disc = lower_expr(&sw.discriminant, builder);
-    builder.push_stmt(Stmt::ExprStmt(disc, None));
+    // Evaluated once, then compared against each case's test.
+    let disc_var = builder.fresh_temp();
+    builder.push_stmt(Stmt::Let {
+        var: disc_var.clone(),
+        rhs: disc,
+        span: None,
+    });
 
     if sw.cases.is_empty() {
         let b = builder.seal_with(Terminator::Jump(exit_block));
@@ -783,12 +789,13 @@ fn lower_switch(sw: &SwitchStatement, builder: &mut BlockBuilder) {
         return;
     }
 
-    // One block per case, fronted by a chain of opaque dispatches: dispatch `i`
-    // either enters case `i` or moves on to dispatch `i + 1`, and the last one
-    // falls to the exit. Which case matches is not a truthiness test on the
-    // discriminant, so every dispatch is opaque, and no case has to match — the
-    // exit is reachable without entering any of them (a `default` clause is
-    // over-approximated as optional).
+    // One block per case, fronted by a chain of dispatches: dispatch `i`
+    // tests `disc == test_i`, either enters case `i` or moves on to dispatch
+    // `i + 1`, and the last one falls to the exit. The test is what the case
+    // depends on: an element rendered under `switch (step.type)` has its mount
+    // condition read `step`. A `default` clause has no test, so its dispatch
+    // is opaque (`true`, which narrows nothing and is taken both ways): it is
+    // over-approximated as optional.
     //
     // Chaining the consequents into one straight line instead was an
     // under-approximation twice over: entering `case 2` without running `case 1`
@@ -803,8 +810,16 @@ fn lower_switch(sw: &SwitchStatement, builder: &mut BlockBuilder) {
 
     for (i, &case_block) in case_blocks.iter().enumerate() {
         let skip_to = later_dispatch.get(i).copied().unwrap_or(exit_block);
+        let cond = match &sw.cases[i].test {
+            Some(test) => Expr::BinOp {
+                op: crate::ir::expr::BinOp::Eq,
+                lhs: Box::new(Expr::Var(disc_var.clone())),
+                rhs: Box::new(lower_expr(test, builder)),
+            },
+            None => Expr::Lit(Prim::Bool(true)),
+        };
         let d = builder.seal_with(Terminator::Branch {
-            cond: Expr::Lit(Prim::Bool(true)),
+            cond,
             then_: case_block,
             else_: skip_to,
             span: None,
@@ -1195,6 +1210,43 @@ mod tests {
             1,
             "the no-case-matched edge is the only way here, and it must exist: {:?}",
             cfg.edges
+        );
+    }
+
+    /// Which case runs depends on the discriminant: each case's dispatch tests
+    /// it, so whatever reads the branch conditions (a mount guard) sees it. A
+    /// `default` has no test and stays opaque.
+    #[test]
+    fn a_switch_dispatch_tests_the_discriminant() {
+        let cfg = cfg_of("switch (s.type) { case \"a\": f(); break; default: g(); }");
+        let conds: Vec<&Expr> = cfg
+            .blocks
+            .values()
+            .filter_map(|b| match &b.term {
+                Terminator::Branch { cond, .. } => Some(cond),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(conds.len(), 2, "{conds:?}");
+        let disc = cfg
+            .blocks
+            .values()
+            .flat_map(|b| &b.stmts)
+            .find_map(|s| match s {
+                Stmt::Let {
+                    var,
+                    rhs: Expr::FieldAccess { field, .. },
+                    ..
+                } if field == "type" => Some(var.clone()),
+                _ => None,
+            })
+            .expect("the discriminant is bound once");
+        assert!(conds.iter().any(|c| matches!(c,
+            Expr::BinOp { lhs, .. } if matches!(lhs.as_ref(), Expr::Var(v) if *v == disc))));
+        assert!(
+            conds
+                .iter()
+                .any(|c| matches!(c, Expr::Lit(Prim::Bool(true))))
         );
     }
 
