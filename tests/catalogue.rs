@@ -713,8 +713,9 @@ fn catalogue() -> Vec<Entry> {
                      mutation site rooted outside the body, or a setter call, is PRESENT: \
                      whether a given call reaches it is conditional, which is why the class \
                      is may-typed and capped at Warning. The claim is made strictly for a \
-                     proven root — a receiver the chase cannot place, including the \
-                     kind-ambiguous fresh methods of the closed wontfix #22, stays non-impure, \
+                     proven root — a receiver the chase cannot place, including a \
+                     `slice`/`concat` copy (the chase is syntactic and reads no receiver kind, \
+                     which the value domain uses for #22), stays non-impure, \
                      an accepted under-fire. The certain same-reference case keeps its native \
                      Error through `must_same_ref_mutation`, untouched by this",
                 ),

@@ -240,7 +240,7 @@ fn eval_state_value(
             eval_unary(op, v)
         }
 
-        Expr::Call { fn_, .. } if returns_fresh_reference(fn_) => {
+        Expr::Call { fn_, .. } if returns_fresh_reference(fn_, env, ctx) => {
             StateValue::reference(Stability::PerRender)
         }
         Expr::Call { .. } => StateValue::top(),
@@ -294,15 +294,21 @@ fn summary_value(sv: &crate::ir::expr::SummaryValue) -> StateValue {
 /// lets `always-unstable-deps` *prove* that `const items = arr.map(f)` in a
 /// deps array defeats memoization.
 ///
-/// Two exclusions keep the proof honest (FP-averse):
+/// Two cases keep the proof honest (FP-averse):
 /// - **kind-ambiguous methods** (`slice`, `concat`): on a string receiver
 ///   they return a *primitive*, which `Object.is` value-compares — claiming
-///   a per-render reference for `id.slice(0, 8)` would be a false proof.
-///   They stay ⊤ (silent).
+///   a per-render reference for `id.slice(0, 8)` would be a false proof. So
+///   the receiver decides: one that can only be a reference is copied; any
+///   other leaves the result ⊤ (#22). A nullish receiver is excluded too:
+///   `xs?.slice()` lowers as `xs.slice()` and hands back `undefined`.
 /// - **in-place methods** (`sort`, `reverse`, `fill`, `copyWithin`,
 ///   `Object.assign`): they return the receiver itself — same identity, the
 ///   opposite fact.
-fn returns_fresh_reference(callee: &Expr) -> bool {
+fn returns_fresh_reference(
+    callee: &Expr,
+    env: &AbstractEnv<StateValue>,
+    ctx: &mut AnalysisCtx<StateValue>,
+) -> bool {
     match callee {
         // `structuredClone(x)` always allocates a deep copy.
         Expr::Var(v) => v == "structuredClone",
@@ -311,6 +317,7 @@ fn returns_fresh_reference(callee: &Expr) -> bool {
             // string receiver has none of these).
             "map" | "filter" | "flat" | "flatMap" | "toSorted" | "toReversed" | "toSpliced"
             | "with" | "split" => true,
+            "slice" | "concat" => eval_state_value(obj, env, ctx).is_reference_only(),
             // Static allocators — receiver-restricted: a bare `.from`/`.keys`
             // on an unknown object could be anything.
             "from" | "of" => matches!(obj.as_ref(), Expr::Var(v) if v == "Array"),
@@ -320,7 +327,7 @@ fn returns_fresh_reference(callee: &Expr) -> bool {
             "parse" => matches!(obj.as_ref(), Expr::Var(v) if v == "JSON"),
             _ => false,
         },
-        Expr::TSAnnotated(inner) => returns_fresh_reference(inner),
+        Expr::TSAnnotated(inner) => returns_fresh_reference(inner, env, ctx),
         _ => false,
     }
 }

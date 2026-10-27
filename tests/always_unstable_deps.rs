@@ -274,6 +274,41 @@ fn kind_ambiguous_slice_stays_silent() {
 }
 
 #[test]
+fn slice_and_concat_of_an_array_fire() {
+    // #22: the receiver is a state array, so it can only be a reference, and
+    // `slice`/`concat` copy it at every render.
+    let h = hits(
+        r#"
+        import { useEffect, useState } from "react";
+        function C() {
+            const [items] = useState([3, 1, 2]);
+            const copy = items.slice();
+            const more = items.concat([4]);
+            useEffect(() => {}, [copy]);
+            useEffect(() => {}, [more]);
+            return <div/>;
+        }
+        "#,
+    );
+    assert_eq!(h, 2, "a copy of an array in deps must fire");
+}
+
+#[test]
+fn slice_of_a_string_literal_stays_silent() {
+    let h = hits(
+        r#"
+        import { useEffect } from "react";
+        function C() {
+            const s = "abcdef".slice(1);
+            useEffect(() => {}, [s]);
+            return <div/>;
+        }
+        "#,
+    );
+    assert_eq!(h, 0, "a string's slice is a primitive");
+}
+
+#[test]
 fn in_place_sort_stays_silent() {
     // `.sort()` returns the RECEIVER (same identity), not a fresh array —
     // the opposite fact. Must not read PerRender.
