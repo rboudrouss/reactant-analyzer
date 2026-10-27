@@ -1427,6 +1427,52 @@ export function App() {
 }
 
 #[test]
+fn a_child_its_grandparent_may_unmount_proves_no_loop() {
+    // #213: `Mid` renders `Child` on every path, but `App` hides `Mid` in its
+    // mount batch, and `Child` goes with it. Staying mounted is transitive.
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Child() {
+  const [s, setS] = useState<number[]>([]);
+  useEffect(() => { setS([...s, 1]); }, [s]);
+  return <div />;
+}
+function Mid() { return <Child />; }
+export function App() {
+  const [shown, setShown] = useState(true);
+  useEffect(() => { setShown(false); }, []);
+  return <div>{shown && <Mid />}</div>;
+}
+"#;
+    let sevs = loop_severities(src, "Child");
+    assert!(
+        !sevs.is_empty() && !sevs.contains(&Severity::Error),
+        "the grandparent may unmount the child with its parent: {sevs:?}"
+    );
+}
+
+#[test]
+fn a_child_every_ancestor_keeps_mounted_keeps_the_error() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Child() {
+  const [s, setS] = useState<number[]>([]);
+  useEffect(() => { setS([...s, 1]); }, [s]);
+  return <div />;
+}
+function Mid() { return <Child />; }
+export function App() {
+  return <div><Mid /></div>;
+}
+"#;
+    let sevs = loop_severities(src, "Child");
+    assert!(
+        sevs.contains(&Severity::Error),
+        "an unconditional chain of parents keeps the child mounted: {sevs:?}"
+    );
+}
+
+#[test]
 fn a_prop_or_a_memo_over_it_is_not_fresh_at_the_childs_own_renders() {
     // Fuzz seed 1, program 1706: `p` is new at each render of `App` only.
     let src = r#"

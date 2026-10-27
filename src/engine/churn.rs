@@ -96,7 +96,7 @@ use crate::{
         ComponentId, QualifiedSlot, SourceRange,
         bindings::{local_bindings, must_slot_read},
         cfg::{CFG, Terminator},
-        expr::{CompOrigin, Expr, SPREAD_KEY_PREFIX, object_member},
+        expr::{Expr, SPREAD_KEY_PREFIX, object_member},
         hooks::HookEntry,
         types::{BlockId, HookLabel, Symbol, Var},
     },
@@ -177,6 +177,75 @@ impl ChurnGraph {
 /// The slot a writer row writes, qualified by its owner.
 fn node_of(component: ComponentId, w: &SlotWriter) -> QualifiedSlot {
     (w.owner.unwrap_or(component), w.slot)
+}
+
+/// One element of a component in another one's render: where it mounts.
+struct Element<'a> {
+    /// The component whose render builds the element, and hands it its
+    /// props.
+    parent: ComponentId,
+    /// The element is built inside a closure (`items.map(i => <Child/>)`),
+    /// which mounts it once per item the loop may add.
+    closure: bool,
+    /// What must hold still in the parent for the element to stay mounted:
+    /// the guards of its block and its `key`.
+    held: Vec<&'a Expr>,
+}
+
+/// The program's component tree, child → the elements that mount it (#213).
+/// A component another one renders only through a value the lowering cannot
+/// place (`origin: None`) has no element here.
+type ComponentTree<'a> = HashMap<ComponentId, Vec<Element<'a>>>;
+
+fn component_tree(result: &ProgramAnalysisResult) -> ComponentTree<'_> {
+    /// Every node under `e`, with whether it sits inside a closure.
+    fn walk<'a>(e: &'a Expr, closure: bool, f: &mut dyn FnMut(&'a Expr, bool)) {
+        f(e, closure);
+        if let Expr::FnLit { body_cfg, .. } = e {
+            body_cfg.for_each_expr(&mut |x| walk(x, true, f));
+        }
+        e.for_each_child(&mut |c| walk(c, closure, f));
+    }
+    let mut tree: ComponentTree = HashMap::new();
+    for (&parent, r) in &result.components {
+        let cfg = &r.render_cfg;
+        for block in cfg.blocks.values() {
+            let guards: Vec<&Expr> = site_guards(cfg, block.id)
+                .into_iter()
+                .map(|(c, _)| c)
+                .collect();
+            block.for_each_expr(&mut |e| {
+                walk(e, false, &mut |e, closure| {
+                    let Expr::CompApp {
+                        origin: Some(o),
+                        props,
+                        ..
+                    } = e
+                    else {
+                        return;
+                    };
+                    let Some(child) = result.component_table.id_of(o) else {
+                        return;
+                    };
+                    if child == parent {
+                        return;
+                    }
+                    let mut held = guards.clone();
+                    if let Expr::ObjectLit { fields, .. } = props.peel_ts()
+                        && let Some(key) = object_member(fields, "key")
+                    {
+                        held.push(key);
+                    }
+                    tree.entry(child).or_default().push(Element {
+                        parent,
+                        closure,
+                        held,
+                    });
+                });
+            });
+        }
+    }
+    tree
 }
 
 /// Build all churn edges of the program.
@@ -287,26 +356,27 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         );
     }
 
+    // Which components stay mounted across the loop, on the component tree
+    // (#162, #213).
+    let tree = component_tree(result);
+    let mut stays_memo: HashMap<ComponentId, bool> = HashMap::new();
+    let kept_mounted: HashMap<ComponentId, bool> = result
+        .components
+        .keys()
+        .map(|&c| {
+            (
+                c,
+                stays(c, &tree, result, &ctxs, navigates, &mut stays_memo),
+            )
+        })
+        .collect();
+
     for (&comp, comp_result) in &result.components {
         let cfg = &comp_result.render_cfg;
         let hook = |label: HookLabel| comp_result.hooks.iter().find(|h| h.label() == label);
         // Mount-only effects fire once for a component that stays mounted —
         // but only an array the engine knows is empty says so.
         let mount_only = |label: HookLabel| comp_result.rerun(label) == Some(Rerun::MountOnly);
-        // Does the owner of a slot this component writes from a mount-only
-        // effect keep this component mounted across the loop (#162)? An
-        // owner that renders it nowhere — the child reached through another
-        // component — fails closed.
-        let stays_mounted = |owner: ComponentId| {
-            let Some(child) = result.component_table.origin(comp) else {
-                return false;
-            };
-            let (Some(parent), Some(pctx)) = (result.components.get(&owner), ctxs.get(&owner))
-            else {
-                return false;
-            };
-            stays_mounted(parent, pctx, &invariance_of(pctx, navigates), child) == Some(true)
-        };
         for w in comp_result
             .slot_writers
             .iter()
@@ -319,7 +389,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     None => None,
                     // A child the loop mounts and unmounts fires it every
                     // round.
-                    Some(owner) if stays_mounted(owner) => None,
+                    Some(_) if kept_mounted[&comp] => None,
                     Some(_) => hook(l).and_then(HookEntry::body_cfg),
                 },
                 WriterRegion::Effect(l) | WriterRegion::Memo(l) => {
@@ -435,55 +505,39 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             navigates,
         }
     }
-    /// Does `parent` mount `child` once and keep it mounted across the
-    /// loop? Every element of `child` in the parent's render sits under
-    /// guards that hold still, carries no `key` or one that holds, and is
-    /// outside any closure. `None` when the parent renders no element of
-    /// `child`: whether that keeps it mounted is the caller's reading.
-    fn stays_mounted(
-        parent: &AnalysisResult<StateValue>,
-        ctx: &CompCtx<'_>,
-        invariance: &Invariance<'_>,
-        child: &CompOrigin,
-    ) -> Option<bool> {
-        /// Every node under `e`, with whether it sits inside a closure.
-        fn walk(e: &Expr, closure: bool, f: &mut dyn FnMut(&Expr, bool)) {
-            f(e, closure);
-            if let Expr::FnLit { body_cfg, .. } = e {
-                body_cfg.for_each_expr(&mut |x| walk(x, true, f));
-            }
-            e.for_each_child(&mut |c| walk(c, closure, f));
+    /// Does every element that mounts `c` keep it mounted across the loop,
+    /// and is its parent kept mounted in turn (#213)? An element keeps its
+    /// child when it sits outside any closure, under guards that hold still
+    /// in the parent, with no `key` or one that holds. A component no
+    /// element mounts is a root and stays; one the table cannot place, or
+    /// one met again while its own answer is pending (a component that
+    /// renders an ancestor of itself), fails closed.
+    fn stays(
+        c: ComponentId,
+        tree: &ComponentTree<'_>,
+        result: &ProgramAnalysisResult,
+        ctxs: &HashMap<ComponentId, CompCtx<'_>>,
+        navigates: bool,
+        memo: &mut HashMap<ComponentId, bool>,
+    ) -> bool {
+        if let Some(&s) = memo.get(&c) {
+            return s;
         }
-        let cfg = &parent.render_cfg;
-        let held = |e: &Expr| invariance.holds(e, &ctx.render_lets, ctx.props_hold);
-        let mut found = false;
-        let mut ok = true;
-        for block in cfg.blocks.values() {
-            let mut visit = |e: &Expr| {
-                walk(e, false, &mut |e, closure| {
-                    if let Expr::CompApp {
-                        origin: Some(o),
-                        props,
-                        ..
-                    } = e
-                        && **o == *child
-                    {
-                        found = true;
-                        // An element a callback renders (`items.map(i =>
-                        // <Child/>)`) mounts once per item the loop may add.
-                        ok &= !closure;
-                        ok &= site_guards(cfg, block.id).iter().all(|(c, _)| held(c));
-                        if let Expr::ObjectLit { fields, .. } = props.peel_ts()
-                            && let Some(key) = object_member(fields, "key")
-                        {
-                            ok &= held(key);
-                        }
-                    }
-                });
-            };
-            block.for_each_expr(&mut visit);
-        }
-        found.then_some(ok)
+        memo.insert(c, false);
+        let s = result.component_table.origin(c).is_some()
+            && tree.get(&c).is_none_or(|els| {
+                els.iter().all(|e| {
+                    let ctx = &ctxs[&e.parent];
+                    let invariance = invariance_of(ctx, navigates);
+                    !e.closure
+                        && e.held
+                            .iter()
+                            .all(|x| invariance.holds(x, &ctx.render_lets, ctx.props_hold))
+                        && stays(e.parent, tree, result, ctxs, navigates, memo)
+                })
+            });
+        memo.insert(c, s);
+        s
     }
     fn site_of<'a>(s: &SiteRef<'a>, convergent: bool) -> WriteSite<'a> {
         WriteSite {
@@ -694,26 +748,6 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             }
         }
     }
-    // The re-render a loop needs happens only if its component is still
-    // mounted, and a parent whose guard or key moves may unmount it in the
-    // very batch that should re-run it: every parent that renders it keeps
-    // it mounted (#162's proof), or none renders it and it is a root.
-    let mut kept_mounted: HashMap<ComponentId, bool> = HashMap::new();
-    let mut stays_mounted_everywhere = |comp: ComponentId| {
-        *kept_mounted.entry(comp).or_insert_with(|| {
-            let Some(child) = result.component_table.origin(comp) else {
-                return false;
-            };
-            result
-                .components
-                .iter()
-                .filter(|(p, _)| **p != comp)
-                .all(|(p, parent)| {
-                    let pctx = &ctxs[p];
-                    stays_mounted(parent, pctx, &invariance_of(pctx), child) != Some(false)
-                })
-        })
-    };
     for f in &facts {
         let ctx = &ctxs[&f.comp];
         let invariance = invariance_of(ctx);
@@ -821,7 +855,10 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 && w.block.is_some()
                 && on_all_paths(f.body_cfg, &fresh_blocks)
                 && !restorable.contains(&node)
-                && stays_mounted_everywhere(f.comp);
+                // The re-render a loop needs happens only if its component
+                // is still mounted: an ancestor whose guard or key moves may
+                // unmount it in the very batch that should re-run it.
+                && kept_mounted[&f.comp];
             let strength = if must_write {
                 EdgeStrength::Must
             } else {
