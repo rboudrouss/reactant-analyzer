@@ -70,8 +70,19 @@ jobs:
       # fails. Whether the *number* is acceptable is the next step's job.
       # Every rule is on, the off-by-default ones included: the corpus measures
       # the engine, and those rules exercise it as much as any other.
+      # One process per repo: each repo is its own project (its own aliases
+      # and import scopes), and the whole tree in one process does not fit
+      # the runner's memory once those imports resolve.
       - name: Run the analyzer over the corpus
-        run: ./target/release/reactant --format json --fail-on never --config tests/fixtures/all-rules.json test-repo > corpus-run.json
+        run: |
+          mkdir -p corpus-runs
+          for repo in test-repo/*/; do
+            name=$(basename "$repo")
+            start=$(date +%s)
+            ./target/release/reactant --format json --fail-on never --config tests/fixtures/all-rules.json "$repo" > "corpus-runs/$name.json"
+            echo "$name: $(( $(date +%s) - start )) s"
+          done
+          ./scripts/corpus-merge.py corpus-run.json corpus-runs/*.json
 
       - name: Compare against the committed baseline
         run: ./scripts/corpus-baseline.py corpus-run.json
