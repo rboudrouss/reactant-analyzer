@@ -718,45 +718,59 @@ impl<'a> Analyzer<'a> {
         let mut out_env: HashMap<BlockId, Env> = HashMap::new();
         let mut pc: HashMap<BlockId, Deps> = HashMap::new();
         let order = cfg.rpo();
-        let mut converged = false;
-        for _ in 0..MAX_ROUNDS {
-            let mut changed = false;
-            for &b in &order {
-                let Some(block) = cfg.blocks.get(&b) else {
-                    continue;
-                };
-                let mut p = outer.pc.clone();
-                for br in controllers.get(&b).into_iter().flatten() {
-                    if let (Some(env), Some(Terminator::Branch { cond, .. })) =
-                        (out_env.get(br), cfg.blocks.get(br).map(|x| &x.term))
-                    {
-                        p.union_with(&self.eval(cond, env).deps);
-                    }
+        // Worklist in RPO priority: a block is revisited only when its input
+        // env or one of its controlling conditions changed. A sweep of every
+        // block per round re-cloned and re-compared each block's whole env
+        // just to confirm nothing moved, which a large render body (many
+        // spliced hooks: many blocks, many names) cannot afford.
+        let pos: HashMap<BlockId, usize> = order.iter().enumerate().map(|(i, b)| (*b, i)).collect();
+        let mut controls: HashMap<BlockId, Vec<usize>> = HashMap::new();
+        for (b, brs) in &controllers {
+            if let Some(&i) = pos.get(b) {
+                for br in brs {
+                    controls.entry(*br).or_default().push(i);
                 }
-                if pc.get(&b) != Some(&p) {
-                    pc.insert(b, p.clone());
-                    changed = true;
-                }
-                let mut env = in_env.get(&b).cloned().unwrap_or_default();
-                for stmt in &block.stmts {
-                    self.transfer(stmt, &mut env, &p);
-                }
-                for s in cfg.successors(b) {
-                    let slot = in_env.entry(s).or_default();
-                    changed |= join_env(slot, &env);
-                }
-                if out_env.get(&b) != Some(&env) {
-                    out_env.insert(b, env);
-                    changed = true;
-                }
-            }
-            if !changed {
-                converged = true;
-                break;
             }
         }
-        if !converged {
-            self.top = true;
+        let mut dirty: BTreeSet<usize> = (0..order.len()).collect();
+        // The same budget as `MAX_ROUNDS` sweeps of every block.
+        let mut budget = MAX_ROUNDS * order.len();
+        while let Some(i) = dirty.pop_first() {
+            if budget == 0 {
+                // Fail closed: the summary degrades to ⊤.
+                self.top = true;
+                break;
+            }
+            budget -= 1;
+            let b = order[i];
+            let Some(block) = cfg.blocks.get(&b) else {
+                continue;
+            };
+            let mut p = outer.pc.clone();
+            for br in controllers.get(&b).into_iter().flatten() {
+                if let (Some(env), Some(Terminator::Branch { cond, .. })) =
+                    (out_env.get(br), cfg.blocks.get(br).map(|x| &x.term))
+                {
+                    p.union_with(&self.eval(cond, env).deps);
+                }
+            }
+            let mut env = in_env.get(&b).cloned().unwrap_or_default();
+            for stmt in &block.stmts {
+                self.transfer(stmt, &mut env, &p);
+            }
+            pc.insert(b, p);
+            for s in cfg.successors(b) {
+                let slot = in_env.entry(s).or_default();
+                if join_env(slot, &env)
+                    && let Some(&j) = pos.get(&s)
+                {
+                    dirty.insert(j);
+                }
+            }
+            if out_env.get(&b) != Some(&env) {
+                out_env.insert(b, env);
+                dirty.extend(controls.get(&b).into_iter().flatten().copied());
+            }
         }
         // Collection pass: sites, and what the CFG uses.
         for &b in &order {
