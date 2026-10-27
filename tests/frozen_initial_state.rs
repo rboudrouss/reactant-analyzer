@@ -585,6 +585,91 @@ fn a_ternary_guarded_on_the_seed_itself_downgrades_to_info() {
     );
 }
 
+/// The stepper of twenty's spreadsheet import (corpus triage 3, E3): the child
+/// mounts only under `switch (cur.type)`, and every write of `cur` while it is
+/// mounted either changes `type` or stores the same object. A guard on the
+/// feeder's own discriminant moves with every write of the feeder.
+const STEPPER: &str = r#"
+    import { useCallback, useState } from "react";
+    function Stepper({ init }) {
+      const [cur, setCur] = useState(init ?? { type: "upload" });
+      const [prev, setPrev] = useState(init ?? { type: "upload" });
+      const handleBack = useCallback(() => {
+        setCur(prev);
+      }, [prev]);
+      switch (cur.type) {
+        case "upload":
+          return <button onClick={() => { setPrev(cur); setCur({ type: "sheet", wb: { names: ["a"] } }); }} />;
+        case "sheet":
+          return <Sheet names={cur.wb.names} onBack={handleBack} onNext={() => { setPrev(cur); setCur({ type: "header" }); }} />;
+        default:
+          return <div onClick={handleBack} />;
+      }
+    }
+    function Sheet({ names, onBack, onNext }) {
+      const [value, setValue] = useState(names[0]);
+      return (
+        <div>
+          {names.map((n) => <input key={n} checked={value === n} onChange={() => setValue(n)} />)}
+          <button onClick={onBack} />
+          <button onClick={onNext} />
+        </div>
+      );
+    }
+"#;
+
+#[test]
+fn a_switch_on_the_feeders_own_discriminant_caps_proven_at_warning() {
+    let d = diags_for(STEPPER, "Sheet");
+    assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
+    assert_eq!(d[0].severity(), Severity::Warning, "{d:?}");
+}
+
+#[test]
+fn a_story_site_without_the_feeder_does_not_restore_the_error() {
+    // The Storybook site passes constants: it neither carries the feeder nor
+    // couples anything, and must not keep the verdict `Free`.
+    let src = format!(
+        "{STEPPER}\n{}",
+        r#"
+        const NAMES = ["x", "y"];
+        function SheetStory() {
+          return <Sheet names={NAMES} onBack={() => null} onNext={() => null} />;
+        }
+        "#
+    );
+    let d = diags_for(&src, "Sheet");
+    assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
+    assert_eq!(d[0].severity(), Severity::Warning, "{d:?}");
+}
+
+#[test]
+fn a_call_site_the_feeder_does_not_reach_caps_proven_at_warning() {
+    // `Parent` alone would be the certain freeze; an instance mounted by
+    // `Story` never sees `user` move, so the defect is not certain wherever
+    // `Child` runs.
+    let d = diags_for(
+        r#"
+        import { useState } from "react";
+        const ADA = { name: "ada" };
+        function Parent() {
+          const [user, setUser] = useState({ name: "a" });
+          return <Child user={user} onRename={() => setUser({ name: "b" })} />;
+        }
+        function Story() {
+          return <Child user={ADA} onRename={() => null} />;
+        }
+        function Child({ user }) {
+          const [local, setLocal] = useState(user);
+          return <button onClick={() => setLocal({ name: "c" })}>{local.name}</button>;
+        }
+        "#,
+        "Child",
+    );
+    assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
+    assert_eq!(d[0].severity(), Severity::Warning, "{d:?}");
+}
+
 #[test]
 fn every_writable_feeder_is_named() {
     // Two parents feed `Child` from their own state (#175 joins the call

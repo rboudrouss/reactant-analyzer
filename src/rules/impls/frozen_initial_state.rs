@@ -33,11 +33,13 @@ use crate::rules::{
 ///   actually be written in its owner, no effect keyed on the prop (and no
 ///   render-time write) syncs the local slot, the local setter never escapes
 ///   this component (nothing else could sync it), and the move is *observable*
-///   — no call site ties the mount condition to the feeder's own writers.
+///   — no call site ties the mount condition to the feeder's own writers, and
+///   every analysed call site passes the feeder.
 /// - **Warning**: the freeze is real but the prop's motion is not proven
 ///   (props ⊤ in intra-only analysis, `VersionedTop`, per-render or unknown
 ///   values), or the proof chain has a hole (setter escapes, feeding slot's
-///   owner unavailable, mount writer-coupled).
+///   owner unavailable, mount writer-coupled, a call site the feeder does not
+///   reach).
 /// - **Info**: intent is declared — every seeding prop is *named* for
 ///   seed-once (`initial*` / `default*`) with unproven motion, the local slot
 ///   is never written at all (`const [{ snap }] = useState(...)`: a deliberate
@@ -199,8 +201,11 @@ impl Rule for FrozenInitialState {
                     // `escaped`: something outside this component holds the
                     // setter — an unseen sync path may exist. `WriterCoupled`:
                     // the mount condition moves with the feeder, so no mounted
-                    // instance need ever observe the change.
-                    let severity = if escaped || mount == MountCoupling::WriterCoupled {
+                    // instance need ever observe the change. `Unfed`: some
+                    // instance is mounted where no feeder reaches it.
+                    let severity = if escaped
+                        || matches!(mount, MountCoupling::WriterCoupled | MountCoupling::Unfed)
+                    {
                         Severity::Warning
                     } else {
                         Severity::Error
