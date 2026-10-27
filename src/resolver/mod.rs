@@ -127,7 +127,7 @@ impl ImportResolver for ChainResolver {
 /// The scope whose root is the **longest** prefix of the importing file wins,
 /// so a nested package overrides its parent; a file under no scope goes to
 /// `fallback`. Same longest-prefix discipline as tsconfig `paths`. Roots and
-/// importing files are compared [`normalize`]d, so `./app` scopes `app/x.ts`.
+/// importing files are compared normalized, so `./app` scopes `app/x.ts`.
 pub struct ScopedResolver {
     scopes: Vec<(PathBuf, Box<dyn ImportResolver>)>,
     fallback: Box<dyn ImportResolver>,
