@@ -51,10 +51,11 @@
 //! in another component has guards this component's env cannot read, so
 //! such a slot is never killed; a handler row needs a user event and is not
 //! a site. One kill, one proof, for the dep-driven same-slot edge too. The
-//! proof reads facts over props only in a component no effect of which
-//! reacts to a parent slot: a loop can enter a component through its props
-//! only by such a dep, and then the props may move on any cycle through it,
-//! whichever edge the cycle takes.
+//! proof reads facts over props only in a component whose props hold: no
+//! write the loop can run moves a slot of an ancestor on the component tree,
+//! and no effect of it reacts to another component's slot. Otherwise the
+//! props may move on any cycle through it, whichever edge the cycle takes —
+//! an effect with no deps array re-runs on them with no trigger row (#206).
 //!
 //! **What is a site** (#162): every non-handler row of an effect, render
 //! or memo body — a `setter-in-render` write revives what it revives — and,
@@ -248,6 +249,21 @@ fn component_tree(result: &ProgramAnalysisResult) -> ComponentTree<'_> {
     tree
 }
 
+/// Every component whose render builds `c`'s element or an ancestor's: the
+/// components whose re-render may hand `c` new props.
+fn ancestors(c: ComponentId, tree: &ComponentTree<'_>) -> HashSet<ComponentId> {
+    let mut seen: HashSet<ComponentId> = HashSet::new();
+    let mut stack = vec![c];
+    while let Some(x) = stack.pop() {
+        for e in tree.get(&x).into_iter().flatten() {
+            if seen.insert(e.parent) {
+                stack.push(e.parent);
+            }
+        }
+    }
+    seen
+}
+
 /// Build all churn edges of the program.
 pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
     // Per-component facts the proofs read.
@@ -263,11 +279,12 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         memo_deps: HashMap<HookLabel, &'a [Expr]>,
         render_lets: HashMap<&'a str, Option<&'a Expr>>,
         mutated: HashSet<Var>,
-        /// No effect of the component reacts to another component's slot, so
-        /// no loop enters it through its props: they hold across every loop
-        /// its edges can be on. One dep versioned by a parent slot, and the
-        /// props may move on any cycle through the component — the proofs
-        /// then read no fact over them.
+        /// The props hold across every loop the component's edges can be on:
+        /// no write the loop can run moves a slot of an ancestor (#206), and
+        /// no effect of the component reacts to another component's slot.
+        /// Otherwise the props may move on any cycle through the component —
+        /// the proofs then read no fact over them. An effect with no deps
+        /// array has no trigger row, so the rows alone cannot say it.
         props_hold: bool,
         /// The render exit env: what the proofs narrow from.
         exit: AbstractEnv<StateValue>,
@@ -317,6 +334,21 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 .any(|b| navigates(b, &render))
     });
 
+    // The component tree (#213), and the components a write the loop can run
+    // may move a slot of: a write through a callback prop included, so
+    // wherever it sits — the child itself, a sibling subtree (#206).
+    let tree = component_tree(result);
+    let moved_owners: HashSet<ComponentId> = result
+        .components
+        .iter()
+        .flat_map(|(&c, r)| {
+            r.slot_writers
+                .iter()
+                .filter(|w| w.phase != WriterPhase::Handler)
+                .map(move |w| node_of(c, w).0)
+        })
+        .collect();
+
     for (&comp, comp_result) in &result.components {
         let cfg = &comp_result.render_cfg;
         let mut mutated = module_written.clone();
@@ -350,7 +382,8 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     .collect(),
                 render_lets: let_bindings(cfg),
                 mutated,
-                props_hold: comp_result.effect_triggers.iter().all(|t| t.slot.0 == comp),
+                props_hold: comp_result.effect_triggers.iter().all(|t| t.slot.0 == comp)
+                    && ancestors(comp, &tree).is_disjoint(&moved_owners),
                 exit: comp_result.exit_env(),
             },
         );
@@ -358,7 +391,6 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
 
     // Which components stay mounted across the loop, on the component tree
     // (#162, #213).
-    let tree = component_tree(result);
     let mut stays_memo: HashMap<ComponentId, bool> = HashMap::new();
     let kept_mounted: HashMap<ComponentId, bool> = result
         .components

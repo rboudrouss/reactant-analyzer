@@ -1452,6 +1452,57 @@ export function App() {
 }
 
 #[test]
+fn a_prop_an_automatic_write_moves_holds_for_no_proof() {
+    // #206: the no-deps effect has no trigger row, but `bump` writes `App`'s
+    // slot, which is `p`: the two writes contradict each other on a prop that
+    // moves, and React loops through both components.
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Child({ p, bump }: { p: boolean; bump: () => void }) {
+  const [s, setS] = useState(false);
+  useEffect(() => {
+    if (p && !s) setS(true);
+    if (!p && s) setS(false);
+  });
+  useEffect(() => { bump(); }, [s]);
+  return <div>{String(s)}</div>;
+}
+export function App() {
+  const [n, setN] = useState(false);
+  return <Child p={n} bump={() => setN(!n)} />;
+}
+"#;
+    let sevs = loop_severities(src, "Child");
+    assert!(
+        !sevs.is_empty(),
+        "the prop moves with the slot `bump` writes: {sevs:?}"
+    );
+}
+
+#[test]
+fn a_prop_only_a_handler_moves_holds_across_the_loop() {
+    // The same two writes, with `App`'s slot written by a click only: no
+    // automatic write moves the prop, and the writes contradict on it.
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Child({ p }: { p: boolean }) {
+  const [s, setS] = useState(false);
+  useEffect(() => {
+    if (p && !s) setS(true);
+    if (!p && s) setS(false);
+  });
+  return <div>{String(s)}</div>;
+}
+export function App() {
+  const [n, setN] = useState(false);
+  return <div><button onClick={() => setN(!n)} /><Child p={n} /></div>;
+}
+"#;
+    let sevs = loop_severities(src, "Child");
+    assert!(sevs.is_empty(), "the prop holds across the loop: {sevs:?}");
+}
+
+#[test]
 fn a_child_every_ancestor_keeps_mounted_keeps_the_error() {
     let src = r#"
 import { useState, useEffect } from 'react';
