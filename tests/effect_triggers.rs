@@ -328,6 +328,43 @@ fn a_dep_that_is_a_new_reference_every_render_reruns_the_effect_every_render() {
 }
 
 #[test]
+fn an_element_in_the_deps_reruns_the_effect_every_render() {
+    // #200: `createElement` allocates at every render, a host element and a
+    // component's alike. Read as stable, the effect was mount-only.
+    let r = parse_and_analyze(
+        r#"
+        import { useState, useEffect } from "react";
+        function Child() { return <span />; }
+        export function C() {
+          const [t, setT] = useState(false);
+          const el = <div />;
+          const child = <Child />;
+          useEffect(() => { setT(!t); }, [el]);
+          useEffect(() => { setT(!t); }, [child]);
+          return <p>{String(t)}</p>;
+        }
+        "#,
+    );
+    let c = comp(&r, "C");
+    let effects: Vec<HookLabel> = c
+        .hooks
+        .iter()
+        .filter_map(|h| match h {
+            HookEntry::Effect { label, .. } => Some(*label),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(effects.len(), 2);
+    for e in effects {
+        assert_eq!(
+            c.rerun(e),
+            Some(Rerun::Always(Always::FreshDep(0))),
+            "effect {e}"
+        );
+    }
+}
+
+#[test]
 fn a_dep_reading_a_ref_contents_may_rerun_the_effect_every_render() {
     // #201: `ref.current` is a cell an effect assigns without any slot
     // moving. The ref object itself is one reference for the instance's

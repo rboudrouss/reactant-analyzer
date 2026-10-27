@@ -220,14 +220,19 @@ fn eval_state_value(
         Expr::ObjectLit { .. } => StateValue::reference(Stability::PerRender),
         Expr::ArrayLit { .. } => StateValue::reference(Stability::PerRender),
         Expr::FnLit { .. } => StateValue::reference(Stability::PerRender),
-        Expr::NativeElem { .. } => StateValue::reference(Stability::Stable),
+        // An element is an object `createElement` allocates at every render
+        // (#200); a component's is evaluated for what its child does.
+        Expr::NativeElem { .. } => StateValue::reference(Stability::PerRender),
 
         Expr::CompApp {
             name,
             props,
             origin,
             ..
-        } => eval_comp_app(name, props, origin.as_deref(), env, ctx),
+        } => {
+            eval_comp_app(name, props, origin.as_deref(), env, ctx);
+            StateValue::reference(Stability::PerRender)
+        }
 
         Expr::BinOp { op, lhs, rhs } => {
             let l = eval_state_value(lhs, env, ctx);
@@ -533,20 +538,21 @@ fn callee_setter(
     }
 }
 
-/// Evaluate a component application: inline child analysis if inter-component context present.
+/// Evaluate a component application for its effects: inline child analysis
+/// if inter-component context present.
 fn eval_comp_app(
     name: &Symbol,
     props_expr: &Expr,
     origin: Option<&CompOrigin>,
     env: &AbstractEnv<StateValue>,
     ctx: &mut AnalysisCtx<StateValue>,
-) -> StateValue {
+) {
     let Some(inter) = ctx.inter else {
         // Intra-component analysis: every child is unanalyzable, so any
         // setter escaping into props may be invoked with any argument —
         // same argument as the unknown-child branch below (TODO.md B).
         havoc_setter_props(props_expr, env, ctx);
-        return StateValue::reference(Stability::Stable);
+        return;
     };
 
     // Registry lookup. The JSX callee name is only how the child was
@@ -558,7 +564,7 @@ fn eval_comp_app(
             Some(id) => id,
             // Unreachable: `resolve_child` only answers with a key this
             // registry holds, and every one of those was interned.
-            None => return StateValue::reference(Stability::Stable),
+            None => return,
         },
         // A child the analysis cannot pin down may invoke any setter it
         // receives, with any argument, at any time (`<Sheet
@@ -580,7 +586,7 @@ fn eval_comp_app(
                 refs.insert((inter.component, name.clone()));
             }
             havoc_setter_props(props_expr, env, ctx);
-            return StateValue::reference(Stability::Stable);
+            return;
         }
     };
 
@@ -591,14 +597,14 @@ fn eval_comp_app(
         stats
             .recursive_component_refs
             .insert((inter.component, child));
-        return StateValue::reference(Stability::Stable);
+        return;
     }
     // Unreachable — `resolve_child` just resolved it — but an unknown child may
     // invoke any setter it received, so the fallback is the unknown-child one,
     // never a silent skip.
     let Some(child_ir) = inter.registry.ir_of(child).cloned() else {
         havoc_setter_props(props_expr, env, ctx);
-        return StateValue::reference(Stability::Stable);
+        return;
     };
 
     // Evaluate props → abstract map (EnvVals, preserving heap Locs for FnLit props)
@@ -619,7 +625,7 @@ fn eval_comp_app(
     {
         inter.stats.borrow_mut().cache_hits += 1;
         record_call_site(inter, child, abstract_props, None);
-        return StateValue::reference(Stability::Stable);
+        return;
     }
     inter.stats.borrow_mut().cache_misses += 1;
 
@@ -656,8 +662,6 @@ fn eval_comp_app(
         .borrow_mut()
         .insert(child, abstract_props.clone(), child_result);
     record_call_site(inter, child, abstract_props, None);
-
-    StateValue::reference(Stability::Stable)
 }
 
 /// Evaluate field access: read the member off every heap object the receiver
