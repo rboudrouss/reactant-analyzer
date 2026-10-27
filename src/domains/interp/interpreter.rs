@@ -366,47 +366,36 @@ fn exec_stmt_core<T: Transfer>(
         // among several and the Loc set may name several allocation sites, so
         // join, never replace.
         Stmt::MemberWrite { obj, key, rhs, .. } => {
-            if let Expr::FnLit {
-                id,
-                params,
-                body_cfg,
-            } = rhs
-            {
-                ctx.heap.alloc_fn(*id, params, body_cfg, env);
-            }
+            let rhs_ids = alloc_literal(transfer, rhs, env, ctx);
             let val = transfer.eval_expr(rhs, env, ctx);
-            if let (Expr::Var(v), MemberKey::Field(field)) = (obj, key)
-                && let Some(EnvVal::Loc { ids, .. }) = env.lookup_env_val(v)
-            {
-                let Some(sv) = val.as_state_value() else {
-                    return;
-                };
-                let new_val = match rhs {
-                    Expr::FnLit { id, .. } => EnvVal::Loc {
-                        ids: std::collections::HashSet::from([*id]),
-                        val: sv,
-                    },
-                    _ => EnvVal::Val(sv),
-                };
-                for id in ids.iter().copied().collect::<Vec<_>>() {
-                    if let Some(HeapValue::Obj(fields)) = ctx.heap.get_mut(id) {
-                        // Values always join; the allocation sites survive only
-                        // when both sides have them (a plain value overwriting
-                        // a literal leaves nothing to chase).
-                        let joined = match (fields.get(field), &new_val) {
-                            (None, new) => new.clone(),
-                            (Some(old), new) => {
-                                let val = old.as_val().join(&new.as_val());
-                                match (old.locs(), new.locs()) {
-                                    (Some(a), Some(b)) => EnvVal::Loc {
-                                        ids: a.union(b).copied().collect(),
-                                        val,
-                                    },
-                                    _ => EnvVal::Val(val),
-                                }
+            let Some(sv) = val.as_state_value() else {
+                return;
+            };
+            let new_val = match rhs_ids {
+                Some(ids) => EnvVal::Loc { ids, val: sv },
+                None => EnvVal::Val(sv),
+            };
+            // The member the write names: a field, or a constant index. Any
+            // other key may be any member — the write joins into each.
+            let member = match key {
+                MemberKey::Field(field) => Some(field.clone()),
+                MemberKey::Index(idx) => match idx.peel_ts() {
+                    Expr::Lit(crate::ir::expr::Prim::Int(i)) if *i >= 0 => Some(i.to_string()),
+                    _ => None,
+                },
+            };
+            for id in resolve_locs(obj, env, ctx.heap).unwrap_or_default() {
+                if let Some(HeapValue::Obj(fields)) = ctx.heap.get_mut(id) {
+                    match &member {
+                        Some(m) => {
+                            let joined = join_member(fields.get(m), &new_val);
+                            fields.insert(m.clone(), joined);
+                        }
+                        None => {
+                            for slot in fields.values_mut() {
+                                *slot = join_member(Some(slot), &new_val);
                             }
-                        };
-                        fields.insert(field.clone(), joined);
+                        }
                     }
                 }
             }
@@ -415,6 +404,66 @@ fn exec_stmt_core<T: Transfer>(
         // routes them to `exec_expr_effects`. Kept as an explicit arm (not `_`)
         // so a new `Stmt` variant still breaks this match.
         Stmt::ExprStmt(..) => {}
+    }
+}
+
+/// A weak write of `new` into a heap member: the values join and the
+/// allocation sites unite, as two bindings of a name do at an env join — a
+/// member that may hold a closure may be called, whatever else it may hold.
+fn join_member(old: Option<&EnvVal<StateValue>>, new: &EnvVal<StateValue>) -> EnvVal<StateValue> {
+    let Some(old) = old else {
+        return new.clone();
+    };
+    let val = old.as_val().join(&new.as_val());
+    match (old.locs(), new.locs()) {
+        (None, None) => EnvVal::Val(val),
+        (a, b) => EnvVal::Loc {
+            ids: a.into_iter().chain(b).flatten().copied().collect(),
+            val,
+        },
+    }
+}
+
+/// A call that mutates its receiver in place (`t.reverse()`, `t.unshift(f)`,
+/// `Object.assign(t, o)`) may move any member to any position, store any
+/// argument, or empty a position: every member of each object the receiver
+/// may name becomes the join of all of them, the arguments and `undefined`.
+fn havoc_members<T: Transfer>(
+    transfer: &T,
+    receiver: &Expr,
+    args: &[Expr],
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+) {
+    let Some(ids) = resolve_locs(receiver, env, ctx.heap) else {
+        return;
+    };
+    let mut all = EnvVal::Val(StateValue::undefined());
+    for arg in args {
+        let locs = alloc_literal(transfer, arg, env, ctx);
+        let val = transfer
+            .eval_expr(arg, env, ctx)
+            .as_state_value()
+            .unwrap_or_else(StateValue::top);
+        let arg = match locs {
+            Some(ids) => EnvVal::Loc { ids, val },
+            None => EnvVal::Val(val),
+        };
+        all = join_member(Some(&all), &arg);
+    }
+    for id in &ids {
+        if let Some(HeapValue::Obj(fields)) = ctx.heap.get(*id) {
+            for member in fields.values() {
+                all = join_member(Some(&all), member);
+            }
+        }
+    }
+    for id in ids {
+        if let Some(HeapValue::Obj(fields)) = ctx.heap.get_mut(id) {
+            for member in fields.values_mut() {
+                *member = all.clone();
+            }
+        }
     }
 }
 
@@ -437,24 +486,16 @@ fn bind_rhs<T: Transfer>(
     if let Expr::CallbackVal(label) = rhs {
         env.bind_callback(var.to_string(), *label);
     }
-    if let Expr::FnLit {
-        id,
-        params,
-        body_cfg,
-    } = rhs
-    {
-        env.extend_loc(var.to_string(), *id);
-        ctx.heap.alloc_fn(*id, params, body_cfg, env);
-    }
-    // An object literal is a fresh container, but its members keep their own
-    // identities: `{ onClear }` where `onClear` is a `useCallback` is a new
-    // object every render holding the SAME function. Recording the per-member
-    // map on the heap is what lets `o.onClear` resolve to the member's own
-    // value instead of inheriting the container's `PerRender` (issue #88).
-    if let Expr::ObjectLit { id, fields } = rhs {
-        let members = obj_members(transfer, fields, env, ctx);
-        ctx.heap.insert(*id, HeapValue::Obj(members));
-        env.extend_loc(var.to_string(), *id);
+    // A literal is allocated, and a name or member chain shares the sites it
+    // points to (`let __obj = __p0`, `let f = props.onClick`). An object
+    // literal is a fresh container whose members keep their own identities:
+    // `{ onClear }` where `onClear` is a `useCallback` is a new object every
+    // render holding the SAME function, which `o.onClear` reads through the
+    // heap instead of inheriting the container's `PerRender` (issue #88).
+    if let Some(ids) = alloc_literal(transfer, rhs, env, ctx) {
+        for id in ids {
+            env.extend_loc(var.to_string(), id);
+        }
     }
     // A library hook whose contract is per member (`useForm()` promises
     // `setValue` is the same function every render, and promises nothing about
@@ -476,28 +517,12 @@ fn bind_rhs<T: Transfer>(
         ctx.heap.insert(*id, HeapValue::Obj(fields));
         env.extend_loc(var.to_string(), *id);
     }
-    // Propagate heap locs for variable aliases (e.g. destructuring preamble:
-    // `let __obj = __p0` where __p0 carries the props heap location).
     if let Expr::Var(src) = rhs {
-        if let Some(EnvVal::Loc { ids, .. }) = env.lookup_env_val(src) {
-            for &id in ids.iter().collect::<Vec<_>>() {
-                env.extend_loc(var.to_string(), id);
-            }
-        }
         if let Some(label) = env.setter_label(src) {
             env.bind_setter(var.to_string(), label);
         }
         if let Some(label) = env.callback_label(src) {
             env.bind_callback(var.to_string(), label);
-        }
-    }
-    // Propagate heap locs from a member chain (e.g. `let f = props.onClick`
-    // where onClick is a FnLit stored in the parent's heap under the Obj).
-    if let Expr::FieldAccess { .. } = rhs
-        && let Some(ids) = resolve_locs(rhs, env, ctx.heap)
-    {
-        for id in ids {
-            env.extend_loc(var.to_string(), id);
         }
     }
     // A slot read, or a rename of one, certifies the name (#197); any
@@ -514,45 +539,72 @@ fn bind_rhs<T: Transfer>(
     }
 }
 
-/// Per-member `EnvVal`s of an object literal, for the heap `Obj` entry.
+/// The allocation sites `expr` denotes, allocating the literals it is: the one
+/// place a literal becomes a heap value, shared by every binding (`let`, `=`,
+/// `o.f =`), every member of an enclosing literal and every JSX prop (#216).
 ///
-/// A member that is (or aliases) a function literal keeps its heap location so
-/// `o.f` stays callable; everything else is the member expression's abstract
-/// value. Members written before a spread are dropped: `{ a, ...rest }` may
-/// overwrite `a` with something this map cannot see, and an absent member falls
-/// back to the container's own value — sound, just imprecise.
-fn obj_members<T: Transfer>(
+/// A function literal is a closure; an object literal an `Obj` of its
+/// members; an array literal an `Obj` of its elements under their indices
+/// (`"0"`, `"1"`…, the keys a constant index reads) — only when every
+/// position is known, i.e. no spread and no elision. Anything else is what
+/// [`resolve_locs`] places, or `None`.
+pub(crate) fn alloc_literal<T: Transfer>(
     transfer: &T,
-    fields: &[(Symbol, Expr)],
+    expr: &Expr,
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
-) -> HashMap<Symbol, EnvVal<StateValue>> {
-    let mut out = HashMap::new();
-    for (key, value) in crate::ir::expr::members_after_last_spread(fields) {
-        let ids = match value {
-            Expr::FnLit {
-                id,
-                params,
-                body_cfg,
-            } => {
-                ctx.heap.alloc_fn(*id, params, body_cfg, env);
-                Some(std::iter::once(*id).collect())
-            }
-            _ => resolve_locs(value, env, ctx.heap),
-        };
+) -> Option<std::collections::HashSet<crate::ir::types::ExprId>> {
+    let (id, fields): (_, Vec<(Symbol, &Expr)>) = match expr.peel_ts() {
+        Expr::FnLit {
+            id,
+            params,
+            body_cfg,
+        } => {
+            ctx.heap.alloc_fn(*id, params, body_cfg, env);
+            return Some(std::iter::once(*id).collect());
+        }
+        // Members written before a spread are dropped: `{ a, ...rest }` may
+        // overwrite `a` with something this map cannot see, and an absent
+        // member falls back to the container's own value.
+        Expr::ObjectLit { id, fields } => (
+            *id,
+            crate::ir::expr::members_after_last_spread(fields)
+                .iter()
+                .map(|(k, v)| (k.clone(), v))
+                .collect(),
+        ),
+        Expr::ArrayLit {
+            id,
+            elems,
+            arity,
+            spread_at,
+        } => {
+            let exact = spread_at.is_empty() && arity.exact() == Some(elems.len());
+            let elems = elems.iter().filter(|_| exact);
+            (
+                *id,
+                elems.enumerate().map(|(i, v)| (i.to_string(), v)).collect(),
+            )
+        }
+        other => return resolve_locs(other, env, ctx.heap),
+    };
+    let mut members = HashMap::new();
+    for (key, value) in fields {
+        let ids = alloc_literal(transfer, value, env, ctx);
         let val = transfer
             .eval_expr(value, env, ctx)
             .as_state_value()
             .unwrap_or_else(StateValue::top);
-        out.insert(
-            key.clone(),
+        members.insert(
+            key,
             match ids {
                 Some(ids) => EnvVal::Loc { ids, val },
                 None => EnvVal::Val(val),
             },
         );
     }
-    out
+    ctx.heap.insert(id, HeapValue::Obj(members));
+    Some(std::iter::once(id).collect())
 }
 
 /// The one transfer for "write a state slot": a call `f(arg)` whose callee is
@@ -679,17 +731,22 @@ fn exec_callbacks_depth<T: Transfer>(
                         }
                         let _ = exec_body_depth(transfer, body_cfg, &sub_env, ctx, depth + 1);
                     }
-                    // B5: variable callback resolve Identifier to heap Fn and execute.
-                    Expr::Var(name) if class == TriggerClass::InCycle && !capped => {
-                        exec_var_callback(transfer, name, env, ctx, depth);
-                    }
                     // Setter/Subscription/Unknown inline closures not descended:
                     // a setter's updater runs in the slot write below.
                     Expr::FnLit { .. } => {}
                     other => {
                         exec_callbacks_depth(transfer, other, env, ctx, depth);
+                        // B5: a callback passed by name or member chain
+                        // (`setTimeout(tick)`, `setTimeout(api.tick)`) runs
+                        // the heap closures it resolves to.
+                        if class == TriggerClass::InCycle && !capped {
+                            exec_fn_value(transfer, other, env, ctx, depth);
+                        }
                     }
                 }
+            }
+            if let Some(receiver) = crate::ir::expr::mutation_receiver(expr) {
+                havoc_members(transfer, receiver, args, env, ctx);
             }
             // B6: direct local call inlining — an Unknown callee that resolves
             // to a heap Fn, or a literal called where it is written (#186).
@@ -723,10 +780,12 @@ fn exec_callbacks_depth<T: Transfer>(
 }
 
 /// Run a function value for its effects, as calling it does: a literal's body
-/// directly (an IIFE, `(() => setN(1))()`, #186), a name through the heap
-/// ([`exec_var_callback`]). Parameters are ⊤. Also how an effect's returned
-/// cleanup runs, which React calls (#171). Returns what the call returns, as
-/// [`exec_var_callback`] does; `None` when no body ran whole.
+/// directly (an IIFE, `(() => setN(1))()`, #186), a name or a member chain
+/// (`api.tick()`, `t[1]()`, #216) through the heap closures it resolves to
+/// ([`exec_heap_fns`]), a `useCallback` name through its hook body.
+/// Parameters are ⊤. Also how an effect's returned cleanup runs, which React
+/// calls (#171). Returns what the call returns; `None` when no body ran
+/// whole.
 pub(crate) fn exec_fn_value<T: Transfer>(
     transfer: &T,
     callee: &Expr,
@@ -751,67 +810,72 @@ pub(crate) fn exec_fn_value<T: Transfer>(
             ))
             .filter(|v| !v.is_bottom())
         }
-        Expr::Var(name) => exec_var_callback(transfer, name, env, ctx, depth),
-        _ => None,
+        other => {
+            if let Some(ids) = resolve_locs(other, env, ctx.heap) {
+                return exec_heap_fns(transfer, ids, env, ctx, depth);
+            }
+            // useCallback binding: the body lives in the hook entry, not the
+            // heap (the rewrite to `CallbackVal` moved it out of the
+            // expression tree). Params stay unbound → env-miss ⊤, captures
+            // resolve in the live env.
+            if let Expr::Var(name) = other
+                && let Some(label) = env.callback_label(name)
+                && let Some(body_cfg) = ctx.query.callback_body(label)
+            {
+                let ret = exec_body_depth(transfer, &body_cfg, env, ctx, depth + 1);
+                return Some(ret).filter(|v| !v.is_bottom());
+            }
+            None
+        }
     }
 }
 
-/// Resolve a variable to its heap-stored Fn bodies and execute each for side effects.
-/// Used for B5 (variable callbacks: `setTimeout(cb)`) and B6 (direct calls: `load()`).
+/// Execute every heap closure among `ids` for its effects. Used for B5
+/// (callbacks: `setTimeout(cb)`) and B6 (direct calls: `load()`,
+/// `api.tick()`).
 ///
 /// Returns the join of what the bodies returned when every target was a
-/// body that ran: a name whose locations include anything else, or that
-/// resolves to no body, answers `None`; so does a body no run returns from.
-fn exec_var_callback<T: Transfer>(
+/// body that ran: locations that include anything else answer `None`; so
+/// does a body no run returns from.
+fn exec_heap_fns<T: Transfer>(
     transfer: &T,
-    name: &str,
+    ids: std::collections::HashSet<crate::ir::types::ExprId>,
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
 ) -> Option<T::Domain> {
-    if let Some(EnvVal::Loc { ids, .. }) = env.lookup_env_val(name) {
-        let ids: Vec<_> = ids.iter().copied().collect();
-        let mut returned = Some(T::Domain::bottom());
-        for id in ids {
-            if let Some(HeapValue::Fn {
-                params,
-                body_cfg,
-                captured,
-                captured_slots,
-            }) = ctx.heap.get(id)
-            {
-                let params = params.clone();
-                let body_cfg = Arc::clone(body_cfg);
-                let captured = captured.clone();
-                let captured_slots = captured_slots.clone();
-                let mut sub_env = env.clone();
-                for (var, val) in captured {
-                    sub_env.extend(var, T::Domain::from_state_value(val));
-                }
-                // The creation-time certificates, not the call site's: the
-                // body's `a` is the one it closed over.
-                for (var, label) in captured_slots {
-                    sub_env.bind_slot(var, label);
-                }
-                for p in &params {
-                    sub_env.extend(p.clone(), T::Domain::top());
-                }
-                let ret = exec_body_depth(transfer, &body_cfg, &sub_env, ctx, depth + 1);
-                returned = returned.map(|acc| acc.join(&ret));
-            } else {
-                returned = None;
+    let mut ids: Vec<_> = ids.into_iter().collect();
+    ids.sort();
+    let mut returned = Some(T::Domain::bottom());
+    for id in ids {
+        if let Some(HeapValue::Fn {
+            params,
+            body_cfg,
+            captured,
+            captured_slots,
+        }) = ctx.heap.get(id)
+        {
+            let params = params.clone();
+            let body_cfg = Arc::clone(body_cfg);
+            let captured = captured.clone();
+            let captured_slots = captured_slots.clone();
+            let mut sub_env = env.clone();
+            for (var, val) in captured {
+                sub_env.extend(var, T::Domain::from_state_value(val));
             }
+            // The creation-time certificates, not the call site's: the
+            // body's `a` is the one it closed over.
+            for (var, label) in captured_slots {
+                sub_env.bind_slot(var, label);
+            }
+            for p in &params {
+                sub_env.extend(p.clone(), T::Domain::top());
+            }
+            let ret = exec_body_depth(transfer, &body_cfg, &sub_env, ctx, depth + 1);
+            returned = returned.map(|acc| acc.join(&ret));
+        } else {
+            returned = None;
         }
-        return returned.filter(|v| !v.is_bottom());
     }
-    // useCallback binding: the body lives in the hook entry, not the heap
-    // (the rewrite to `CallbackVal` moved it out of the expression tree).
-    // Params stay unbound → env-miss ⊤, captures resolve in the live env.
-    if let Some(label) = env.callback_label(name)
-        && let Some(body_cfg) = ctx.query.callback_body(label)
-    {
-        let ret = exec_body_depth(transfer, &body_cfg, env, ctx, depth + 1);
-        return Some(ret).filter(|v| !v.is_bottom());
-    }
-    None
+    returned.filter(|v| !v.is_bottom())
 }

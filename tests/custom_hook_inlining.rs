@@ -567,6 +567,35 @@ fn a_tuple_setter_from_a_hook_loops_in_a_no_deps_effect() {
 }
 
 #[test]
+fn a_setter_called_off_a_named_hook_result_is_a_write() {
+    // #233: no destructuring to forward through — the result is a heap
+    // object, `t[1]` / `api.setV` read the setter off it, and the call is a
+    // row of the effect under the member's path.
+    for (ret, read, call) in [
+        ("[v, setV]", "t[0]", "t[1]"),
+        ("{ v, setV }", "t.v", "t.setV"),
+    ] {
+        let found = rules_for(
+            &format!(
+                r#"
+                function useSlot() {{
+                    const [v, setV] = useState(0);
+                    return {ret};
+                }}
+                function App() {{
+                    const t = useSlot();
+                    useEffect(() => {{ {call}({read} + 1); }});
+                    return <div>{{{read}}}</div>;
+                }}
+                "#
+            ),
+            "App",
+        );
+        assert!(fires(&found, "infinite-loop"), "{call}: {found:?}");
+    }
+}
+
+#[test]
 fn an_object_setter_from_a_hook_loops_in_an_effect() {
     let found = rules_for(
         r#"

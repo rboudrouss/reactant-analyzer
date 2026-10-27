@@ -6,7 +6,7 @@ use crate::{
     domains::{
         AbstractDomain, AnalysisCtx, Transfer,
         impls::{BoolVal, Interval, SetterVal, Stability, StateValue, StrConst},
-        interp::{exec_body, exec_stmt_with_callbacks},
+        interp::{alloc_literal, exec_body, exec_stmt_with_callbacks},
         stores::{AbstractEnv, EnvVal, Heap, HeapValue, resolve_locs},
     },
     engine::component_registry::ChildLookup,
@@ -615,35 +615,31 @@ fn eval_comp_app(
         .iter()
         .map(|(k, ev)| (k.clone(), ev.as_val()))
         .collect();
+    // The heap the child receives: everything its props reach, so a closure
+    // inside an object prop (`api={{ tick: cb }}`) is callable there (#216).
+    let props_heap = ctx.heap.reachable(
+        abstract_props_full
+            .values()
+            .filter_map(EnvVal::locs)
+            .flatten()
+            .copied(),
+    );
+    let cache_key = props_cache_key(&abstract_props, &props_heap);
 
     // Cache lookup (strict equality)
-    if inter
-        .cache
-        .borrow()
-        .lookup(child, &abstract_props)
-        .is_some()
-    {
+    if inter.cache.borrow().lookup(child, &cache_key).is_some() {
         inter.stats.borrow_mut().cache_hits += 1;
         record_call_site(inter, child, abstract_props, None);
         return;
     }
     inter.stats.borrow_mut().cache_misses += 1;
 
-    // Build child initial env + heap:
-    // - copy heap entries for any Loc-valued props (FnLit bodies) into child's heap
-    // - insert the Obj (with full EnvVals) so the child can resolve FieldAccess → Loc
+    // Build child initial env + heap: the props' reachable heap, plus the
+    // props Obj itself (with full EnvVals) so the child can resolve
+    // FieldAccess → Loc.
     let mut child_env = AbstractEnv::bottom();
     let props_id = ExprId::fresh();
-    let mut initial_heap = crate::domains::stores::Heap::new();
-    for ev in abstract_props_full.values() {
-        if let EnvVal::Loc { ids, .. } = ev {
-            for &id in ids {
-                if let Some(hv) = ctx.heap.get(id) {
-                    initial_heap.insert(id, hv.clone());
-                }
-            }
-        }
-    }
+    let mut initial_heap = props_heap;
     initial_heap.insert(props_id, HeapValue::Obj(abstract_props_full.clone()));
     child_env.extend_loc(child_ir.param.clone(), props_id);
 
@@ -660,8 +656,37 @@ fn eval_comp_app(
     inter
         .cache
         .borrow_mut()
-        .insert(child, abstract_props.clone(), child_result);
+        .insert(child, cache_key, child_result);
     record_call_site(inter, child, abstract_props, None);
+}
+
+/// What a child's analysis depends on, as the cache compares it: the props'
+/// values and the contents of the heap they reach — a closure's captured
+/// values, an object's members — under keys no prop name can take. Two
+/// renders passing `() => setN(n + 1)` pass the same reference, but the
+/// child runs the body under each `n`: a key without the captures answered
+/// the first one's result for every later `n`, and the loop it drives was
+/// never seen.
+fn props_cache_key(
+    props: &HashMap<Symbol, StateValue>,
+    reached: &Heap,
+) -> HashMap<Symbol, StateValue> {
+    let mut key = props.clone();
+    for (id, hv) in reached.iter() {
+        match hv {
+            HeapValue::Fn { captured, .. } => key.extend(
+                captured
+                    .iter()
+                    .map(|(v, val)| (format!("@{}:{v}", id.0), val.clone())),
+            ),
+            HeapValue::Obj(fields) => key.extend(
+                fields
+                    .iter()
+                    .map(|(m, ev)| (format!("@{}.{m}", id.0), ev.as_val())),
+            ),
+        }
+    }
+    key
 }
 
 /// Evaluate field access: read the member off every heap object the receiver
@@ -725,7 +750,8 @@ fn eval_index_access(
 ///
 /// Every prop carries its evaluated value; a prop that is (or aliases) a
 /// literal also carries the allocation sites, so the child can inline a
-/// callback prop's body or resolve a member of an object prop.
+/// callback prop's body or resolve a member of an object prop — an inline
+/// literal (`api={{ tick: cb }}`) is allocated as any literal is (#216).
 fn eval_props_map(
     props_expr: &Expr,
     env: &AbstractEnv<StateValue>,
@@ -735,18 +761,7 @@ fn eval_props_map(
         Expr::ObjectLit { fields, .. } => fields
             .iter()
             .map(|(k, v)| {
-                let ids = match v {
-                    // Inline FnLit prop: allocate a heap entry so the child can inline it.
-                    Expr::FnLit {
-                        id,
-                        params,
-                        body_cfg,
-                    } => {
-                        ctx.heap.alloc_fn(*id, params, body_cfg, env);
-                        Some(std::iter::once(*id).collect())
-                    }
-                    _ => resolve_locs(v, env, ctx.heap),
-                };
+                let ids = alloc_literal(&StateValueTransfer, v, env, ctx);
                 let val = eval_state_value(v, env, ctx);
                 let env_val = match ids {
                     Some(ids) => EnvVal::Loc { ids, val },

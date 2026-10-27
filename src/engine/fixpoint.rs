@@ -618,12 +618,10 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     let effect_info = collect_effect_info(&hooks);
     let handler_info = collect_handler_info(&hooks);
     // A write through a parent's setter prop is a row too, owner-qualified
-    // (ADR-042 §2) — the same resolution `setter-in-render` reads.
-    let foreign: HashMap<Var, crate::engine::setters::SetterProp> =
-        crate::engine::setters::collect_component_setter_vars(&render_cfg, &block_states, &heap)
-            .into_iter()
-            .filter(|(_, prop)| prop.component != comp_id)
-            .collect();
+    // (ADR-042 §2) — the same resolution `setter-in-render` reads — and so is
+    // one through a name or member the converged values bind to an own setter.
+    let converged_setters =
+        crate::engine::setters::collect_component_setter_vars(&render_cfg, &block_states, &heap);
     // The envs each row's argument is evaluated in: the converged stores, and
     // the per-block envs of the region the row sits in.
     let site_envs = crate::engine::written::SiteEnvs {
@@ -642,7 +640,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         &hooks,
         &inline_regions,
         &hook_provenance,
-        &foreign,
+        &converged_setters,
         &site_envs,
         &reducers,
     );

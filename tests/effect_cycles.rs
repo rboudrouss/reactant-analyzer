@@ -243,6 +243,59 @@ function Child({ value, onUpdate }) {
     );
 }
 
+#[test]
+fn a_closure_prop_over_a_moving_slot_is_rerun_at_each_value() {
+    // Every render passes `() => setN(n + 1)`: the same reference, but a
+    // closure over a new `n`. The child cache keyed on the props' values
+    // alone answered the first `n`'s analysis for every later one, so the
+    // write never grew past `1` and the loop was missed.
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Child({ tick }) {
+  useEffect(() => { tick(); });
+  return null;
+}
+export function App() {
+  const [n, setN] = useState(0);
+  const cb = () => setN(n + 1);
+  return <Child tick={cb} />;
+}
+"#;
+    let diags = infinite_loop_diags(src, "Child");
+    assert!(
+        diags
+            .iter()
+            .any(|(r, _, m)| r == "cross-component-infinite-loop" && m.contains("`tick`")),
+        "{diags:?}"
+    );
+}
+
+#[test]
+fn a_callback_inside_an_object_prop_is_run_by_the_child() {
+    // #216: `api.tick()` resolves through the object literal the parent
+    // passed, two heap levels deep, and its write into the parent's slot is
+    // a row of the child's effect.
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Child({ api }) {
+  useEffect(() => { api.h.tick(); });
+  return null;
+}
+export function App() {
+  const [n, setN] = useState(0);
+  const cb = () => setN(n + 1);
+  return <Child api={{ h: { tick: cb } }} />;
+}
+"#;
+    let diags = infinite_loop_diags(src, "Child");
+    assert!(
+        diags
+            .iter()
+            .any(|(r, _, m)| r == "cross-component-infinite-loop" && m.contains("`api.h.tick`")),
+        "{diags:?}"
+    );
+}
+
 // ── convergent / acyclic patterns → silent ───────────────────────────────────
 
 #[test]

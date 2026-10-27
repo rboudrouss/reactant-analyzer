@@ -266,6 +266,9 @@ pub(crate) struct SetterProp {
     /// handler, writes nothing when called. Both are still writes for a *may*
     /// reader — ⊤ over what the callee does — but only a must may be certified.
     pub must_write: bool,
+    /// Reached through a closure that captured the setter: calling the name
+    /// runs the closure, whose argument is not the one the setter stores.
+    pub closure: bool,
 }
 
 /// Collect variables in `cfg` whose abstract value at any block exit is
@@ -305,57 +308,97 @@ pub(crate) fn collect_component_setter_vars(
     let mut result: HashMap<Var, SetterProp> = HashMap::new();
     for env in cfg.blocks.keys().filter_map(|b| block_states.get(b)) {
         for var in &var_names {
-            if result.contains_key(var) {
+            let Some(ev) = env.lookup_env_val(var) else {
                 continue;
-            }
-            // Direct component-setter value (exact setter slot).
-            if let Some((component, label)) = env.lookup(var).as_setter() {
-                result.insert(
-                    var.clone(),
-                    SetterProp {
-                        component: *component,
-                        label: *label,
-                        must_write: true,
-                    },
-                );
-                continue;
-            }
-            // Loc pointing to a FnLit that captures a ComponentSetter
-            // (e.g. the parent passed `() => setCount(0)` as a prop).
-            // Allocation sites and captures are hash sets/maps, and the first
-            // setter found wins — so both are walked in sorted order (#120).
-            if let Some(EnvVal::Loc { ids, .. }) = env.lookup_env_val(var) {
-                let mut ids: Vec<_> = ids.iter().copied().collect();
+            };
+            // The name itself, then every member path of the objects it
+            // points to (`api.tick`, `t.1`): what `callee_path` names a member
+            // call by (#216, #233).
+            let mut stack: Vec<(Var, EnvVal<StateValue>)> = vec![(var.clone(), ev)];
+            let mut seen: HashSet<crate::ir::types::ExprId> = HashSet::new();
+            while let Some((name, ev)) = stack.pop() {
+                if !result.contains_key(&name)
+                    && let Some(prop) = setter_of(&ev, heap)
+                {
+                    result.insert(name.clone(), prop);
+                }
+                let mut ids: Vec<_> = ev.locs().into_iter().flatten().copied().collect();
                 ids.sort();
                 for id in ids {
-                    if let Some(HeapValue::Fn {
-                        captured, body_cfg, ..
-                    }) = heap.get(id)
-                    {
-                        let mut caps: Vec<_> = captured.iter().collect();
-                        caps.sort_by_key(|(k, _)| *k);
-                        for (name, val) in caps {
-                            if let Some((component, label)) = val.as_setter() {
-                                result.insert(
-                                    var.clone(),
-                                    SetterProp {
-                                        component: *component,
-                                        label: *label,
-                                        must_write: body_writes(body_cfg, name),
-                                    },
-                                );
-                                break;
-                            }
-                        }
+                    if !seen.insert(id) {
+                        continue;
                     }
-                    if result.contains_key(var) {
-                        break;
+                    if let Some(HeapValue::Obj(fields)) = heap.get(id) {
+                        let mut members: Vec<_> = fields.iter().collect();
+                        members.sort_by(|a, b| b.0.cmp(a.0));
+                        stack.extend(
+                            members
+                                .into_iter()
+                                .map(|(m, ev)| (format!("{name}.{m}"), ev.clone())),
+                        );
                     }
                 }
             }
         }
     }
     result
+}
+
+/// The name a call goes through: a variable, or a member path rooted at one
+/// (`api.tick`, `t.1` for `t[1]`) — the names the converged-value reading
+/// ([`collect_component_setter_vars`]) gives the members it finds a setter
+/// in. A path cannot collide with a variable: no identifier holds a dot.
+pub(crate) fn callee_path(fn_: &Expr) -> Option<Var> {
+    match fn_.peel_ts() {
+        Expr::Var(name) => Some(name.clone()),
+        Expr::FieldAccess { obj, field } => Some(format!("{}.{field}", callee_path(obj)?)),
+        Expr::IndexAccess { arr, idx } => match idx.peel_ts() {
+            Expr::Lit(crate::ir::expr::Prim::Int(i)) if *i >= 0 => {
+                Some(format!("{}.{i}", callee_path(arr)?))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The setter calling a value with these contents writes: the value itself,
+/// or a closure it may point to that captured one (the parent passed
+/// `() => setCount(0)` as a prop). Allocation sites and captures are hash
+/// sets/maps, and the first setter found wins — so both are walked in sorted
+/// order (#120).
+fn setter_of(ev: &EnvVal<StateValue>, heap: &Heap) -> Option<SetterProp> {
+    if let Some((component, label)) = ev.as_val().as_setter() {
+        return Some(SetterProp {
+            component: *component,
+            label: *label,
+            must_write: true,
+            closure: false,
+        });
+    }
+    let mut ids: Vec<_> = ev.locs()?.iter().copied().collect();
+    ids.sort();
+    for id in ids {
+        if let Some(HeapValue::Fn {
+            captured, body_cfg, ..
+        }) = heap.get(id)
+        {
+            let mut caps: Vec<_> = captured.iter().collect();
+            caps.sort_by_key(|(k, _)| *k);
+            if let Some((name, (component, label))) = caps
+                .into_iter()
+                .find_map(|(name, val)| val.as_setter().map(|s| (name, s)))
+            {
+                return Some(SetterProp {
+                    component: *component,
+                    label: *label,
+                    must_write: body_writes(body_cfg, name),
+                    closure: true,
+                });
+            }
+        }
+    }
+    None
 }
 
 /// Does `var` still denote a component setter **at this call**?
@@ -1028,7 +1071,7 @@ pub(crate) fn collect_slot_writers(
     hooks: &[HookEntry],
     regions: &InlineRegions,
     hook_provenance: &[crate::ir::hooks::HookProvenance],
-    foreign: &HashMap<Var, SetterProp>,
+    converged: &HashMap<Var, SetterProp>,
     envs: &SiteEnvs<'_>,
     reducers: &crate::engine::Reducers<'_>,
 ) -> Vec<SlotWriter> {
@@ -1037,15 +1080,26 @@ pub(crate) fn collect_slot_writers(
         labels = resolve_setter_aliases(cfg, &labels);
     }
     // Every name a write can go through, with the slot it writes and the slot's
-    // owner. A local binding wins a tie (ADR-030 §1). Foreign names are not
-    // alias-resolved: `cross_component_setters` already reads the converged
-    // value of every render binding, so an alias holds the same setter value.
+    // owner. A local binding wins a tie (ADR-030 §1). The converged values
+    // (`collect_component_setter_vars`) are read beside the syntactic alias
+    // map: every render binding and member path holding a setter, so an
+    // alias holds the same setter value. An own slot is taken only from a
+    // name that IS the setter — `t[1](0)`, `api.setV(0)` on a hook's result
+    // (#233); a closure over one is walked through its body instead.
     let mut targets: HashMap<Var, (Option<ComponentId>, HookLabel)> =
         labels.into_iter().map(|(v, l)| (v, (None, l))).collect();
-    for (v, prop) in foreign {
-        targets
-            .entry(v.clone())
-            .or_insert((Some(prop.component), prop.label));
+    let mut converged: Vec<_> = converged.iter().collect();
+    converged.sort_by(|a, b| a.0.cmp(b.0));
+    for (v, prop) in converged {
+        let owner = if prop.component == envs.component {
+            if prop.closure {
+                continue;
+            }
+            None
+        } else {
+            Some(prop.component)
+        };
+        targets.entry(v.clone()).or_insert((owner, prop.label));
     }
     let setter_vars: HashSet<Var> = targets.keys().cloned().collect();
     // A write of the slot's own read stores its content (`written::classify`),
@@ -1980,20 +2034,22 @@ impl<'a> SetterWalk<'a> {
         // `Promise` executor runs synchronously, and a class the body binds
         // is a local helper like any other.
         if let Expr::Call { fn_, args } | Expr::New { fn_, args, .. } = expr {
+            if let Some(name) = callee_path(fn_)
+                && self.setter_vars.contains(&name)
+            {
+                found.setters.push(FoundSite {
+                    var: name,
+                    class: mode,
+                    span: stmt_span,
+                    at,
+                    prov_block: prov,
+                    repeats: self.repeating,
+                    updater: self.updater_of(args),
+                    arg: args.first().map(|a| a.peel_ts().clone()),
+                    through: self.path.clone(),
+                });
+            }
             if let Expr::Var(name) = fn_.as_ref() {
-                if self.setter_vars.contains(name) {
-                    found.setters.push(FoundSite {
-                        var: name.clone(),
-                        class: mode,
-                        span: stmt_span,
-                        at,
-                        prov_block: prov,
-                        repeats: self.repeating,
-                        updater: self.updater_of(args),
-                        arg: args.first().map(|a| a.peel_ts().clone()),
-                        through: self.path.clone(),
-                    });
-                }
                 // B6: direct call to a locally-bound function — its body runs
                 // in the CURRENT mode, so sync-in-helper writes take this call
                 // site's class and block id; writes the helper defers or

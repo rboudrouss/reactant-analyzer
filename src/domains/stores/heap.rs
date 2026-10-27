@@ -82,8 +82,34 @@ impl Heap {
         self.0.get(&id)
     }
 
+    /// The part of the heap reachable from `roots`: every location a member
+    /// of a reachable object points to, transitively. What a child receives
+    /// with its props — a closure inside an object prop
+    /// (`api={{ tick: cb }}`) is as callable as one passed directly (#216).
+    pub fn reachable(&self, roots: impl IntoIterator<Item = ExprId>) -> Heap {
+        let mut out = Heap::new();
+        let mut stack: Vec<ExprId> = roots.into_iter().collect();
+        while let Some(id) = stack.pop() {
+            if out.0.contains_key(&id) {
+                continue;
+            }
+            let Some(hv) = self.get(id) else {
+                continue;
+            };
+            if let HeapValue::Obj(fields) = hv {
+                stack.extend(fields.values().filter_map(EnvVal::locs).flatten().copied());
+            }
+            out.insert(id, hv.clone());
+        }
+        out
+    }
+
     pub fn get_mut(&mut self, id: ExprId) -> Option<&mut HeapValue> {
         self.0.get_mut(&id)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&ExprId, &HeapValue)> {
+        self.0.iter()
     }
 
     /// Pointwise join: union of keys, join values at shared keys.
@@ -162,22 +188,27 @@ pub fn resolve_locs<D: AbstractDomain>(
     env: &AbstractEnv<D>,
     heap: &Heap,
 ) -> Option<HashSet<ExprId>> {
-    match expr {
-        Expr::Var(v) => env.lookup_env_val(v).and_then(|ev| ev.locs().cloned()),
-        Expr::TSAnnotated(inner) => resolve_locs(inner, env, heap),
-        Expr::FieldAccess { obj, field } => {
-            let ids: HashSet<ExprId> = resolve_locs(obj, env, heap)?
-                .iter()
-                .filter_map(|id| match heap.get(*id) {
-                    Some(HeapValue::Obj(fields)) => fields.get(field),
-                    _ => None,
-                })
-                .filter_map(|ev| ev.locs())
-                .flatten()
-                .copied()
-                .collect();
-            (!ids.is_empty()).then_some(ids)
-        }
-        _ => None,
-    }
+    let (obj, member) = match expr {
+        Expr::Var(v) => return env.lookup_env_val(v).and_then(|ev| ev.locs().cloned()),
+        Expr::TSAnnotated(inner) => return resolve_locs(inner, env, heap),
+        Expr::FieldAccess { obj, field } => (obj, field.clone()),
+        // A constant index is a member read (`t[1]`), as `eval_index_access`
+        // reads it.
+        Expr::IndexAccess { arr, idx } => match idx.peel_ts() {
+            Expr::Lit(crate::ir::expr::Prim::Int(i)) if *i >= 0 => (arr, i.to_string()),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let ids: HashSet<ExprId> = resolve_locs(obj, env, heap)?
+        .iter()
+        .filter_map(|id| match heap.get(*id) {
+            Some(HeapValue::Obj(fields)) => fields.get(&member),
+            _ => None,
+        })
+        .filter_map(|ev| ev.locs())
+        .flatten()
+        .copied()
+        .collect();
+    (!ids.is_empty()).then_some(ids)
 }
