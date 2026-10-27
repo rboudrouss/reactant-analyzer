@@ -149,6 +149,17 @@ pub fn dispatched(reducer: &Reducer) -> Written {
     }
 }
 
+/// What a write through a closure that captured the setter stores: whatever
+/// the closure passes it, which the call's argument is not. Any value, so
+/// it may change the slot at every call.
+pub fn carried() -> Written {
+    Written {
+        change: Change::May,
+        value: StateValue::top(),
+        expr: None,
+    }
+}
+
 /// The value a functional updater stores: the join of what its returns are
 /// without an env — an allocation is a fresh reference, a literal is itself,
 /// anything else (its parameter included) is ⊤. A proof that reads another

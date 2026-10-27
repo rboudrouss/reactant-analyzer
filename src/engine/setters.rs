@@ -1088,6 +1088,10 @@ pub(crate) fn collect_slot_writers(
     // (#233); a closure over one is walked through its body instead.
     let mut targets: HashMap<Var, (Option<ComponentId>, HookLabel)> =
         labels.into_iter().map(|(v, l)| (v, (None, l))).collect();
+    // The names that write another component's slot by running a closure
+    // that captured its setter (`bump={() => setN(n + 1)}`): the call's own
+    // argument is not what the setter stores.
+    let mut carried: HashSet<Var> = HashSet::new();
     let mut converged: Vec<_> = converged.iter().collect();
     converged.sort_by(|a, b| a.0.cmp(b.0));
     for (v, prop) in converged {
@@ -1099,7 +1103,12 @@ pub(crate) fn collect_slot_writers(
         } else {
             Some(prop.component)
         };
-        targets.entry(v.clone()).or_insert((owner, prop.label));
+        if !targets.contains_key(v) {
+            targets.insert(v.clone(), (owner, prop.label));
+            if prop.closure {
+                carried.insert(v.clone());
+            }
+        }
     }
     let setter_vars: HashSet<Var> = targets.keys().cloned().collect();
     // A write of the slot's own read stores its content (`written::classify`),
@@ -1266,6 +1275,7 @@ pub(crate) fn collect_slot_writers(
             let target = (owner.unwrap_or(envs.component), slot);
             let written = match reducers.get(target.0, target.1) {
                 Some(reducer) => written::dispatched(&reducer),
+                None if carried.contains(&site.var) => written::carried(),
                 None => written::classify(
                     site.arg.as_ref(),
                     &site.updater,

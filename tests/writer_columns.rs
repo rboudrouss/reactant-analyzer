@@ -218,6 +218,36 @@ fn a_parent_setter_called_in_the_child_is_an_owner_qualified_row() {
     );
 }
 
+#[test]
+fn a_closure_carrying_a_parent_setter_stores_what_the_closure_passes() {
+    // `bump()` is no `setN()`: the closure stores `n + 1`, not `undefined`
+    // once. A call of a closure that captured the setter may store anything.
+    let r = parse_and_analyze(
+        r#"
+        import { useState, useEffect } from "react";
+        export function Parent() {
+          const [n, setN] = useState(0);
+          return <Child bump={() => setN(n + 1)} />;
+        }
+        function Child({ bump }: { bump: () => void }) {
+          useEffect(() => {
+            bump();
+          }, []);
+          return null;
+        }
+        "#,
+    );
+    let child = comp(&r, "Child");
+    let foreign: Vec<&SlotWriter> = child
+        .slot_writers
+        .iter()
+        .filter(|w| w.owner.is_some())
+        .collect();
+    assert_eq!(foreign.len(), 1, "{:?}", child.slot_writers);
+    assert_eq!(foreign[0].written.change, Change::May);
+    assert!(foreign[0].written.expr.is_none());
+}
+
 // ── `Change::Never` is a must fact ───────────────────────────────────────────
 
 /// The `written.change` of the only effect write through `setter` in `src`.
