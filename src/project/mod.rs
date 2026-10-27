@@ -17,7 +17,7 @@ pub mod tsconfig;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::resolver::{DefaultImportResolver, FileSystem, ImportResolver};
+use crate::resolver::{DefaultImportResolver, FileSystem, ImportResolver, ScopedResolver};
 
 pub use nextjs::{USE_CLIENT, server_entry_kind, server_modules};
 pub use paths_resolver::TsconfigPathsResolver;
@@ -130,6 +130,61 @@ fn locate_tsconfig_paths(config_root: &Path, fs: &dyn FileSystem) -> Option<Tsco
     })
     .map(|(paths, _)| paths)
     .or(base_only)
+}
+
+/// The import resolver a run started at `dir` resolves with: the tsconfig
+/// `paths` found from `dir` upward, else relative resolution only.
+pub fn resolver_at(dir: &Path, fs: Arc<dyn FileSystem>) -> Box<dyn ImportResolver> {
+    match locate_tsconfig_paths(dir, fs.as_ref()) {
+        Some(paths) => Box::new(TsconfigPathsResolver::new(paths, fs)),
+        None => Box::new(DefaultImportResolver::new(fs)),
+    }
+}
+
+/// Whether a file named `name` can make its directory a project root: a
+/// build-tool marker or a TypeScript config. Discovery collects the
+/// directories holding one ([`crate::resolver::DefaultFileDiscoverer::discover_marked`]).
+pub fn is_root_marker(name: &str) -> bool {
+    name == "tsconfig.json"
+        || name == "jsconfig.json"
+        || VITE_CONFIGS.contains(&name)
+        || NEXT_CONFIGS.contains(&name)
+}
+
+/// Route each file's imports through the innermost project root holding it.
+///
+/// One invocation can cover several projects (a monorepo's apps and
+/// packages, a directory of repositories), and each resolves its specifiers
+/// its own way: one resolver for the whole run maps `@/…` the way the first
+/// project does, or not at all. Each of `starts` (the directories a run was
+/// asked to walk) and each of `marked` that is a real root (a build-tool
+/// marker, or a tsconfig declaring `paths` or `baseUrl`) becomes a scope
+/// resolving as a run started there would ([`resolver_at`]); a file under
+/// none of them goes to `fallback`. With no scope, `fallback` is returned
+/// as-is.
+pub fn scope_by_project(
+    fallback: Box<dyn ImportResolver>,
+    starts: &[PathBuf],
+    marked: &[PathBuf],
+    fs: Arc<dyn FileSystem>,
+) -> Box<dyn ImportResolver> {
+    let roots: Vec<&PathBuf> = starts
+        .iter()
+        .chain(marked.iter().filter(|dir| {
+            detect(dir, fs.as_ref()) != ProjectKind::Plain
+                || load_tsconfig_paths(dir, fs.as_ref()).is_some()
+        }))
+        .collect();
+    if roots.is_empty() {
+        return fallback;
+    }
+    Box::new(
+        roots
+            .into_iter()
+            .fold(ScopedResolver::new(fallback), |scoped, dir| {
+                scoped.scope(dir.clone(), resolver_at(dir, fs.clone()))
+            }),
+    )
 }
 
 /// Narrow discovery to `<root>/src` when the Next.js router lives there.

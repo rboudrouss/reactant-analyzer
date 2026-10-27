@@ -174,7 +174,12 @@ there deliberately will not be (ADR-023 §4).
 A project's conventions do not stop applying when you point at one of its
 subdirectories: `reactant check src/features` is still a run inside that Vite
 project, and its `@/...` imports still resolve through the tsconfig at the root.
-Other path arguments are discovered as-is with the same resolver. Next.js is
+Other path arguments are discovered as-is. Imports resolve per project, not per
+run: every directory argument, and every directory under the walk holding a
+`vite.config.*`, a `next.config.*`, or a `tsconfig.json`/`jsconfig.json` that
+declares `paths` or `baseUrl`, resolves the imports of the files under it as a
+run started there would, the innermost one winning. A monorepo's apps, or a
+directory of repositories, therefore each keep their own aliases. Next.js is
 tested before Vite: a Next app may keep a `vite.config.*` for its test runner,
 and the router conventions are the ones that govern the sources.
 

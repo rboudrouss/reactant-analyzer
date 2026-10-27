@@ -126,7 +126,8 @@ impl ImportResolver for ChainResolver {
 ///
 /// The scope whose root is the **longest** prefix of the importing file wins,
 /// so a nested package overrides its parent; a file under no scope goes to
-/// `fallback`. Same longest-prefix discipline as tsconfig `paths`.
+/// `fallback`. Same longest-prefix discipline as tsconfig `paths`. Roots and
+/// importing files are compared [`normalize`]d, so `./app` scopes `app/x.ts`.
 pub struct ScopedResolver {
     scopes: Vec<(PathBuf, Box<dyn ImportResolver>)>,
     fallback: Box<dyn ImportResolver>,
@@ -142,16 +143,17 @@ impl ScopedResolver {
 
     /// Route imports written in files under `root` through `resolver`.
     pub fn scope(mut self, root: impl Into<PathBuf>, resolver: Box<dyn ImportResolver>) -> Self {
-        self.scopes.push((root.into(), resolver));
+        self.scopes.push((normalize(&root.into()), resolver));
         self
     }
 }
 
 impl ImportResolver for ScopedResolver {
     fn resolve(&self, from: &Path, specifier: &str) -> Option<PathBuf> {
+        let file = normalize(from);
         self.scopes
             .iter()
-            .filter(|(root, _)| from.starts_with(root))
+            .filter(|(root, _)| file.starts_with(root))
             .max_by_key(|(root, _)| root.components().count())
             .map(|(_, r)| r.as_ref())
             .unwrap_or(self.fallback.as_ref())
@@ -581,17 +583,26 @@ fn walk(
     configured: &[String],
     ignores: &mut GitignoreStack,
     out: &mut Vec<PathBuf>,
+    is_marker: &dyn Fn(&str) -> bool,
+    marked: &mut Vec<PathBuf>,
 ) {
     let pushed = ignores.push_for(fs, dir);
+    let mut dir_marked = false;
     for path in fs.read_dir(dir) {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if fs.is_dir(&path) {
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if skip_dir(name, &path, configured, ignores) {
                 continue;
             }
-            walk(fs, &path, configured, ignores, out);
-        } else if fs.is_file(&path) && is_source_file(&path) {
-            out.push(path);
+            walk(fs, &path, configured, ignores, out, is_marker, marked);
+        } else if fs.is_file(&path) {
+            if !dir_marked && is_marker(name) {
+                dir_marked = true;
+                marked.push(dir.to_path_buf());
+            }
+            if is_source_file(&path) {
+                out.push(path);
+            }
         }
     }
     if pushed {
@@ -599,14 +610,23 @@ fn walk(
     }
 }
 
-impl FileDiscoverer for DefaultFileDiscoverer {
-    fn discover(&self, root: &Path) -> Vec<PathBuf> {
+impl DefaultFileDiscoverer {
+    /// [`FileDiscoverer::discover`], also returning every walked directory
+    /// holding a file whose bare name satisfies `is_marker`, collected in the
+    /// same pass: a caller that needs the tree's project roots does not walk
+    /// it twice.
+    pub fn discover_marked(
+        &self,
+        root: &Path,
+        is_marker: &dyn Fn(&str) -> bool,
+    ) -> (Vec<PathBuf>, Vec<PathBuf>) {
         let mut files = Vec::new();
+        let mut marked = Vec::new();
         if self.fs.is_file(root) {
             if is_source_file(root) {
                 files.push(root.to_path_buf());
             }
-            return files;
+            return (files, marked);
         }
         // The `.gitignore`s above `root` govern it too — `reactant check
         // src/features` is still inside the repository that wrote them.
@@ -617,9 +637,18 @@ impl FileDiscoverer for DefaultFileDiscoverer {
             &self.exclude_dirs,
             &mut ignores,
             &mut files,
+            is_marker,
+            &mut marked,
         );
         files.sort();
-        files
+        marked.sort();
+        (files, marked)
+    }
+}
+
+impl FileDiscoverer for DefaultFileDiscoverer {
+    fn discover(&self, root: &Path) -> Vec<PathBuf> {
+        self.discover_marked(root, &|_| false).0
     }
 }
 
