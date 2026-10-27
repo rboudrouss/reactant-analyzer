@@ -193,20 +193,8 @@ export function Page() {
 }
 "#;
 
-fn flags_page(manifest: &str) -> bool {
-    let fs = mem_fs(&[
-        (
-            "/w/pnpm-workspace.yaml",
-            "packages:\n  - apps/*\n  - packages/*\n",
-        ),
-        ("/w/apps/web/src/Page.tsx", PAGE),
-        ("/w/packages/ui/package.json", manifest),
-        (
-            "/w/packages/ui/src/index.ts",
-            "export { useThing } from \"./useThing\";\n",
-        ),
-        ("/w/packages/ui/src/useThing.ts", BUGGY),
-    ]);
+/// Every `(rule, component)` a run over `/w` reports.
+fn check(files: &[(&str, &str)]) -> Vec<(String, String)> {
     let opts = CheckOptions {
         info: false,
         show_clean: false,
@@ -222,7 +210,7 @@ fn flags_page(manifest: &str) -> bool {
         color: false,
     };
     let out = run_check(
-        fs,
+        mem_fs(files),
         &["/w".to_string()],
         &RuleRegistry::natives(),
         &opts,
@@ -234,7 +222,31 @@ fn flags_page(manifest: &str) -> bool {
         .as_array()
         .expect("diagnostics array")
         .iter()
-        .any(|d| d["component"].as_str() == Some("Page"))
+        .map(|d| {
+            (
+                d["rule"].as_str().unwrap_or_default().to_string(),
+                d["component"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+fn flags_page(manifest: &str) -> bool {
+    check(&[
+        (
+            "/w/pnpm-workspace.yaml",
+            "packages:\n  - apps/*\n  - packages/*\n",
+        ),
+        ("/w/apps/web/src/Page.tsx", PAGE),
+        ("/w/packages/ui/package.json", manifest),
+        (
+            "/w/packages/ui/src/index.ts",
+            "export { useThing } from \"./useThing\";\n",
+        ),
+        ("/w/packages/ui/src/useThing.ts", BUGGY),
+    ])
+    .iter()
+    .any(|(_, component)| component == "Page")
 }
 
 /// The hook behind `@acme/ui` is inlined into the app's component, through
@@ -246,5 +258,52 @@ fn a_workspace_hook_reaches_the_component_that_calls_it() {
     ));
     assert!(!flags_page(
         r#"{ "name": "other", "main": "./dist/index.js" }"#
+    ));
+}
+
+/// Whether the App Router's server graph takes `@acme/ui`'s `Panel`, a
+/// component calling `useState` with no `"use client"` in its source.
+fn panel_is_server_rendered(manifest: &str) -> bool {
+    check(&[
+        (
+            "/w/package.json",
+            r#"{ "workspaces": ["apps/*", "packages/*"] }"#,
+        ),
+        ("/w/apps/web/next.config.js", "module.exports = {};"),
+        (
+            "/w/apps/web/app/page.tsx",
+            "import { Panel } from \"@acme/ui\";\n\
+             export default function Home() { return <Panel />; }\n",
+        ),
+        (
+            "/w/apps/web/app/client.tsx",
+            "\"use client\";\nexport function C() { return null; }\n",
+        ),
+        ("/w/packages/ui/package.json", manifest),
+        (
+            "/w/packages/ui/src/index.ts",
+            "export { Panel } from \"./panel\";\n",
+        ),
+        (
+            "/w/packages/ui/src/panel.tsx",
+            "import { useState } from \"react\";\n\
+             export function Panel() { const [n] = useState(0); return <p>{n}</p>; }\n",
+        ),
+    ])
+    .iter()
+    .any(|(rule, component)| rule == "server-component-hook" && component == "Panel")
+}
+
+/// A compiled entry's directives are the build's, not the source's (dub's
+/// bundler prepends `"use client"` to `@dub/ui`), so the server graph does
+/// not enter the source standing in for it; a declared TypeScript entry is
+/// the module itself, directives included.
+#[test]
+fn the_server_graph_does_not_enter_a_compiled_entry() {
+    assert!(!panel_is_server_rendered(
+        r#"{ "name": "@acme/ui", "main": "./dist/index.mjs" }"#
+    ));
+    assert!(panel_is_server_rendered(
+        r#"{ "name": "@acme/ui", "main": "./src/index.ts" }"#
     ));
 }

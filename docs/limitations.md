@@ -77,7 +77,8 @@ that writes it (see *Cross-file limits*).
 - Cross-component rules need the parent to be reached top-down. A parent analyzed only intra leaves
   `cross-component-infinite-loop` silent [#20](https://github.com/rboudrouss/reactant-analyzer/issues/20).
 - `server-component-hook` under-reports when any import on the path to a server module is unresolved
-  [#29](https://github.com/rboudrouss/reactant-analyzer/issues/29).
+  [#29](https://github.com/rboudrouss/reactant-analyzer/issues/29), or reaches a workspace package
+  through a compiled entry, whose directives are the build's and not in its source [#48](https://github.com/rboudrouss/reactant-analyzer/issues/48).
 - Per-rule residuals: `state-mutation` on an escaped alias [#23](https://github.com/rboudrouss/reactant-analyzer/issues/23), `stale-closure` when the
   callback does not resolve syntactically [#24](https://github.com/rboudrouss/reactant-analyzer/issues/24), `frozen-initial-state` on primitive props
   and memo-chained seeds [#25](https://github.com/rboudrouss/reactant-analyzer/issues/25), provider detection inside an inline arrow

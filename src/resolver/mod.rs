@@ -44,6 +44,14 @@ pub trait ImportResolver: Send + Sync {
     /// Returns `None` for package imports (non-relative specifiers) or
     /// unresolvable paths.
     fn resolve(&self, from: &Path, specifier: &str) -> Option<PathBuf>;
+
+    /// Whether the file `resolve` answers stands in for a package's compiled
+    /// entry (build output the checkout does not hold, #48): its code is the
+    /// source's, its module directives are the build's, which the source does
+    /// not show (a bundler `"use client"` banner).
+    fn is_compiled_entry(&self, _from: &Path, _specifier: &str) -> bool {
+        false
+    }
 }
 
 pub struct DefaultFileDiscoverer {
@@ -115,6 +123,13 @@ impl ImportResolver for ChainResolver {
     fn resolve(&self, from: &Path, specifier: &str) -> Option<PathBuf> {
         self.0.iter().find_map(|r| r.resolve(from, specifier))
     }
+
+    fn is_compiled_entry(&self, from: &Path, specifier: &str) -> bool {
+        self.0
+            .iter()
+            .find(|r| r.resolve(from, specifier).is_some())
+            .is_some_and(|r| r.is_compiled_entry(from, specifier))
+    }
 }
 
 /// Per-file resolution: route by the *importing* file's location.
@@ -146,10 +161,9 @@ impl ScopedResolver {
         self.scopes.push((normalize(&root.into()), resolver));
         self
     }
-}
 
-impl ImportResolver for ScopedResolver {
-    fn resolve(&self, from: &Path, specifier: &str) -> Option<PathBuf> {
+    /// The resolver governing imports written in `from`.
+    fn scope_of(&self, from: &Path) -> &dyn ImportResolver {
         let file = normalize(from);
         self.scopes
             .iter()
@@ -157,7 +171,16 @@ impl ImportResolver for ScopedResolver {
             .max_by_key(|(root, _)| root.components().count())
             .map(|(_, r)| r.as_ref())
             .unwrap_or(self.fallback.as_ref())
-            .resolve(from, specifier)
+    }
+}
+
+impl ImportResolver for ScopedResolver {
+    fn resolve(&self, from: &Path, specifier: &str) -> Option<PathBuf> {
+        self.scope_of(from).resolve(from, specifier)
+    }
+
+    fn is_compiled_entry(&self, from: &Path, specifier: &str) -> bool {
+        self.scope_of(from).is_compiled_entry(from, specifier)
     }
 }
 

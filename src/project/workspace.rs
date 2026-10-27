@@ -12,7 +12,10 @@
 //! One heuristic, and only one: a declared entry that is not TypeScript is
 //! compiled output (`dist/index.mjs`, `esm/index.mjs`), absent from a source
 //! checkout or excluded from the walk, so the package's `src/<subpath>`
-//! (`src/index` for the root) stands for it when that file exists.
+//! (`src/index` for the root) stands for it when that file exists. The
+//! stand-in carries the entry's code, not its module directives — those are
+//! the build's (dub's bundler prepends `"use client"` to `@dub/ui`) — which
+//! [`ImportResolver::is_compiled_entry`] reports.
 //!
 //! Soundness: a specifier nothing here maps — a package outside the
 //! workspace, a subpath the `exports` map does not list, a name two members
@@ -63,10 +66,10 @@ impl WorkspaceResolver {
         }
         found
     }
-}
 
-impl ImportResolver for WorkspaceResolver {
-    fn resolve(&self, from: &Path, specifier: &str) -> Option<PathBuf> {
+    /// The file `specifier` names from `from`, and whether it stands in for
+    /// a compiled entry.
+    fn entry(&self, from: &Path, specifier: &str) -> Option<Entry> {
         let (name, subpath) = split_package(specifier)?;
         let from = normalize(from);
         let workspace = self.workspace_for(from.parent()?)?;
@@ -76,6 +79,23 @@ impl ImportResolver for WorkspaceResolver {
             .as_ref()?
             .resolve(self.fs.as_ref(), subpath)
     }
+}
+
+impl ImportResolver for WorkspaceResolver {
+    fn resolve(&self, from: &Path, specifier: &str) -> Option<PathBuf> {
+        self.entry(from, specifier).map(|e| e.file)
+    }
+
+    fn is_compiled_entry(&self, from: &Path, specifier: &str) -> bool {
+        self.entry(from, specifier).is_some_and(|e| e.compiled)
+    }
+}
+
+/// A resolved package entry.
+struct Entry {
+    file: PathBuf,
+    /// `file` is the source standing in for a compiled entry.
+    compiled: bool,
 }
 
 /// `@scope/name/sub/path` → `("@scope/name", "sub/path")`, `name` →
@@ -264,22 +284,29 @@ impl Package {
     /// the first declared entry that is TypeScript source, else the source
     /// of the compiled output (`src/<subpath>`), else the first declared
     /// entry that is a source file at all.
-    fn resolve(&self, fs: &dyn FileSystem, subpath: &str) -> Option<PathBuf> {
+    fn resolve(&self, fs: &dyn FileSystem, subpath: &str) -> Option<Entry> {
         let found: Vec<PathBuf> = self
             .targets(subpath)?
             .iter()
             .filter_map(|t| probe_module(fs, &self.dir.join(t)))
             .collect();
+        let declared = |file: &PathBuf| Entry {
+            file: file.clone(),
+            compiled: false,
+        };
         let source = || {
             let stem = if subpath.is_empty() { "index" } else { subpath };
-            probe_module(fs, &self.dir.join("src").join(stem))
+            probe_module(fs, &self.dir.join("src").join(stem)).map(|file| Entry {
+                file,
+                compiled: true,
+            })
         };
         found
             .iter()
             .find(|p| is_typescript(p))
-            .cloned()
+            .map(declared)
             .or_else(source)
-            .or_else(|| found.first().cloned())
+            .or_else(|| found.first().map(declared))
     }
 
     /// The entries the manifest declares for `subpath`, in declaration

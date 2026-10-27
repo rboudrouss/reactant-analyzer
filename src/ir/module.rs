@@ -33,6 +33,10 @@ pub struct ModuleFacts {
     /// (`export … from`, `export * from`), because a barrel re-export carries
     /// a directive boundary exactly like a plain import does.
     pub imports: Vec<PathBuf>,
+    /// The `imports` that stand in for a package's compiled entry
+    /// ([`crate::resolver::ImportResolver::is_compiled_entry`]): the module's
+    /// code, not its directives.
+    pub compiled_entries: Vec<PathBuf>,
     /// The names this module exports *from another analyzed file* — what a
     /// barrel is made of (#49, #226).
     pub re_exports: ReExports,
@@ -194,6 +198,10 @@ impl ModuleTable {
     /// everything imported below it, so a walk that starts in one environment
     /// ends where the next one is declared. Pass `None` for a plain forward
     /// reachability walk.
+    ///
+    /// A directive walk does not enter a compiled entry either: whether the
+    /// build gave it the directive is not in its source, so it is left out
+    /// exactly as an npm package, which leaves no edge, is.
     pub fn reachable_from<'p>(
         &self,
         seeds: impl IntoIterator<Item = &'p Path>,
@@ -214,7 +222,8 @@ impl ModuleTable {
                 continue;
             };
             for dep in &facts.imports {
-                if !blocked(dep) && seen.insert(dep.clone()) {
+                let compiled = boundary.is_some() && facts.compiled_entries.contains(dep);
+                if !compiled && !blocked(dep) && seen.insert(dep.clone()) {
                     queue.push_back(dep.clone());
                 }
             }

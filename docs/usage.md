@@ -191,7 +191,9 @@ entry: `source`, else the `exports` entry for `.` / `./icons` (conditions in
 declaration order, `types` skipped), else `module` / `main`. An entry that is
 not TypeScript is taken to be compiled output (`dist/index.mjs`), and the
 package's `src/index` (`src/icons` for a subpath) stands for it when that
-file exists. tsconfig `paths` still come first. A package outside the
+file exists. The stand-in carries the entry's code, not its directives
+(a bundler may prepend `"use client"`), so the App Router server graph does
+not enter it. tsconfig `paths` still come first. A package outside the
 member globs, a subpath its `exports` map does not list, or a name two
 members share stays unresolved.
 

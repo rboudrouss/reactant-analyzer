@@ -27,10 +27,14 @@ pub fn collect_module_facts(
         .collect();
 
     let mut imports = Vec::new();
+    let mut compiled_entries = Vec::new();
     let mut push = |specifier: &str| -> Option<PathBuf> {
         let resolved = resolver.resolve(file, specifier)?;
         if !imports.contains(&resolved) {
             imports.push(resolved.clone());
+        }
+        if resolver.is_compiled_entry(file, specifier) && !compiled_entries.contains(&resolved) {
+            compiled_entries.push(resolved.clone());
         }
         Some(resolved)
     };
@@ -96,6 +100,7 @@ pub fn collect_module_facts(
     ModuleFacts {
         directives,
         imports,
+        compiled_entries,
         re_exports,
     }
 }
