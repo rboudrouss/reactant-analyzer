@@ -1,7 +1,8 @@
+use std::collections::BTreeSet;
+
 use crate::rules::RuleCtx;
 use crate::{
-    domains::{AbstractEnv, MemoStore, StateStore, StateValueTransfer, impls::StateValue},
-    engine::HookKind,
+    engine::{FreshDeps, HookKind, fresh_deps},
     ir::{
         ComponentId,
         expr::Expr,
@@ -61,12 +62,15 @@ impl Rule for AlwaysUnstableDeps {
     fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic> {
         let (program, component) = (ctx.program(), ctx.component());
         let result = &program.components[&component];
-        let env_exit = result.exit_env();
         let mut diags = Vec::new();
-        let transfer = StateValueTransfer;
-        // One scratch heap for the whole component, not one per dep — see
-        // [`crate::engine::eval::Eval`].
-        let mut scratch = result.heap.clone();
+        let fresh = fresh_deps(result);
+        // The elements under which the component does what its result, the
+        // join of all of them, does not show (#175).
+        let sites: Vec<(ComponentId, &FreshDeps)> = program
+            .call_graph
+            .sites_of(component)
+            .filter_map(|(caller, site)| site.own.as_ref().map(|o| (caller, &o.fresh_deps)))
+            .collect();
 
         for hook in &result.hooks {
             let (label, deps, kind, span) = match hook {
@@ -89,31 +93,41 @@ impl Rule for AlwaysUnstableDeps {
                 continue;
             }
 
-            let unstable: Vec<&Expr> = deps_ref
-                .iter()
-                .filter(|dep| {
-                    eval_dep_is_unstable(
-                        result.component,
-                        dep,
-                        &env_exit,
-                        &result.state_store,
-                        &result.memo_store,
-                        &mut scratch,
-                        &transfer,
-                    )
-                })
-                .collect();
+            // Fresh wherever the component renders, or else through the
+            // elements under which it is: those are named.
+            let (indices, via): (BTreeSet<usize>, Vec<String>) = match fresh.get(&label) {
+                Some(own) => (own.clone(), Vec::new()),
+                None => {
+                    let mut indices = BTreeSet::new();
+                    let mut via = Vec::new();
+                    for (caller, site) in &sites {
+                        if let Some(i) = site.get(&label) {
+                            indices.extend(i);
+                            via.push(format!("`<{}>`", program.display_name(*caller)));
+                        }
+                    }
+                    via.sort();
+                    via.dedup();
+                    (indices, via)
+                }
+            };
+            let unstable: Vec<&Expr> = indices.iter().filter_map(|i| deps_ref.get(*i)).collect();
 
             if unstable.is_empty() {
                 continue;
             }
 
             let word = crate::rules::hook_kind_word(kind);
+            let when = if via.is_empty() {
+                String::new()
+            } else {
+                format!(" when {} renders it", via.join(" or "))
+            };
             let mut d = Diagnostic::warn(
                 "always-unstable-deps",
                 format!(
                     "this {word} depends on {what}, a new reference every \
-                     render, so `Object.is` always differs and the {word} \
+                     render{when}, so `Object.is` always differs and the {word} \
                      re-runs on every render regardless of the other deps",
                     what = fmt_deps(&unstable),
                 ),
@@ -140,30 +154,6 @@ impl Rule for AlwaysUnstableDeps {
     }
 }
 
-fn eval_dep_is_unstable(
-    component: ComponentId,
-    dep: &Expr,
-    env: &AbstractEnv<StateValue>,
-    state: &StateStore<StateValue>,
-    memo: &MemoStore<StateValue>,
-    // The component's *converged* heap, not an empty one — a member dep
-    // (`obj.f`, `form.onSubmit`) only resolves through the heap, and an empty
-    // seed answers ⊤, which this rule reads as silence (#135). The decomposed
-    // bundle survives here only because the unit tests below build one; every
-    // caller with an `AnalysisResult` gets the same seed from
-    // [`crate::rules::ConvergedEval::eval_in`].
-    heap: &mut crate::domains::Heap,
-    // Retained for the test-facing signature; the shared eval core builds its
-    // own (zero-size) transfer.
-    _transfer: &StateValueTransfer,
-) -> bool {
-    let val = crate::rules::eval_in_stores(dep, env, component, state, memo, heap);
-    // Only a freshly-allocated reference breaks `Object.is` every render.
-    // Primitives (Number/Bool/Str) are value-compared — never flagged here, even
-    // for wide intervals. `Top` (precision lost) stays silent to avoid FPs.
-    val.is_unstable_reference_only()
-}
-
 /// Name the offending dependencies, never their positions (#118).
 ///
 /// A position in `elems` stops being a position in the source array the moment
@@ -187,7 +177,7 @@ mod tests {
     use super::*;
     use crate::ir::hooks::{Arity, DepsArg, DepsList};
     use crate::{
-        domains::StateValueTransfer,
+        domains::{AbstractEnv, StateValueTransfer},
         engine::{Config, ProgramAnalysisResult, analyze_component},
         ir::{
             cfg::{BasicBlock, CFG, Terminator},
@@ -428,14 +418,13 @@ mod tests {
         );
         let memo = MemoStore::<StateValue>::new();
         assert!(
-            !eval_dep_is_unstable(
+            !crate::engine::dep_is_fresh(
                 crate::test_support::C,
                 &Expr::StateVal(0),
                 &env,
                 &state,
                 &memo,
                 &mut crate::domains::Heap::new(),
-                &StateValueTransfer
             ),
             "wide numeric state dep must not count as unstable"
         );
@@ -448,7 +437,7 @@ mod tests {
         let env = AbstractEnv::<StateValue>::default();
         let state = StateStore::<StateValue>::bottom();
         let memo = MemoStore::<StateValue>::new();
-        assert!(eval_dep_is_unstable(
+        assert!(crate::engine::dep_is_fresh(
             crate::test_support::C,
             &Expr::ObjectLit {
                 id: ExprId(0),
@@ -458,7 +447,6 @@ mod tests {
             &state,
             &memo,
             &mut crate::domains::Heap::new(),
-            &StateValueTransfer
         ));
     }
 

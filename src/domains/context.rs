@@ -3,7 +3,7 @@ use std::cell::RefCell;
 use crate::{
     domains::{
         AbstractDomain, StateValue,
-        stores::{AbstractEnv, EnvVal, Heap, MemoStore, SharedStateStore, StateStore},
+        stores::{AbstractEnv, EnvVal, Heap, HeapValue, MemoStore, SharedStateStore, StateStore},
     },
     engine::{
         AnalysisResult, AnalysisStats, ComponentCache, ComponentCallGraph, ComponentRegistry,
@@ -78,6 +78,15 @@ pub struct InterCtx<'a> {
     /// Per child, the join of the inputs of every call site analysed so
     /// far: what its entry in `results` was computed under.
     pub inputs: &'a RefCell<std::collections::HashMap<ComponentId, ChildInput>>,
+    /// Per element, the join of the inputs it handed its child: what the
+    /// child is re-analysed under once phase 1 is over, to keep the facts the
+    /// join above loses ([`crate::engine::SiteFacts`]).
+    pub site_inputs: &'a RefCell<std::collections::HashMap<SiteKey, ChildInput>>,
+    /// A re-analysis under one call site's input, for the facts it keeps and
+    /// nothing else. Its input is below the one its result was stored under,
+    /// so what it would hand its children and write into other components'
+    /// slots is already recorded: it records nothing, and analyses no child.
+    pub probe: bool,
     /// Components currently being analyzed (for recursion detection).
     pub call_stack: RefCell<Vec<ComponentId>>,
     /// The component being analyzed at this level.
@@ -108,6 +117,8 @@ impl<'a> InterCtx<'a> {
             stats: self.stats,
             results: self.results,
             inputs: self.inputs,
+            site_inputs: self.site_inputs,
+            probe: self.probe,
             call_stack: RefCell::new(new_stack),
             component: child,
             config: self.config,
@@ -120,7 +131,25 @@ impl<'a> InterCtx<'a> {
     pub fn is_recursive(&self, id: ComponentId) -> bool {
         self.call_stack.borrow().contains(&id) || self.component == id
     }
+
+    /// Analyse this context's component under `input`: its props object,
+    /// with the heap the props reach, so the child resolves a member read
+    /// through it.
+    pub fn analyze_under(&self, ir: &ComponentIR, input: ChildInput) -> AnalysisResult<StateValue> {
+        let mut env = AbstractEnv::bottom();
+        let mut heap = input.heap;
+        heap.insert(input.props_id, HeapValue::Obj(input.props));
+        env.extend_loc(ir.param.clone(), input.props_id);
+        (self.analyze_child)(ir, self.component, env, heap, self)
+    }
 }
+
+/// One element: `(child, caller, span)`.
+pub type SiteKey = (
+    ComponentId,
+    ComponentId,
+    Option<crate::ir::source_range::SourceRange>,
+);
 
 /// What a child's analysis depends on: its props, and the heap they reach,
 /// under one props object per child so that two call sites' inputs join
@@ -256,7 +285,9 @@ impl<'a, D: AbstractDomain> AnalysisCtx<'a, D> {
     pub fn write_slot(&mut self, owner: ComponentId, label: crate::ir::types::HookLabel, val: D) {
         if owner == self.component {
             self.state.update(label, val);
-        } else if let Some(inter) = self.inter {
+        } else if let Some(inter) = self.inter
+            && !inter.probe
+        {
             let val = val.as_state_value().unwrap_or_else(StateValue::top);
             inter.shared_state.borrow_mut().update(owner, label, val);
         }

@@ -37,7 +37,9 @@ pub use fixpoint::{
 pub use function_registry::{FunctionKey, FunctionRegistry};
 pub use hook_registry::{HookKey, HookRegistry};
 pub use program_relations::ProgramRelations;
-pub use program_result::{AnalysisStats, CallSite, ComponentCallGraph, ProgramAnalysisResult};
+pub use program_result::{
+    AnalysisStats, CallSite, ComponentCallGraph, FreshDeps, ProgramAnalysisResult, SiteFacts,
+};
 pub use reducers::{ProgramReducers, Reducer, Reducers};
 pub use registrations::{Firing, Pairing, Registrar, Registration, Timing};
 pub use root_detector::RootStrategy;
@@ -47,5 +49,5 @@ pub use setters::{
     collect_slot_reads,
 };
 pub use symbol_graph::{SymbolGraph, SymbolKind, SymbolNode};
-pub use triggers::{Always, EffectTrigger, Rerun, triggers_of};
+pub use triggers::{Always, EffectTrigger, Rerun, dep_is_fresh, fresh_deps, triggers_of};
 pub use written::{Change, SiteEnvs, Written};

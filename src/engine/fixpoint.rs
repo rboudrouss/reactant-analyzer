@@ -758,6 +758,8 @@ pub fn analyze_program(
         RefCell::new(HashMap::new());
     let inputs: RefCell<HashMap<ComponentId, crate::domains::ChildInput>> =
         RefCell::new(HashMap::new());
+    let site_inputs: RefCell<HashMap<crate::domains::SiteKey, crate::domains::ChildInput>> =
+        RefCell::new(HashMap::new());
 
     let roots = strategy.detect(&registry);
     let mut analysed: std::collections::HashSet<ComponentId> = std::collections::HashSet::new();
@@ -767,28 +769,32 @@ pub fn analyze_program(
         &config.function_registry,
     );
 
+    let inter_for = |component: ComponentId, call_stack: Vec<ComponentId>| InterCtx {
+        registry: &registry,
+        cache: &cache,
+        shared_state: &shared_state,
+        reducers: &reducers,
+        call_graph: &call_graph,
+        stats: &stats,
+        results: &results,
+        inputs: &inputs,
+        site_inputs: &site_inputs,
+        probe: false,
+        call_stack: RefCell::new(call_stack),
+        component,
+        config,
+        analyze_child: analyze_component_inter as AnalyzeChildFn,
+        hook_registry: Some(&hook_registry),
+        dispatches,
+    };
+
     // Phase 1: analyze roots top-down (children inlined via eval_comp_app).
     for &root in &roots {
         let Some(root_key) = registry.key_of(root) else {
             continue;
         };
         if let Some(root_ir) = registry.ir_for(&root_key) {
-            let inter = InterCtx {
-                registry: &registry,
-                cache: &cache,
-                shared_state: &shared_state,
-                reducers: &reducers,
-                call_graph: &call_graph,
-                stats: &stats,
-                results: &results,
-                inputs: &inputs,
-                call_stack: RefCell::new(vec![]),
-                component: root,
-                config,
-                analyze_child: analyze_component_inter as AnalyzeChildFn,
-                hook_registry: Some(&hook_registry),
-                dispatches,
-            };
+            let inter = inter_for(root, vec![]);
             let result = analyze_component_impl(
                 root_ir,
                 root,
@@ -802,6 +808,38 @@ pub fn analyze_program(
             stats.borrow_mut().components_analyzed += 1;
             results.borrow_mut().insert(root, result);
             analysed.insert(root);
+        }
+    }
+
+    // Per-site facts (#175). A child's result is its analysis under the join
+    // of every element's input, and the join loses what holds through one
+    // element alone (a dep that is a new reference at every render when one
+    // parent renders it). Each element whose input is below the join
+    // re-analyses its child under that input once, as a probe that changes
+    // nothing phase 1 stored, and its call-graph row keeps the facts.
+    let mut sites: Vec<_> = site_inputs.take().into_iter().collect();
+    sites.sort_by_key(|((child, caller, span), _)| (*child, *caller, span.map(|s| s.pos_key())));
+    for ((child, caller, span), input) in sites {
+        let alone = inputs
+            .borrow()
+            .get(&child)
+            .is_none_or(|joined| input.covers(&joined.props, &joined.heap));
+        let Some(ir) = registry.ir_of(child) else {
+            continue;
+        };
+        if alone {
+            continue;
+        }
+        let probe = InterCtx {
+            probe: true,
+            ..inter_for(child, vec![caller])
+        };
+        let result = probe.analyze_under(ir, input);
+        let facts = crate::engine::SiteFacts {
+            fresh_deps: crate::engine::fresh_deps(&result),
+        };
+        if let Some(row) = call_graph.borrow_mut().site_mut(caller, child, span) {
+            row.own = Some(facts);
         }
     }
 

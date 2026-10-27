@@ -158,6 +158,25 @@ A relation that is a property of the whole program has no per-component
 slice. It is built once per program, lazily, and shared by every reader
 (ADR-042 §5).
 
+### The call sites — `ComponentCallGraph` (#175)
+
+Recorded by the engine during phase 1, on `ProgramAnalysisResult`. One row
+per element that renders an analysed child, `sites_of(child)` reads them. A
+child's own result is its analysis under the join of every row's input, so a
+fact that holds through one element alone (a dep that is a new reference at
+every render when one parent renders it) is lost there. After phase 1, each
+element whose input is below that join re-analyses its child under its own
+input, once, and keeps the facts in `own`. That re-analysis is a probe: what
+it would hand its own children or write into another component's slot is
+already recorded, so it records nothing and analyses no child. A rule quantifying "always" over a
+prop-derived value reads `own` and names the parents it holds through.
+
+| column | claim | polarity |
+|---|---|---|
+| `callee`, `location` | the child and the element's span (`None`: unplaced, one row per callee) | exact |
+| `props` | each prop's value, joined over every evaluation of the element | may |
+| `own.fresh_deps` | the child's hook deps that are a new reference at every render under this element's input alone; `None` when no other input reaches the child | must, for this element |
+
 ### The churn graph — `ChurnGraph` (ADR-018, ADR-042 §4)
 
 A fold over `slot_writers` and `effect_triggers`: `edge x → y` when a change

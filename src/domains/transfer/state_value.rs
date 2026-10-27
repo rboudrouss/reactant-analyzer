@@ -228,9 +228,9 @@ fn eval_state_value(
             name,
             props,
             origin,
-            ..
+            span,
         } => {
-            eval_comp_app(name, props, origin.as_deref(), env, ctx);
+            eval_comp_app(name, props, origin.as_deref(), *span, env, ctx);
             StateValue::reference(Stability::PerRender)
         }
 
@@ -537,6 +537,7 @@ fn eval_comp_app(
     name: &Symbol,
     props_expr: &Expr,
     origin: Option<&CompOrigin>,
+    span: Option<crate::ir::SourceRange>,
     env: &AbstractEnv<StateValue>,
     ctx: &mut AnalysisCtx<StateValue>,
 ) {
@@ -547,6 +548,11 @@ fn eval_comp_app(
         havoc_setter_props(props_expr, env, ctx);
         return;
     };
+    // What this element hands its child, and what the child writes back
+    // through it, were recorded when the input above this one was analysed.
+    if inter.probe {
+        return;
+    }
 
     // Registry lookup. The JSX callee name is only how the child was
     // *written*; who it is, is the `ComponentId` the registry resolves it to,
@@ -618,11 +624,12 @@ fn eval_comp_app(
             .copied(),
     );
     let cache_key = props_cache_key(&abstract_props, &props_heap);
+    record_call_site(inter, child, abstract_props, span);
+    record_site_input(inter, child, span, &abstract_props_full, &props_heap);
 
     // Cache lookup (strict equality)
     if inter.cache.borrow().contains(child, &cache_key) {
         inter.stats.borrow_mut().cache_hits += 1;
-        record_call_site(inter, child, abstract_props, None);
         return;
     }
     inter.stats.borrow_mut().cache_misses += 1;
@@ -648,28 +655,36 @@ fn eval_comp_app(
         joined
     };
     let Some(input) = input else {
-        record_call_site(inter, child, abstract_props, None);
         return;
     };
 
-    // Build child initial env + heap: the props' reachable heap, plus the
-    // props Obj itself (with full EnvVals) so the child can resolve
-    // FieldAccess → Loc.
-    let mut child_env = AbstractEnv::bottom();
-    let props_id = input.props_id;
-    let mut initial_heap = input.heap;
-    initial_heap.insert(props_id, HeapValue::Obj(input.props));
-    child_env.extend_loc(child_ir.param.clone(), props_id);
-
-    // Create child inter context and analyze
-    let child_inter = inter.child(child);
-    let analyze_child = inter.analyze_child;
-    let child_result = analyze_child(&child_ir, child, child_env, initial_heap, &child_inter);
+    let child_result = inter.child(child).analyze_under(&child_ir, input);
 
     // Store result in the program-level results map and cache
     inter.results.borrow_mut().insert(child, child_result);
     inter.cache.borrow_mut().insert(child, cache_key);
-    record_call_site(inter, child, abstract_props, None);
+}
+
+/// Join one evaluation of an element into what it hands its child
+/// ([`crate::domains::InterCtx::site_inputs`]).
+fn record_site_input(
+    inter: &crate::domains::InterCtx<'_>,
+    child: ComponentId,
+    span: Option<crate::ir::SourceRange>,
+    props: &HashMap<Symbol, EnvVal<StateValue>>,
+    heap: &Heap,
+) {
+    let mut sites = inter.site_inputs.borrow_mut();
+    let site = sites
+        .entry((child, inter.component, span))
+        .or_insert_with(|| crate::domains::ChildInput {
+            props_id: ExprId::fresh(),
+            props: props.clone(),
+            heap: heap.clone(),
+        });
+    if !site.covers(props, heap) {
+        *site = site.join(props, heap);
+    }
 }
 
 /// What a child's analysis depends on, as the cache compares it: the props'
@@ -799,6 +814,7 @@ fn record_call_site(
             callee,
             props,
             location,
+            own: None,
         },
     );
 }

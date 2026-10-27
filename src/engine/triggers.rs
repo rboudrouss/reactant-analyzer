@@ -29,8 +29,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::{
-    domains::{StateValue, impls::Stability, stores::MemoStore},
+    domains::{
+        AbstractEnv, StateValue,
+        impls::Stability,
+        stores::{Heap, MemoStore, StateStore},
+    },
     engine::{
+        AnalysisResult, FreshDeps,
         render_deps::{Deps, Source},
         setters::{memo_val_labels, resolve_setter_aliases},
     },
@@ -363,6 +368,62 @@ fn ref_may_move(label: HookLabel, render_cfg: &CFG, hooks: &[HookEntry]) -> bool
                 .body_cfg()
                 .is_some_and(|b| body_escapes(b, &named, &rooted)),
         })
+}
+
+/// Is `dep`, read at the render's exit, a new reference at every render? The
+/// fact `always-unstable-deps` reports. A primitive is compared by value and
+/// ⊤ guarantees nothing, so both answer `false`.
+pub fn dep_is_fresh(
+    component: ComponentId,
+    dep: &Expr,
+    env: &AbstractEnv<StateValue>,
+    state: &StateStore<StateValue>,
+    memo: &MemoStore<StateValue>,
+    heap: &mut Heap,
+) -> bool {
+    crate::engine::eval::eval_in_stores(dep, env, component, state, memo, heap)
+        .is_unstable_reference_only()
+}
+
+/// Every effect, memo and callback of `result` with a written deps list
+/// that holds a dep [`dep_is_fresh`], and the indices of those deps.
+pub fn fresh_deps(result: &AnalysisResult<StateValue>) -> FreshDeps {
+    let env = result.exit_env();
+    // One scratch heap for the whole component: a member dep (`obj.f`) only
+    // resolves through the converged heap (#135).
+    let mut heap = result.heap.clone();
+    let mut out = FreshDeps::new();
+    for hook in &result.hooks {
+        let (HookEntry::Effect { label, deps, .. }
+        | HookEntry::Memo { label, deps, .. }
+        | HookEntry::Callback { label, deps, .. }) = hook
+        else {
+            continue;
+        };
+        let Some(list) = deps.list() else {
+            continue;
+        };
+        let fresh: BTreeSet<usize> = list
+            .as_slice()
+            .iter()
+            .enumerate()
+            .filter(|(_, dep)| {
+                dep_is_fresh(
+                    result.component,
+                    dep,
+                    &env,
+                    &result.state_store,
+                    &result.memo_store,
+                    &mut heap,
+                )
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if !fresh.is_empty() {
+            out.insert(*label, fresh);
+        }
+    }
+    out
 }
 
 /// The rows of one effect.

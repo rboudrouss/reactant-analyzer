@@ -5,7 +5,8 @@ pub mod stores;
 pub mod transfer;
 
 pub use context::{
-    AnalysisCtx, AnalyzeChildFn, ChildInput, FixpointCtx, InterCtx, NullCtx, QueryContext, Widening,
+    AnalysisCtx, AnalyzeChildFn, ChildInput, FixpointCtx, InterCtx, NullCtx, QueryContext, SiteKey,
+    Widening,
 };
 pub use impls::{BoolVal, Interval, Stability, StateValue};
 pub use stores::{AbstractEnv, EnvVal, Heap, HeapValue, MemoStore, StateStore};
