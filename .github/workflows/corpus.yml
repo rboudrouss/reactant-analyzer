@@ -76,13 +76,18 @@ jobs:
       - name: Run the analyzer over the corpus
         run: |
           mkdir -p corpus-runs
+          failed=0
           for repo in test-repo/*/; do
             name=$(basename "$repo")
             start=$(date +%s)
-            ./target/release/reactant --format json --fail-on never --config tests/fixtures/all-rules.json "$repo" > "corpus-runs/$name.json"
-            echo "$name: $(( $(date +%s) - start )) s"
+            if /usr/bin/time -f "$name: %e s, %M KB peak" ./target/release/reactant --format json --fail-on never --config tests/fixtures/all-rules.json "$repo" > "corpus-runs/$name.json"; then
+              :
+            else
+              echo "$name: FAILED (exit $?)"; rm -f "corpus-runs/$name.json"; failed=1
+            fi
           done
           ./scripts/corpus-merge.py corpus-run.json corpus-runs/*.json
+          exit $failed
 
       - name: Compare against the committed baseline
         run: ./scripts/corpus-baseline.py corpus-run.json
@@ -95,5 +100,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: corpus-run
-          path: corpus-run.json
+          path: |
+            corpus-run.json
+            corpus-runs/
           retention-days: 30
