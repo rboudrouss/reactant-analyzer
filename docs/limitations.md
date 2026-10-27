@@ -122,6 +122,13 @@ that writes it (see *Cross-file limits*).
   *truthy* values keeps the child mounted (`if (!data) return <Spinner/>` over refetched data), and
   an object `key` stringifies to a constant. The finding is downgraded, never deleted. The residual
   family, a caller that always remounts with a `key`, is [#136](https://github.com/rboudrouss/reactant-analyzer/issues/136).
+  A guard on the feeding state itself (`switch (step.type)`), or one call site the feeder does not
+  reach (a story passing constants), caps a proven freeze at Warning.
+- **Per-call-site facts.** A child's result is its analysis under the join of every call site
+  [#175](https://github.com/rboudrouss/reactant-analyzer/issues/175). `always-unstable-deps` also
+  reads the child re-analysed under each call site alone and names the parents a dep is fresh
+  through. `infinite-loop`, `cross-component-infinite-loop` and `missing-deps` read the join only,
+  so a fact that holds through one parent alone is missed there.
 - **Render cascades stop at what the analysis cannot see into.** `state-lifted-too-high` and
   `wasted-subtree-render` ([ADR-041](adr/ADR-041-render-dependence.md)) treat an element whose
   component does not resolve as a use, and never count it as wasted. That covers a library
