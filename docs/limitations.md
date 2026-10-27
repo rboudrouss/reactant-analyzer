@@ -223,6 +223,12 @@ carries an Error.
   `subscribe`) as a long-lived registration [#42](https://github.com/rboudrouss/reactant-analyzer/issues/42). Such a match never reaches Error, and
   neither does a write back that is not on every path of the callback
   [#142](https://github.com/rboudrouss/reactant-analyzer/issues/142).
+- **One `dispatchEvent` anywhere makes every `addEventListener` listener ⊤.** A listener is
+  event-only (no churn edge) only while no body of the program calls `dispatchEvent` (or `emit`
+  on a receiver): a dispatch runs the listeners before it returns, and which listener it reaches
+  is a question of event names and targets the analysis does not resolve (#219). A dispatch
+  hidden in an opaque callee is not seen. A JSX handler (`onClick`) stays event-only even then,
+  though dispatching on a DOM node React manages would run it synchronously too.
 - **`frozen-initial-state`** still fires on a child remounted by machinery it cannot see: a dialog
   body unmounted by its library wrapper, a route that swaps the subtree [#136](https://github.com/rboudrouss/reactant-analyzer/issues/136).
 - **`missing-deps`** asks whether a capture can go *stale*, so a read through a handle that never

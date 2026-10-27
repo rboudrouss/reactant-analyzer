@@ -258,6 +258,105 @@ fn addeventlistener_in_render_body_not_lifted() {
     );
 }
 
+// ── Synchronous dispatch (#219) ───────────────────────────────────────────────
+
+/// The effect-region rows through `setter`, with their phases.
+fn effect_phases(
+    r: &reactant::engine::ProgramAnalysisResult,
+    comp: &str,
+    setter: &str,
+) -> Vec<reactant::engine::WriterPhase> {
+    r.components[&r.component_named(comp).unwrap()]
+        .slot_writers
+        .iter()
+        .filter(|w| matches!(w.region, reactant::engine::WriterRegion::Effect(_)))
+        .filter(|w| reactant::ir::source_name(&w.setter) == setter)
+        .map(|w| w.phase)
+        .collect()
+}
+
+fn analyze(src: &str) -> reactant::engine::ProgramAnalysisResult {
+    let alloc = Allocator::default();
+    let ret = Parser::new(&alloc, src, SourceType::tsx())
+        .with_options(ParseOptions::default())
+        .parse();
+    let components = lower_program(
+        &ret.program,
+        src,
+        std::path::Path::new("test.tsx"),
+        &mut Default::default(),
+    );
+    reactant::engine::analyze_program(
+        reactant::engine::ComponentRegistry::from_components(components),
+        reactant::engine::HookRegistry::new(),
+        reactant::engine::RootStrategy::Heuristic,
+        &Config::default(),
+    )
+}
+
+#[test]
+fn a_listener_the_effect_dispatches_to_runs_in_the_effect() {
+    // `dispatchEvent` runs the listeners before it returns: the write is an
+    // effect write, every run re-renders, and the effect has no deps.
+    let src = r#"
+        import { useState, useEffect } from "react";
+        function C() {
+            const [s, setS] = useState({});
+            useEffect(() => {
+                const h = () => setS({});
+                window.addEventListener("ping", h);
+                window.dispatchEvent(new Event("ping"));
+                return () => window.removeEventListener("ping", h);
+            });
+            return <div>{Object.keys(s).length}</div>;
+        }
+    "#;
+    assert!(infinite_loop_hits(src) > 0, "React loops on this program");
+    let inline = src.replace("const h = () => setS({});", "").replace(
+        "addEventListener(\"ping\", h)",
+        "addEventListener(\"ping\", () => setS({}))",
+    );
+    assert!(
+        infinite_loop_hits(&inline) > 0,
+        "the reified inline listener runs in the effect too"
+    );
+}
+
+#[test]
+fn a_dispatch_anywhere_in_the_program_makes_every_listener_top() {
+    use reactant::engine::WriterPhase;
+    let listener = r#"
+        import { useState, useEffect } from "react";
+        export function Listener() {
+            const [n, setN] = useState(0);
+            useEffect(() => {
+                const h = () => setN(1);
+                window.addEventListener("ping", h);
+                return () => window.removeEventListener("ping", h);
+            }, []);
+            return <div>{n}</div>;
+        }
+    "#;
+    let r = analyze(listener);
+    assert_eq!(
+        effect_phases(&r, "Listener", "setN"),
+        vec![WriterPhase::Handler],
+        "no dispatch in the program: event-only"
+    );
+    let dispatcher = r#"
+        export function Dispatcher() {
+            useEffect(() => { window.dispatchEvent(new Event("ping")); });
+            return null;
+        }
+    "#;
+    let r = analyze(&format!("{listener}{dispatcher}"));
+    assert_eq!(
+        effect_phases(&r, "Listener", "setN"),
+        vec![WriterPhase::Unknown],
+        "another component dispatches: the listener may run in its effect"
+    );
+}
+
 // ── Fixture file regression ───────────────────────────────────────────────────
 
 #[test]

@@ -125,6 +125,7 @@ pub fn collect_setter_calls_with_extra(
         walking: HashSet::new(),
         root: cfg as *const CFG as usize,
         effect_body: false,
+        dispatches: false,
         shadowed: &empty,
         repeating: false,
         callback_bodies: &HashMap::new(),
@@ -191,11 +192,16 @@ pub(crate) struct WriteSite {
 /// `inc` was defined in render is invisible to a walk of the body alone. A
 /// name the walked body binds itself drops out of the set, fail-closed, the
 /// same device as `shadowed`.
+///
+/// `dispatches`: some body of the program fires event listeners itself
+/// ([`SetterWalk::dispatches`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_write_sites(
     cfg: &CFG,
     setter_vars: &HashSet<Var>,
     max_depth: usize,
     effect_body: bool,
+    dispatches: bool,
     shadowed: &HashSet<Var>,
     outer_fns: &HashMap<Var, Arc<CFG>>,
     callback_bodies: &HashMap<HookLabel, Arc<CFG>>,
@@ -224,6 +230,7 @@ pub(crate) fn collect_write_sites(
         walking: HashSet::new(),
         root: cfg as *const CFG as usize,
         effect_body,
+        dispatches,
         shadowed,
         repeating: false,
         callback_bodies,
@@ -1097,6 +1104,7 @@ fn class_phase(class: WalkClass, region: WriterRegion) -> WriterPhase {
 ///
 /// A write into a `useReducer` slot, own or foreign, stores what `reducers`
 /// says the slot's reducer returns, never its argument.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_slot_writers(
     render_cfg: &CFG,
     hooks: &[HookEntry],
@@ -1105,6 +1113,7 @@ pub(crate) fn collect_slot_writers(
     converged: &HashMap<Var, Vec<SetterProp>>,
     envs: &SiteEnvs<'_>,
     reducers: &crate::engine::Reducers<'_>,
+    dispatches: bool,
 ) -> Vec<SlotWriter> {
     let mut labels = setter_var_labels(render_cfg);
     for cfg in std::iter::once(render_cfg).chain(hooks.iter().filter_map(|h| h.body_cfg())) {
@@ -1259,6 +1268,7 @@ pub(crate) fn collect_slot_writers(
             &setter_vars,
             2,
             effect_body,
+            dispatches,
             &shadowed,
             &outer_fns,
             &callback_bodies,
@@ -1445,6 +1455,10 @@ struct SetterWalk<'a> {
     /// listeners were reified as Handler entries (`extract_subscriptions`),
     /// and its returned function is its cleanup.
     effect_body: bool,
+    /// Some body of the program dispatches events itself, so a listener may
+    /// run synchronously in the dispatching body: it is ⊤, not `Handler`
+    /// ([`Timing::in_program`](crate::engine::registrations::Timing::in_program), #219).
+    dispatches: bool,
     /// Locally-bound names that disable a deferring-global summary
     /// (fail-closed: `let setTimeout = …` anywhere in the component makes
     /// the bare name mean nothing).
@@ -1837,7 +1851,7 @@ impl<'a> SetterWalk<'a> {
             let shadowed = !reg.method_only
                 && matches!(fn_.peel_ts(), Expr::Var(n) if self.shadowed.contains(n.as_str()));
             if !shadowed {
-                return match reg.timing {
+                return match reg.timing.in_program(self.dispatches) {
                     Timing::Deferred => WalkClass::Deferred,
                     Timing::Handler => WalkClass::Handler,
                     Timing::Unknown => WalkClass::Unknown,
@@ -2162,9 +2176,16 @@ impl<'a> SetterWalk<'a> {
             // is exactly what `extract_subscriptions` reified as a Handler
             // entry — its body is walked as its own Handler region, so
             // descending it here would double-count. Anywhere else the same
-            // shape was NOT reified: classify the listener as Handler.
+            // shape was NOT reified: classify the listener as Handler. In a
+            // program that dispatches events, the listener may also run
+            // synchronously in this body's phase: the reified row keeps the
+            // event, and the descent here adds the ⊤ row (#219).
             let listener = expr.subscription_listener().is_some();
-            let reified = listener && self.effect_body && at_root && mode == WalkClass::Sync;
+            let reified = listener
+                && self.effect_body
+                && at_root
+                && mode == WalkClass::Sync
+                && !self.dispatches;
             // A teardown takes the callback back, it does not call it
             // (ADR-034 §5). Descending it here gave every registered listener
             // a second ⊤ row — from the very cleanup that unregisters it —
@@ -2177,7 +2198,11 @@ impl<'a> SetterWalk<'a> {
                     continue;
                 }
                 let class = if listener && i == 1 {
-                    WalkClass::Handler
+                    if self.dispatches {
+                        WalkClass::Unknown
+                    } else {
+                        WalkClass::Handler
+                    }
                 } else {
                     self.arg_class(fn_, mode)
                 };
@@ -2297,6 +2322,7 @@ pub fn collect_slot_reads(render_cfg: &CFG, hooks: &[HookEntry]) -> Vec<SlotRead
             walking: HashSet::new(),
             root: cfg as *const CFG as usize,
             effect_body: matches!(region, WriterRegion::Effect(_)),
+            dispatches: false,
             shadowed: &no_shadow,
             repeating: false,
             callback_bodies: &HashMap::new(),
@@ -2376,6 +2402,7 @@ pub fn collect_body_calls(cfg: &CFG, region: WriterRegion, max_depth: usize) -> 
         walking: HashSet::new(),
         root: cfg as *const CFG as usize,
         effect_body: matches!(region, WriterRegion::Effect(_)),
+        dispatches: false,
         shadowed: &empty_shadow,
         repeating: false,
         callback_bodies: &HashMap::new(),

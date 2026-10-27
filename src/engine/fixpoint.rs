@@ -77,6 +77,7 @@ pub fn analyze_component_inter(
         initial_env,
         initial_heap,
         Some(inter),
+        inter.dispatches,
     )
 }
 
@@ -114,6 +115,11 @@ pub fn analyze_component_as<T: Transfer<Domain = StateValue>>(
         AbstractEnv::bottom(),
         Heap::new(),
         None,
+        // The program is this component and the utilities it may call.
+        config
+            .function_registry
+            .all_functions()
+            .any(|f| crate::engine::registrations::dispatches_events(&f.body_cfg)),
     )
 }
 
@@ -127,6 +133,7 @@ pub fn analyze_component_as<T: Transfer<Domain = StateValue>>(
 ///   5. Handler passes (in-cycle).
 ///   6. Convergence check.
 ///   7. Widen after `config.widen_threshold` iterations.
+#[allow(clippy::too_many_arguments)]
 fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     comp: ComponentIR,
     comp_id: ComponentId,
@@ -135,6 +142,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     initial_env: AbstractEnv<StateValue>,
     initial_heap: Heap,
     inter: Option<&InterCtx<'_>>,
+    program_dispatches: bool,
 ) -> AnalysisResult<StateValue> {
     let ComponentIR {
         file: comp_file,
@@ -635,6 +643,11 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         effect_exits: &effect_block_states,
         handler_exits: &handler_block_states,
     };
+    // A listener may run synchronously wherever the program dispatches
+    // events (#219): this component's own bodies, inlined hooks and utilities
+    // included, or any other body of the program.
+    let dispatches = program_dispatches
+        || crate::engine::registrations::body_dispatches_events(&render_cfg, &hooks);
     let slot_writers = crate::engine::setters::collect_slot_writers(
         &render_cfg,
         &hooks,
@@ -643,6 +656,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         &converged_setters,
         &site_envs,
         &reducers,
+        dispatches,
     );
     // The seed relation rides the same slice: it folds `slot_writers` rows and
     // the effects' declared deps, so it must come after both (#106, ADR-031).
@@ -657,7 +671,8 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     // The registration relation rides the same slice (#111, ADR-034): one
     // scan of the effect bodies, read by `stale-closure`, `missing-cleanup`
     // and the Tier-A `registrations` anchor alike.
-    let registrations = crate::engine::registrations::collect_registrations(&render_cfg, &hooks);
+    let registrations =
+        crate::engine::registrations::collect_registrations(&render_cfg, &hooks, dispatches);
     let hooks_clone = hooks.clone();
 
     let mut result = AnalysisResult {
@@ -746,6 +761,11 @@ pub fn analyze_program(
 
     let roots = strategy.detect(&registry);
     let mut analysed: std::collections::HashSet<ComponentId> = std::collections::HashSet::new();
+    let dispatches = crate::engine::registrations::program_dispatches_events(
+        &registry,
+        &hook_registry,
+        &config.function_registry,
+    );
 
     // Phase 1: analyze roots top-down (children inlined via eval_comp_app).
     for &root in &roots {
@@ -767,6 +787,7 @@ pub fn analyze_program(
                 config,
                 analyze_child: analyze_component_inter as AnalyzeChildFn,
                 hook_registry: Some(&hook_registry),
+                dispatches,
             };
             let result = analyze_component_impl(
                 root_ir,
@@ -776,6 +797,7 @@ pub fn analyze_program(
                 AbstractEnv::bottom(),
                 Heap::new(),
                 Some(&inter),
+                dispatches,
             );
             stats.borrow_mut().components_analyzed += 1;
             results.borrow_mut().insert(root, result);
@@ -816,6 +838,7 @@ pub fn analyze_program(
                 AbstractEnv::bottom(),
                 Heap::new(),
                 None,
+                dispatches,
             );
             stats.borrow_mut().components_analyzed += 1;
             results.borrow_mut().insert(id, result);
