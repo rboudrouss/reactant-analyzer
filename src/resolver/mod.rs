@@ -701,9 +701,14 @@ pub(crate) fn normalize(path: &Path) -> PathBuf {
 }
 
 /// The source file a module path names, the way TypeScript's bundler
-/// resolution reads it: the path itself when it is a source file (never a
-/// `.d.ts`), else `<path>.<ext>`, else the same path with its extension
-/// swapped (`./x.js` written for `./x.ts`), else `<path>/index.<ext>`.
+/// resolution reads it: a JavaScript extension swapped for TypeScript
+/// (`./x.js` written for `./x.ts`), else the path itself when it is a source
+/// file (never a `.d.ts`), else `<path>.<ext>`, else `<path>/index.<ext>`.
+///
+/// The one probe every resolver goes through. Only a JavaScript extension is
+/// ever replaced: any other dot is part of the name, so `./Modal.context`
+/// names `Modal.context.ts` and never `Modal.tsx` — swapping it bound the
+/// wrong module, and analysed the wrong body.
 pub(crate) fn probe_module(fs: &dyn FileSystem, path: &Path) -> Option<PathBuf> {
     let base = normalize(path);
     let is_source = |p: &PathBuf| {
@@ -712,21 +717,25 @@ pub(crate) fn probe_module(fs: &dyn FileSystem, path: &Path) -> Option<PathBuf> 
             .is_some_and(|e| SOURCE_EXTENSIONS.contains(&e))
             && !p.to_string_lossy().ends_with(".d.ts")
     };
+    let javascript = base
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| matches!(e, "js" | "jsx" | "mjs" | "cjs"));
+    let swapped = ["ts", "tsx"]
+        .iter()
+        .filter(|_| javascript)
+        .map(|ext| base.with_extension(ext));
     let appended = SOURCE_EXTENSIONS.iter().map(|ext| {
         let mut p = base.clone().into_os_string();
         p.push(format!(".{ext}"));
         PathBuf::from(p)
     });
-    let swapped = SOURCE_EXTENSIONS
-        .iter()
-        .filter(|_| base.extension().is_some())
-        .map(|ext| base.with_extension(ext));
     let index = SOURCE_EXTENSIONS
         .iter()
         .map(|ext| base.join(format!("index.{ext}")));
-    std::iter::once(base.clone())
+    swapped
+        .chain(std::iter::once(base.clone()))
         .chain(appended)
-        .chain(swapped)
         .chain(index)
         .find(|candidate| is_source(candidate) && fs.is_file(candidate))
 }
@@ -736,27 +745,7 @@ impl ImportResolver for DefaultImportResolver {
         if !specifier.starts_with('.') {
             return None;
         }
-
-        let parent = from.parent()?;
-        let base = parent.join(specifier);
-
-        // Try <base>.<ext> for each source extension.
-        for ext in SOURCE_EXTENSIONS {
-            let candidate = base.with_extension(ext);
-            if self.fs.is_file(&candidate) {
-                return Some(normalize(&candidate));
-            }
-        }
-
-        // Try <base>/index.<ext>.
-        for ext in SOURCE_EXTENSIONS {
-            let candidate = base.join(format!("index.{ext}"));
-            if self.fs.is_file(&candidate) {
-                return Some(normalize(&candidate));
-            }
-        }
-
-        None
+        probe_module(self.fs.as_ref(), &from.parent()?.join(specifier))
     }
 }
 
@@ -931,6 +920,38 @@ mod tests {
 
         let resolved = DefaultImportResolver::default().resolve(&from, "./utils");
         assert_eq!(resolved, Some(ts));
+    }
+
+    /// A dot inside a module name is part of the name: `./Modal.context`
+    /// is `Modal.context.ts`, and never the `Modal.tsx` beside it.
+    #[test]
+    fn resolve_keeps_a_dotted_name_whole() {
+        let tmp = Tmp::new("resolve-dotted");
+        let from = tmp.write("a/b.tsx", "");
+        tmp.write("a/Modal.tsx", "");
+        let context = tmp.write("a/Modal.context.ts", "");
+        let r = DefaultImportResolver::default();
+        assert_eq!(r.resolve(&from, "./Modal.context"), Some(context));
+        assert_eq!(
+            r.resolve(&from, "./Modal.styles"),
+            None,
+            "no `Modal.styles.*`: unresolved, not `Modal.tsx`"
+        );
+        let dir = tmp.write("a/Store.state/index.ts", "");
+        assert_eq!(r.resolve(&from, "./Store.state"), Some(dir));
+    }
+
+    /// `./utils.js` written for `./utils.ts` (TypeScript's ESM convention)
+    /// is the only extension ever replaced.
+    #[test]
+    fn resolve_maps_a_javascript_extension_to_typescript() {
+        let tmp = Tmp::new("resolve-js-ext");
+        let from = tmp.write("a/b.tsx", "");
+        let ts = tmp.write("a/utils.ts", "");
+        tmp.write("a/utils.js", "");
+        let r = DefaultImportResolver::default();
+        assert_eq!(r.resolve(&from, "./utils.js"), Some(ts.clone()));
+        assert_eq!(r.resolve(&from, "./utils.ts"), Some(ts));
     }
 
     #[test]
