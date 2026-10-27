@@ -741,6 +741,8 @@ pub fn analyze_program(
     let stats = RefCell::new(AnalysisStats::default());
     let results: RefCell<HashMap<ComponentId, AnalysisResult<crate::domains::StateValue>>> =
         RefCell::new(HashMap::new());
+    let inputs: RefCell<HashMap<ComponentId, crate::domains::ChildInput>> =
+        RefCell::new(HashMap::new());
 
     let roots = strategy.detect(&registry);
     let mut analysed: std::collections::HashSet<ComponentId> = std::collections::HashSet::new();
@@ -759,6 +761,7 @@ pub fn analyze_program(
                 call_graph: &call_graph,
                 stats: &stats,
                 results: &results,
+                inputs: &inputs,
                 call_stack: RefCell::new(vec![]),
                 component: root,
                 config,

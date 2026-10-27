@@ -3,7 +3,7 @@ use std::cell::RefCell;
 use crate::{
     domains::{
         AbstractDomain, StateValue,
-        stores::{AbstractEnv, Heap, MemoStore, SharedStateStore, StateStore},
+        stores::{AbstractEnv, EnvVal, Heap, MemoStore, SharedStateStore, StateStore},
     },
     engine::{
         AnalysisResult, AnalysisStats, ComponentCache, ComponentCallGraph, ComponentRegistry,
@@ -72,7 +72,12 @@ pub struct InterCtx<'a> {
     pub call_graph: &'a RefCell<ComponentCallGraph>,
     pub stats: &'a RefCell<AnalysisStats>,
     /// All analysis results accumulated across the entire program analysis.
+    /// A child's is its analysis under [`InterCtx::inputs`]: every call
+    /// site's props at once (#175).
     pub results: &'a RefCell<std::collections::HashMap<ComponentId, AnalysisResult<StateValue>>>,
+    /// Per child, the join of the inputs of every call site analysed so
+    /// far: what its entry in `results` was computed under.
+    pub inputs: &'a RefCell<std::collections::HashMap<ComponentId, ChildInput>>,
     /// Components currently being analyzed (for recursion detection).
     pub call_stack: RefCell<Vec<ComponentId>>,
     /// The component being analyzed at this level.
@@ -99,6 +104,7 @@ impl<'a> InterCtx<'a> {
             call_graph: self.call_graph,
             stats: self.stats,
             results: self.results,
+            inputs: self.inputs,
             call_stack: RefCell::new(new_stack),
             component: child,
             config: self.config,
@@ -109,6 +115,62 @@ impl<'a> InterCtx<'a> {
 
     pub fn is_recursive(&self, id: ComponentId) -> bool {
         self.call_stack.borrow().contains(&id) || self.component == id
+    }
+}
+
+/// What a child's analysis depends on: its props, and the heap they reach,
+/// under one props object per child so that two call sites' inputs join
+/// (#175).
+#[derive(Debug, Clone)]
+pub struct ChildInput {
+    pub props_id: crate::ir::types::ExprId,
+    pub props: std::collections::HashMap<crate::ir::types::Symbol, EnvVal<StateValue>>,
+    pub heap: Heap,
+}
+
+impl ChildInput {
+    /// Either site's input. A prop one site does not pass is `undefined`
+    /// there.
+    pub fn join(
+        &self,
+        props: &std::collections::HashMap<crate::ir::types::Symbol, EnvVal<StateValue>>,
+        heap: &Heap,
+    ) -> Self {
+        let absent = EnvVal::Val(StateValue::undefined());
+        let mut joined = self.props.clone();
+        for (k, v) in props {
+            let mine = self.props.get(k).unwrap_or(&absent);
+            joined.insert(k.clone(), mine.join(v));
+        }
+        for (k, v) in joined.iter_mut() {
+            if !props.contains_key(k) {
+                *v = v.join(&absent);
+            }
+        }
+        ChildInput {
+            props_id: self.props_id,
+            props: joined,
+            heap: self.heap.join(heap),
+        }
+    }
+
+    /// Is a site's input below this one: the child's analysis under it
+    /// already covers the site?
+    pub fn covers(
+        &self,
+        props: &std::collections::HashMap<crate::ir::types::Symbol, EnvVal<StateValue>>,
+        heap: &Heap,
+    ) -> bool {
+        let absent = EnvVal::Val(StateValue::undefined());
+        props
+            .iter()
+            .all(|(k, v)| self.props.get(k).is_some_and(|mine| v.leq(mine)))
+            && self
+                .props
+                .iter()
+                .filter(|(k, _)| !props.contains_key(*k))
+                .all(|(_, mine)| absent.leq(mine))
+            && heap.leq(&self.heap)
     }
 }
 

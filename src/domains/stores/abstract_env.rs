@@ -41,6 +41,29 @@ impl<D: AbstractDomain> EnvVal<D> {
             EnvVal::Val(_) => None,
         }
     }
+
+    /// Either entry: the join of the values and the union of the sites —
+    /// the reading [`AbstractEnv::join`] gives a name, its values and its
+    /// locations joined apart.
+    pub fn join(&self, other: &Self) -> Self {
+        let val = self.as_val().join(&other.as_val());
+        match (self.locs(), other.locs()) {
+            (None, None) => EnvVal::Val(val),
+            (a, b) => EnvVal::Loc {
+                ids: a.into_iter().chain(b).flatten().copied().collect(),
+                val,
+            },
+        }
+    }
+
+    /// `self ⊑ other`: a value below, and sites among the other's.
+    pub fn leq(&self, other: &Self) -> bool {
+        let (a, b) = (self.as_val(), other.as_val());
+        a.join(&b) == b
+            && self
+                .locs()
+                .is_none_or(|s| s.is_empty() || other.locs().is_some_and(|o| s.is_subset(o)))
+    }
 }
 
 /// Per-variable abstract environment.

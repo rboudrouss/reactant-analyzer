@@ -122,7 +122,8 @@ impl Heap {
 
     /// Pointwise join: union of keys, join values at shared keys.
     /// `Fn` entries join their captured env (body CFG is structural: same site → same body);
-    /// `Obj` entries are kept structural.
+    /// `Obj` entries join member by member — one literal evaluated in two
+    /// envs (two call sites of a child, #175) is either object.
     pub fn join(&self, other: &Self) -> Self {
         let mut result = self.0.clone();
         for (id, val) in &other.0 {
@@ -166,7 +167,16 @@ impl Heap {
                         );
                     }
                 }
-                Some(_) => {} // Obj: keep self (structural)
+                Some(HeapValue::Obj(mine)) => {
+                    if let HeapValue::Obj(theirs) = val {
+                        let mut members = mine.clone();
+                        for (m, ev) in theirs {
+                            let joined = members.get(m).map_or_else(|| ev.clone(), |e| e.join(ev));
+                            members.insert(m.clone(), joined);
+                        }
+                        result.insert(*id, HeapValue::Obj(members));
+                    }
+                }
             }
         }
         Heap(result)
@@ -178,10 +188,21 @@ impl Heap {
         self.join(other)
     }
 
+    /// `self ⊑ other`: every entry of `self` is in `other`, a closure's
+    /// captures and an object's members each below the other's.
     pub fn leq(&self, other: &Self) -> bool {
-        // self ⊑ other: every key in self must exist in other.
-        // (Heap grows monotonically; no key removal is needed for soundness.)
-        self.0.keys().all(|k| other.0.contains_key(k))
+        self.0.iter().all(|(id, hv)| match (hv, other.0.get(id)) {
+            (HeapValue::Fn { captured: a, .. }, Some(HeapValue::Fn { captured: b, .. })) => {
+                a.iter().all(|(k, v)| {
+                    let w = map_get_or(b, k, StateValue::bottom);
+                    v.join(&w) == w
+                })
+            }
+            (HeapValue::Obj(a), Some(HeapValue::Obj(b))) => a
+                .iter()
+                .all(|(m, ev)| b.get(m).is_some_and(|other| ev.leq(other))),
+            _ => false,
+        })
     }
 }
 
@@ -221,4 +242,28 @@ pub fn resolve_locs<D: AbstractDomain>(
         .copied()
         .collect();
     (!ids.is_empty()).then_some(ids)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domains::impls::Interval;
+
+    fn obj(step: f64) -> Heap {
+        let mut h = Heap::new();
+        let members = HashMap::from([(
+            "step".to_string(),
+            EnvVal::Val(StateValue::number(Interval::point(step))),
+        )]);
+        h.insert(ExprId(7), HeapValue::Obj(members));
+        h
+    }
+
+    #[test]
+    fn one_object_from_two_envs_joins_member_by_member() {
+        let (a, b) = (obj(0.0), obj(1.0));
+        let j = a.join(&b);
+        assert!(a.leq(&j) && b.leq(&j));
+        assert!(!b.leq(&a), "a member moved: the heap is not below");
+    }
 }

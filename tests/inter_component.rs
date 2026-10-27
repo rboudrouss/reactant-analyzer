@@ -491,6 +491,78 @@ fn parse_and_analyze_with_strategy(src: &str, strategy: RootStrategy) -> Program
     analyze_program(reg, HookRegistry::new(), strategy, &Config::default())
 }
 
+// ── #175: a child's result covers every call site ─────────────────────────────
+
+/// The `infinite-loop` / `cross-component-infinite-loop` messages on
+/// `component`, sorted.
+fn loop_messages(src: &str, component: &str) -> Vec<String> {
+    use reactant::rules::{InfiniteLoop, Rule};
+    let result = parse_and_analyze(src);
+    let mut out: Vec<String> = InfiniteLoop
+        .check(&RuleCtx::new(
+            &result,
+            result.component_named(component).unwrap(),
+        ))
+        .into_iter()
+        .map(|d| d.message)
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn a_child_two_parents_render_reports_both_parents_in_any_order() {
+    let child = r#"
+import { useState, useEffect } from 'react';
+function Child({ v, set }: { v: object; set: (x: object) => void }) {
+  useEffect(() => { set({}); }, [v]);
+  return null;
+}
+"#;
+    let a = r#"
+export function A() {
+  const [a, setA] = useState({});
+  return <Child v={a} set={setA} />;
+}
+"#;
+    let b = r#"
+export function B() {
+  const [b, setB] = useState({});
+  return <Child v={b} set={setB} />;
+}
+"#;
+    for src in [format!("{child}{a}{b}"), format!("{child}{b}{a}")] {
+        let msgs = loop_messages(&src, "Child");
+        for parent in ["`A`", "`B`"] {
+            assert!(
+                msgs.iter().any(|m| m.contains(parent)),
+                "parent {parent} is reported: {msgs:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_last_call_site_of_a_child_does_not_hide_the_first() {
+    // L8: `step={0}` settles at once; analysed last, it used to be the only
+    // analysis of `Counter` left in the table.
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Counter({ step }: { step: number }) {
+  const [n, setN] = useState(0);
+  useEffect(() => { setN(n + step); }, [n]);
+  return <p>{n}</p>;
+}
+export function App() {
+  return (<div><Counter step={1} /><Counter step={0} /></div>);
+}
+"#;
+    assert!(
+        !loop_messages(src, "Counter").is_empty(),
+        "the `step={{1}}` instance loops"
+    );
+}
+
 #[test]
 fn fixture_inter_component_no_crash() {
     let src = std::fs::read_to_string("tests/fixtures/inter_component.tsx")

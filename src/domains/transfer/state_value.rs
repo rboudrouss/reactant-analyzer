@@ -627,13 +627,38 @@ fn eval_comp_app(
     }
     inter.stats.borrow_mut().cache_misses += 1;
 
+    // The child's entry in `results` is its analysis under the join of every
+    // call site's input (#175): one table slot per child, so the last site
+    // must not overwrite the others. A site the stored join covers adds
+    // nothing; any other re-runs the child under the new join.
+    let input = {
+        let mut inputs = inter.inputs.borrow_mut();
+        let joined = match inputs.get(&child) {
+            Some(stored) if stored.covers(&abstract_props_full, &props_heap) => None,
+            Some(stored) => Some(stored.join(&abstract_props_full, &props_heap)),
+            None => Some(crate::domains::ChildInput {
+                props_id: ExprId::fresh(),
+                props: abstract_props_full,
+                heap: props_heap,
+            }),
+        };
+        if let Some(j) = &joined {
+            inputs.insert(child, j.clone());
+        }
+        joined
+    };
+    let Some(input) = input else {
+        record_call_site(inter, child, abstract_props, None);
+        return;
+    };
+
     // Build child initial env + heap: the props' reachable heap, plus the
     // props Obj itself (with full EnvVals) so the child can resolve
     // FieldAccess → Loc.
     let mut child_env = AbstractEnv::bottom();
-    let props_id = ExprId::fresh();
-    let mut initial_heap = props_heap;
-    initial_heap.insert(props_id, HeapValue::Obj(abstract_props_full.clone()));
+    let props_id = input.props_id;
+    let mut initial_heap = input.heap;
+    initial_heap.insert(props_id, HeapValue::Obj(input.props));
     child_env.extend_loc(child_ir.param.clone(), props_id);
 
     // Create child inter context and analyze
