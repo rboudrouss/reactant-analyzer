@@ -907,19 +907,37 @@ fn alloc_span(cfg: &CFG, hooks: &[HookEntry]) -> usize {
         .unwrap_or(0)
 }
 
-/// Guard strategy: every entry carries its **ancestry** — the hook names whose
-/// expansion produced it, outermost first (empty for the component's own
-/// calls). A `Custom` entry is skipped (cut to ⊤) only when its name is in its
-/// own ancestry, which is exactly a self- or mutually-recursive call. Each
-/// expansion strictly lengthens the ancestry with a name not already in it, so
-/// the chain is bounded by the number of distinct hook names and the loop
-/// terminates.
-///
-/// The guard used to be one set of every name expanded so far in the
-/// component, never popped: a hook called twice — `useSlot(0)` then
-/// `useSlot(2)`, siblings, not recursion — had its second call left opaque, so
-/// its state slot and every write through its setter were invisible (a false
-/// `verified`, #185).
+/// The recursion guard both splices share (custom hooks, utilities): the
+/// names whose inlining produced a call, outermost first (empty for the
+/// component's own code). A call is cut to ⊤ only when its callee is in its
+/// own ancestry — exactly self- or mutual recursion. A name inlined
+/// *elsewhere* is no reason to cut: a guard remembering every name ever
+/// inlined left a sibling second call opaque, and every write through it
+/// invisible (#185, #232). Each inlining strictly lengthens the chain with a
+/// name not already in it, so chains are bounded by the number of names.
+#[derive(Clone, Default)]
+struct Ancestry(std::rc::Rc<Vec<String>>);
+
+impl Ancestry {
+    /// A call of `callee` here would re-enter an enclosing inlining.
+    fn recurses(&self, callee: &str) -> bool {
+        self.0.iter().any(|n| n == callee)
+    }
+
+    /// The ancestry of the code an inlining of `callee` from here produces.
+    fn enter(&self, callee: &str) -> Ancestry {
+        Ancestry(std::rc::Rc::new(
+            self.0
+                .iter()
+                .cloned()
+                .chain(std::iter::once(callee.to_string()))
+                .collect(),
+        ))
+    }
+}
+
+/// Guard strategy: every entry carries its [`Ancestry`]. A `Custom` entry is
+/// skipped (cut to ⊤) only when its ancestry recurses on its name.
 fn expand_custom_hooks(
     hooks: &mut Vec<HookEntry>,
     hook_provenance: &mut Vec<crate::ir::hooks::HookProvenance>,
@@ -935,7 +953,7 @@ fn expand_custom_hooks(
     };
 
     // Ancestry by entry label; an entry with no row is the component's own.
-    let mut ancestry: HashMap<HookLabel, std::rc::Rc<Vec<String>>> = HashMap::new();
+    let mut ancestry: HashMap<HookLabel, Ancestry> = HashMap::new();
 
     let mut i = 0;
     while i < hooks.len() {
@@ -961,7 +979,7 @@ fn expand_custom_hooks(
 
         // Recursion guard: skip a call of a hook this entry is already inside.
         let chain = ancestry.get(&custom_label).cloned().unwrap_or_default();
-        if chain.contains(&name) {
+        if chain.recurses(&name) {
             i += 1;
             continue;
         }
@@ -1167,15 +1185,9 @@ fn expand_custom_hooks(
 
         // The inlined entries sit one hook deeper: their ancestry is this
         // call's plus this hook, so a call of `name` among them is recursion.
-        let inner: std::rc::Rc<Vec<String>> = std::rc::Rc::new(
-            chain
-                .iter()
-                .cloned()
-                .chain(std::iter::once(name.clone()))
-                .collect(),
-        );
+        let inner = chain.enter(&name);
         for h in &remapped {
-            ancestry.insert(h.label(), std::rc::Rc::clone(&inner));
+            ancestry.insert(h.label(), inner.clone());
         }
 
         // Replace the Custom entry with the hook's remapped sub-entries.
@@ -1567,12 +1579,7 @@ fn expand_utility_calls(
         salt,
         truncated: false,
     };
-    inline_in_cfg(
-        render_cfg,
-        &mut ctx,
-        &mut regions.render,
-        &mut HashSet::new(),
-    );
+    inline_in_cfg(render_cfg, &mut ctx, &mut regions.render);
     for hook in hooks.iter_mut() {
         match hook {
             HookEntry::Effect {
@@ -1588,7 +1595,7 @@ fn expand_utility_calls(
                 label, body_cfg, ..
             } => {
                 let body_regions = regions.bodies.entry(*label).or_default();
-                inline_in_cfg(body_cfg, &mut ctx, body_regions, &mut HashSet::new());
+                inline_in_cfg(body_cfg, &mut ctx, body_regions);
             }
             _ => {}
         }
@@ -1596,10 +1603,10 @@ fn expand_utility_calls(
     ctx.truncated
 }
 
-/// Splice utility calls in `cfg`. Each utility name is inlined at most once
-/// per CFG: this is the recursion guard (self-recursive utilities, and
-/// `A → B → A` chains, terminate after a single round-trip; subsequent calls
-/// remain `Call` → opaque `Top`).
+/// Splice utility calls in `cfg`. The recursion guard is each block's
+/// [`Ancestry`]: a call is left `Call` → opaque `Top` only inside an inlining
+/// of its own callee (self-recursion, `A → B → A`), so two sibling calls of
+/// one utility are both inlined (#232).
 ///
 /// `max_depth` caps the total number of splices into one CFG so a single
 /// inlining never explodes the IR even with deep utility chains.
@@ -1607,11 +1614,26 @@ fn inline_in_cfg(
     cfg: &mut CFG,
     ctx: &mut InlineCtx<'_>,
     regions: &mut Vec<crate::engine::setters::InlineRegion>,
-    expanding: &mut HashSet<String>,
 ) {
+    // Ancestry by block range: a splice's blocks sit one utility deeper than
+    // its call; its join block (the caller's post-call statements, just past
+    // the range) keeps the call's own. Ranges are disjoint, each splice
+    // allocating strictly above.
+    let mut scopes: Vec<(std::ops::Range<BlockId>, Ancestry)> = Vec::new();
+    // A splice that bailed (a headless body) would bail again: never retried.
+    let mut unsplicable: HashSet<String> = HashSet::new();
     let mut budget = ctx.max_depth;
     loop {
-        let target = find_inlining_target(cfg, ctx.registry, ctx.caller_file, regions, expanding);
+        let ancestry = |bid: BlockId| {
+            scopes
+                .iter()
+                .find(|(r, _)| r.contains(&bid))
+                .map(|(_, a)| a.clone())
+                .unwrap_or_default()
+        };
+        let target = find_inlining_target(cfg, ctx.registry, ctx.caller_file, regions, |bid, n| {
+            unsplicable.contains(n) || ancestry(bid).recurses(n)
+        });
         if budget == 0 {
             // Exhausting the budget leaves the remaining calls opaque (⊤) —
             // sound, but a truncation, and one that measurably happens (20 CFGs
@@ -1624,9 +1646,7 @@ fn inline_in_cfg(
         let Some((block_id, stmt_idx, name)) = target else {
             break;
         };
-        // Mark before splicing so a self-recursive call inside the spliced
-        // body is skipped on the next scan.
-        expanding.insert(name.clone());
+        let chain = ancestry(block_id);
         // Provenance (ADR-019 origins, ADR-027 §4 regions): recorded as an
         // explicit pair with the splice, only when it actually happened —
         // the old push-before-splice let an early-returning splice desync
@@ -1647,6 +1667,8 @@ fn inline_in_cfg(
             let parent = regions
                 .iter()
                 .position(|r| r.start <= block_id && block_id < r.end);
+            scopes.push((range.end..range.end + 1, chain.clone()));
+            scopes.push((range.clone(), chain.enter(&name)));
             regions.push(crate::engine::setters::InlineRegion {
                 start: range.start,
                 end: range.end,
@@ -1654,17 +1676,21 @@ fn inline_in_cfg(
                 from,
                 parent,
             });
+        } else {
+            unsplicable.insert(name);
         }
         budget -= 1;
     }
 }
 
+/// The first call to a resolvable utility in `cfg` that `skip(block, name)`
+/// does not cut.
 fn find_inlining_target(
     cfg: &CFG,
     registry: &FunctionRegistry,
     caller_file: &std::path::Path,
     regions: &[crate::engine::setters::InlineRegion],
-    expanding: &HashSet<String>,
+    skip: impl Fn(BlockId, &str) -> bool,
 ) -> Option<(BlockId, usize, String)> {
     for (&bid, block) in &cfg.blocks {
         // A statement inside a spliced region came from the wrapper's file:
@@ -1678,7 +1704,7 @@ fn find_inlining_target(
             .unwrap_or(caller_file);
         for (idx, stmt) in block.stmts.iter().enumerate() {
             if let Some(name) = utility_call_target(stmt) {
-                if expanding.contains(&name) {
+                if skip(bid, &name) {
                     continue;
                 }
                 if registry.resolve(res_file, &name).is_some() {
