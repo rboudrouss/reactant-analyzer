@@ -718,6 +718,7 @@ impl<'a> Analyzer<'a> {
         let mut out_env: HashMap<BlockId, Env> = HashMap::new();
         let mut pc: HashMap<BlockId, Deps> = HashMap::new();
         let order = cfg.rpo();
+        let succs = cfg.successor_map();
         // Worklist in RPO priority: a block is revisited only when its input
         // env or one of its controlling conditions changed. A sweep of every
         // block per round re-cloned and re-compared each block's whole env
@@ -759,7 +760,7 @@ impl<'a> Analyzer<'a> {
                 self.transfer(stmt, &mut env, &p);
             }
             pc.insert(b, p);
-            for s in cfg.successors(b) {
+            for &s in succs.get(&b).into_iter().flatten() {
                 let slot = in_env.entry(s).or_default();
                 if join_env(slot, &env)
                     && let Some(&j) = pos.get(&s)
