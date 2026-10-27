@@ -269,11 +269,14 @@ pub fn extract_hooks(
     cfg: &mut CFG,
     imports: &ImportCtx<'_>,
 ) -> (Vec<HookEntry>, Vec<HookProvenance>, HookLabel) {
-    let mut label: HookLabel = 0;
-    let mut hooks: Vec<HookEntry> = Vec::new();
-    let mut provenance: Vec<HookProvenance> = Vec::new();
-    // Maps array-destructuring temps (e.g. "__arr_42") → hook label, for useState/useReducer.
-    let mut state_temps: HashMap<String, HookLabel> = HashMap::new();
+    let mut ex = Extractor {
+        hooks: Vec::new(),
+        provenance: Vec::new(),
+        label: 0,
+        state_temps: HashMap::new(),
+        staged: 0,
+        imports,
+    };
 
     // Collected up front because the loop takes `&mut cfg.blocks` — the ids
     // already come out in order (`CFG::blocks` is a `BTreeMap`).
@@ -283,24 +286,104 @@ pub fn extract_hooks(
 
     for id in ids {
         let old = std::mem::take(&mut cfg.blocks.get_mut(&id).unwrap().stmts);
-        let mut new: Vec<Stmt> = Vec::with_capacity(old.len());
-
+        let mut new = BlockOut::default();
         for stmt in old {
-            process_stmt(
-                stmt,
-                &mut new,
-                &mut hooks,
-                &mut provenance,
-                &mut label,
-                &mut state_temps,
-                imports,
-            );
+            ex.stmt(stmt, &mut new);
         }
-
-        cfg.blocks.get_mut(&id).unwrap().stmts = new;
+        new.install(cfg, id);
     }
 
-    (hooks, provenance, label)
+    (ex.hooks, ex.provenance, ex.label)
+}
+
+/// What one block's statements become once its hooks are extracted.
+///
+/// A lazy initializer (`useState(() => …)`) runs during the mount render
+/// only, so it cannot sit among the block's statements, which run at every
+/// render. Each one cuts the block: the statements before it end in a branch
+/// on ⊤ whose taken side runs the initializer, and the rest of the block
+/// follows the join — a site that runs on some renders, which is what "the
+/// mount render" is to an analysis of every render.
+#[derive(Default)]
+struct BlockOut {
+    stmts: Vec<Stmt>,
+    /// The closed segments, each followed by the statement of a lazy
+    /// initializer.
+    cuts: Vec<(Vec<Stmt>, Stmt)>,
+}
+
+impl BlockOut {
+    fn push(&mut self, stmt: Stmt) {
+        self.stmts.push(stmt);
+    }
+
+    /// `stmt` runs at the mount render only, after everything pushed so far.
+    fn push_on_mount(&mut self, stmt: Stmt) {
+        let before = std::mem::take(&mut self.stmts);
+        self.cuts.push((before, stmt));
+    }
+
+    /// Write the statements back as block `id`, cut into fresh blocks where
+    /// a mount-only statement runs. The block's terminator and its outgoing
+    /// edges move to the last segment; its incoming edges stay on `id`.
+    fn install(self, cfg: &mut CFG, id: BlockId) {
+        use crate::ir::cfg::{Edge, EdgeKind};
+        if self.cuts.is_empty() {
+            cfg.blocks.get_mut(&id).unwrap().stmts = self.stmts;
+            return;
+        }
+        let mut next: BlockId = cfg.blocks.keys().max().map_or(0, |m| m + 1);
+        let term = std::mem::replace(
+            &mut cfg.blocks.get_mut(&id).unwrap().term,
+            Terminator::Unreachable,
+        );
+        let outgoing: Vec<usize> = (0..cfg.edges.len())
+            .filter(|&i| cfg.edges[i].from == id)
+            .collect();
+        let mut cur = id;
+        for (stmts, on_mount) in self.cuts {
+            let (then_, join) = (next, next + 1);
+            next += 2;
+            let block = cfg.blocks.get_mut(&cur).unwrap();
+            block.stmts = stmts;
+            block.term = Terminator::Branch {
+                cond: Expr::SummaryVal(crate::ir::expr::SummaryValue::Top),
+                then_,
+                else_: join,
+                span: None,
+            };
+            cfg.blocks.insert(
+                then_,
+                BasicBlock {
+                    id: then_,
+                    stmts: vec![on_mount],
+                    term: Terminator::Jump(join),
+                },
+            );
+            cfg.blocks.insert(
+                join,
+                BasicBlock {
+                    id: join,
+                    stmts: vec![],
+                    term: Terminator::Unreachable,
+                },
+            );
+            for (from, to, kind) in [
+                (cur, then_, EdgeKind::IfTrue),
+                (cur, join, EdgeKind::IfFalse),
+                (then_, join, EdgeKind::Unconditional),
+            ] {
+                cfg.edges.push(Edge { from, to, kind });
+            }
+            cur = join;
+        }
+        let last = cfg.blocks.get_mut(&cur).unwrap();
+        last.stmts = self.stmts;
+        last.term = term;
+        for i in outgoing {
+            cfg.edges[i].from = cur;
+        }
+    }
 }
 
 /// Move a hook call out of a terminator and into a statement (#4).
@@ -357,106 +440,241 @@ fn contains_hook_call(expr: &Expr, imports: &ImportCtx<'_>) -> bool {
     found
 }
 
-fn process_stmt(
-    stmt: Stmt,
-    out: &mut Vec<Stmt>,
-    hooks: &mut Vec<HookEntry>,
-    provenance: &mut Vec<HookProvenance>,
-    label: &mut HookLabel,
-    state_temps: &mut HashMap<String, HookLabel>,
-    imports: &ImportCtx<'_>,
-) {
-    match stmt {
-        Stmt::Let {
-            var,
-            rhs,
-            span: stmt_span,
-        } => match try_consume_hook_call(rhs, imports) {
-            Ok((call, args)) => {
-                let lbl = *label;
-                *label += 1;
-                let is_state_like =
-                    call.is_react && matches!(call.origin_name.as_str(), "useState" | "useReducer");
-                let is_arr_temp = var.starts_with("__arr_");
+/// The state of one body's hook extraction.
+struct Extractor<'i, 'a> {
+    hooks: Vec<HookEntry>,
+    provenance: Vec<HookProvenance>,
+    label: HookLabel,
+    /// Array-destructuring temps (e.g. "__arr_42") → hook label, for
+    /// useState/useReducer.
+    state_temps: HashMap<String, HookLabel>,
+    /// Hook arguments staged so far, for fresh temp names.
+    staged: usize,
+    imports: &'i ImportCtx<'a>,
+}
 
-                let entry = make_hook_entry(&call, lbl, args, stmt_span);
-                let marker = hook_result_expr(&call, lbl, entry.as_ref());
-                provenance.push(call.provenance(lbl, stmt_span));
-                if let Some(entry) = entry {
-                    hooks.push(entry);
-                }
+impl Extractor<'_, '_> {
+    fn stmt(&mut self, stmt: Stmt, out: &mut BlockOut) {
+        match stmt {
+            Stmt::Let {
+                var,
+                rhs,
+                span: stmt_span,
+            } => match try_consume_hook_call(rhs, self.imports) {
+                Ok((call, args)) => {
+                    let (lbl, entry) = self.hook_call(&call, args, stmt_span, out);
+                    let is_state_like = call.is_react
+                        && matches!(call.origin_name.as_str(), "useState" | "useReducer");
+                    let is_arr_temp = var.starts_with("__arr_");
+                    let marker = hook_result_expr(&call, lbl, entry.as_ref());
+                    if let Some(entry) = entry {
+                        self.hooks.push(entry);
+                    }
 
-                // Record the binding variable on Custom hooks (their import
-                // source and resolved file come from the classification).
-                if let Some(HookEntry::Custom { binding, .. }) = hooks.last_mut() {
-                    // `__arr_N` / `__obj_N` is a lowering temp, never a source name.
-                    if !crate::ir::splice::is_destructuring_temp(&var) {
-                        *binding = Some(var.clone());
+                    // Record the binding variable on Custom hooks (their import
+                    // source and resolved file come from the classification).
+                    if let Some(HookEntry::Custom { binding, .. }) = self.hooks.last_mut() {
+                        // `__arr_N` / `__obj_N` is a lowering temp, never a source name.
+                        if !crate::ir::splice::is_destructuring_temp(&var) {
+                            *binding = Some(var.clone());
+                        }
+                    }
+
+                    if is_state_like && is_arr_temp {
+                        // Array-destructured useState/useReducer: drop the temp Let,
+                        // subsequent IndexAccess stmts will be rewritten by rewrite_expr.
+                        self.state_temps.insert(var, lbl);
+                    } else {
+                        out.push(Stmt::Let {
+                            var,
+                            rhs: marker,
+                            span: stmt_span,
+                        });
                     }
                 }
-
-                if is_state_like && is_arr_temp {
-                    // Array-destructured useState/useReducer: drop the temp Let,
-                    // subsequent IndexAccess stmts will be rewritten by rewrite_expr.
-                    state_temps.insert(var, lbl);
-                } else {
+                Err(rhs) => {
                     out.push(Stmt::Let {
                         var,
-                        rhs: marker,
+                        rhs: rewrite_expr(rhs, &self.state_temps),
                         span: stmt_span,
                     });
                 }
-            }
-            Err(rhs) => {
-                out.push(Stmt::Let {
+            },
+            Stmt::ExprStmt(expr, stmt_span) => match try_consume_hook_call(expr, self.imports) {
+                Ok((call, args)) => {
+                    let (lbl, entry) = self.hook_call(&call, args, stmt_span, out);
+                    let marker = marker_val(entry.as_ref());
+                    if let Some(entry) = entry {
+                        self.hooks.push(entry);
+                    }
+                    // Void hooks (useEffect, bare custom calls): leave a marker so
+                    // the call-site block stays recoverable from the CFG.
+                    out.push(Stmt::ExprStmt(Expr::HookMarker(lbl, marker), stmt_span));
+                }
+                Err(expr) => {
+                    out.push(Stmt::ExprStmt(
+                        rewrite_expr(expr, &self.state_temps),
+                        stmt_span,
+                    ));
+                }
+            },
+            Stmt::Assign { var, rhs, span } => {
+                out.push(Stmt::Assign {
                     var,
-                    rhs: rewrite_expr(rhs, state_temps),
-                    span: stmt_span,
+                    rhs: rewrite_expr(rhs, &self.state_temps),
+                    span,
                 });
             }
-        },
-        Stmt::ExprStmt(expr, stmt_span) => match try_consume_hook_call(expr, imports) {
-            Ok((call, args)) => {
-                let lbl = *label;
-                *label += 1;
-                let entry = make_hook_entry(&call, lbl, args, stmt_span);
-                let marker = marker_val(entry.as_ref());
-                provenance.push(call.provenance(lbl, stmt_span));
-                if let Some(entry) = entry {
-                    hooks.push(entry);
-                }
-                // Void hooks (useEffect, bare custom calls): leave a marker so
-                // the call-site block stays recoverable from the CFG.
-                out.push(Stmt::ExprStmt(Expr::HookMarker(lbl, marker), stmt_span));
-            }
-            Err(expr) => {
-                out.push(Stmt::ExprStmt(rewrite_expr(expr, state_temps), stmt_span));
-            }
-        },
-        Stmt::Assign { var, rhs, span } => {
-            out.push(Stmt::Assign {
-                var,
-                rhs: rewrite_expr(rhs, state_temps),
+            Stmt::MemberWrite {
+                obj,
+                key,
+                rhs,
                 span,
-            });
-        }
-        Stmt::MemberWrite {
-            obj,
-            key,
-            rhs,
-            span,
-        } => {
-            out.push(Stmt::MemberWrite {
-                obj: rewrite_expr(obj, state_temps),
-                key: match key {
-                    MemberKey::Field(f) => MemberKey::Field(f),
-                    MemberKey::Index(idx) => MemberKey::Index(rewrite_expr(idx, state_temps)),
-                },
-                rhs: rewrite_expr(rhs, state_temps),
-                span,
-            });
+            } => {
+                out.push(Stmt::MemberWrite {
+                    obj: rewrite_expr(obj, &self.state_temps),
+                    key: match key {
+                        MemberKey::Field(f) => MemberKey::Field(f),
+                        MemberKey::Index(idx) => {
+                            MemberKey::Index(rewrite_expr(idx, &self.state_temps))
+                        }
+                    },
+                    rhs: rewrite_expr(rhs, &self.state_temps),
+                    span,
+                });
+            }
         }
     }
+
+    /// Label one hook call and build its entry, once its arguments are
+    /// staged in the render body.
+    fn hook_call(
+        &mut self,
+        call: &ResolvedHookCall,
+        args: Vec<Expr>,
+        span: Option<SourceRange>,
+        out: &mut BlockOut,
+    ) -> (HookLabel, Option<HookEntry>) {
+        let staged = self.stage_args(call, &args, span, out);
+        let lbl = self.label;
+        self.label += 1;
+        self.provenance.push(call.provenance(lbl, span));
+        let mut entry = make_hook_entry(call, lbl, args, span);
+        if let Some(HookEntry::Custom { args, .. }) = &mut entry {
+            *args = staged;
+        }
+        (lbl, entry)
+    }
+
+    /// Evaluate a hook call's arguments where React does: in the render body,
+    /// before the hook, at every render (#193).
+    ///
+    /// The entry takes the arguments out of the render CFG, so a call written
+    /// in one — `useState(setA(1))`, `useMemo(f, [setA(1)])`,
+    /// `useThing(load())` — was a call no render pass ran: no write in the
+    /// render phase, a `verified setter-in-render`. An argument that runs a
+    /// call (outside a function literal, which only creates a closure) is now
+    /// bound to a temp by a render statement ahead of the hook's marker, so
+    /// the interpreter, the writer relation and every render-body rule see it
+    /// run. Returns what stands for each argument's value there: the temp, or
+    /// the argument itself when evaluating it runs nothing.
+    ///
+    /// A custom hook receives the values — its body is spliced with its
+    /// parameters bound to its arguments — so its entry takes them and the
+    /// call runs once. A modeled React hook's entry keeps the expressions,
+    /// which its readers take syntactically (`lazy-init`, the deps rules) and
+    /// the engine evaluates without effects.
+    ///
+    /// A lazy initializer — a function handed to `useState`, or `useReducer`'s
+    /// third argument — runs during the mount render only, which
+    /// [`BlockOut::push_on_mount`] models.
+    fn stage_args(
+        &mut self,
+        call: &ResolvedHookCall,
+        args: &[Expr],
+        span: Option<SourceRange>,
+        out: &mut BlockOut,
+    ) -> Vec<Expr> {
+        let mut values: Vec<Expr> = Vec::with_capacity(args.len());
+        for arg in args {
+            if !runs_a_call(arg) {
+                values.push(arg.clone());
+                continue;
+            }
+            let var = format!("__hookarg_{}", self.staged);
+            self.staged += 1;
+            self.stmt(
+                Stmt::Let {
+                    var: var.clone(),
+                    rhs: arg.clone(),
+                    span,
+                },
+                out,
+            );
+            values.push(Expr::Var(var));
+        }
+        if let Some(lazy) = lazy_initializer(call, args) {
+            let fn_ = values[lazy.callee].clone();
+            let args = lazy.args.iter().map(|&i| values[i].clone()).collect();
+            out.push_on_mount(Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(fn_),
+                    args,
+                },
+                span,
+            ));
+        }
+        values
+    }
+}
+
+/// The call React makes at mount to a hook's lazy initializer: argument
+/// `callee`, applied to arguments `args` (positions in the hook call).
+struct LazyInit {
+    callee: usize,
+    args: Vec<usize>,
+}
+
+/// `useState(init)` calls `init()` at mount when it is a function;
+/// `useReducer(r, arg, init)` calls `init(arg)`. Fail-closed: anything that
+/// may evaluate to a function is called.
+fn lazy_initializer(call: &ResolvedHookCall, args: &[Expr]) -> Option<LazyInit> {
+    if !call.is_react {
+        return None;
+    }
+    let (callee, applied) = match call.origin_name.as_str() {
+        "useState" => (0, vec![]),
+        "useReducer" if args.len() > 2 => (2, vec![1]),
+        _ => return None,
+    };
+    let may_be_function = !matches!(
+        args.get(callee).map(Expr::peel_ts),
+        None | Some(
+            Expr::Lit(_)
+                | Expr::ObjectLit { .. }
+                | Expr::ArrayLit { .. }
+                | Expr::BinOp { .. }
+                | Expr::UnaryOp { .. }
+                | Expr::NativeElem { .. }
+                | Expr::CompApp { .. }
+                | Expr::New { .. }
+        )
+    );
+    may_be_function.then_some(LazyInit {
+        callee,
+        args: applied,
+    })
+}
+
+/// Does evaluating `e` run a call? Not inside a function literal: evaluating
+/// one creates a closure and runs nothing.
+fn runs_a_call(e: &Expr) -> bool {
+    if matches!(e, Expr::Call { .. } | Expr::New { .. }) {
+        return true;
+    }
+    let mut found = false;
+    e.for_each_child(&mut |c| found = found || runs_a_call(c));
+    found
 }
 
 // ── Hook call detection ───────────────────────────────────────────────────────
@@ -1053,6 +1271,85 @@ mod tests {
             find_let_rhs(stmts, "pair"),
             Some(Expr::StateVal(0))
         ));
+    }
+
+    // ── render-evaluated arguments (#193) ───────────────────────────────────
+
+    #[test]
+    fn a_call_in_a_hook_argument_stays_a_render_statement_before_the_marker() {
+        let (cfg, hooks) = parse_and_extract(
+            "function C() { const v = useMemo(() => 1, [f(x)]); return <div/>; }",
+        );
+        let stmts = entry_stmts(&cfg);
+        let call = stmts
+            .iter()
+            .position(|s| {
+                matches!(
+                    s,
+                    Stmt::Let {
+                        rhs: Expr::ArrayLit { .. },
+                        ..
+                    }
+                )
+            })
+            .expect("the deps list runs in render");
+        let marker = stmts
+            .iter()
+            .position(|s| {
+                matches!(
+                    s,
+                    Stmt::Let {
+                        rhs: Expr::MemoVal(0),
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert!(call < marker, "{stmts:?}");
+        // The entry keeps the deps as written.
+        assert!(
+            matches!(&hooks[0], HookEntry::Memo { deps: DepsArg::List(d), .. } if d.len() == 1)
+        );
+    }
+
+    #[test]
+    fn a_custom_hook_receives_its_staged_argument() {
+        let (cfg, hooks) =
+            parse_and_extract("function C() { const v = useThing(load()); return <div/>; }");
+        let HookEntry::Custom { args, .. } = &hooks[0] else {
+            panic!("{hooks:?}");
+        };
+        let [Expr::Var(t)] = args.as_slice() else {
+            panic!("{args:?}");
+        };
+        assert!(
+            matches!(find_let_rhs(entry_stmts(&cfg), t), Some(Expr::Call { .. })),
+            "the call runs once, in render, bound to what the hook receives"
+        );
+    }
+
+    #[test]
+    fn a_lazy_initializer_runs_on_a_branch_and_the_block_continues_after_it() {
+        let (cfg, _) = parse_and_extract(
+            "function C() { const [a] = useState(() => 0); if (a) { g(); } return <div/>; }",
+        );
+        let entry = &cfg.blocks[&cfg.entry];
+        let Terminator::Branch { then_, else_, .. } = entry.term else {
+            panic!("the entry ends on the mount branch: {:?}", entry.term);
+        };
+        assert!(matches!(
+            cfg.blocks[&then_].stmts.as_slice(),
+            [Stmt::ExprStmt(Expr::Call { fn_, .. }, _)] if matches!(**fn_, Expr::FnLit { .. })
+        ));
+        // The rest of the block — the binding and the `if` — follows the join.
+        let join = &cfg.blocks[&else_];
+        assert!(matches!(
+            find_let_rhs(&join.stmts, "a"),
+            Some(Expr::StateVal(0))
+        ));
+        assert!(matches!(join.term, Terminator::Branch { .. }));
+        assert_eq!(cfg.successors(else_).len(), 2, "the `if` edges moved along");
+        assert_eq!(cfg.successors(cfg.entry), vec![then_, else_]);
     }
 
     // ── useEffect ────────────────────────────────────────────────────────────
