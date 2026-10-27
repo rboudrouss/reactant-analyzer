@@ -26,7 +26,8 @@ pub use tsconfig::{TsconfigPaths, load_tsconfig_paths, strip_jsonc};
 /// Build-tool convention detected at a project root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectKind {
-    /// No recognized build tool: walk the given path as-is, relative imports only.
+    /// No recognized build tool: walk the given path as-is; tsconfig `paths`
+    /// when a tsconfig declares them, relative imports otherwise.
     Plain,
     /// Vite project: sources under `src/`, tsconfig `paths` aliases.
     Vite,
@@ -135,7 +136,15 @@ fn locate_tsconfig_paths(config_root: &Path, fs: &dyn FileSystem) -> Option<Tsco
 /// The import resolver a run started at `dir` resolves with: the tsconfig
 /// `paths` found from `dir` upward, else relative resolution only.
 pub fn resolver_at(dir: &Path, fs: Arc<dyn FileSystem>) -> Box<dyn ImportResolver> {
-    match locate_tsconfig_paths(dir, fs.as_ref()) {
+    paths_resolver(locate_tsconfig_paths(dir, fs.as_ref()), fs)
+}
+
+/// Resolution through `paths` when there are any, relative only otherwise.
+fn paths_resolver(
+    paths: Option<TsconfigPaths>,
+    fs: Arc<dyn FileSystem>,
+) -> Box<dyn ImportResolver> {
+    match paths {
         Some(paths) => Box::new(TsconfigPathsResolver::new(paths, fs)),
         None => Box::new(DefaultImportResolver::new(fs)),
     }
@@ -260,51 +269,38 @@ pub fn build_context(
     } else {
         root.to_path_buf()
     };
-    if kind == ProjectKind::Plain {
-        return ProjectContext {
-            kind,
-            discovery_root,
-            resolver: Box::new(DefaultImportResolver::new(fs)),
-            alias_warning: None,
-        };
-    }
-
+    // tsconfig `paths` are TypeScript's, not the build tool's: a Plain tree
+    // loads them too. Only the warning is the build tool's, since a Vite or
+    // Next project is the one whose missing aliases imply a blind spot.
+    let paths = locate_tsconfig_paths(&config_root, fs.as_ref());
     let config_name = match kind {
         ProjectKind::NextJs => "next.config",
         _ => "vite.config",
     };
-    match locate_tsconfig_paths(&config_root, fs.as_ref()) {
+    let alias_warning = match &paths {
+        _ if kind == ProjectKind::Plain => None,
         // A patternless entry means the config declared only `baseUrl`. That
         // resolves bare specifiers (`import "lib/api"`, the Next scaffold
         // without `paths`), so it is a real resolver — but no `@/*` alias
         // exists, and a project written against one would still be blind.
-        Some(paths) if paths.patterns.is_empty() => ProjectContext {
-            kind,
-            discovery_root,
-            resolver: Box::new(TsconfigPathsResolver::new(paths, fs)),
-            alias_warning: Some(format!(
-                "tsconfig declares `baseUrl` but no `paths`, so bare specifiers resolve \
-                 against it, but `@/...`-style aliases stay unresolved and their targets \
-                 are NOT analyzed (possible false negatives). Aliases declared only in \
-                 {config_name} are not read."
-            )),
-        },
-        Some(paths) => ProjectContext {
-            kind,
-            discovery_root,
-            resolver: Box::new(TsconfigPathsResolver::new(paths, fs)),
-            alias_warning: None,
-        },
-        None => ProjectContext {
-            kind,
-            discovery_root,
-            resolver: Box::new(DefaultImportResolver::new(fs)),
-            alias_warning: Some(format!(
-                "no tsconfig `paths` found, so aliased imports (e.g. `@/...`) stay \
-                 unresolved and their targets are NOT analyzed (possible false \
-                 negatives). Aliases declared only in {config_name} are not read."
-            )),
-        },
+        Some(paths) if paths.patterns.is_empty() => Some(format!(
+            "tsconfig declares `baseUrl` but no `paths`, so bare specifiers resolve \
+             against it, but `@/...`-style aliases stay unresolved and their targets \
+             are NOT analyzed (possible false negatives). Aliases declared only in \
+             {config_name} are not read."
+        )),
+        Some(_) => None,
+        None => Some(format!(
+            "no tsconfig `paths` found, so aliased imports (e.g. `@/...`) stay \
+             unresolved and their targets are NOT analyzed (possible false \
+             negatives). Aliases declared only in {config_name} are not read."
+        )),
+    };
+    ProjectContext {
+        kind,
+        discovery_root,
+        resolver: paths_resolver(paths, fs),
+        alias_warning,
     }
 }
 

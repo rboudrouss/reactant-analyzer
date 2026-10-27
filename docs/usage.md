@@ -227,7 +227,10 @@ imports that then resolve outside what you named are reported as
 ### Plain (everything else)
 
 Recursive walk of the given directories for `.ts/.tsx/.js/.jsx`, excluding
-`*.test.*`, `*.spec.*` and `*.d.ts`. Relative imports only.
+`*.test.*`, `*.spec.*` and `*.d.ts`. Aliases come from tsconfig `paths`
+when a tsconfig declares them, searched upward as for Vite; without one,
+relative imports only. No build tool implies aliases here, so their absence
+does not warn.
 
 Which *directories* are skipped has one precedence order, three sources:
 

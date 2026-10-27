@@ -195,6 +195,19 @@ fn the_innermost_project_wins() {
     assert!(found.flags("Inner"), "{:?}", found.defects);
 }
 
+/// A tree with tsconfig `paths` and no build-tool marker (mantine's root)
+/// loads them, even named from below the tsconfig, and does not warn.
+#[test]
+fn a_plain_tree_loads_its_tsconfig_paths() {
+    let tmp = Tmp::new("plain");
+    tmp.write("tsconfig.json", PATHS);
+    tmp.write("src/App.tsx", &app("App"));
+    tmp.write("src/hooks/useThing.ts", BUGGY);
+    let found = run(&[tmp.arg("src")]);
+    assert!(found.flags("App"), "{:?}", found.defects);
+    assert!(!found.stderr.contains("[warn]"), "{}", found.stderr);
+}
+
 /// A single project resolves and warns exactly as before: a Vite project
 /// without `paths` still says its aliases are unresolved.
 #[test]
