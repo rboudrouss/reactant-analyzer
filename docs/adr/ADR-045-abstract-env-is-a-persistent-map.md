@@ -25,6 +25,12 @@ differ (`diff`); a name both sides bind to the same value keeps it, since the
 join is idempotent. Widening still visits every name, writing only the ones
 it changes. The API of `AbstractEnv` is unchanged.
 
+The render-dependence analysis (`render_deps`) keeps its own per-block env
+during its fixpoint, transient but dense in the same way: one 1,447-block
+component of twenty grew the live heap by 6 GB there. It takes the same map,
+with its values behind an `Arc` (a `DVal` holds several sets, so a node copy
+would otherwise deep-copy each of them).
+
 `OrdMap` rather than `imbl::HashMap`: its iteration order is the key order,
 deterministic with no hasher to choose, its equality skips shared nodes
 (`imbl::HashMap::eq` rebuilds a key set on each call), and a `Var` compare is
@@ -40,6 +46,8 @@ cheap next to hashing one.
   repository), and the seed-1 oracle fuzz is unchanged.
 - Measured: dub `apps/web/{ui,lib}` 37.0 s / 1.83 GB → 23.5 s / 0.99 GB; whole
   dub (MemoryHigh 5 GB) 392 s / ≥5.1 GB (capped) → 94 s / 3.8 GB.
+- twenty `object-record` + `ui` + `views` (MemoryHigh 6 GB): 246 s / 6.1 GB
+  (swapping) → 77 s / 0.76 GB once `render_deps` shares too.
 - An env that rebinds a name in a shared leaf still copies that leaf (≤16
   entries) and the path above it; a body whose blocks each rebind many names
   keeps a correspondingly larger share of its own.

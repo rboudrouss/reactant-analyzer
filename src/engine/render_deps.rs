@@ -35,6 +35,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
+use imbl::{OrdMap, ordmap::DiffItem};
+
 use crate::domains::AbstractDomain;
 use crate::engine::{AnalysisResult, HookKind, dominance::controlling_branches};
 use crate::ir::{
@@ -400,27 +402,31 @@ impl DVal {
     }
 }
 
-type Env = HashMap<Var, DVal>;
+/// One block's bindings: a persistent map, so the env of every block shares
+/// with its predecessor's whatever the block did not rebind (ADR-045), and a
+/// join walks only the names that differ.
+type Env = OrdMap<Var, Arc<DVal>>;
 
+/// Join `b` into `a`; `true` when `a` grew. A name bound to the same value
+/// on both sides is left as it is: the join is idempotent.
 fn join_env(a: &mut Env, b: &Env) -> bool {
-    let mut changed = false;
-    for (k, v) in b {
-        match a.get(k) {
-            // The join is idempotent: an equal value changes nothing, and
-            // comparing allocates nothing where the join would.
-            Some(x) if x == v => {}
-            Some(x) => {
+    let grown: Vec<(Var, Arc<DVal>)> = a
+        .diff(b)
+        .filter_map(|item| match item {
+            DiffItem::Update {
+                old: (k, x),
+                new: (_, v),
+            } => {
                 let j = x.join(v);
-                if j != *x {
-                    a.insert(k.clone(), j);
-                    changed = true;
-                }
+                (j != **x).then(|| (k.clone(), Arc::new(j)))
             }
-            None => {
-                a.insert(k.clone(), v.clone());
-                changed = true;
-            }
-        }
+            DiffItem::Add(k, v) => Some((k.clone(), v.clone())),
+            DiffItem::Remove(..) => None,
+        })
+        .collect();
+    let changed = !grown.is_empty();
+    for (k, v) in grown {
+        a.insert(k, v);
     }
     changed
 }
@@ -480,10 +486,10 @@ pub fn render_deps(
     let mut entry = Env::new();
     entry.insert(
         result.param.clone(),
-        DVal {
+        Arc::new(DVal {
             deps: Deps::one(Source::AllProps),
             shape: Shape::Props,
-        },
+        }),
     );
     let top_frame = Collect {
         pc: Deps::default(),
@@ -641,7 +647,7 @@ impl<'a> Analyzer<'a> {
 
     fn var(&self, env: &Env, v: &Var) -> DVal {
         if v == self.param {
-            return env.get(v).cloned().unwrap_or(DVal {
+            return env.get(v).map(|d| (**d).clone()).unwrap_or(DVal {
                 deps: Deps::one(Source::AllProps),
                 shape: Shape::Props,
             });
@@ -651,7 +657,7 @@ impl<'a> Analyzer<'a> {
         // sets; a name some function writes as the name itself; anything
         // else is constant across renders and reads as nothing.
         env.get(v)
-            .cloned()
+            .map(|d| (**d).clone())
             .unwrap_or_else(|| match self.consts.get(v) {
                 Some(ModuleConstInit::Context(id)) => {
                     DVal::of(Deps::one(Source::Context(id.clone())))
@@ -833,7 +839,7 @@ impl<'a> Analyzer<'a> {
             Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. } => {
                 let mut v = self.eval(rhs, env);
                 v.deps.union_with(pc);
-                env.insert(var.clone(), v);
+                env.insert(var.clone(), Arc::new(v));
             }
             // A write through a member: the root binding may now hold the
             // written value (weak update), and loses any shape it had.
@@ -845,7 +851,7 @@ impl<'a> Analyzer<'a> {
                         d.union_with(&self.eval(i, env).deps);
                     }
                     d.union_with(pc);
-                    env.insert(root, DVal::of(d));
+                    env.insert(root, Arc::new(DVal::of(d)));
                 }
             }
             // `xs.push(v)`: a method call may store its arguments in the
@@ -859,7 +865,7 @@ impl<'a> Analyzer<'a> {
                     for a in args {
                         d.union_with(&self.eval(a, env).deps);
                     }
-                    env.insert(root, DVal::of(d));
+                    env.insert(root, Arc::new(DVal::of(d)));
                 }
             }
             Stmt::ExprStmt(..) => {}
@@ -1162,7 +1168,7 @@ impl<'a> Analyzer<'a> {
             .filter_map(|v| env.get(v).map(|d| (v.clone(), d.clone())))
             .collect();
         for p in params {
-            inner.insert(p.clone(), DVal::of(feed.clone()));
+            inner.insert(p.clone(), Arc::new(DVal::of(feed.clone())));
         }
         let frame = Collect {
             in_list: ctx.in_list || list,
