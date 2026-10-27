@@ -182,7 +182,7 @@ impl StateValue {
 
     pub fn component_setter(component: ComponentId, label: HookLabel) -> Self {
         StateValue {
-            setter: SetterVal::One(component, label),
+            setter: SetterVal::one(component, label),
             ..Self::bottom_value()
         }
     }
@@ -276,6 +276,17 @@ impl StateValue {
             self.setter.as_one()
         } else {
             None
+        }
+    }
+
+    /// Every setter the value may be, under the same reading as
+    /// [`Self::as_setter`]: a call of it writes one of them. A value two
+    /// call sites bind to two setters names both (#175).
+    pub fn setters(&self) -> Vec<(ComponentId, HookLabel)> {
+        if self.populated_kinds().only(KindMask::SETTER) {
+            self.setter.candidates().collect()
+        } else {
+            Vec::new()
         }
     }
 
@@ -560,7 +571,13 @@ impl fmt::Debug for StateValue {
         }
         match &self.setter {
             SetterVal::Bottom => {}
-            SetterVal::One(c, l) => parts.push(format!("setter(#{}#{l})", c.index())),
+            SetterVal::Some(s) => parts.push(format!(
+                "setter({})",
+                s.iter()
+                    .map(|(c, l)| format!("#{}#{l}", c.index()))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )),
             SetterVal::Top => parts.push("setter".into()),
         }
         if self.other {
@@ -1284,14 +1301,14 @@ mod tests {
     }
 
     #[test]
-    fn component_setter_join_different_loses_identity_stays_stable() {
-        // Joining distinct setters keeps the setter slot at ⊤ — still Stable,
-        // identity lost.
+    fn component_setter_join_different_keeps_both_stays_stable() {
+        // Joining distinct setters keeps both candidates — still Stable, no
+        // longer one exact identity.
         for j in [
             cs("Foo", 0).join(&cs("Bar", 0)),
             cs("Foo", 0).join(&cs("Foo", 1)),
         ] {
-            assert_eq!(j.setter, SetterVal::Top);
+            assert_eq!(j.setters().len(), 2);
             assert!(j.as_setter().is_none());
             assert_eq!(j.to_stability(), Stability::Stable);
         }
@@ -1300,7 +1317,7 @@ mod tests {
     #[test]
     fn component_setter_join_with_ref_keeps_both_slots() {
         let j = cs("Foo", 0).join(&StateValue::reference(Stability::Stable));
-        assert_eq!(j.setter, SetterVal::One(crate::test_support::cid(0), 0));
+        assert_eq!(j.setter, SetterVal::one(crate::test_support::cid(0), 0));
         assert_eq!(j.reference, Stability::Stable);
         // Mixed with a reference → no longer an exact setter.
         assert!(j.as_setter().is_none());

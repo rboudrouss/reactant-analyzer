@@ -248,6 +248,38 @@ fn a_closure_carrying_a_parent_setter_stores_what_the_closure_passes() {
     assert!(foreign[0].written.expr.is_none());
 }
 
+#[test]
+fn a_prop_bound_to_one_of_two_setters_writes_both_slots() {
+    // The join of `setA` and `setB` is both setters, not "some setter": a
+    // row per candidate slot.
+    let r = parse_and_analyze(
+        r#"
+        import { useState, useEffect } from "react";
+        export function Parent() {
+          const [a, setA] = useState({});
+          const [b, setB] = useState(0);
+          return <Child v={a} set={b > 5 ? setB : setA} />;
+        }
+        function Child({ v, set }: { v: object; set: (x: object) => void }) {
+          useEffect(() => {
+            set({});
+          }, [v]);
+          return null;
+        }
+        "#,
+    );
+    let parent = r.component_named("Parent").unwrap();
+    let child = comp(&r, "Child");
+    let mut slots: Vec<_> = child
+        .slot_writers
+        .iter()
+        .filter(|w| w.owner == Some(parent))
+        .map(|w| w.slot)
+        .collect();
+    slots.sort();
+    assert_eq!(slots, vec![0, 1], "{:?}", child.slot_writers);
+}
+
 // ── `Change::Never` is a must fact ───────────────────────────────────────────
 
 /// The `written.change` of the only effect write through `setter` in `src`.

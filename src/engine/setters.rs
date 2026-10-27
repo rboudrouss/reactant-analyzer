@@ -271,11 +271,23 @@ pub(crate) struct SetterProp {
     pub closure: bool,
 }
 
+/// One slot a write through a name may land in ([`collect_slot_writers`]).
+#[derive(Debug, Clone, Copy)]
+struct Target {
+    /// `None`: this component's slot.
+    owner: Option<ComponentId>,
+    slot: HookLabel,
+    /// Through a closure that captured the setter: the call's argument is
+    /// not the stored value.
+    carried: bool,
+}
+
 /// Collect variables in `cfg` whose abstract value at any block exit is
 /// `ComponentSetter { component, label }`, or whose Loc in the heap points to a
 /// FnLit that captures a ComponentSetter (e.g. `() => setCount(0)` passed as prop).
 ///
-/// Returns `var` → [`SetterProp`].
+/// Returns `var` → every [`SetterProp`] it may be, sorted, never empty: a
+/// prop two call sites bind to two setters is both (#175).
 ///
 /// Used by cross-component rules to find props that are parent setters.
 ///
@@ -289,7 +301,7 @@ pub(crate) fn collect_component_setter_vars(
     cfg: &CFG,
     block_states: &HashMap<BlockId, AbstractEnv<StateValue>>,
     heap: &Heap,
-) -> HashMap<Var, SetterProp> {
+) -> HashMap<Var, Vec<SetterProp>> {
     let mut var_names: HashSet<Var> = HashSet::new();
     for block in cfg.blocks.values() {
         for stmt in &block.stmts {
@@ -305,7 +317,7 @@ pub(crate) fn collect_component_setter_vars(
     let mut var_names: Vec<Var> = var_names.into_iter().collect();
     var_names.sort();
 
-    let mut result: HashMap<Var, SetterProp> = HashMap::new();
+    let mut result: HashMap<Var, Vec<SetterProp>> = HashMap::new();
     for env in cfg.blocks.keys().filter_map(|b| block_states.get(b)) {
         for var in &var_names {
             let Some(ev) = env.lookup_env_val(var) else {
@@ -317,10 +329,11 @@ pub(crate) fn collect_component_setter_vars(
             let mut stack: Vec<(Var, EnvVal<StateValue>)> = vec![(var.clone(), ev)];
             let mut seen: HashSet<crate::ir::types::ExprId> = HashSet::new();
             while let Some((name, ev)) = stack.pop() {
-                if !result.contains_key(&name)
-                    && let Some(prop) = setter_of(&ev, heap)
-                {
-                    result.insert(name.clone(), prop);
+                if !result.contains_key(&name) {
+                    let props = setter_of(&ev, heap);
+                    if !props.is_empty() {
+                        result.insert(name.clone(), props);
+                    }
                 }
                 let mut ids: Vec<_> = ev.locs().into_iter().flatten().copied().collect();
                 ids.sort();
@@ -362,21 +375,26 @@ pub(crate) fn callee_path(fn_: &Expr) -> Option<Var> {
     }
 }
 
-/// The setter calling a value with these contents writes: the value itself,
-/// or a closure it may point to that captured one (the parent passed
-/// `() => setCount(0)` as a prop). Allocation sites and captures are hash
-/// sets/maps, and the first setter found wins — so both are walked in sorted
-/// order (#120).
-fn setter_of(ev: &EnvVal<StateValue>, heap: &Heap) -> Option<SetterProp> {
-    if let Some((component, label)) = ev.as_val().as_setter() {
-        return Some(SetterProp {
-            component: *component,
-            label: *label,
+/// The setters calling a value with these contents may write: the value
+/// itself, or the closures it may point to that captured one (the parent
+/// passed `() => setCount(0)` as a prop) — one per closure, the first setter
+/// it captured, as before. A value that may be several (two call sites, two
+/// setters) is each of them, and provably none: `must_write` needs one.
+/// Allocation sites and captures are hash sets/maps, so both are walked in
+/// sorted order (#120).
+fn setter_of(ev: &EnvVal<StateValue>, heap: &Heap) -> Vec<SetterProp> {
+    let mut out: Vec<SetterProp> = ev
+        .as_val()
+        .setters()
+        .into_iter()
+        .map(|(component, label)| SetterProp {
+            component,
+            label,
             must_write: true,
             closure: false,
-        });
-    }
-    let mut ids: Vec<_> = ev.locs()?.iter().copied().collect();
+        })
+        .collect();
+    let mut ids: Vec<_> = ev.locs().into_iter().flatten().copied().collect();
     ids.sort();
     for id in ids {
         if let Some(HeapValue::Fn {
@@ -389,7 +407,7 @@ fn setter_of(ev: &EnvVal<StateValue>, heap: &Heap) -> Option<SetterProp> {
                 .into_iter()
                 .find_map(|(name, val)| val.as_setter().map(|s| (name, s)))
             {
-                return Some(SetterProp {
+                out.push(SetterProp {
                     component: *component,
                     label: *label,
                     must_write: body_writes(body_cfg, name),
@@ -398,7 +416,14 @@ fn setter_of(ev: &EnvVal<StateValue>, heap: &Heap) -> Option<SetterProp> {
             }
         }
     }
-    None
+    out.sort_by_key(|p| (p.component, p.label, p.closure));
+    out.dedup_by_key(|p| (p.component, p.label, p.closure));
+    if out.len() > 1 {
+        for p in &mut out {
+            p.must_write = false;
+        }
+    }
+    out
 }
 
 /// Does `var` still denote a component setter **at this call**?
@@ -485,10 +510,16 @@ fn body_writes(body_cfg: &CFG, setter: &Symbol) -> bool {
 pub(crate) fn cross_component_setters(
     comp: &AnalysisResult<StateValue>,
     component: ComponentId,
-) -> HashMap<Var, SetterProp> {
+) -> HashMap<Var, Vec<SetterProp>> {
     collect_component_setter_vars(&comp.render_cfg, &comp.block_states, &comp.heap)
         .into_iter()
-        .filter(|(_, prop)| prop.component != component)
+        .filter_map(|(v, props)| {
+            let foreign: Vec<SetterProp> = props
+                .into_iter()
+                .filter(|p| p.component != component)
+                .collect();
+            (!foreign.is_empty()).then_some((v, foreign))
+        })
         .collect()
 }
 
@@ -1071,7 +1102,7 @@ pub(crate) fn collect_slot_writers(
     hooks: &[HookEntry],
     regions: &InlineRegions,
     hook_provenance: &[crate::ir::hooks::HookProvenance],
-    converged: &HashMap<Var, SetterProp>,
+    converged: &HashMap<Var, Vec<SetterProp>>,
     envs: &SiteEnvs<'_>,
     reducers: &crate::engine::Reducers<'_>,
 ) -> Vec<SlotWriter> {
@@ -1086,28 +1117,40 @@ pub(crate) fn collect_slot_writers(
     // alias holds the same setter value. An own slot is taken only from a
     // name that IS the setter — `t[1](0)`, `api.setV(0)` on a hook's result
     // (#233); a closure over one is walked through its body instead.
-    let mut targets: HashMap<Var, (Option<ComponentId>, HookLabel)> =
-        labels.into_iter().map(|(v, l)| (v, (None, l))).collect();
-    // The names that write another component's slot by running a closure
-    // that captured its setter (`bump={() => setN(n + 1)}`): the call's own
-    // argument is not what the setter stores.
-    let mut carried: HashSet<Var> = HashSet::new();
+    // A name a converged value binds to several setters (a prop two call
+    // sites pass, #175) writes one of them: a row per candidate. `carried`:
+    // the write runs a closure that captured the setter (`bump={() =>
+    // setN(n + 1)}`), and the call's own argument is not what it stores.
+    let mut targets: HashMap<Var, Vec<Target>> = labels
+        .into_iter()
+        .map(|(v, l)| {
+            (
+                v,
+                vec![Target {
+                    owner: None,
+                    slot: l,
+                    carried: false,
+                }],
+            )
+        })
+        .collect();
     let mut converged: Vec<_> = converged.iter().collect();
     converged.sort_by(|a, b| a.0.cmp(b.0));
-    for (v, prop) in converged {
-        let owner = if prop.component == envs.component {
-            if prop.closure {
-                continue;
-            }
-            None
-        } else {
-            Some(prop.component)
-        };
-        if !targets.contains_key(v) {
-            targets.insert(v.clone(), (owner, prop.label));
-            if prop.closure {
-                carried.insert(v.clone());
-            }
+    for (v, props) in converged {
+        if targets.contains_key(v) {
+            continue;
+        }
+        let candidates: Vec<Target> = props
+            .iter()
+            .filter(|p| p.component != envs.component || !p.closure)
+            .map(|p| Target {
+                owner: (p.component != envs.component).then_some(p.component),
+                slot: p.label,
+                carried: p.closure,
+            })
+            .collect();
+        if !candidates.is_empty() {
+            targets.insert(v.clone(), candidates);
         }
     }
     let setter_vars: HashSet<Var> = targets.keys().cloned().collect();
@@ -1236,16 +1279,23 @@ pub(crate) fn collect_slot_writers(
             HashMap::new();
         for s in &sites {
             if s.class == WalkClass::Sync
-                && let (Some(&target), Some(b)) = (targets.get(&s.var), s.prov_block)
+                && let (Some(ts), Some(b)) = (targets.get(&s.var), s.prov_block)
             {
-                sync_blocks.entry(target).or_default().push(b);
+                for t in ts {
+                    sync_blocks.entry((t.owner, t.slot)).or_default().push(b);
+                }
             }
         }
         let reach = Reachability::of(cfg);
-        for site in sites {
-            let Some(&(owner, slot)) = targets.get(&site.var) else {
-                continue;
-            };
+        for (site, target) in sites.into_iter().flat_map(|s| {
+            let ts = targets.get(&s.var).cloned().unwrap_or_default();
+            ts.into_iter().map(move |t| (s.clone(), t))
+        }) {
+            let Target {
+                owner,
+                slot,
+                carried,
+            } = target;
             let same_tick = site.repeats
                 || match (site.class, site.prov_block) {
                     (WalkClass::Sync, Some(b)) => {
@@ -1275,7 +1325,7 @@ pub(crate) fn collect_slot_writers(
             let target = (owner.unwrap_or(envs.component), slot);
             let written = match reducers.get(target.0, target.1) {
                 Some(reducer) => written::dispatched(&reducer),
-                None if carried.contains(&site.var) => written::carried(),
+                None if carried => written::carried(),
                 None => written::classify(
                     site.arg.as_ref(),
                     &site.updater,

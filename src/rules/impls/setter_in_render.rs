@@ -69,7 +69,7 @@ impl Rule for SetterInRender {
         );
 
         // Cross-component setters: ComponentSetter-valued props, excluding self-references.
-        let cs_vars: HashMap<Var, crate::engine::setters::SetterProp> =
+        let cs_vars: HashMap<Var, Vec<crate::engine::setters::SetterProp>> =
             crate::rules::cross_component_setters(comp_result, component);
 
         let mut all_setter_vars: HashSet<Var> = local_setter_info.keys().cloned().collect();
@@ -146,7 +146,9 @@ impl Rule for SetterInRender {
                     );
                 let certain_write = call.class == SetterCallPhase::Sync
                     && certainly_the_setter
-                    && cs_vars.get(&call.var).is_none_or(|p| p.must_write);
+                    && cs_vars
+                        .get(&call.var)
+                        .is_none_or(|ps| ps.iter().all(|p| p.must_write));
                 let proof = certain_write
                     .then_some(call.block_id)
                     .flatten()
@@ -197,8 +199,15 @@ impl Rule for SetterInRender {
                         Some(label),
                         None,
                     )
-                } else if let Some(prop) = cs_vars.get(&call.var) {
-                    let parent_comp = &prop.component;
+                } else if let Some(props) = cs_vars.get(&call.var) {
+                    // A prop several call sites bind to several parents'
+                    // setters names them all.
+                    let mut parents: Vec<String> = props
+                        .iter()
+                        .map(|p| result.display_name(p.component))
+                        .collect();
+                    parents.dedup();
+                    let parents = parents.join("` or `");
                     (
                         "cross-setter-in-render",
                         if call.class == SetterCallPhase::Sync {
@@ -206,7 +215,7 @@ impl Rule for SetterInRender {
                                 "prop `{}` (a state setter of parent `{}`) called during render \
                                  of `{}`, which triggers a parent re-render on every render",
                                 crate::ir::source_name(&call.var),
-                                result.display_name(*parent_comp),
+                                parents,
                                 result.display_name(component)
                             )
                         } else {
@@ -215,7 +224,7 @@ impl Rule for SetterInRender {
                                  with no timing summary. If that callee runs it during render, \
                                  `{}` re-renders its parent on every render",
                                 crate::ir::source_name(&call.var),
-                                result.display_name(*parent_comp),
+                                parents,
                                 result.display_name(component)
                             )
                         },

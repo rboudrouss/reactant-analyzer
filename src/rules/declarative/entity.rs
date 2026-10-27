@@ -141,7 +141,7 @@ pub(crate) struct EntityCtx<'a> {
     provenance: OnceCell<HashMap<HookLabel, usize>>,
     /// `ComponentSetter`-valued props (#107), resolved on first use by the
     /// ownership-aware enumeration.
-    cross_setters: OnceCell<HashMap<Var, crate::engine::setters::SetterProp>>,
+    cross_setters: OnceCell<HashMap<Var, Vec<crate::engine::setters::SetterProp>>>,
     /// The slot → readers relation (#127), computed on first use: unlike the
     /// writers, it is not needed by any native rule, so a component no pack
     /// asks about never walks for it.
@@ -221,7 +221,7 @@ impl<'a> EntityCtx<'a> {
     /// `var → (owning component, slot)` for every `ComponentSetter`-valued
     /// prop of this component — the engine resolution the native
     /// `setter-in-render` rule consumes, read once and shared (ADR-027 §1).
-    fn cross_setters(&self) -> &HashMap<Var, crate::engine::setters::SetterProp> {
+    fn cross_setters(&self) -> &HashMap<Var, Vec<crate::engine::setters::SetterProp>> {
         self.cross_setters
             .get_or_init(|| cross_component_setters(self.comp, self.ctx.component()))
     }
@@ -990,28 +990,33 @@ impl<'a> EntityCtx<'a> {
     fn sorted_setters(
         &self,
         calls: Vec<SetterCall>,
-        cross: &HashMap<Var, crate::engine::setters::SetterProp>,
+        cross: &HashMap<Var, Vec<crate::engine::setters::SetterProp>>,
     ) -> Vec<SetterEntity> {
         let mut setters: Vec<SetterEntity> = calls
             .into_iter()
-            .map(|c| {
+            .flat_map(|c| {
                 // A local binding wins: a component passing its own setter down
                 // is not a foreign write, and `cross_component_setters` already
-                // filtered self-owned entries out.
-                let (slot, owner) = match self.setter_labels.get(&c.var) {
-                    Some(&label) => (Some(label), None),
-                    None => match cross.get(&c.var) {
-                        Some(prop) => (Some(prop.label), Some(prop.component)),
-                        None => (None, None),
-                    },
-                };
-                SetterEntity {
+                // filtered self-owned entries out. A prop that may be several
+                // parents' setters is one entity per candidate.
+                let targets: Vec<(Option<HookLabel>, Option<ComponentId>)> =
+                    match self.setter_labels.get(&c.var) {
+                        Some(&label) => vec![(Some(label), None)],
+                        None => match cross.get(&c.var) {
+                            Some(props) => props
+                                .iter()
+                                .map(|p| (Some(p.label), Some(p.component)))
+                                .collect(),
+                            None => vec![(None, None)],
+                        },
+                    };
+                targets.into_iter().map(move |(slot, owner)| SetterEntity {
                     slot,
                     owner,
-                    var: c.var,
+                    var: c.var.clone(),
                     span: c.span,
                     block_id: c.block_id,
-                }
+                })
             })
             .collect();
         setters.sort_by(|a, b| {

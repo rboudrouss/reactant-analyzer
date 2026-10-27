@@ -632,16 +632,30 @@ fn exec_slot_write<T: Transfer>(
         Expr::Var(name) => env.setter_label(name),
         _ => None,
     };
-    let target = match bound {
-        Some(label) => Some((ctx.component, label)),
+    // A value two call sites bound to two setters writes one of them: each
+    // candidate gets the write, a join like every slot write.
+    let targets = match bound {
+        Some(label) => vec![(ctx.component, label)],
         None => transfer
             .eval_expr(fn_, env, ctx)
             .as_state_value()
-            .and_then(|sv| sv.as_setter().map(|(c, l)| (*c, *l))),
+            .map_or_else(Vec::new, |sv| sv.setters()),
     };
-    let Some((owner, label)) = target else {
-        return;
-    };
+    for (owner, label) in targets {
+        write_one_slot(transfer, owner, label, args, env, ctx, depth);
+    }
+}
+
+/// [`exec_slot_write`] for one target slot.
+fn write_one_slot<T: Transfer>(
+    transfer: &T,
+    owner: crate::ir::ComponentId,
+    label: crate::ir::types::HookLabel,
+    args: &[Expr],
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+    depth: usize,
+) {
     // The pass's store, joined with the slot's value at the start of the
     // pass: a re-run from ⊥ would otherwise hand the updater ⊥, and a ⊥
     // write vanishes in the join with any other write of the slot.

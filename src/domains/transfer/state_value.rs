@@ -355,10 +355,7 @@ fn havoc_setter_props(
         // Bare setter prop (`<X onOpenChange={setOpen}/>`): the value
         // carries its owner (`StateSetter` always evals to a
         // `component_setter`, intra included).
-        let val = eval_state_value(v, env, ctx);
-        if let Some((c, l)) = val.as_setter() {
-            setters.push((*c, *l));
-        }
+        setters.extend(eval_state_value(v, env, ctx).setters());
         // Everything a function value can smuggle a setter through: spread
         // objects, closures wrapping a setter call, heap-allocated FnLits.
         collect_escaping_setters(v, env, ctx.heap, own, &mut setters, &mut HashSet::new());
@@ -409,9 +406,7 @@ fn collect_escaping_setters(
                     }
                     Some(HeapValue::Obj(obj_fields)) => {
                         for ev in obj_fields.values() {
-                            if let Some((c, l)) = ev.as_val().as_setter() {
-                                out.push((*c, *l));
-                            }
+                            out.extend(ev.as_val().setters());
                         }
                     }
                     _ => {}
@@ -475,9 +470,7 @@ fn setter_calls_in_expr(
 ) {
     match e {
         Expr::Call { fn_, .. } => {
-            if let Some((c, l)) = callee_setter(fn_, env, captured, heap, own) {
-                out.push((c, l));
-            }
+            out.extend(callee_setter(fn_, env, captured, heap, own));
             e.for_each_child(&mut |c| {
                 setter_calls_in_expr(c, env, captured, heap, own, out, walked)
             });
@@ -493,7 +486,7 @@ fn setter_calls_in_expr(
     }
 }
 
-/// Resolve a call target to a setter, if it is one. Resolution order for
+/// Resolve a call target to the setters it may be. Resolution order for
 /// variables: the closure's captured environment (creation-time values),
 /// then the live env.
 fn callee_setter(
@@ -502,39 +495,39 @@ fn callee_setter(
     captured: Option<&HashMap<Symbol, StateValue>>,
     heap: &Heap,
     own: ComponentId,
-) -> Option<(ComponentId, crate::ir::types::HookLabel)> {
+) -> Vec<(ComponentId, crate::ir::types::HookLabel)> {
     match fn_ {
         // Direct state-binding reference: always the current component's.
-        Expr::StateSetter(l) => Some((own, *l)),
+        Expr::StateSetter(l) => vec![(own, *l)],
         Expr::Var(name) => {
             if let Some(cap) = captured
                 && let Some(v) = cap.get(name.as_str())
-                && let Some((c, l)) = v.as_setter()
             {
-                return Some((*c, *l));
+                let s = v.setters();
+                if !s.is_empty() {
+                    return s;
+                }
             }
-            env.lookup(name).as_setter().map(|(c, l)| (*c, *l))
+            env.lookup(name).setters()
         }
         // `props.onDone(...)`: chase the object's heap fields.
         Expr::FieldAccess { obj, field } => {
             let Expr::Var(o) = obj.as_ref() else {
-                return None;
+                return Vec::new();
             };
             let Some(EnvVal::Loc { ids, .. }) = env.lookup_env_val(o) else {
-                return None;
+                return Vec::new();
             };
-            for id in ids.iter().copied() {
-                if let Some(HeapValue::Obj(obj_fields)) = heap.get(id)
-                    && let Some(ev) = obj_fields.get(field)
-                    && let Some((c, l)) = ev.as_val().as_setter()
-                {
-                    return Some((*c, *l));
-                }
-            }
-            None
+            ids.iter()
+                .filter_map(|id| match heap.get(*id) {
+                    Some(HeapValue::Obj(obj_fields)) => obj_fields.get(field),
+                    _ => None,
+                })
+                .flat_map(|ev| ev.as_val().setters())
+                .collect()
         }
         Expr::TSAnnotated(inner) => callee_setter(inner, env, captured, heap, own),
-        _ => None,
+        _ => Vec::new(),
     }
 }
 
