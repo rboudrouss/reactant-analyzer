@@ -432,17 +432,39 @@ fn a_ref_nothing_writes_keeps_its_primitive_contents() {
 }
 
 #[test]
+fn a_dep_holding_one_value_is_no_trigger() {
+    // `m` is `3` at every render, whatever `s` does: `Object.is` never fails
+    // on it, so the effect writing `s` does not re-run itself.
+    let r = parse_and_analyze(
+        r#"
+        import { useState, useEffect, useMemo } from "react";
+        export function C() {
+          const [s, setS] = useState(0);
+          const m = useMemo(() => 3, [s]);
+          useEffect(() => { setS((p) => p + 1); }, [m]);
+          return <div>{s}</div>;
+        }
+        "#,
+    );
+    let c = comp(&r, "C");
+    let rows: Vec<&EffectTrigger> = c.effect_triggers.iter().collect();
+    assert!(rows.is_empty(), "{rows:?}");
+    assert_eq!(only_effect_class(c), Rerun::OnSlots);
+}
+
+#[test]
 fn a_primitive_dep_computed_from_a_slot_is_a_versioned_trigger_of_it() {
     // #203: `!on` and `count * 2` carry no version label (ADR-017: the change
     // component lives on the reference kind), but a primitive is compared by
     // value, so it changes only when what it is computed from does — and may
     // whenever that does. The rows come from the dep's `render_deps` sources,
-    // the condition of a ternary included.
-    for (state, dep) in [
-        ("false", "!s"),
-        ("0", "s * 2"),
-        ("false", "s ? 1 : 2"),
-        ("{ n: 0 }", "s.n === 0"),
+    // the condition of a ternary included. The handler moves the slot: a
+    // slot nothing writes holds one value, and so does `d`.
+    for (state, next, dep) in [
+        ("false", "true", "!s"),
+        ("0", "1", "s * 2"),
+        ("false", "true", "s ? 1 : 2"),
+        ("{ n: 0 }", "{ n: 1 }", "s.n === 0"),
     ] {
         let src = format!(
             r#"
@@ -451,7 +473,7 @@ fn a_primitive_dep_computed_from_a_slot_is_a_versioned_trigger_of_it() {
               const [s, setS] = useState({state});
               const d = {dep};
               useEffect(() => {{ console.log(d); }}, [d]);
-              return <div />;
+              return <div onClick={{() => setS({next})}} />;
             }}
             "#
         );

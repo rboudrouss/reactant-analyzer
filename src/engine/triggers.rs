@@ -234,7 +234,11 @@ pub(crate) fn collect_effect_triggers(
             }
             let by_identity = val.is_reference_only()
                 && !matches!(val.reference, Stability::Unknown | Stability::VersionedTop);
-            if !by_identity {
+            // One value at every render (`useMemo(() => 3, [s])`) moves with
+            // nothing it is computed from; a name holds it at the call only
+            // when it is bound once.
+            let held = val.is_single_value() && certain_binding && !spread;
+            if !by_identity && !held {
                 let lost = Deps::top();
                 let src = sources.get(label).and_then(|d| d.get(i)).unwrap_or(&lost);
                 let mut moving_ref = |l: HookLabel| {
