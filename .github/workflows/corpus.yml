@@ -79,7 +79,6 @@ jobs:
           failed=0
           for repo in test-repo/*/; do
             name=$(basename "$repo")
-            start=$(date +%s)
             if /usr/bin/time -f "$name: %e s, %M KB peak" ./target/release/reactant --format json --fail-on never --config tests/fixtures/all-rules.json "$repo" > "corpus-runs/$name.json"; then
               :
             else
