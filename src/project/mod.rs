@@ -8,7 +8,7 @@
 //!
 //! Out of scope (deliberately): evaluating `vite.config.*` / `next.config.*`
 //! for `resolve.alias` / `webpack` overrides (requires running JS),
-//! `jsconfig.json`, package.json `exports` maps.
+//! package.json `exports` maps.
 
 pub mod nextjs;
 pub mod paths_resolver;
