@@ -620,7 +620,7 @@ fn eval_comp_app(
     let cache_key = props_cache_key(&abstract_props, &props_heap);
 
     // Cache lookup (strict equality)
-    if inter.cache.borrow().lookup(child, &cache_key).is_some() {
+    if inter.cache.borrow().contains(child, &cache_key) {
         inter.stats.borrow_mut().cache_hits += 1;
         record_call_site(inter, child, abstract_props, None);
         return;
@@ -667,14 +667,8 @@ fn eval_comp_app(
     let child_result = analyze_child(&child_ir, child, child_env, initial_heap, &child_inter);
 
     // Store result in the program-level results map and cache
-    inter
-        .results
-        .borrow_mut()
-        .insert(child, child_result.clone());
-    inter
-        .cache
-        .borrow_mut()
-        .insert(child, cache_key, child_result);
+    inter.results.borrow_mut().insert(child, child_result);
+    inter.cache.borrow_mut().insert(child, cache_key);
     record_call_site(inter, child, abstract_props, None);
 }
 
