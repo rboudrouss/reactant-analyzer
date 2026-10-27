@@ -586,6 +586,36 @@ fn a_ternary_guarded_on_the_seed_itself_downgrades_to_info() {
 }
 
 #[test]
+fn every_writable_feeder_is_named() {
+    // Two parents feed `Child` from their own state (#175 joins the call
+    // sites): the message names both, not whichever came first.
+    let d = diags_for(
+        r#"
+        import { useState } from "react";
+        function Settings() {
+          const [fields, setFields] = useState([{ id: "a" }]);
+          return <Child fields={fields} onReset={() => setFields([{ id: "b" }])} />;
+        }
+        function Prompt() {
+          const [schema, setSchema] = useState([{ id: "c" }]);
+          return <Child fields={schema} onReset={() => setSchema([{ id: "d" }])} />;
+        }
+        function Child({ fields }) {
+          const [open, setOpen] = useState(fields);
+          return <button onClick={() => setOpen([])}>{open.length}</button>;
+        }
+        "#,
+        "Child",
+    );
+    assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
+    let msg: &str = &d[0].message;
+    assert!(
+        msg.contains("state `fields` of `Settings`") && msg.contains("state `schema` of `Prompt`"),
+        "every feeder must be named: {msg}"
+    );
+}
+
+#[test]
 fn a_guard_does_not_read_the_element_it_guards() {
     // `{enabled && <Row label={label}/>}` assigns the element to the very temp
     // the branch tests. Following that assignment would hand the guard every

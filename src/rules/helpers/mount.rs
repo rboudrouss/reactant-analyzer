@@ -114,8 +114,8 @@ impl MountIndex {
     }
 
     /// Classify `consumer`'s mount lifetime against the props its `useState`
-    /// initializer reads (`seed_props`) and the slot feeding them (`feeder`,
-    /// when one is proven).
+    /// initializer reads (`seed_props`) and the slots proven to feed them
+    /// (`feeders`, empty when none is).
     ///
     /// Every call site must agree: one element that keeps the consumer mounted
     /// across the change is enough for the freeze to be observable, and a
@@ -124,7 +124,7 @@ impl MountIndex {
         &self,
         consumer: ComponentId,
         seed_props: &[Symbol],
-        feeder: Option<(ComponentId, HookLabel)>,
+        feeders: &[(ComponentId, HookLabel)],
         program: &ProgramAnalysisResult,
     ) -> MountCoupling {
         let sites = match self.sites.get(&consumer) {
@@ -137,9 +137,14 @@ impl MountIndex {
         if sites.iter().all(|s| s.reseeds(seed_props)) {
             return MountCoupling::Reseeds;
         }
-        let coupled = feeder.is_some_and(|(owner, slot)| {
-            sites.iter().all(|s| s.writer_coupled(owner, slot, program))
-        });
+        // A site in one feeder's owner is coupled through that feeder: the
+        // others reach the consumer through their own owners' sites.
+        let coupled = !feeders.is_empty()
+            && sites.iter().all(|s| {
+                feeders
+                    .iter()
+                    .any(|(owner, slot)| s.writer_coupled(*owner, *slot, program))
+            });
         if coupled {
             MountCoupling::WriterCoupled
         } else {
