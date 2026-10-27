@@ -406,6 +406,9 @@ fn join_env(a: &mut Env, b: &Env) -> bool {
     let mut changed = false;
     for (k, v) in b {
         match a.get(k) {
+            // The join is idempotent: an equal value changes nothing, and
+            // comparing allocates nothing where the join would.
+            Some(x) if x == v => {}
             Some(x) => {
                 let j = x.join(v);
                 if j != *x {
