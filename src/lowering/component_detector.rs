@@ -1,9 +1,8 @@
 use oxc_ast::ast::*;
 
 use super::Candidate;
+use super::body_scan::scan_body;
 use super::detector::{self, Classify, FnItem};
-use super::hook_call_detect::body_calls_hook;
-use super::jsx_detect::body_returns_jsx;
 
 /// A React component function detected in the AST, ready for lowering.
 pub type ComponentCandidate<'a> = Candidate<'a>;
@@ -53,8 +52,11 @@ fn is_component(name: &str, stmts: &[Statement], return_type: Option<&TSTypeAnno
     if !name.chars().next().is_some_and(|c| c.is_uppercase()) {
         return false;
     }
-    // Rule 2: any return path yields JSX
-    if body_returns_jsx(stmts) {
+    let facts = scan_body(stmts);
+    // Rule 2: it creates JSX — returned on some path, handed to a call
+    // (`createPortal`), held in an array, or produced by a callback
+    // (`items.map(i => <li/>)`), wherever the statement sits (#178).
+    if facts.jsx {
         return true;
     }
     // Rule 3: TypeScript component type annotation on the return type
@@ -69,7 +71,7 @@ fn is_component(name: &str, stmts: &[Statement], return_type: Option<&TSTypeAnno
     // that returns `null` on every path: an analytics mount, a portal host, a
     // keyboard-shortcut registrar. Those are exactly where lifecycle bugs live,
     // and before this rule they were not lowered at all.
-    body_calls_hook(stmts)
+    facts.hook_call
 }
 
 // ── TypeScript annotation check ───────────────────────────────────────────────

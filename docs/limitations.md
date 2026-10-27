@@ -462,6 +462,13 @@ ADR-027 through ADR-034.
 
 ## Out of scope
 
+Class components (`class X extends React.Component`): detection considers
+top-level functions only, and a class is never a candidate, so it is not
+analysed and the `✓` line says nothing about it. The engine models hooks, which
+a class cannot call; `this.setState` and the lifecycle methods would be a second
+model, which is not planned (#178, same footing as #63 and #65). A function is a
+component when its name is capitalised and its body creates JSX anywhere,
+calls a hook outside a nested function, or carries a component return type.
 Dynamic components (`const C = cond ? A : B; <C />`) [#63](https://github.com/rboudrouss/reactant-analyzer/issues/63);
 `React.memo` and `forwardRef` wrappers [#64](https://github.com/rboudrouss/reactant-analyzer/issues/64); anonymous default
 exports, which get a generic name [#65](https://github.com/rboudrouss/reactant-analyzer/issues/65). Vite and the Next.js App
