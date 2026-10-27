@@ -29,8 +29,9 @@
 //!   value is a new reference every call (`Change::Must`) ∧ so is every
 //!   other write of y, program-wide: React re-renders on the batch's last
 //!   value, and a later `setY(y)` in the same batch undoes the fresh one
-//!   (#188) ∧ every parent keeps the component mounted, or it is a root.
-//!   An all-must cycle ⇒ Error.
+//!   (#188) ∧ the component stays mounted: every element that mounts it
+//!   keeps it, and its parent stays in turn (#213). An all-must cycle ⇒
+//!   Error.
 //! - `May`: the dep is merely versioned by x, or the write is conditional,
 //!   nested, deferred or imprecise.
 //!
@@ -56,6 +57,14 @@
 //! and no effect of it reacts to another component's slot. Otherwise the
 //! props may move on any cycle through it, whichever edge the cycle takes —
 //! an effect with no deps array re-runs on them with no trigger row (#206).
+//!
+//! **The props node** `P_c` (#207): its in-edges are the ancestors' slots a
+//! write the loop runs moves, so the props hold exactly when none enters
+//! it. Out of it go an edge into a write that reads a prop of an effect a
+//! prop re-runs, and a mount edge into every effect write of a component
+//! that does not stay mounted, which fires again at each mount whatever its
+//! certificates say. The node is eliminated: its out-edges are pushed from
+//! each in-edge's slot, so every edge keeps its carrying effect.
 //!
 //! **What is a site** (#162): every non-handler row of an effect, render
 //! or memo body — a `setter-in-render` write revives what it revives — and,
@@ -304,6 +313,8 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         triggers: Vec<&'a EffectTrigger>,
         exact_local: HashSet<HookLabel>,
         versioned: HashSet<QualifiedSlot>,
+        /// A dep may move with the props: `P_c` is a trigger (#207).
+        props: bool,
         writes: Vec<&'a SlotWriter>,
     }
     /// One write site of a slot, with the body it sits in (module doc,
@@ -338,14 +349,33 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
     // may move a slot of: a write through a callback prop included, so
     // wherever it sits — the child itself, a sibling subtree (#206).
     let tree = component_tree(result);
-    let moved_owners: HashSet<ComponentId> = result
+    let moved: HashSet<QualifiedSlot> = result
         .components
         .iter()
         .flat_map(|(&c, r)| {
             r.slot_writers
                 .iter()
                 .filter(|w| w.phase != WriterPhase::Handler)
-                .map(move |w| node_of(c, w).0)
+                .map(move |w| node_of(c, w))
+        })
+        .collect();
+    // The props node `P_c` (#207), by its in-edges: every slot of an
+    // ancestor some write the loop can run moves — `P_parent → P_c` is
+    // folded in, the ancestors being transitive. An edge out of `P_c` is
+    // pushed from each of them, so every edge stays a slot-to-slot write
+    // edge with its carrying effect.
+    let props_in: HashMap<ComponentId, Vec<QualifiedSlot>> = result
+        .components
+        .keys()
+        .map(|&c| {
+            let up = ancestors(c, &tree);
+            let mut v: Vec<QualifiedSlot> = moved
+                .iter()
+                .filter(|s| up.contains(&s.0))
+                .copied()
+                .collect();
+            v.sort();
+            (c, v)
         })
         .collect();
 
@@ -383,7 +413,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 render_lets: let_bindings(cfg),
                 mutated,
                 props_hold: comp_result.effect_triggers.iter().all(|t| t.slot.0 == comp)
-                    && ancestors(comp, &tree).is_disjoint(&moved_owners),
+                    && props_in[&comp].is_empty(),
                 exit: comp_result.exit_env(),
             },
         );
@@ -505,6 +535,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 triggers,
                 exact_local,
                 versioned,
+                props: comp_result.effect_props.contains(label),
                 writes,
             });
         }
@@ -679,10 +710,16 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         }
     }
     /// Can the loop re-run the body `s` sits in? A render or memo body, an
-    /// effect that re-runs after every render, or one with a slot among its
-    /// triggers. An effect whose deps no slot moves re-runs only when
-    /// something outside the loop changes.
-    fn reruns_in_loop(s: &SiteRef<'_>, result: &ProgramAnalysisResult) -> bool {
+    /// effect that re-runs after every render, one with a slot among its
+    /// triggers or with props a loop moves (#207), or a mount-only effect of
+    /// a component the loop may remount. An effect whose deps no slot moves
+    /// re-runs only when something outside the loop changes.
+    fn reruns_in_loop(
+        s: &SiteRef<'_>,
+        result: &ProgramAnalysisResult,
+        props_in: &HashMap<ComponentId, Vec<QualifiedSlot>>,
+        kept_mounted: &HashMap<ComponentId, bool>,
+    ) -> bool {
         let WriterRegion::Effect(l) = s.row.region else {
             return true;
         };
@@ -691,8 +728,12 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         };
         match r.rerun(l) {
             Some(Rerun::Always(_)) => true,
-            Some(Rerun::MountOnly) => false,
-            Some(Rerun::OnSlots) | None => triggers_of(&r.effect_triggers, l).next().is_some(),
+            Some(Rerun::MountOnly) => kept_mounted.get(&s.comp) != Some(&true),
+            Some(Rerun::OnSlots) | None => {
+                triggers_of(&r.effect_triggers, l).next().is_some()
+                    || (r.effect_props.contains(&l)
+                        && props_in.get(&s.comp).is_none_or(|p| !p.is_empty()))
+            }
         }
     }
     let invariance_of = |ctx| invariance_of(ctx, navigates);
@@ -808,7 +849,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     node_of(s.comp, s.row) == node
                         && !std::ptr::eq(s.row, *w)
                         && !convergent[*j]
-                        && reruns_in_loop(s, result)
+                        && reruns_in_loop(s, result, &props_in, &kept_mounted)
                 })
                 .any(|(_, s)| match s.row.written.change {
                     Change::Never => false,
@@ -901,39 +942,39 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                             strength: EdgeStrength,
                             self_slot: bool,
                             always: Option<(Always, bool)>| {
-                let key = (from, node, f.comp, f.effect_label);
-                let edge = ChurnEdge {
-                    from,
-                    to: node,
-                    strength,
-                    component: f.comp,
-                    effect_label: f.effect_label,
-                    write_span: w.span,
-                    always,
-                    self_slot,
-                };
-                best.entry(key)
-                    .and_modify(|e| {
-                        if (strength, std::cmp::Reverse(pos(w.span)))
-                            > (e.strength, std::cmp::Reverse(pos(e.write_span)))
-                        {
-                            *e = edge.clone();
-                        }
-                    })
-                    .or_insert(edge);
+                insert_edge(
+                    &mut best,
+                    ChurnEdge {
+                        from,
+                        to: node,
+                        strength,
+                        component: f.comp,
+                        effect_label: f.effect_label,
+                        write_span: w.span,
+                        always,
+                        self_slot,
+                    },
+                );
             };
 
             if killed {
                 continue;
             }
+            // The props node's edges into this write (#207): a write that
+            // reads a prop, or anything, changes when `P_c` moves. Where no
+            // edge enters `P_c` — a root, or a component rendered through a
+            // value the tree cannot place — the write's own slot stands in
+            // for it, a self-edge, as before the node existed.
+            let p_in = &props_in[&f.comp];
+            let reads_props = reads.as_ref().is_none_or(|r| r.props);
+            let from_props: &[QualifiedSlot] = if reads_props { p_in } else { &[] };
             // An effect that re-runs after every render: a change of anything
             // the write reads re-runs it (a handler row was dropped above), so
             // each slot it reads is an edge into its own, and a write that
-            // reads everything or a prop re-triggers itself, whichever turn
-            // it runs on.
+            // reads everything re-triggers itself, whichever turn it runs on.
             let every_render: Vec<QualifiedSlot> = match &reads {
                 Some(r) => {
-                    let props = r.props.then_some(node);
+                    let props = (r.props && p_in.is_empty()).then_some(node);
                     r.slots.iter().map(|&l| (f.comp, l)).chain(props).collect()
                 }
                 None => vec![node],
@@ -942,6 +983,9 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             if let Some((_, true)) = f.always {
                 for &x in &every_render {
                     push(x, strength, false, f.always);
+                }
+                for &x in from_props {
+                    push(x, EdgeStrength::May, false, f.always);
                 }
                 continue;
             }
@@ -964,10 +1008,16 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     push(x, EdgeStrength::May, self_slot, None);
                 }
             }
+            // A dep the props move: `P_c` is a trigger.
+            if f.props {
+                for &x in from_props {
+                    push(x, EdgeStrength::May, false, None);
+                }
+            }
             // A re-run that is only possible adds May edges beside the rows'
             // own, which keep their partition on a tie (pushed first).
             if let Some((_, false)) = f.always {
-                for &x in &every_render {
+                for &x in every_render.iter().chain(from_props) {
                     push(x, EdgeStrength::May, false, f.always);
                 }
             }
@@ -975,13 +1025,51 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             // which holds only if nothing the write reads moved in between. A
             // read that is no trigger moves without re-running the effect,
             // and the next re-run a trigger causes stores its new value: the
-            // write's edges come from what it reads, trigger or not (#204).
+            // write's edges come from what it reads, trigger or not (#204),
+            // the props node included.
             if let Some(r) = &reads
-                && !f.triggers.is_empty()
+                && (!f.triggers.is_empty() || f.props)
             {
                 for &l in &r.slots {
                     push((f.comp, l), EdgeStrength::May, false, None);
                 }
+                for &x in from_props {
+                    push(x, EdgeStrength::May, false, None);
+                }
+            }
+        }
+    }
+
+    // Mount edges `P_c → y` (#207): a component the loop may remount runs
+    // every effect again at each mount, its mount-only ones included, and
+    // its fresh instance's writes are bounded by no certificate of the old
+    // one — only an identity changes nothing.
+    for (&comp, r) in &result.components {
+        if kept_mounted[&comp] {
+            continue;
+        }
+        for w in r.slot_writers.iter().filter(|w| {
+            matches!(w.region, WriterRegion::Effect(_))
+                && w.phase != WriterPhase::Handler
+                && w.written.change != Change::Never
+        }) {
+            let WriterRegion::Effect(effect_label) = w.region else {
+                continue;
+            };
+            for &from in &props_in[&comp] {
+                insert_edge(
+                    &mut best,
+                    ChurnEdge {
+                        from,
+                        to: node_of(comp, w),
+                        strength: EdgeStrength::May,
+                        component: comp,
+                        effect_label,
+                        write_span: w.span,
+                        always: None,
+                        self_slot: false,
+                    },
+                );
             }
         }
     }
@@ -1000,6 +1088,24 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
     /// A position to rank spans by; a spanless site ranks last.
     fn pos(s: Option<SourceRange>) -> (u32, u32) {
         s.map_or((u32::MAX, u32::MAX), |r| r.pos_key())
+    }
+
+    /// Keep, per (from, to, component, effect), the strongest edge, and
+    /// among equals the earliest write site.
+    fn insert_edge(
+        best: &mut HashMap<(QualifiedSlot, QualifiedSlot, ComponentId, HookLabel), ChurnEdge>,
+        edge: ChurnEdge,
+    ) {
+        let key = (edge.from, edge.to, edge.component, edge.effect_label);
+        best.entry(key)
+            .and_modify(|e| {
+                if (edge.strength, std::cmp::Reverse(pos(edge.write_span)))
+                    > (e.strength, std::cmp::Reverse(pos(e.write_span)))
+                {
+                    *e = edge.clone();
+                }
+            })
+            .or_insert(edge);
     }
 
     /// May a written value that passed through a call be a reference the

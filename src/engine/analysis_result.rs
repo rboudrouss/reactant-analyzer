@@ -264,6 +264,9 @@ pub struct AnalysisResult<D: AbstractDomain> {
     /// whether it runs once per mount, when a slot of its rows moves, or
     /// after every render. Read it through [`AnalysisResult::rerun`].
     pub effect_reruns: HashMap<HookLabel, crate::engine::triggers::Rerun>,
+    /// The effects a dep of which may move with the props, beside the rows:
+    /// the churn graph's props node is among their triggers (#207).
+    pub effect_props: std::collections::HashSet<HookLabel>,
     /// Number of outer fixpoint iterations before convergence.  Useful for
     /// --verbose output and for Info diagnostics about analysis depth.
     pub iterations: usize,

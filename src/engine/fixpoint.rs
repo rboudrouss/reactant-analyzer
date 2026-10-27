@@ -686,6 +686,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         registrations,
         effect_triggers: Vec::new(),
         effect_reruns: HashMap::new(),
+        effect_props: Default::default(),
         iterations: iteration,
         heap,
     };
@@ -716,6 +717,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     };
     result.effect_triggers = relation.rows;
     result.effect_reruns = relation.reruns;
+    result.effect_props = relation.props;
     result
 }
 

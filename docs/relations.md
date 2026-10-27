@@ -69,7 +69,10 @@ from, this says whether the dep changes exactly when the slot does. The two
 meet where identity is dependence: a dep that may be a primitive (or a
 reference whose change the domain cannot bound) is compared by value, so its
 may rows are the `Slot` sources `render_deps` gives it where the effect is
-called — `[!on]`, `[count * 2]`, a ternary's condition (#203).
+called — `[!on]`, `[count * 2]`, a ternary's condition (#203). Such a dep
+with a `Prop` source is moved by a parent no row names: the effect is in
+`effect_props`, and the churn graph's props node is among its triggers
+(#207).
 
 **The re-run class** — `effect_reruns`, read through `AnalysisResult::rerun`.
 One `Rerun` per effect, computed with the rows, and the first thing every
@@ -171,8 +174,31 @@ holds only if nothing the write reads moved since its last run, and a read
 that is not a trigger moves without re-running the effect: the next re-run
 stores its new value. So for such a write the edge sources are the slots
 it reads, trigger or not, and the triggers it does not read carry none
-(#204). A prop it reads is a source only through the effect's trigger rows
-on parent slots; a prop read that is no dep has no node of its own (#207).
+(#204). A prop it reads is a source through the props node below.
+
+**The component tree and the props node** (#213, #206, #207). The parent
+relation is read once per program from the element tree: `p` is a parent of
+`c` when `p`'s render builds an element whose origin the component table
+resolves to `c` — the element's creator, which is who hands `c` its props.
+`stays(c)` holds when every such element sits outside closures, under
+guards and a `key` that hold still in `p`, and `stays(p)`; a root stays, a
+cycle of the tree fails closed. Only a component that stays may carry a
+`Must` edge, and only its mount-only effects fire once. The props node
+`P_c` stands for "the props of `c` moved": its in-edges are every slot of
+every ancestor that a non-`Handler` write moves (the `P_parent → P_c` edge
+is folded in, ancestry being transitive), so the props of `c` hold — the
+guard proofs may read facts over them — exactly when no edge enters `P_c`.
+Out of `P_c` go an edge into every write that reads a prop (or anything),
+of an effect that re-runs after every render or that `effect_props` marks;
+and **mount edges** into every effect write of a component that does not
+stay, its mount-only ones included, which no certificate kills: a fresh
+instance fires again. The node is eliminated in the graph — an edge out of
+`P_c` is pushed from each of its in-edges, so every edge keeps a carrying
+effect and a write span. Where nothing enters `P_c` (a root, or a component
+rendered through a value the tree cannot place), a write that reads a prop
+keeps the self-edge that stood in for it before. The tree is the creator
+relation: a component that receives an element as `children` and hides it
+is not seen as its parent.
 
 | column | claim | polarity |
 |---|---|---|
@@ -192,8 +218,9 @@ An edge is dropped when its write provably fires at most once: the site's
 guards die under its own write and under every other effect write of the
 slot in the component, each taken with the facts that site ran under that
 hold still across the loop (`engine/guards.rs`, #154). What the graph does
-not see is recorded, not guessed: a prop-mediated edge needs the parent slot
-flowed top-down (#20), and a slot another component also writes is never
+not see is recorded, not guessed: a prop-mediated edge needs the parent in
+the component tree (an element whose origin resolves, #20), and a slot
+another component also writes is never
 killed, since that site's guards live in bodies this component's env cannot
 read.
 

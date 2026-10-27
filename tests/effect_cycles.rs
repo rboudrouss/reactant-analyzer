@@ -1472,10 +1472,12 @@ export function App() {
   return <Child p={n} bump={() => setN(!n)} />;
 }
 "#;
-    let sevs = loop_severities(src, "Child");
+    let diags = infinite_loop_diags(src, "Child");
     assert!(
-        !sevs.is_empty(),
-        "the prop moves with the slot `bump` writes: {sevs:?}"
+        diags
+            .iter()
+            .any(|(rule, sev, _)| rule.ends_with("infinite-loop") && *sev != Severity::Info),
+        "the prop moves with the slot `bump` writes: {diags:?}"
     );
 }
 
@@ -1500,6 +1502,106 @@ export function App() {
 "#;
     let sevs = loop_severities(src, "Child");
     assert!(sevs.is_empty(), "the prop holds across the loop: {sevs:?}");
+}
+
+/// The cycles of the program graph carried by an effect of `component`.
+fn cycles_carried_by(src: &str, component: &str) -> usize {
+    let result = parse_and_analyze(src);
+    let id = result.component_named(component).unwrap();
+    let graph = reactant::engine::ChurnGraph::build(&result);
+    graph
+        .cycles
+        .iter()
+        .filter(|c| c.edge_idx.iter().any(|&i| graph.edges[i].component == id))
+        .count()
+}
+
+#[test]
+fn a_fresh_prop_forwarded_by_a_middle_component_closes_a_cycle() {
+    // #207: `v` is new at every render of `App`, forwarded by `Mid`; `Leaf`
+    // carries no label of `App`'s slot, but its props move whenever `App`'s
+    // slot does, and its effect writes that slot.
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Leaf({ v, bump }: { v: object; bump: () => void }) {
+  useEffect(() => { bump(); }, [v]);
+  return null;
+}
+function Mid({ v, bump }: { v: object; bump: () => void }) {
+  return <Leaf v={v} bump={bump} />;
+}
+export function App() {
+  const [n, setN] = useState(0);
+  return <Mid v={{}} bump={() => setN(n + 1)} />;
+}
+"#;
+    assert!(
+        cycles_carried_by(src, "Leaf") > 0,
+        "App's slot → Leaf's props → App's slot"
+    );
+}
+
+#[test]
+fn a_child_of_a_rekeyed_parent_fires_its_mount_effect_every_round() {
+    // #207: `Mid` is re-keyed by `App`'s slot at every write, and `Child` is
+    // remounted with it: its `[]` effect fires at every mount.
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Child({ onMount }: { onMount: () => void }) {
+  useEffect(() => { onMount(); }, []);
+  return null;
+}
+function Mid({ onMount }: { onMount: () => void }) {
+  return <Child onMount={onMount} />;
+}
+export function App() {
+  const [k, setK] = useState(false);
+  return <Mid key={String(k)} onMount={() => setK(!k)} />;
+}
+"#;
+    assert!(
+        cycles_carried_by(src, "Child") > 0,
+        "a remounted child's mount effect is a mount edge"
+    );
+}
+
+#[test]
+fn a_primitive_prop_dep_is_moved_by_the_props_node() {
+    // `p` is a number computed from `App`'s slot: no reference label, no
+    // trigger row, but the props move it.
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Child({ p, bump }: { p: number; bump: () => void }) {
+  useEffect(() => { bump(); }, [p]);
+  return null;
+}
+export function App() {
+  const [n, setN] = useState(0);
+  return <Child p={n % 2} bump={() => setN(n + 1)} />;
+}
+"#;
+    assert!(cycles_carried_by(src, "Child") > 0);
+}
+
+#[test]
+fn a_prop_copied_into_child_state_closes_no_cycle() {
+    // The props move with `App`'s slot, and `Child` copies one into its own
+    // state: an edge into `Child`'s slot, none back into `App`'s.
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Child({ p }: { p: number }) {
+  const [local, setLocal] = useState(0);
+  useEffect(() => { setLocal(p); }, [p]);
+  return <div>{local}</div>;
+}
+export function App() {
+  const [n, setN] = useState(0);
+  useEffect(() => { setN(1); }, []);
+  return <Child p={n} />;
+}
+"#;
+    assert_eq!(cycles_carried_by(src, "Child"), 0);
+    assert!(loop_severities(src, "Child").is_empty());
 }
 
 #[test]

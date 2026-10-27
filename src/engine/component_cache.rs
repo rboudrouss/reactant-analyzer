@@ -175,6 +175,7 @@ mod tests {
             registrations: vec![],
             effect_triggers: vec![],
             effect_reruns: HashMap::new(),
+            effect_props: Default::default(),
             custom_arg_returns: HashMap::new(),
             iterations: 1,
             heap: crate::domains::stores::Heap::new(),

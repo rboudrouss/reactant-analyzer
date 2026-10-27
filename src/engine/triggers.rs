@@ -26,7 +26,7 @@
 //! Computed at convergence in the `slot_seeds` slice and stored on
 //! `AnalysisResult`. Both arms of `infinite-loop` read it.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::{
     domains::{StateValue, impls::Stability, stores::MemoStore},
@@ -123,10 +123,16 @@ impl Rerun {
     }
 }
 
-/// The relation for one component: the rows and the class of every effect.
+/// The relation for one component: the rows, the class of every effect, and
+/// the effects the props move.
 pub(crate) struct EffectTriggers {
     pub rows: Vec<EffectTrigger>,
     pub reruns: HashMap<HookLabel, Rerun>,
+    /// The effects a dep of which may move with the props, though no row
+    /// names the parent slot it is computed from: a primitive or a
+    /// reference whose change the domain cannot bound, computed from a prop
+    /// (#207). The churn graph's props node is among their triggers.
+    pub props: HashSet<HookLabel>,
 }
 
 /// Every trigger row and re-run class of `component`'s effects. `eval`
@@ -148,6 +154,7 @@ pub(crate) fn collect_effect_triggers(
     let mut out = EffectTriggers {
         rows: Vec::new(),
         reruns: HashMap::new(),
+        props: HashSet::new(),
     };
     let mut refs_move: HashMap<HookLabel, bool> = HashMap::new();
     for hook in hooks {
@@ -260,6 +267,16 @@ pub(crate) fn collect_effect_triggers(
                     Source::Slot(l) => Some((component, *l)),
                     _ => None,
                 }));
+                // What a prop is computed from lives in a parent, which may
+                // re-render this one with new props (`p={n % 2}`): the props
+                // themselves are the trigger.
+                if src
+                    .set
+                    .iter()
+                    .any(|s| matches!(s, Source::Prop(_) | Source::AllProps))
+                {
+                    out.props.insert(*label);
+                }
             }
             for slot in slots {
                 out.rows.push(EffectTrigger {
