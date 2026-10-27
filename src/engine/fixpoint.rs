@@ -447,15 +447,21 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             hooks
                 .iter()
                 .filter_map(|hook| match hook {
-                    HookEntry::Memo { label, deps, .. }
-                    | HookEntry::Callback { label, deps, .. } => Some((
+                    HookEntry::Memo { label, .. } | HookEntry::Callback { label, .. } => Some((
                         *label,
-                        transfer.recompute_memo(comp_id, deps, &env_exit, &mut memo_ctx),
+                        transfer.recompute_memo(
+                            comp_id,
+                            hook,
+                            &render_cfg,
+                            &env_exit,
+                            &mut memo_ctx,
+                        ),
                     )),
                     _ => None,
                 })
                 .collect()
         };
+        let memo_before = memo_store.clone();
         for (label, val) in memo_updates {
             memo_store.set(label, val);
         }
@@ -520,7 +526,10 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             .join(&state_from_handlers)
             .join(&external_updates);
 
-        if new_state.leq(&state) {
+        // The memo store is part of the carrier: this pass's render read the
+        // memos the previous iteration computed, so it saw the stores only
+        // once they stop moving.
+        if new_state.leq(&state) && memo_store == memo_before {
             break;
         }
 
@@ -1453,6 +1462,7 @@ fn collect_effect_info(hooks: &[HookEntry]) -> HashMap<HookLabel, EffectInfo> {
                 params,
                 deps,
                 span,
+                ..
             } => {
                 let (mut free_paths, mut deps_pinned) =
                     free_paths_and_pinned(body_cfg, &deps.covering());
@@ -1789,10 +1799,6 @@ mod tests {
     };
     use std::sync::Arc;
 
-    fn trivial_cfg() -> CFG {
-        crate::test_support::single_block_cfg(vec![])
-    }
-
     fn component(hooks: Vec<HookEntry>, render_stmts: Vec<Stmt>) -> ComponentIR {
         ComponentIR {
             file: std::path::PathBuf::new(),
@@ -2031,10 +2037,18 @@ mod tests {
 
     #[test]
     fn memo_store_recomputed_from_deps() {
-        // useMemo(() => x, [x]) where x = Number([1,1]) (stable point) → memo[0] = Reference(Stable)
+        // useMemo(() => [], [x]) where x = Number([1,1]) (stable point) → memo[0] = Reference(Stable)
         let hooks = vec![HookEntry::Memo {
             label: 0,
-            body_cfg: trivial_cfg(),
+            body_cfg: crate::test_support::single_block_cfg_term(
+                vec![],
+                Terminator::Return(Expr::ArrayLit {
+                    id: ExprId(0),
+                    elems: vec![],
+                    arity: crate::ir::hooks::Arity::Exact(0),
+                    spread_at: vec![],
+                }),
+            ),
             deps: DepsArg::List(DepsList::exact(vec![Expr::Var("x".to_string())])),
             span: None,
         }];
@@ -2052,7 +2066,8 @@ mod tests {
         ];
         let comp = component(hooks, render_stmts);
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-        // dep x = Number([1,1]).to_stability() = Stable → Reference(Stable)
+        // dep x = Number([1,1]).to_stability() = Stable → the body's array,
+        // Reference(Stable)
         assert_eq!(
             result.memo_store.get(0),
             StateValue::reference(Stability::Stable)

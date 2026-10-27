@@ -781,6 +781,7 @@ pub fn rename_hook_entry(entry: HookEntry, ren: &HashMap<Var, Var>) -> HookEntry
             label,
             body_cfg,
             params,
+            literal,
             deps,
             span,
         } => {
@@ -791,6 +792,7 @@ pub fn rename_hook_entry(entry: HookEntry, ren: &HashMap<Var, Var>) -> HookEntry
                 label,
                 body_cfg: rename_vars_cfg(body_cfg, &inner),
                 params,
+                literal,
                 deps: deps.map_exprs(|e| rename_vars_expr(e, ren)),
                 span,
             }

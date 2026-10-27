@@ -279,6 +279,10 @@ pub enum HookEntry {
         /// of any same-named outer binding (`(options) => …` shadowing a
         /// component-scope `options`).
         params: Vec<Var>,
+        /// The argument is a function literal, so every recompute hands back
+        /// a new function. Any other argument (`useCallback(f, deps)`) is
+        /// handed back as it is, whatever it is.
+        literal: bool,
         /// See [`HookEntry::Memo`]'s `deps`.
         deps: DepsArg,
         span: Option<SourceRange>,

@@ -698,17 +698,18 @@ fn make_hook_entry(
             // No `FnLit` means no parameter list either: an empty one
             // subtracts nothing from the body's free variables, so captures are
             // over-approximated rather than missed.
-            let (params, body_cfg) = match it.next() {
+            let (params, body_cfg, literal) = match it.next() {
                 Some(Expr::FnLit {
                     params, body_cfg, ..
-                }) => (params, unwrap_body(body_cfg)),
-                other => (vec![], hook_body_cfg(other)),
+                }) => (params, unwrap_body(body_cfg), true),
+                other => (vec![], hook_body_cfg(other), false),
             };
             let deps = it.next().map_or(DepsArg::Absent, DepsArg::from_expr);
             Some(HookEntry::Callback {
                 label,
                 body_cfg,
                 params,
+                literal,
                 deps,
                 span,
             })
@@ -812,33 +813,31 @@ fn unwrap_body(body_cfg: std::sync::Arc<CFG>) -> CFG {
 ///
 /// A literal `() => {…}` contributes its own CFG. Anything else — a variable, a
 /// member access, a call returning a function — is *not* unanalysable: the hook
-/// invokes it, so the body is exactly that invocation, and the engine resolves
-/// the callee from the env like any other call.
+/// invokes it, so the body is exactly that invocation, returning what it
+/// returns (a memo's value, an effect's cleanup), and the engine resolves the
+/// callee from the env like any other call.
 ///
 /// The previous fallback handed back an `Unreachable` CFG, which claimed the
 /// callback did nothing at all: ⊥ where ⊤ was required. `useEffect(handler)`
 /// came out clean *and certified* `verified infinite-loop`, while the same body
 /// written inline was reported.
 fn hook_body_cfg(arg: Option<Expr>) -> CFG {
-    let stmts = match arg {
+    let ret = match arg {
         Some(Expr::FnLit { body_cfg, .. }) => return unwrap_body(body_cfg),
-        Some(callee) => vec![Stmt::ExprStmt(
-            Expr::Call {
-                fn_: Box::new(callee),
-                args: vec![],
-            },
-            None,
-        )],
+        Some(callee) => Expr::Call {
+            fn_: Box::new(callee),
+            args: vec![],
+        },
         // No callback argument at all — not valid React; nothing runs.
-        None => vec![],
+        None => Expr::Lit(Prim::Unit),
     };
     let mut blocks = std::collections::BTreeMap::new();
     blocks.insert(
         0,
         BasicBlock {
             id: 0,
-            stmts,
-            term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            stmts: vec![],
+            term: Terminator::Return(ret),
         },
     );
     CFG {
@@ -993,14 +992,15 @@ mod tests {
             !matches!(body.blocks[&body.entry].term, Terminator::Unreachable),
             "an indirect callback body must not be unreachable"
         );
+        // The call is the body's return: a memo's value, an effect's cleanup.
         assert!(
-            body.blocks[&body.entry].stmts.iter().any(|s| matches!(
-                s,
-                Stmt::ExprStmt(Expr::Call { fn_, .. }, _)
+            matches!(
+                &body.blocks[&body.entry].term,
+                Terminator::Return(Expr::Call { fn_, .. })
                     if matches!(fn_.as_ref(), Expr::Var(v) if v == "handler")
-            )),
-            "the body must call the callback it was handed: {:?}",
-            body.blocks[&body.entry].stmts
+            ),
+            "the body must call and return the callback it was handed: {:?}",
+            body.blocks[&body.entry].term
         );
     }
 

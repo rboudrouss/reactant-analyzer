@@ -6,14 +6,16 @@ use crate::{
     domains::{
         AbstractDomain, AnalysisCtx, Transfer,
         impls::{BoolVal, Interval, SetterVal, Stability, StateValue, StrConst},
-        interp::exec_stmt_with_callbacks,
+        interp::{exec_body, exec_stmt_with_callbacks},
         stores::{AbstractEnv, EnvVal, Heap, HeapValue, resolve_locs},
     },
     engine::component_registry::ChildLookup,
     ir::{
         ComponentId,
+        bindings::binding_of,
+        cfg::CFG,
         expr::{BinOp, CompOrigin, Expr, MarkerVal, Prim, UnaryOp},
-        hooks::{Arity, DepsArg},
+        hooks::{Arity, DepsArg, HookEntry},
         stmt::Stmt,
         types::{ExprId, Symbol},
     },
@@ -44,52 +46,126 @@ impl Transfer for StateValueTransfer {
         exec_stmt_with_callbacks(self, stmt, env, ctx);
     }
 
+    /// A memo holds what some recompute handed back, so its kinds are those of
+    /// one recompute, and its reference changes only when the deps let it
+    /// recompute: the deps' **may** bound. Recomputing is not changing
+    /// (`useMemo(() => 0, [{}])` is `0` at every render, #199), so the memo is
+    /// a new reference every render only when it surely recomputes (a dep is
+    /// a new reference every render) and each recompute surely allocates. A
+    /// value whose kinds were `reference` alone made `useMemo(() => 0, [])`
+    /// an object, which a truthiness guard then killed (#198).
     fn recompute_memo(
         &self,
         component: ComponentId,
-        deps: &DepsArg,
+        memo: &HookEntry,
+        render_cfg: &CFG,
         env: &AbstractEnv<StateValue>,
         ctx: &mut AnalysisCtx<StateValue>,
     ) -> StateValue {
-        // No readable deps array: the memo may recompute on any render and may
-        // equally never recompute — ⊤. `Stable` here would be a *must* claim
-        // about a list the IR never saw, which is how `useMemo(fn, deps)` used
-        // to read as pinned forever.
-        let Some(deps) = deps.list() else {
-            return StateValue::reference(Stability::Unknown);
+        // One recompute: a memo's body, run against the real stores (ADR-020
+        // item 8); a new function for a callback literal; for any other
+        // callback, its argument, which nothing here reads. A body no run
+        // returns from bounds nothing.
+        let (deps, value) = match memo {
+            HookEntry::Memo { body_cfg, deps, .. } => (deps, exec_body(self, body_cfg, env, ctx)),
+            HookEntry::Callback {
+                literal: true,
+                deps,
+                ..
+            } => (deps, StateValue::reference(Stability::PerRender)),
+            HookEntry::Callback { deps, .. } => (deps, StateValue::top()),
+            _ => return StateValue::top(),
         };
-        if deps.arity == Arity::Exact(0) {
-            // `[]` pins the memo — but only an array *known* to be empty.
-            return StateValue::reference(Stability::Stable);
+        let value = if value.is_bottom_value() {
+            StateValue::top()
+        } else {
+            value
+        };
+        // No deps argument: React recomputes at every render, so the memo is
+        // what its body is at that render.
+        if matches!(deps, DepsArg::Absent) {
+            return value;
         }
-        if deps.is_empty() {
-            // Every entry is a spread whose source the fold cannot reach.
-            return StateValue::reference(Stability::Unknown);
+        let (may, fresh_dep) = deps_change(component, deps, render_cfg, env, ctx);
+        if fresh_dep && value.is_unstable_reference_only() {
+            return value;
         }
-        let stability = deps.as_slice().iter().fold(Stability::Bottom, |acc, dep| {
-            // Structural projection (ADR-017): a dep that IS a state slot
-            // versions the memo by that slot regardless of the slot's kind —
-            // it changes only at the slot's setter events, `Versioned({l})`.
-            // `eval_state_value` can't express this: version labels live on
-            // the reference slot, so a numeric/bool state dep would collapse
-            // to a plain `Stable`/`PerRender` via `to_stability`. Not a store
-            // workaround — a genuine memo-side projection.
-            if let Expr::StateVal(l) = dep.peel_ts() {
-                return acc.join(&Stability::versioned_by(component, *l));
-            }
-            // Every other dep is evaluated through the normal path against the
-            // real fixpoint stores in `ctx` (so `MemoVal`, heap fields, and
-            // compound deps resolve instead of reading a fabricated ⊥ store).
-            let val = eval_state_value(dep, env, ctx);
-            // A dep whose reference kind is already versioned keeps its
-            // labels (`to_stability` would erase them if another slot is ⊤).
-            acc.join(
-                &val.versioned_reference()
-                    .unwrap_or_else(|| val.to_stability()),
-            )
-        });
-        StateValue::reference(stability)
+        if value.reference.is_bottom() {
+            return value;
+        }
+        StateValue {
+            reference: may,
+            ..value
+        }
     }
+}
+
+/// The renders at which a deps list may let its hook recompute (a may bound),
+/// and whether some dep is surely a new reference at every render, so the
+/// hook surely recomputes at every render.
+///
+/// No readable list bounds nothing: `Stable` would be a *must* claim about a
+/// list the IR never saw, which is how `useMemo(fn, deps)` used to read as
+/// pinned forever; `[]` pins the hook, but only an array *known* to be empty.
+fn deps_change(
+    component: ComponentId,
+    deps: &DepsArg,
+    render_cfg: &CFG,
+    env: &AbstractEnv<StateValue>,
+    ctx: &mut AnalysisCtx<StateValue>,
+) -> (Stability, bool) {
+    let Some(list) = deps.list() else {
+        return (Stability::Unknown, false);
+    };
+    if list.arity == Arity::Exact(0) {
+        return (Stability::Stable, false);
+    }
+    if list.is_empty() {
+        // Every entry is a spread whose source the fold cannot reach.
+        return (Stability::Unknown, false);
+    }
+    let mut may = Stability::Bottom;
+    let mut fresh = false;
+    for (i, dep) in list.as_slice().iter().enumerate() {
+        // Structural projection (ADR-017): a dep that IS a state slot moves
+        // only at the slot's setter events, whatever the slot's kind; its
+        // value cannot say so, version labels living on the reference slot.
+        if let Expr::StateVal(l) = dep.peel_ts() {
+            may = may.join(&Stability::versioned_by(component, *l));
+            continue;
+        }
+        let val = eval_state_value(dep, env, ctx);
+        // A spread's source is not compared, its elements are: they hold
+        // only while the source is a reference that moves at slot events.
+        if list.spread_at.contains(&i) {
+            let held = val.is_reference_only()
+                && matches!(val.reference, Stability::Stable | Stability::Versioned(_));
+            may = may.join(&if held {
+                val.reference.clone()
+            } else {
+                Stability::Unknown
+            });
+            continue;
+        }
+        // A name is read at the render's exit, so its value there is its
+        // value at the call only when it is bound once.
+        let bound_once = match dep.peel_ts() {
+            Expr::Var(v) => binding_of(v, render_cfg).is_some(),
+            _ => true,
+        };
+        fresh |= bound_once && val.is_unstable_reference_only();
+        // A dep whose reference is versioned keeps its labels (`to_stability`
+        // would erase them if another slot is ⊤); a dep in motion may move at
+        // any render, which is the may side of `PerRender`.
+        may = may.join(&match val.versioned_reference() {
+            Some(v) => v,
+            None => match val.to_stability() {
+                Stability::PerRender => Stability::Unknown,
+                s => s,
+            },
+        });
+    }
+    (may, fresh)
 }
 
 // ── Expression evaluator ──────────────────────────────────────────────────────

@@ -469,6 +469,7 @@ mod tests {
             label: 0,
             body_cfg: empty_cfg(),
             params: vec![],
+            literal: true,
             deps: DepsArg::List(DepsList::exact(vec![Expr::ArrayLit {
                 id: ExprId(0),
                 elems: vec![],
