@@ -2685,6 +2685,7 @@ mod tests {
                 params: vec![],
                 body_cfg: Arc::new(cb_body),
                 captured: std::collections::HashMap::new(),
+                owner: crate::test_support::C,
                 captured_slots: std::collections::HashMap::new(),
             },
         );

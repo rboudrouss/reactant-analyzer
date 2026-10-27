@@ -244,6 +244,30 @@ function Child({ value, onUpdate }) {
 }
 
 #[test]
+fn a_closure_reads_a_variable_assigned_after_it_was_created() {
+    // #215: a closure captures `x`, not its value `0` at creation. The
+    // effect calls it after `x = 1`, so it writes `n + 1`, every render.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function App() {
+  const [n, setN] = useState(0);
+  let x = 0;
+  const bump = () => setN(n + x);
+  x = 1;
+  useEffect(() => { bump(); });
+  return <div>{n}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "App");
+    assert!(
+        diags
+            .iter()
+            .any(|(r, s, _)| r == "infinite-loop" && *s != Severity::Info),
+        "{diags:?}"
+    );
+}
+
+#[test]
 fn a_closure_prop_over_a_moving_slot_is_rerun_at_each_value() {
     // Every render passes `() => setN(n + 1)`: the same reference, but a
     // closure over a new `n`. The child cache keyed on the props' values

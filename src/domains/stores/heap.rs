@@ -3,6 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use crate::{
     domains::{AbstractDomain, impls::StateValue},
     ir::{
+        ComponentId,
         cfg::CFG,
         expr::Expr,
         free_vars::compute_free_vars,
@@ -23,6 +24,11 @@ pub enum HeapValue {
         body_cfg: Arc<CFG>,
         /// Free variables captured from the enclosing scope when this function was created.
         captured: HashMap<Symbol, StateValue>,
+        /// The component whose scope the closure was created in. A call in
+        /// that same component reads a captured variable as it is at the
+        /// call too: JavaScript closures capture variables, not values, so an
+        /// assignment after creation is visible (#215).
+        owner: ComponentId,
         /// The captured names that were a state slot's read value at
         /// creation (`AbstractEnv::slot_label`): what the body's conditions
         /// on them change with (#197).
@@ -57,6 +63,7 @@ impl Heap {
         params: &[Var],
         body_cfg: &Arc<CFG>,
         env: &AbstractEnv<D>,
+        owner: ComponentId,
     ) {
         let free = compute_free_vars(body_cfg);
         let captured = free
@@ -73,6 +80,7 @@ impl Heap {
                 params: params.to_vec(),
                 body_cfg: Arc::clone(body_cfg),
                 captured,
+                owner,
                 captured_slots,
             },
         );
@@ -126,6 +134,7 @@ impl Heap {
                     params,
                     body_cfg,
                     captured: cap_self,
+                    owner,
                     captured_slots: slots_self,
                 }) => {
                     if let HeapValue::Fn {
@@ -151,6 +160,7 @@ impl Heap {
                                 params: params.clone(),
                                 body_cfg: Arc::clone(body_cfg),
                                 captured: joined_cap,
+                                owner: *owner,
                                 captured_slots: joined_slots,
                             },
                         );

@@ -560,7 +560,7 @@ pub(crate) fn alloc_literal<T: Transfer>(
             params,
             body_cfg,
         } => {
-            ctx.heap.alloc_fn(*id, params, body_cfg, env);
+            ctx.heap.alloc_fn(*id, params, body_cfg, env, ctx.component);
             return Some(std::iter::once(*id).collect());
         }
         // Members written before a spread are dropped: `{ a, ...rest }` may
@@ -852,6 +852,7 @@ fn exec_heap_fns<T: Transfer>(
             params,
             body_cfg,
             captured,
+            owner,
             captured_slots,
         }) = ctx.heap.get(id)
         {
@@ -859,14 +860,34 @@ fn exec_heap_fns<T: Transfer>(
             let body_cfg = Arc::clone(body_cfg);
             let captured = captured.clone();
             let captured_slots = captured_slots.clone();
+            // A closure captures variables (#215): called in the component
+            // that created it, a captured name is also what it holds at the
+            // call — the render's exit env, for a call in an effect or a
+            // handler, holds every assignment made after the creation.
+            let live: HashSet<Symbol> = if *owner == ctx.component {
+                captured
+                    .keys()
+                    .filter(|v| env.contains(v))
+                    .cloned()
+                    .collect()
+            } else {
+                HashSet::new()
+            };
             let mut sub_env = env.clone();
             for (var, val) in captured {
-                sub_env.extend(var, T::Domain::from_state_value(val));
+                let mut val = T::Domain::from_state_value(val);
+                if live.contains(&var) {
+                    val = val.join(&env.lookup(&var));
+                }
+                sub_env.extend(var, val);
             }
             // The creation-time certificates, not the call site's: the
-            // body's `a` is the one it closed over.
+            // body's `a` is the one it closed over — and, for a name the
+            // call also reads, only where both agree.
             for (var, label) in captured_slots {
-                sub_env.bind_slot(var, label);
+                if !live.contains(&var) || env.slot_label(&var) == Some(label) {
+                    sub_env.bind_slot(var, label);
+                }
             }
             for p in &params {
                 sub_env.extend(p.clone(), T::Domain::top());
