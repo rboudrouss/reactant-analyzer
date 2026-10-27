@@ -357,7 +357,10 @@ with no position of its own takes the first one its witness chain names
 
 Aliases declared only in `vite.config.*` or `next.config.*` (a `jsconfig.json`
 is read where no `tsconfig.json` exists)
-[#47](https://github.com/rboudrouss/reactant-analyzer/issues/47); monorepo `@workspace/*` specifiers [#48](https://github.com/rboudrouss/reactant-analyzer/issues/48); re-export
+[#47](https://github.com/rboudrouss/reactant-analyzer/issues/47); a workspace package whose compiled entry
+is not built from `src/<subpath>` (`twenty-sdk/front-component` comes from
+`src/sdk/front-component`, named only in its `vite.config`) stays opaque
+[#48](https://github.com/rboudrouss/reactant-analyzer/issues/48); re-export
 chains beyond one level for components, contexts and utilities [#49](https://github.com/rboudrouss/reactant-analyzer/issues/49)
 (a custom hook's import follows the chain to its end); a third-party hook re-exported under a
 local alias [#50](https://github.com/rboudrouss/reactant-analyzer/issues/50). `node_modules` is never lowered, and the

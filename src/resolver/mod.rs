@@ -677,6 +677,37 @@ pub(crate) fn normalize(path: &Path) -> PathBuf {
     out
 }
 
+/// The source file a module path names, the way TypeScript's bundler
+/// resolution reads it: the path itself when it is a source file (never a
+/// `.d.ts`), else `<path>.<ext>`, else the same path with its extension
+/// swapped (`./x.js` written for `./x.ts`), else `<path>/index.<ext>`.
+pub(crate) fn probe_module(fs: &dyn FileSystem, path: &Path) -> Option<PathBuf> {
+    let base = normalize(path);
+    let is_source = |p: &PathBuf| {
+        p.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| SOURCE_EXTENSIONS.contains(&e))
+            && !p.to_string_lossy().ends_with(".d.ts")
+    };
+    let appended = SOURCE_EXTENSIONS.iter().map(|ext| {
+        let mut p = base.clone().into_os_string();
+        p.push(format!(".{ext}"));
+        PathBuf::from(p)
+    });
+    let swapped = SOURCE_EXTENSIONS
+        .iter()
+        .filter(|_| base.extension().is_some())
+        .map(|ext| base.with_extension(ext));
+    let index = SOURCE_EXTENSIONS
+        .iter()
+        .map(|ext| base.join(format!("index.{ext}")));
+    std::iter::once(base.clone())
+        .chain(appended)
+        .chain(swapped)
+        .chain(index)
+        .find(|candidate| is_source(candidate) && fs.is_file(candidate))
+}
+
 impl ImportResolver for DefaultImportResolver {
     fn resolve(&self, from: &Path, specifier: &str) -> Option<PathBuf> {
         if !specifier.starts_with('.') {

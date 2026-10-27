@@ -4,24 +4,28 @@
 //! live and how import specifiers map to files. Detected: **Vite** (presence
 //! of `vite.config.*`) and **Next.js** (presence of `next.config.*`), both of
 //! which load `@/*`-style aliases from tsconfig `paths` (see [`tsconfig`]).
-//! Everything else is [`ProjectKind::Plain`].
+//! Everything else is [`ProjectKind::Plain`]. Monorepo workspace packages
+//! resolve to their source through [`workspace`].
 //!
 //! Out of scope (deliberately): evaluating `vite.config.*` / `next.config.*`
-//! for `resolve.alias` / `webpack` overrides (requires running JS),
-//! package.json `exports` maps.
+//! for `resolve.alias` / `webpack` overrides (requires running JS).
 
 pub mod nextjs;
 pub mod paths_resolver;
 pub mod tsconfig;
+pub mod workspace;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::resolver::{DefaultImportResolver, FileSystem, ImportResolver, ScopedResolver};
+use crate::resolver::{
+    ChainResolver, DefaultImportResolver, FileSystem, ImportResolver, ScopedResolver,
+};
 
 pub use nextjs::{USE_CLIENT, server_entry_kind, server_modules};
 pub use paths_resolver::TsconfigPathsResolver;
 pub use tsconfig::{TsconfigPaths, load_tsconfig_paths, strip_jsonc};
+pub use workspace::WorkspaceResolver;
 
 /// Build-tool convention detected at a project root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,8 +173,9 @@ pub fn is_root_marker(name: &str) -> bool {
 /// asked to walk) and each of `marked` that is a real root (a build-tool
 /// marker, or a tsconfig declaring `paths` or `baseUrl`) becomes a scope
 /// resolving as a run started there would ([`resolver_at`]); a file under
-/// none of them goes to `fallback`. With no scope, `fallback` is returned
-/// as-is.
+/// none of them goes to `fallback`. A bare specifier the project's own
+/// statement (its tsconfig `paths`) leaves unresolved then goes to the
+/// workspace packages ([`WorkspaceResolver`]).
 pub fn scope_by_project(
     fallback: Box<dyn ImportResolver>,
     starts: &[PathBuf],
@@ -184,16 +189,21 @@ pub fn scope_by_project(
                 || load_tsconfig_paths(dir, fs.as_ref()).is_some()
         }))
         .collect();
-    if roots.is_empty() {
-        return fallback;
-    }
-    Box::new(
-        roots
-            .into_iter()
-            .fold(ScopedResolver::new(fallback), |scoped, dir| {
-                scoped.scope(dir.clone(), resolver_at(dir, fs.clone()))
-            }),
-    )
+    let projects = if roots.is_empty() {
+        fallback
+    } else {
+        Box::new(
+            roots
+                .into_iter()
+                .fold(ScopedResolver::new(fallback), |scoped, dir| {
+                    scoped.scope(dir.clone(), resolver_at(dir, fs.clone()))
+                }),
+        )
+    };
+    Box::new(ChainResolver::new(vec![
+        projects,
+        Box::new(WorkspaceResolver::new(fs)),
+    ]))
 }
 
 /// Narrow discovery to `<root>/src` when the Next.js router lives there.

@@ -183,6 +183,18 @@ directory of repositories, therefore each keep their own aliases. Next.js is
 tested before Vite: a Next app may keep a `vite.config.*` for its test runner,
 and the router conventions are the ones that govern the sources.
 
+Monorepo workspace packages resolve to their source. The nearest ancestor of an
+importing file that declares workspace members (`pnpm-workspace.yaml`'s
+`packages:`, or `package.json`'s `workspaces`) has its member globs expanded,
+and `import … from "@acme/ui"` or `"@acme/ui/icons"` maps to that member's
+entry: `source`, else the `exports` entry for `.` / `./icons` (conditions in
+declaration order, `types` skipped), else `module` / `main`. An entry that is
+not TypeScript is taken to be compiled output (`dist/index.mjs`), and the
+package's `src/index` (`src/icons` for a subpath) stands for it when that
+file exists. tsconfig `paths` still come first. A package outside the
+member globs, a subpath its `exports` map does not list, or a name two
+members share stays unresolved.
+
 Discovery still walks exactly the directories you named. The `<root>/src`
 narrowing below is a convenience for "analyse this project" and applies only
 when the path you gave *is* the project root. Pointing inside is already a
@@ -634,10 +646,10 @@ Summary: [docs/limitations.md](limitations.md). Open work, one entry per
 limit: the [issue tracker](https://github.com/rboudrouss/reactant-analyzer/issues).
 Most impactful:
 
-- Aliases outside tsconfig `paths` stay opaque (monorepo `@workspace/*`
-  without tsconfig entries, vite-config-only aliases). The imported symbol
-  is treated as external and its body is not analyzed, a possible false
-  negative. Write a custom `ImportResolver` for those.
+- Aliases outside tsconfig `paths` and the workspace packages stay opaque
+  (vite-config-only aliases, a package whose source is not at `src/<subpath>`).
+  The imported symbol is treated as external and its body is not analyzed, a
+  possible false negative. Write a custom `ImportResolver` for those.
 - An alias resolving *outside* the discovery root is never read at all, and
   the notice is `--info`-only: pass the target directory too.
 - Utility inlining is statement-level only; `if (util(x))` and `setX(util(y))`
