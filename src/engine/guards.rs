@@ -65,7 +65,7 @@ use crate::{
 /// `exit_env` is the env the guards are narrowed from, and must be the env
 /// of `cfg` itself (a render site); `eval` evaluates the literal the member
 /// arm reads, and nothing else. `state_vals` is the must-alias table
-/// ([`must_state_vals`](crate::engine::setters::must_state_vals)), as for
+/// (`engine::setters::must_state_vals`), as for
 /// [`converges_under_all_writes`] (#231).
 #[allow(clippy::too_many_arguments)]
 pub fn converges_once_written(
