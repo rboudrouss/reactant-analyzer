@@ -50,6 +50,7 @@ params included. Two `setX(…)` calls in one body are two rows.
 | `written.change` | the write may change its slot — store a value that fails `Object.is` against what the slot holds. `Must`: a new reference every call. `Never`: the slot's own state read (#155) or the updater's parameter. `Once`: a single value known in advance (`false`, `5`, `null`, a stable reference), which changes the slot again only if another write moves it away. `May`: everything else, a toggle and a bounded counter included | must for `Must`, must for `Never` |
 | `written.value` | the abstract value stored, evaluated in the env of the row's own statement | may (an over-approximation of the value) |
 | `written.expr` | argument 0 as written | exact |
+| `written.own_read` | the write stores a value the slot held: its own state read, current or captured by an older render's closure (a cleanup, a timer, a handler), or the updater's parameter. A slot every row of which has it, and whose setter escapes nowhere, never leaves its initial value (`written::keeps_initial`, #223) | must |
 
 ### `effect_triggers` — `EffectTrigger` (ADR-042 §3)
 
@@ -191,7 +192,8 @@ single element reads as the join.
 A fold over `slot_writers` and `effect_triggers`: `edge x → y` when a change
 of `x` re-runs an effect whose write may change `y`. Nothing is walked. The
 graph warns unless convergence is proven instead of looking for growth, and
-four proofs settle a write: `written.change` is `Never`, or `Once` with no
+four proofs settle a write: `written.change` is `Never`, or every write of
+the slot has `written.own_read` (#223), or `Once` with no
 other write moving the slot away; the write reads neither `x` nor its own
 slot (`Invariance::reads`) and crosses no call that may allocate, so a
 change of `x` re-runs it to the same value; every write of the slot moves

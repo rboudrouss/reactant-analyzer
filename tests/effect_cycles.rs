@@ -1976,6 +1976,55 @@ export function C() {
 }
 
 #[test]
+fn a_slot_every_write_of_which_stores_its_own_read_keeps_its_initial_value() {
+    // A sync, a deferred and a cleanup write of `x`'s own read: each stores
+    // a value the slot held, so it only ever holds its first object (#223).
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [x, setX] = useState({ v: 0 });
+  useEffect(() => {
+    setX(x);
+    Promise.resolve().then(() => setX(x));
+    return () => { setX(x); };
+  });
+  return <div>{x.v}</div>;
+}
+"#;
+    let sevs = loop_severities(src, "C");
+    assert!(sevs.is_empty(), "{sevs:?}");
+}
+
+#[test]
+fn a_slot_with_one_write_of_something_else_leaves_its_initial_value() {
+    // A third write stores a new object, a handler writes a constant, the
+    // setter reaches a callee no row describes: the stale reads are no longer
+    // the initial value (#223, #205).
+    for extra in [
+        "useEffect(() => { setX({ v: 1 }); }, []);",
+        "const h = <button onClick={() => setX({ v: 1 })} />;",
+        "useEffect(() => { register(setX); }, []);",
+    ] {
+        let src = format!(
+            r#"
+import {{ useState, useEffect }} from 'react';
+import {{ register }} from 'ext';
+export function C() {{
+  const [x, setX] = useState({{ v: 0 }});
+  {extra}
+  useEffect(() => {{
+    Promise.resolve().then(() => setX(x));
+    return () => {{ setX(x); }};
+  }}, [x]);
+  return <div>{{x.v}}</div>;
+}}
+"#
+        );
+        assert!(!loop_severities(&src, "C").is_empty(), "{extra}");
+    }
+}
+
+#[test]
 fn a_name_bound_to_the_read_on_one_path_is_not_an_identity_write() {
     // `d` is `s` only when the guard fails; it never does (#210).
     let src = r#"

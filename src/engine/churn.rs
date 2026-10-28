@@ -9,7 +9,9 @@
 //! (`written::Change`), and an edge exists unless its convergence is proven
 //! — the graph no longer looks for growth: a toggle `!on` closes an edge as
 //! surely as a counter. What settles a write: it stores the slot's own
-//! content; it stores one value known in advance and no other write moves
+//! content; every write of its slot stores a value the slot held, current
+//! or stale, so the slot never leaves its initial value (#223); it stores
+//! one value known in advance and no other write moves
 //! the slot away; it reads neither the trigger nor its own slot
 //! (`Invariance::reads`) and crosses no call whose result may differ on
 //! the same inputs (`guards::call_may_differ`, #218, #224), so
@@ -104,7 +106,7 @@ use crate::{
         },
         triggers::{Always, Rerun},
         triggers_of,
-        written::churning_part,
+        written::{Written, churning_part, keeps_initial},
     },
     ir::{
         ComponentId, QualifiedSlot, SourceRange,
@@ -204,6 +206,32 @@ impl ChurnGraph {
 /// The slot a writer row writes, qualified by its owner.
 fn node_of(component: ComponentId, w: &SlotWriter) -> QualifiedSlot {
     (w.owner.unwrap_or(component), w.slot)
+}
+
+/// The slots that never leave their initial value: every write of the slot,
+/// program-wide, stores a value it held, and its setter reaches nothing the
+/// rows do not describe (`written::keeps_initial`, #223).
+fn initial_only_slots(result: &ProgramAnalysisResult) -> HashSet<QualifiedSlot> {
+    let mut rows: HashMap<QualifiedSlot, Vec<&Written>> = HashMap::new();
+    for (&c, r) in &result.components {
+        for w in &r.slot_writers {
+            rows.entry(node_of(c, w)).or_default().push(&w.written);
+        }
+    }
+    let mut escaping: HashMap<ComponentId, HashSet<HookLabel>> = HashMap::new();
+    rows.into_iter()
+        .filter(|((owner, label), written)| {
+            let escapes = match result.components.get(owner) {
+                Some(r) => escaping
+                    .entry(*owner)
+                    .or_insert_with(|| r.escaping_slots())
+                    .contains(label),
+                None => true,
+            };
+            keeps_initial(written.iter().copied(), escapes)
+        })
+        .map(|(slot, _)| slot)
+        .collect()
 }
 
 /// One element of a component in another one's render: where it mounts.
@@ -869,6 +897,12 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             }
         }
     }
+    // A write that cannot change its slot closes no edge: it stores the
+    // slot's own content, or its slot never leaves its initial value (#223).
+    let keeps = initial_only_slots(result);
+    let never = |comp: ComponentId, w: &SlotWriter| {
+        w.written.change == Change::Never || keeps.contains(&node_of(comp, w))
+    };
     for f in &facts {
         let ctx = &ctxs[&f.comp];
         let invariance = invariance_of(ctx);
@@ -880,7 +914,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             .map(|&j| site_of(&all_sites[j], convergent[j]))
             .collect();
         for w in &f.writes {
-            if w.written.change == Change::Never {
+            if never(f.comp, w) {
                 continue;
             }
             let node = node_of(f.comp, w);
@@ -1113,7 +1147,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         for w in r.slot_writers.iter().filter(|w| {
             matches!(w.region, WriterRegion::Effect(_))
                 && w.phase != WriterPhase::Handler
-                && w.written.change != Change::Never
+                && !never(comp, w)
         }) {
             let WriterRegion::Effect(effect_label) = w.region else {
                 continue;

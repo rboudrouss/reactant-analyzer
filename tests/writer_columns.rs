@@ -514,6 +514,41 @@ fn the_own_read_written_back_by_a_cleanup_or_a_timer_may_change_the_slot() {
     }
 }
 
+/// Whatever closure it runs in, `setX(x)` stores a value the slot held, and
+/// so does the identity updater; a value derived from the read, a constant or
+/// another slot's read does not (#223).
+#[test]
+fn the_own_read_column_holds_for_a_current_or_stale_read_of_the_slot() {
+    for (effect, own) in [
+        ("setX(x);", true),
+        ("return () => { setX(x); };", true),
+        ("setTimeout(() => setX(x), 0);", true),
+        ("Promise.resolve().then(() => setX(x));", true),
+        ("setX((p) => p);", true),
+        ("return () => { setX(x + 1); };", false),
+        ("setX(0);", false),
+        ("setX(y);", false),
+    ] {
+        let src = format!(
+            r#"
+            import {{ useState, useEffect }} from "react";
+            export function C() {{
+              const [x, setX] = useState(0);
+              const [y] = useState(0);
+              useEffect(() => {{
+                {effect}
+              }}, [x]);
+              return <div />;
+            }}
+            "#
+        );
+        let r = parse_and_analyze(&src);
+        let rows = effect_rows(comp(&r, "C"), "setX");
+        assert_eq!(rows.len(), 1, "{effect}");
+        assert_eq!(rows[0].written.own_read, own, "{effect}");
+    }
+}
+
 /// `Object.is(0, -0)` is false: a write of `-0` is not the single value a
 /// write of `0` is, while the ordinary `setX(0)` keeps its `Once` (#208).
 #[test]

@@ -70,6 +70,22 @@ pub struct Written {
     pub value: StateValue,
     /// The argument as written, `None` for a bare `setX()`.
     pub expr: Option<Expr>,
+    /// The write stores a value the slot held at some render: its own read,
+    /// current or stale (`setX(x)` in a cleanup, a timer, a handler), or an
+    /// updater's identity `p => p`. A slot every write of which does so
+    /// never leaves its initial value ([`keeps_initial`], #223).
+    pub own_read: bool,
+}
+
+/// Does a slot never leave its initial value? True when every write of it,
+/// `rows` being all of them program-wide, stores a value it held
+/// (`Written::own_read`): by induction on the writes, that value is the
+/// initial one, so none of them changes the slot (`Object.is`, React bails
+/// out). `escapes` is whether the setter reaches code no row describes (a
+/// prop, an opaque call): then not every write is a row, and nothing is
+/// claimed.
+pub fn keeps_initial<'a>(mut rows: impl Iterator<Item = &'a Written>, escapes: bool) -> bool {
+    !escapes && rows.all(|w| w.own_read)
 }
 
 /// Classify argument 0 of a write. `value_of` evaluates a value expression
@@ -91,41 +107,41 @@ pub fn classify(
     must_read: impl Fn(&Expr) -> Option<HookLabel>,
     value_of: impl FnOnce(&Expr) -> StateValue,
 ) -> Written {
-    let identity = own_slot.is_some_and(|slot| {
-        reads_committed_state(phase) && stores_own_content(arg, slot, &must_read)
-    });
+    // The slot's own read, in whatever render's closure the write runs.
+    let own_read = own_slot.is_some_and(|slot| stores_own_content(arg, slot, &must_read));
+    let identity = own_read && reads_committed_state(phase);
     // A bare `setX()` stores `undefined`, one value known in advance.
     let Some(arg) = arg else {
         return Written {
             change: Change::Once,
             value: StateValue::undefined(),
             expr: None,
+            own_read: false,
         };
     };
     let arg = arg.peel_ts();
     let expr = Some(arg.clone());
+    let returned = |change: Change, value: StateValue| Written {
+        own_read: change == Change::Never,
+        change,
+        value,
+        expr: expr.clone(),
+    };
     match (arg, updater) {
         (
             Expr::FnLit {
                 params, body_cfg, ..
             },
             _,
-        ) => Written {
-            change: returns_change(body_cfg, params),
-            value: returns_value(body_cfg),
-            expr,
-        },
-        (_, Updater::Functional(body)) => Written {
-            change: returns_change(body, &[]),
-            value: returns_value(body),
-            expr,
-        },
+        ) => returned(returns_change(body_cfg, params), returns_value(body_cfg)),
+        (_, Updater::Functional(body)) => returned(returns_change(body, &[]), returns_value(body)),
         (other, Updater::Unknown) => {
             let value = value_of(other);
             Written {
                 change: value_change(&value, identity),
                 value,
                 expr,
+                own_read,
             }
         }
     }
@@ -137,15 +153,20 @@ pub fn classify(
 /// either: no proof may compare the slot against it.
 pub fn dispatched(reducer: &Reducer) -> Written {
     match reducer {
-        Reducer::Body { params, body } => Written {
-            change: returns_change(body, params),
-            value: returns_value(body),
-            expr: None,
-        },
+        Reducer::Body { params, body } => {
+            let change = returns_change(body, params);
+            Written {
+                change,
+                value: returns_value(body),
+                expr: None,
+                own_read: change == Change::Never,
+            }
+        }
         Reducer::Opaque => Written {
             change: Change::May,
             value: StateValue::top(),
             expr: None,
+            own_read: false,
         },
     }
 }
@@ -158,6 +179,7 @@ pub fn carried() -> Written {
         change: Change::May,
         value: StateValue::top(),
         expr: None,
+        own_read: false,
     }
 }
 
