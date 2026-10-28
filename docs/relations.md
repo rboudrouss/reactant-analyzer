@@ -241,12 +241,17 @@ of its edges. An all-must cycle inside one component is the certain
 a prop dep is never the exact slot.
 
 An edge is dropped when its write provably fires at most once: the site's
-guards die under its own write and under every other effect write of the
-slot in the component, each taken with the facts that site ran under that
-hold still across the loop (`engine/guards.rs`, #154). What the graph does
-not see is recorded, not guessed: a prop-mediated edge needs the parent in
-the component tree (an element whose origin resolves, #20), and a slot
-another component also writes is never
+guards die under its own write and under every other site of the slot, each
+taken with the facts that site ran under that hold still across the loop
+(`engine/guards.rs`, #154). A site is any non-`Handler` row of an effect,
+render or memo body — a render write revives what it revives — except a
+mount-only effect's row that writes its own component's slot, or another's
+from a component that stays: those fire once per instance (#162, a new
+instance is the mount edge's). A name the site's body binds reads ⊤ in the
+render exit env the proof starts from, since the render may bind it to
+something else. What the graph does not see is recorded, not guessed: a
+prop-mediated edge needs the parent in the component tree (an element whose
+origin resolves, #20), and a slot with a site in another component is never
 killed, since that site's guards live in bodies this component's env cannot
 read.
 
