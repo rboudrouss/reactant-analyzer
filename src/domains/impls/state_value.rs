@@ -279,15 +279,20 @@ impl StateValue {
         }
     }
 
-    /// Every setter the value may be, under the same reading as
-    /// [`Self::as_setter`]: a call of it writes one of them. A value two
-    /// call sites bind to two setters names both (#175).
+    /// Every setter the value may be: a call of it may write each of them. A
+    /// value two call sites bind to two setters names both (#175), and so does
+    /// one that may also be something else (`c ? [setV, v] : [v, setV]`, #233)
+    /// — a call of a non-function throws and a call of another function runs
+    /// elsewhere, so the setters are still what the call may write. That the
+    /// call surely writes one is [`Self::surely_setter`].
     pub fn setters(&self) -> Vec<(ComponentId, HookLabel)> {
-        if self.populated_kinds().only(KindMask::SETTER) {
-            self.setter.candidates().collect()
-        } else {
-            Vec::new()
-        }
+        self.setter.candidates().collect()
+    }
+
+    /// The value can only be a setter: a call of it surely writes one of
+    /// [`Self::setters`].
+    pub fn surely_setter(&self) -> bool {
+        self.populated_kinds().only(KindMask::SETTER)
     }
 
     /// True when the value is exactly a per-render-fresh reference (nothing
@@ -1319,8 +1324,11 @@ mod tests {
         let j = cs("Foo", 0).join(&StateValue::reference(Stability::Stable));
         assert_eq!(j.setter, SetterVal::one(crate::test_support::cid(0), 0));
         assert_eq!(j.reference, Stability::Stable);
-        // Mixed with a reference → no longer an exact setter.
+        // Mixed with a reference → no longer an exact setter, still one a
+        // call may write (#233).
         assert!(j.as_setter().is_none());
+        assert!(!j.surely_setter());
+        assert_eq!(j.setters(), vec![(crate::test_support::cid(0), 0)]);
         // Two populated kinds = two distinct possible values → not
         // definitely stable (cross-kind union rule).
         assert_eq!(j.to_stability(), Stability::Unknown);

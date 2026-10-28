@@ -287,6 +287,9 @@ struct Target {
     /// Through a closure that captured the setter: the call's argument is
     /// not the stored value.
     carried: bool,
+    /// A call through the name surely writes: [`SetterProp::must_write`] for
+    /// a converged value, which may also be something else (#233).
+    sure: bool,
 }
 
 /// Collect variables in `cfg` whose abstract value at any block exit is
@@ -386,18 +389,19 @@ pub(crate) fn callee_path(fn_: &Expr) -> Option<Var> {
 /// itself, or the closures it may point to that captured one (the parent
 /// passed `() => setCount(0)` as a prop) — one per closure, the first setter
 /// it captured, as before. A value that may be several (two call sites, two
-/// setters) is each of them, and provably none: `must_write` needs one.
+/// setters) is each of them, and provably none: `must_write` needs one, and a
+/// value that may be something else than a setter (#233) writes none surely.
 /// Allocation sites and captures are hash sets/maps, so both are walked in
 /// sorted order (#120).
 fn setter_of(ev: &EnvVal<StateValue>, heap: &Heap) -> Vec<SetterProp> {
-    let mut out: Vec<SetterProp> = ev
-        .as_val()
+    let val = ev.as_val();
+    let mut out: Vec<SetterProp> = val
         .setters()
         .into_iter()
         .map(|(component, label)| SetterProp {
             component,
             label,
-            must_write: true,
+            must_write: val.surely_setter(),
             closure: false,
         })
         .collect();
@@ -1270,6 +1274,7 @@ pub(crate) fn collect_slot_writers(
             owner: None,
             slot,
             carried: false,
+            sure: true,
         });
     }
     let mut converged: Vec<_> = converged.iter().collect();
@@ -1285,6 +1290,7 @@ pub(crate) fn collect_slot_writers(
                 owner: (p.component != envs.component).then_some(p.component),
                 slot: p.label,
                 carried: p.closure,
+                sure: p.must_write,
             })
             .collect();
         if !candidates.is_empty() {
@@ -1418,13 +1424,14 @@ pub(crate) fn collect_slot_writers(
         let reach = Reachability::of(cfg);
         for (site, target, sole) in sites.into_iter().flat_map(|s| {
             let ts = targets.get(&s.var).cloned().unwrap_or_default();
-            let sole = ts.len() == 1;
+            let sole = matches!(ts.as_slice(), [t] if t.sure);
             ts.into_iter().map(move |t| (s.clone(), t, sole))
         }) {
             let Target {
                 owner,
                 slot,
                 carried,
+                ..
             } = target;
             let same_tick = site.repeats
                 || match (site.class, site.prov_block) {
@@ -1451,8 +1458,9 @@ pub(crate) fn collect_slot_writers(
             let at = (site.class == WalkClass::Sync && !site.repeats)
                 .then_some(site.at)
                 .flatten();
-            // A call through a name with several targets writes one of them:
-            // no slot of the several is surely written there.
+            // A call through a name with several targets writes one of them,
+            // and one through a name that may be something else may write
+            // none: no slot is surely written there.
             let block = at.map(|(b, _)| b).filter(|_| sole);
             let target = (owner.unwrap_or(envs.component), slot);
             let written = match reducers.get(target.0, target.1) {

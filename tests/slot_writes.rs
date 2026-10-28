@@ -387,3 +387,34 @@ export function Ternary({ c }: { c?: boolean }) {
         );
     }
 }
+
+/// A value that may be a setter or something else writes the setter when
+/// called (#233): `t[1]` is `setV` or `v` depending on the branch, and a
+/// call of a number throws, so the call may write `v` — never surely.
+#[test]
+fn a_value_that_may_be_a_setter_writes_it() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function Flip({ c }: { c?: boolean }) {
+  const [v, setV] = useState(0);
+  const t = c ? [setV, v] : [v, setV];
+  const b = t[1];
+  useEffect(() => { b((n: number) => n + 1); });
+  return <div>{v}</div>;
+}
+"#;
+    let result = analyze(src);
+    let comp = &result.components[&result.component_named("Flip").unwrap()];
+    let rows: Vec<_> = comp
+        .slot_writers
+        .iter()
+        .filter(|w| w.slot == 0 && w.setter == "b")
+        .collect();
+    assert!(!rows.is_empty(), "no row writes `v`");
+    assert!(rows.iter().all(|w| w.block.is_none()), "{rows:?}");
+    let sev = loops(&result, "Flip");
+    assert!(
+        sev.contains(&Severity::Warning) && !sev.contains(&Severity::Error),
+        "{sev:?}"
+    );
+}
