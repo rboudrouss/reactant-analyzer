@@ -134,6 +134,11 @@ pub struct Deps {
     pub captured: BTreeSet<Source>,
     /// For a function value: what calling it writes besides state.
     pub writes: Writes,
+    /// The value may be a call's result. The engine knows no callee to
+    /// return the same value on the same inputs (`Math.random()`), so such a
+    /// value may move with none of its sources (#224); whether it does is a
+    /// question about the value ([`call_may_differ`](crate::engine::guards::call_may_differ)).
+    pub call: bool,
 }
 
 /// `mine ∪ theirs` restricted to the sources no contributor holds outside
@@ -175,6 +180,7 @@ impl Deps {
 
     pub fn union_with(&mut self, other: &Deps) {
         self.top |= other.top;
+        self.call |= other.call;
         self.writes.union_with(&other.writes);
         if self.top {
             self.set.clear();
@@ -443,8 +449,18 @@ pub fn provided_context_name(element: &str) -> &str {
 /// in its render and in every hook body, nested closures included. The union
 /// over the program is what [`render_deps`] reads a free name against.
 pub fn written_names(result: &AnalysisResult<impl AbstractDomain>) -> HashSet<Var> {
-    let mut out = written_roots(std::slice::from_ref(&result.param), &result.render_cfg);
-    for body in result.hooks.iter().filter_map(HookEntry::body_cfg) {
+    written_in(
+        std::slice::from_ref(&result.param),
+        &result.render_cfg,
+        &result.hooks,
+    )
+}
+
+/// [`written_names`] of a body with its parameters and its hook table, before
+/// it is an [`AnalysisResult`]: a component or a custom hook as lowered.
+pub(crate) fn written_in(params: &[Var], body: &CFG, hooks: &[HookEntry]) -> HashSet<Var> {
+    let mut out = written_roots(params, body);
+    for body in hooks.iter().filter_map(HookEntry::body_cfg) {
         out.extend(written_roots(&[], body));
     }
     out
@@ -971,6 +987,7 @@ impl<'a> Analyzer<'a> {
                 for a in args {
                     d.union_with(&self.eval(a, env).deps.ungated());
                 }
+                d.call = true;
                 DVal::of(d)
             }
             Expr::ObjectLit { fields, .. } => {

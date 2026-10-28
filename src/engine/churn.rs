@@ -11,7 +11,8 @@
 //! surely as a counter. What settles a write: it stores the slot's own
 //! content; it stores one value known in advance and no other write moves
 //! the slot away; it reads neither the trigger nor its own slot
-//! (`Invariance::reads`) and crosses no call that may allocate (#218), so
+//! (`Invariance::reads`) and crosses no call whose result may differ on
+//! the same inputs (`guards::call_may_differ`, #218, #224), so
 //! the re-run stores what the last run did — unless a read moved in
 //! between, which is why every slot such a write reads is an edge into its
 //! slot, trigger or not (#204); every
@@ -87,14 +88,14 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    domains::{AbstractEnv, Stability, StateValue},
+    domains::{AbstractEnv, StateValue},
     engine::{
         AnalysisResult, Change, ConvergedEval, EffectTrigger, ProgramAnalysisResult, SlotWriter,
         WriterPhase, WriterRegion,
         dominance::on_all_paths,
         guards::{
-            Invariance, Reads, WriteSite, converges_under_all_writes, let_bindings, mutated_roots,
-            navigates, site_guards,
+            Invariance, WriteSite, call_may_differ, converges_under_all_writes, let_bindings,
+            mutated_roots, navigates, site_guards,
         },
         render_deps::written_names,
         setters::{
@@ -909,9 +910,18 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 _ => None,
             }
             .filter(|r| !(node.0 == f.comp && r.slots.contains(&node.1)))
-            // A call over the reads is a function of them only when it
-            // cannot hand back a new reference (#218).
-            .filter(|r| !r.call || !may_allocate(&w.written.value, r, f.comp));
+            // A call over the reads is a function of them only when the
+            // value it stores is pinned (#218, #224).
+            .filter(|r| {
+                !r.call
+                    || !call_may_differ(&w.written.value, |(c, l)| {
+                        if c == f.comp {
+                            r.slots.contains(&l)
+                        } else {
+                            r.props
+                        }
+                    })
+            });
             let reads_slot = |x: QualifiedSlot| match &reads {
                 None => true,
                 Some(r) if x.0 == f.comp => r.slots.contains(&x.1),
@@ -1105,25 +1115,6 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 }
             })
             .or_insert(edge);
-    }
-
-    /// May a written value that passed through a call be a reference the
-    /// call allocated? Not when it holds no reference, one stable reference,
-    /// or one only the write's reads move; a residual kind may be a fresh
-    /// symbol (#218).
-    fn may_allocate(v: &StateValue, r: &Reads, comp: ComponentId) -> bool {
-        v.other
-            || match &v.reference {
-                Stability::Bottom | Stability::Stable => false,
-                Stability::Versioned(s) => !s.iter().all(|&(c, l)| {
-                    if c == comp {
-                        r.slots.contains(&l)
-                    } else {
-                        r.props
-                    }
-                }),
-                Stability::VersionedTop | Stability::PerRender | Stability::Unknown => true,
-            }
     }
 
     /// Can a write of `w` into its own slot change any dep of this effect?

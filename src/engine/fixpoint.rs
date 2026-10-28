@@ -59,6 +59,60 @@ impl Default for Config {
     }
 }
 
+/// What the bodies of the whole program do, read once before any component
+/// is analysed: facts a component's own bodies cannot settle, and the
+/// results they would be joined over do not exist yet.
+pub struct ProgramFacts {
+    /// Some body fires event listeners itself (`dispatchEvent`), so no
+    /// listener is event-only (#219).
+    pub dispatches: bool,
+    /// The names some body writes outside itself
+    /// ([`written_names`](crate::engine::render_deps::written_names)): a
+    /// module binding among them is a cell that moves with no slot (#224).
+    pub written: HashSet<Var>,
+}
+
+impl ProgramFacts {
+    /// Every component, custom hook and utility of the program, as lowered.
+    pub(crate) fn of(
+        components: &ComponentRegistry,
+        hooks: &HookRegistry,
+        utilities: &FunctionRegistry,
+    ) -> Self {
+        use crate::engine::render_deps::written_in;
+        let mut facts = Self::of_utilities(utilities);
+        facts.dispatches =
+            crate::engine::registrations::program_dispatches_events(components, hooks, utilities);
+        for c in components.all_components() {
+            facts.written.extend(written_in(
+                std::slice::from_ref(&c.param),
+                &c.render_cfg,
+                &c.hooks,
+            ));
+        }
+        for h in hooks.all_keys().iter().filter_map(|k| hooks.get(k)) {
+            facts
+                .written
+                .extend(written_in(&h.params, &h.body_cfg, &h.hooks));
+        }
+        facts
+    }
+
+    /// A lone component's program: the utilities it may call. Its own bodies
+    /// are read where it is analysed, after its hooks are inlined.
+    fn of_utilities(utilities: &FunctionRegistry) -> Self {
+        ProgramFacts {
+            dispatches: utilities
+                .all_functions()
+                .any(|f| crate::engine::registrations::dispatches_events(&f.body_cfg)),
+            written: utilities
+                .all_functions()
+                .flat_map(|f| crate::engine::render_deps::written_roots(&f.params, &f.body_cfg))
+                .collect(),
+        }
+    }
+}
+
 /// `AnalyzeChildFn` callback called from `eval_comp_app` to inline a child component.
 /// Provided to `InterCtx` at creation time to break the circular dep between
 /// `domains::transfer` and `engine::fixpoint`.
@@ -77,7 +131,7 @@ pub fn analyze_component_inter(
         initial_env,
         initial_heap,
         Some(inter),
-        inter.dispatches,
+        inter.program,
     )
 }
 
@@ -116,10 +170,7 @@ pub fn analyze_component_as<T: Transfer<Domain = StateValue>>(
         Heap::new(),
         None,
         // The program is this component and the utilities it may call.
-        config
-            .function_registry
-            .all_functions()
-            .any(|f| crate::engine::registrations::dispatches_events(&f.body_cfg)),
+        &ProgramFacts::of_utilities(&config.function_registry),
     )
 }
 
@@ -142,7 +193,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     initial_env: AbstractEnv<StateValue>,
     initial_heap: Heap,
     inter: Option<&InterCtx<'_>>,
-    program_dispatches: bool,
+    program: &ProgramFacts,
 ) -> AnalysisResult<StateValue> {
     let ComponentIR {
         file: comp_file,
@@ -646,7 +697,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     // A listener may run synchronously wherever the program dispatches
     // events (#219): this component's own bodies, inlined hooks and utilities
     // included, or any other body of the program.
-    let dispatches = program_dispatches
+    let dispatches = program.dispatches
         || crate::engine::registrations::body_dispatches_events(&render_cfg, &hooks);
     let slot_writers = crate::engine::setters::collect_slot_writers(
         &render_cfg,
@@ -707,9 +758,11 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     };
     // The effect-trigger relation (ADR-042 §3): a dep evaluated in the render
     // exit env, the one every hook body starts from, and what it is computed
-    // from where the effect is called. Only the slot and ref sources are
-    // read, so no module name needs to be known as written.
-    let sources = crate::engine::render_deps::render_deps(&result, &HashSet::new()).effect_deps;
+    // from where the effect is called. A module name some body of the
+    // program writes, this one's inlined bodies included, is a cell (#224).
+    let mut written = crate::engine::render_deps::written_names(&result);
+    written.extend(program.written.iter().cloned());
+    let sources = crate::engine::render_deps::render_deps(&result, &written).effect_deps;
     let relation = {
         let mut scratch = result.heap.clone();
         crate::engine::triggers::collect_effect_triggers(
@@ -763,11 +816,7 @@ pub fn analyze_program(
 
     let roots = strategy.detect(&registry);
     let mut analysed: std::collections::HashSet<ComponentId> = std::collections::HashSet::new();
-    let dispatches = crate::engine::registrations::program_dispatches_events(
-        &registry,
-        &hook_registry,
-        &config.function_registry,
-    );
+    let program = ProgramFacts::of(&registry, &hook_registry, &config.function_registry);
 
     let inter_for = |component: ComponentId, call_stack: Vec<ComponentId>| InterCtx {
         registry: &registry,
@@ -785,7 +834,7 @@ pub fn analyze_program(
         config,
         analyze_child: analyze_component_inter as AnalyzeChildFn,
         hook_registry: Some(&hook_registry),
-        dispatches,
+        program: &program,
     };
 
     // Phase 1: analyze roots top-down (children inlined via eval_comp_app).
@@ -803,7 +852,7 @@ pub fn analyze_program(
                 AbstractEnv::bottom(),
                 Heap::new(),
                 Some(&inter),
-                dispatches,
+                &program,
             );
             stats.borrow_mut().components_analyzed += 1;
             results.borrow_mut().insert(root, result);
@@ -876,7 +925,7 @@ pub fn analyze_program(
                 AbstractEnv::bottom(),
                 Heap::new(),
                 None,
-                dispatches,
+                &program,
             );
             stats.borrow_mut().components_analyzed += 1;
             results.borrow_mut().insert(id, result);

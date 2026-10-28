@@ -666,3 +666,46 @@ fn a_ref_a_callback_only_captures_is_no_ref_contents_dep() {
         assert_eq!(only_effect_class(comp(&r, "C")), class, "`{decl}`");
     }
 }
+
+#[test]
+fn a_dep_that_moves_with_no_slot_may_rerun_the_effect_every_render() {
+    // #224: a call's result the value does not pin, and a module binding
+    // some body writes, move with no slot behind them. A module binding
+    // nothing writes, and a call whose value is one value, hold.
+    for (decl, dep, class) in [
+        ("", "Math.random()", Rerun::Always(Always::MutableDep(0))),
+        (
+            "useEffect(() => { cache.set(cache.size, 1); }, []);",
+            "cache.size",
+            Rerun::Always(Always::MutableDep(0)),
+        ),
+        ("", "cache.size", Rerun::OnSlots),
+        ("", "String(t)", Rerun::Always(Always::MutableDep(0))),
+        ("", "t", Rerun::OnSlots),
+    ] {
+        let src = format!(
+            r#"
+            import {{ useState, useEffect }} from "react";
+            const cache = new Map<number, number>();
+            export function C() {{
+              const [t, setT] = useState(false);
+              {decl}
+              useEffect(() => {{ setT(!t); }}, [{dep}]);
+              return <div />;
+            }}
+            "#
+        );
+        let r = parse_and_analyze(&src);
+        let c = comp(&r, "C");
+        let last = c
+            .hooks
+            .iter()
+            .filter_map(|h| match h {
+                HookEntry::Effect { label, .. } => Some(*label),
+                _ => None,
+            })
+            .max()
+            .unwrap();
+        assert_eq!(c.rerun(last), Some(class), "`{decl}` `[{dep}]`");
+    }
+}

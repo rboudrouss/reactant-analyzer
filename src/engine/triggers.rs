@@ -20,8 +20,9 @@
 //! slots. [`Rerun`] is the per-effect class every reader takes first: an
 //! effect with no deps argument, or with a dep that is a new reference every
 //! render, re-runs after every render; so may one whose deps argument cannot
-//! be read, or one with a dep reading a ref's contents — a cell the loop can
-//! mutate without a slot moving (#189, #201, #212).
+//! be read, or one with a dep reading a ref's contents or a written module
+//! binding — a cell the loop can mutate without a slot moving — or a call's
+//! result (#189, #201, #212, #224).
 //!
 //! Computed at convergence in the `slot_seeds` slice and stored on
 //! `AnalysisResult`. Both arms of `infinite-loop` read it.
@@ -36,6 +37,7 @@ use crate::{
     },
     engine::{
         AnalysisResult, FreshDeps,
+        guards::call_may_differ,
         render_deps::{Deps, Source},
         setters::{memo_val_labels, resolve_setter_aliases},
     },
@@ -93,8 +95,9 @@ pub enum Always {
     /// the engine cannot see, which may change at any render.
     OpaqueDeps,
     /// The dep at this index may change without any slot moving: it reads a
-    /// ref's contents (a mutable cell) or a source the dependence analysis
-    /// lost, it is a fresh reference that cannot be certified fresh at the
+    /// ref's contents or a module binding some body writes (a mutable cell),
+    /// a call's result its value does not pin, or a source the dependence
+    /// analysis lost, it is a fresh reference that cannot be certified fresh at the
     /// call (a name bound on two paths), or it is a spread whose elements
     /// nothing labels.
     MutableDep(usize),
@@ -258,12 +261,20 @@ pub(crate) fn collect_effect_triggers(
                         .entry(l)
                         .or_insert_with(|| ref_may_move(l, render_cfg, hooks))
                 };
-                // A ref a function value only captures is not read here: the
-                // function's identity, not the ref's contents, is compared.
+                // A cell that moves with no slot: a ref's contents, a module
+                // binding some body writes (`cache.size`), or a call's result
+                // the value does not pin (`Math.random()`, #224). A source a
+                // function value only captures is not read here: the
+                // function's identity, not the cell, is compared.
                 if src.top
+                    || (src.call && call_may_differ(&val, |_| true))
                     || src.set.iter().any(|s| {
-                        matches!(s, Source::Ref(l)
-                            if !src.captured.contains(s) && moving_ref(*l))
+                        !src.captured.contains(s)
+                            && match s {
+                                Source::Ref(l) => moving_ref(*l),
+                                Source::Module(_) => true,
+                                _ => false,
+                            }
                     })
                 {
                     mutable.get_or_insert(i);

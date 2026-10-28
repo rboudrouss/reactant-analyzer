@@ -85,11 +85,12 @@ that writes it (see *Cross-file limits*).
   [#30](https://github.com/rboudrouss/reactant-analyzer/issues/30), and `redundant-set-state` on a reference: the domain
   knows a reference is stable, not which one it is, so `setV(A)` while `v` holds `A` is not
   reported, the price of not reporting `setV(B)` [#179](https://github.com/rboudrouss/reactant-analyzer/issues/179).
-- The convergence proof assumes a call over held inputs returns the same value on every run, unless
-  the value may be a new reference: a write whose value crosses a call that may allocate is not read
-  as a function of its inputs [#218](https://github.com/rboudrouss/reactant-analyzer/issues/218). A
-  primitive is taken on trust, so a module helper over `Math.random()` is read as one value, the
-  write-side form of [#224](https://github.com/rboudrouss/reactant-analyzer/issues/224). It also assumes
+- The guard proofs assume a call over held inputs returns the same value on every run. The
+  reads-kill does not: the engine knows no callee to be deterministic, so a write whose value
+  crosses a call is read as a function of its inputs only when that value is one value, or a
+  reference versioned by what the write reads
+  [#218](https://github.com/rboudrouss/reactant-analyzer/issues/218),
+  [#224](https://github.com/rboudrouss/reactant-analyzer/issues/224). The convergence proof also assumes
   that a call it cannot see into does not navigate: a router hook's result (`useSearchParams`,
   `useParams`, `usePathname`, `useLocation`) holds still across the loop unless some render,
   effect, memo or callback body of the program visibly navigates — a call through what a summary
@@ -158,10 +159,14 @@ that writes it (see *Cross-file limits*).
 - **What an effect's deps can move without a slot.** An effect re-runs after every render when it
   has no deps array or a dep that is a new reference every render, and may when its deps argument
   is not a written array or a dep reads a ref's contents some body can replace (#189, #201,
-  #212). A callback that only names the ref in its body does not read it: its identity moves with
-  its deps list [#227](https://github.com/rboudrouss/reactant-analyzer/issues/227). A dep that moves for another reason reads as held: a module binding some function
-  mutates (`[cache.size]`), a call the analysis cannot see into (`[Math.random()]`,
-  `[Date.now()]`), and, by decision, a hook's or a context's result
+  #212), a module binding some body of the program writes (`[cache.size]`), or a call's result
+  its value does not pin to one value: the engine knows no callee to be deterministic, so
+  `[Math.random()]` and `[JSON.stringify(filters)]` alike may re-run the effect, a Warning on an
+  effect that writes state [#224](https://github.com/rboudrouss/reactant-analyzer/issues/224). A
+  callback that only names the ref or the binding in its body does not read it: its identity moves
+  with its deps list [#227](https://github.com/rboudrouss/reactant-analyzer/issues/227). A dep
+  that moves for another reason reads as held: a module binding written only behind a call the
+  analysis cannot see into, and, by decision, a hook's or a context's result
   [#161](https://github.com/rboudrouss/reactant-analyzer/issues/161).
 
 ## Why reactant may warn wrongly (false positives)

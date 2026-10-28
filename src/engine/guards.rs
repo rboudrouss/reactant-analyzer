@@ -45,7 +45,9 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::{
-    domains::{AbstractDomain, StateValue, interp::narrow_env_for_branch, stores::AbstractEnv},
+    domains::{
+        AbstractDomain, Stability, StateValue, interp::narrow_env_for_branch, stores::AbstractEnv,
+    },
     ir::{
         ComponentId, QualifiedSlot,
         bindings::local_bindings,
@@ -755,9 +757,21 @@ pub struct Reads {
     /// It reads a prop, which moves with another component's slots.
     pub props: bool,
     /// It passes through a call. Same inputs give the same value only when
-    /// the call cannot return a new reference, a fact about the value the
-    /// caller holds (#218).
+    /// the value says so ([`call_may_differ`]), a fact the caller holds
+    /// (#218).
     pub call: bool,
+}
+
+/// May a value that passed through a call differ between two runs over the
+/// same inputs? The engine knows no callee to be deterministic
+/// (`Math.random()`, an allocating factory), so only the value can say no:
+/// one value at every run, or only a reference versioned by slots `covered`
+/// says the caller already follows (#218, #224).
+pub fn call_may_differ(v: &StateValue, covered: impl Fn(QualifiedSlot) -> bool) -> bool {
+    let pinned = v.is_single_value()
+        || (v.is_reference_only()
+            && matches!(&v.reference, Stability::Versioned(s) if s.iter().all(|&q| covered(q))));
+    !pinned
 }
 
 /// One scope [`Invariance::reads`] resolves names in.

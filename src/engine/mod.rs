@@ -32,7 +32,8 @@ pub use component_registry::{ComponentKey, ComponentRegistry};
 pub use dominance::{DominatorTree, compute_dominators, dominates, on_all_paths};
 pub use eval::{ConvergedEval, Eval, eval_in_stores};
 pub use fixpoint::{
-    Config, analyze_component, analyze_component_as, analyze_component_inter, analyze_program,
+    Config, ProgramFacts, analyze_component, analyze_component_as, analyze_component_inter,
+    analyze_program,
 };
 pub use function_registry::{FunctionKey, FunctionRegistry};
 pub use hook_registry::{HookKey, HookRegistry};
