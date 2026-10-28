@@ -18,7 +18,8 @@
 //! `new`) — `find`, `at`, `reduce` and `Map.get` are not.
 //!
 //! A kind is a syntactic fact the caller computes ([`Kind`]): a literal, a
-//! known constructor, a known call's result, or a free name of the language's
+//! known constructor, a known call's result, a library hook's documented
+//! result (a router's `useSearchParams`), or a free name of the language's
 //! global scope. A builtin that runs a function argument (`map`, `filter`,
 //! `replace`) is pure only when that argument is a closure whose own calls
 //! are ([`body_holds`]) or a value of a known kind. The conversions a builtin
@@ -49,6 +50,9 @@ pub enum Kind {
     Date,
     /// A `URLSearchParams`.
     Params,
+    /// A pair whose first element is a `URLSearchParams` (react-router's
+    /// `useSearchParams()`).
+    ParamsPair,
     /// A `Map` or a `Set`.
     Keyed,
 }
@@ -279,6 +283,30 @@ const NEWS: &[Builtin] = &[
     b(Kind::Global("Set"), "", K),
 ];
 
+/// A library hook whose result's kind its package documents: `(package,
+/// hook, kind)`. A router's search params are a `URLSearchParams`.
+const HOOKS: &[(&str, &str, Kind)] = &[
+    ("next/navigation", "useSearchParams", Kind::Params),
+    ("react-router", "useSearchParams", Kind::ParamsPair),
+    ("react-router-dom", "useSearchParams", Kind::ParamsPair),
+];
+
+/// The kind of the result of hook `name` imported from `package`.
+pub fn hook_result(package: Option<&str>, name: &str) -> Kind {
+    HOOKS
+        .iter()
+        .find(|(p, h, _)| package == Some(*p) && *h == name)
+        .map_or(Kind::Unknown, |(_, _, k)| *k)
+}
+
+/// The kind of element `idx` of a value of kind `of`.
+pub fn element(of: Kind, idx: &Expr) -> Kind {
+    match (of, idx.peel_ts()) {
+        (Kind::ParamsPair, Expr::Lit(Prim::Int(0))) => Kind::Params,
+        _ => Kind::Unknown,
+    }
+}
+
 /// What a call is made through.
 #[derive(Debug, Clone, Copy)]
 pub enum Callee<'e> {
@@ -375,6 +403,7 @@ pub fn kind_of(e: &Expr, var: &dyn Fn(&str) -> Kind) -> Kind {
         Expr::Lit(p) => lit(p),
         Expr::Var(v) => var(v),
         Expr::ArrayLit { .. } => Kind::Array,
+        Expr::IndexAccess { arr, idx } => element(kind_of(arr, var), idx),
         Expr::TSAnnotated(inner) => kind_of(inner, var),
         Expr::BinOp { op, lhs, rhs } => binop(op, kind_of(lhs, var), kind_of(rhs, var)),
         Expr::UnaryOp { op, .. } => unary(op),

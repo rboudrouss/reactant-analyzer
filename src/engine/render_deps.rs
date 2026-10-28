@@ -961,16 +961,24 @@ impl<'a> Analyzer<'a> {
                 // like any call's (`useContext(Ctx)` reads `Ctx`'s value).
                 Some(HookKind::Custom) | None => {
                     let mut d = Deps::one(Source::Hook(*l));
-                    if let Some(HookEntry::Custom { args, .. }) = self.hooks.get(l) {
+                    let mut kind = Kind::Unknown;
+                    if let Some(HookEntry::Custom {
+                        args,
+                        name,
+                        import_source,
+                        ..
+                    }) = self.hooks.get(l)
+                    {
                         for a in args {
                             d.union_with(&self.eval(a, env).deps.ungated());
                         }
+                        kind = purity::hook_result(import_source.as_deref(), name);
                     }
                     // The result is held by decision (#161): an argument
                     // computed through an unknown call moves it no more than
                     // the hook's own state does.
                     d.impure = false;
-                    DVal::of(d)
+                    DVal::of_kind(d, kind)
                 }
                 _ => DVal::empty(),
             },
@@ -1017,9 +1025,10 @@ impl<'a> Analyzer<'a> {
             } => DVal::of(self.closure(params, body_cfg, env)),
             Expr::FieldAccess { obj, field } => Self::member(&self.eval(obj, env), field),
             Expr::IndexAccess { arr, idx } => {
-                let mut d = self.eval(arr, env).deps;
+                let a = self.eval(arr, env);
+                let mut d = a.deps;
                 d.union_with(&self.eval(idx, env).deps);
-                DVal::of(d)
+                DVal::of_kind(d, purity::element(a.kind, idx))
             }
             Expr::BinOp { op, lhs, rhs } => {
                 let (l, r) = (self.eval(lhs, env), self.eval(rhs, env));

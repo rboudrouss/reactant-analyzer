@@ -729,12 +729,25 @@ fn a_dep_that_moves_with_no_slot_may_rerun_the_effect_every_render() {
             "o.b",
             Rerun::Always(Always::MutableDep(0)),
         ),
+        // A router's search params are a `URLSearchParams`; a hook's result
+        // of no documented kind has no method the table knows.
+        (
+            "const sp = useSearchParams();",
+            "sp.get(\"q\")",
+            Rerun::OnSlots,
+        ),
+        (
+            "const sp = useThing();",
+            "sp.get(\"q\")",
+            Rerun::Always(Always::MutableDep(0)),
+        ),
     ] {
         let src = format!(
             r#"
             import {{ useState, useEffect }} from "react";
             import {{ format }} from "date-fns";
             import {{ useThing }} from "lib";
+            import {{ useSearchParams }} from "next/navigation";
             const cache = new Map<number, number>();
             export function C() {{
               const [t, setT] = useState(false);
