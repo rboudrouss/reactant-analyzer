@@ -280,15 +280,35 @@ pub fn extract_hooks(
 
     // Collected up front because the loop takes `&mut cfg.blocks` — the ids
     // already come out in order (`CFG::blocks` is a `BTreeMap`).
-    hoist_terminator_hooks(cfg, imports);
-
     let ids: Vec<BlockId> = cfg.blocks.keys().copied().collect();
 
     for id in ids {
-        let old = std::mem::take(&mut cfg.blocks.get_mut(&id).unwrap().stmts);
+        let block = cfg.blocks.get_mut(&id).unwrap();
+        let old = std::mem::take(&mut block.stmts);
         let mut new = BlockOut::default();
         for stmt in old {
             ex.stmt(stmt, &mut new);
+        }
+        // A hook reached only through `return useThing()` or
+        // `if (useThing())` runs too (#4): the terminator's hook calls are
+        // staged like a statement's, after the block's statements.
+        let block = cfg.blocks.get_mut(&id).unwrap();
+        match &mut block.term {
+            Terminator::Return(e) => {
+                let staged =
+                    ex.stage_hooks(std::mem::replace(e, Expr::Lit(Prim::Unit)), None, &mut new);
+                *e = staged;
+            }
+            Terminator::Branch { cond, span, .. } => {
+                let span = *span;
+                let staged = ex.stage_hooks(
+                    std::mem::replace(cond, Expr::Lit(Prim::Unit)),
+                    span,
+                    &mut new,
+                );
+                *cond = staged;
+            }
+            Terminator::Jump(_) | Terminator::Unreachable => {}
         }
         new.install(cfg, id);
     }
@@ -386,60 +406,6 @@ impl BlockOut {
     }
 }
 
-/// Move a hook call out of a terminator and into a statement (#4).
-///
-/// The extractor below rewrites `block.stmts` and never looks at terminators,
-/// so a hook reached only through `return useThing()` or `if (useThing())`
-/// produced no [`HookEntry`] at all: the component reported zero hooks and
-/// every rule passed it in silence. Teaching the extractor to also walk
-/// terminators would mean duplicating its destructuring, labelling and
-/// marker-rewriting over a second position, so the CFG is normalised instead —
-/// the expression is bound to a temp in the block's statement list and the
-/// terminator reads that temp. What the extractor then sees is an ordinary
-/// `Let`, and nothing downstream has to know this happened.
-///
-/// Statements run before the terminator, so appending is the correct place.
-/// Only bodies that actually put a hook there are touched; the common CFG is
-/// returned unchanged.
-fn hoist_terminator_hooks(cfg: &mut CFG, imports: &ImportCtx<'_>) {
-    let ids: Vec<BlockId> = cfg.blocks.keys().copied().collect();
-    for id in ids {
-        let block = cfg.blocks.get_mut(&id).unwrap();
-        let (expr, span) = match &mut block.term {
-            Terminator::Return(e) => (e, None),
-            Terminator::Branch { cond, span, .. } => (cond, *span),
-            Terminator::Jump(_) | Terminator::Unreachable => continue,
-        };
-        if !contains_hook_call(expr, imports) {
-            continue;
-        }
-        let var = format!("__term_{id}");
-        let hoisted = std::mem::replace(expr, Expr::Var(var.clone()));
-        block.stmts.push(Stmt::Let {
-            var,
-            rhs: hoisted,
-            span,
-        });
-    }
-}
-
-/// Does this expression call a hook anywhere inside it?
-///
-/// Deliberately a *containment* test rather than "is a hook call": the whole
-/// expression is what gets hoisted, so `return cond ? useA() : useB()` moves as
-/// one piece and keeps its meaning. Conditional hook calls are the point of
-/// `conditional-hook`, and it cannot fire on a hook nobody extracted.
-fn contains_hook_call(expr: &Expr, imports: &ImportCtx<'_>) -> bool {
-    if let Expr::Call { fn_, .. } = expr
-        && imports.classify_callee(fn_).is_some()
-    {
-        return true;
-    }
-    let mut found = false;
-    expr.for_each_child(&mut |child| found |= contains_hook_call(child, imports));
-    found
-}
-
 /// The state of one body's hook extraction.
 struct Extractor<'i, 'a> {
     hooks: Vec<HookEntry>,
@@ -493,6 +459,7 @@ impl Extractor<'_, '_> {
                     }
                 }
                 Err(rhs) => {
+                    let rhs = self.stage_hooks(rhs, stmt_span, out);
                     out.push(Stmt::Let {
                         var,
                         rhs: rewrite_expr(rhs, &self.state_temps),
@@ -512,6 +479,7 @@ impl Extractor<'_, '_> {
                     out.push(Stmt::ExprStmt(Expr::HookMarker(lbl, marker), stmt_span));
                 }
                 Err(expr) => {
+                    let expr = self.stage_hooks(expr, stmt_span, out);
                     out.push(Stmt::ExprStmt(
                         rewrite_expr(expr, &self.state_temps),
                         stmt_span,
@@ -519,6 +487,7 @@ impl Extractor<'_, '_> {
                 }
             },
             Stmt::Assign { var, rhs, span } => {
+                let rhs = self.stage_hooks(rhs, span, out);
                 out.push(Stmt::Assign {
                     var,
                     rhs: rewrite_expr(rhs, &self.state_temps),
@@ -531,6 +500,12 @@ impl Extractor<'_, '_> {
                 rhs,
                 span,
             } => {
+                let obj = self.stage_hooks(obj, span, out);
+                let key = match key {
+                    MemberKey::Field(f) => MemberKey::Field(f),
+                    MemberKey::Index(idx) => MemberKey::Index(self.stage_hooks(idx, span, out)),
+                };
+                let rhs = self.stage_hooks(rhs, span, out);
                 out.push(Stmt::MemberWrite {
                     obj: rewrite_expr(obj, &self.state_temps),
                     key: match key {
@@ -544,6 +519,46 @@ impl Extractor<'_, '_> {
                 });
             }
         }
+    }
+
+    /// Bind every hook call inside `expr` to a temp of its own, extracted by a
+    /// statement right before the one `expr` belongs to, and return `expr`
+    /// reading the temps (#233). A hook nested in an expression — `[v,
+    /// useCallback(…)]`, `f(useMemo(…))`, `x = c && useX()`'s arm — or
+    /// written in a terminator (`return useThing()`, `if (useThing())`, #4)
+    /// runs at that render like any other, and only a statement that is the
+    /// hook call is one the extractor takes: left nested, it was a call of
+    /// an unknown function, its hook missing from every rule. Calls are
+    /// staged in evaluation order; the statement's other operands run after
+    /// them, the reordering hook arguments already take (#193) — a hook call
+    /// has no effect a sibling operand of the same statement can observe. A
+    /// function literal is not entered: its hooks run when it is called.
+    fn stage_hooks(&mut self, expr: Expr, span: Option<SourceRange>, out: &mut BlockOut) -> Expr {
+        let is_hook_call = |e: &Expr| match e {
+            Expr::Call { fn_, .. } => self.imports.classify_callee(fn_).is_some(),
+            Expr::TSAnnotated(inner) => matches!(&**inner,
+                Expr::Call { fn_, .. } if self.imports.classify_callee(fn_).is_some()),
+            _ => false,
+        };
+        if is_hook_call(&expr) {
+            let var = format!("__hook_{}", self.staged);
+            self.staged += 1;
+            self.stmt(
+                Stmt::Let {
+                    var: var.clone(),
+                    rhs: expr,
+                    span,
+                },
+                out,
+            );
+            return Expr::Var(var);
+        }
+        let mut expr = expr;
+        expr.for_each_child_mut(&mut |child| {
+            let taken = std::mem::replace(child, Expr::Lit(Prim::Unit));
+            *child = self.stage_hooks(taken, span, out);
+        });
+        expr
     }
 
     /// Label one hook call and build its entry, once its arguments are

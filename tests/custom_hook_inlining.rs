@@ -877,3 +877,36 @@ fn a_memoized_literal_a_hook_returns_hands_its_members_over() {
         assert!(fires(&found, "infinite-loop"), "{ret}: {found:?}");
     }
 }
+
+#[test]
+fn a_hook_nested_in_an_expression_is_extracted() {
+    // #233: `useCallback` inside the returned literal was a call of an
+    // unknown function, so `inc` ran nothing; `c && useMemo(…)` was no hook
+    // at all, and `conditional-hook` verified the component.
+    let found = rules_for(
+        r#"
+        function useCounter() {
+            const [v, setV] = useState(0);
+            return [v, useCallback(() => setV(v + 1), [v])];
+        }
+        function App() {
+            const [v, inc] = useCounter();
+            useEffect(() => { inc(); });
+            return <div>{v}</div>;
+        }
+        "#,
+        "App",
+    );
+    assert!(fires(&found, "infinite-loop"), "{found:?}");
+    let found = rules_for(
+        r#"
+        function App({ c }) {
+            const [v] = useState(0);
+            const x = c && useMemo(() => v + 1, [v]);
+            return <div>{x}</div>;
+        }
+        "#,
+        "App",
+    );
+    assert!(fires(&found, "conditional-hook"), "{found:?}");
+}
