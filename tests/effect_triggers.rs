@@ -717,6 +717,18 @@ fn a_dep_that_moves_with_no_slot_may_rerun_the_effect_every_render() {
         // A hook's result is held by decision (#161), whatever its
         // arguments are computed through.
         ("const d = useThing(format(t));", "d", Rerun::OnSlots),
+        // A member of an object literal with spreads reads what may be put
+        // there, not its siblings.
+        (
+            "const o = { ...{ a: t }, b: format(t) };",
+            "o.a",
+            Rerun::OnSlots,
+        ),
+        (
+            "const o = { b: format(t), ...{ a: t } };",
+            "o.b",
+            Rerun::Always(Always::MutableDep(0)),
+        ),
     ] {
         let src = format!(
             r#"

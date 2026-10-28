@@ -380,6 +380,13 @@ enum Shape {
     None,
     Props,
     Members(Arc<BTreeMap<Symbol, DVal>>),
+    /// An object literal with spreads: a member it names is that value and
+    /// whatever a later spread may put there; a name it does not write is
+    /// whatever a spread may put there.
+    Spread {
+        members: Arc<BTreeMap<Symbol, DVal>>,
+        spreads: Arc<Vec<DVal>>,
+    },
 }
 
 impl DVal {
@@ -922,14 +929,22 @@ impl<'a> Analyzer<'a> {
     }
 
     /// The member `field` of a value.
-    fn member(base: DVal, field: &str) -> DVal {
+    fn member(base: &DVal, field: &str) -> DVal {
         match &base.shape {
             Shape::Props => DVal::of(Deps::one(Source::Prop(field.to_string()))),
             Shape::Members(m) => match m.get(field) {
                 Some(v) => v.clone(),
-                None => DVal::of(base.deps),
+                None => DVal::of(base.deps.clone()),
             },
-            Shape::None => DVal::of(base.deps),
+            Shape::Spread { members, spreads } => match members.get(field) {
+                Some(v) => v.clone(),
+                None => spreads
+                    .iter()
+                    .map(|s| Self::member(s, field))
+                    .reduce(|a, b| a.join(&b))
+                    .unwrap_or_else(|| DVal::of(base.deps.clone())),
+            },
+            Shape::None => DVal::of(base.deps.clone()),
         }
     }
 
@@ -1000,7 +1015,7 @@ impl<'a> Analyzer<'a> {
             Expr::FnLit {
                 params, body_cfg, ..
             } => DVal::of(self.closure(params, body_cfg, env)),
-            Expr::FieldAccess { obj, field } => Self::member(self.eval(obj, env), field),
+            Expr::FieldAccess { obj, field } => Self::member(&self.eval(obj, env), field),
             Expr::IndexAccess { arr, idx } => {
                 let mut d = self.eval(arr, env).deps;
                 d.union_with(&self.eval(idx, env).deps);
@@ -1030,7 +1045,7 @@ impl<'a> Analyzer<'a> {
                     Expr::FieldAccess { obj, field } => {
                         let recv = self.eval(obj, env);
                         let kind = recv.kind;
-                        (Self::member(recv, field), Callee::Method(kind, field))
+                        (Self::member(&recv, field), Callee::Method(kind, field))
                     }
                     other => {
                         let f = self.eval(other, env);
@@ -1057,22 +1072,30 @@ impl<'a> Analyzer<'a> {
             }
             Expr::ObjectLit { fields, .. } => {
                 let mut d = Deps::default();
-                let mut members = BTreeMap::new();
-                let mut spread = false;
+                let mut members: BTreeMap<Symbol, DVal> = BTreeMap::new();
+                let mut spreads: Vec<DVal> = Vec::new();
                 for (k, v) in fields {
                     let val = self.eval(v, env);
                     d.union_with(&val.deps);
                     if k.starts_with(SPREAD_KEY_PREFIX) {
-                        spread = true;
+                        // What it may put over every member written so far.
+                        for (name, m) in members.iter_mut() {
+                            *m = m.join(&Self::member(&val, name));
+                        }
+                        spreads.push(val);
                     } else {
                         members.insert(k.clone(), val);
                     }
                 }
+                let members = Arc::new(members);
                 DVal {
-                    shape: if spread {
-                        Shape::None
+                    shape: if spreads.is_empty() {
+                        Shape::Members(members)
                     } else {
-                        Shape::Members(Arc::new(members))
+                        Shape::Spread {
+                            members,
+                            spreads: Arc::new(spreads),
+                        }
                     },
                     ..DVal::of(d)
                 }
