@@ -561,3 +561,43 @@ fn a_closure_called_through_a_member_path_is_a_write() {
         );
     }
 }
+
+#[test]
+fn a_closure_passed_through_a_member_path_is_a_write_in_its_position_class() {
+    // #239: `api.inc` handed to a callee or a JSX prop runs with the
+    // position's timing, the class a literal there gets: deferred for a
+    // timer or a continuation, the effect's own phase for a sync HOF (0..N
+    // times), a handler for an event prop. Never placed at the call.
+    use reactant::engine::WriterPhase;
+    for (effect, jsx, phase) in [
+        ("setTimeout(api.inc, 0);", "<div />", WriterPhase::Deferred),
+        (
+            "Promise.resolve().then(api.inc);",
+            "<div />",
+            WriterPhase::Deferred,
+        ),
+        ("[1].forEach(api.inc);", "<div />", WriterPhase::Effect),
+        ("", "<button onClick={api.inc} />", WriterPhase::Handler),
+    ] {
+        let src = format!(
+            r#"
+            import {{ useState, useEffect }} from "react";
+            function useCounter() {{
+              const [v, setV] = useState(0);
+              return {{ v, inc: () => setV((x) => x + 1) }};
+            }}
+            export function App() {{
+              const api = useCounter();
+              useEffect(() => {{ {effect} }});
+              return {jsx};
+            }}
+            "#
+        );
+        let r = parse_and_analyze_with_hooks(&src);
+        let c = comp(&r, "App");
+        let rows: Vec<&SlotWriter> = c.slot_writers.iter().collect();
+        assert_eq!(rows.len(), 1, "{effect}{jsx}: {:?}", c.slot_writers);
+        assert_eq!(rows[0].phase, phase, "{effect}{jsx}: {:?}", rows[0]);
+        assert!(rows[0].block.is_none(), "{effect}{jsx}: {:?}", rows[0]);
+    }
+}

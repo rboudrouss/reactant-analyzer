@@ -72,16 +72,17 @@ that writes it (see *Cross-file limits*).
   [#202](https://github.com/rboudrouss/reactant-analyzer/issues/202). A closure called through a
   member path (`api.inc()`) is walked where the converged values point it, in render as in an
   effect; its write is a certain one only when the path certainly names one literal closure that
-  nothing may rewrite (`api` used only to read its members). A setter read off a value is surely
+  nothing may rewrite (`api` used only to read its members). One only passed, to a callee or a JSX
+  prop (`setTimeout(api.inc)`, `onClick={api.inc}`), is walked with the timing a literal there
+  gets, never as a write at the call [#239](https://github.com/rboudrouss/reactant-analyzer/issues/239).
+  A setter read off a value is surely
   written only where every block exit binds it to that setter. A hook call nested
   in an expression (`return [v, useCallback(…)]`, `c && useMemo(…)`) is extracted like one
   written as a statement. A setter joined with a value the analysis cannot see into (`c ?
   wrap(setV) : setV`, `wrap` unknown) is still a possible write of it
   [#238](https://github.com/rboudrouss/reactant-analyzer/issues/238); a call of a value nothing
   names a setter in writes nothing (#19). Still missed: an array with a spread or an object member a spread may
-  overwrite; a memo whose body returns something the heap does not place on some path; a closure
-  only passed as a callback through a path or a destructured memo member (`setTimeout(api.inc)`)
-  is not walked by the writer relation.
+  overwrite; a memo whose body returns something the heap does not place on some path.
 - `useContext` is unmodelled, so a context value reads ⊤. This is the single largest source of
   analysis limits, 363 sites across the eight corpora [#28](https://github.com/rboudrouss/reactant-analyzer/issues/28).
 - Seven React hooks are unmodelled and emit an Info rather than a summary: `useActionState`,

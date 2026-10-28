@@ -2482,30 +2482,8 @@ impl<'a> SetterWalk<'a> {
             // A call through a name or member path no binding certifies, which
             // the converged values point at closures of this component
             // (`api.inc()`, #233): each body may run here, so its writes are
-            // the call's. They are placed at the call only when it certainly
-            // runs that one closure — otherwise it may run another.
-            if depth > 0
-                && let Some(converged) = self.converged
-                && let Some(name) = callee_path(fn_)
-                && !self.fn_bindings.contains_key(&name)
-                && let Some(bodies) = converged.bodies(&name)
-            {
-                let sure = matches!(bodies, [only] if converged.certain(fn_, only));
-                for body in bodies {
-                    let mut inner = Found::default();
-                    self.path.push(name.clone());
-                    self.cfg(
-                        body,
-                        depth - 1,
-                        &mut inner,
-                        WalkClass::Sync,
-                        prov,
-                        stmt_span,
-                    );
-                    self.path.pop();
-                    found.absorb(inner, body, mode, at.filter(|_| sure), prov);
-                }
-            }
+            // the call's.
+            self.converged_bodies(fn_, mode, at, depth, found, prov, stmt_span);
             // An immediately-invoked function expression runs NOW, at this
             // call site, in this mode — `(async () => { … })()` is how an
             // effect awaits, and it is the standard shape. The walk descended a
@@ -2553,11 +2531,7 @@ impl<'a> SetterWalk<'a> {
                     continue;
                 }
                 let class = if listener && i == 1 {
-                    if self.dispatches {
-                        WalkClass::Unknown
-                    } else {
-                        WalkClass::Handler
-                    }
+                    self.listener_class()
                 } else {
                     self.arg_class(fn_, mode)
                 };
@@ -2574,17 +2548,87 @@ impl<'a> SetterWalk<'a> {
                     // B5: variable arg name resolution, no depth cost — so this is
                     // the arm that can cycle (`const tick = t => raf(tick)`); the
                     // `walking` stack is what terminates it.
-                    Expr::Var(name) => {
-                        if let Some(body) = self.fn_bindings.get(name) {
-                            self.path.push(name.clone());
-                            self.cfg(body, depth, found, class, prov, stmt_span);
-                            self.path.pop();
-                        }
+                    Expr::Var(name) if self.fn_bindings.contains_key(name) => {
+                        let body = &self.fn_bindings[name];
+                        self.path.push(name.clone());
+                        self.cfg(body, depth, found, class, prov, stmt_span);
+                        self.path.pop();
                     }
-                    _ => {}
+                    // A path the converged values point at closures of this
+                    // component (`setTimeout(api.inc)`, #239): each runs in
+                    // the argument's class, never at this call.
+                    _ => self.converged_bodies(arg, class, None, depth, found, prov, stmt_span),
                 }
                 self.repeating = outer_repeating;
             }
+        }
+        // A JSX prop React or the child may invoke runs as a listener, the
+        // class extraction gives a literal there (`extract_handlers`); a path
+        // the converged values resolve is walked the same way (#239).
+        if let Expr::NativeElem { props, .. } | Expr::CompApp { props, .. } = expr
+            && let Expr::ObjectLit { fields, .. } = props.peel_ts()
+        {
+            let native = matches!(expr, Expr::NativeElem { .. });
+            let class = self.listener_class();
+            for (name, val) in fields {
+                if crate::lowering::hook_extractor::invoked_prop(native, name) {
+                    self.converged_bodies(val, class, None, depth, found, prov, stmt_span);
+                }
+            }
+        }
+    }
+
+    /// A listener's class: `Handler`, or ⊤ in a program that dispatches
+    /// events itself, where it may run synchronously in the dispatching body
+    /// ([`Timing::in_program`](crate::engine::registrations::Timing::in_program), #219).
+    fn listener_class(&self) -> WalkClass {
+        if self.dispatches {
+            WalkClass::Unknown
+        } else {
+            WalkClass::Handler
+        }
+    }
+
+    /// Walk the closures of this component the converged values put behind
+    /// `e`, a name or member path no binding certifies ([`ConvergedFns`]):
+    /// called (`api.inc()`, #233) or handed to a callee or a JSX prop
+    /// (`setTimeout(api.inc)`, `onClick={api.inc}`, #239). Each body may run,
+    /// in `class`; its rows are placed at `at` only when `e` certainly names
+    /// that one closure — otherwise it may run another.
+    #[allow(clippy::too_many_arguments)]
+    fn converged_bodies(
+        &mut self,
+        e: &Expr,
+        class: WalkClass,
+        at: Option<(BlockId, usize)>,
+        depth: usize,
+        found: &mut Found,
+        prov: Option<BlockId>,
+        stmt_span: Option<SourceRange>,
+    ) {
+        let Some(converged) = self.converged.filter(|_| depth > 0) else {
+            return;
+        };
+        let Some(name) = callee_path(e).filter(|n| !self.fn_bindings.contains_key(n)) else {
+            return;
+        };
+        let Some(bodies) = converged.bodies(&name) else {
+            return;
+        };
+        let sure = matches!(bodies, [only] if converged.certain(e, only));
+        for body in bodies {
+            let mut inner = Found::default();
+            self.path.push(name.clone());
+            self.cfg(
+                body,
+                depth - 1,
+                &mut inner,
+                WalkClass::Sync,
+                prov,
+                stmt_span,
+            );
+            self.path.pop();
+            found.absorb(inner, body, class, at.filter(|_| sure), prov);
         }
     }
 }

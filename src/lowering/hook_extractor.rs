@@ -171,7 +171,7 @@ fn collect_handlers_in_expr(
                     // on native elements: React calls them at arbitrary times
                     // (events / mount-unmount). Other native props are DOM
                     // data, never invoked.
-                    if is_event_prop(name) || name == "ref" {
+                    if invoked_prop(true, name) {
                         if let Some(body_cfg) = handler_body(val, var_bodies) {
                             let label = *next_label;
                             *next_label += 1;
@@ -238,6 +238,13 @@ fn collect_handlers_in_expr(
             });
         }
     }
+}
+
+/// A JSX prop whose function value may be invoked: a native element's `on*`
+/// events and `ref` (the only native props React calls), and any prop a
+/// component receives (the child may call whatever it is given).
+pub(crate) fn invoked_prop(native: bool, name: &str) -> bool {
+    !native || is_event_prop(name) || name == "ref"
 }
 
 pub(crate) fn is_event_prop(name: &str) -> bool {
