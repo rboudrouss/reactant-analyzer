@@ -262,12 +262,12 @@ pub(crate) fn collect_effect_triggers(
                         .or_insert_with(|| ref_may_move(l, render_cfg, hooks))
                 };
                 // A cell that moves with no slot: a ref's contents, a module
-                // binding some body writes (`cache.size`), or a call's result
-                // the value does not pin (`Math.random()`, #224). A source a
-                // function value only captures is not read here: the
-                // function's identity, not the cell, is compared.
+                // binding some body writes (`cache.size`), or the result of a
+                // call not known pure the value does not pin (`Math.random()`,
+                // #224). A source a function value only captures is not read
+                // here: the function's identity, not the cell, is compared.
                 if src.top
-                    || (src.call && call_may_differ(&val, |_| true))
+                    || (src.impure && call_may_differ(&val, |_| true, true))
                     || src.set.iter().any(|s| {
                         !src.captured.contains(s)
                             && match s {

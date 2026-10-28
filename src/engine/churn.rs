@@ -911,16 +911,20 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             }
             .filter(|r| !(node.0 == f.comp && r.slots.contains(&node.1)))
             // A call over the reads is a function of them only when the
-            // value it stores is pinned (#218, #224).
+            // value it stores cannot differ on them (#218, #224).
             .filter(|r| {
                 !r.call
-                    || !call_may_differ(&w.written.value, |(c, l)| {
-                        if c == f.comp {
-                            r.slots.contains(&l)
-                        } else {
-                            r.props
-                        }
-                    })
+                    || !call_may_differ(
+                        &w.written.value,
+                        |(c, l)| {
+                            if c == f.comp {
+                                r.slots.contains(&l)
+                            } else {
+                                r.props
+                            }
+                        },
+                        r.impure,
+                    )
             });
             let reads_slot = |x: QualifiedSlot| match &reads {
                 None => true,

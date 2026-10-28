@@ -48,6 +48,7 @@ use crate::{
     domains::{
         AbstractDomain, Stability, StateValue, interp::narrow_env_for_branch, stores::AbstractEnv,
     },
+    engine::purity::{self, Callee, Kind},
     ir::{
         ComponentId, QualifiedSlot,
         bindings::local_bindings,
@@ -362,9 +363,11 @@ impl Invariance<'_> {
     /// name is no exception: the alias table is a may reading, and a name
     /// bound to the read on one path only reads its other paths too (#222).
     ///
-    /// A call is read as a function of its inputs, and [`Reads::call`] says
-    /// one was crossed: whether the call may allocate is a fact about the
-    /// value it returns, which the caller holds (#218).
+    /// A call is read as a function of its inputs: [`Reads::call`] says one
+    /// was crossed, [`Reads::impure`] one whose callee is not known to be
+    /// one ([`purity`], #224), and a global the builtin table knows reads
+    /// nothing. Whether the value differs is the caller's question
+    /// ([`call_may_differ`]).
     pub fn reads(
         &self,
         e: &Expr,
@@ -469,9 +472,48 @@ impl Invariance<'_> {
             ),
             Expr::UnaryOp { arg, .. } => self.read_into(arg, scopes, free, out, seen, next),
             Expr::Call { fn_, args } => {
+                // A name's kind: a global nothing binds, or what its one
+                // binding's right-hand side is, its own names left unknown.
+                let unbound = |v: &str| {
+                    !free(v)
+                        && !self.mutated.contains(v)
+                        && scopes
+                            .iter()
+                            .all(|s| !s.bindings.contains_key(v) && !s.nested.contains(v))
+                };
+                let shallow = |v: &str| {
+                    if unbound(v) {
+                        purity::global(v)
+                    } else {
+                        Kind::Unknown
+                    }
+                };
+                let var = |v: &str| match scopes.iter().find_map(|s| s.bindings.get(v)) {
+                    Some(rhs) if rhs.len() == 1 && !self.mutated.contains(v) => {
+                        purity::kind_of(rhs[0], &shallow)
+                    }
+                    _ => shallow(v),
+                };
+                let callee = Callee::of(fn_, &mut |x| purity::kind_of(x, &var));
+                let known = purity::call(
+                    callee,
+                    false,
+                    args,
+                    &|i| purity::kind_of(&args[i], &var),
+                    &var,
+                );
                 out.call = true;
+                out.impure |= known.is_none();
+                // A global holds: nothing of it to read.
+                let global = matches!(
+                    callee,
+                    Callee::Value(Kind::Global(_)) | Callee::Method(Kind::Global(_), _)
+                );
                 all(
-                    &mut std::iter::once(fn_.as_ref()).chain(args.iter()),
+                    &mut (!global)
+                        .then_some(fn_.as_ref())
+                        .into_iter()
+                        .chain(args.iter()),
                     scopes,
                     out,
                     seen,
@@ -756,22 +798,32 @@ pub struct Reads {
     pub slots: BTreeSet<HookLabel>,
     /// It reads a prop, which moves with another component's slots.
     pub props: bool,
-    /// It passes through a call. Same inputs give the same value only when
-    /// the value says so ([`call_may_differ`]), a fact the caller holds
-    /// (#218).
+    /// It passes through a call, whose result may be a new reference
+    /// ([`call_may_differ`], #218).
     pub call: bool,
+    /// One of those calls is not known to compute the same content from the
+    /// same inputs ([`purity`], #224).
+    pub impure: bool,
 }
 
 /// May a value that passed through a call differ between two runs over the
-/// same inputs? The engine knows no callee to be deterministic
-/// (`Math.random()`, an allocating factory), so only the value can say no:
-/// one value at every run, or only a reference versioned by slots `covered`
-/// says the caller already follows (#218, #224).
-pub fn call_may_differ(v: &StateValue, covered: impl Fn(QualifiedSlot) -> bool) -> bool {
-    let pinned = v.is_single_value()
-        || (v.is_reference_only()
-            && matches!(&v.reference, Stability::Versioned(s) if s.iter().all(|&q| covered(q))));
-    !pinned
+/// same inputs? In content, when a callee is not known to be a function of
+/// its inputs (`impure`: `Math.random()`, an import): only the value can say
+/// no, one value at every run. In identity, when it may be a reference the
+/// call allocated: not when it holds no reference or a stable one. Either
+/// way a reference versioned only by slots `covered` says the caller
+/// already follows holds (#218, #224).
+pub fn call_may_differ(
+    v: &StateValue,
+    covered: impl Fn(QualifiedSlot) -> bool,
+    impure: bool,
+) -> bool {
+    let followed = matches!(&v.reference, Stability::Versioned(s) if s.iter().all(|&q| covered(q)));
+    if impure {
+        !(v.is_single_value() || (v.is_reference_only() && followed))
+    } else {
+        v.other || !(followed || matches!(v.reference, Stability::Bottom | Stability::Stable))
+    }
 }
 
 /// One scope [`Invariance::reads`] resolves names in.

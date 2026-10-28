@@ -86,9 +86,10 @@ that writes it (see *Cross-file limits*).
   knows a reference is stable, not which one it is, so `setV(A)` while `v` holds `A` is not
   reported, the price of not reporting `setV(B)` [#179](https://github.com/rboudrouss/reactant-analyzer/issues/179).
 - The guard proofs assume a call over held inputs returns the same value on every run. The
-  reads-kill does not: the engine knows no callee to be deterministic, so a write whose value
-  crosses a call is read as a function of its inputs only when that value is one value, or a
-  reference versioned by what the write reads
+  reads-kill does not: a write whose value crosses a call not known pure (see *Which calls are
+  functions of their inputs* below) is read as a function of its inputs only when that value is
+  one value, and one crossing any call only when it is no new reference; a reference versioned by
+  what the write reads passes both
   [#218](https://github.com/rboudrouss/reactant-analyzer/issues/218),
   [#224](https://github.com/rboudrouss/reactant-analyzer/issues/224). The convergence proof also assumes
   that a call it cannot see into does not navigate: a router hook's result (`useSearchParams`,
@@ -159,15 +160,29 @@ that writes it (see *Cross-file limits*).
 - **What an effect's deps can move without a slot.** An effect re-runs after every render when it
   has no deps array or a dep that is a new reference every render, and may when its deps argument
   is not a written array or a dep reads a ref's contents some body can replace (#189, #201,
-  #212), a module binding some body of the program writes (`[cache.size]`), or a call's result
-  its value does not pin to one value: the engine knows no callee to be deterministic, so
-  `[Math.random()]` and `[JSON.stringify(filters)]` alike may re-run the effect, a Warning on an
-  effect that writes state [#224](https://github.com/rboudrouss/reactant-analyzer/issues/224). A
+  #212), a module binding some body of the program writes (`[cache.size]`), or the result of a
+  call not known pure its value does not pin to one value: `[Math.random()]` and `[format(x)]`
+  over an import may re-run the effect, a Warning on an effect that writes state, while
+  `[JSON.stringify(filters)]` moves with `filters` alone
+  [#224](https://github.com/rboudrouss/reactant-analyzer/issues/224). A
   callback that only names the ref or the binding in its body does not read it: its identity moves
   with its deps list [#227](https://github.com/rboudrouss/reactant-analyzer/issues/227). A dep
   that moves for another reason reads as held: a module binding written only behind a call the
   analysis cannot see into, and, by decision, a hook's or a context's result
   [#161](https://github.com/rboudrouss/reactant-analyzer/issues/161).
+- **Which calls are functions of their inputs.** A call computes the same content from the same
+  inputs when its callee is a builtin the engine names — `JSON.stringify`/`parse`, `String`,
+  `Number`, `Object.keys`, `Array.isArray`, `Math.*` but `random`, and the methods of a receiver
+  whose kind it knows from a literal, a constructor or another such call: a string's `trim` or
+  `split`, an array's `join` or `filter`, a `new Date(x)`'s `getTime`, a `new URLSearchParams(s)`'s
+  `get` — and a function a builtin runs is a closure whose own calls are such. A utility the
+  analysis resolves is inlined, so its own calls are what is read. Everything else may differ:
+  `Date.now()`, `new Date()`, `performance.now()`, `crypto.*`, `Symbol()`, an import, a local
+  closure, a method on a receiver of unknown kind (`value.startsAt.getTime()` on a prop, a router
+  hook's `searchParams.get`). A global is recognised by name when nothing in its module binds it,
+  and the conversions a builtin makes on an object argument (`toString`, `toJSON`) are taken as
+  deterministic. Whether the result is a new reference is the value's question, so `find`, `at`,
+  `reduce` and `Map.get` are left out [#224](https://github.com/rboudrouss/reactant-analyzer/issues/224).
 
 ## Why reactant may warn wrongly (false positives)
 

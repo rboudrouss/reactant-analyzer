@@ -31,11 +31,13 @@ export const IN_LOOP = 10;
 /**
  * A package the analyzer cannot see into (ADR-009's `Unknown` callee): a bare
  * specifier that resolves nowhere on disk. `runNow` calls its callback at once,
- * `defer` in a microtask, like `Promise.then`; neither is a timer.
+ * `defer` in a microtask, like `Promise.then`; neither is a timer. `format` is
+ * a function of its argument, which the analyzer cannot know (#224).
  */
 const EXT = {
   runNow: (cb) => cb(),
   defer: (cb) => void Promise.resolve().then(cb),
+  format: (x) => `<${x}>`,
 };
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>");

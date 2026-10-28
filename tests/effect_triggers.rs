@@ -680,12 +680,45 @@ fn a_dep_that_moves_with_no_slot_may_rerun_the_effect_every_render() {
             Rerun::Always(Always::MutableDep(0)),
         ),
         ("", "cache.size", Rerun::OnSlots),
-        ("", "String(t)", Rerun::Always(Always::MutableDep(0))),
         ("", "t", Rerun::OnSlots),
+        // A callee known pure computes the same content from the same
+        // inputs; one not known may not (#224).
+        ("", "String(t)", Rerun::OnSlots),
+        ("", "JSON.stringify({ t })", Rerun::OnSlots),
+        ("", "new Date(String(t)).getTime()", Rerun::OnSlots),
+        (
+            "",
+            "new URLSearchParams(`q=${t}`).get(\"q\")",
+            Rerun::OnSlots,
+        ),
+        (
+            "const s = `${t}`;",
+            "s.trim().split(\",\").map((x) => x.length).join()",
+            Rerun::OnSlots,
+        ),
+        ("", "Date.now()", Rerun::Always(Always::MutableDep(0))),
+        (
+            "",
+            "new Date().getTime()",
+            Rerun::Always(Always::MutableDep(0)),
+        ),
+        ("", "format(t)", Rerun::Always(Always::MutableDep(0))),
+        ("", "cache.get(1)", Rerun::Always(Always::MutableDep(0))),
+        (
+            "const s = `${t}`;",
+            "s.split(\",\").map(() => Math.random()).join()",
+            Rerun::Always(Always::MutableDep(0)),
+        ),
+        (
+            "const s = `${t}`;",
+            "s.split(\",\").map(format).join()",
+            Rerun::Always(Always::MutableDep(0)),
+        ),
     ] {
         let src = format!(
             r#"
             import {{ useState, useEffect }} from "react";
+            import {{ format }} from "date-fns";
             const cache = new Map<number, number>();
             export function C() {{
               const [t, setT] = useState(false);

@@ -11,6 +11,7 @@ pub mod guards;
 pub mod hook_registry;
 pub mod program_relations;
 pub mod program_result;
+pub mod purity;
 pub mod reducers;
 pub mod registrations;
 pub mod render_deps;
