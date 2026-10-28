@@ -593,6 +593,29 @@ pub(crate) fn cross_component_setters(
         .collect()
 }
 
+/// The setters a call through each name or member path of `comp` may write,
+/// read off the converged values: another component's setter, or this one's
+/// when the value is the setter itself — `t[1]`, `api.setV`, a member a
+/// nested or memoized destructuring reads (#216, #233). A closure over an own
+/// setter is not one: its body is walked instead. The writer relation and
+/// `setter-in-render` read the same table.
+pub(crate) fn converged_call_targets(
+    converged: &HashMap<Var, Vec<SetterProp>>,
+    component: ComponentId,
+) -> HashMap<Var, Vec<SetterProp>> {
+    converged
+        .iter()
+        .filter_map(|(v, props)| {
+            let targets: Vec<SetterProp> = props
+                .iter()
+                .filter(|p| p.component != component || !p.closure)
+                .cloned()
+                .collect();
+            (!targets.is_empty()).then(|| (v.clone(), targets))
+        })
+        .collect()
+}
+
 /// The subset of `bindings` whose name is bound exactly once, to a function
 /// literal, and never re-bound *anywhere below* — including inside nested
 /// closures, which `fn_binding_in` alone does not scan.
@@ -1336,15 +1359,12 @@ pub(crate) fn collect_slot_writers(
             sure: true,
         });
     }
-    let mut converged: Vec<_> = converged.iter().collect();
-    converged.sort_by(|a, b| a.0.cmp(b.0));
-    for (v, props) in converged {
-        if targets.contains_key(v) {
+    for (v, props) in converged_call_targets(converged, envs.component) {
+        if targets.contains_key(&v) {
             continue;
         }
         let candidates: Vec<Target> = props
             .iter()
-            .filter(|p| p.component != envs.component || !p.closure)
             .map(|p| Target {
                 owner: (p.component != envs.component).then_some(p.component),
                 slot: p.label,
@@ -1352,9 +1372,7 @@ pub(crate) fn collect_slot_writers(
                 sure: p.must_write,
             })
             .collect();
-        if !candidates.is_empty() {
-            targets.insert(v.clone(), candidates);
-        }
+        targets.insert(v, candidates);
     }
     let setter_vars: HashSet<Var> = targets.keys().cloned().collect();
     // A write of the slot's own read stores its content (`written::classify`),

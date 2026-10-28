@@ -910,3 +910,40 @@ fn a_hook_nested_in_an_expression_is_extracted() {
     );
     assert!(fires(&found, "conditional-hook"), "{found:?}");
 }
+
+#[test]
+fn a_setter_read_off_a_hook_value_called_in_render_is_setter_in_render() {
+    // #233: nested destructuring, a named receiver, a memoized tuple — the
+    // setter reaches the call through the heap, not through a binding.
+    for (ret, decl, call) in [
+        (
+            "[{ v, setV }]",
+            "const [{ v, setV }] = useSlot();",
+            "setV(0)",
+        ),
+        ("[v, setV]", "const t = useSlot();", "t[1](0)"),
+        (
+            "useMemo(() => [v, setV], [v])",
+            "const [v, setV] = useSlot();",
+            "setV(0)",
+        ),
+    ] {
+        let found = rules_for(
+            &format!(
+                r#"
+                function useSlot() {{
+                    const [v, setV] = useState(0);
+                    return {ret};
+                }}
+                function App() {{
+                    {decl}
+                    {call};
+                    return <div />;
+                }}
+                "#
+            ),
+            "App",
+        );
+        assert!(fires(&found, "setter-in-render"), "{decl}: {found:?}");
+    }
+}

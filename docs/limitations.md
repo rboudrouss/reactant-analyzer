@@ -59,26 +59,24 @@ that writes it (see *Cross-file limits*).
   through an index or a returned function [#46](https://github.com/rboudrouss/reactant-analyzer/issues/46). A setter or `dispatch` *call* in any expression
   position, `wrap(setN(1))`, a `&&` or ternary arm, a branch condition, a JSX prop, writes its slot
   [#169](https://github.com/rboudrouss/reactant-analyzer/issues/169); it is the callee's *inlining* that is not.
-- **What a custom hook returns reaches the caller when it is destructured.** A setter, a slot
-  value or a closure a hook returns in a literal (`return [v, setV]`, `return { v, setV, inc }`)
-  is the caller's own alias of it once the hook is spliced (#185). It is not when the caller keeps
-  the container under a name (`const t = useSlot(); t[1](0)`, `api.setV(0)`)
-  [#216](https://github.com/rboudrouss/reactant-analyzer/issues/216), when the hook returns
-  something else than a literal on some path (a returned variable), one level of destructuring
-  below the first
-  (`const [{ setV }] = useSlot()`), an array with a spread, or an object member a spread may
-  overwrite. A hook whose returns pick different setters is forwarded on every path, and a name
-  bound to several setters writes each of them, as a possible write of each
-  [#202](https://github.com/rboudrouss/reactant-analyzer/issues/202). A value that may be a setter
-  or something else (`return c ? [setV, v] : [v, setV]`) writes the setter when called, a possible
-  write ([#233](https://github.com/rboudrouss/reactant-analyzer/issues/233)); a slot widened to ⊤
-  absorbs the setter it is joined with, and a call of ⊤ writes nothing. A memo is the literal its
-  body returns (`return useMemo(() => [v, setV], [v])`), whose members the caller reads through
-  the heap — when every return of the body is one the heap places. A closure called through a
-  member path (`const api = useCounter(); api.inc()`) is walked where the converged values point
-  it; one only passed as a callback through a path or a destructured name (`setTimeout(api.inc)`)
-  is not. A hook call nested in an expression (`return [v, useCallback(…)]`, `c && useMemo(…)`) is
-  extracted like one written as a statement, ahead of the statement it sits in.
+- **What a custom hook returns reaches the caller.** A setter, a slot value or a closure a hook
+  returns in a literal (`return [v, setV]`, `return { v, setV, inc }`) is the caller's own alias
+  of it once the hook is spliced (#185). Any other shape reaches the caller through the values
+  ([#216](https://github.com/rboudrouss/reactant-analyzer/issues/216),
+  [#233](https://github.com/rboudrouss/reactant-analyzer/issues/233)): a container kept under a
+  name (`t[1](0)`, `api.setV(0)`), a nested destructuring (`const [{ setV }] = useSlot()`), a
+  memo, which is the literal its body returns (`return useMemo(() => [v, setV], [v])`), and a
+  ternary of literals (`return c ? [setV, v] : [v, setV]`), whose member may be a setter or
+  something else and writes the setter when called, as a possible write. A name bound to several
+  setters writes each of them, as a possible write of each
+  [#202](https://github.com/rboudrouss/reactant-analyzer/issues/202). A closure called through a
+  member path (`api.inc()`) is walked where the converged values point it, and a hook call nested
+  in an expression (`return [v, useCallback(…)]`, `c && useMemo(…)`) is extracted like one
+  written as a statement. Still missed: an array with a spread or an object member a spread may
+  overwrite; a memo whose body returns something the heap does not place on some path; a slot
+  widened to ⊤ absorbs the setter it is joined with, and a call of ⊤ writes nothing; a closure
+  only passed as a callback through a path or a destructured memo member (`setTimeout(api.inc)`)
+  is not walked by the writer relation.
 - `useContext` is unmodelled, so a context value reads ⊤. This is the single largest source of
   analysis limits, 363 sites across the eight corpora [#28](https://github.com/rboudrouss/reactant-analyzer/issues/28).
 - Seven React hooks are unmodelled and emit an Info rather than a summary: `useActionState`,

@@ -66,9 +66,19 @@ impl Rule for SetterInRender {
         let local_setter_info =
             SetterTargets::bound_in(&comp_result.render_cfg).resolve(&comp_result.render_cfg);
 
-        // Cross-component setters: ComponentSetter-valued props, excluding self-references.
+        // The setters the converged values put behind a name or member path:
+        // a parent's setter prop, or this component's own setter read off a
+        // value (`t[1]`, a nested or memoized destructuring, #233) — the
+        // table the writer relation reads.
         let cs_vars: HashMap<Var, Vec<crate::engine::setters::SetterProp>> =
-            crate::rules::cross_component_setters(comp_result, component);
+            crate::engine::setters::converged_call_targets(
+                &crate::engine::setters::collect_component_setter_vars(
+                    &comp_result.render_cfg,
+                    &comp_result.block_states,
+                    &comp_result.heap,
+                ),
+                component,
+            );
 
         let mut all_setter_vars: HashSet<Var> = local_setter_info.names().cloned().collect();
         all_setter_vars.extend(cs_vars.keys().cloned());
@@ -203,11 +213,29 @@ impl Rule for SetterInRender {
                         Some(label),
                         None,
                     )
+                } else if let Some(props) = cs_vars.get(&call.var)
+                    && props.iter().all(|p| p.component == component)
+                {
+                    (
+                        "setter-in-render",
+                        if call.class == SetterCallPhase::Sync {
+                            format!(
+                                "setter `{}` called directly in the render body, \
+                                 move this call into a useEffect or an event handler",
+                                crate::ir::source_name(&call.var)
+                            )
+                        } else {
+                            unknown_phase_message(&call.var)
+                        },
+                        props.first().map(|p| p.label),
+                        None,
+                    )
                 } else if let Some(props) = cs_vars.get(&call.var) {
                     // A prop several call sites bind to several parents'
                     // setters names them all.
                     let mut parents: Vec<String> = props
                         .iter()
+                        .filter(|p| p.component != component)
                         .map(|p| result.display_name(p.component))
                         .collect();
                     parents.dedup();
