@@ -514,17 +514,21 @@ fn a_write_through_a_hook_closure_is_not_direct() {
 #[test]
 fn a_closure_called_through_a_member_path_is_a_write() {
     // #233: `api.inc` names no binding; the converged heap points it at the
-    // closure, whose body is walked. The call may run another value, so the
-    // row has no block, and no name certifies where it was written.
-    for (decl, call) in [
-        ("const api = useCounter();", "api.inc()"),
+    // closure, whose body is walked. The row is placed at the call only when
+    // `api` is certainly the hook's literal, never rewritten; a memo's member
+    // is a value the syntax does not certify. No name certifies where the
+    // closure was written.
+    for (decl, call, placed) in [
+        ("const api = useCounter();", "api.inc()", true),
         (
             "const [v, setV] = useState(0); const api = useMemo(() => ({ inc: () => setV(v + 1) }), [v]);",
             "api.inc()",
+            false,
         ),
         (
             "const [v, setV] = useState(0); const { inc } = useMemo(() => ({ inc: () => setV(v + 1) }), [v]);",
             "inc()",
+            false,
         ),
     ] {
         let src = format!(
@@ -549,7 +553,7 @@ fn a_closure_called_through_a_member_path_is_a_write() {
             .filter(|w| matches!(w.region, WriterRegion::Effect(_)))
             .collect();
         assert_eq!(rows.len(), 1, "{decl}: {:?}", c.slot_writers);
-        assert!(rows[0].block.is_none(), "{decl}: {:?}", rows[0]);
+        assert_eq!(rows[0].block.is_some(), placed, "{decl}: {:?}", rows[0]);
         assert_eq!(
             rows[0].via,
             reactant::engine::setters::WriteProvenance::Unknown,

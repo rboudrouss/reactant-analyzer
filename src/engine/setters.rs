@@ -109,6 +109,35 @@ pub fn collect_setter_calls_with_extra(
     max_depth: usize,
     extra_fn_bindings: &HashMap<Var, Arc<CFG>>,
 ) -> Vec<SetterCall> {
+    setter_calls(cfg, setter_vars, max_depth, extra_fn_bindings, None)
+}
+
+/// `collect_setter_calls` that also runs the closures the converged values
+/// put behind a called path (`api.inc()`, #233): a write in one is a write of
+/// the call — the same table the writer relation walks.
+pub(crate) fn collect_setter_calls_converged(
+    cfg: &CFG,
+    setter_vars: &HashSet<Var>,
+    max_depth: usize,
+    converged: &ConvergedFns<'_>,
+) -> Vec<SetterCall> {
+    setter_calls(
+        cfg,
+        setter_vars,
+        max_depth,
+        &HashMap::new(),
+        Some(converged),
+    )
+}
+
+fn setter_calls(
+    cfg: &CFG,
+    setter_vars: &HashSet<Var>,
+    max_depth: usize,
+    extra_fn_bindings: &HashMap<Var, Arc<CFG>>,
+    converged: Option<&ConvergedFns<'_>>,
+) -> Vec<SetterCall> {
+    let converged = converged.map(|c| c.seen_from(cfg));
     let mut fn_bindings = collect_fn_bindings(cfg);
     for (k, v) in extra_fn_bindings {
         fn_bindings
@@ -122,7 +151,7 @@ pub fn collect_setter_calls_with_extra(
     let mut walk = SetterWalk {
         setter_vars,
         fn_bindings: &fn_bindings,
-        may_fns: &NO_FNS,
+        converged: converged.as_ref(),
         walking: HashSet::new(),
         root: cfg as *const CFG as usize,
         effect_body: false,
@@ -192,9 +221,9 @@ pub(crate) struct WriteSite {
 /// handler body is extracted out of the render CFG, so a `set(inc)` whose
 /// `inc` was defined in render is invisible to a walk of the body alone. A
 /// name the walked body binds itself drops out of the set, fail-closed, the
-/// same device as `shadowed`. `may_fns` are the closures the converged values
-/// put behind a name or member path ([`collect_converged_fns`]), dropped the
-/// same way when the body binds the path's root.
+/// same device as `shadowed`. `converged` are the closures the converged
+/// values put behind a name or member path ([`ConvergedFns`]), dropped the
+/// same way when a body other than the render binds the path's root.
 ///
 /// `dispatches`: some body of the program fires event listeners itself
 /// ([`SetterWalk::dispatches`]).
@@ -207,7 +236,7 @@ pub(crate) fn collect_write_sites(
     dispatches: bool,
     shadowed: &HashSet<Var>,
     outer_fns: &HashMap<Var, Arc<CFG>>,
-    may_fns: &HashMap<Var, Vec<Arc<CFG>>>,
+    converged: &ConvergedFns<'_>,
     callback_bodies: &HashMap<HookLabel, Arc<CFG>>,
 ) -> Vec<WriteSite> {
     let mut found = Found::default();
@@ -228,15 +257,11 @@ pub(crate) fn collect_write_sites(
     // A body's own rename of an outer function (`const run = inc` in an
     // effect) only resolves once the outer names are in.
     let fn_bindings = resolve_aliases(cfg, &fn_bindings);
-    let may_fns: HashMap<Var, Vec<Arc<CFG>>> = may_fns
-        .iter()
-        .filter(|(path, _)| !local_binders.contains(path_root(path)))
-        .map(|(path, bodies)| (path.clone(), bodies.clone()))
-        .collect();
+    let converged = converged.seen_from(cfg);
     let mut walk = SetterWalk {
         setter_vars,
         fn_bindings: &fn_bindings,
-        may_fns: &may_fns,
+        converged: Some(&converged),
         walking: HashSet::new(),
         root: cfg as *const CFG as usize,
         effect_body,
@@ -355,13 +380,74 @@ pub(crate) fn collect_component_setter_vars(
     result
 }
 
+/// The closures a call through a name or member path may run, read off the
+/// converged values ([`collect_converged_fns`]), with what certifies that a
+/// call runs one of them for sure: the render CFG and the other bodies a
+/// [`must_member_binding`](crate::ir::bindings::must_member_binding) is
+/// checked against. The table the writer relation and `setter-in-render`
+/// walk (#233).
+pub(crate) struct ConvergedFns<'a> {
+    fns: HashMap<Var, Vec<Arc<CFG>>>,
+    render: &'a CFG,
+    scopes: Vec<(&'a [Var], &'a CFG)>,
+}
+
+impl<'a> ConvergedFns<'a> {
+    pub(crate) fn of(
+        render: &'a CFG,
+        hooks: &'a [HookEntry],
+        block_states: &HashMap<BlockId, AbstractEnv<StateValue>>,
+        heap: &Heap,
+        component: ComponentId,
+    ) -> Self {
+        ConvergedFns {
+            fns: collect_converged_fns(render, block_states, heap, component),
+            render,
+            scopes: must_alias_scopes(render, hooks),
+        }
+    }
+
+    /// The same table, without the paths whose root `body` binds: there the
+    /// name is the body's own (fail-closed, as `shadowed`). The render binds
+    /// the roots the table is about, so it keeps them all.
+    fn seen_from(&self, body: &CFG) -> Self {
+        let mut binders = HashSet::new();
+        if !std::ptr::eq(body, self.render) {
+            collect_binders(body, &mut binders);
+        }
+        ConvergedFns {
+            fns: self
+                .fns
+                .iter()
+                .filter(|(path, _)| !binders.contains(path_root(path)))
+                .map(|(path, bodies)| (path.clone(), bodies.clone()))
+                .collect(),
+            render: self.render,
+            scopes: self.scopes.clone(),
+        }
+    }
+
+    fn bodies(&self, path: &str) -> Option<&[Arc<CFG>]> {
+        self.fns.get(path).map(Vec::as_slice)
+    }
+
+    /// A call of `fn_` surely runs `body`: the table has no other closure
+    /// for it, and the callee is certainly bound to that literal.
+    fn certain(&self, fn_: &Expr, body: &Arc<CFG>) -> bool {
+        matches!(
+            crate::ir::bindings::must_member_binding(fn_, self.render, &self.scopes),
+            Some(Expr::FnLit { body_cfg, .. }) if Arc::ptr_eq(body_cfg, body)
+        )
+    }
+}
+
 /// Every closure of `component` a name or member path of `cfg` may point to
 /// in some block's converged env (#233): `api.inc` for a hook's or a memo's
 /// returned object, `inc` destructured off a memo. A call through the path
 /// may run any of them — the writer relation walks each body
-/// ([`SetterWalk::may_fns`]). Another component's closure stays a carried
-/// setter prop: its body names that component's bindings.
-pub(crate) fn collect_converged_fns(
+/// ([`ConvergedFns`]). Another component's closure stays a carried setter
+/// prop: its body names that component's bindings.
+fn collect_converged_fns(
     cfg: &CFG,
     block_states: &HashMap<BlockId, AbstractEnv<StateValue>>,
     heap: &Heap,
@@ -1449,8 +1535,13 @@ pub(crate) fn collect_slot_writers(
     ));
     // What no single binding certifies, the converged values may still point
     // at: a closure behind a member path (`api.inc()`) or a memo's member.
-    let converged_fns =
-        collect_converged_fns(render_cfg, envs.render_exits, envs.heap, envs.component);
+    let converged_fns = ConvergedFns::of(
+        render_cfg,
+        hooks,
+        envs.render_exits,
+        envs.heap,
+        envs.component,
+    );
 
     // A write reached through a function name is authored where that function
     // is defined, and a name can carry a closure out of the region it was
@@ -1681,9 +1772,9 @@ struct SetterWalk<'a> {
     setter_vars: &'a HashSet<Var>,
     fn_bindings: &'a HashMap<Var, Arc<CFG>>,
     /// Names and member paths the converged values point at closures of this
-    /// component ([`collect_converged_fns`]): a call through one may run
-    /// each body. Empty for every consumer without converged values.
-    may_fns: &'a HashMap<Var, Vec<Arc<CFG>>>,
+    /// component ([`ConvergedFns`]): a call through one may run each body.
+    /// `None` for every consumer without converged values.
+    converged: Option<&'a ConvergedFns<'a>>,
     walking: HashSet<usize>,
     /// The walk's outermost CFG (pointer identity) — where effect cleanup
     /// returns and reified listeners are recognized.
@@ -1737,10 +1828,6 @@ static NO_VARS: std::sync::LazyLock<HashSet<Var>> = std::sync::LazyLock::new(Has
 
 /// No proven wrappers — every consumer that walks without resolving summaries.
 static NO_WRAPPERS: std::sync::LazyLock<HashSet<String>> = std::sync::LazyLock::new(HashSet::new);
-
-/// No converged closures — every consumer that walks a body alone.
-static NO_FNS: std::sync::LazyLock<HashMap<Var, Vec<Arc<CFG>>>> =
-    std::sync::LazyLock::new(HashMap::new);
 
 impl SetterWalk<'_> {
     fn collect_reads(&self) -> bool {
@@ -2395,12 +2482,15 @@ impl<'a> SetterWalk<'a> {
             // A call through a name or member path no binding certifies, which
             // the converged values point at closures of this component
             // (`api.inc()`, #233): each body may run here, so its writes are
-            // the call's — none placed at the call, since it may run another.
+            // the call's. They are placed at the call only when it certainly
+            // runs that one closure — otherwise it may run another.
             if depth > 0
+                && let Some(converged) = self.converged
                 && let Some(name) = callee_path(fn_)
                 && !self.fn_bindings.contains_key(&name)
-                && let Some(bodies) = self.may_fns.get(&name)
+                && let Some(bodies) = converged.bodies(&name)
             {
+                let sure = matches!(bodies, [only] if converged.certain(fn_, only));
                 for body in bodies {
                     let mut inner = Found::default();
                     self.path.push(name.clone());
@@ -2413,7 +2503,7 @@ impl<'a> SetterWalk<'a> {
                         stmt_span,
                     );
                     self.path.pop();
-                    found.absorb(inner, body, mode, None, prov);
+                    found.absorb(inner, body, mode, at.filter(|_| sure), prov);
                 }
             }
             // An immediately-invoked function expression runs NOW, at this
@@ -2584,7 +2674,7 @@ pub fn collect_slot_reads(render_cfg: &CFG, hooks: &[HookEntry]) -> Vec<SlotRead
         let mut walk = SetterWalk {
             setter_vars: &NO_VARS,
             fn_bindings: &fn_bindings,
-            may_fns: &NO_FNS,
+            converged: None,
             walking: HashSet::new(),
             root: cfg as *const CFG as usize,
             effect_body: matches!(region, WriterRegion::Effect(_)),
@@ -2665,7 +2755,7 @@ pub fn collect_body_calls(cfg: &CFG, region: WriterRegion, max_depth: usize) -> 
     let mut walk = SetterWalk {
         setter_vars: &empty_vars,
         fn_bindings: &fn_bindings,
-        may_fns: &NO_FNS,
+        converged: None,
         walking: HashSet::new(),
         root: cfg as *const CFG as usize,
         effect_body: matches!(region, WriterRegion::Effect(_)),

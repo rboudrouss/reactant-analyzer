@@ -172,6 +172,95 @@ pub fn must_binding<'e>(
     None
 }
 
+/// [`must_binding`] through members: `api.inc` is the member `inc` of the
+/// object literal `api` is certainly bound to (the readable one, after every
+/// spread), `t[1]` the element of an exact array literal — when nothing can
+/// have replaced it since: no body, `scope` or `elsewhere`, uses the root
+/// other than to read a member (no member write rooted at it, no mutating
+/// method, no alias, no argument).
+pub fn must_member_binding<'e>(
+    expr: &'e Expr,
+    scope: &'e CFG,
+    elsewhere: &[(&[Var], &CFG)],
+) -> Option<&'e Expr> {
+    let (obj, key) = match expr.peel_ts() {
+        Expr::FieldAccess { obj, field } => (obj, field.clone()),
+        Expr::IndexAccess { arr, idx } => match idx.peel_ts() {
+            Expr::Lit(crate::ir::Prim::Int(i)) if *i >= 0 => (arr, i.to_string()),
+            _ => return None,
+        },
+        _ => return must_binding(expr, scope, elsewhere),
+    };
+    let root = root_var(obj)?;
+    if std::iter::once(scope)
+        .chain(elsewhere.iter().map(|(_, body)| *body))
+        .any(|body| used_whole(root, body))
+    {
+        return None;
+    }
+    let member = match must_member_binding(obj, scope, elsewhere)? {
+        Expr::ObjectLit { fields, .. } => object_member(fields, &key)?,
+        Expr::ArrayLit {
+            elems,
+            arity,
+            spread_at,
+            ..
+        } if spread_at.is_empty() && arity.exact() == Some(elems.len()) => {
+            elems.get(key.parse::<usize>().ok()?)?
+        }
+        _ => return None,
+    };
+    must_member_binding(member, scope, elsewhere)
+}
+
+/// The variable a member chain is rooted at: `api` for `api.a[0]`.
+fn root_var(expr: &Expr) -> Option<&Var> {
+    match expr.peel_ts() {
+        Expr::Var(v) => Some(v),
+        Expr::FieldAccess { obj, .. } => root_var(obj),
+        Expr::IndexAccess { arr, .. } => root_var(arr),
+        _ => None,
+    }
+}
+
+/// Does `cfg`, closures included, use `root` otherwise than as the receiver
+/// of a member read — the uses through which a member may be replaced?
+fn used_whole(root: &str, cfg: &CFG) -> bool {
+    fn expr(root: &str, e: &Expr) -> bool {
+        if crate::ir::expr::mutation_receiver(e)
+            .and_then(root_var)
+            .is_some_and(|r| r == root)
+        {
+            return true;
+        }
+        match e.peel_ts() {
+            Expr::Var(v) => v == root,
+            Expr::FieldAccess { obj, .. } if matches!(obj.peel_ts(), Expr::Var(v) if v == root) => {
+                false
+            }
+            Expr::IndexAccess { arr, idx } if matches!(arr.peel_ts(), Expr::Var(v) if v == root) => {
+                expr(root, idx)
+            }
+            Expr::FnLit {
+                params, body_cfg, ..
+            } => !params.iter().any(|p| p == root) && used_whole(root, body_cfg),
+            other => {
+                let mut found = false;
+                other.for_each_child(&mut |c| found = found || expr(root, c));
+                found
+            }
+        }
+    }
+    cfg.blocks.values().any(|block| {
+        let written = block.stmts.iter().any(|s| {
+            matches!(s, Stmt::MemberWrite { obj, .. } if root_var(obj).is_some_and(|r| r == root))
+        });
+        let mut found = written;
+        block.for_each_expr(&mut |e| found = found || expr(root, e));
+        found
+    })
+}
+
 /// Every function body nested under `cfg`, at any depth, with its parameters.
 pub fn nested_bodies(cfg: &CFG) -> Vec<(&[Var], &CFG)> {
     fn walk<'c>(e: &'c Expr, out: &mut Vec<(&'c [Var], &'c CFG)>) {

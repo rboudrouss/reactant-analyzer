@@ -949,6 +949,52 @@ fn a_setter_read_off_a_hook_value_called_in_render_is_setter_in_render() {
 }
 
 #[test]
+fn a_closure_called_through_a_member_path_in_render_is_setter_in_render() {
+    // #233: the closure a member path certainly names, written to on every
+    // path, called unconditionally: an Error. Called on one arm, or through
+    // a path that may name another closure, or off a root something may
+    // rewrite: a Warning.
+    let hook = r#"
+        function useCounter() {
+            const [v, setV] = useState(0);
+            return { v, inc: () => setV((x) => x + 1) };
+        }
+    "#;
+    let severity = |body: &str| {
+        let found = rules_for(
+            &format!("{hook}\nfunction App({{ c }}) {{ {body} }}"),
+            "App",
+        );
+        found
+            .iter()
+            .filter(|(r, _)| r == "setter-in-render")
+            .map(|(_, s)| *s)
+            .max_by_key(|s| *s == reactant::rules::Severity::Error)
+    };
+    use reactant::rules::Severity::{Error, Warning};
+    for (body, expected) in [
+        (
+            "const api = useCounter(); api.inc(); return <div />;",
+            Error,
+        ),
+        (
+            "const api = useCounter(); if (c) api.inc(); return <div />;",
+            Warning,
+        ),
+        (
+            "const api = useCounter(); if (c) api.inc = () => {}; api.inc(); return <div />;",
+            Warning,
+        ),
+        (
+            "const [v, setV] = useState(0); const api = c ? { inc: () => setV(1) } : { inc: () => {} }; api.inc(); return <div />;",
+            Warning,
+        ),
+    ] {
+        assert_eq!(severity(body), Some(expected), "{body}");
+    }
+}
+
+#[test]
 fn a_member_that_is_the_setter_on_one_path_only_is_no_certain_write() {
     // #233: `t[1]` is the setter at one block exit and a no-op at another;
     // the table is the meet of every exit, so the render call is a Warning.

@@ -70,7 +70,10 @@ that writes it (see *Cross-file limits*).
   something else and writes the setter when called, as a possible write. A name bound to several
   setters writes each of them, as a possible write of each
   [#202](https://github.com/rboudrouss/reactant-analyzer/issues/202). A closure called through a
-  member path (`api.inc()`) is walked where the converged values point it, and a hook call nested
+  member path (`api.inc()`) is walked where the converged values point it, in render as in an
+  effect; its write is a certain one only when the path certainly names one literal closure that
+  nothing may rewrite (`api` used only to read its members). A setter read off a value is surely
+  written only where every block exit binds it to that setter. A hook call nested
   in an expression (`return [v, useCallback(…)]`, `c && useMemo(…)`) is extracted like one
   written as a statement. Still missed: an array with a spread or an object member a spread may
   overwrite; a memo whose body returns something the heap does not place on some path; a slot

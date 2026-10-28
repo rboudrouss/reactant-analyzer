@@ -11,8 +11,7 @@ use crate::engine::guards::converges_once_written;
 use crate::engine::setters::{SetterCallPhase, SetterTargets};
 use crate::rules::helpers::eval_in_exit_env;
 use crate::rules::{
-    Diagnostic, ExitDominance, MustResult, Rule, collect_setter_calls, must_alias_scopes,
-    must_state_vals,
+    Diagnostic, ExitDominance, MustResult, Rule, must_alias_scopes, must_state_vals,
 };
 
 /// Fires when a state setter is called directly in the render body either a
@@ -98,213 +97,227 @@ impl Rule for SetterInRender {
         // otherwise conditional ⟹ Warning.
         let exit_dom = ExitDominance::of(&comp_result.render_cfg);
 
-        collect_setter_calls(&comp_result.render_cfg, &all_setter_vars, 2)
-            .into_iter()
-            .filter_map(|call| {
-                // The walk classified when this write runs, and this rule is
-                // the question "during the render pass?". A `Handler` or
-                // `Deferred` row is a *proof* of no — a user event or a known
-                // deferring registrar stands between the render pass and the
-                // write — so it is not this rule's finding. `Unknown` is ⊤ and
-                // stays, because ⊤ includes the render pass and dropping it
-                // would be the false negative #130 is about.
-                if !call.class.may_run_in_body() {
-                    return None;
-                }
-                // The cross-component map is an existential over program
-                // points; this call site is a program point (#119). Where the
-                // name is *only* a parent's setter by that existential — no
-                // local setter binds it — and this same block reassigns it to
-                // a function mentioning no setter before the call, there is no
-                // write here to report, and the row was reaching Error.
-                //
-                // Deliberately syntactic: the abstract env cannot answer this.
-                // At the call block of `if (c) { f = onUpdate; } f()` the env
-                // holds the join of the arrow and the setter, and that join
-                // drops setter-ness — so refuting on the env would delete the
-                // true finding along with the false one.
-                if cs_vars.contains_key(&call.var)
-                    && !local_setter_info.contains(&call.var)
-                    && let Some(bid) = call.block_id
-                    && let Some(block) = comp_result.render_cfg.blocks.get(&bid)
-                    && crate::rules::setter_reassigned_before_call(
-                        block,
-                        &call.var,
-                        call.span,
-                        &all_setter_vars,
-                    )
-                {
-                    return None;
-                }
-                // Unconditional call ⟹ a `Certified` proof — the only path to
-                // Error, and it takes two musts. The phase must be `Sync`: a ⊤
-                // row is never certain, whatever block it sits in, because the
-                // proof would be about the block, not about the timing. And
-                // calling the variable must provably write: a local helper that
-                // only *carries* a captured setter into a JSX handler writes
-                // nothing when called, and dominance cannot upgrade a may.
-                // A local name must be the setter by a certain binding: the
-                // alias table is a may-map (first binding wins), and a name
-                // bound to the setter on one path and to anything else on
-                // another — `if (c) set = setV`, a hook returning `[v, setV]`
-                // or `[v, noop]`, a closure the render runs that rebinds it
-                // (#235) — writes on some renders only.
-                let certainly_the_setter = !local_setter_info.contains(&call.var)
-                    || matches!(
-                        crate::ir::bindings::must_binding(
-                            &Expr::Var(call.var.clone()),
-                            &comp_result.render_cfg,
-                            &scopes
-                        ),
-                        Some(Expr::StateSetter(_))
-                    );
-                let certain_write = call.class == SetterCallPhase::Sync
-                    && certainly_the_setter
-                    && cs_vars
-                        .get(&call.var)
-                        .is_none_or(|ps| ps.iter().all(|p| p.must_write));
-                let proof = certain_write
-                    .then_some(call.block_id)
-                    .flatten()
-                    .and_then(|bid| match exit_dom.certify(bid) {
-                        MustResult::All(c) => Some(c),
-                        _ => None,
-                    });
-
-                // Sanctioned adjust-during-render idiom: conditional local call
-                // whose guards die once the written value is in the slot —
-                // converges after one extra render, no diagnostic.
-                if proof.is_none()
-                    && let Some(bid) = call.block_id
-                    && let Some(label) = local_setter_info.sole(&call.var)
-                    && let Some(arg) = setter_call_arg(&comp_result.render_cfg, bid, &call.var)
-                    && converges_once_written(
+        // A closure the converged values put behind a called path
+        // (`api.inc()`) runs at the call: its writes are render writes there.
+        let converged = crate::engine::setters::ConvergedFns::of(
+            &comp_result.render_cfg,
+            &comp_result.hooks,
+            &comp_result.block_states,
+            &comp_result.heap,
+            component,
+        );
+        crate::engine::setters::collect_setter_calls_converged(
+            &comp_result.render_cfg,
+            &all_setter_vars,
+            2,
+            &converged,
+        )
+        .into_iter()
+        .filter_map(|call| {
+            // The walk classified when this write runs, and this rule is
+            // the question "during the render pass?". A `Handler` or
+            // `Deferred` row is a *proof* of no — a user event or a known
+            // deferring registrar stands between the render pass and the
+            // write — so it is not this rule's finding. `Unknown` is ⊤ and
+            // stays, because ⊤ includes the render pass and dropping it
+            // would be the false negative #130 is about.
+            if !call.class.may_run_in_body() {
+                return None;
+            }
+            // The cross-component map is an existential over program
+            // points; this call site is a program point (#119). Where the
+            // name is *only* a parent's setter by that existential — no
+            // local setter binds it — and this same block reassigns it to
+            // a function mentioning no setter before the call, there is no
+            // write here to report, and the row was reaching Error.
+            //
+            // Deliberately syntactic: the abstract env cannot answer this.
+            // At the call block of `if (c) { f = onUpdate; } f()` the env
+            // holds the join of the arrow and the setter, and that join
+            // drops setter-ness — so refuting on the env would delete the
+            // true finding along with the false one.
+            if cs_vars.contains_key(&call.var)
+                && !local_setter_info.contains(&call.var)
+                && let Some(bid) = call.block_id
+                && let Some(block) = comp_result.render_cfg.blocks.get(&bid)
+                && crate::rules::setter_reassigned_before_call(
+                    block,
+                    &call.var,
+                    call.span,
+                    &all_setter_vars,
+                )
+            {
+                return None;
+            }
+            // Unconditional call ⟹ a `Certified` proof — the only path to
+            // Error, and it takes two musts. The phase must be `Sync`: a ⊤
+            // row is never certain, whatever block it sits in, because the
+            // proof would be about the block, not about the timing. And
+            // calling the variable must provably write: a local helper that
+            // only *carries* a captured setter into a JSX handler writes
+            // nothing when called, and dominance cannot upgrade a may.
+            // A local name must be the setter by a certain binding: the
+            // alias table is a may-map (first binding wins), and a name
+            // bound to the setter on one path and to anything else on
+            // another — `if (c) set = setV`, a hook returning `[v, setV]`
+            // or `[v, noop]`, a closure the render runs that rebinds it
+            // (#235) — writes on some renders only.
+            let certainly_the_setter = !local_setter_info.contains(&call.var)
+                || matches!(
+                    crate::ir::bindings::must_binding(
+                        &Expr::Var(call.var.clone()),
                         &comp_result.render_cfg,
-                        bid,
-                        &state_vals,
-                        label,
-                        &eval_in_exit_env(arg, comp_result),
-                        Some(arg),
-                        &comp_result.exit_env(),
-                        &mut |e| eval_in_exit_env(e, comp_result),
-                    )
-                {
-                    return None;
-                }
+                        &scopes
+                    ),
+                    Some(Expr::StateSetter(_))
+                );
+            let certain_write = call.class == SetterCallPhase::Sync
+                && certainly_the_setter
+                && cs_vars
+                    .get(&call.var)
+                    .is_none_or(|ps| ps.iter().all(|p| p.must_write));
+            let proof = certain_write
+                .then_some(call.block_id)
+                .flatten()
+                .and_then(|bid| match exit_dom.certify(bid) {
+                    MustResult::All(c) => Some(c),
+                    _ => None,
+                });
 
-                // Rule name, message, and primary anchor (local label vs prop var).
-                let (rule_name, message, label, var): (
-                    &'static str,
-                    String,
-                    Option<HookLabel>,
-                    Option<Var>,
-                ) = if let Some(label) = local_setter_info.targets(&call.var).next() {
-                    (
-                        "setter-in-render",
-                        if call.class == SetterCallPhase::Sync {
-                            format!(
-                                "setter `{}` called directly in the render body, \
+            // Sanctioned adjust-during-render idiom: conditional local call
+            // whose guards die once the written value is in the slot —
+            // converges after one extra render, no diagnostic.
+            if proof.is_none()
+                && let Some(bid) = call.block_id
+                && let Some(label) = local_setter_info.sole(&call.var)
+                && let Some(arg) = setter_call_arg(&comp_result.render_cfg, bid, &call.var)
+                && converges_once_written(
+                    &comp_result.render_cfg,
+                    bid,
+                    &state_vals,
+                    label,
+                    &eval_in_exit_env(arg, comp_result),
+                    Some(arg),
+                    &comp_result.exit_env(),
+                    &mut |e| eval_in_exit_env(e, comp_result),
+                )
+            {
+                return None;
+            }
+
+            // Rule name, message, and primary anchor (local label vs prop var).
+            let (rule_name, message, label, var): (
+                &'static str,
+                String,
+                Option<HookLabel>,
+                Option<Var>,
+            ) = if let Some(label) = local_setter_info.targets(&call.var).next() {
+                (
+                    "setter-in-render",
+                    if call.class == SetterCallPhase::Sync {
+                        format!(
+                            "setter `{}` called directly in the render body, \
                                  move this call into a useEffect or an event handler",
-                                crate::ir::source_name(&call.var)
-                            )
-                        } else {
-                            unknown_phase_message(&call.var)
-                        },
-                        Some(label),
-                        None,
-                    )
-                } else if let Some(props) = cs_vars.get(&call.var)
-                    && props.iter().all(|p| p.component == component)
-                {
-                    (
-                        "setter-in-render",
-                        if call.class == SetterCallPhase::Sync {
-                            format!(
-                                "setter `{}` called directly in the render body, \
+                            crate::ir::source_name(&call.var)
+                        )
+                    } else {
+                        unknown_phase_message(&call.var)
+                    },
+                    Some(label),
+                    None,
+                )
+            } else if let Some(props) = cs_vars.get(&call.var)
+                && props.iter().all(|p| p.component == component)
+            {
+                (
+                    "setter-in-render",
+                    if call.class == SetterCallPhase::Sync {
+                        format!(
+                            "setter `{}` called directly in the render body, \
                                  move this call into a useEffect or an event handler",
-                                crate::ir::source_name(&call.var)
-                            )
-                        } else {
-                            unknown_phase_message(&call.var)
-                        },
-                        props.first().map(|p| p.label),
-                        None,
-                    )
-                } else if let Some(props) = cs_vars.get(&call.var) {
-                    // A prop several call sites bind to several parents'
-                    // setters names them all.
-                    let mut parents: Vec<String> = props
-                        .iter()
-                        .filter(|p| p.component != component)
-                        .map(|p| result.display_name(p.component))
-                        .collect();
-                    parents.dedup();
-                    let parents = parents.join("` or `");
-                    (
-                        "cross-setter-in-render",
-                        if call.class == SetterCallPhase::Sync {
-                            format!(
-                                "prop `{}` (a state setter of parent `{}`) called during render \
+                            crate::ir::source_name(&call.var)
+                        )
+                    } else {
+                        unknown_phase_message(&call.var)
+                    },
+                    props.first().map(|p| p.label),
+                    None,
+                )
+            } else if let Some(props) = cs_vars.get(&call.var) {
+                // A prop several call sites bind to several parents'
+                // setters names them all.
+                let mut parents: Vec<String> = props
+                    .iter()
+                    .filter(|p| p.component != component)
+                    .map(|p| result.display_name(p.component))
+                    .collect();
+                parents.dedup();
+                let parents = parents.join("` or `");
+                (
+                    "cross-setter-in-render",
+                    if call.class == SetterCallPhase::Sync {
+                        format!(
+                            "prop `{}` (a state setter of parent `{}`) called during render \
                                  of `{}`, which triggers a parent re-render on every render",
-                                crate::ir::source_name(&call.var),
-                                parents,
-                                result.display_name(component)
-                            )
-                        } else {
-                            format!(
-                                "prop `{}` (a state setter of parent `{}`) is handed to a callee \
+                            crate::ir::source_name(&call.var),
+                            parents,
+                            result.display_name(component)
+                        )
+                    } else {
+                        format!(
+                            "prop `{}` (a state setter of parent `{}`) is handed to a callee \
                                  with no timing summary. If that callee runs it during render, \
                                  `{}` re-renders its parent on every render",
-                                crate::ir::source_name(&call.var),
-                                parents,
-                                result.display_name(component)
-                            )
-                        },
-                        None,
-                        Some(call.var.clone()),
-                    )
-                } else {
-                    (
-                        "setter-in-render",
-                        if call.class == SetterCallPhase::Sync {
-                            format!(
-                                "setter `{}` called in the render body",
-                                crate::ir::source_name(&call.var)
-                            )
-                        } else {
-                            unknown_phase_message(&call.var)
-                        },
-                        None,
-                        None,
-                    )
-                };
-
-                let mut d = match proof {
-                    Some(proof) => Diagnostic::error(rule_name, proof, message),
-                    None => Diagnostic::warn(rule_name, message),
-                };
-                if let Some(label) = label {
-                    d = d.with_label(label);
-                }
-                if let Some(var) = var {
-                    d = d.with_var(var);
-                }
-                if let Some(r) = call.span {
-                    d = d.with_range(r);
-                }
-                // Witness (ADR-019): the render-time setter call itself.
-                d = d.with_step(
-                    crate::rules::Step::Call {
-                        callee: call.var.clone(),
-                        class: crate::rules::EffectClass::Setter,
+                            crate::ir::source_name(&call.var),
+                            parents,
+                            result.display_name(component)
+                        )
                     },
                     None,
-                    call.span,
-                    &crate::rules::api::witness::fallback_name,
-                );
-                Some(d)
-            })
-            .collect()
+                    Some(call.var.clone()),
+                )
+            } else {
+                (
+                    "setter-in-render",
+                    if call.class == SetterCallPhase::Sync {
+                        format!(
+                            "setter `{}` called in the render body",
+                            crate::ir::source_name(&call.var)
+                        )
+                    } else {
+                        unknown_phase_message(&call.var)
+                    },
+                    None,
+                    None,
+                )
+            };
+
+            let mut d = match proof {
+                Some(proof) => Diagnostic::error(rule_name, proof, message),
+                None => Diagnostic::warn(rule_name, message),
+            };
+            if let Some(label) = label {
+                d = d.with_label(label);
+            }
+            if let Some(var) = var {
+                d = d.with_var(var);
+            }
+            if let Some(r) = call.span {
+                d = d.with_range(r);
+            }
+            // Witness (ADR-019): the render-time setter call itself.
+            d = d.with_step(
+                crate::rules::Step::Call {
+                    callee: call.var.clone(),
+                    class: crate::rules::EffectClass::Setter,
+                },
+                None,
+                call.span,
+                &crate::rules::api::witness::fallback_name,
+            );
+            Some(d)
+        })
+        .collect()
     }
 }
 
