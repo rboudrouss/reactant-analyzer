@@ -2343,3 +2343,21 @@ export function C() {{
         assert!(!sevs.is_empty(), "{decl} {effect}");
     }
 }
+
+#[test]
+fn a_parameter_default_that_writes_state_is_a_write() {
+    // `go()` omits `v`, so its default runs and stores a new object into the
+    // slot the effect's deps read.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [s, setS] = useState({});
+  useEffect(() => {
+    const go = (v = setS({})) => v;
+    go();
+  }, [s]);
+  return <div />;
+}
+"#;
+    assert!(!loop_severities(src, "C").is_empty());
+}

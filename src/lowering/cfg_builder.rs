@@ -973,18 +973,50 @@ pub(super) fn inject_param_preamble(
 ) -> Vec<String> {
     let mut names = Vec::new();
     for (i, p) in params.items.iter().enumerate() {
-        match &p.pattern {
-            BindingPattern::BindingIdentifier(id) => {
-                names.push(id.name.to_string());
-            }
-            other => {
-                let temp = format!("__p{}", i);
-                names.push(temp.clone());
-                lower_binding_pattern(other, Expr::Var(temp), None, builder);
-            }
+        let name = match &p.pattern {
+            BindingPattern::BindingIdentifier(id) => id.name.to_string(),
+            _ => format!("__p{}", i),
+        };
+        names.push(name.clone());
+        if let Some(init) = p.initializer.as_deref() {
+            lower_param_default(&name, init, builder);
+        }
+        if !matches!(p.pattern, BindingPattern::BindingIdentifier(_)) {
+            lower_binding_pattern(&p.pattern, Expr::Var(name), None, builder);
         }
     }
     names
+}
+
+/// `name = init` evaluates `init` when the argument is `undefined`: lowered
+/// under that test, so its reads and its writes stay in the body — a setter
+/// call, a reassignment of an earlier parameter. Dropping it was a write the
+/// body makes and no walk saw. As for a destructuring default, the value is
+/// not modeled: the name keeps the argument.
+fn lower_param_default(name: &str, init: &Expression, builder: &mut BlockBuilder) {
+    let span = builder.span_at(init.span().start);
+    let then_ = builder.new_block();
+    let join = builder.new_block();
+    let test = builder.seal_with(Terminator::Branch {
+        cond: Expr::BinOp {
+            op: crate::ir::expr::BinOp::Eq,
+            lhs: Box::new(Expr::Var(name.to_string())),
+            rhs: Box::new(Expr::Lit(Prim::Unit)),
+        },
+        then_,
+        else_: join,
+        span,
+    });
+    builder.add_edge(test, then_, EdgeKind::IfTrue);
+    builder.add_edge(test, join, EdgeKind::IfFalse);
+    builder.start_block(then_);
+    let value = lower_expr(init, builder);
+    builder.push_stmt(Stmt::ExprStmt(value, span));
+    if !builder.is_terminated() {
+        let end = builder.seal_with(Terminator::Jump(join));
+        builder.add_edge(end, join, EdgeKind::Unconditional);
+    }
+    builder.start_block(join);
 }
 
 /// Build a function body CFG with param destructuring preamble.
