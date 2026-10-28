@@ -1030,3 +1030,37 @@ fn a_member_that_is_the_setter_on_one_path_only_is_no_certain_write() {
         );
     }
 }
+
+#[test]
+fn a_setter_joined_with_an_unknown_value_is_still_written() {
+    // #238: `api.f` is `setV` or what an unknown callee returned (⊤). The
+    // join kept no setter, so neither call below wrote anything. Both are
+    // possible writes: a loop Warning, a render Warning, never an Error.
+    let hook = r#"
+        import { wrap } from "ext";
+        function useThing(c) {
+            const [v, setV] = useState(0);
+            const f = c ? wrap(setV) : setV;
+            return { v, f };
+        }
+    "#;
+    for (body, rule) in [
+        (
+            "useEffect(() => { api.f(api.v + 1); }); return <div />;",
+            "infinite-loop",
+        ),
+        ("api.f(1); return <div />;", "setter-in-render"),
+    ] {
+        let found = rules_for(
+            &format!("{hook}\nfunction App({{ c }}) {{ const api = useThing(c); {body} }}"),
+            "App",
+        );
+        assert!(fires(&found, rule), "{body}: {found:?}");
+        assert!(
+            found
+                .iter()
+                .all(|(_, s)| *s != reactant::rules::Severity::Error),
+            "{body}: {found:?}"
+        );
+    }
+}

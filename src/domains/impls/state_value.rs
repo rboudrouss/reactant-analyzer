@@ -234,7 +234,7 @@ impl StateValue {
             && *reference == Stability::Unknown
             && *null
             && *undef
-            && *setter == SetterVal::Top
+            && !setter.is_closed()
             && *other
     }
 
@@ -284,15 +284,16 @@ impl StateValue {
     /// one that may also be something else (`c ? [setV, v] : [v, setV]`, #233)
     /// — a call of a non-function throws and a call of another function runs
     /// elsewhere, so the setters are still what the call may write. That the
-    /// call surely writes one is [`Self::surely_setter`].
+    /// call surely writes one is [`Self::surely_setter`]. A setter joined with
+    /// a value the analysis cannot see into is still named (#238).
     pub fn setters(&self) -> Vec<(ComponentId, HookLabel)> {
         self.setter.candidates().collect()
     }
 
-    /// The value can only be a setter: a call of it surely writes one of
-    /// [`Self::setters`].
+    /// The value can only be one of [`Self::setters`]: a call of it surely
+    /// writes one of them.
     pub fn surely_setter(&self) -> bool {
-        self.populated_kinds().only(KindMask::SETTER)
+        self.populated_kinds().only(KindMask::SETTER) && self.setter.is_closed()
     }
 
     /// True when the value is exactly a per-render-fresh reference (nothing
@@ -576,12 +577,13 @@ impl fmt::Debug for StateValue {
         }
         match &self.setter {
             SetterVal::Bottom => {}
-            SetterVal::Some(s) => parts.push(format!(
-                "setter({})",
-                s.iter()
+            s @ (SetterVal::Some(_) | SetterVal::Open(_)) => parts.push(format!(
+                "setter({}{})",
+                s.candidates()
                     .map(|(c, l)| format!("#{}#{l}", c.index()))
                     .collect::<Vec<_>>()
-                    .join(",")
+                    .join(","),
+                if s.is_closed() { "" } else { ",…" }
             )),
             SetterVal::Top => parts.push("setter".into()),
         }
@@ -635,7 +637,7 @@ impl AbstractDomain for StateValue {
             reference: Stability::Unknown,
             null: true,
             undef: true,
-            setter: SetterVal::Top,
+            setter: SetterVal::unnamed(),
             other: true,
         }
     }
@@ -1359,7 +1361,12 @@ mod tests {
 
     #[test]
     fn component_setter_join_with_top_gives_top() {
-        assert!(cs("Foo", 0).join(&StateValue::top()).is_top_value());
+        let j = cs("Foo", 0).join(&StateValue::top());
+        assert!(j.is_top_value());
+        // ⊤ does not erase the setter it is joined with (#238): a call may
+        // write it, not surely.
+        assert_eq!(j.setters(), vec![(crate::test_support::named("Foo"), 0)]);
+        assert!(!j.surely_setter());
     }
 
     #[test]
