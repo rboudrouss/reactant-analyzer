@@ -819,12 +819,10 @@ fn a_hook_returning_its_setter_on_one_path_only_is_not_a_certain_write() {
 }
 
 #[test]
-#[ignore = "#202: a setter binding is one label, the join of two keeps the first"]
 fn a_hook_returning_a_branch_chosen_setter_writes_both() {
-    // Each return is forwarded, so `s` is bound on both paths; what is lost
-    // is the join: a setter binding holds one label and the alias pass is
-    // first-wins, so `s` reads as `setA` and the write of `b` under `[b]` —
-    // the loop, when `c` is falsy — is never seen.
+    // Each return is forwarded, so `s` is bound on both paths, and the join
+    // keeps both setters (#202): the write of `b` under `[b]` — the loop,
+    // when `c` is falsy — is a Warning, not an Error, since `c` may be truthy.
     let found = rules_for(
         r#"
         function usePick(c) {
@@ -843,5 +841,14 @@ fn a_hook_returning_a_branch_chosen_setter_writes_both() {
         "#,
         "App",
     );
-    assert!(fires(&found, "infinite-loop"), "{found:?}");
+    let loops: Vec<_> = found
+        .iter()
+        .filter(|(r, _)| r == "infinite-loop")
+        .map(|(_, s)| *s)
+        .collect();
+    assert!(
+        loops.contains(&reactant::rules::Severity::Warning)
+            && !loops.contains(&reactant::rules::Severity::Error),
+        "{found:?}"
+    );
 }

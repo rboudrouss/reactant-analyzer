@@ -518,11 +518,11 @@ fn bind_rhs<T: Transfer>(
         env.extend_loc(var.to_string(), *id);
     }
     if let Expr::Var(src) = rhs {
-        if let Some(label) = env.setter_label(src) {
-            env.bind_setter(var.to_string(), label);
+        if let Some(labels) = env.setter_labels(src).cloned() {
+            env.bind_setters(var.to_string(), labels);
         }
-        if let Some(label) = env.callback_label(src) {
-            env.bind_callback(var.to_string(), label);
+        if let Some(labels) = env.callback_labels(src).cloned() {
+            env.bind_callbacks(var.to_string(), labels);
         }
     }
     // A slot read, or a rename of one, certifies the name (#197); any
@@ -629,13 +629,14 @@ fn exec_slot_write<T: Transfer>(
     depth: usize,
 ) {
     let bound = match fn_ {
-        Expr::Var(name) => env.setter_label(name),
+        Expr::Var(name) => env.setter_labels(name),
         _ => None,
     };
-    // A value two call sites bound to two setters writes one of them: each
-    // candidate gets the write, a join like every slot write.
+    // A name two paths bound to two setters (#202), or a value two call sites
+    // bound to two setters, writes one of them: each candidate gets the
+    // write, a join like every slot write.
     let targets = match bound {
-        Some(label) => vec![(ctx.component, label)],
+        Some(labels) => labels.iter().map(|&l| (ctx.component, l)).collect(),
         None => transfer
             .eval_expr(fn_, env, ctx)
             .as_state_value()
@@ -831,13 +832,23 @@ pub(crate) fn exec_fn_value<T: Transfer>(
             // useCallback binding: the body lives in the hook entry, not the
             // heap (the rewrite to `CallbackVal` moved it out of the
             // expression tree). Params stay unbound → env-miss ⊤, captures
-            // resolve in the live env.
+            // resolve in the live env. A name two paths bound to two
+            // callbacks runs either: each runs, and the call returns the
+            // join when every body is in reach.
             if let Expr::Var(name) = other
-                && let Some(label) = env.callback_label(name)
-                && let Some(body_cfg) = ctx.query.callback_body(label)
+                && let Some(labels) = env.callback_labels(name).cloned()
             {
-                let ret = exec_body_depth(transfer, &body_cfg, env, ctx, depth + 1);
-                return Some(ret).filter(|v| !v.is_bottom());
+                let mut returned = Some(T::Domain::bottom());
+                for label in labels {
+                    match ctx.query.callback_body(label) {
+                        Some(body_cfg) => {
+                            let ret = exec_body_depth(transfer, &body_cfg, env, ctx, depth + 1);
+                            returned = returned.map(|r| r.join(&ret));
+                        }
+                        None => returned = None,
+                    }
+                }
+                return returned.filter(|v| !v.is_bottom());
             }
             None
         }

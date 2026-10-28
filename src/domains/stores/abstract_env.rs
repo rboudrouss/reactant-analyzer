@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use imbl::{OrdMap, ordmap::DiffItem};
 
@@ -87,11 +87,14 @@ type Map<K, V> = OrdMap<K, V>;
 pub struct AbstractEnv<D: AbstractDomain> {
     stabs: Map<Var, D>,
     locs: Map<Var, HashSet<ExprId>>,
-    setter_bindings: Map<Var, HookLabel>,
+    /// The setters a name may be: one per path that bound it, unioned at a
+    /// join (#202).
+    setter_bindings: Map<Var, Labels>,
     /// Side-channel for `useCallback` bindings: the body lives in the hook
     /// entry (`QueryContext::callback_body`), not the heap, so calls through
-    /// the variable can still be executed for side effects.
-    callback_bindings: Map<Var, HookLabel>,
+    /// the variable can still be executed for side effects. Unioned at a
+    /// join, as the setters are.
+    callback_bindings: Map<Var, Labels>,
     /// The names that are, at this point, the value a state slot was read
     /// as in this render: `a = StateVal(l)` and its renames. A primitive
     /// slot's value carries no label (ADR-017, #203), so this is the only
@@ -127,15 +130,39 @@ fn agreed_slots(a: &Map<Var, HookLabel>, b: &Map<Var, HookLabel>) -> Map<Var, Ho
     out
 }
 
-/// `a` with the bindings only `b` has: on a name both bind, `a` wins.
-fn union_first_wins(a: &Map<Var, HookLabel>, b: &Map<Var, HookLabel>) -> Map<Var, HookLabel> {
+/// The hooks a name may be bound to.
+pub type Labels = BTreeSet<HookLabel>;
+
+/// Every binding of either side, a name both bind holding the union.
+fn union_labels(a: &Map<Var, Labels>, b: &Map<Var, Labels>) -> Map<Var, Labels> {
     let mut out = a.clone();
     for item in a.diff(b) {
-        if let DiffItem::Add(k, v) = item {
-            out.insert(k.clone(), *v);
+        match item {
+            DiffItem::Add(k, v) => {
+                out.insert(k.clone(), v.clone());
+            }
+            DiffItem::Update {
+                old: (k, x),
+                new: (_, y),
+            } => {
+                out.insert(k.clone(), x.union(y).copied().collect());
+            }
+            DiffItem::Remove(..) => {}
         }
     }
     out
+}
+
+/// `a ⊑ b` over label bindings: every name `a` binds, `b` binds to a superset.
+fn labels_leq(a: &Map<Var, Labels>, b: &Map<Var, Labels>) -> bool {
+    a.diff(b).all(|item| match item {
+        DiffItem::Update {
+            old: (_, x),
+            new: (_, y),
+        } => x.is_subset(y),
+        DiffItem::Remove(_, x) => x.is_empty(),
+        DiffItem::Add(..) => true,
+    })
 }
 
 impl<D: AbstractDomain> AbstractEnv<D> {
@@ -202,24 +229,42 @@ impl<D: AbstractDomain> AbstractEnv<D> {
         self.locs.insert(var, ids);
     }
 
-    /// Record that `var` is a state-setter for hook `label`.
+    /// Record that `var` is the state-setter for hook `label`, and nothing
+    /// else.
     pub fn bind_setter(&mut self, var: Var, label: HookLabel) {
-        self.setter_bindings.insert(var, label);
+        self.setter_bindings.insert(var, Labels::from([label]));
     }
 
-    /// Returns the hook label if `var` is a known state-setter, else `None`.
+    /// Record that `var` is one of the state-setters `labels`.
+    pub fn bind_setters(&mut self, var: Var, labels: Labels) {
+        self.setter_bindings.insert(var, labels);
+    }
+
+    /// The hooks `var` may be the state-setter of; none for a non-setter.
+    pub fn setter_labels(&self, var: &str) -> Option<&Labels> {
+        self.setter_bindings.get(var)
+    }
+
+    /// The hook `var` is the state-setter of, when it is one setter.
     pub fn setter_label(&self, var: &str) -> Option<HookLabel> {
-        self.setter_bindings.get(var).copied()
+        self.setter_labels(var)
+            .filter(|s| s.len() == 1)
+            .and_then(|s| s.first().copied())
     }
 
     /// Record that `var` is bound to a `useCallback` hook `label`.
     pub fn bind_callback(&mut self, var: Var, label: HookLabel) {
-        self.callback_bindings.insert(var, label);
+        self.callback_bindings.insert(var, Labels::from([label]));
     }
 
-    /// Returns the hook label if `var` is a known `useCallback` binding.
-    pub fn callback_label(&self, var: &str) -> Option<HookLabel> {
-        self.callback_bindings.get(var).copied()
+    /// Record that `var` is one of the `useCallback` hooks `labels`.
+    pub fn bind_callbacks(&mut self, var: Var, labels: Labels) {
+        self.callback_bindings.insert(var, labels);
+    }
+
+    /// The `useCallback` hooks `var` may be bound to; none for another name.
+    pub fn callback_labels(&self, var: &str) -> Option<&Labels> {
+        self.callback_bindings.get(var)
     }
 
     /// Pointwise join over the entries that differ: a name both sides bind
@@ -273,8 +318,8 @@ impl<D: AbstractDomain> AbstractEnv<D> {
         AbstractEnv {
             stabs: Self::join_stabs(&self.stabs, &other.stabs),
             locs: Self::join_locs(&self.locs, &other.locs),
-            setter_bindings: union_first_wins(&self.setter_bindings, &other.setter_bindings),
-            callback_bindings: union_first_wins(&self.callback_bindings, &other.callback_bindings),
+            setter_bindings: union_labels(&self.setter_bindings, &other.setter_bindings),
+            callback_bindings: union_labels(&self.callback_bindings, &other.callback_bindings),
             slot_bindings: agreed_slots(&self.slot_bindings, &other.slot_bindings),
         }
     }
@@ -306,8 +351,8 @@ impl<D: AbstractDomain> AbstractEnv<D> {
         AbstractEnv {
             stabs,
             locs: Self::join_locs(&self.locs, &other.locs),
-            setter_bindings: union_first_wins(&self.setter_bindings, &other.setter_bindings),
-            callback_bindings: union_first_wins(&self.callback_bindings, &other.callback_bindings),
+            setter_bindings: union_labels(&self.setter_bindings, &other.setter_bindings),
+            callback_bindings: union_labels(&self.callback_bindings, &other.callback_bindings),
             slot_bindings: agreed_slots(&self.slot_bindings, &other.slot_bindings),
         }
     }
@@ -347,7 +392,8 @@ impl<D: AbstractDomain> AbstractEnv<D> {
                 return false;
             }
         }
-        true
+        labels_leq(&self.setter_bindings, &other.setter_bindings)
+            && labels_leq(&self.callback_bindings, &other.callback_bindings)
     }
 }
 
@@ -441,6 +487,20 @@ mod tests {
         let joined = a.join(&b);
         assert_eq!(joined.setter_label("setA"), Some(0));
         assert_eq!(joined.setter_label("setB"), Some(1));
+    }
+
+    #[test]
+    fn a_join_of_two_setters_bound_to_one_name_keeps_both() {
+        let mut a = Env::new();
+        a.bind_setter("s".to_string(), 0);
+        let mut b = Env::new();
+        b.bind_setter("s".to_string(), 1);
+        let both = Labels::from([0, 1]);
+        assert_eq!(a.join(&b).setter_labels("s"), Some(&both));
+        assert_eq!(b.join(&a).setter_labels("s"), Some(&both), "commutative");
+        assert_eq!(a.widen_to(&b, &[]).setter_labels("s"), Some(&both));
+        assert_eq!(a.join(&b).setter_label("s"), None, "no one setter");
+        assert!(a.leq(&a.join(&b)) && !a.join(&b).leq(&a));
     }
 
     #[test]

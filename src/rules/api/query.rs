@@ -842,11 +842,7 @@ fn slot_write_evidence(
     if !may.contains(&slot) {
         return (false, None);
     }
-    let setters: HashSet<Var> = setter_labels
-        .iter()
-        .filter(|(_, l)| **l == slot)
-        .map(|(v, _)| v.clone())
-        .collect();
+    let setters: HashSet<Var> = setter_labels.aliases_of(slot);
     let render_fns = crate::rules::collect_fn_bindings(&owner.render_cfg);
     let mut spans: Vec<SourceRange> = std::iter::once(&owner.render_cfg)
         .chain(owner.hooks.iter().filter_map(|h| h.body_cfg()))

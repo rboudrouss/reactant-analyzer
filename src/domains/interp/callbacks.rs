@@ -28,7 +28,7 @@ pub enum TriggerClass {
 pub fn classify_callee<D: AbstractDomain>(fn_: &Expr, env: &AbstractEnv<D>) -> TriggerClass {
     match fn_ {
         Expr::Var(name) => {
-            if env.setter_label(name).is_some() {
+            if env.setter_labels(name).is_some() {
                 TriggerClass::Setter
             } else {
                 match name.as_str() {

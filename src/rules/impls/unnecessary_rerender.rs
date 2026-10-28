@@ -11,9 +11,8 @@ use crate::{
     },
 };
 
-use crate::rules::{
-    Diagnostic, Rule, resolve_setter_aliases, setter_var_labels, state_slot_name, state_val_labels,
-};
+use crate::engine::setters::SetterTargets;
+use crate::rules::{Diagnostic, Rule, state_slot_name, state_val_labels};
 
 /// Fires when a mount-only effect (`deps: []`) sets a state to a stable constant
 /// that differs from the state's init value.
@@ -82,7 +81,7 @@ impl Rule for UnnecessaryRerender {
             .collect();
 
         // Setter var → state label, from the render body's `let setX = useState(...)[1]`.
-        let setter_to_label = setter_var_labels(&result.render_cfg);
+        let setter_to_label = SetterTargets::bound_in(&result.render_cfg);
         let state_names = state_val_labels(&result.render_cfg);
 
         let mut diags = Vec::new();
@@ -105,7 +104,7 @@ impl Rule for UnnecessaryRerender {
             // Utility inlining binds a setter param via an alias `let setter = setX`
             // inside the effect body. Follow such aliases so a spliced `setter(B)`
             // is still recognised as a call to the underlying state setter.
-            let setters = resolve_setter_aliases(body_cfg, &setter_to_label);
+            let setters = setter_to_label.resolve(body_cfg);
 
             // Order-independent scan: any const setter call anywhere in a
             // mount-only effect forces the extra render, so a flat pass over
@@ -119,74 +118,74 @@ impl Rule for UnnecessaryRerender {
                         continue;
                     };
 
-                    let Some(&state_label) = setters.get(setter_name) else {
-                        continue;
-                    };
+                    // A name bound to several setters (#202) writes one of
+                    // them: each is a possible extra render.
+                    for state_label in setters.targets(setter_name) {
+                        let Some(init_val) = init_values.get(&state_label) else {
+                            continue;
+                        };
+                        if !init_val.is_stable() {
+                            continue;
+                        }
 
-                    let Some(init_val) = init_values.get(&state_label) else {
-                        continue;
-                    };
-                    if !init_val.is_stable() {
-                        continue;
-                    }
+                        let arg_val = args
+                            .first()
+                            .map(|a| {
+                                use crate::rules::ConvergedEval;
+                                result.eval_in(&empty_env, a)
+                            })
+                            .unwrap_or(StateValue::top());
 
-                    let arg_val = args
-                        .first()
-                        .map(|a| {
-                            use crate::rules::ConvergedEval;
-                            result.eval_in(&empty_env, a)
-                        })
-                        .unwrap_or(StateValue::top());
+                        if !arg_val.is_stable() {
+                            continue;
+                        }
+                        if arg_val == *init_val {
+                            continue; // same as init → redundant-set-state, not this rule
+                        }
 
-                    if !arg_val.is_stable() {
-                        continue;
-                    }
-                    if arg_val == *init_val {
-                        continue; // same as init → redundant-set-state, not this rule
-                    }
+                        // SSR mount-flag idiom: `useState(false)` flipped to
+                        // `true` on mount (hasMounted/isClient/isHydrated). The
+                        // extra render is the point — the server/hydration pass
+                        // must see `false` — so "initialise with the target
+                        // value" would break hydration. Keep the warning (the
+                        // idiom has a modern replacement) but give advice that
+                        // doesn't break the component.
+                        let is_mount_flag = *init_val == StateValue::boolean(BoolVal::False)
+                            && arg_val == StateValue::boolean(BoolVal::True);
 
-                    // SSR mount-flag idiom: `useState(false)` flipped to
-                    // `true` on mount (hasMounted/isClient/isHydrated). The
-                    // extra render is the point — the server/hydration pass
-                    // must see `false` — so "initialise with the target
-                    // value" would break hydration. Keep the warning (the
-                    // idiom has a modern replacement) but give advice that
-                    // doesn't break the component.
-                    let is_mount_flag = *init_val == StateValue::boolean(BoolVal::False)
-                        && arg_val == StateValue::boolean(BoolVal::True);
-
-                    let message = if is_mount_flag {
-                        format!(
-                            "mount-only effect flips state {} from `false` to `true`. \
+                        let message = if is_mount_flag {
+                            format!(
+                                "mount-only effect flips state {} from `false` to `true`. \
                              The SSR mount-flag idiom costs one extra rerender on every \
                              mount; prefer `useSyncExternalStore` for client detection",
-                            state_slot_name(state_label, &state_names)
-                        )
-                    } else {
-                        format!(
-                            "mount-only effect sets state {} to a constant \
+                                state_slot_name(state_label, &state_names)
+                            )
+                        } else {
+                            format!(
+                                "mount-only effect sets state {} to a constant \
                              different from its initial value, which costs one extra rerender on mount; \
                              consider initialising directly with the target value",
-                            state_slot_name(state_label, &state_names)
-                        )
-                    };
-                    let mut d =
-                        Diagnostic::warn("unnecessary-rerender", message).with_label(state_label);
-                    if let Some(r) = eff_span {
-                        d = d.with_range(r);
+                                state_slot_name(state_label, &state_names)
+                            )
+                        };
+                        let mut d = Diagnostic::warn("unnecessary-rerender", message)
+                            .with_label(state_label);
+                        if let Some(r) = eff_span {
+                            d = d.with_range(r);
+                        }
+                        // Witness (ADR-019): the mount-effect write that overrides
+                        // the initial value.
+                        d = d.with_step(
+                            crate::rules::Step::Write {
+                                slot: state_label,
+                                value: crate::rules::ValueClass::Unknown,
+                            },
+                            Some(*eff_label),
+                            eff_span,
+                            &|l| state_slot_name(l, &state_names),
+                        );
+                        diags.push(d);
                     }
-                    // Witness (ADR-019): the mount-effect write that overrides
-                    // the initial value.
-                    d = d.with_step(
-                        crate::rules::Step::Write {
-                            slot: state_label,
-                            value: crate::rules::ValueClass::Unknown,
-                        },
-                        Some(*eff_label),
-                        eff_span,
-                        &|l| state_slot_name(l, &state_names),
-                    );
-                    diags.push(d);
                 }
             }
         }

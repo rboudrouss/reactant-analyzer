@@ -84,7 +84,7 @@ pub(crate) fn collect_slot_seeds(
     render_cfg: &CFG,
     hooks: &[HookEntry],
     param: &Var,
-    setter_labels: &HashMap<Var, HookLabel>,
+    setter_labels: &crate::engine::setters::SetterTargets,
     slot_writers: &[SlotWriter],
     effect_info: &HashMap<HookLabel, EffectInfo>,
 ) -> Vec<SlotSeed> {
@@ -100,11 +100,7 @@ pub(crate) fn collect_slot_seeds(
             continue;
         }
 
-        let aliases: HashSet<Var> = setter_labels
-            .iter()
-            .filter(|(_, l)| **l == *label)
-            .map(|(v, _)| v.clone())
-            .collect();
+        let aliases: HashSet<Var> = setter_labels.aliases_of(*label);
 
         // The two slot-level kills, read off the writer relation: a
         // render-time write (the adjust-during-render pattern — a sync path

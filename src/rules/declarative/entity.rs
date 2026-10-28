@@ -123,8 +123,8 @@ pub(crate) enum EntityVal<'a, 'b> {
 pub(crate) struct EntityCtx<'a> {
     pub ctx: &'a RuleCtx<'a>,
     pub comp: &'a AnalysisResult<StateValue>,
-    /// Canonical alias-resolved setter → slot relation (`all_setter_labels`).
-    pub setter_labels: HashMap<Var, HookLabel>,
+    /// Canonical alias-resolved setter → slots relation (`all_setter_labels`).
+    pub setter_labels: crate::engine::setters::SetterTargets,
     pub setter_vars: HashSet<Var>,
     /// State-value bindings in the render CFG (alias-resolved) — the naming
     /// table for slots.
@@ -156,7 +156,7 @@ impl<'a> EntityCtx<'a> {
     pub fn new(ctx: &'a RuleCtx<'a>) -> Self {
         let comp = ctx.comp();
         let setter_labels = all_setter_labels(comp);
-        let setter_vars = setter_labels.keys().cloned().collect();
+        let setter_vars = setter_labels.names().cloned().collect();
         let state_names =
             resolve_setter_aliases(&comp.render_cfg, &state_val_labels(&comp.render_cfg));
         EntityCtx {
@@ -998,18 +998,20 @@ impl<'a> EntityCtx<'a> {
                 // A local binding wins: a component passing its own setter down
                 // is not a foreign write, and `cross_component_setters` already
                 // filtered self-owned entries out. A prop that may be several
-                // parents' setters is one entity per candidate.
-                let targets: Vec<(Option<HookLabel>, Option<ComponentId>)> =
-                    match self.setter_labels.get(&c.var) {
-                        Some(&label) => vec![(Some(label), None)],
-                        None => match cross.get(&c.var) {
-                            Some(props) => props
-                                .iter()
-                                .map(|p| (Some(p.label), Some(p.component)))
-                                .collect(),
-                            None => vec![(None, None)],
-                        },
-                    };
+                // parents' setters is one entity per candidate, and so is a
+                // local name bound to several setters (#202).
+                let local: Vec<_> = self.setter_labels.targets(&c.var).collect();
+                let targets: Vec<(Option<HookLabel>, Option<ComponentId>)> = match local.is_empty()
+                {
+                    false => local.into_iter().map(|l| (Some(l), None)).collect(),
+                    true => match cross.get(&c.var) {
+                        Some(props) => props
+                            .iter()
+                            .map(|p| (Some(p.label), Some(p.component)))
+                            .collect(),
+                        None => vec![(None, None)],
+                    },
+                };
                 targets.into_iter().map(move |(slot, owner)| SetterEntity {
                     slot,
                     owner,

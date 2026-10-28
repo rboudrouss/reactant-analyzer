@@ -67,8 +67,9 @@ that writes it (see *Cross-file limits*).
   something else than a literal on some path (`return useMemo(() => [v, setV], [v])`, `return c ? [a,
   setA] : [b, setB]`, a returned variable), one level of destructuring below the first
   (`const [{ setV }] = useSlot()`), an array with a spread, or an object member a spread may
-  overwrite. A hook whose returns pick different setters is forwarded on every path, but the
-  setter binding keeps one of them [#202](https://github.com/rboudrouss/reactant-analyzer/issues/202).
+  overwrite. A hook whose returns pick different setters is forwarded on every path, and a name
+  bound to several setters writes each of them, as a possible write of each
+  [#202](https://github.com/rboudrouss/reactant-analyzer/issues/202).
 - `useContext` is unmodelled, so a context value reads ⊤. This is the single largest source of
   analysis limits, 363 sites across the eight corpora [#28](https://github.com/rboudrouss/reactant-analyzer/issues/28).
 - Seven React hooks are unmodelled and emit an Info rather than a summary: `useActionState`,

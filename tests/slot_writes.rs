@@ -343,3 +343,47 @@ export function Named({ id }: { id: number }) {
         assert_eq!(slot.join(&seven), slot, "{c}: 7 is not in {slot:?}");
     }
 }
+
+/// A name two paths bind to two setters writes one of them (#202): the join
+/// keeps both, so each slot gets the write — a weak one, which no row may
+/// place as a certain write of either.
+#[test]
+fn a_branch_chosen_setter_writes_both_slots() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function IfElse({ c }: { c?: boolean }) {
+  const [a, setA] = useState(0);
+  const [b, setB] = useState(0);
+  let s;
+  if (c) { s = setA; } else { s = setB; }
+  useEffect(() => { s(b + 1); }, [b]);
+  return <div>{a}{b}</div>;
+}
+export function Ternary({ c }: { c?: boolean }) {
+  const [a, setA] = useState(0);
+  const [b, setB] = useState(0);
+  const s = c ? setA : setB;
+  useEffect(() => { s(b + 1); }, [b]);
+  return <div>{a}{b}</div>;
+}
+"#;
+    let result = analyze(src);
+    for c in ["IfElse", "Ternary"] {
+        let comp = &result.components[&result.component_named(c).unwrap()];
+        for slot in [0, 1] {
+            let rows: Vec<_> = comp
+                .slot_writers
+                .iter()
+                .filter(|w| w.slot == slot && w.setter == "s")
+                .collect();
+            assert!(!rows.is_empty(), "{c}: no row writes slot {slot}");
+            assert!(rows.iter().all(|w| w.block.is_none()), "{c}: {rows:?}");
+        }
+        assert!(comp.diverges(1).is_some(), "{c}: `b` is written under [b]");
+        let sev = loops(&result, c);
+        assert!(
+            sev.contains(&Severity::Warning) && !sev.contains(&Severity::Error),
+            "{c}: {sev:?}"
+        );
+    }
+}

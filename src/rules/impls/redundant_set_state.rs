@@ -203,19 +203,21 @@ fn collect_setter_vals_in_expr(
     match expr {
         Expr::Call { fn_, args } => {
             if let Expr::Var(name) = fn_.as_ref()
-                && let Some(label) = env.setter_label(name)
+                && let Some(labels) = env.setter_labels(name)
             {
                 let arg_val = args
                     .first()
                     .map(|a| crate::rules::eval_in_stores(a, env, component, state, memo, heap))
                     .unwrap_or(StateValue::top());
-                match tracker.entry(label) {
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        e.insert((arg_val, false));
-                    }
-                    std::collections::hash_map::Entry::Occupied(mut e) => {
-                        if e.get().0 != arg_val {
-                            e.get_mut().1 = true;
+                for &label in labels {
+                    match tracker.entry(label) {
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            e.insert((arg_val.clone(), false));
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            if e.get().0 != arg_val {
+                                e.get_mut().1 = true;
+                            }
                         }
                     }
                 }

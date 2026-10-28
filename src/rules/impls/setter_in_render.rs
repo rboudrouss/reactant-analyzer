@@ -8,11 +8,11 @@ use crate::ir::{
 };
 
 use crate::engine::guards::converges_once_written;
-use crate::engine::setters::SetterCallPhase;
+use crate::engine::setters::{SetterCallPhase, SetterTargets};
 use crate::rules::helpers::eval_in_exit_env;
 use crate::rules::{
     Diagnostic, ExitDominance, MustResult, Rule, collect_setter_calls, must_alias_scopes,
-    must_state_vals, resolve_setter_aliases, setter_var_labels,
+    must_state_vals,
 };
 
 /// Fires when a state setter is called directly in the render body either a
@@ -63,16 +63,14 @@ impl Rule for SetterInRender {
         // Local setters with their aliases (`const s = setN`): a name the
         // table misses is a call the rule never sees, and a false `verified`
         // (#176).
-        let local_setter_info: HashMap<Var, HookLabel> = resolve_setter_aliases(
-            &comp_result.render_cfg,
-            &setter_var_labels(&comp_result.render_cfg),
-        );
+        let local_setter_info =
+            SetterTargets::bound_in(&comp_result.render_cfg).resolve(&comp_result.render_cfg);
 
         // Cross-component setters: ComponentSetter-valued props, excluding self-references.
         let cs_vars: HashMap<Var, Vec<crate::engine::setters::SetterProp>> =
             crate::rules::cross_component_setters(comp_result, component);
 
-        let mut all_setter_vars: HashSet<Var> = local_setter_info.keys().cloned().collect();
+        let mut all_setter_vars: HashSet<Var> = local_setter_info.names().cloned().collect();
         all_setter_vars.extend(cs_vars.keys().cloned());
 
         if all_setter_vars.is_empty() {
@@ -116,7 +114,7 @@ impl Rule for SetterInRender {
                 // drops setter-ness — so refuting on the env would delete the
                 // true finding along with the false one.
                 if cs_vars.contains_key(&call.var)
-                    && !local_setter_info.contains_key(&call.var)
+                    && !local_setter_info.contains(&call.var)
                     && let Some(bid) = call.block_id
                     && let Some(block) = comp_result.render_cfg.blocks.get(&bid)
                     && crate::rules::setter_reassigned_before_call(
@@ -141,7 +139,7 @@ impl Rule for SetterInRender {
                 // another — `if (c) set = setV`, a hook returning `[v, setV]`
                 // or `[v, noop]`, a closure the render runs that rebinds it
                 // (#235) — writes on some renders only.
-                let certainly_the_setter = !local_setter_info.contains_key(&call.var)
+                let certainly_the_setter = !local_setter_info.contains(&call.var)
                     || matches!(
                         crate::ir::bindings::must_binding(
                             &Expr::Var(call.var.clone()),
@@ -168,7 +166,7 @@ impl Rule for SetterInRender {
                 // converges after one extra render, no diagnostic.
                 if proof.is_none()
                     && let Some(bid) = call.block_id
-                    && let Some(&label) = local_setter_info.get(&call.var)
+                    && let Some(label) = local_setter_info.sole(&call.var)
                     && let Some(arg) = setter_call_arg(&comp_result.render_cfg, bid, &call.var)
                     && converges_once_written(
                         &comp_result.render_cfg,
@@ -190,7 +188,7 @@ impl Rule for SetterInRender {
                     String,
                     Option<HookLabel>,
                     Option<Var>,
-                ) = if let Some(&label) = local_setter_info.get(&call.var) {
+                ) = if let Some(label) = local_setter_info.targets(&call.var).next() {
                     (
                         "setter-in-render",
                         if call.class == SetterCallPhase::Sync {

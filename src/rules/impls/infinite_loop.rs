@@ -61,14 +61,14 @@ impl Rule for InfiniteLoop {
         // (`const s1 = setX`, `s2 = s1`) resolved across the render and every
         // hook body — a setter called in an effect through an alias must still
         // be attributed to its state slot (else a real loop goes unflagged).
-        let local_setter_labels: HashMap<Var, HookLabel> = all_setter_labels(comp_result);
+        let local_setter_labels = all_setter_labels(comp_result);
         let state_names = state_val_labels(&comp_result.render_cfg);
 
         // ComponentSetter props, excluding self-references.
         let cs_vars: HashMap<Var, Vec<crate::engine::setters::SetterProp>> =
             crate::rules::cross_component_setters(comp_result, component);
 
-        let mut all_setter_vars: HashSet<Var> = local_setter_labels.keys().cloned().collect();
+        let mut all_setter_vars: HashSet<Var> = local_setter_labels.names().cloned().collect();
         all_setter_vars.extend(cs_vars.keys().cloned());
 
         if all_setter_vars.is_empty() {
@@ -125,69 +125,72 @@ impl Rule for InfiniteLoop {
                 if call.class == SetterCallPhase::Handler {
                     continue;
                 }
-                if let Some(&state_label) = local_setter_labels.get(&call.var) {
+                let local: Vec<HookLabel> = local_setter_labels.targets(&call.var).collect();
+                if !local.is_empty() {
                     // ── Intra ─────────────────────────────────────────────────
-                    if comp_result.diverges(state_label).is_none() {
-                        continue; // the cycle bounded the slot
-                    }
-
-                    let deps_note = if deps.is_declared() {
-                        " (its deps do not provably gate it, so the effect can re-run every render)"
-                    } else {
-                        ""
-                    };
-                    let mut diag = Diagnostic::warn(
-                        "infinite-loop",
-                        format!(
-                            "this effect keeps pushing state {}{} to new values \
-                             on every run. Potential infinite render loop",
-                            state_slot_name(state_label, &state_names),
-                            deps_note
-                        ),
-                    )
-                    .with_label(state_label);
-
-                    if let Some(r) = comp_result.effect_info.get(eff_label).and_then(|i| i.span) {
-                        diag = diag.with_range(r);
-                    }
-
-                    let setter_vars_for_label: HashSet<Var> = local_setter_labels
-                        .iter()
-                        .filter(|&(_, l)| *l == state_label)
-                        .map(|(v, _)| v.clone())
-                        .collect();
-                    for h in &comp_result.hooks {
-                        if let HookEntry::Handler {
-                            label: h_label,
-                            event,
-                            body_cfg: h_cfg,
-                            ..
-                        } = h
-                            && !collect_setter_calls(h_cfg, &setter_vars_for_label, 1).is_empty()
-                        {
-                            let h_span = comp_result.handler_info.get(h_label).and_then(|i| i.span);
-                            diag = diag.with_step(
-                                crate::rules::Step::Handler {
-                                    event: event.clone(),
-                                    slot: state_label,
-                                },
-                                Some(*h_label),
-                                h_span,
-                                &|l| state_slot_name(l, &state_names),
-                            );
+                    // A name bound to several setters may write each (#202).
+                    for state_label in local {
+                        if comp_result.diverges(state_label).is_none() {
+                            continue; // the cycle bounded the slot
                         }
+
+                        let deps_note = if deps.is_declared() {
+                            " (its deps do not provably gate it, so the effect can re-run every render)"
+                        } else {
+                            ""
+                        };
+                        let mut diag = Diagnostic::warn(
+                            "infinite-loop",
+                            format!(
+                                "this effect keeps pushing state {}{} to new values \
+                             on every run. Potential infinite render loop",
+                                state_slot_name(state_label, &state_names),
+                                deps_note
+                            ),
+                        )
+                        .with_label(state_label);
+
+                        if let Some(r) = comp_result.effect_info.get(eff_label).and_then(|i| i.span)
+                        {
+                            diag = diag.with_range(r);
+                        }
+
+                        let setter_vars_for_label = local_setter_labels.aliases_of(state_label);
+                        for h in &comp_result.hooks {
+                            if let HookEntry::Handler {
+                                label: h_label,
+                                event,
+                                body_cfg: h_cfg,
+                                ..
+                            } = h
+                                && !collect_setter_calls(h_cfg, &setter_vars_for_label, 1)
+                                    .is_empty()
+                            {
+                                let h_span =
+                                    comp_result.handler_info.get(h_label).and_then(|i| i.span);
+                                diag = diag.with_step(
+                                    crate::rules::Step::Handler {
+                                        event: event.clone(),
+                                        slot: state_label,
+                                    },
+                                    Some(*h_label),
+                                    h_span,
+                                    &|l| state_slot_name(l, &state_names),
+                                );
+                            }
+                        }
+
+                        // Fixpoint evidence (ADR-019): which effects were writing
+                        // the slot when it widened, and at which iteration.
+                        diag = diag.with_notes(crate::rules::api::witness::slot_history(
+                            comp_result,
+                            state_label,
+                            &|l| state_slot_name(l, &state_names),
+                        ));
+
+                        reported_effects.insert(*eff_label);
+                        diags.push(diag);
                     }
-
-                    // Fixpoint evidence (ADR-019): which effects were writing
-                    // the slot when it widened, and at which iteration.
-                    diag = diag.with_notes(crate::rules::api::witness::slot_history(
-                        comp_result,
-                        state_label,
-                        &|l| state_slot_name(l, &state_names),
-                    ));
-
-                    reported_effects.insert(*eff_label);
-                    diags.push(diag);
                 } else if let Some(props) = cs_vars.get(&call.var) {
                     // ── Cross-component ────────────────────────────────────────
                     // A prop several call sites bind to several parents'

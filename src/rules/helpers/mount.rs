@@ -248,14 +248,9 @@ fn writes_move_together(
         return false;
     };
     let labels = all_setter_labels(comp);
-    let setters_of = |wanted: HookLabel| -> HashSet<Var> {
-        labels
-            .iter()
-            .filter(|(_, l)| **l == wanted)
-            .map(|(v, _)| v.clone())
-            .collect()
-    };
-    let (feeder_setters, guard_setters) = (setters_of(slot), setters_of(guard_slot));
+    // A scope that may write the feeder must surely write the guard.
+    let (feeder_setters, guard_setters) =
+        (labels.aliases_of(slot), labels.sure_aliases_of(guard_slot));
     if feeder_setters.is_empty() || guard_setters.is_empty() {
         return false;
     }

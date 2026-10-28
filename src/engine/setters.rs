@@ -4,7 +4,7 @@
 //! alias chains, the may-written slot proof — and the slot-writer relation
 //! (`collect_slot_writers`) the fixpoint stores on `AnalysisResult`.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::ir::ComponentId;
@@ -655,13 +655,15 @@ fn state_binding_labels(
     map
 }
 
-/// Extend a `setter var → state label` map with alias `let a = b` bindings in
-/// `cfg` (b a known setter ⇒ a is too). Iterates to a fixpoint so chains
+/// Extend a `var → label` naming map with alias `let a = b` bindings in
+/// `cfg` (b named ⇒ a is too). Iterates to a fixpoint so chains
 /// `let s1 = setX; let s2 = s1` all resolve.
 ///
 /// Utility inlining binds setter params via such aliases (`let setter = setX`)
 /// inside spliced bodies; rules matching setters by name must follow them or
-/// the spliced setter call goes unseen (false negative).
+/// the spliced setter call goes unseen (false negative). A name keeps one
+/// label, the first it meets: what names a slot. The slots a call through
+/// a setter may write are [`SetterTargets`], which keeps every one.
 pub(crate) fn resolve_setter_aliases(
     cfg: &CFG,
     base: &HashMap<Var, HookLabel>,
@@ -713,6 +715,17 @@ pub(crate) fn must_state_vals(
 /// with `b` in the map gives `a` the same entry, chains included. A name
 /// already in the map keeps its own entry.
 fn resolve_aliases<T: Clone>(cfg: &CFG, base: &HashMap<Var, T>) -> HashMap<Var, T> {
+    resolve_aliases_by(cfg, base, |_, _| false)
+}
+
+/// [`resolve_aliases`] where a name already in the map takes `merge` of its
+/// entry and the alias's: `merge(entry, fact)` folds `fact` in and says
+/// whether the entry grew.
+fn resolve_aliases_by<T: Clone>(
+    cfg: &CFG,
+    base: &HashMap<Var, T>,
+    merge: impl Fn(&mut T, &T) -> bool,
+) -> HashMap<Var, T> {
     let mut map = base.clone();
     loop {
         let mut changed = false;
@@ -734,11 +747,15 @@ fn resolve_aliases<T: Clone>(cfg: &CFG, base: &HashMap<Var, T>) -> HashMap<Var, 
                     _ => None,
                 };
                 if let Some((var, src)) = alias
-                    && !map.contains_key(var)
                     && let Some(fact) = map.get(src).cloned()
                 {
-                    map.insert(var.clone(), fact);
-                    changed = true;
+                    match map.get_mut(var) {
+                        Some(entry) => changed |= merge(entry, &fact),
+                        None => {
+                            map.insert(var.clone(), fact);
+                            changed = true;
+                        }
+                    }
                 }
             }
         }
@@ -749,22 +766,101 @@ fn resolve_aliases<T: Clone>(cfg: &CFG, base: &HashMap<Var, T>) -> HashMap<Var, 
     map
 }
 
-/// Alias-resolved `setter var → state label` across the render body and every
-/// hook body. Utility inlining binds setter params via aliases (`let setter =
-/// setX`) inside spliced bodies; rules matching a setter by name must follow
-/// those aliases through every body or a spliced setter call goes unseen (false
+/// Every slot a setter name may write: the setter names a body binds
+/// (`const [x, setX] = useState()`) and their aliases, each alias with the
+/// union of what it is bound to — `s = setA` on one path and `s = setB` on
+/// another make `s` both (#202). A call through a name with several targets
+/// writes one of them, a may-write of each.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SetterTargets(HashMap<Var, BTreeSet<HookLabel>>);
+
+impl SetterTargets {
+    /// The setter names `cfg` binds, each to its own slot.
+    pub(crate) fn bound_in(cfg: &CFG) -> Self {
+        SetterTargets(
+            setter_var_labels(cfg)
+                .into_iter()
+                .map(|(v, l)| (v, BTreeSet::from([l])))
+                .collect(),
+        )
+    }
+
+    /// Closed over the aliases `cfg` writes (`let s1 = setX; s2 = s1`, a
+    /// spliced wrapper's `let setter = setX`), chains included.
+    pub(crate) fn resolve(&self, cfg: &CFG) -> Self {
+        SetterTargets(resolve_aliases_by(cfg, &self.0, |entry, fact| {
+            let before = entry.len();
+            entry.extend(fact.iter().copied());
+            entry.len() > before
+        }))
+    }
+
+    /// The slots a call through `var` may write; none for a non-setter.
+    pub(crate) fn targets(&self, var: &str) -> impl Iterator<Item = HookLabel> + '_ {
+        self.0.get(var).into_iter().flatten().copied()
+    }
+
+    /// The one slot a call through `var` may write, when no other setter
+    /// reaches the name.
+    pub(crate) fn sole(&self, var: &str) -> Option<HookLabel> {
+        self.0
+            .get(var)
+            .filter(|s| s.len() == 1)
+            .and_then(|s| s.first().copied())
+    }
+
+    pub(crate) fn contains(&self, var: &str) -> bool {
+        self.0.contains_key(var)
+    }
+
+    /// Every setter name.
+    pub(crate) fn names(&self) -> impl Iterator<Item = &Var> + '_ {
+        self.0.keys()
+    }
+
+    /// Every `(name, slot)` a call through the name may write.
+    pub(crate) fn pairs(&self) -> impl Iterator<Item = (&Var, HookLabel)> + '_ {
+        self.0
+            .iter()
+            .flat_map(|(v, s)| s.iter().map(move |l| (v, *l)))
+    }
+
+    /// The names a call through which may write `slot`.
+    pub(crate) fn aliases_of(&self, slot: HookLabel) -> HashSet<Var> {
+        self.pairs()
+            .filter(|(_, l)| *l == slot)
+            .map(|(v, _)| v.clone())
+            .collect()
+    }
+
+    /// The names no setter but `slot`'s reaches ([`Self::sole`]): what a
+    /// must reading of a write may take. Whether the name is a setter on
+    /// every path is the binding's own question (`must_binding`).
+    pub(crate) fn sure_aliases_of(&self, slot: HookLabel) -> HashSet<Var> {
+        self.0
+            .keys()
+            .filter(|v| self.sole(v) == Some(slot))
+            .cloned()
+            .collect()
+    }
+}
+
+/// Alias-resolved setter targets across the render body and every hook body.
+/// Utility inlining binds setter params via aliases (`let setter = setX`)
+/// inside spliced bodies; rules matching a setter by name must follow those
+/// aliases through every body or a spliced setter call goes unseen (false
 /// negative). The shared recipe of `derived-state`, `state-mutation`,
 /// `stale-closure` and `frozen-initial-state`.
-pub(crate) fn all_setter_labels(comp: &AnalysisResult<StateValue>) -> HashMap<Var, HookLabel> {
+pub(crate) fn all_setter_labels(comp: &AnalysisResult<StateValue>) -> SetterTargets {
     setter_labels_of(&comp.render_cfg, &comp.hooks)
 }
 
 /// [`all_setter_labels`] over a render body and its hook table, before they
 /// are an [`AnalysisResult`] — what the fixpoint reads to store its relations.
-pub(crate) fn setter_labels_of(render_cfg: &CFG, hooks: &[HookEntry]) -> HashMap<Var, HookLabel> {
-    let mut labels = setter_var_labels(render_cfg);
+pub(crate) fn setter_labels_of(render_cfg: &CFG, hooks: &[HookEntry]) -> SetterTargets {
+    let mut labels = SetterTargets::bound_in(render_cfg);
     for cfg in std::iter::once(render_cfg).chain(hooks.iter().filter_map(|h| h.body_cfg())) {
-        labels = resolve_setter_aliases(cfg, &labels);
+        labels = labels.resolve(cfg);
     }
     labels
 }
@@ -907,7 +1003,8 @@ pub struct SlotWriter {
     pub owner: Option<ComponentId>,
     /// The block of the region's CFG the write runs in, for a write that runs
     /// synchronously in the region, once per pass — what `must_on_all_paths`
-    /// takes. `None` for a nested, deferred, cleanup or repeating site.
+    /// takes. `None` for a nested, deferred, cleanup or repeating site, and
+    /// for a call through a name with several targets, which writes one.
     pub block: Option<BlockId>,
     /// The block of the region's CFG whose dominating guards the write runs
     /// under: `block` for a synchronous write, the statement that scheduled
@@ -1155,12 +1252,9 @@ pub(crate) fn collect_slot_writers(
     reducers: &crate::engine::Reducers<'_>,
     dispatches: bool,
 ) -> Vec<SlotWriter> {
-    let mut labels = setter_var_labels(render_cfg);
-    for cfg in std::iter::once(render_cfg).chain(hooks.iter().filter_map(|h| h.body_cfg())) {
-        labels = resolve_setter_aliases(cfg, &labels);
-    }
-    // Every name a write can go through, with the slot it writes and the slot's
-    // owner. A local binding wins a tie (ADR-030 §1). The converged values
+    // Every name a write can go through, with the slots it may write and their
+    // owner — a local name bound to two setters on two paths writes one of
+    // them (#202). A local binding wins a tie (ADR-030 §1). The converged values
     // (`collect_component_setter_vars`) are read beside the syntactic alias
     // map: every render binding and member path holding a setter, so an
     // alias holds the same setter value. An own slot is taken only from a
@@ -1170,19 +1264,14 @@ pub(crate) fn collect_slot_writers(
     // sites pass, #175) writes one of them: a row per candidate. `carried`:
     // the write runs a closure that captured the setter (`bump={() =>
     // setN(n + 1)}`), and the call's own argument is not what it stores.
-    let mut targets: HashMap<Var, Vec<Target>> = labels
-        .into_iter()
-        .map(|(v, l)| {
-            (
-                v,
-                vec![Target {
-                    owner: None,
-                    slot: l,
-                    carried: false,
-                }],
-            )
-        })
-        .collect();
+    let mut targets: HashMap<Var, Vec<Target>> = HashMap::new();
+    for (v, slot) in setter_labels_of(render_cfg, hooks).pairs() {
+        targets.entry(v.clone()).or_default().push(Target {
+            owner: None,
+            slot,
+            carried: false,
+        });
+    }
     let mut converged: Vec<_> = converged.iter().collect();
     converged.sort_by(|a, b| a.0.cmp(b.0));
     for (v, props) in converged {
@@ -1327,9 +1416,10 @@ pub(crate) fn collect_slot_writers(
             }
         }
         let reach = Reachability::of(cfg);
-        for (site, target) in sites.into_iter().flat_map(|s| {
+        for (site, target, sole) in sites.into_iter().flat_map(|s| {
             let ts = targets.get(&s.var).cloned().unwrap_or_default();
-            ts.into_iter().map(move |t| (s.clone(), t))
+            let sole = ts.len() == 1;
+            ts.into_iter().map(move |t| (s.clone(), t, sole))
         }) {
             let Target {
                 owner,
@@ -1361,7 +1451,9 @@ pub(crate) fn collect_slot_writers(
             let at = (site.class == WalkClass::Sync && !site.repeats)
                 .then_some(site.at)
                 .flatten();
-            let block = at.map(|(b, _)| b);
+            // A call through a name with several targets writes one of them:
+            // no slot of the several is surely written there.
+            let block = at.map(|(b, _)| b).filter(|_| sole);
             let target = (owner.unwrap_or(envs.component), slot);
             let written = match reducers.get(target.0, target.1) {
                 Some(reducer) => written::dispatched(&reducer),
@@ -2475,7 +2567,7 @@ pub fn collect_body_calls(cfg: &CFG, region: WriterRegion, max_depth: usize) -> 
 pub(crate) fn may_written_slots(
     render_cfg: &CFG,
     hooks: &[HookEntry],
-    setter_labels: &HashMap<Var, HookLabel>,
+    setter_labels: &SetterTargets,
 ) -> HashSet<HookLabel> {
     fn scan_cfg(cfg: &CFG, used: &mut HashSet<Var>) {
         cfg.for_each_expr(&mut |e| collect_used_vars(e, used));
@@ -2500,9 +2592,9 @@ pub(crate) fn may_written_slots(
         }
     }
     setter_labels
-        .iter()
+        .pairs()
         .filter(|(v, _)| used.contains(*v))
-        .map(|(_, l)| *l)
+        .map(|(_, l)| l)
         .collect()
 }
 
@@ -2583,15 +2675,6 @@ pub fn setter_escapes(render_cfg: &CFG, hooks: &[HookEntry], aliases: &HashSet<V
     })
 }
 
-/// The setter aliases of one slot, from a `var -> label` map.
-fn aliases_of(setter_labels: &HashMap<Var, HookLabel>, slot: HookLabel) -> HashSet<Var> {
-    setter_labels
-        .iter()
-        .filter(|(_, l)| **l == slot)
-        .map(|(v, _)| v.clone())
-        .collect()
-}
-
 impl AnalysisResult<StateValue> {
     /// `true` when anything other than `except` may write `slot`.
     ///
@@ -2631,17 +2714,12 @@ impl AnalysisResult<StateValue> {
     /// Closing the alias set walks every body, so asking per slot would redo
     /// that walk once per slot. Callers that test more than one slot want this.
     pub fn escaping_slots(&self) -> HashSet<crate::ir::types::HookLabel> {
-        let mut labels = setter_var_labels(&self.render_cfg);
-        for cfg in
-            std::iter::once(&self.render_cfg).chain(self.hooks.iter().filter_map(|h| h.body_cfg()))
-        {
-            labels = resolve_setter_aliases(cfg, &labels);
-        }
-        let slots: HashSet<HookLabel> = labels.values().copied().collect();
+        let labels = setter_labels_of(&self.render_cfg, &self.hooks);
+        let slots: HashSet<HookLabel> = labels.pairs().map(|(_, l)| l).collect();
         slots
             .into_iter()
             .filter(|s| {
-                let aliases = aliases_of(&labels, *s);
+                let aliases = labels.aliases_of(*s);
                 !aliases.is_empty() && setter_escapes(&self.render_cfg, &self.hooks, &aliases)
             })
             .collect()

@@ -324,10 +324,12 @@ impl Rule for StaleClosure {
                     }
 
                     // Does the callback itself write a slot it captures?
+                    // A name bound to several setters (#202) writes one of
+                    // them: it writes a captured slot when they all are.
                     let slot_setters: HashSet<Var> = setter_labels
-                        .iter()
-                        .filter(|(_, l)| live_local.contains(l))
-                        .map(|(v, _)| v.clone())
+                        .names()
+                        .filter(|v| setter_labels.targets(v).all(|l| live_local.contains(&l)))
+                        .cloned()
                         .collect();
                     let self_write = if slot_setters.is_empty() {
                         None
@@ -337,7 +339,7 @@ impl Rule for StaleClosure {
                         calls.sort_by_key(|c| c.span.map_or((u32::MAX, u32::MAX), |r| r.pos_key()));
                         calls
                             .first()
-                            .and_then(|c| setter_labels.get(&c.var).map(|l| (*l, c.span)))
+                            .and_then(|c| setter_labels.targets(&c.var).next().map(|l| (l, c.span)))
                     };
 
                     // The whole Error claim is one proof (#142): a proof of

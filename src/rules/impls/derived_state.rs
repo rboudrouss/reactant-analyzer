@@ -50,7 +50,7 @@ impl Rule for DerivedState {
         let setter_label = all_setter_labels(result);
         let state_val_label = state_val_labels(&result.render_cfg);
         let state_var_names: HashSet<Var> = state_val_label.keys().cloned().collect();
-        let setter_vars: HashSet<Var> = setter_label.keys().cloned().collect();
+        let setter_vars: HashSet<Var> = setter_label.names().cloned().collect();
 
         // Setters called in render body are not derived-state candidates.
         let render_setters: HashSet<Var> =
@@ -95,11 +95,10 @@ impl Rule for DerivedState {
                     _ => continue,
                 };
 
-            // Reject self-referential updates (e.g. `setX(x+1)`) accumulation, not derivation.
-            if let (Some(set_lbl), Some(dep_lbl)) = (
-                setter_label.get(&setter_name),
-                state_val_label.get(&dep_var),
-            ) && set_lbl == dep_lbl
+            // Reject self-referential updates (e.g. `setX(x+1)`) accumulation,
+            // not derivation — through any slot the name may write (#202).
+            if let Some(&dep_lbl) = state_val_label.get(&dep_var)
+                && setter_label.targets(&setter_name).any(|l| l == dep_lbl)
             {
                 continue;
             }
@@ -114,11 +113,11 @@ impl Rule for DerivedState {
             //
             // And if the setter left the component at all, the claim is not
             // ours to make: something we cannot see may write the slot.
-            if let Some(&slot) = setter_label.get(&setter_name) {
-                if result.slot_written_outside(slot, WriterRegion::Effect(*eff_label)) {
-                    continue;
-                }
-                if result.slot_setter_escapes(slot) {
+            if setter_label.contains(&setter_name) {
+                if setter_label.targets(&setter_name).any(|slot| {
+                    result.slot_written_outside(slot, WriterRegion::Effect(*eff_label))
+                        || result.slot_setter_escapes(slot)
+                }) {
                     continue;
                 }
             } else if render_setters.contains(&setter_name) {
@@ -150,10 +149,10 @@ impl Rule for DerivedState {
                 *span,
                 &name_of,
             );
-            if let Some(slot) = setter_label.get(&setter_name) {
+            if let Some(slot) = setter_label.sole(&setter_name) {
                 d = d.with_step(
                     crate::rules::Step::Write {
-                        slot: *slot,
+                        slot,
                         value: crate::rules::ValueClass::Unknown,
                     },
                     Some(*eff_label),
