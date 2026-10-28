@@ -16,7 +16,7 @@ use crate::{
     engine::{
         AnalysisResult,
         dominance::on_all_paths,
-        written::{self, SiteEnvs, Written},
+        written::{self, ClosureEnv, SiteEnvs, Written},
     },
     ir::{
         SourceRange,
@@ -350,27 +350,43 @@ pub(crate) fn collect_component_setter_vars(
     block_states: &HashMap<BlockId, AbstractEnv<StateValue>>,
     heap: &Heap,
 ) -> HashMap<Var, Vec<SetterProp>> {
+    setter_vars_over([(cfg, params, block_states)], heap)
+}
+
+/// [`collect_component_setter_vars`] over several bodies at once: a name two
+/// of them bind is read off both, as two blocks of one body are.
+fn setter_vars_over<'b>(
+    bodies: impl IntoIterator<
+        Item = (
+            &'b CFG,
+            &'b [Var],
+            &'b HashMap<BlockId, AbstractEnv<StateValue>>,
+        ),
+    >,
+    heap: &Heap,
+) -> HashMap<Var, Vec<SetterProp>> {
     let mut result: HashMap<Var, Vec<SetterProp>> = HashMap::new();
     let mut unsure: HashSet<Var> = HashSet::new();
-    for_each_converged_path(cfg, params, block_states, heap, |name, ev| {
-        let props = setter_of(ev, heap);
-        if props.is_empty() {
-            if !ev.as_val().is_bottom_value() {
-                unsure.insert(name.clone());
+    for (cfg, params, block_states) in bodies {
+        for_each_converged_path(cfg, params, block_states, heap, |name, ev| {
+            let props = setter_of(ev, heap);
+            if props.is_empty() {
+                if !ev.as_val().is_bottom_value() {
+                    unsure.insert(name.clone());
+                }
+                return;
             }
-            return;
-        }
-        let row = result.entry(name.clone()).or_default();
-        for p in props {
-            match row
-                .iter_mut()
-                .find(|q| (q.component, q.label, q.closure) == (p.component, p.label, p.closure))
-            {
-                Some(q) => q.must_write &= p.must_write,
-                None => row.push(p),
+            let row = result.entry(name.clone()).or_default();
+            for p in props {
+                match row.iter_mut().find(|q| {
+                    (q.component, q.label, q.closure) == (p.component, p.label, p.closure)
+                }) {
+                    Some(q) => q.must_write &= p.must_write,
+                    None => row.push(p),
+                }
             }
-        }
-    });
+        });
+    }
     for (name, row) in &mut result {
         row.sort_by_key(|p| (p.component, p.label, p.closure));
         if row.len() > 1 || unsure.contains(name) {
@@ -390,6 +406,9 @@ pub(crate) fn collect_component_setter_vars(
 /// walk (#233).
 pub(crate) struct ConvergedFns<'a> {
     fns: HashMap<Var, Vec<Arc<CFG>>>,
+    /// The closures the names of a body with no per-block envs of its own
+    /// may point to ([`ConvergedFns::with_closures`]).
+    closures: HashMap<Var, Vec<Arc<CFG>>>,
     render: &'a CFG,
     scopes: Vec<(&'a [Var], &'a CFG)>,
     heap: &'a Heap,
@@ -407,6 +426,7 @@ impl<'a> ConvergedFns<'a> {
     ) -> Self {
         ConvergedFns {
             fns: collect_converged_fns(render, params, block_states, heap, component),
+            closures: HashMap::new(),
             render,
             scopes: must_alias_scopes(render, hooks),
             heap,
@@ -414,11 +434,28 @@ impl<'a> ConvergedFns<'a> {
         }
     }
 
+    /// The same table, with the closures the names of a memo or callback
+    /// body, or of a function literal, may point to, read off the envs of a
+    /// run of each ([`SiteEnvs::closure_envs`], #246). A body no stored env
+    /// covers is reached from any body of the component, so the table is
+    /// every body's.
+    fn with_closures(self, closures: &[ClosureEnv<'_>], heap: &Heap) -> Self {
+        let mut table = HashMap::new();
+        for c in closures {
+            add_converged_fns(&mut table, c.body, c.params, &c.exits, heap, self.component);
+        }
+        ConvergedFns {
+            closures: table,
+            ..self
+        }
+    }
+
     /// The same table, without the paths whose root `body` binds: there the
     /// name is the body's own (fail-closed, as `shadowed`) — read off the
     /// body's converged envs instead, when it has them (`exits`, an effect's
-    /// or a handler's blocks: `get()(x)` in an effect, #46). The render binds
-    /// the roots the table is about, so it keeps them all.
+    /// or a handler's blocks: `get()(x)` in an effect, #46), and off the runs
+    /// of the bodies that keep none (a closure nested in it, #246). The
+    /// render binds the roots the table is about, so it keeps them all.
     fn seen_from(
         &self,
         body: &CFG,
@@ -443,8 +480,17 @@ impl<'a> ConvergedFns<'a> {
                 self.component,
             ));
         }
+        for (path, bodies) in &self.closures {
+            let known = fns.entry(path.clone()).or_default();
+            for b in bodies {
+                if !known.iter().any(|k| Arc::ptr_eq(k, b)) {
+                    known.push(Arc::clone(b));
+                }
+            }
+        }
         ConvergedFns {
             fns,
+            closures: self.closures.clone(),
             render: self.render,
             scopes: self.scopes.clone(),
             heap: self.heap,
@@ -480,6 +526,20 @@ fn collect_converged_fns(
     component: ComponentId,
 ) -> HashMap<Var, Vec<Arc<CFG>>> {
     let mut result: HashMap<Var, Vec<Arc<CFG>>> = HashMap::new();
+    add_converged_fns(&mut result, cfg, params, block_states, heap, component);
+    result
+}
+
+/// [`collect_converged_fns`] into `result`, beside what other bodies put
+/// there.
+fn add_converged_fns(
+    result: &mut HashMap<Var, Vec<Arc<CFG>>>,
+    cfg: &CFG,
+    params: &[Var],
+    block_states: &HashMap<BlockId, AbstractEnv<StateValue>>,
+    heap: &Heap,
+    component: ComponentId,
+) {
     for_each_converged_path(cfg, params, block_states, heap, |name, ev| {
         let mut ids: Vec<_> = ev.locs().into_iter().flatten().copied().collect();
         ids.sort();
@@ -496,7 +556,6 @@ fn collect_converged_fns(
             }
         }
     });
-    result
 }
 
 /// The variable a member path is rooted at: `api` for `api.inc`.
@@ -1536,6 +1595,19 @@ pub(crate) fn collect_slot_writers(
         }
     };
     add_converged(&mut targets, converged);
+    // A name a body with no per-block envs binds — a memo's or a callback's,
+    // a closure's nested in any body, `get()`'s temp in a `forEach` callback
+    // — is read off a run of that body from the env it is reached from
+    // (#246). Any body may reach such a body (a callback called in an
+    // effect, a memo's closure run by one), so the names are every region's.
+    let (closures, closure_heap) = envs.closure_envs(render_cfg, hooks);
+    add_converged(
+        &mut targets,
+        &setter_vars_over(
+            closures.iter().map(|c| (c.body, c.params, &c.exits)),
+            &closure_heap,
+        ),
+    );
     // A write of the slot's own read stores its content (`written::classify`),
     // a must fact: the name is bound once, in render, to the read, and no
     // other body — a hook body, a closure, a callback's parameter — binds it
@@ -1596,7 +1668,8 @@ pub(crate) fn collect_slot_writers(
         envs.render_exits,
         envs.heap,
         envs.component,
-    );
+    )
+    .with_closures(&closures, &closure_heap);
 
     // A write reached through a function name is authored where that function
     // is defined, and a name can carry a closure out of the region it was

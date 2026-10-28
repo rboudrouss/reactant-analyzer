@@ -690,3 +690,125 @@ fn a_call_whose_callee_is_a_call_writes_what_the_inner_call_returns() {
         );
     }
 }
+
+#[test]
+fn a_name_a_nested_closure_binds_is_read_off_a_run_of_the_closure() {
+    // #246: the temp `get()` is bound to, or a `const s = get()`, lives in a
+    // closure nested in the effect, a body the fixpoint keeps no envs for.
+    // It is read off a run of the closure from the env it is reached from,
+    // and the write keeps the closure's class: the effect's own for a sync
+    // callback (0..N times, so never placed at a block), `Deferred` for a
+    // continuation, placed only in an IIFE, which certainly runs there once.
+    use reactant::engine::WriterPhase;
+    for (effect, phase, placed) in [
+        (
+            "[1].forEach(() => get()(v + 1));",
+            WriterPhase::Effect,
+            false,
+        ),
+        (
+            "[1].forEach(() => { const s = get(); s(v + 1); });",
+            WriterPhase::Effect,
+            false,
+        ),
+        (
+            "Promise.resolve().then(() => get()(v + 1));",
+            WriterPhase::Deferred,
+            false,
+        ),
+        ("(() => get()(v + 1))();", WriterPhase::Effect, true),
+    ] {
+        let src = format!(
+            r#"
+            import {{ useState, useEffect }} from "react";
+            export function App() {{
+              const [v, setV] = useState(0);
+              const get = () => setV;
+              useEffect(() => {{ {effect} }});
+              return <div>{{v}}</div>;
+            }}
+            "#
+        );
+        let r = parse_and_analyze(&src);
+        let c = comp(&r, "App");
+        let rows: Vec<&SlotWriter> = c
+            .slot_writers
+            .iter()
+            .filter(|w| matches!(w.region, WriterRegion::Effect(_)))
+            .collect();
+        assert_eq!(rows.len(), 1, "{effect}: {:?}", c.slot_writers);
+        assert_eq!(rows[0].owner, None, "{effect}");
+        assert_eq!(rows[0].phase, phase, "{effect}: {:?}", rows[0]);
+        assert_eq!(rows[0].block.is_some(), placed, "{effect}: {:?}", rows[0]);
+    }
+}
+
+#[test]
+fn a_nested_closure_that_never_runs_or_may_not_write_is_not_a_certain_write() {
+    // #246, the precision side: a closure built and never called writes
+    // nothing, and one that calls a setter on one arm only is a row no block
+    // holds, even where the closure itself runs once (an IIFE).
+    let src = r#"
+        import { useState, useEffect } from "react";
+        export function App({ c }) {
+          const [v, setV] = useState(0);
+          const get = () => setV;
+          const maybe = () => (c ? setV : (x) => {});
+          useEffect(() => { const later = () => get()(v + 1); });
+          useEffect(() => { (() => maybe()(v + 1))(); });
+          return <div>{v}</div>;
+        }
+    "#;
+    let r = parse_and_analyze(src);
+    let c = comp(&r, "App");
+    let rows: Vec<&SlotWriter> = c
+        .slot_writers
+        .iter()
+        .filter(|w| matches!(w.region, WriterRegion::Effect(_)))
+        .collect();
+    assert_eq!(rows.len(), 1, "{:?}", c.slot_writers);
+    assert!(rows[0].block.is_none(), "{:?}", rows[0]);
+}
+
+#[test]
+fn a_name_bound_in_a_closure_under_a_memo_or_a_callback_is_read_off_its_run() {
+    // #246: a memo or a callback body keeps no per-block envs either, so the
+    // closures it holds are run from its own run. Both are reached from the
+    // effect that calls them: one effect row each, a sync one 0..N times.
+    for (decl, call) in [
+        (
+            "const run = useMemo(() => () => get()(v + 1), [v]);",
+            "run();",
+        ),
+        (
+            "const bump = useCallback(() => { [1].forEach(() => get()(v + 1)); }, [v]);",
+            "bump();",
+        ),
+        (
+            "const bump = useCallback(() => get()(v + 1), [v]);",
+            "bump();",
+        ),
+    ] {
+        let src = format!(
+            r#"
+            import {{ useState, useEffect, useMemo, useCallback }} from "react";
+            export function App() {{
+              const [v, setV] = useState(0);
+              const get = () => setV;
+              {decl}
+              useEffect(() => {{ {call} }});
+              return <div>{{v}}</div>;
+            }}
+            "#
+        );
+        let r = parse_and_analyze(&src);
+        let c = comp(&r, "App");
+        let rows: Vec<&SlotWriter> = c
+            .slot_writers
+            .iter()
+            .filter(|w| matches!(w.region, WriterRegion::Effect(_)))
+            .collect();
+        assert_eq!(rows.len(), 1, "{decl}: {:?}", c.slot_writers);
+        assert_eq!(rows[0].owner, None, "{decl}");
+    }
+}

@@ -2179,3 +2179,55 @@ export function Q() { return <Child opts={B} />; }
 "#;
     assert!(infinite_loop_diags(src, "Child").is_empty());
 }
+
+#[test]
+fn a_call_returned_setter_in_a_closure_nested_in_an_effect_loops() {
+    // #246: `get()(x)` in a `forEach` callback, a `.then` continuation, a
+    // closure under a memo or a callback the effect runs: the temp lives in
+    // a body with no per-block envs, read off a run of it. A possible loop
+    // (the callback may run 0 times, the continuation later), never an
+    // Error; and none when `get()` may be a no-op or the closure never runs.
+    let comp = |decl: &str, effect: &str| {
+        format!(
+            r#"
+            import {{ useState, useEffect, useMemo, useCallback }} from "react";
+            function App({{ c }}) {{
+              const [v, setV] = useState(0);
+              const get = () => setV;
+              const maybe = () => (c ? setV : (x) => {{}});
+              {decl}
+              useEffect(() => {{ {effect} }});
+              return <div>{{v}}</div>;
+            }}
+            "#
+        )
+    };
+    for (decl, effect) in [
+        ("", "[1].forEach(() => get()(v + 1));"),
+        ("", "Promise.resolve().then(() => get()(v + 1));"),
+        ("", "[1].forEach(() => { const s = get(); s(v + 1); });"),
+        (
+            "const run = useMemo(() => () => get()(v + 1), [v]);",
+            "run();",
+        ),
+        (
+            "const bump = useCallback(() => { [1].forEach(() => get()(v + 1)); }, [v]);",
+            "bump();",
+        ),
+        ("", "[1].forEach(() => maybe()(v + 1));"),
+    ] {
+        let diags = infinite_loop_diags(&comp(decl, effect), "App");
+        assert!(
+            diags
+                .iter()
+                .any(|(r, s, _)| r == "infinite-loop" && *s == Severity::Warning),
+            "{decl} {effect}: {diags:?}"
+        );
+        assert!(
+            diags.iter().all(|(_, s, _)| *s != Severity::Error),
+            "{decl} {effect}: {diags:?}"
+        );
+    }
+    let never = infinite_loop_diags(&comp("", "const later = () => get()(v + 1);"), "App");
+    assert!(never.is_empty(), "{never:?}");
+}

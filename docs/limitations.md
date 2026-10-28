@@ -57,10 +57,12 @@ that writes it (see *Cross-file limits*).
   [#19](https://github.com/rboudrouss/reactant-analyzer/issues/19), silently: `pkgFn(() => setN(n + 1))` in an effect gets no
   analysis-limit, and `infinite-loop` is reported verified; utility *inlining* is statement-position only [#52](https://github.com/rboudrouss/reactant-analyzer/issues/52). A setter
   or a closure called through a call that returns it (`get()(x)`, `makeSetter()(x)`,
-  `api.get()(x)`) is written where the call's value is read off the converged envs — the render's,
-  an effect's or a handler's own names — but not inside a closure nested in a body (a `forEach`
-  callback, a timer), whose names no converged env holds
-  [#46](https://github.com/rboudrouss/reactant-analyzer/issues/46). A setter or `dispatch` *call* in any expression
+  `api.get()(x)`) is written where the call's value is read: off the converged envs of the render,
+  an effect or a handler [#46](https://github.com/rboudrouss/reactant-analyzer/issues/46), and off a
+  run of a body that keeps none — a memo or callback body, a closure nested in any body (a `forEach`
+  callback, a `.then` continuation) — from the env it is reached from
+  [#246](https://github.com/rboudrouss/reactant-analyzer/issues/246). `setter-in-render` still reads
+  the render's own names only: `xs.forEach(() => get()(x))` in render is not its finding. A setter or `dispatch` *call* in any expression
   position, `wrap(setN(1))`, a `&&` or ternary arm, a branch condition, a JSX prop, writes its slot
   [#169](https://github.com/rboudrouss/reactant-analyzer/issues/169); it is the callee's *inlining* that is not.
 - **What a custom hook returns reaches the caller.** A setter, a slot value or a closure a hook

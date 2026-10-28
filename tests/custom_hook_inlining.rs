@@ -1186,3 +1186,33 @@ fn a_setter_or_a_closure_a_call_returns_is_written_when_called() {
         assert_eq!(severity, Some(expected), "{body}: {found:?}");
     }
 }
+
+#[test]
+fn a_call_returned_setter_of_a_hook_in_a_nested_closure_is_written() {
+    // #246: the hook's `get` called in a closure nested in the effect — a
+    // `forEach` callback, a `.then` continuation — binds the setter it
+    // returns to a temp of the closure, read off a run of it: a loop Warning.
+    let hook = r#"
+        function useThing() {
+            const [v, setV] = useState(0);
+            return { v, get: () => setV };
+        }
+    "#;
+    for effect in [
+        "[1].forEach(() => api.get()(api.v + 1));",
+        "Promise.resolve().then(() => api.get()(api.v + 1));",
+    ] {
+        let found = rules_for(
+            &format!(
+                "{hook}\nfunction App() {{ const api = useThing(); useEffect(() => {{ {effect} }}); return <div />; }}"
+            ),
+            "App",
+        );
+        assert!(
+            found
+                .iter()
+                .any(|(r, s)| r == "infinite-loop" && *s == reactant::rules::Severity::Warning),
+            "{effect}: {found:?}"
+        );
+    }
+}
