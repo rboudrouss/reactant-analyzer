@@ -919,6 +919,32 @@ export function C({ enabled }: { enabled: boolean }) {
 }
 
 #[test]
+fn a_shadowed_name_read_as_top_leaves_the_other_conjunct_to_settle() {
+    // The body's `flag` reads ⊤, not the render's `true`, but `!on` dies once
+    // `true` is written: the write fires once (oracle case
+    // `guard-on-body-shadowed-render-name-settles`).
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C({ enabled }: { enabled: boolean }) {
+  const [on, setOn] = useState(false);
+  const flag = true;
+  useEffect(() => {
+    const flag = enabled;
+    if (flag && !on) setOn(true);
+  }, [on]);
+  return <div>{flag && on ? 'y' : 'n'}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags
+            .iter()
+            .all(|(rule, sev, _)| rule != "infinite-loop" || *sev == Severity::Info),
+        "`!on` settles whatever the body's `flag` is: {diags:?}"
+    );
+}
+
+#[test]
 fn opposite_facts_on_one_prop_across_two_bodies_prove_convergence() {
     // The same shape over one prop: the first effect fires only while `flag`
     // is truthy, the second only while it is falsy, and a prop holds still
