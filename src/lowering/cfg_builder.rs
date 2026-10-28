@@ -35,7 +35,7 @@ use crate::{
 /// ([`crate::ir::ComponentId::site_base`]): a child's heap holds its parents'
 /// sites too (#243).
 #[derive(Debug, Clone, Default)]
-pub struct ExprIds(Rc<Cell<usize>>);
+pub struct ExprIds(Rc<Cell<u64>>);
 
 impl ExprIds {
     fn next(&self) -> ExprId {

@@ -57,11 +57,11 @@ impl ComponentId {
     /// live in a range of their own, `(index + 1)·2³²` up (#247). Below the
     /// first range sit [`ExprId::fresh`](crate::ir::types::ExprId::fresh)
     /// ids, and [`Self::SYNTHETIC`]'s, which analyses alone.
-    pub fn site_base(self) -> usize {
+    pub fn site_base(self) -> u64 {
         if self == Self::SYNTHETIC {
             return 0;
         }
-        (self.0 as usize + 1) << 32
+        (u64::from(self.0) + 1) << 32
     }
 }
 

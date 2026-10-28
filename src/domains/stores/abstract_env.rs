@@ -586,7 +586,7 @@ mod tests {
         assert!(!a.leq(&Env::bottom()));
     }
 
-    fn bind(env: &mut Env, var: &str, ids: &[usize]) {
+    fn bind(env: &mut Env, var: &str, ids: &[u64]) {
         let sites = Sites::closed(ids.iter().map(|i| ExprId(*i)));
         env.bind_locs(var.to_string(), Some(sites));
     }

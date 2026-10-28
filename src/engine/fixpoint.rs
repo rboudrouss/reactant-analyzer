@@ -981,7 +981,7 @@ pub fn analyze_program(
 /// (#134).
 pub(crate) struct SpliceIds {
     salt: u32,
-    next_alloc: usize,
+    next_alloc: u64,
 }
 
 impl SpliceIds {
@@ -1004,7 +1004,7 @@ impl SpliceIds {
 
     /// The salt and allocation-id offset for one graft `span` ids wide,
     /// advancing both supplies past it.
-    fn take(&mut self, span: usize) -> (u32, usize) {
+    fn take(&mut self, span: u64) -> (u32, u64) {
         let salt = self.salt;
         self.salt += 1;
         let ids = self.next_alloc;
@@ -1016,7 +1016,7 @@ impl SpliceIds {
 /// The allocation-id width of a body together with the hook table grafted
 /// alongside it — they are numbered from one file counter, so they share a
 /// range and must be shifted by one offset.
-fn alloc_span(cfg: &CFG, hooks: &[HookEntry]) -> usize {
+fn alloc_span(cfg: &CFG, hooks: &[HookEntry]) -> u64 {
     std::iter::once(crate::ir::alloc_id_span(cfg))
         .chain(
             hooks

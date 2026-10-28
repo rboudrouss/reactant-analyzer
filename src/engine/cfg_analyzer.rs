@@ -439,7 +439,7 @@ mod tests {
                 },
             },
         );
-        let arm = |id: BlockId, r: &str, n: &str, alloc: usize| BasicBlock {
+        let arm = |id: BlockId, r: &str, n: &str, alloc: u64| BasicBlock {
             id,
             stmts: vec![
                 Stmt::Let {
