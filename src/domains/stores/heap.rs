@@ -11,9 +11,7 @@ use crate::{
     },
 };
 
-use std::collections::HashSet;
-
-use super::{AbstractEnv, EnvVal, map_get_or};
+use super::{AbstractEnv, EnvVal, Sites, map_get_or};
 
 /// Value stored at a heap location (indexed by `ExprId` allocation site).
 #[derive(Debug, Clone)]
@@ -88,6 +86,26 @@ impl Heap {
 
     pub fn get(&self, id: ExprId) -> Option<&HeapValue> {
         self.0.get(&id)
+    }
+
+    /// What `member` of a value pointing to `sites` may be: the entry of each
+    /// site that records it, in site order, and whether it may also be what
+    /// no entry says — the sites are open, or one of them is not an object
+    /// recording the member (#240).
+    pub fn members(&self, sites: &Sites, member: &str) -> (Vec<&EnvVal<StateValue>>, bool) {
+        let mut ids: Vec<_> = sites.ids.iter().copied().collect();
+        ids.sort();
+        let mut open = sites.open;
+        let mut entries = Vec::new();
+        for id in ids {
+            match self.get(id) {
+                Some(HeapValue::Obj(fields)) if fields.contains_key(member) => {
+                    entries.push(&fields[member]);
+                }
+                _ => open = true,
+            }
+        }
+        (entries, open)
     }
 
     /// The part of the heap reachable from `roots`: every location a member
@@ -210,6 +228,7 @@ impl Heap {
 /// heap: `o.a.f` resolves as far as the objects on the way record their
 /// members. `None` for anything the heap cannot place (a call, a primitive, an
 /// unbound variable) — the caller then falls back to the expression's value.
+/// Open when the chain may also denote something no site places (#240).
 ///
 /// One walker so every consumer — the field evaluator, the `let` binder, the
 /// object-literal member map — agrees on what a chain points to; the old
@@ -218,9 +237,9 @@ pub fn resolve_locs<D: AbstractDomain>(
     expr: &Expr,
     env: &AbstractEnv<D>,
     heap: &Heap,
-) -> Option<HashSet<ExprId>> {
+) -> Option<Sites> {
     let (obj, member) = match expr {
-        Expr::Var(v) => return env.lookup_env_val(v).and_then(|ev| ev.locs().cloned()),
+        Expr::Var(v) => return env.lookup_env_val(v).and_then(|ev| ev.sites().cloned()),
         Expr::TSAnnotated(inner) => return resolve_locs(inner, env, heap),
         Expr::FieldAccess { obj, field } => (obj, field.clone()),
         // A constant index is a member read (`t[1]`), as `eval_index_access`
@@ -231,17 +250,18 @@ pub fn resolve_locs<D: AbstractDomain>(
         },
         _ => return None,
     };
-    let ids: HashSet<ExprId> = resolve_locs(obj, env, heap)?
-        .iter()
-        .filter_map(|id| match heap.get(*id) {
-            Some(HeapValue::Obj(fields)) => fields.get(&member),
-            _ => None,
-        })
-        .filter_map(|ev| ev.locs())
-        .flatten()
-        .copied()
-        .collect();
-    (!ids.is_empty()).then_some(ids)
+    let (entries, open) = heap.members(&resolve_locs(obj, env, heap)?, &member);
+    let sites = entries.into_iter().fold(
+        Sites {
+            open,
+            ..Sites::default()
+        },
+        |acc, ev| match ev.sites() {
+            Some(s) => acc.join(s),
+            None => acc.opened(),
+        },
+    );
+    (!sites.ids.is_empty()).then_some(sites)
 }
 
 #[cfg(test)]

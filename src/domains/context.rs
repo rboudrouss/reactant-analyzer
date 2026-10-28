@@ -139,7 +139,10 @@ impl<'a> InterCtx<'a> {
         let mut env = AbstractEnv::bottom();
         let mut heap = input.heap;
         heap.insert(input.props_id, HeapValue::Obj(input.props));
-        env.extend_loc(ir.param.clone(), input.props_id);
+        env.bind_locs(
+            ir.param.clone(),
+            Some(crate::domains::stores::Sites::closed([input.props_id])),
+        );
         (self.analyze_child)(ir, self.component, env, heap, self)
     }
 }

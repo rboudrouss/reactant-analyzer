@@ -7,7 +7,7 @@ use crate::{
         AbstractDomain, AnalysisCtx, Transfer,
         impls::{BoolVal, Interval, SetterVal, Stability, StateValue, StrConst},
         interp::{alloc_literal, exec_stmt_with_callbacks, run_cfg},
-        stores::{AbstractEnv, EnvVal, Heap, HeapValue, resolve_locs},
+        stores::{AbstractEnv, EnvVal, Heap, HeapValue, Sites, resolve_locs},
     },
     engine::component_registry::ChildLookup,
     ir::{
@@ -66,11 +66,11 @@ impl Transfer for StateValueTransfer {
         // item 8), with the sites it returns; a new function for a callback
         // literal; for any other callback, its argument, which nothing here
         // reads. A body no run returns from bounds nothing.
-        let (deps, value, locs) = match memo {
+        let (deps, value, sites) = match memo {
             HookEntry::Memo { body_cfg, deps, .. } => {
                 let run = run_cfg(self, body_cfg, env.clone(), ctx, 0);
-                let locs = returned_locs(self, body_cfg, &run.exits, ctx);
-                (deps, run.ret, locs)
+                let sites = returned_sites(self, body_cfg, &run.exits, ctx);
+                (deps, run.ret, sites)
             }
             HookEntry::Callback {
                 literal: true,
@@ -81,10 +81,7 @@ impl Transfer for StateValueTransfer {
             _ => return EnvVal::Val(StateValue::top()),
         };
         let value = memo_value(component, deps, value, render_cfg, env, ctx);
-        match locs {
-            Some(ids) => EnvVal::Loc { ids, val: value },
-            None => EnvVal::Val(value),
-        }
+        EnvVal::located(sites, value)
     }
 }
 
@@ -92,19 +89,19 @@ impl Transfer for StateValueTransfer {
 /// `return`s, each allocated in the env it returns in — `None` as soon as one
 /// returns something the heap does not place, since a reader of the sites
 /// would then miss that path's value (#233).
-fn returned_locs(
+fn returned_sites(
     transfer: &StateValueTransfer,
     body: &CFG,
     exits: &HashMap<crate::ir::types::BlockId, AbstractEnv<StateValue>>,
     ctx: &mut AnalysisCtx<StateValue>,
-) -> Option<HashSet<ExprId>> {
-    let mut out: Option<HashSet<ExprId>> = None;
+) -> Option<Sites> {
+    let mut out: Option<Sites> = None;
     for (b, block) in &body.blocks {
         let (Terminator::Return(expr), Some(exit)) = (&block.term, exits.get(b)) else {
             continue;
         };
-        out.get_or_insert_with(HashSet::new)
-            .extend(alloc_literal(transfer, expr, exit, ctx)?);
+        let sites = alloc_literal(transfer, expr, exit, ctx)?;
+        out = Some(out.map_or(sites.clone(), |acc| acc.join(&sites)));
     }
     out
 }
@@ -436,7 +433,11 @@ fn collect_escaping_setters(
             setter_calls_in_cfg(body_cfg, env, None, heap, own, out, walked);
         }
         Expr::Var(name) => {
-            let Some(EnvVal::Loc { ids, .. }) = env.lookup_env_val(name) else {
+            let Some(EnvVal::Loc {
+                sites: Sites { ids, .. },
+                ..
+            }) = env.lookup_env_val(name)
+            else {
                 return;
             };
             for id in ids.iter().copied().collect::<Vec<_>>() {
@@ -557,14 +558,12 @@ fn callee_setter(
             let Expr::Var(o) = obj.as_ref() else {
                 return Vec::new();
             };
-            let Some(EnvVal::Loc { ids, .. }) = env.lookup_env_val(o) else {
+            let Some(EnvVal::Loc { sites, .. }) = env.lookup_env_val(o) else {
                 return Vec::new();
             };
-            ids.iter()
-                .filter_map(|id| match heap.get(*id) {
-                    Some(HeapValue::Obj(obj_fields)) => obj_fields.get(field),
-                    _ => None,
-                })
+            let (entries, _) = heap.members(&sites, field);
+            entries
+                .into_iter()
                 .flat_map(|ev| ev.as_val().setters())
                 .collect()
         }
@@ -759,25 +758,25 @@ fn props_cache_key(
 }
 
 /// Evaluate field access: read the member off every heap object the receiver
-/// may denote (a whole member chain, not just a bare variable).
+/// may denote (a whole member chain, not just a bare variable), and, when the
+/// receiver may also be something no site places or a site does not record
+/// the member, what the member of anything is (#240).
 fn eval_field_access(
     obj: &Expr,
     field: &Symbol,
     env: &AbstractEnv<StateValue>,
     ctx: &mut AnalysisCtx<StateValue>,
 ) -> StateValue {
-    if let Some(ids) = resolve_locs(obj, env, ctx.heap) {
-        let vals: Vec<StateValue> = ids
-            .iter()
-            .filter_map(|id| ctx.heap.get(*id))
-            .filter_map(|hv| match hv {
-                HeapValue::Obj(fields) => fields.get(field).map(EnvVal::as_val),
-                _ => None,
-            })
-            .collect();
-        if !vals.is_empty() {
-            return vals.into_iter().reduce(|a, b| a.join(&b)).unwrap();
+    let (vals, open) = match resolve_locs(obj, env, ctx.heap) {
+        Some(sites) => {
+            let (entries, open) = ctx.heap.members(&sites, field);
+            (entries.into_iter().map(EnvVal::as_val).collect(), open)
         }
+        None => (Vec::new(), true),
+    };
+    let placed = vals.into_iter().reduce(|a: StateValue, b| a.join(&b));
+    if let Some(placed) = placed.as_ref().filter(|_| !open) {
+        return placed.clone();
     }
     // A field of a versioned object can change only at the object's own
     // setter events: keep the version labels instead of degrading to ⊤
@@ -786,10 +785,11 @@ fn eval_field_access(
     // conversion above; in-place writes have their own diagnostics
     // (`state-mutation`). ADR-017 §Limitations, member-deps.
     let obj_val = eval_state_value(obj, env, ctx);
-    StateValue {
+    let any = StateValue {
         reference: obj_val.versioned_reference().unwrap_or(Stability::Unknown),
         ..StateValue::top()
-    }
+    };
+    placed.map_or(any.clone(), |p| p.join(&any))
 }
 
 /// A **constant** index is a member read, and the heap answers it exactly as it
@@ -830,13 +830,9 @@ fn eval_props_map(
         Expr::ObjectLit { fields, .. } => fields
             .iter()
             .map(|(k, v)| {
-                let ids = alloc_literal(&StateValueTransfer, v, env, ctx);
+                let sites = alloc_literal(&StateValueTransfer, v, env, ctx);
                 let val = eval_state_value(v, env, ctx);
-                let env_val = match ids {
-                    Some(ids) => EnvVal::Loc { ids, val },
-                    None => EnvVal::Val(val),
-                };
-                (k.clone(), env_val)
+                (k.clone(), EnvVal::located(sites, val))
             })
             .collect(),
         _ => HashMap::new(),

@@ -5,7 +5,7 @@ use crate::{
     domains::{
         AbstractDomain, AnalysisCtx, Stability, Transfer,
         impls::StateValue,
-        stores::{AbstractEnv, EnvVal, HeapValue, resolve_locs},
+        stores::{AbstractEnv, EnvVal, HeapValue, Sites, resolve_locs},
     },
     engine::{
         Reducer,
@@ -366,15 +366,12 @@ fn exec_stmt_core<T: Transfer>(
         // among several and the Loc set may name several allocation sites, so
         // join, never replace.
         Stmt::MemberWrite { obj, key, rhs, .. } => {
-            let rhs_ids = alloc_literal(transfer, rhs, env, ctx);
+            let rhs_sites = alloc_literal(transfer, rhs, env, ctx);
             let val = transfer.eval_expr(rhs, env, ctx);
             let Some(sv) = val.as_state_value() else {
                 return;
             };
-            let new_val = match rhs_ids {
-                Some(ids) => EnvVal::Loc { ids, val: sv },
-                None => EnvVal::Val(sv),
-            };
+            let new_val = EnvVal::located(rhs_sites, sv);
             // The member the write names: a field, or a constant index. Any
             // other key may be any member — the write joins into each.
             let member = match key {
@@ -384,7 +381,10 @@ fn exec_stmt_core<T: Transfer>(
                     _ => None,
                 },
             };
-            for id in resolve_locs(obj, env, ctx.heap).unwrap_or_default() {
+            for id in resolve_locs(obj, env, ctx.heap)
+                .map(|s| s.ids)
+                .unwrap_or_default()
+            {
                 if let Some(HeapValue::Obj(fields)) = ctx.heap.get_mut(id) {
                     match &member {
                         Some(m) => {
@@ -411,17 +411,7 @@ fn exec_stmt_core<T: Transfer>(
 /// allocation sites unite, as two bindings of a name do at an env join — a
 /// member that may hold a closure may be called, whatever else it may hold.
 fn join_member(old: Option<&EnvVal<StateValue>>, new: &EnvVal<StateValue>) -> EnvVal<StateValue> {
-    let Some(old) = old else {
-        return new.clone();
-    };
-    let val = old.as_val().join(&new.as_val());
-    match (old.locs(), new.locs()) {
-        (None, None) => EnvVal::Val(val),
-        (a, b) => EnvVal::Loc {
-            ids: a.into_iter().chain(b).flatten().copied().collect(),
-            val,
-        },
-    }
+    old.map_or_else(|| new.clone(), |old| old.join(new))
 }
 
 /// A call that mutates its receiver in place (`t.reverse()`, `t.unshift(f)`,
@@ -435,21 +425,17 @@ fn havoc_members<T: Transfer>(
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
 ) {
-    let Some(ids) = resolve_locs(receiver, env, ctx.heap) else {
+    let Some(Sites { ids, .. }) = resolve_locs(receiver, env, ctx.heap) else {
         return;
     };
     let mut all = EnvVal::Val(StateValue::undefined());
     for arg in args {
-        let locs = alloc_literal(transfer, arg, env, ctx);
+        let sites = alloc_literal(transfer, arg, env, ctx);
         let val = transfer
             .eval_expr(arg, env, ctx)
             .as_state_value()
             .unwrap_or_else(StateValue::top);
-        let arg = match locs {
-            Some(ids) => EnvVal::Loc { ids, val },
-            None => EnvVal::Val(val),
-        };
-        all = join_member(Some(&all), &arg);
+        all = join_member(Some(&all), &EnvVal::located(sites, val));
     }
     for id in &ids {
         if let Some(HeapValue::Obj(fields)) = ctx.heap.get(*id) {
@@ -492,11 +478,10 @@ fn bind_rhs<T: Transfer>(
     // `{ onClear }` where `onClear` is a `useCallback` is a new object every
     // render holding the SAME function, which `o.onClear` reads through the
     // heap instead of inheriting the container's `PerRender` (issue #88).
-    if let Some(ids) = alloc_literal(transfer, rhs, env, ctx) {
-        for id in ids {
-            env.extend_loc(var.to_string(), id);
-        }
-    }
+    // Anything else points nowhere the heap knows: the sites of the name's
+    // previous binding are not what it holds now (#240).
+    let sites = alloc_literal(transfer, rhs, env, ctx);
+    env.bind_locs(var.to_string(), sites);
     // A library hook whose contract is per member (`useForm()` promises
     // `setValue` is the same function every render, and promises nothing about
     // `formState`) reads as the same per-member map an object literal gets.
@@ -515,7 +500,7 @@ fn bind_rhs<T: Transfer>(
             })
             .collect();
         ctx.heap.insert(*id, HeapValue::Obj(fields));
-        env.extend_loc(var.to_string(), *id);
+        env.bind_locs(var.to_string(), Some(Sites::closed([*id])));
     }
     if let Expr::Var(src) = rhs {
         if let Some(labels) = env.setter_labels(src).cloned() {
@@ -554,7 +539,7 @@ pub(crate) fn alloc_literal<T: Transfer>(
     expr: &Expr,
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
-) -> Option<std::collections::HashSet<crate::ir::types::ExprId>> {
+) -> Option<Sites> {
     let (id, fields): (_, Vec<(Symbol, &Expr)>) = match expr.peel_ts() {
         Expr::FnLit {
             id,
@@ -562,7 +547,7 @@ pub(crate) fn alloc_literal<T: Transfer>(
             body_cfg,
         } => {
             ctx.heap.alloc_fn(*id, params, body_cfg, env, ctx.component);
-            return Some(std::iter::once(*id).collect());
+            return Some(Sites::closed([*id]));
         }
         // Members written before a spread are dropped: `{ a, ...rest }` may
         // overwrite `a` with something this map cannot see, and an absent
@@ -587,26 +572,20 @@ pub(crate) fn alloc_literal<T: Transfer>(
                 elems.enumerate().map(|(i, v)| (i.to_string(), v)).collect(),
             )
         }
-        Expr::MemoVal(label) => return ctx.memo.locs(*label).cloned(),
+        Expr::MemoVal(label) => return ctx.memo.sites(*label).cloned(),
         other => return resolve_locs(other, env, ctx.heap),
     };
     let mut members = HashMap::new();
     for (key, value) in fields {
-        let ids = alloc_literal(transfer, value, env, ctx);
+        let sites = alloc_literal(transfer, value, env, ctx);
         let val = transfer
             .eval_expr(value, env, ctx)
             .as_state_value()
             .unwrap_or_else(StateValue::top);
-        members.insert(
-            key,
-            match ids {
-                Some(ids) => EnvVal::Loc { ids, val },
-                None => EnvVal::Val(val),
-            },
-        );
+        members.insert(key, EnvVal::located(sites, val));
     }
     ctx.heap.insert(id, HeapValue::Obj(members));
-    Some(std::iter::once(id).collect())
+    Some(Sites::closed([id]))
 }
 
 /// The one transfer for "write a state slot": a call `f(arg)` whose callee is
@@ -828,8 +807,8 @@ pub(crate) fn exec_fn_value<T: Transfer>(
             .filter(|v| !v.is_bottom())
         }
         other => {
-            if let Some(ids) = resolve_locs(other, env, ctx.heap) {
-                return exec_heap_fns(transfer, ids, env, ctx, depth);
+            if let Some(sites) = resolve_locs(other, env, ctx.heap) {
+                return exec_heap_fns(transfer, sites, env, ctx, depth);
             }
             // useCallback binding: the body lives in the hook entry, not the
             // heap (the rewrite to `CallbackVal` moved it out of the
@@ -862,18 +841,19 @@ pub(crate) fn exec_fn_value<T: Transfer>(
 /// `api.tick()`).
 ///
 /// Returns the join of what the bodies returned when every target was a
-/// body that ran: locations that include anything else answer `None`; so
-/// does a body no run returns from.
+/// body that ran: locations that include anything else, or open ones that
+/// may be something no site places (#240), answer `None`; so does a body no
+/// run returns from.
 fn exec_heap_fns<T: Transfer>(
     transfer: &T,
-    ids: std::collections::HashSet<crate::ir::types::ExprId>,
+    sites: Sites,
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
 ) -> Option<T::Domain> {
-    let mut ids: Vec<_> = ids.into_iter().collect();
+    let mut ids: Vec<_> = sites.ids.into_iter().collect();
     ids.sort();
-    let mut returned = Some(T::Domain::bottom());
+    let mut returned = (!sites.open).then(T::Domain::bottom);
     for id in ids {
         if let Some(HeapValue::Fn {
             params,

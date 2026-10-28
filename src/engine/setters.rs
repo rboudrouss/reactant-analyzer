@@ -10,8 +10,8 @@ use std::sync::Arc;
 use crate::ir::ComponentId;
 use crate::{
     domains::{
-        AbstractEnv, StateValue,
-        stores::{EnvVal, Heap, HeapValue},
+        AbstractDomain, AbstractEnv, StateValue,
+        stores::{EnvVal, Heap, HeapValue, Sites},
     },
     engine::{
         AnalysisResult,
@@ -481,7 +481,9 @@ fn path_root(path: &str) -> &str {
 /// Visit every name `cfg` binds, then every member path of the objects it
 /// points to (`api.tick`, `t.1`: what [`callee_path`] names a member call
 /// by, #216, #233), with its value in each block's converged env — blocks in
-/// program order, names and members sorted (#120).
+/// program order, names and members sorted (#120). A member the value may
+/// hold without a site saying so — the value is open, or one of its sites
+/// does not record the member — is also visited as ⊤ (#240).
 fn for_each_converged_path(
     cfg: &CFG,
     block_states: &HashMap<BlockId, AbstractEnv<StateValue>>,
@@ -512,21 +514,34 @@ fn for_each_converged_path(
             let mut seen: HashSet<crate::ir::types::ExprId> = HashSet::new();
             while let Some((name, ev)) = stack.pop() {
                 visit(&name, &ev);
-                let mut ids: Vec<_> = ev.locs().into_iter().flatten().copied().collect();
-                ids.sort();
-                for id in ids {
-                    if !seen.insert(id) {
-                        continue;
+                let Some(sites) = ev.sites() else {
+                    continue;
+                };
+                let fresh = Sites {
+                    ids: sites
+                        .ids
+                        .iter()
+                        .copied()
+                        .filter(|id| seen.insert(*id))
+                        .collect(),
+                    open: sites.open,
+                };
+                let members: BTreeSet<&Var> = fresh
+                    .ids
+                    .iter()
+                    .filter_map(|id| match heap.get(*id) {
+                        Some(HeapValue::Obj(fields)) => Some(fields.keys()),
+                        _ => None,
+                    })
+                    .flatten()
+                    .collect();
+                for m in members.into_iter().rev() {
+                    let path = format!("{name}.{m}");
+                    let (entries, open) = heap.members(&fresh, m);
+                    if open {
+                        stack.push((path.clone(), EnvVal::Val(StateValue::top())));
                     }
-                    if let Some(HeapValue::Obj(fields)) = heap.get(id) {
-                        let mut members: Vec<_> = fields.iter().collect();
-                        members.sort_by(|a, b| b.0.cmp(a.0));
-                        stack.extend(
-                            members
-                                .into_iter()
-                                .map(|(m, ev)| (format!("{name}.{m}"), ev.clone())),
-                        );
-                    }
+                    stack.extend(entries.into_iter().rev().map(|e| (path.clone(), e.clone())));
                 }
             }
         }
@@ -556,10 +571,12 @@ pub(crate) fn callee_path(fn_: &Expr) -> Option<Var> {
 /// passed `() => setCount(0)` as a prop) — one per closure, the first setter
 /// it captured, as before. A value that may be several (two call sites, two
 /// setters) is each of them, and provably none: `must_write` needs one, and a
-/// value that may be something else than a setter (#233) writes none surely.
+/// value that may be something else than a setter (#233) writes none surely,
+/// nor does one that may be a function no site places (#240).
 /// Allocation sites and captures are hash sets/maps, so both are walked in
 /// sorted order (#120).
 fn setter_of(ev: &EnvVal<StateValue>, heap: &Heap) -> Vec<SetterProp> {
+    let open = ev.sites().is_some_and(|s| s.open);
     let val = ev.as_val();
     let mut out: Vec<SetterProp> = val
         .setters()
@@ -587,7 +604,7 @@ fn setter_of(ev: &EnvVal<StateValue>, heap: &Heap) -> Vec<SetterProp> {
                 out.push(SetterProp {
                     component: *component,
                     label: *label,
-                    must_write: body_writes(body_cfg, name),
+                    must_write: !open && body_writes(body_cfg, name),
                     closure: true,
                 });
             }

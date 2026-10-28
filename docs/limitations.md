@@ -69,7 +69,9 @@ that writes it (see *Cross-file limits*).
   ternary of literals (`return c ? [setV, v] : [v, setV]`), whose member may be a setter or
   something else and writes the setter when called, as a possible write. A name bound to several
   setters writes each of them, as a possible write of each
-  [#202](https://github.com/rboudrouss/reactant-analyzer/issues/202). A closure called through a
+  [#202](https://github.com/rboudrouss/reactant-analyzer/issues/202). A name bound to a literal on
+  one path and to something the heap does not place on another reads the literal's members as
+  possibly something else too: a possible write, never a certain one. A closure called through a
   member path (`api.inc()`) is walked where the converged values point it, in render as in an
   effect; its write is a certain one only when the path certainly names one literal closure that
   nothing may rewrite (`api` used only to read its members). One only passed, to a callee or a JSX

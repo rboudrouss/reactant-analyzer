@@ -1032,6 +1032,39 @@ fn a_member_that_is_the_setter_on_one_path_only_is_no_certain_write() {
 }
 
 #[test]
+fn a_member_of_a_value_no_site_may_place_is_no_certain_write() {
+    // A name bound to a literal on one path and to a value the heap does not
+    // place on another (or rebound to one) read the literal's member as all
+    // it may be, and `setter-in-render` certified an Error React does not
+    // bear out. A possible write where the literal may be what `t` holds;
+    // none where it surely is not.
+    let unknown = "Object.freeze([0, (x) => {}])";
+    for (body, fires_at_all) in [
+        (format!("let t = {unknown}; if (c) t = [v, setV];"), true),
+        (format!("let t = [v, setV]; if (c) t = {unknown};"), true),
+        (format!("let t = [v, setV]; t = {unknown};"), false),
+    ] {
+        let found = rules_for(
+            &format!(
+                "function App({{ c }}) {{ const [v, setV] = useState(0); {body} t[1](1); return <div />; }}"
+            ),
+            "App",
+        );
+        assert_eq!(
+            fires(&found, "setter-in-render"),
+            fires_at_all,
+            "{body}: {found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .all(|(_, s)| *s != reactant::rules::Severity::Error),
+            "{body}: {found:?}"
+        );
+    }
+}
+
+#[test]
 fn a_setter_joined_with_an_unknown_value_is_still_written() {
     // #238: `api.f` is `setV` or what an unknown callee returned (⊤). The
     // join kept no setter, so neither call below wrote anything. Both are

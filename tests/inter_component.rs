@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use reactant::{
     domains::{
         impls::{Stability, StateValue, interval::Interval},
-        stores::{AbstractEnv, EnvVal, MemoStore, StateStore},
+        stores::{AbstractEnv, EnvVal, MemoStore, Sites, StateStore},
     },
     engine::{
         ComponentRegistry, Config, HookRegistry, ProgramAnalysisResult, RootStrategy,
@@ -406,7 +406,7 @@ fn field_access_resolves_abstract_object_in_heap() {
 
     // Build env: props → loc ExprId(1)
     let mut env = AbstractEnv::bottom();
-    env.extend_loc("props".to_string(), ExprId(1));
+    env.bind_locs("props".to_string(), Some(Sites::closed([ExprId(1)])));
 
     let mut state = StateStore::bottom();
     let memo = MemoStore::new();
@@ -440,7 +440,7 @@ fn field_access_unknown_field_returns_top() {
     heap.insert(ExprId(1), reactant::domains::stores::HeapValue::Obj(fields));
 
     let mut env = AbstractEnv::bottom();
-    env.extend_loc("props".to_string(), ExprId(1));
+    env.bind_locs("props".to_string(), Some(Sites::closed([ExprId(1)])));
 
     let mut state = StateStore::bottom();
     let memo = MemoStore::new();

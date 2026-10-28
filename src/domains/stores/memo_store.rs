@@ -1,11 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
-use crate::{
-    domains::AbstractDomain,
-    ir::types::{ExprId, HookLabel},
-};
+use crate::{domains::AbstractDomain, ir::types::HookLabel};
 
-use super::EnvVal;
+use super::{EnvVal, Sites};
 
 /// Maps each `useMemo` / `useCallback` hook label to its current abstract value.
 ///
@@ -35,10 +32,11 @@ impl<D: AbstractDomain> MemoStore<D> {
         self.0.get(&label).map_or_else(D::top, EnvVal::as_val)
     }
 
-    /// The allocation sites the memo may point to; `None` when some recompute
-    /// may hand back anything else, or none ran yet.
-    pub fn locs(&self, label: HookLabel) -> Option<&HashSet<ExprId>> {
-        self.0.get(&label).and_then(EnvVal::locs)
+    /// The allocation sites the memo may point to, open when a recompute may
+    /// hand back something no site places (#240); `None` when no recompute
+    /// returns a site, or none ran yet.
+    pub fn sites(&self, label: HookLabel) -> Option<&Sites> {
+        self.0.get(&label).and_then(EnvVal::sites)
     }
 
     /// Store a precomputed value for a label.
@@ -53,6 +51,7 @@ impl<D: AbstractDomain> MemoStore<D> {
 mod tests {
     use super::*;
     use crate::domains::Stability;
+    use crate::ir::types::ExprId;
 
     type Memo = MemoStore<Stability>;
 
@@ -68,7 +67,7 @@ mod tests {
         assert_eq!(m.get(0), Stability::Stable);
         m.set(0, EnvVal::Val(Stability::PerRender));
         assert_eq!(m.get(0), Stability::PerRender);
-        assert!(m.locs(0).is_none());
+        assert!(m.sites(0).is_none());
     }
 
     #[test]
@@ -84,15 +83,15 @@ mod tests {
     #[test]
     fn a_memo_keeps_the_sites_it_points_to() {
         let mut m = Memo::new();
-        let ids = HashSet::from([ExprId(4)]);
+        let sites = Sites::closed([ExprId(4)]);
         m.set(
             0,
             EnvVal::Loc {
-                ids: ids.clone(),
+                sites: sites.clone(),
                 val: Stability::PerRender,
             },
         );
         assert_eq!(m.get(0), Stability::PerRender);
-        assert_eq!(m.locs(0), Some(&ids));
+        assert_eq!(m.sites(0), Some(&sites));
     }
 }
