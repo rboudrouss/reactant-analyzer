@@ -42,7 +42,7 @@ params included. Two `setX(…)` calls in one body are two rows.
 | `span` | the witness call site | exact, `None` when unplaceable |
 | `region` | the lexical body the write sits in (render, effect, memo, callback, handler) | exact |
 | `phase` | when the write executes: its body's phase for a synchronous write, `Deferred` / `Handler` / `Cleanup` from a callee summary, `Unknown` under an unresolved callee | may, ⊤-bearing |
-| `via` | caller-authored (`Direct`) or reached through inlined wrappers (`Via`); `Unknown` when the site could not be placed. A write inside a closure reached by name is authored where the closure is defined (a hook's returned `inc` is `Via` the hook) | exact; `Direct` is certifiable |
+| `via` | caller-authored (`Direct`) or reached through inlined wrappers (`Via`); `Unknown` when the site could not be placed. A write inside a closure reached by name is authored where the closure is defined (a hook's returned `inc` is `Via` the hook); one reached through a path no binding certifies, which the converged values point at the closure (`api.inc()`, #233), is `Unknown` | exact; `Direct` is certifiable |
 | `updater` | argument 0 proven a function literal (`Functional`, body kept) or ⊤ | must for `Functional` |
 | `same_tick` | another write of the same slot in this region is CFG-reachable from this one | may, one-directional: `false` is not a promise |
 | `block` | the region block a write that runs synchronously, once per pass, sits in — what `must_on_all_paths` takes | exact; `None` for nested, deferred, cleanup and repeating sites, and for a call through a name with several setters, which writes one, or with a value that may be something else, which may write none |

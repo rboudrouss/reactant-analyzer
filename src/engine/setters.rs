@@ -122,6 +122,7 @@ pub fn collect_setter_calls_with_extra(
     let mut walk = SetterWalk {
         setter_vars,
         fn_bindings: &fn_bindings,
+        may_fns: &NO_FNS,
         walking: HashSet::new(),
         root: cfg as *const CFG as usize,
         effect_body: false,
@@ -191,7 +192,9 @@ pub(crate) struct WriteSite {
 /// handler body is extracted out of the render CFG, so a `set(inc)` whose
 /// `inc` was defined in render is invisible to a walk of the body alone. A
 /// name the walked body binds itself drops out of the set, fail-closed, the
-/// same device as `shadowed`.
+/// same device as `shadowed`. `may_fns` are the closures the converged values
+/// put behind a name or member path ([`collect_converged_fns`]), dropped the
+/// same way when the body binds the path's root.
 ///
 /// `dispatches`: some body of the program fires event listeners itself
 /// ([`SetterWalk::dispatches`]).
@@ -204,6 +207,7 @@ pub(crate) fn collect_write_sites(
     dispatches: bool,
     shadowed: &HashSet<Var>,
     outer_fns: &HashMap<Var, Arc<CFG>>,
+    may_fns: &HashMap<Var, Vec<Arc<CFG>>>,
     callback_bodies: &HashMap<HookLabel, Arc<CFG>>,
 ) -> Vec<WriteSite> {
     let mut found = Found::default();
@@ -224,9 +228,15 @@ pub(crate) fn collect_write_sites(
     // A body's own rename of an outer function (`const run = inc` in an
     // effect) only resolves once the outer names are in.
     let fn_bindings = resolve_aliases(cfg, &fn_bindings);
+    let may_fns: HashMap<Var, Vec<Arc<CFG>>> = may_fns
+        .iter()
+        .filter(|(path, _)| !local_binders.contains(path_root(path)))
+        .map(|(path, bodies)| (path.clone(), bodies.clone()))
+        .collect();
     let mut walk = SetterWalk {
         setter_vars,
         fn_bindings: &fn_bindings,
+        may_fns: &may_fns,
         walking: HashSet::new(),
         root: cfg as *const CFG as usize,
         effect_body,
@@ -312,6 +322,65 @@ pub(crate) fn collect_component_setter_vars(
     block_states: &HashMap<BlockId, AbstractEnv<StateValue>>,
     heap: &Heap,
 ) -> HashMap<Var, Vec<SetterProp>> {
+    let mut result: HashMap<Var, Vec<SetterProp>> = HashMap::new();
+    for_each_converged_path(cfg, block_states, heap, |name, ev| {
+        if !result.contains_key(name) {
+            let props = setter_of(ev, heap);
+            if !props.is_empty() {
+                result.insert(name.clone(), props);
+            }
+        }
+    });
+    result
+}
+
+/// Every closure of `component` a name or member path of `cfg` may point to
+/// in some block's converged env (#233): `api.inc` for a hook's or a memo's
+/// returned object, `inc` destructured off a memo. A call through the path
+/// may run any of them — the writer relation walks each body
+/// ([`SetterWalk::may_fns`]). Another component's closure stays a carried
+/// setter prop: its body names that component's bindings.
+pub(crate) fn collect_converged_fns(
+    cfg: &CFG,
+    block_states: &HashMap<BlockId, AbstractEnv<StateValue>>,
+    heap: &Heap,
+    component: ComponentId,
+) -> HashMap<Var, Vec<Arc<CFG>>> {
+    let mut result: HashMap<Var, Vec<Arc<CFG>>> = HashMap::new();
+    for_each_converged_path(cfg, block_states, heap, |name, ev| {
+        let mut ids: Vec<_> = ev.locs().into_iter().flatten().copied().collect();
+        ids.sort();
+        for id in ids {
+            if let Some(HeapValue::Fn {
+                body_cfg, owner, ..
+            }) = heap.get(id)
+                && *owner == component
+            {
+                let bodies = result.entry(name.clone()).or_default();
+                if !bodies.iter().any(|b| Arc::ptr_eq(b, body_cfg)) {
+                    bodies.push(Arc::clone(body_cfg));
+                }
+            }
+        }
+    });
+    result
+}
+
+/// The variable a member path is rooted at: `api` for `api.inc`.
+fn path_root(path: &str) -> &str {
+    path.split('.').next().unwrap_or(path)
+}
+
+/// Visit every name `cfg` binds, then every member path of the objects it
+/// points to (`api.tick`, `t.1`: what [`callee_path`] names a member call
+/// by, #216, #233), with its value in each block's converged env — blocks in
+/// program order, names and members sorted (#120).
+fn for_each_converged_path(
+    cfg: &CFG,
+    block_states: &HashMap<BlockId, AbstractEnv<StateValue>>,
+    heap: &Heap,
+    mut visit: impl FnMut(&Var, &EnvVal<StateValue>),
+) {
     let mut var_names: HashSet<Var> = HashSet::new();
     for block in cfg.blocks.values() {
         for stmt in &block.stmts {
@@ -327,24 +396,15 @@ pub(crate) fn collect_component_setter_vars(
     let mut var_names: Vec<Var> = var_names.into_iter().collect();
     var_names.sort();
 
-    let mut result: HashMap<Var, Vec<SetterProp>> = HashMap::new();
     for env in cfg.blocks.keys().filter_map(|b| block_states.get(b)) {
         for var in &var_names {
             let Some(ev) = env.lookup_env_val(var) else {
                 continue;
             };
-            // The name itself, then every member path of the objects it
-            // points to (`api.tick`, `t.1`): what `callee_path` names a member
-            // call by (#216, #233).
             let mut stack: Vec<(Var, EnvVal<StateValue>)> = vec![(var.clone(), ev)];
             let mut seen: HashSet<crate::ir::types::ExprId> = HashSet::new();
             while let Some((name, ev)) = stack.pop() {
-                if !result.contains_key(&name) {
-                    let props = setter_of(&ev, heap);
-                    if !props.is_empty() {
-                        result.insert(name.clone(), props);
-                    }
-                }
+                visit(&name, &ev);
                 let mut ids: Vec<_> = ev.locs().into_iter().flatten().copied().collect();
                 ids.sort();
                 for id in ids {
@@ -364,7 +424,6 @@ pub(crate) fn collect_component_setter_vars(
             }
         }
     }
-    result
 }
 
 /// The name a call goes through: a variable, or a member path rooted at one
@@ -1349,6 +1408,10 @@ pub(crate) fn collect_slot_writers(
         &hook_bodies,
         &callback_bodies,
     ));
+    // What no single binding certifies, the converged values may still point
+    // at: a closure behind a member path (`api.inc()`) or a memo's member.
+    let converged_fns =
+        collect_converged_fns(render_cfg, envs.render_exits, envs.heap, envs.component);
 
     // A write reached through a function name is authored where that function
     // is defined, and a name can carry a closure out of the region it was
@@ -1396,6 +1459,7 @@ pub(crate) fn collect_slot_writers(
             dispatches,
             &shadowed,
             &outer_fns,
+            &converged_fns,
             &callback_bodies,
         );
         // One source site is one row. A local helper called twice pulls its
@@ -1577,6 +1641,10 @@ pub(crate) fn collect_slot_writers(
 struct SetterWalk<'a> {
     setter_vars: &'a HashSet<Var>,
     fn_bindings: &'a HashMap<Var, Arc<CFG>>,
+    /// Names and member paths the converged values point at closures of this
+    /// component ([`collect_converged_fns`]): a call through one may run
+    /// each body. Empty for every consumer without converged values.
+    may_fns: &'a HashMap<Var, Vec<Arc<CFG>>>,
     walking: HashSet<usize>,
     /// The walk's outermost CFG (pointer identity) — where effect cleanup
     /// returns and reified listeners are recognized.
@@ -1630,6 +1698,10 @@ static NO_VARS: std::sync::LazyLock<HashSet<Var>> = std::sync::LazyLock::new(Has
 
 /// No proven wrappers — every consumer that walks without resolving summaries.
 static NO_WRAPPERS: std::sync::LazyLock<HashSet<String>> = std::sync::LazyLock::new(HashSet::new);
+
+/// No converged closures — every consumer that walks a body alone.
+static NO_FNS: std::sync::LazyLock<HashMap<Var, Vec<Arc<CFG>>>> =
+    std::sync::LazyLock::new(HashMap::new);
 
 impl SetterWalk<'_> {
     fn collect_reads(&self) -> bool {
@@ -2281,6 +2353,30 @@ impl<'a> SetterWalk<'a> {
                     found.absorb(inner, body, mode, at, prov);
                 }
             }
+            // A call through a name or member path no binding certifies, which
+            // the converged values point at closures of this component
+            // (`api.inc()`, #233): each body may run here, so its writes are
+            // the call's — none placed at the call, since it may run another.
+            if depth > 0
+                && let Some(name) = callee_path(fn_)
+                && !self.fn_bindings.contains_key(&name)
+                && let Some(bodies) = self.may_fns.get(&name)
+            {
+                for body in bodies {
+                    let mut inner = Found::default();
+                    self.path.push(name.clone());
+                    self.cfg(
+                        body,
+                        depth - 1,
+                        &mut inner,
+                        WalkClass::Sync,
+                        prov,
+                        stmt_span,
+                    );
+                    self.path.pop();
+                    found.absorb(inner, body, mode, None, prov);
+                }
+            }
             // An immediately-invoked function expression runs NOW, at this
             // call site, in this mode — `(async () => { … })()` is how an
             // effect awaits, and it is the standard shape. The walk descended a
@@ -2449,6 +2545,7 @@ pub fn collect_slot_reads(render_cfg: &CFG, hooks: &[HookEntry]) -> Vec<SlotRead
         let mut walk = SetterWalk {
             setter_vars: &NO_VARS,
             fn_bindings: &fn_bindings,
+            may_fns: &NO_FNS,
             walking: HashSet::new(),
             root: cfg as *const CFG as usize,
             effect_body: matches!(region, WriterRegion::Effect(_)),
@@ -2529,6 +2626,7 @@ pub fn collect_body_calls(cfg: &CFG, region: WriterRegion, max_depth: usize) -> 
     let mut walk = SetterWalk {
         setter_vars: &empty_vars,
         fn_bindings: &fn_bindings,
+        may_fns: &NO_FNS,
         walking: HashSet::new(),
         root: cfg as *const CFG as usize,
         effect_body: matches!(region, WriterRegion::Effect(_)),

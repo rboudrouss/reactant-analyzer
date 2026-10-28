@@ -74,7 +74,9 @@ that writes it (see *Cross-file limits*).
   write ([#233](https://github.com/rboudrouss/reactant-analyzer/issues/233)); a slot widened to ⊤
   absorbs the setter it is joined with, and a call of ⊤ writes nothing. A memo is the literal its
   body returns (`return useMemo(() => [v, setV], [v])`), whose members the caller reads through
-  the heap — when every return of the body is one the heap places.
+  the heap — when every return of the body is one the heap places. A closure called through a
+  member path (`const api = useCounter(); api.inc()`) is walked where the converged values point
+  it; one only passed by a member path (`setTimeout(api.inc)`) is not.
 - `useContext` is unmodelled, so a context value reads ⊤. This is the single largest source of
   analysis limits, 363 sites across the eight corpora [#28](https://github.com/rboudrouss/reactant-analyzer/issues/28).
 - Seven React hooks are unmodelled and emit an Info rather than a summary: `useActionState`,
