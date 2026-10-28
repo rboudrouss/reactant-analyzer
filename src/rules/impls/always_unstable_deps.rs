@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use crate::rules::RuleCtx;
 use crate::{
-    engine::{FreshDeps, HookKind, fresh_deps},
+    engine::{HookKind, fresh_deps},
     ir::{
         ComponentId,
         expr::Expr,
@@ -64,13 +64,6 @@ impl Rule for AlwaysUnstableDeps {
         let result = &program.components[&component];
         let mut diags = Vec::new();
         let fresh = fresh_deps(result);
-        // The elements under which the component does what its result, the
-        // join of all of them, does not show (#175).
-        let sites: Vec<(ComponentId, &FreshDeps)> = program
-            .call_graph
-            .sites_of(component)
-            .filter_map(|(caller, site)| site.own.as_ref().map(|o| (caller, &o.fresh_deps)))
-            .collect();
 
         for hook in &result.hooks {
             let (label, deps, kind, span) = match hook {
@@ -94,21 +87,17 @@ impl Rule for AlwaysUnstableDeps {
             }
 
             // Fresh wherever the component renders, or else through the
-            // elements under which it is: those are named.
-            let (indices, via): (BTreeSet<usize>, Vec<String>) = match fresh.get(&label) {
-                Some(own) => (own.clone(), Vec::new()),
+            // elements under which it is (#175): those are named.
+            let (indices, via): (BTreeSet<usize>, String) = match fresh.get(&label) {
+                Some(own) => (own.clone(), String::new()),
                 None => {
-                    let mut indices = BTreeSet::new();
-                    let mut via = Vec::new();
-                    for (caller, site) in &sites {
-                        if let Some(i) = site.get(&label) {
-                            indices.extend(i);
-                            via.push(format!("`<{}>`", program.display_name(*caller)));
-                        }
-                    }
-                    via.sort();
-                    via.dedup();
-                    (indices, via)
+                    let through = program.call_graph.fresh_through(component, label);
+                    let parents: BTreeSet<ComponentId> =
+                        through.values().flatten().copied().collect();
+                    (
+                        through.into_keys().collect(),
+                        crate::rules::parent_elements(program, &parents),
+                    )
                 }
             };
             let unstable: Vec<&Expr> = indices.iter().filter_map(|i| deps_ref.get(*i)).collect();
@@ -121,7 +110,7 @@ impl Rule for AlwaysUnstableDeps {
             let when = if via.is_empty() {
                 String::new()
             } else {
-                format!(" when {} renders it", via.join(" or "))
+                format!(" when {via} renders it")
             };
             let mut d = Diagnostic::warn(
                 "always-unstable-deps",

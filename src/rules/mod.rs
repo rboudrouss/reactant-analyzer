@@ -54,7 +54,7 @@ pub(in crate::rules) use helpers::setters::{
 };
 pub(crate) use helpers::{
     ConvergedEval, arg_is_call_free, collect_callees, describe_value, eval_in_stores,
-    has_hook_kind, hook_kind_word, local_bindings, state_slot_name,
+    has_hook_kind, hook_kind_word, local_bindings, parent_elements, state_slot_name,
 };
 pub(in crate::rules) use helpers::{all_deps_provably_stable, fn_lit_binding};
 

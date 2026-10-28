@@ -128,10 +128,14 @@ that writes it (see *Cross-file limits*).
   A guard on the feeding state itself (`switch (step.type)`), or one call site the feeder does not
   reach (a story passing constants), caps a proven freeze at Warning.
 - **Per-call-site facts.** A child's result is its analysis under the join of every call site
-  [#175](https://github.com/rboudrouss/reactant-analyzer/issues/175). `always-unstable-deps` also
-  reads the child re-analysed under each call site alone and names the parents a dep is fresh
-  through. `infinite-loop`, `cross-component-infinite-loop` and `missing-deps` read the join only,
-  so a fact that holds through one parent alone is missed there.
+  [#175](https://github.com/rboudrouss/reactant-analyzer/issues/175). The child is also
+  re-analysed under each call site alone: a dep fresh through one parent is reported by
+  `always-unstable-deps`, and re-runs its effect after every render for `infinite-loop` and
+  `cross-component-infinite-loop`, at Warning, naming the parents
+  [#237](https://github.com/rboudrouss/reactant-analyzer/issues/237). That re-analysis is one level
+  deep: a dep fresh through a grandparent, handed down by a wrapper with one element
+  (`<Inner {...props} />`), reads as the join. `missing-deps` asks whether a capture *may* change,
+  which the join answers for every site at once.
 - **Render cascades stop at what the analysis cannot see into.** `state-lifted-too-high` and
   `wasted-subtree-render` ([ADR-041](adr/ADR-041-render-dependence.md)) treat an element whose
   component does not resolve as a use, and never count it as wasted. That covers a library

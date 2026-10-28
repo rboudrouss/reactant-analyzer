@@ -13,7 +13,9 @@ use crate::{
 };
 
 use crate::engine::setters::SetterCallPhase;
-use crate::engine::{Always, Change, ChurnEdge, ChurnGraph, EdgeStrength, Rerun, WriterRegion};
+use crate::engine::{
+    Always, Change, ChurnEdge, ChurnGraph, EdgeStrength, EveryRender, Rerun, WriterRegion,
+};
 use crate::ir::ComponentId;
 use crate::rules::api::query::must_effect_cycle;
 use crate::rules::helpers::cycles::{NodeNames, cycle_path, node_display};
@@ -329,14 +331,11 @@ fn check_multi_effect_cycles(
                     })
             };
             // Why a length-1 cycle re-runs its own effect after every render.
-            let always = e.always.filter(|_| cyc.len() == 1).map(|(why, surely)| {
-                always_clause(
-                    why,
-                    surely,
-                    &result.components[&e.component],
-                    e.effect_label,
-                )
-            });
+            let always = e
+                .always
+                .as_ref()
+                .filter(|_| cyc.len() == 1)
+                .map(|a| always_clause(a, result, e.component, e.effect_label));
             let msg = if !certain && !cyc.iter().all(|e| allocates(e)) {
                 if let Some((why, reruns)) = &always {
                     format!(
@@ -447,13 +446,16 @@ fn check_multi_effect_cycles(
 
 /// Why effect `label` re-runs after every render, as a clause of the
 /// message, and whether it surely does (`re-runs`) or only may (`may re-run`)
-/// — `surely` as the engine computed it on the edge.
+/// — `surely` as the engine computed it on the edge — naming the parents
+/// whose elements alone make it so (#237).
 fn always_clause(
-    why: Always,
-    surely: bool,
-    comp: &crate::engine::AnalysisResult<crate::domains::StateValue>,
+    always: &EveryRender,
+    program: &ProgramAnalysisResult,
+    component: ComponentId,
     label: HookLabel,
 ) -> (String, &'static str) {
+    let comp = &program.components[&component];
+    let (why, surely) = (always.why, always.surely);
     let dep = |i: usize| {
         comp.hooks
             .iter()
@@ -471,6 +473,12 @@ fn always_clause(
         Always::FreshDep(i) if surely => {
             format!("depends on `{}`, a new reference every render,", dep(i))
         }
+        // Fresh under these parents' elements alone.
+        Always::FreshDep(i) if !always.through.is_empty() => format!(
+            "depends on `{}`, a new reference whenever {} renders it,",
+            dep(i),
+            crate::rules::parent_elements(program, &always.through)
+        ),
         // Fresh while the props hold: a prop the parent allocates.
         Always::FreshDep(i) => format!(
             "depends on `{}`, a new reference whenever its parent re-renders,",

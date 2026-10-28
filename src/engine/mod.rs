@@ -27,7 +27,7 @@ pub use analysis_result::{
     WidenEvent,
 };
 pub use cfg_analyzer::analyze_cfg;
-pub use churn::{ChurnCycle, ChurnEdge, ChurnGraph, EdgeStrength};
+pub use churn::{ChurnCycle, ChurnEdge, ChurnGraph, EdgeStrength, EveryRender};
 pub use component_cache::ComponentCache;
 pub use component_registry::{ComponentKey, ComponentRegistry};
 pub use dominance::{DominatorTree, compute_dominators, dominates, on_all_paths};

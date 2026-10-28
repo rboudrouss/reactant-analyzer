@@ -90,7 +90,10 @@ reads no deps array, at strength `min(why, must(write))`; for `FreshDep` it
 also asks that the dep does not hold while props hold — a prop the parent
 allocates is the same when the component re-renders alone, the reading a
 fresh *write* gets too. A hook's or a context's result is held (#161), so it
-makes no effect `Always`.
+makes no effect `Always`. Where the class is not `Always`, the churn graph
+also reads a dep fresh under one call site's input alone (`fresh_through`,
+below) as a possible `FreshDep` re-run, naming the parents it holds through
+(#237).
 
 | column | claim | polarity |
 |---|---|---|
@@ -168,8 +171,12 @@ every render when one parent renders it) is lost there. After phase 1, each
 element whose input is below that join re-analyses its child under its own
 input, once, and keeps the facts in `own`. That re-analysis is a probe: what
 it would hand its own children or write into another component's slot is
-already recorded, so it records nothing and analyses no child. A rule quantifying "always" over a
-prop-derived value reads `own` and names the parents it holds through.
+already recorded, so it records nothing and analyses no child. A reader quantifying "always" over a
+prop-derived dep reads `fresh_through(child, hook)` — per dep, the parents through whose
+elements it is fresh — and names them: `always-unstable-deps` and the churn graph's re-run
+class (#237). A may question (`missing-deps`: may this capture change?) is the join's to
+answer. The probe is one level deep: what a grandparent hands down through a wrapper's
+single element reads as the join.
 
 | column | claim | polarity |
 |---|---|---|
@@ -224,7 +231,7 @@ is not seen as its parent.
 | `from`, `to` | qualified slots | exact |
 | `component`, `effect_label`, `write_span` | the carrying effect and its write | exact |
 | `strength` | `Must`: (exact-slot dep, or a certain every-render re-run) ∧ `Fresh` write on all paths of the body. `May`: everything else | must / may |
-| `always` | the edge exists because the carrying effect re-runs after every render (its re-run class), why, and whether surely (a fresh dep the parent allocates is new only at the parent's renders) | exact |
+| `always` | the edge exists because the carrying effect re-runs after every render (its re-run class, or a call site's own), why, whether surely (a fresh dep the parent allocates is new only at the parent's renders), and `through`: the parents whose elements alone make it so, empty when the class says it (#237) | exact; `through` non-empty is never sure |
 | `self_slot` | a dep-driven edge from a slot into itself: the self-churn arm's partition, never part of a reported cycle | exact |
 
 A cycle (`ChurnCycle`) is a simple cycle of one strongly connected component

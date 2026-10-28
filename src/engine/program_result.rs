@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::{
     domains::{AbstractDomain, impls::StateValue, stores::SharedStateStore},
@@ -6,7 +6,7 @@ use crate::{
     ir::{
         ComponentId, ComponentTable, ModuleTable,
         source_range::{FileTable, SourceRange},
-        types::Symbol,
+        types::{HookLabel, Symbol},
     },
 };
 
@@ -225,6 +225,26 @@ impl ComponentCallGraph {
             .into_iter()
             .flatten()
             .map(|(caller, i)| (*caller, &self.edges[caller][*i]))
+    }
+
+    /// The deps of `hook` in `comp` that are a new reference at every render
+    /// under one element's input alone, each with the components whose
+    /// render builds such an element (#175, #237). What the joined result
+    /// loses: a reader quantifying "always fresh" over a prop-derived dep
+    /// reads it where the result does not say so, and names the parents.
+    pub fn fresh_through(
+        &self,
+        comp: ComponentId,
+        hook: HookLabel,
+    ) -> BTreeMap<usize, BTreeSet<ComponentId>> {
+        let mut out: BTreeMap<usize, BTreeSet<ComponentId>> = BTreeMap::new();
+        for (caller, site) in self.sites_of(comp) {
+            let fresh = site.own.as_ref().and_then(|o| o.fresh_deps.get(&hook));
+            for &i in fresh.into_iter().flatten() {
+                out.entry(i).or_default().insert(caller);
+            }
+        }
+        out
     }
 
     /// The row of one element, to record what the callee does under it.

@@ -2047,3 +2047,53 @@ export function C() {
 "#;
     assert!(!loop_severities(src, "C").is_empty());
 }
+
+// ── A re-run that holds through one call site (#237) ──────────────────────────
+
+const ONE_FRESH_SITE: &str = r#"
+import { useState, useEffect } from 'react';
+const CONST = { a: 1 };
+function Child({ opts }: { opts: object }) {
+  const [n, setN] = useState({});
+  useEffect(() => { setN({ ...n }); }, [opts]);
+  return <div />;
+}
+export function Fresh() {
+  return <Child opts={{ a: 2 }} />;
+}
+"#;
+
+#[test]
+fn a_dep_fresh_through_one_call_site_reruns_the_effect_there() {
+    // A second element hands `opts` a constant: the join of the two is not
+    // a new reference every render, but through `<Fresh>` it is, and the
+    // effect re-runs there as it does when `<Fresh>` alone renders it. The
+    // finding names that parent, at Warning: the other one does not.
+    let joined =
+        format!("{ONE_FRESH_SITE}export function Still() {{ return <Child opts={{CONST}} />; }}\n");
+    for src in [ONE_FRESH_SITE, joined.as_str()] {
+        let d = infinite_loop_diags(src, "Child");
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].1, Severity::Warning, "{d:?}");
+    }
+    let d = infinite_loop_diags(&joined, "Child");
+    assert!(d[0].2.contains("whenever `<Fresh>` renders it"), "{d:?}");
+    assert!(!d[0].2.contains("Still"), "{d:?}");
+}
+
+#[test]
+fn a_dep_stable_at_every_call_site_reruns_nothing() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+const A = { a: 1 };
+const B = { b: 1 };
+function Child({ opts }: { opts: object }) {
+  const [n, setN] = useState({});
+  useEffect(() => { setN({ ...n }); }, [opts]);
+  return <div />;
+}
+export function P() { return <Child opts={A} />; }
+export function Q() { return <Child opts={B} />; }
+"#;
+    assert!(infinite_loop_diags(src, "Child").is_empty());
+}

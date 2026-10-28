@@ -85,7 +85,7 @@
 //! partition. The cycle search skips it; the self-churn arm reads only it.
 //! Every other edge is the graph arm's.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::{
     domains::{AbstractEnv, StateValue},
@@ -134,14 +134,27 @@ pub struct ChurnEdge {
     pub effect_label: HookLabel,
     pub write_span: Option<SourceRange>,
     /// The edge exists because the carrying effect re-runs after every render
-    /// (its re-run class, `engine::triggers::Rerun::Always`), and why: no
-    /// dependency array, a dep that is a new reference every render, … —
-    /// and whether it surely does: a fresh dep the parent allocates is new
-    /// only when the parent re-renders.
-    pub always: Option<(Always, bool)>,
+    /// (its re-run class, `engine::triggers::Rerun::Always`, or a call
+    /// site's own), and why.
+    pub always: Option<EveryRender>,
     /// A dep-driven edge from a slot into itself: the self-churn arm's
     /// partition (ADR-020 item 2). Never part of a cycle the graph reports.
     pub self_slot: bool,
+}
+
+/// Why an effect re-runs after every render, as the edges it carries say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EveryRender {
+    /// No dependency array, a dep that is a new reference every render, …
+    pub why: Always,
+    /// It surely does: a fresh dep the parent allocates is new only when the
+    /// parent re-renders.
+    pub surely: bool,
+    /// Empty: the component's result says it, wherever it renders. Otherwise
+    /// the parents through whose elements alone the dep is a new reference
+    /// at every render, a fact their join loses (#175, #237): it re-runs
+    /// after every render there, and only may elsewhere.
+    pub through: BTreeSet<ComponentId>,
 }
 
 /// One churn cycle: indices into the edge list, in cycle order
@@ -310,9 +323,9 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         comp_result: &'a AnalysisResult<StateValue>,
         body_cfg: &'a CFG,
         effect_label: HookLabel,
-        /// The effect re-runs after every render, and whether that is
+        /// The effect re-runs after every render, why, and whether that is
         /// certain: what its no-dependency-array path reads.
-        always: Option<(Always, bool)>,
+        always: Option<EveryRender>,
         deps: &'a [Expr],
         triggers: Vec<&'a EffectTrigger>,
         exact_local: HashSet<HookLabel>,
@@ -512,19 +525,36 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             // holds while props hold is a prop the parent allocated, the same
             // when the component re-renders alone. An unreadable deps
             // argument or a ref's contents only may re-run it (#212, #201).
-            let always = comp_result.rerun(*label).and_then(Rerun::always).map(|a| {
-                let certain = match a {
-                    Always::FreshDep(i) => deps.get(i).is_some_and(|d| {
-                        !invariance_of(&ctxs[&comp], navigates).holds(
-                            d,
-                            &ctxs[&comp].render_lets,
-                            true,
-                        )
+            // Where the result, the join of every call site's input, says
+            // nothing, a dep fresh under one element's input alone re-runs it
+            // after every render through that element (#237): a possible
+            // re-run, since another element may hand it a stable value.
+            let always = match comp_result.rerun(*label).and_then(Rerun::always) {
+                Some(why) => Some(EveryRender {
+                    why,
+                    surely: match why {
+                        Always::FreshDep(i) => deps.get(i).is_some_and(|d| {
+                            !invariance_of(&ctxs[&comp], navigates).holds(
+                                d,
+                                &ctxs[&comp].render_lets,
+                                true,
+                            )
+                        }),
+                        _ => why.certain(),
+                    },
+                    through: BTreeSet::new(),
+                }),
+                None => result
+                    .call_graph
+                    .fresh_through(comp, *label)
+                    .into_iter()
+                    .next()
+                    .map(|(i, through)| EveryRender {
+                        why: Always::FreshDep(i),
+                        surely: false,
+                        through,
                     }),
-                    _ => a.certain(),
-                };
-                (a, certain)
-            });
+            };
             facts.push(EffectFacts {
                 comp,
                 comp_result,
@@ -954,7 +984,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             let mut push = |from: QualifiedSlot,
                             strength: EdgeStrength,
                             self_slot: bool,
-                            always: Option<(Always, bool)>| {
+                            always: Option<&EveryRender>| {
                 insert_edge(
                     &mut best,
                     ChurnEdge {
@@ -964,7 +994,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                         component: f.comp,
                         effect_label: f.effect_label,
                         write_span: w.span,
-                        always,
+                        always: always.cloned(),
                         self_slot,
                     },
                 );
@@ -993,12 +1023,13 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 None => vec![node],
             };
             // A certain re-run reads every row already.
-            if let Some((_, true)) = f.always {
+            let always = f.always.as_ref();
+            if always.is_some_and(|a| a.surely) {
                 for &x in &every_render {
-                    push(x, strength, false, f.always);
+                    push(x, strength, false, always);
                 }
                 for &x in from_props {
-                    push(x, EdgeStrength::May, false, f.always);
+                    push(x, EdgeStrength::May, false, always);
                 }
                 continue;
             }
@@ -1029,9 +1060,9 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             }
             // A re-run that is only possible adds May edges beside the rows'
             // own, which keep their partition on a tie (pushed first).
-            if let Some((_, false)) = f.always {
+            if always.is_some_and(|a| !a.surely) {
                 for &x in every_render.iter().chain(from_props) {
-                    push(x, EdgeStrength::May, false, f.always);
+                    push(x, EdgeStrength::May, false, always);
                 }
             }
             // The reads-kill says a re-run stores what the last run stored,
