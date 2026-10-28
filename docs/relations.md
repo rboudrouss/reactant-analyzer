@@ -37,7 +37,7 @@ params included. Two `setX(…)` calls in one body are two rows.
 | column | claim | polarity |
 |---|---|---|
 | `slot` | the slot written, as a `HookLabel` of the **owner** | exact |
-| `owner` | `None`: this component's slot. `Some(parent)`: a write through a `ComponentSetter` prop, whose `slot` is the parent's label; the prop may be a closure that merely carries the setter, so the write itself is a may-fact | exact / may |
+| `owner` | `None`: this component's slot. `Some(parent)`: a write through a `ComponentSetter` prop, destructured (`f()`) or read off the props object (`props.f()`, #243), whose `slot` is the parent's label; the prop may be a closure that merely carries the setter, so the write itself is a may-fact | exact / may |
 | `setter` | the setter variable at the call site, alias chains resolved — a member of a spliced callee's returned literal (`const [v, setV] = useSlot()`) included (#185). A name bound to several setters (`s = c ? setA : setB`, a hook returning either) is a row per setter, each a may-write (#202), and so is a name whose value may be a setter or something else (`c ? [setV, v] : [v, setV]`, #233), an unknown callee's result included (`c ? wrap(setV) : setV`, #238) | exact |
 | `span` | the witness call site | exact, `None` when unplaceable |
 | `region` | the lexical body the write sits in (render, effect, memo, callback, handler) | exact |

@@ -280,6 +280,53 @@ fn a_prop_bound_to_one_of_two_setters_writes_both_slots() {
     assert_eq!(slots, vec![0, 1], "{:?}", child.slot_writers);
 }
 
+#[test]
+fn a_prop_called_through_the_props_object_is_an_owner_qualified_row_in_every_region() {
+    // #243: `props.f` is the member of the props literal the parent passed,
+    // as `f` destructured off it is — in render, in an effect, in a handler.
+    let r = parse_and_analyze(
+        r#"
+        import { useState, useEffect } from "react";
+        export function Parent() {
+          const [n, setN] = useState(0);
+          return <Child f={() => setN((x) => x + 1)} />;
+        }
+        function Child(props: { f: () => void }) {
+          props.f();
+          useEffect(() => {
+            props.f();
+          });
+          return <button onClick={() => props.f()} />;
+        }
+        "#,
+    );
+    let parent = r.component_named("Parent").unwrap();
+    let child = comp(&r, "Child");
+    let regions: Vec<&WriterRegion> = child
+        .slot_writers
+        .iter()
+        .filter(|w| w.owner == Some(parent) && reactant::ir::source_name(&w.setter) == "props.f")
+        .map(|w| &w.region)
+        .collect();
+    assert!(
+        regions.iter().any(|g| matches!(g, WriterRegion::Render)),
+        "{:?}",
+        child.slot_writers
+    );
+    assert!(
+        regions.iter().any(|g| matches!(g, WriterRegion::Effect(_))),
+        "{:?}",
+        child.slot_writers
+    );
+    assert!(
+        regions
+            .iter()
+            .any(|g| matches!(g, WriterRegion::Handler(_))),
+        "{:?}",
+        child.slot_writers
+    );
+}
+
 // ── `Change::Never` is a must fact ───────────────────────────────────────────
 
 /// The `written.change` of the only effect write through `setter` in `src`.

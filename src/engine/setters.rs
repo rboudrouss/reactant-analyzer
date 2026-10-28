@@ -343,14 +343,17 @@ struct Target {
 /// `t[1]` of `c ? [v, setV] : [v, noop]` is the setter at one visit and a
 /// closure at the other — a possible write, never a certain one. Blocks are
 /// visited in `CFG::blocks` order, so the rows are deterministic (#120).
+/// `params` are the body's parameters: the props object, whose members
+/// (`props.f`) are the parent's props literal's (#243).
 pub(crate) fn collect_component_setter_vars(
     cfg: &CFG,
+    params: &[Var],
     block_states: &HashMap<BlockId, AbstractEnv<StateValue>>,
     heap: &Heap,
 ) -> HashMap<Var, Vec<SetterProp>> {
     let mut result: HashMap<Var, Vec<SetterProp>> = HashMap::new();
     let mut unsure: HashSet<Var> = HashSet::new();
-    for_each_converged_path(cfg, block_states, heap, |name, ev| {
+    for_each_converged_path(cfg, params, block_states, heap, |name, ev| {
         let props = setter_of(ev, heap);
         if props.is_empty() {
             if !ev.as_val().is_bottom_value() {
@@ -395,13 +398,14 @@ pub(crate) struct ConvergedFns<'a> {
 impl<'a> ConvergedFns<'a> {
     pub(crate) fn of(
         render: &'a CFG,
+        params: &[Var],
         hooks: &'a [HookEntry],
         block_states: &HashMap<BlockId, AbstractEnv<StateValue>>,
         heap: &Heap,
         component: ComponentId,
     ) -> Self {
         ConvergedFns {
-            fns: collect_converged_fns(render, block_states, heap, component),
+            fns: collect_converged_fns(render, params, block_states, heap, component),
             render,
             scopes: must_alias_scopes(render, hooks),
         }
@@ -449,12 +453,13 @@ impl<'a> ConvergedFns<'a> {
 /// prop: its body names that component's bindings.
 fn collect_converged_fns(
     cfg: &CFG,
+    params: &[Var],
     block_states: &HashMap<BlockId, AbstractEnv<StateValue>>,
     heap: &Heap,
     component: ComponentId,
 ) -> HashMap<Var, Vec<Arc<CFG>>> {
     let mut result: HashMap<Var, Vec<Arc<CFG>>> = HashMap::new();
-    for_each_converged_path(cfg, block_states, heap, |name, ev| {
+    for_each_converged_path(cfg, params, block_states, heap, |name, ev| {
         let mut ids: Vec<_> = ev.locs().into_iter().flatten().copied().collect();
         ids.sort();
         for id in ids {
@@ -478,19 +483,21 @@ fn path_root(path: &str) -> &str {
     path.split('.').next().unwrap_or(path)
 }
 
-/// Visit every name `cfg` binds, then every member path of the objects it
-/// points to (`api.tick`, `t.1`: what [`callee_path`] names a member call
-/// by, #216, #233), with its value in each block's converged env — blocks in
-/// program order, names and members sorted (#120). A member the value may
-/// hold without a site saying so — the value is open, or one of its sites
-/// does not record the member — is also visited as ⊤ (#240).
+/// Visit every name `cfg` binds — its `params`, and every name a statement
+/// binds — then every member path of the objects it points to (`api.tick`,
+/// `t.1`, `props.f`: what [`callee_path`] names a member call by, #216, #233,
+/// #243), with its value in each block's converged env — blocks in program
+/// order, names and members sorted (#120). A member the value may hold
+/// without a site saying so — the value is open, or one of its sites does not
+/// record the member — is also visited as ⊤ (#240).
 fn for_each_converged_path(
     cfg: &CFG,
+    params: &[Var],
     block_states: &HashMap<BlockId, AbstractEnv<StateValue>>,
     heap: &Heap,
     mut visit: impl FnMut(&Var, &EnvVal<StateValue>),
 ) {
-    let mut var_names: HashSet<Var> = HashSet::new();
+    let mut var_names: HashSet<Var> = params.iter().cloned().collect();
     for block in cfg.blocks.values() {
         for stmt in &block.stmts {
             match stmt {
@@ -705,16 +712,21 @@ pub(crate) fn cross_component_setters(
     comp: &AnalysisResult<StateValue>,
     component: ComponentId,
 ) -> HashMap<Var, Vec<SetterProp>> {
-    collect_component_setter_vars(&comp.render_cfg, &comp.block_states, &comp.heap)
-        .into_iter()
-        .filter_map(|(v, props)| {
-            let foreign: Vec<SetterProp> = props
-                .into_iter()
-                .filter(|p| p.component != component)
-                .collect();
-            (!foreign.is_empty()).then_some((v, foreign))
-        })
-        .collect()
+    collect_component_setter_vars(
+        &comp.render_cfg,
+        std::slice::from_ref(&comp.param),
+        &comp.block_states,
+        &comp.heap,
+    )
+    .into_iter()
+    .filter_map(|(v, props)| {
+        let foreign: Vec<SetterProp> = props
+            .into_iter()
+            .filter(|p| p.component != component)
+            .collect();
+        (!foreign.is_empty()).then_some((v, foreign))
+    })
+    .collect()
 }
 
 /// The setters a call through each name or member path of `comp` may write,
@@ -1454,6 +1466,7 @@ fn class_phase(class: WalkClass, region: WriterRegion) -> WriterPhase {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_slot_writers(
     render_cfg: &CFG,
+    params: &[Var],
     hooks: &[HookEntry],
     regions: &InlineRegions,
     hook_provenance: &[crate::ir::hooks::HookProvenance],
@@ -1554,6 +1567,7 @@ pub(crate) fn collect_slot_writers(
     // at: a closure behind a member path (`api.inc()`) or a memo's member.
     let converged_fns = ConvergedFns::of(
         render_cfg,
+        params,
         hooks,
         envs.render_exits,
         envs.heap,

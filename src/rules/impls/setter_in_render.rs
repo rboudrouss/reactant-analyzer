@@ -73,6 +73,7 @@ impl Rule for SetterInRender {
             crate::engine::setters::converged_call_targets(
                 &crate::engine::setters::collect_component_setter_vars(
                     &comp_result.render_cfg,
+                    std::slice::from_ref(&comp_result.param),
                     &comp_result.block_states,
                     &comp_result.heap,
                 ),
@@ -101,6 +102,7 @@ impl Rule for SetterInRender {
         // (`api.inc()`) runs at the call: its writes are render writes there.
         let converged = crate::engine::setters::ConvergedFns::of(
             &comp_result.render_cfg,
+            std::slice::from_ref(&comp_result.param),
             &comp_result.hooks,
             &comp_result.block_states,
             &comp_result.heap,

@@ -563,6 +563,69 @@ export function App() {
     );
 }
 
+// ── #243: a prop called through the props object ──────────────────────────────
+
+/// A child whose parameter is `param` calling the parent's closure as `call`
+/// in an effect whose deps argument is `deps`.
+fn props_member_child(param: &str, call: &str, deps: &str) -> String {
+    format!(
+        r#"
+import {{ useState, useEffect }} from 'react';
+function Child({param}: {{ f: () => void }}) {{
+  useEffect(() => {{ {call}; }}{deps});
+  return <div />;
+}}
+export function App() {{
+  const [v, setV] = useState(0);
+  return <Child f={{() => setV((x) => x + 1)}} />;
+}}
+"#
+    )
+}
+
+#[test]
+fn a_prop_called_through_the_props_object_closes_the_loop_as_destructured() {
+    let member = loop_messages(&props_member_child("props", "props.f()", ""), "Child");
+    assert_eq!(member.len(), 1, "{member:?}");
+    assert!(member[0].contains("`App`"), "{member:?}");
+    let destructured = loop_messages(&props_member_child("{ f }", "f()", ""), "Child");
+    assert_eq!(destructured.len(), 1, "{destructured:?}");
+}
+
+#[test]
+fn a_prop_called_through_the_props_object_in_a_mount_only_effect_is_no_loop() {
+    let msgs = loop_messages(&props_member_child("props", "props.f()", ", []"), "Child");
+    assert!(msgs.is_empty(), "{msgs:?}");
+}
+
+#[test]
+fn a_prop_called_through_the_props_object_in_render_writes_the_parent() {
+    use reactant::rules::{Rule, SetterInRender};
+    let src = r#"
+import { useState } from 'react';
+function Child(props: { onChange: (d: number) => void }) {
+  props.onChange(1);
+  return <div />;
+}
+export function App() {
+  const [v, setV] = useState(0);
+  return <Child onChange={(d) => setV((x) => x + d)} />;
+}
+"#;
+    let result = parse_and_analyze(src);
+    let diags = SetterInRender.check(&RuleCtx::new(
+        &result,
+        result.component_named("Child").unwrap(),
+    ));
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.rule == "cross-setter-in-render"
+                && d.var.as_deref() == Some("props.onChange")),
+        "{diags:?}"
+    );
+}
+
 #[test]
 fn fixture_inter_component_no_crash() {
     let src = std::fs::read_to_string("tests/fixtures/inter_component.tsx")
