@@ -41,7 +41,7 @@ params included. Two `setX(…)` calls in one body are two rows.
 | `setter` | the setter variable at the call site, alias chains resolved — a member of a spliced callee's returned literal (`const [v, setV] = useSlot()`) included (#185). A name bound to several setters (`s = c ? setA : setB`, a hook returning either) is a row per setter, each a may-write (#202), and so is a name whose value may be a setter or something else (`c ? [setV, v] : [v, setV]`, #233), an unknown callee's result included (`c ? wrap(setV) : setV`, #238). A callee that is a call (`get()(x)`) is the value that call returns, bound to a temp the body's own converged envs read — the render's, an effect's, a handler's (#46) — or, in a body that keeps none (a memo or callback body, a closure nested in any body), a run of it from the env it is reached from (#246) | exact |
 | `span` | the witness call site | exact, `None` when unplaceable |
 | `region` | the lexical body the write sits in (render, effect, memo, callback, handler) | exact |
-| `phase` | when the write executes: its body's phase for a synchronous write, `Deferred` / `Handler` / `Cleanup` from a callee summary, `Unknown` under an unresolved callee. A closure passed by name or path rather than written inline (`setTimeout(api.inc)`, `onClick={api.inc}`, #239) takes the class of its position, as a literal there would | may, ⊤-bearing |
+| `phase` | when the write executes: its body's phase for a synchronous write — a memo body's (`Memo`) is a render-phase write that runs each time the memo recomputes, which the memo's re-run class below says (#249) — `Deferred` / `Handler` / `Cleanup` from a callee summary, `Unknown` under an unresolved callee. A closure passed by name or path rather than written inline (`setTimeout(api.inc)`, `onClick={api.inc}`, #239) takes the class of its position, as a literal there would | may, ⊤-bearing |
 | `via` | caller-authored (`Direct`) or reached through inlined wrappers (`Via`); `Unknown` when the site could not be placed. A write inside a closure reached by name is authored where the closure is defined (a hook's returned `inc` is `Via` the hook); one reached through a path no binding certifies, which the converged values point at the closure (`api.inc()`, #233; passed, #239), is `Unknown` | exact; `Direct` is certifiable |
 | `updater` | argument 0 proven a function literal (`Functional`, body kept) or ⊤ | must for `Functional` |
 | `same_tick` | another write of the same slot in this region is CFG-reachable from this one | may, one-directional: `false` is not a promise |
@@ -55,7 +55,9 @@ params included. Two `setX(…)` calls in one body are two rows.
 
 One row per `(effect, dep index, qualified slot)`: the slot moves that dep.
 An effect with no deps list, or an empty one, has no rows; its re-run class
-(below) says when it runs.
+(below) says when it runs. A memo's list gates its body the way an effect's
+does, so a memo has rows and a class too (#249): `setter-in-render` reads them
+for a memo body's writes, and the churn graph reads its effects' own.
 
 | column | claim | polarity |
 |---|---|---|
@@ -150,7 +152,7 @@ variable maps to a may-set of sources (`Slot`, `Setter`, `Prop`, `AllProps`,
 | `handlers` | host handlers and their sources | may-set |
 | `any_context` | some context the analysis cannot name may be read | may |
 | `effect_writes` | per effect, the slots its writes may reach | may |
-| `effect_deps` | per effect with a written list, what each element may be computed from where the effect is called | may-sets |
+| `effect_deps` | per effect or memo with a written list, what each element may be computed from where the hook is called | may-sets |
 | `Deps::gated` | the sources a function value reaches only behind a test of its own arguments | must: one ungated contributor takes a source out |
 
 Absence of a use is a proof here, so every unknown counts as a use.

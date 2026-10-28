@@ -104,6 +104,65 @@ fn a_write_inside_a_sync_hof_callback_has_no_block() {
 }
 
 #[test]
+fn a_memo_body_write_is_a_memo_phase_row_with_its_block_and_the_memo_a_rerun_class() {
+    // #249: a memo body runs during render, when the memo recomputes. Its
+    // synchronous write is a `Memo` row placed in the body; a write the body
+    // defers is not; and the memo's deps list gives it a re-run class and an
+    // exact trigger row, as an effect's does.
+    use reactant::engine::{Always, Rerun, WriterPhase};
+    use reactant::ir::hooks::HookEntry;
+    let r = parse_and_analyze(
+        r#"
+        import { useState, useMemo } from "react";
+        export function C() {
+          const [v, setV] = useState(0);
+          const [n, setN] = useState(0);
+          const a = useMemo(() => { setV(v + 1); return v; }, [v]);
+          const b = useMemo(() => { setTimeout(() => setN(1)); return n; });
+          return <div>{a}{b}</div>;
+        }
+        "#,
+    );
+    let c = comp(&r, "C");
+    let memos: Vec<_> = c
+        .hooks
+        .iter()
+        .filter_map(|h| match h {
+            HookEntry::Memo { label, .. } => Some(*label),
+            _ => None,
+        })
+        .collect();
+    let [a, b] = memos[..] else {
+        panic!("two memos: {memos:?}");
+    };
+    let rows = |setter: &str| -> Vec<&SlotWriter> {
+        c.slot_writers
+            .iter()
+            .filter(|w| reactant::ir::source_name(&w.setter) == setter)
+            .collect()
+    };
+    let v = rows("setV");
+    assert_eq!(v.len(), 1, "{:?}", c.slot_writers);
+    assert_eq!(v[0].region, WriterRegion::Memo(a));
+    assert_eq!(v[0].phase, WriterPhase::Memo);
+    assert!(v[0].block.is_some(), "a sync memo-body write is placed");
+    let n = rows("setN");
+    assert_eq!(n.len(), 1, "{:?}", c.slot_writers);
+    assert_eq!(n[0].region, WriterRegion::Memo(b));
+    assert_eq!(n[0].phase, WriterPhase::Deferred);
+    assert!(n[0].block.is_none(), "a timer runs on another turn");
+    assert_eq!(c.rerun(a), Some(Rerun::OnSlots));
+    assert_eq!(c.rerun(b), Some(Rerun::Always(Always::NoDeps)));
+    assert!(
+        c.effect_triggers
+            .iter()
+            .any(|t| t.hook == a && t.exact && t.slot == (c.component, v[0].slot)),
+        "the memo's dep is the written slot itself: {:?}",
+        c.effect_triggers
+    );
+}
+
+#[test]
 fn a_sync_callback_write_is_placed_at_the_call_only_when_the_receiver_surely_runs_it() {
     // #248: a write in a sync callback ran in the callback's own blocks, and
     // the walk handed one of them to the render's dominance proof. It is

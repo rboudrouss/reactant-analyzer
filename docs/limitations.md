@@ -336,6 +336,14 @@ carries an Error.
   deliberately: a library with no table, a handler this body invokes itself, and a name bound more
   than once, since two forms inlined into one render body leave no way to say whose `handleSubmit` a
   call means [precision-log](precision-log.md#2026-09-03-a-wrapper-does-not-run-its-argument).
+- **A write in a `useMemo` body is a render write** [#249](https://github.com/rboudrouss/reactant-analyzer/issues/249),
+  with the memo's re-run class. It is an Error only when the memo is called on every render, its
+  body writes on every path, and it recomputes at every render: no deps array, or the written slot
+  is an exact dep and every render-phase write of it stores a new reference. `setV(v + 1)` under
+  `[v]` is a Warning, since nothing proves `v + 1` differs from `v`, and `setV(5)` under `[v]`
+  settles. A memo with `[]` runs once per mount and is silent, and so is a `useCallback` body,
+  which does not run during render. A guarded write in a memo body is a Warning: the
+  adjust-during-render proof that settles a render write is not applied there.
 - **Being a wrapper and being stable are two claims, and a table entry says them separately.**
   react-hook-form's `handleSubmit` is `useCallback`-backed; `@mantine/form`'s `onSubmit` is
   `(handler) => (event) => …`, rebuilt on every render. Both wrap, only one is stable, and the mantine

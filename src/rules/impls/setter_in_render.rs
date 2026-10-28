@@ -9,13 +9,19 @@ use crate::ir::{
 
 use crate::engine::guards::converges_once_written;
 use crate::engine::setters::{SetterCallPhase, SetterTargets};
+use crate::engine::triggers::{Always, Rerun};
+use crate::engine::{Change, SlotWriter, WriterPhase, WriterRegion, triggers_of};
+use crate::ir::hooks::HookEntry;
 use crate::rules::helpers::eval_in_exit_env;
 use crate::rules::{
-    Diagnostic, ExitDominance, MustResult, Rule, must_alias_scopes, must_state_vals,
+    Diagnostic, ExitDominance, MustResult, Rule, must_alias_scopes, must_dominates_all_exits,
+    must_state_vals,
 };
 
 /// Fires when a state setter is called directly in the render body either a
 /// local setter (`StateSetter`) or a parent-component setter passed as a prop.
+/// A `useMemo` body runs during render too, and its writes are reported with
+/// the memo's re-run class (#249).
 ///
 /// Rule names emitted in diagnostics:
 /// - `"setter-in-render"`        local `useState` setter called in render.
@@ -56,6 +62,20 @@ impl Rule for SetterInRender {
     }
 
     fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic> {
+        let comp_result = &ctx.program().components[&ctx.component()];
+        // Dominance over exits, built once (not per call × exit). A call block
+        // dominating every exit ⟹ it runs unconditionally ⟹ the certified Error;
+        // otherwise conditional ⟹ Warning.
+        let exit_dom = ExitDominance::of(&comp_result.render_cfg);
+        let mut out = self.render_writes(ctx, &exit_dom);
+        out.extend(self.memo_writes(ctx, &exit_dom));
+        out
+    }
+}
+
+impl SetterInRender {
+    /// The setter calls of the render body itself, found by the walk.
+    fn render_writes(&self, ctx: &RuleCtx, exit_dom: &ExitDominance) -> Vec<Diagnostic> {
         let (result, component) = (ctx.program(), ctx.component());
         let comp_result = &result.components[&component];
         let names = ctx.source_names();
@@ -93,11 +113,6 @@ impl Rule for SetterInRender {
         // the name IS the slot: the must-alias, never the may table (#231).
         let scopes = must_alias_scopes(&comp_result.render_cfg, &comp_result.hooks);
         let state_vals = must_state_vals(&comp_result.render_cfg, &scopes);
-
-        // Dominance over exits, built once (not per call × exit). A call block
-        // dominating every exit ⟹ it runs unconditionally ⟹ the certified Error;
-        // otherwise conditional ⟹ Warning.
-        let exit_dom = ExitDominance::of(&comp_result.render_cfg);
 
         // A closure the converged values put behind a called path
         // (`api.inc()`) runs at the call: its writes are render writes there.
@@ -321,6 +336,123 @@ impl Rule for SetterInRender {
             Some(d)
         })
         .collect()
+    }
+
+    /// The writes of a `useMemo` body (#249): it runs during render, each time
+    /// the memo recomputes, so its writes are render-phase writes. Read off the
+    /// writer relation, whose `Memo` rows are the body's synchronous writes.
+    ///
+    /// Error takes every conjunct: the memo is called on every render, it
+    /// recomputes at every render — no deps list, or the written slot is an
+    /// exact dep that every render-phase write of it moves (a new reference;
+    /// a later `setS(s)` in the same pass undoes it) — and the write runs on
+    /// every path of the body, through a name that is surely the setter
+    /// (`block`). An empty list runs the body once per mount: one update,
+    /// which settles. Anything else is a possible loop.
+    fn memo_writes(&self, ctx: &RuleCtx, exit_dom: &ExitDominance) -> Vec<Diagnostic> {
+        let (result, component) = (ctx.program(), ctx.component());
+        let comp_result = &result.components[&component];
+        let names = ctx.source_names();
+        // The writes of this component's slots that may run in the render
+        // pass, where the last one of a slot is what the re-render reads.
+        let render_phase = |w: &&SlotWriter| {
+            w.owner.is_none()
+                && matches!(w.region, WriterRegion::Render | WriterRegion::Memo(_))
+                && matches!(
+                    w.phase,
+                    WriterPhase::Render | WriterPhase::Memo | WriterPhase::Unknown
+                )
+        };
+        comp_result
+            .slot_writers
+            .iter()
+            .filter_map(|w| {
+                let WriterRegion::Memo(memo) = w.region else {
+                    return None;
+                };
+                // A deferred or handler row runs on another turn; ⊤ may run
+                // in the memo's own run.
+                let sync = match w.phase {
+                    WriterPhase::Memo => true,
+                    WriterPhase::Unknown => false,
+                    _ => return None,
+                };
+                let rerun = comp_result.rerun(memo);
+                if rerun == Some(Rerun::MountOnly) {
+                    return None;
+                }
+                let body = comp_result.hooks.iter().find_map(|h| match h {
+                    HookEntry::Memo {
+                        label, body_cfg, ..
+                    } if *label == memo => Some(body_cfg),
+                    _ => None,
+                })?;
+                let every_render = rerun == Some(Rerun::Always(Always::NoDeps))
+                    || (w.owner.is_none()
+                        && triggers_of(&comp_result.effect_triggers, memo)
+                            .any(|t| t.exact && t.slot == (component, w.slot))
+                        && comp_result
+                            .slot_writers
+                            .iter()
+                            .filter(render_phase)
+                            .filter(|o| o.slot == w.slot)
+                            .all(|o| o.written.change == Change::Must));
+                let called = comp_result
+                    .hook_calls
+                    .iter()
+                    .find(|c| c.label == memo)
+                    .is_some_and(|c| matches!(exit_dom.certify(c.block_id), MustResult::All(_)));
+                let proof = (sync && every_render && called)
+                    .then_some(w.block)
+                    .flatten()
+                    .and_then(|b| match must_dominates_all_exits(body, b) {
+                        MustResult::All(c) => Some(c),
+                        _ => None,
+                    });
+                let (rule_name, message) = match w.owner {
+                    None if sync => (
+                        "setter-in-render",
+                        format!(
+                            "setter `{}` called in a useMemo body, which runs during render: \
+                             move this call into a useEffect or an event handler",
+                            names.name(&w.setter)
+                        ),
+                    ),
+                    None => ("setter-in-render", unknown_phase_message(names, &w.setter)),
+                    Some(parent) => (
+                        "cross-setter-in-render",
+                        format!(
+                            "prop `{}` (a state setter of parent `{}`) called in a useMemo body \
+                             during render of `{}`, which triggers a parent re-render",
+                            names.name(&w.setter),
+                            result.display_name(parent),
+                            result.display_name(component)
+                        ),
+                    ),
+                };
+                let mut d = match proof {
+                    Some(proof) => Diagnostic::error(rule_name, proof, message),
+                    None => Diagnostic::warn(rule_name, message),
+                };
+                d = match w.owner {
+                    None => d.with_label(w.slot),
+                    Some(_) => d.with_var(w.setter.clone()),
+                };
+                if let Some(r) = w.span {
+                    d = d.with_range(r);
+                }
+                d = d.with_step(
+                    crate::rules::Step::Call {
+                        callee: w.setter.clone(),
+                        class: crate::rules::EffectClass::Setter,
+                    },
+                    None,
+                    w.span,
+                    &ctx.names(&crate::rules::api::witness::fallback_name),
+                );
+                Some(d)
+            })
+            .collect()
     }
 }
 

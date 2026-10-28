@@ -342,10 +342,10 @@ pub struct RenderDeps {
     /// Per effect, the module names its body (callbacks it registers
     /// included) may write: what a write it makes to a slot travels with.
     pub effect_writes: BTreeMap<HookLabel, Writes>,
-    /// Per effect with a written deps list, what each element (in `elems`
-    /// order) may be computed from, read where the effect is called: what the
-    /// re-run class of a dep the value domain cannot label is read off
-    /// (`engine::triggers`).
+    /// Per effect or memo with a written deps list, what each element (in
+    /// `elems` order) may be computed from, read where the hook is called:
+    /// what the re-run class of a dep the value domain cannot label is read
+    /// off (`engine::triggers`).
     pub effect_deps: BTreeMap<HookLabel, Vec<Deps>>,
 }
 
@@ -571,6 +571,16 @@ pub fn render_deps(
                     used.union_with(&a.eval(e, &env).deps);
                 }
                 a.out.any_context |= a.reads_unnamed_context(hook, &env, &inlined);
+            }
+            // A memo's list gates its body as an effect's does (#249). What
+            // the memo makes is used only where its value is, so its deps
+            // are recorded for the re-run class and used by nothing here.
+            HookEntry::Memo { deps, .. } => {
+                if let Some(l) = deps.list() {
+                    let per_dep: Vec<Deps> = l.elems.iter().map(|e| a.eval(e, &env).deps).collect();
+                    a.out.effect_deps.insert(call.label, per_dep);
+                }
+                continue;
             }
             _ => continue,
         }

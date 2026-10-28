@@ -90,8 +90,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use crate::{
     domains::{AbstractEnv, StateValue},
     engine::{
-        AnalysisResult, Change, ConvergedEval, EffectTrigger, ProgramAnalysisResult, SlotWriter,
-        WriterPhase, WriterRegion,
+        AnalysisResult, Change, ConvergedEval, EffectTrigger, HookKind, ProgramAnalysisResult,
+        SlotWriter, WriterPhase, WriterRegion,
         dominance::on_all_paths,
         guards::{
             Invariance, WriteSite, call_may_differ, converges_under_all_writes, let_bindings,
@@ -425,7 +425,18 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     .collect(),
                 render_lets: let_bindings(cfg),
                 mutated,
-                props_hold: comp_result.effect_triggers.iter().all(|t| t.slot.0 == comp)
+                // An effect's rows: a memo's write is a render-phase write,
+                // whose re-runs the render's own sites already stand for.
+                props_hold: comp_result
+                    .effect_triggers
+                    .iter()
+                    .filter(|t| {
+                        comp_result
+                            .effect_info
+                            .get(&t.hook)
+                            .is_some_and(|i| i.kind == HookKind::Effect)
+                    })
+                    .all(|t| t.slot.0 == comp)
                     && props_in[&comp].is_empty(),
                 exit: comp_result.exit_env(),
             },

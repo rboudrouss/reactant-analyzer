@@ -141,6 +141,32 @@ fn a_settling_render_write_is_not_verified_as_no_setter_call() {
     );
 }
 
+#[test]
+fn a_memo_body_write_is_a_render_write_certain_only_when_the_memo_runs_every_render() {
+    // #249: a memo body runs during render, each time the memo recomputes.
+    let out = report(PHASE);
+    let line = line_for(&out, "MemoNoDeps");
+    assert!(
+        line.contains("error") && line.contains("setter-in-render") && line.contains("useMemo"),
+        "no deps array: the body and its unconditional write run at every render:\n{out}"
+    );
+    for component in ["MemoSlotDep", "MemoGuarded"] {
+        let line = line_for(&out, component);
+        assert!(
+            line.contains("warn") && line.contains("setter-in-render"),
+            "{component}: a re-run on a dep `n + 1` may not move, or a guarded write, \
+             is a possible loop, never a certain one:\n{out}"
+        );
+    }
+    for component in ["MemoMountOnly", "CallbackBody"] {
+        assert!(
+            !out.contains(component),
+            "{component}: an empty list runs the body once per mount, and a \
+             callback body does not run during render:\n{out}"
+        );
+    }
+}
+
 const NAMES: &str = "tests/fixtures/setter_names";
 
 /// The `setter `…`` a component's `setter-in-render` row names.

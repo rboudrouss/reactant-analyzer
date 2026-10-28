@@ -4,7 +4,7 @@
 //! contract.
 use reactant::domains::StateValue;
 use reactant::engine::{
-    Always, AnalysisResult, ComponentRegistry, Config, EffectTrigger, HookRegistry,
+    Always, AnalysisResult, ComponentRegistry, Config, EffectTrigger, HookKind, HookRegistry,
     ProgramAnalysisResult, Rerun, RootStrategy, analyze_program,
 };
 use reactant::ir::{hooks::HookEntry, types::HookLabel};
@@ -40,6 +40,18 @@ fn parse_and_analyze(src: &str) -> ProgramAnalysisResult {
 
 fn comp<'a>(r: &'a ProgramAnalysisResult, name: &str) -> &'a AnalysisResult<StateValue> {
     &r.components[&r.component_named(name).unwrap()]
+}
+
+/// The rows of the component's effects: a memo's list has rows too (#249).
+fn effect_rows(c: &AnalysisResult<StateValue>) -> Vec<&EffectTrigger> {
+    c.effect_triggers
+        .iter()
+        .filter(|t| {
+            c.effect_info
+                .get(&t.hook)
+                .is_some_and(|i| i.kind == HookKind::Effect)
+        })
+        .collect()
 }
 
 /// The label of the component's one `useState` slot.
@@ -85,7 +97,7 @@ fn a_field_read_and_a_memo_are_versioned_triggers_not_exact_ones() {
     );
     let c = comp(&r, "C");
     let x = only_slot(c);
-    let rows: Vec<&EffectTrigger> = c.effect_triggers.iter().collect();
+    let rows = effect_rows(c);
     assert!(
         rows.iter()
             .any(|t| t.dep == 0 && t.slot == (c.component, x) && !t.exact),
@@ -447,7 +459,7 @@ fn a_dep_holding_one_value_is_no_trigger() {
         "#,
     );
     let c = comp(&r, "C");
-    let rows: Vec<&EffectTrigger> = c.effect_triggers.iter().collect();
+    let rows = effect_rows(c);
     assert!(rows.is_empty(), "{rows:?}");
     assert_eq!(only_effect_class(c), Rerun::OnSlots);
 }

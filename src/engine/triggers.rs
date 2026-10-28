@@ -1,5 +1,7 @@
 //! The `effect_triggers` relation (ADR-042 §3): which state slot moves which
 //! dep of an effect, and how surely — and, per effect, its **re-run class**.
+//! A memo's body is gated by its deps list the same way, so a memo has rows
+//! and a class too (#249); a reader that walks effects reads its own labels.
 //!
 //! One row per `(effect, dep index, qualified slot)`. `exact` is the
 //! must-rerun bit: the dep **is** the slot's value, so a fresh value landing
@@ -143,12 +145,12 @@ pub(crate) struct EffectTriggers {
     pub props: HashSet<HookLabel>,
 }
 
-/// Every trigger row and re-run class of `component`'s effects. `eval`
+/// Every trigger row and re-run class of `component`'s effects and memos. `eval`
 /// evaluates a dep expression in the render exit env; a memo or callback
 /// binding is read from the memo store instead, because its env value is
 /// bound before the memo store is recomputed and reads as a stale ⊤.
-/// `sources` is what each element of each effect's deps list may be computed
-/// from (`RenderDeps::effect_deps`).
+/// `sources` is what each element of each effect's or memo's deps list may be
+/// computed from (`RenderDeps::effect_deps`).
 pub(crate) fn collect_effect_triggers(
     component: ComponentId,
     render_cfg: &CFG,
@@ -166,7 +168,10 @@ pub(crate) fn collect_effect_triggers(
     };
     let mut refs_move: HashMap<HookLabel, bool> = HashMap::new();
     for hook in hooks {
-        let HookEntry::Effect { label, deps, .. } = hook else {
+        // A memo's deps list gates its body exactly as an effect's does: React
+        // compares both lists the same way, at the same render (#249).
+        let (HookEntry::Effect { label, deps, .. } | HookEntry::Memo { label, deps, .. }) = hook
+        else {
             continue;
         };
         if let Some(class) = Rerun::of_shape(deps) {
