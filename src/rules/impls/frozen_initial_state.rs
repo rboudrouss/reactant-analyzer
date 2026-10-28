@@ -301,13 +301,13 @@ impl Rule for FrozenInitialState {
                 },
                 Some(*label),
                 *span,
-                &name_of,
+                &ctx.names(&name_of),
             );
             d = d.with_step(
                 Step::InitOnce { slot: *label },
                 Some(*label),
                 *span,
-                &name_of,
+                &ctx.names(&name_of),
             );
             for feeder in proven_evidence.into_iter().flatten() {
                 let (slot, write_span) = (feeder.slot, feeder.write_span);
@@ -319,7 +319,7 @@ impl Rule for FrozenInitialState {
                     },
                     None,
                     write_span,
-                    &owner_name,
+                    &ctx.names(&owner_name),
                 );
             }
             diags.push(d);

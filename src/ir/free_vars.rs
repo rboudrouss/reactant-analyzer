@@ -80,7 +80,7 @@ impl fmt::Display for AccessPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Show the source-level name: a spliced-hook capture root may carry the
         // internal `#salt` alpha-rename marker, which must not reach the user.
-        f.write_str(crate::ir::source_name(&self.root))?;
+        f.write_str(&crate::ir::source_name(&self.root))?;
         for seg in &self.segments {
             write!(f, ".{seg}")?;
         }

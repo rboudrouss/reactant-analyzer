@@ -177,7 +177,7 @@ impl Rule for InfiniteLoop {
                                     },
                                     Some(*h_label),
                                     h_span,
-                                    &|l| state_slot_name(l, &state_names),
+                                    &ctx.names(&|l| state_slot_name(l, &state_names)),
                                 );
                             }
                         }
@@ -187,7 +187,7 @@ impl Rule for InfiniteLoop {
                         diag = diag.with_notes(crate::rules::api::witness::slot_history(
                             comp_result,
                             state_label,
-                            &|l| state_slot_name(l, &state_names),
+                            &ctx.names(&|l| state_slot_name(l, &state_names)),
                         ));
 
                         reported_effects.insert(*eff_label);
@@ -243,10 +243,11 @@ impl Rule for InfiniteLoop {
         // builds it once for the run (issue #86).
         let graph = ctx.cache().churn();
         let (cycle_diags, covered) =
-            check_multi_effect_cycles(graph, result, component, &reported_effects);
+            check_multi_effect_cycles(ctx, graph, result, component, &reported_effects);
         diags.extend(cycle_diags);
         // Self-churn arm last: its Info branch skips writes a cycle covers.
         diags.extend(check_object_churn(
+            ctx,
             graph,
             result,
             component,
@@ -265,6 +266,7 @@ impl Rule for InfiniteLoop {
 /// the `(effect label, local state label)` writes covered by a reported
 /// cycle so the self-churn Info arm doesn't duplicate them.
 fn check_multi_effect_cycles(
+    ctx: &RuleCtx,
     graph: &ChurnGraph,
     result: &ProgramAnalysisResult,
     component: ComponentId,
@@ -418,7 +420,7 @@ fn check_multi_effect_cycles(
                     Some(e.effect_label),
                     Some(r),
                     // Qualified display (may name a parent component's slot).
-                    &|_| to_name.clone(),
+                    &ctx.names(&|_| to_name.clone()),
                 );
             }
             // Point at the cycle's other steps living in this component.
@@ -435,7 +437,7 @@ fn check_multi_effect_cycles(
                     },
                     Some(other.effect_label),
                     other.write_span,
-                    &crate::rules::api::witness::fallback_name,
+                    &ctx.names(&crate::rules::api::witness::fallback_name),
                 );
             }
             diags.push(diag);
@@ -507,6 +509,7 @@ fn always_clause(
 //            state — cross-effect cycles are not analyzed (FN-flavor limit)
 
 fn check_object_churn(
+    ctx: &RuleCtx,
     graph: &ChurnGraph,
     result: &ProgramAnalysisResult,
     component: ComponentId,
@@ -686,7 +689,7 @@ fn check_object_churn(
                     },
                     Some(*eff_label),
                     Some(r),
-                    &|l| state_slot_name(l, &state_vals),
+                    &ctx.names(&|l| state_slot_name(l, &state_vals)),
                 );
             }
             diags.push(diag);

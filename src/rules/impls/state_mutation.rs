@@ -470,7 +470,7 @@ impl Rule for StateMutation {
                 },
                 Some(label),
                 site.span,
-                &name_of,
+                &ctx.names(&name_of),
             );
             d = d.with_step(
                 Step::Write {
@@ -479,7 +479,7 @@ impl Rule for StateMutation {
                 },
                 Some(label),
                 set_site.span,
-                &name_of,
+                &ctx.names(&name_of),
             );
             diags.push(d);
         }
@@ -512,7 +512,7 @@ impl Rule for StateMutation {
                 },
                 None,
                 site.span,
-                &name_of,
+                &ctx.names(&name_of),
             );
             diags.push(d);
         }

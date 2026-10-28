@@ -1220,7 +1220,9 @@ fn expand_custom_hooks(
         // multi-block-body FN (only the entry block used to survive) and the
         // destructuring rebind (the return is now actually bound).
         let body = remap_cfg(hook_ir.body_cfg.clone(), off);
-        if let Some((block_id, stmt_idx, bound_var)) = find_hook_marker(render_cfg, custom_label) {
+        let marker = find_hook_marker(render_cfg, custom_label);
+        let bound_temp = marker.as_ref().and_then(|(_, _, v)| v.clone());
+        if let Some((block_id, stmt_idx, bound_var)) = marker {
             let range = crate::ir::splice_callee_into_cfg(
                 render_cfg,
                 block_id,
@@ -1289,6 +1291,7 @@ fn expand_custom_hooks(
             name: name.clone(),
             from: hook_ir.file.clone(),
             kind: crate::engine::InlineKind::Hook,
+            bound: bound_temp,
         });
 
         // Provenance rows (ADR-023 step 1): the hook's own rows join the
@@ -1777,6 +1780,10 @@ fn inline_in_cfg(
             .find(|r| r.start <= block_id && block_id < r.end)
             .map(|r| r.from.clone())
             .unwrap_or_else(|| ctx.caller_file.to_path_buf());
+        let bound = match &cfg.blocks[&block_id].stmts[stmt_idx] {
+            Stmt::Let { var, .. } => Some(var.clone()),
+            _ => None,
+        };
         if let Some((range, exported, from)) =
             splice_one_call(cfg, block_id, stmt_idx, ctx.registry, &res_file, ctx.salt)
         {
@@ -1784,6 +1791,7 @@ fn inline_in_cfg(
                 name: name.clone(),
                 from: from.clone(),
                 kind: crate::engine::InlineKind::Utility,
+                bound,
             });
             let parent = regions
                 .iter()

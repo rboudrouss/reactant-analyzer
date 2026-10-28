@@ -432,7 +432,7 @@ impl Rule for StaleClosure {
                     },
                     Some(*eff_label),
                     f.reg_span,
-                    &name_of,
+                    &ctx.names(&name_of),
                 );
                 if let Some(via) = &f.resolved_via {
                     d = d.with_step(
@@ -442,14 +442,14 @@ impl Rule for StaleClosure {
                         },
                         None,
                         None,
-                        &name_of,
+                        &ctx.names(&name_of),
                     );
                 }
                 d = d.with_step(
                     Step::Capture { what: path.clone() },
                     f.slots.first().copied(),
                     f.reg_span,
-                    &name_of,
+                    &ctx.names(&name_of),
                 );
                 if let Some((slot, span)) = f.self_write {
                     d = d.with_step(
@@ -459,7 +459,7 @@ impl Rule for StaleClosure {
                         },
                         Some(slot),
                         span,
-                        &name_of,
+                        &ctx.names(&name_of),
                     );
                 }
                 diags.push(d);

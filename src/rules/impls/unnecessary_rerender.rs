@@ -182,7 +182,7 @@ impl Rule for UnnecessaryRerender {
                             },
                             Some(*eff_label),
                             eff_span,
-                            &|l| state_slot_name(l, &state_names),
+                            &ctx.names(&|l| state_slot_name(l, &state_names)),
                         );
                         diags.push(d);
                     }

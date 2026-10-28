@@ -58,6 +58,7 @@ impl Rule for SetterInRender {
     fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic> {
         let (result, component) = (ctx.program(), ctx.component());
         let comp_result = &result.components[&component];
+        let names = ctx.source_names();
 
         // Local setters with their aliases (`const s = setN`): a name the
         // table misses is a call the rule never sees, and a false `verified`
@@ -220,10 +221,10 @@ impl Rule for SetterInRender {
                         format!(
                             "setter `{}` called directly in the render body, \
                                  move this call into a useEffect or an event handler",
-                            crate::ir::source_name(&call.var)
+                            names.name(&call.var)
                         )
                     } else {
-                        unknown_phase_message(&call.var)
+                        unknown_phase_message(names, &call.var)
                     },
                     Some(label),
                     None,
@@ -237,10 +238,10 @@ impl Rule for SetterInRender {
                         format!(
                             "setter `{}` called directly in the render body, \
                                  move this call into a useEffect or an event handler",
-                            crate::ir::source_name(&call.var)
+                            names.name(&call.var)
                         )
                     } else {
-                        unknown_phase_message(&call.var)
+                        unknown_phase_message(names, &call.var)
                     },
                     props.first().map(|p| p.label),
                     None,
@@ -261,7 +262,7 @@ impl Rule for SetterInRender {
                         format!(
                             "prop `{}` (a state setter of parent `{}`) called during render \
                                  of `{}`, which triggers a parent re-render on every render",
-                            crate::ir::source_name(&call.var),
+                            names.name(&call.var),
                             parents,
                             result.display_name(component)
                         )
@@ -270,7 +271,7 @@ impl Rule for SetterInRender {
                             "prop `{}` (a state setter of parent `{}`) is handed to a callee \
                                  with no timing summary. If that callee runs it during render, \
                                  `{}` re-renders its parent on every render",
-                            crate::ir::source_name(&call.var),
+                            names.name(&call.var),
                             parents,
                             result.display_name(component)
                         )
@@ -284,10 +285,10 @@ impl Rule for SetterInRender {
                     if call.class == SetterCallPhase::Sync {
                         format!(
                             "setter `{}` called in the render body",
-                            crate::ir::source_name(&call.var)
+                            names.name(&call.var)
                         )
                     } else {
-                        unknown_phase_message(&call.var)
+                        unknown_phase_message(names, &call.var)
                     },
                     None,
                     None,
@@ -315,7 +316,7 @@ impl Rule for SetterInRender {
                 },
                 None,
                 call.span,
-                &crate::rules::api::witness::fallback_name,
+                &ctx.names(&crate::rules::api::witness::fallback_name),
             );
             Some(d)
         })
@@ -328,11 +329,11 @@ impl Rule for SetterInRender {
 /// `composeEventHandlers(a, cb)`), so every phase is possible and the render
 /// pass is one of them. Saying "called directly in the render body" of that row
 /// would state as fact the one thing the walk could not establish.
-fn unknown_phase_message(var: &Var) -> String {
+fn unknown_phase_message(names: &crate::ir::SourceNames, var: &Var) -> String {
     format!(
         "setter `{}` is handed to a callee with no timing summary. If that callee \
          runs it during render, this re-renders on every render",
-        crate::ir::source_name(var)
+        names.name(var)
     )
 }
 

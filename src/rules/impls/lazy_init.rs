@@ -199,6 +199,7 @@ impl Rule for LazyInit {
                 init,
                 &program.function_registry,
                 &result.file,
+                &ctx.names(&crate::rules::api::witness::fallback_name),
             ));
             diags.push(d);
         }

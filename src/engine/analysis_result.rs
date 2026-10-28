@@ -45,6 +45,10 @@ pub struct InlineOrigin {
     /// File the inlined body came from.
     pub from: std::path::PathBuf,
     pub kind: InlineKind,
+    /// The variable the call's value was bound to, which the splice rebinds
+    /// to the body's return: the only place the call survives for a lowering
+    /// temp (`__call_N`, `__hook_N`), whose message name is that call.
+    pub bound: Option<crate::ir::Var>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

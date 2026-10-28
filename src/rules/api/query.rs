@@ -320,6 +320,7 @@ pub struct RuleCtx<'a> {
     component: ComponentId,
     comp: &'a AnalysisResult<StateValue>,
     config: RuleConfig,
+    source_names: std::sync::OnceLock<crate::ir::SourceNames>,
 }
 
 /// The ctx's [`ProgramCache`]: shared with every other component of the same
@@ -378,6 +379,7 @@ impl<'a> RuleCtx<'a> {
             component,
             comp,
             config,
+            source_names: std::sync::OnceLock::new(),
         }
     }
 
@@ -411,6 +413,29 @@ impl<'a> RuleCtx<'a> {
 
     pub fn config(&self) -> &RuleConfig {
         &self.config
+    }
+
+    /// How this component's variables are named in a message: the source
+    /// expression a lowering temp stands for, not its spelling. Built on first
+    /// use.
+    pub fn source_names(&self) -> &crate::ir::SourceNames {
+        self.source_names.get_or_init(|| {
+            crate::ir::SourceNames::of(
+                &self.comp.render_cfg,
+                &self.comp.hook_provenance,
+                self.comp
+                    .inline_origins
+                    .iter()
+                    .filter_map(|o| Some((o.bound.as_ref()?, o.name.as_str()))),
+            )
+        })
+    }
+
+    /// The one printer of a message's names: slots through `slot` (the rule's
+    /// own table, or [`witness::fallback_name`](super::witness::fallback_name)),
+    /// variables through [`RuleCtx::source_names`].
+    pub fn names<'b>(&'b self, slot: &'b dyn Fn(HookLabel) -> String) -> super::witness::Names<'b> {
+        super::witness::Names::new(slot, self.source_names())
     }
 }
 
@@ -489,7 +514,7 @@ impl<'a> RuleCtx<'a> {
                             .to_string(),
                     };
                     notes.push(Note {
-                        message: step.render(&super::witness::fallback_name),
+                        message: step.render(&self.names(&super::witness::fallback_name)),
                         step,
                         hook_label: None,
                         range: guard_span,

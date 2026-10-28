@@ -134,6 +134,7 @@ impl Rule for AlwaysUnstableDeps {
                     dep,
                     &program.function_registry,
                     &result.file,
+                    &ctx.names(&crate::rules::api::witness::fallback_name),
                 ));
             }
             diags.push(d);

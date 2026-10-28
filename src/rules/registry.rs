@@ -414,7 +414,10 @@ mod tests {
             },
             None,
             Some(here),
-            &crate::rules::api::witness::fallback_name,
+            &crate::rules::api::witness::Names::new(
+                &crate::rules::api::witness::fallback_name,
+                &Default::default(),
+            ),
         );
         assert_eq!(d.range, None, "the rule set no range of its own");
         assert_eq!(located(d).range, Some(here));
@@ -444,7 +447,10 @@ mod tests {
                 },
                 None,
                 Some(step),
-                &crate::rules::api::witness::fallback_name,
+                &crate::rules::api::witness::Names::new(
+                    &crate::rules::api::witness::fallback_name,
+                    &Default::default(),
+                ),
             );
         assert_eq!(located(d).range, Some(own));
     }

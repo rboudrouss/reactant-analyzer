@@ -584,20 +584,18 @@ impl<'a> EntityCtx<'a> {
                 // A custom hook is called by its own name; every other kind is
                 // called by the variable it binds.
                 EntityVal::Hook(h) => match h.entry {
-                    Some(HookEntry::Custom { name, .. }) => {
-                        Some(crate::ir::source_name(name).to_string())
-                    }
+                    Some(HookEntry::Custom { name, .. }) => Some(self.var_name(name)),
                     _ => self.binding_name(h.info.label),
                 },
                 // The origin hook's own name — the resolved identity, never a
                 // binding variable (there may be none: the row survives
                 // inlining). A provider's name is its context binding.
                 EntityVal::Origin(p) => Some(p.origin_hook.clone()),
-                EntityVal::Provider(p) => Some(crate::ir::source_name(p.context).to_string()),
+                EntityVal::Provider(p) => Some(self.var_name(p.context)),
                 EntityVal::JsxProp(j) => Some(j.element.to_string()),
                 EntityVal::Element(e) => Some(e.name.to_string()),
                 // The local binding the call reads the context through.
-                EntityVal::Consumer(c) => Some(crate::ir::source_name(&c.name).to_string()),
+                EntityVal::Consumer(c) => Some(self.var_name(&c.name)),
                 // A registration is named by its registrar — the table key,
                 // matchable by a `name` guard. The receiver-qualified form
                 // (`socket.addEventListener`) stays internal to the native
@@ -611,7 +609,7 @@ impl<'a> EntityCtx<'a> {
                 EntityVal::Call(c) => Some(c.name.clone()),
                 // A read row is named by the binding it went through — the
                 // slot's own name, or the alias the site actually wrote.
-                EntityVal::Read(r) => Some(crate::ir::source_name(&r.name).to_string()),
+                EntityVal::Read(r) => Some(self.var_name(&r.name)),
                 EntityVal::Setter(_)
                 | EntityVal::Dep(_)
                 | EntityVal::Arg(_)
@@ -679,8 +677,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Call(_) => None,
             },
             Field::Setter => match v {
-                EntityVal::Setter(s) => Some(crate::ir::source_name(&s.var).to_string()),
-                EntityVal::Writer(w) => Some(crate::ir::source_name(&w.setter).to_string()),
+                EntityVal::Setter(s) => Some(self.var_name(&s.var)),
+                EntityVal::Writer(w) => Some(self.var_name(&w.setter)),
                 EntityVal::Hook(_)
                 | EntityVal::Dep(_)
                 | EntityVal::Arg(_)
@@ -786,7 +784,7 @@ impl<'a> EntityCtx<'a> {
                     WriteProvenance::Direct => "direct".to_string(),
                     WriteProvenance::Via(chain) => chain
                         .iter()
-                        .map(|n| crate::ir::source_name(n).to_string())
+                        .map(|n| self.var_name(n))
                         .collect::<Vec<_>>()
                         .join(" → "),
                     WriteProvenance::Unknown => "unknown".to_string(),
@@ -946,7 +944,7 @@ impl<'a> EntityCtx<'a> {
             | Field::Identity
             | Field::Cleanup
             | Field::Firing
-            | Field::Cycle => raw.unwrap_or_else(|| anonymous(v)),
+            | Field::Cycle => raw.unwrap_or_else(|| anonymous(v, self.ctx.source_names())),
             // Source identifiers are quoted, verdict words are not.
             Field::Name
             | Field::Slot
@@ -955,7 +953,7 @@ impl<'a> EntityCtx<'a> {
             | Field::Prop
             | Field::Owner => match raw {
                 Some(s) => format!("`{s}`"),
-                None => anonymous(v),
+                None => anonymous(v, self.ctx.source_names()),
             },
         }
     }
@@ -974,6 +972,11 @@ impl<'a> EntityCtx<'a> {
         let comp = self.ctx.program().components.get(&owner)?;
         let names = resolve_setter_aliases(&comp.render_cfg, &state_val_labels(&comp.render_cfg));
         pick_name(&names, label)
+    }
+
+    /// A variable as the source names it ([`RuleCtx::source_names`]).
+    fn var_name(&self, var: &str) -> String {
+        self.ctx.source_names().name(var).into_owned()
     }
 
     /// The unquoted source name of the variable a hook's result binds to.
@@ -1044,12 +1047,12 @@ fn region_of(row: &HookRow<'_>) -> WriterRegion {
 
 /// How an entity is named when it has no source name. Mirrors the native
 /// discipline: an identifier the reader can act on, never a bare label.
-fn anonymous(v: &EntityVal<'_, '_>) -> String {
+fn anonymous(v: &EntityVal<'_, '_>, names: &crate::ir::SourceNames) -> String {
     match v {
         EntityVal::Hook(h) => format!("{} #{}", hook_kind_word(h.info.kind), h.info.label),
         EntityVal::Setter(s) => match s.slot {
             Some(label) => format!("state #{label}"),
-            None => format!("`{}`", crate::ir::source_name(&s.var)),
+            None => format!("`{}`", names.name(&s.var)),
         },
         // The dependency as written, never its position: an index into `elems`
         // stops being an index into the source array once lowering drops an
@@ -1057,18 +1060,18 @@ fn anonymous(v: &EntityVal<'_, '_>) -> String {
         EntityVal::Dep(d) => format!("`{}`", d.expr.describe()),
         EntityVal::Arg(a) => format!("argument #{}", a.index),
         EntityVal::Origin(p) => format!("`{}`", p.origin_hook),
-        EntityVal::Writer(w) => format!("`{}`", crate::ir::source_name(&w.setter)),
+        EntityVal::Writer(w) => format!("`{}`", names.name(&w.setter)),
         EntityVal::Provider(p) => format!("`{}`", p.element),
         EntityVal::JsxProp(j) => format!("`{}` of `<{}>`", j.prop, j.element),
         EntityVal::Cycle(c) => format!("the loop through effect #{}", c.effect),
-        EntityVal::Read(r) => format!("`{}`", crate::ir::source_name(&r.name)),
+        EntityVal::Read(r) => format!("`{}`", names.name(&r.name)),
         EntityVal::Element(e) => format!("`<{}>`", e.name),
         EntityVal::Call(c) => match &c.receiver {
             Some(r) => format!("`{}.{}()`", r, c.name),
             None => format!("`{}()`", c.name),
         },
         EntityVal::Seed(s) => format!("`{}`", s.path),
-        EntityVal::Consumer(c) => format!("`{}`", crate::ir::source_name(&c.name)),
+        EntityVal::Consumer(c) => format!("`{}`", names.name(&c.name)),
         EntityVal::Registration(r) => format!("`{}`", r.display),
     }
 }

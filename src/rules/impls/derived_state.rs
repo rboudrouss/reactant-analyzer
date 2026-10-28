@@ -147,7 +147,7 @@ impl Rule for DerivedState {
                 },
                 state_val_label.get(&dep_var).copied(),
                 *span,
-                &name_of,
+                &ctx.names(&name_of),
             );
             if let Some(slot) = setter_label.sole(&setter_name) {
                 d = d.with_step(
@@ -157,7 +157,7 @@ impl Rule for DerivedState {
                     },
                     Some(*eff_label),
                     write_span,
-                    &name_of,
+                    &ctx.names(&name_of),
                 );
             }
             diags.push(d);

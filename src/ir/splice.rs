@@ -529,16 +529,6 @@ fn rename_one(ren: &HashMap<Var, Var>, v: &Var) -> Var {
 /// marks a variable alpha-renamed by [`splice_callee_into_cfg`].
 pub const SPLICE_MARK: char = '#';
 
-/// Recover the source-level name of a (possibly spliced-and-renamed) variable
-/// for user-facing display: `count#3` → `count`, `count` → `count`. Never use
-/// this for matching — only the full renamed name is unique.
-pub fn source_name(var: &str) -> &str {
-    match var.split_once(SPLICE_MARK) {
-        Some((base, _)) => base,
-        None => var,
-    }
-}
-
 /// Rename every occurrence (binding site and read) of a bound variable in `cfg`.
 pub fn rename_vars_cfg(cfg: CFG, ren: &HashMap<Var, Var>) -> CFG {
     if ren.is_empty() {

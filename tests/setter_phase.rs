@@ -126,8 +126,10 @@ fn a_settling_render_write_is_not_verified_as_no_setter_call() {
         .take_while(|l| l.starts_with("    "))
         .collect();
     assert!(
-        !section.iter().any(|l| l.contains("setter-in-render")
-            && l.contains("no setter is called during render")),
+        !section
+            .iter()
+            .any(|l| l.contains("setter-in-render")
+                && l.contains("no setter is called during render")),
         "`if (s) setS(null)` calls a setter during render; the rule drops it \
          because it settles, and may claim only that:\n{out}"
     );
@@ -136,5 +138,49 @@ fn a_settling_render_write_is_not_verified_as_no_setter_call() {
             && l.contains("setter-in-render")
             && l.contains("fails to settle")),
         "the rule did check the component, and says what it proved:\n{out}"
+    );
+}
+
+const NAMES: &str = "tests/fixtures/setter_names";
+
+/// The `setter `…`` a component's `setter-in-render` row names.
+fn named_setter(component: &str) -> String {
+    let out = report(NAMES);
+    let line = line_for(&out, component);
+    let after = line
+        .split_once("setter `")
+        .unwrap_or_else(|| panic!("no setter named for {component}:\n{out}"))
+        .1;
+    after.split('`').next().unwrap_or("").to_string()
+}
+
+#[test]
+fn a_setter_read_off_an_index_is_named_as_the_source_indexes_it() {
+    assert_eq!(named_setter("IndexAccess"), "t[1]");
+}
+
+#[test]
+fn a_setter_read_off_a_hook_value_keeps_its_member_path() {
+    assert_eq!(named_setter("MemberOfHook"), "c.set");
+}
+
+#[test]
+fn a_setter_returned_by_a_call_is_named_by_that_call() {
+    assert_eq!(named_setter("CallOfHook"), "useCounter(…).set");
+    assert_eq!(named_setter("CallOfUtility"), "pick(…)");
+    assert_eq!(named_setter("CallOfLocalFn"), "getSetter(…)");
+}
+
+#[test]
+fn the_trace_names_the_setter_as_the_message_does_and_json_keeps_the_variable() {
+    let trace = String::from_utf8_lossy(&reactant(NAMES, &["--trace"]).stdout).into_owned();
+    assert!(
+        trace.contains("`getSetter(…)` is a state setter"),
+        "the witness step names the callee by its call:\n{trace}"
+    );
+    let json = String::from_utf8_lossy(&reactant(NAMES, &["--format", "json"]).stdout).into_owned();
+    assert!(
+        json.contains("\"callee\":\"__call_") || json.contains("\"callee\": \"__call_"),
+        "the machine-readable `callee` is the variable, unchanged:\n{json}"
     );
 }
