@@ -1032,6 +1032,36 @@ fn a_member_that_is_the_setter_on_one_path_only_is_no_certain_write() {
 }
 
 #[test]
+fn a_memo_returning_an_unplaced_value_on_some_path_still_names_its_setter() {
+    // #240: one return the heap does not place (`null` on an early exit)
+    // dropped the memo's sites, so a member read off it wrote nothing. The
+    // memo is the placed returns' sites, open to the rest: a possible write,
+    // a Warning, never an Error.
+    let memo = "useMemo(() => { if (c) return null; return [v, setV]; }, [c, v])";
+    for (at, rule) in [
+        (
+            "useEffect(() => { if (t) t[1](t[0] + 1); });",
+            "infinite-loop",
+        ),
+        ("if (t) t[1](1);", "setter-in-render"),
+    ] {
+        let found = rules_for(
+            &format!(
+                "function App({{ c }}) {{ const [v, setV] = useState(0); const t = {memo}; {at} return <div />; }}"
+            ),
+            "App",
+        );
+        assert!(fires(&found, rule), "{at}: {found:?}");
+        assert!(
+            found
+                .iter()
+                .all(|(_, s)| *s != reactant::rules::Severity::Error),
+            "{at}: {found:?}"
+        );
+    }
+}
+
+#[test]
 fn a_member_of_a_value_no_site_may_place_is_no_certain_write() {
     // A name bound to a literal on one path and to a value the heap does not
     // place on another (or rebound to one) read the literal's member as all

@@ -85,25 +85,29 @@ impl Transfer for StateValueTransfer {
     }
 }
 
-/// The allocation sites a body run may return: the union over its reached
-/// `return`s, each allocated in the env it returns in — `None` as soon as one
-/// returns something the heap does not place, since a reader of the sites
-/// would then miss that path's value (#233).
+/// The allocation sites a body run may return: the join over its reached
+/// `return`s, each allocated in the env it returns in (#233) — open where one
+/// returns something the heap does not place, as a name bound so on one path
+/// is (#240).
 fn returned_sites(
     transfer: &StateValueTransfer,
     body: &CFG,
     exits: &HashMap<crate::ir::types::BlockId, AbstractEnv<StateValue>>,
     ctx: &mut AnalysisCtx<StateValue>,
 ) -> Option<Sites> {
-    let mut out: Option<Sites> = None;
+    // `None` until a return is reached.
+    let mut out: Option<Option<Sites>> = None;
     for (b, block) in &body.blocks {
         let (Terminator::Return(expr), Some(exit)) = (&block.term, exits.get(b)) else {
             continue;
         };
-        let sites = alloc_literal(transfer, expr, exit, ctx)?;
-        out = Some(out.map_or(sites.clone(), |acc| acc.join(&sites)));
+        let sites = alloc_literal(transfer, expr, exit, ctx);
+        out = Some(match out {
+            None => sites,
+            Some(acc) => Sites::join_opt(acc.as_ref(), sites.as_ref()),
+        });
     }
-    out
+    out.flatten()
 }
 
 /// What a recompute's `value` is as the memo's value: its kinds, with a

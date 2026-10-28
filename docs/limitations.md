@@ -65,7 +65,9 @@ that writes it (see *Cross-file limits*).
   ([#216](https://github.com/rboudrouss/reactant-analyzer/issues/216),
   [#233](https://github.com/rboudrouss/reactant-analyzer/issues/233)): a container kept under a
   name (`t[1](0)`, `api.setV(0)`), a nested destructuring (`const [{ setV }] = useSlot()`), a
-  memo, which is the literal its body returns (`return useMemo(() => [v, setV], [v])`), and a
+  memo, which is the literal its body returns (`return useMemo(() => [v, setV], [v])`), or may
+  be when another return is something else (`if (c) return null`,
+  [#240](https://github.com/rboudrouss/reactant-analyzer/issues/240)), and a
   ternary of literals (`return c ? [setV, v] : [v, setV]`), whose member may be a setter or
   something else and writes the setter when called, as a possible write. A name bound to several
   setters writes each of them, as a possible write of each
@@ -84,7 +86,7 @@ that writes it (see *Cross-file limits*).
   wrap(setV) : setV`, `wrap` unknown) is still a possible write of it
   [#238](https://github.com/rboudrouss/reactant-analyzer/issues/238); a call of a value nothing
   names a setter in writes nothing (#19). Still missed: an array with a spread or an object member a spread may
-  overwrite; a memo whose body returns something the heap does not place on some path.
+  overwrite.
 - `useContext` is unmodelled, so a context value reads ⊤. This is the single largest source of
   analysis limits, 363 sites across the eight corpora [#28](https://github.com/rboudrouss/reactant-analyzer/issues/28).
 - Seven React hooks are unmodelled and emit an Info rather than a summary: `useActionState`,
