@@ -103,6 +103,69 @@ fn a_write_inside_a_sync_hof_callback_has_no_block() {
     );
 }
 
+#[test]
+fn a_sync_callback_write_is_placed_at_the_call_only_when_the_receiver_surely_runs_it() {
+    // #248: a write in a sync callback ran in the callback's own blocks, and
+    // the walk handed one of them to the render's dominance proof. It is
+    // placed at the call — the render block holding it — when the receiver
+    // is a literal that surely calls the callback, and nowhere otherwise: an
+    // array that may be empty, `sort` on one entry, `reduce` with no initial
+    // value on one entry. The writer row of a repeating site has no block
+    // either way.
+    use std::collections::HashSet;
+    for (call, placed) in [
+        ("[1].forEach(() => setV(v + 1));", true),
+        ("[1, 2].map(() => setV(v + 1));", true),
+        ("[1].reduce((a) => { setV(v + 1); return a; }, 0);", true),
+        ("[1, 2].reduce((a) => { setV(v + 1); return a; });", true),
+        ("(xs ?? []).forEach(() => setV(v + 1));", false),
+        ("xs.some(() => setV(v + 1));", false),
+        ("[...xs].forEach(() => setV(v + 1));", false),
+        ("[, 1].forEach(() => setV(v + 1));", false),
+        ("[1].sort(() => { setV(v + 1); return 0; });", false),
+        ("[1].reduce((a) => { setV(v + 1); return a; });", false),
+        ("[1].forEach(() => { if (c) setV(v + 1); });", false),
+    ] {
+        let src = format!(
+            r#"
+            import {{ useState }} from "react";
+            export function App({{ xs, c }}) {{
+              const [v, setV] = useState(0);
+              if (c) {{ console.log(c); }}
+              {call}
+              return <div>{{v}}</div>;
+            }}
+            "#
+        );
+        let r = parse_and_analyze(&src);
+        let c = comp(&r, "App");
+        let setters: HashSet<String> = c.slot_writers.iter().map(|w| w.setter.clone()).collect();
+        let calls = reactant::rules::collect_setter_calls(&c.render_cfg, &setters, 2);
+        assert_eq!(calls.len(), 1, "{call}: {calls:?}");
+        match calls[0].block_id {
+            Some(b) => {
+                assert!(placed, "{call}: placed at {b:?}");
+                use reactant::ir::{expr::Expr, stmt::Stmt};
+                let block = &c.render_cfg.blocks[&b];
+                assert!(
+                    block.stmts.iter().any(|s| matches!(
+                        s,
+                        Stmt::ExprStmt(Expr::Call { fn_, .. }, _)
+                            if matches!(**fn_, Expr::FieldAccess { .. })
+                    )),
+                    "{call}: {b:?} is not the block of the call"
+                );
+            }
+            None => assert!(!placed, "{call}: not placed"),
+        }
+        assert!(
+            c.slot_writers.iter().all(|w| w.block.is_none()),
+            "{call}: {:?}",
+            c.slot_writers
+        );
+    }
+}
+
 // ── `written` ────────────────────────────────────────────────────────────────
 
 #[test]

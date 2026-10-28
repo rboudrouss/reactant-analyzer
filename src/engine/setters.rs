@@ -2165,6 +2165,39 @@ pub(crate) const SYNC_HOF_METHODS: &[&str] = &[
     "sort",
 ];
 
+/// Does the sync HOF call `fn_(args)` surely run its callback (argument 0) at
+/// least once (#248)? Only when the receiver is an array literal written at
+/// the call with every entry present and none spread (`[1]`, not `[...xs]`
+/// nor `[, 1]`), and the method calls its callback on a first entry whatever
+/// the entries are: `reduce` and `reduceRight` only past an initial value or
+/// on two entries, `sort` never — a one-entry or all-`undefined` array calls
+/// no comparator. A receiver read off a name is not enough: the heap keeps an
+/// array's entries after a `pop()` or a `length = 0` emptied it.
+fn runs_at_least_once(fn_: &Expr, args: &[Expr]) -> bool {
+    let Expr::FieldAccess { obj, field } = fn_.peel_ts() else {
+        return false;
+    };
+    let Expr::ArrayLit {
+        elems,
+        arity,
+        spread_at,
+        ..
+    } = obj.peel_ts()
+    else {
+        return false;
+    };
+    if !spread_at.is_empty() || arity.exact() != Some(elems.len()) {
+        return false;
+    }
+    let n = elems.len();
+    match field.as_str() {
+        "map" | "forEach" | "filter" | "flatMap" | "find" | "findIndex" | "findLast"
+        | "findLastIndex" | "some" | "every" => n >= 1,
+        "reduce" | "reduceRight" => n >= 2 || (n >= 1 && args.len() >= 2),
+        _ => false,
+    }
+}
+
 /// Callee spellings proven to be a **wrapper**: a library member that returns
 /// a handler around its function argument instead of running it
 /// (`form.handleSubmit(onSubmit)`).
@@ -2682,24 +2715,33 @@ impl<'a> SetterWalk<'a> {
                 // CFG cycle to show for it.
                 let outer_repeating = self.repeating;
                 self.repeating = outer_repeating || self.is_sync_hof(fn_);
+                // A sync callback's own blocks mean nothing in this CFG: its
+                // rows run at this call, and are placed here only when the
+                // receiver surely runs it, as an IIFE is (#248).
+                let placed = at.filter(|_| i == 0 && runs_at_least_once(fn_, args));
                 match arg {
                     // Inline FnLit arg descend body, costs one depth level.
                     Expr::FnLit { body_cfg, .. } if depth > 0 => {
-                        self.cfg(body_cfg, depth - 1, found, class, prov, stmt_span);
+                        let mut inner = Found::default();
+                        self.cfg(body_cfg, depth - 1, &mut inner, class, prov, stmt_span);
+                        found.absorb(inner, body_cfg, class, placed, prov);
                     }
                     // B5: variable arg name resolution, no depth cost — so this is
                     // the arm that can cycle (`const tick = t => raf(tick)`); the
                     // `walking` stack is what terminates it.
                     Expr::Var(name) if self.fn_bindings.contains_key(name) => {
                         let body = &self.fn_bindings[name];
+                        let mut inner = Found::default();
                         self.path.push(name.clone());
-                        self.cfg(body, depth, found, class, prov, stmt_span);
+                        self.cfg(body, depth, &mut inner, class, prov, stmt_span);
                         self.path.pop();
+                        found.absorb(inner, body, class, placed, prov);
                     }
                     // A path the converged values point at closures of this
                     // component (`setTimeout(api.inc)`, #239): each runs in
-                    // the argument's class, never at this call.
-                    _ => self.converged_bodies(arg, class, None, depth, found, prov, stmt_span),
+                    // the argument's class, at this call only when it is a
+                    // callback the receiver surely runs.
+                    _ => self.converged_bodies(arg, class, placed, depth, found, prov, stmt_span),
                 }
                 self.repeating = outer_repeating;
             }
