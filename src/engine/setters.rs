@@ -669,6 +669,46 @@ pub(crate) fn resolve_setter_aliases(
     resolve_aliases(cfg, base)
 }
 
+/// Every body other than the render a read of a render name may sit in or be
+/// reached from, with its parameters: the render's nested functions, and every
+/// hook body with its own (a callback's parameters included). The `elsewhere`
+/// of [`must_slot_read`](crate::ir::bindings::must_slot_read): a binder of a
+/// name in one of them refuses the name's must-alias.
+pub(crate) fn must_alias_scopes<'c>(
+    render_cfg: &'c CFG,
+    hooks: &'c [HookEntry],
+) -> Vec<(&'c [Var], &'c CFG)> {
+    let mut scopes = crate::ir::bindings::nested_bodies(render_cfg);
+    for hook in hooks {
+        let params: &[Var] = match hook {
+            HookEntry::Callback { params, .. } => params,
+            _ => &[],
+        };
+        if let Some(body) = hook.body_cfg() {
+            scopes.push((params, body));
+            scopes.extend(crate::ir::bindings::nested_bodies(body));
+        }
+    }
+    scopes
+}
+
+/// The must reading of `state_val_labels` beside the may table
+/// [`resolve_setter_aliases`] builds: the names the render binds to a slot's
+/// read on every path, and no body of `scopes` ([`must_alias_scopes`])
+/// rebinds. What a proof may read as the slot itself (#210, #222, #231).
+pub(crate) fn must_state_vals(
+    render_cfg: &CFG,
+    scopes: &[(&[Var], &CFG)],
+) -> HashMap<Var, HookLabel> {
+    resolve_setter_aliases(render_cfg, &state_val_labels(render_cfg))
+        .into_iter()
+        .filter(|(v, l)| {
+            crate::ir::bindings::must_slot_read(&Expr::Var(v.clone()), render_cfg, scopes)
+                == Some(*l)
+        })
+        .collect()
+}
+
 /// The alias closure itself, for any fact keyed by a name: `let a = b` / `a = b`
 /// with `b` in the map gives `a` the same entry, chains included. A name
 /// already in the map keeps its own entry.
@@ -1167,17 +1207,7 @@ pub(crate) fn collect_slot_writers(
     // a must fact: the name is bound once, in render, to the read, and no
     // other body — a hook body, a closure, a callback's parameter — binds it
     // (#210). The alias map above stays the may reading that finds writes.
-    let mut elsewhere = crate::ir::bindings::nested_bodies(render_cfg);
-    for hook in hooks {
-        let params: &[Var] = match hook {
-            HookEntry::Callback { params, .. } => params,
-            _ => &[],
-        };
-        if let Some(body) = hook.body_cfg() {
-            elsewhere.push((params, body));
-            elsewhere.extend(crate::ir::bindings::nested_bodies(body));
-        }
-    }
+    let elsewhere = must_alias_scopes(render_cfg, hooks);
     let must_read = |e: &Expr| crate::ir::bindings::must_slot_read(e, render_cfg, &elsewhere);
     // Any local binding of a deferring global's name disables its summary,
     // wherever the call sits (fail-closed across every body, nested `FnLit`

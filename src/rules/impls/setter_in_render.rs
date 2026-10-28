@@ -11,8 +11,8 @@ use crate::engine::guards::converges_once_written;
 use crate::engine::setters::SetterCallPhase;
 use crate::rules::helpers::eval_in_exit_env;
 use crate::rules::{
-    Diagnostic, ExitDominance, MustResult, Rule, collect_setter_calls, resolve_setter_aliases,
-    setter_var_labels, state_val_labels,
+    Diagnostic, ExitDominance, MustResult, Rule, collect_setter_calls, must_alias_scopes,
+    must_state_vals, resolve_setter_aliases, setter_var_labels,
 };
 
 /// Fires when a state setter is called directly in the render body either a
@@ -79,9 +79,12 @@ impl Rule for SetterInRender {
             return vec![];
         }
 
-        let state_vals = resolve_setter_aliases(
+        // The convergence proof rebinds a name to the written value, which
+        // claims the name IS the slot: the must-alias, never the may table
+        // (#231).
+        let state_vals = must_state_vals(
             &comp_result.render_cfg,
-            &state_val_labels(&comp_result.render_cfg),
+            &must_alias_scopes(&comp_result.render_cfg, &comp_result.hooks),
         );
 
         // Dominance over exits, built once (not per call × exit). A call block

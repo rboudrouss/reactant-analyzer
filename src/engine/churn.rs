@@ -97,14 +97,17 @@ use crate::{
             navigates, site_guards,
         },
         render_deps::written_names,
-        setters::{memo_val_labels, resolve_setter_aliases, state_val_labels},
+        setters::{
+            memo_val_labels, must_alias_scopes, must_state_vals, resolve_setter_aliases,
+            state_val_labels,
+        },
         triggers::{Always, Rerun},
         triggers_of,
         written::churning_part,
     },
     ir::{
         ComponentId, QualifiedSlot, SourceRange,
-        bindings::{local_bindings, must_slot_read},
+        bindings::local_bindings,
         cfg::{CFG, Terminator},
         expr::{Expr, SPREAD_KEY_PREFIX, object_member},
         hooks::HookEntry,
@@ -280,9 +283,9 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         /// The names some render binding ties to a slot's read: a may
         /// reading, for what may move.
         state_vals: HashMap<Var, HookLabel>,
-        /// The names the render binds to a slot's read on every path
-        /// (`must_slot_read`): what the proofs may read as the slot itself
-        /// (#210, #222).
+        /// The names the render binds to a slot's read on every path, no
+        /// other body rebinding them (`setters::must_state_vals`): what the
+        /// proofs may read as the slot itself (#210, #222).
         must_state_vals: HashMap<Var, HookLabel>,
         memo_vals: HashMap<Var, HookLabel>,
         memo_deps: HashMap<HookLabel, &'a [Expr]>,
@@ -387,11 +390,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             mutated.extend(mutated_roots(body));
         }
         let state_vals = resolve_setter_aliases(cfg, &state_val_labels(cfg));
-        let must_state_vals = state_vals
-            .iter()
-            .filter(|(v, l)| must_slot_read(&Expr::Var((*v).clone()), cfg, &[]) == Some(**l))
-            .map(|(v, l)| (v.clone(), *l))
-            .collect();
+        let must_state_vals = must_state_vals(cfg, &must_alias_scopes(cfg, &comp_result.hooks));
         ctxs.insert(
             comp,
             CompCtx {

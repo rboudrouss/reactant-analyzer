@@ -201,8 +201,10 @@ carries an Error.
   controlled input mirrored through two slots (`setLocal(value)`, then `onChange(local)`). Never an
   Error: the Error still needs a new reference stored on all paths
   [#157](https://github.com/rboudrouss/reactant-analyzer/issues/157). Each proof reads only what
-  it can certify: a slot read through a name bound to it on one arm only, or rebound in the
-  effect's body, is not the slot [#222](https://github.com/rboudrouss/reactant-analyzer/issues/222);
+  it can certify: a slot read through a name bound to it on one arm only, or bound in any other
+  body of the component (a closure, a hook body, a parameter), is not the slot, nor is it for
+  `setter-in-render`'s adjust-during-render proof
+  [#222](https://github.com/rboudrouss/reactant-analyzer/issues/222), [#231](https://github.com/rboudrouss/reactant-analyzer/issues/231);
   a relational guard `s !== t` settles only while `t` holds still
   [#209](https://github.com/rboudrouss/reactant-analyzer/issues/209); and a write that reads a slot
   its effect does not depend on keeps an edge from that slot, even when the read sits on an arm

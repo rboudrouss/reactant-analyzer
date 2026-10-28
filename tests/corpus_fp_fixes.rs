@@ -1672,6 +1672,45 @@ function A({ options }) {
 }
 
 #[test]
+fn adjust_during_render_on_a_one_arm_alias_warns() {
+    // `d` is the slot on one arm only and `null` on the arm that runs: the
+    // write never kills the guard (#231).
+    let src = r#"
+function A() {
+  const [s, setS] = useState(null);
+  const [c] = useState(false);
+  const d = c ? s : null;
+  if (d === null) setS({ n: 1 });
+  return <div/>;
+}
+"#;
+    let diags = diagnostics_sev(src);
+    assert!(
+        diags.iter().any(|(r, _, _)| r == "setter-in-render"),
+        "a guard on a one-arm alias is not settled by the write: {diags:?}"
+    );
+}
+
+#[test]
+fn adjust_during_render_on_a_closure_rebound_alias_warns() {
+    // `d` is the slot until a closure the render runs rebinds it (#231).
+    let src = r#"
+function A() {
+  const [s, setS] = useState(null);
+  let d = s;
+  [1].forEach(() => { d = null; });
+  if (d === null) setS({ n: 1 });
+  return <div/>;
+}
+"#;
+    let diags = diagnostics_sev(src);
+    assert!(
+        diags.iter().any(|(r, _, _)| r == "setter-in-render"),
+        "a guard on a name a closure rebinds is not settled by the write: {diags:?}"
+    );
+}
+
+#[test]
 fn unconditional_render_setter_still_error() {
     let src = r#"
 function A() {
