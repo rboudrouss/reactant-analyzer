@@ -492,7 +492,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         // second pass so each recompute reads a consistent snapshot — the
         // fixpoint converges any memo-to-memo dependency across iterations.
         env_exit = exit_env(&render_cfg, &block_states);
-        let memo_updates: Vec<(HookLabel, StateValue)> = {
+        let memo_updates: Vec<(HookLabel, crate::domains::EnvVal<StateValue>)> = {
             let mut memo_ctx = AnalysisCtx {
                 component: comp_id,
                 state: &mut state_store,

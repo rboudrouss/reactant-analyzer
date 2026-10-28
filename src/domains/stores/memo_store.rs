@@ -1,8 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use crate::{domains::AbstractDomain, ir::types::HookLabel};
+use crate::{
+    domains::AbstractDomain,
+    ir::types::{ExprId, HookLabel},
+};
 
-use super::map_get_or;
+use super::EnvVal;
 
 /// Maps each `useMemo` / `useCallback` hook label to its current abstract value.
 ///
@@ -10,8 +13,11 @@ use super::map_get_or;
 /// recomputed via `Transfer::recompute_memo` after each render-pass analysis.
 /// The `set` method is the only mutation; the recomputation logic lives in the
 /// `Transfer` implementation so each domain can define its own semantics.
+///
+/// A value keeps the allocation sites it may point to: a memo is the object
+/// its body returned, whose members a caller reads through the heap (#233).
 #[derive(Debug, Clone, PartialEq)]
-pub struct MemoStore<D: AbstractDomain>(HashMap<HookLabel, D>);
+pub struct MemoStore<D: AbstractDomain>(HashMap<HookLabel, EnvVal<D>>);
 
 impl<D: AbstractDomain> Default for MemoStore<D> {
     fn default() -> Self {
@@ -26,11 +32,17 @@ impl<D: AbstractDomain> MemoStore<D> {
 
     /// Returns `D::top()` for labels not yet computed (conservative).
     pub fn get(&self, label: HookLabel) -> D {
-        map_get_or(&self.0, &label, D::top)
+        self.0.get(&label).map_or_else(D::top, EnvVal::as_val)
     }
 
-    /// Store a precomputed domain value for a label.
-    pub fn set(&mut self, label: HookLabel, val: D) {
+    /// The allocation sites the memo may point to; `None` when some recompute
+    /// may hand back anything else, or none ran yet.
+    pub fn locs(&self, label: HookLabel) -> Option<&HashSet<ExprId>> {
+        self.0.get(&label).and_then(EnvVal::locs)
+    }
+
+    /// Store a precomputed value for a label.
+    pub fn set(&mut self, label: HookLabel, val: EnvVal<D>) {
         self.0.insert(label, val);
     }
 }
@@ -52,19 +64,35 @@ mod tests {
     #[test]
     fn set_and_get() {
         let mut m = Memo::new();
-        m.set(0, Stability::Stable);
+        m.set(0, EnvVal::Val(Stability::Stable));
         assert_eq!(m.get(0), Stability::Stable);
-        m.set(0, Stability::PerRender);
+        m.set(0, EnvVal::Val(Stability::PerRender));
         assert_eq!(m.get(0), Stability::PerRender);
+        assert!(m.locs(0).is_none());
     }
 
     #[test]
     fn multiple_labels_independent() {
         let mut m = Memo::new();
-        m.set(0, Stability::Stable);
-        m.set(1, Stability::PerRender);
+        m.set(0, EnvVal::Val(Stability::Stable));
+        m.set(1, EnvVal::Val(Stability::PerRender));
         assert_eq!(m.get(0), Stability::Stable);
         assert_eq!(m.get(1), Stability::PerRender);
         assert_eq!(m.get(2), Stability::Unknown); // unset → top
+    }
+
+    #[test]
+    fn a_memo_keeps_the_sites_it_points_to() {
+        let mut m = Memo::new();
+        let ids = HashSet::from([ExprId(4)]);
+        m.set(
+            0,
+            EnvVal::Loc {
+                ids: ids.clone(),
+                val: Stability::PerRender,
+            },
+        );
+        assert_eq!(m.get(0), Stability::PerRender);
+        assert_eq!(m.locs(0), Some(&ids));
     }
 }

@@ -6,14 +6,14 @@ use crate::{
     domains::{
         AbstractDomain, AnalysisCtx, Transfer,
         impls::{BoolVal, Interval, SetterVal, Stability, StateValue, StrConst},
-        interp::{alloc_literal, exec_body, exec_stmt_with_callbacks},
+        interp::{alloc_literal, exec_stmt_with_callbacks, run_cfg},
         stores::{AbstractEnv, EnvVal, Heap, HeapValue, resolve_locs},
     },
     engine::component_registry::ChildLookup,
     ir::{
         ComponentId,
         bindings::binding_of,
-        cfg::CFG,
+        cfg::{CFG, Terminator},
         expr::{BinOp, CompOrigin, Expr, MarkerVal, Prim, UnaryOp},
         hooks::{Arity, DepsArg, HookEntry},
         stmt::Stmt,
@@ -61,42 +61,84 @@ impl Transfer for StateValueTransfer {
         render_cfg: &CFG,
         env: &AbstractEnv<StateValue>,
         ctx: &mut AnalysisCtx<StateValue>,
-    ) -> StateValue {
+    ) -> EnvVal<StateValue> {
         // One recompute: a memo's body, run against the real stores (ADR-020
-        // item 8); a new function for a callback literal; for any other
-        // callback, its argument, which nothing here reads. A body no run
-        // returns from bounds nothing.
-        let (deps, value) = match memo {
-            HookEntry::Memo { body_cfg, deps, .. } => (deps, exec_body(self, body_cfg, env, ctx)),
+        // item 8), with the sites it returns; a new function for a callback
+        // literal; for any other callback, its argument, which nothing here
+        // reads. A body no run returns from bounds nothing.
+        let (deps, value, locs) = match memo {
+            HookEntry::Memo { body_cfg, deps, .. } => {
+                let run = run_cfg(self, body_cfg, env.clone(), ctx, 0);
+                let locs = returned_locs(self, body_cfg, &run.exits, ctx);
+                (deps, run.ret, locs)
+            }
             HookEntry::Callback {
                 literal: true,
                 deps,
                 ..
-            } => (deps, StateValue::reference(Stability::PerRender)),
-            HookEntry::Callback { deps, .. } => (deps, StateValue::top()),
-            _ => return StateValue::top(),
+            } => (deps, StateValue::reference(Stability::PerRender), None),
+            HookEntry::Callback { deps, .. } => (deps, StateValue::top(), None),
+            _ => return EnvVal::Val(StateValue::top()),
         };
-        let value = if value.is_bottom_value() {
-            StateValue::top()
-        } else {
-            value
+        let value = memo_value(component, deps, value, render_cfg, env, ctx);
+        match locs {
+            Some(ids) => EnvVal::Loc { ids, val: value },
+            None => EnvVal::Val(value),
+        }
+    }
+}
+
+/// The allocation sites a body run may return: the union over its reached
+/// `return`s, each allocated in the env it returns in — `None` as soon as one
+/// returns something the heap does not place, since a reader of the sites
+/// would then miss that path's value (#233).
+fn returned_locs(
+    transfer: &StateValueTransfer,
+    body: &CFG,
+    exits: &HashMap<crate::ir::types::BlockId, AbstractEnv<StateValue>>,
+    ctx: &mut AnalysisCtx<StateValue>,
+) -> Option<HashSet<ExprId>> {
+    let mut out: Option<HashSet<ExprId>> = None;
+    for (b, block) in &body.blocks {
+        let (Terminator::Return(expr), Some(exit)) = (&block.term, exits.get(b)) else {
+            continue;
         };
-        // No deps argument: React recomputes at every render, so the memo is
-        // what its body is at that render.
-        if matches!(deps, DepsArg::Absent) {
-            return value;
-        }
-        let (may, fresh_dep) = deps_change(component, deps, render_cfg, env, ctx);
-        if fresh_dep && value.is_unstable_reference_only() {
-            return value;
-        }
-        if value.reference.is_bottom() {
-            return value;
-        }
-        StateValue {
-            reference: may,
-            ..value
-        }
+        out.get_or_insert_with(HashSet::new)
+            .extend(alloc_literal(transfer, expr, exit, ctx)?);
+    }
+    out
+}
+
+/// What a recompute's `value` is as the memo's value: its kinds, with a
+/// reference that changes only when `deps` let the memo recompute.
+fn memo_value(
+    component: ComponentId,
+    deps: &DepsArg,
+    value: StateValue,
+    render_cfg: &CFG,
+    env: &AbstractEnv<StateValue>,
+    ctx: &mut AnalysisCtx<StateValue>,
+) -> StateValue {
+    let value = if value.is_bottom_value() {
+        StateValue::top()
+    } else {
+        value
+    };
+    // No deps argument: React recomputes at every render, so the memo is
+    // what its body is at that render.
+    if matches!(deps, DepsArg::Absent) {
+        return value;
+    }
+    let (may, fresh_dep) = deps_change(component, deps, render_cfg, env, ctx);
+    if fresh_dep && value.is_unstable_reference_only() {
+        return value;
+    }
+    if value.reference.is_bottom() {
+        return value;
+    }
+    StateValue {
+        reference: may,
+        ..value
     }
 }
 

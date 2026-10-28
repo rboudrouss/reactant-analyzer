@@ -162,6 +162,9 @@ pub trait Transfer {
     ///
     /// A deps argument the engine could not read bounds nothing: it must not
     /// share an answer with a written `[]`, which pins the memo forever.
+    ///
+    /// The value keeps the allocation sites the body returns, when every
+    /// return is one the heap places (#233).
     fn recompute_memo(
         &self,
         component: crate::ir::ComponentId,
@@ -169,5 +172,5 @@ pub trait Transfer {
         render_cfg: &crate::ir::cfg::CFG,
         env: &AbstractEnv<Self::Domain>,
         ctx: &mut context::AnalysisCtx<Self::Domain>,
-    ) -> Self::Domain;
+    ) -> EnvVal<Self::Domain>;
 }

@@ -852,3 +852,28 @@ fn a_hook_returning_a_branch_chosen_setter_writes_both() {
         "{found:?}"
     );
 }
+
+#[test]
+fn a_memoized_literal_a_hook_returns_hands_its_members_over() {
+    // #233: the memo is the literal its body returns, so the caller's
+    // destructuring reads the setter through the heap.
+    for (ret, pattern) in [("[v, setV]", "[v, setV]"), ("({ v, setV })", "{ v, setV }")] {
+        let found = rules_for(
+            &format!(
+                r#"
+                function useSlot() {{
+                    const [v, setV] = useState(0);
+                    return useMemo(() => {ret}, [v]);
+                }}
+                function App() {{
+                    const {pattern} = useSlot();
+                    useEffect(() => {{ setV(v + 1); }});
+                    return <div>{{v}}</div>;
+                }}
+                "#
+            ),
+            "App",
+        );
+        assert!(fires(&found, "infinite-loop"), "{ret}: {found:?}");
+    }
+}

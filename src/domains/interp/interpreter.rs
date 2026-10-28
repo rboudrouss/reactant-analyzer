@@ -546,8 +546,9 @@ fn bind_rhs<T: Transfer>(
 /// A function literal is a closure; an object literal an `Obj` of its
 /// members; an array literal an `Obj` of its elements under their indices
 /// (`"0"`, `"1"`…, the keys a constant index reads) — only when every
-/// position is known, i.e. no spread and no elision. Anything else is what
-/// [`resolve_locs`] places, or `None`.
+/// position is known, i.e. no spread and no elision. A memo points where its
+/// body's returns do (#233). Anything else is what [`resolve_locs`] places, or
+/// `None`.
 pub(crate) fn alloc_literal<T: Transfer>(
     transfer: &T,
     expr: &Expr,
@@ -586,6 +587,7 @@ pub(crate) fn alloc_literal<T: Transfer>(
                 elems.enumerate().map(|(i, v)| (i.to_string(), v)).collect(),
             )
         }
+        Expr::MemoVal(label) => return ctx.memo.locs(*label).cloned(),
         other => return resolve_locs(other, env, ctx.heap),
     };
     let mut members = HashMap::new();
