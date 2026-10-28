@@ -9,4 +9,5 @@ pub(crate) use interpreter::alloc_literal;
 pub(crate) use interpreter::exec_body;
 pub(crate) use interpreter::exec_fn_value;
 pub(crate) use interpreter::exec_stmt_with_callbacks;
+pub(crate) use interpreter::returned_sites;
 pub(crate) use interpreter::run_cfg;

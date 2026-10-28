@@ -137,7 +137,7 @@ fn setter_calls(
     extra_fn_bindings: &HashMap<Var, Arc<CFG>>,
     converged: Option<&ConvergedFns<'_>>,
 ) -> Vec<SetterCall> {
-    let converged = converged.map(|c| c.seen_from(cfg));
+    let converged = converged.map(|c| c.seen_from(cfg, None));
     let mut fn_bindings = collect_fn_bindings(cfg);
     for (k, v) in extra_fn_bindings {
         fn_bindings
@@ -222,8 +222,8 @@ pub(crate) struct WriteSite {
 /// `inc` was defined in render is invisible to a walk of the body alone. A
 /// name the walked body binds itself drops out of the set, fail-closed, the
 /// same device as `shadowed`. `converged` are the closures the converged
-/// values put behind a name or member path ([`ConvergedFns`]), dropped the
-/// same way when a body other than the render binds the path's root.
+/// values put behind a name or member path ([`ConvergedFns`]), as seen from
+/// `cfg` ([`ConvergedFns::seen_from`]).
 ///
 /// `dispatches`: some body of the program fires event listeners itself
 /// ([`SetterWalk::dispatches`]).
@@ -257,11 +257,10 @@ pub(crate) fn collect_write_sites(
     // A body's own rename of an outer function (`const run = inc` in an
     // effect) only resolves once the outer names are in.
     let fn_bindings = resolve_aliases(cfg, &fn_bindings);
-    let converged = converged.seen_from(cfg);
     let mut walk = SetterWalk {
         setter_vars,
         fn_bindings: &fn_bindings,
-        converged: Some(&converged),
+        converged: Some(converged),
         walking: HashSet::new(),
         root: cfg as *const CFG as usize,
         effect_body,
@@ -393,6 +392,8 @@ pub(crate) struct ConvergedFns<'a> {
     fns: HashMap<Var, Vec<Arc<CFG>>>,
     render: &'a CFG,
     scopes: Vec<(&'a [Var], &'a CFG)>,
+    heap: &'a Heap,
+    component: ComponentId,
 }
 
 impl<'a> ConvergedFns<'a> {
@@ -401,33 +402,53 @@ impl<'a> ConvergedFns<'a> {
         params: &[Var],
         hooks: &'a [HookEntry],
         block_states: &HashMap<BlockId, AbstractEnv<StateValue>>,
-        heap: &Heap,
+        heap: &'a Heap,
         component: ComponentId,
     ) -> Self {
         ConvergedFns {
             fns: collect_converged_fns(render, params, block_states, heap, component),
             render,
             scopes: must_alias_scopes(render, hooks),
+            heap,
+            component,
         }
     }
 
     /// The same table, without the paths whose root `body` binds: there the
-    /// name is the body's own (fail-closed, as `shadowed`). The render binds
+    /// name is the body's own (fail-closed, as `shadowed`) — read off the
+    /// body's converged envs instead, when it has them (`exits`, an effect's
+    /// or a handler's blocks: `get()(x)` in an effect, #46). The render binds
     /// the roots the table is about, so it keeps them all.
-    fn seen_from(&self, body: &CFG) -> Self {
+    fn seen_from(
+        &self,
+        body: &CFG,
+        exits: Option<&HashMap<BlockId, AbstractEnv<StateValue>>>,
+    ) -> Self {
         let mut binders = HashSet::new();
         if !std::ptr::eq(body, self.render) {
             collect_binders(body, &mut binders);
         }
+        let mut fns: HashMap<Var, Vec<Arc<CFG>>> = self
+            .fns
+            .iter()
+            .filter(|(path, _)| !binders.contains(path_root(path)))
+            .map(|(path, bodies)| (path.clone(), bodies.clone()))
+            .collect();
+        if let Some(exits) = exits.filter(|_| !binders.is_empty()) {
+            fns.extend(collect_converged_fns(
+                body,
+                &[],
+                exits,
+                self.heap,
+                self.component,
+            ));
+        }
         ConvergedFns {
-            fns: self
-                .fns
-                .iter()
-                .filter(|(path, _)| !binders.contains(path_root(path)))
-                .map(|(path, bodies)| (path.clone(), bodies.clone()))
-                .collect(),
+            fns,
             render: self.render,
             scopes: self.scopes.clone(),
+            heap: self.heap,
+            component: self.component,
         }
     }
 
@@ -1496,22 +1517,25 @@ pub(crate) fn collect_slot_writers(
             sure: true,
         });
     }
-    for (v, props) in converged_call_targets(converged, envs.component) {
-        if targets.contains_key(&v) {
-            continue;
+    let add_converged = |targets: &mut HashMap<Var, Vec<Target>>,
+                         converged: &HashMap<Var, Vec<SetterProp>>| {
+        for (v, props) in converged_call_targets(converged, envs.component) {
+            if targets.contains_key(&v) {
+                continue;
+            }
+            let candidates: Vec<Target> = props
+                .iter()
+                .map(|p| Target {
+                    owner: (p.component != envs.component).then_some(p.component),
+                    slot: p.label,
+                    carried: p.closure,
+                    sure: p.must_write,
+                })
+                .collect();
+            targets.insert(v, candidates);
         }
-        let candidates: Vec<Target> = props
-            .iter()
-            .map(|p| Target {
-                owner: (p.component != envs.component).then_some(p.component),
-                slot: p.label,
-                carried: p.closure,
-                sure: p.must_write,
-            })
-            .collect();
-        targets.insert(v, candidates);
-    }
-    let setter_vars: HashSet<Var> = targets.keys().cloned().collect();
+    };
+    add_converged(&mut targets, converged);
     // A write of the slot's own read stores its content (`written::classify`),
     // a must fact: the name is bound once, in render, to the read, and no
     // other body — a hook body, a closure, a callback's parameter — binds it
@@ -1612,6 +1636,20 @@ pub(crate) fn collect_slot_writers(
             | WriterRegion::Handler(l) => (Some(l), inlined_origin(l)),
         };
         let effect_body = matches!(region, WriterRegion::Effect(_));
+        // A name the body binds is read in the body's own converged envs,
+        // where it has them — an effect's or a handler's blocks: the value
+        // `get()` returns in `get()(x)` is a name no render env holds (#46).
+        let exits = match region {
+            WriterRegion::Effect(l) => envs.effect_exits.get(&l),
+            WriterRegion::Handler(l) => envs.handler_exits.get(&l),
+            _ => None,
+        };
+        let mut targets = targets.clone();
+        if let Some(exits) = exits {
+            let own = collect_component_setter_vars(cfg, &[], exits, envs.heap);
+            add_converged(&mut targets, &own);
+        }
+        let setter_vars: HashSet<Var> = targets.keys().cloned().collect();
         let mut sites = collect_write_sites(
             cfg,
             &setter_vars,
@@ -1620,7 +1658,7 @@ pub(crate) fn collect_slot_writers(
             dispatches,
             &shadowed,
             &outer_fns,
-            &converged_fns,
+            &converged_fns.seen_from(cfg, exits),
             &callback_bodies,
         );
         // One source site is one row. A local helper called twice pulls its

@@ -179,7 +179,8 @@ pub(crate) fn run_cfg<T: Transfer>(
                 // branch answers with its own takes the branch's condition.
                 Terminator::Return(expr) => {
                     let returned = exec_callbacks_depth(transfer, expr, &env, ctx, depth);
-                    let mut val = returned.unwrap_or_else(|| transfer.eval_expr(expr, &env, ctx));
+                    let mut val = returned
+                        .map_or_else(|| transfer.eval_expr(expr, &env, ctx), |ev| ev.as_val());
                     let pc_ret = bound_under(returning.get(&b), &cond_bounds);
                     if under_condition(&pc_ret) {
                         val = val.select_under(&pc_ret);
@@ -293,13 +294,15 @@ fn exec_full_stmt<T: Transfer>(
         // Binding statements: the effects of every call in the RHS parts —
         // a slot write included, `x = flag && setA(1)` is one (#169) — then
         // the binding core. A call of a local function binds what its
-        // bodies returned, which the effect walk just computed; the
-        // evaluator alone reads any call as ⊤ (ADR-009).
+        // bodies returned, which the effect walk just computed, and points
+        // where their returns do (#46); the evaluator alone reads any call
+        // as ⊤ (ADR-009).
         Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. } => {
             let returned = exec_callbacks_depth(transfer, rhs, env, ctx, depth);
             exec_stmt_core(transfer, stmt, env, ctx);
-            if let Some(val) = returned {
-                env.extend(var.clone(), val);
+            if let Some(ev) = returned {
+                env.bind_locs(var.clone(), ev.sites().cloned());
+                env.extend(var.clone(), ev.as_val());
             }
         }
         Stmt::MemberWrite { obj, key, rhs, .. } => {
@@ -693,16 +696,16 @@ fn write_one_slot<T: Transfer>(
 /// would double-execute. Nesting is handled naturally by that recursion.
 ///
 /// Returns the value of `expr` when it is a call of a local function whose
-/// every body this walk ran (B6): the join of what they returned. `None`
-/// for any other expression, and for a call the walk could not resolve
-/// whole or skipped at the depth cap — the evaluator's ⊤ stands.
+/// every body this walk ran (B6): the join of what they returned, and where
+/// it points. `None` for any other expression, and for a call the walk could
+/// not resolve whole or skipped at the depth cap — the evaluator's ⊤ stands.
 fn exec_callbacks_depth<T: Transfer>(
     transfer: &T,
     expr: &Expr,
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
-) -> Option<T::Domain> {
+) -> Option<EnvVal<T::Domain>> {
     let capped = depth >= MAX_INLINE_DEPTH;
     if capped && let Some(inter) = ctx.inter {
         inter
@@ -780,15 +783,15 @@ fn exec_callbacks_depth<T: Transfer>(
 /// (`api.tick()`, `t[1]()`, #216) through the heap closures it resolves to
 /// ([`exec_heap_fns`]), a `useCallback` name through its hook body.
 /// Parameters are ⊤. Also how an effect's returned cleanup runs, which React
-/// calls (#171). Returns what the call returns; `None` when no body ran
-/// whole.
+/// calls (#171). Returns what the call returns, with the allocation sites
+/// its returns place (#46); `None` when no body ran whole.
 pub(crate) fn exec_fn_value<T: Transfer>(
     transfer: &T,
     callee: &Expr,
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
-) -> Option<T::Domain> {
+) -> Option<EnvVal<T::Domain>> {
     match callee.peel_ts() {
         Expr::FnLit {
             params, body_cfg, ..
@@ -797,14 +800,11 @@ pub(crate) fn exec_fn_value<T: Transfer>(
             for p in params {
                 sub_env.extend(p.clone(), T::Domain::top());
             }
-            Some(exec_body_depth(
-                transfer,
-                body_cfg,
-                &sub_env,
-                ctx,
-                depth + 1,
-            ))
-            .filter(|v| !v.is_bottom())
+            let run = run_cfg(transfer, body_cfg, sub_env, ctx, depth + 1);
+            let sites = returned_sites(transfer, body_cfg, &run.exits, ctx);
+            Some(run.ret)
+                .filter(|v| !v.is_bottom())
+                .map(|v| EnvVal::located(sites, v))
         }
         other => {
             if let Some(sites) = resolve_locs(other, env, ctx.heap) {
@@ -829,7 +829,7 @@ pub(crate) fn exec_fn_value<T: Transfer>(
                         None => returned = None,
                     }
                 }
-                return returned.filter(|v| !v.is_bottom());
+                return returned.filter(|v| !v.is_bottom()).map(EnvVal::Val);
             }
             None
         }
@@ -841,19 +841,21 @@ pub(crate) fn exec_fn_value<T: Transfer>(
 /// `api.tick()`).
 ///
 /// Returns the join of what the bodies returned when every target was a
-/// body that ran: locations that include anything else, or open ones that
-/// may be something no site places (#240), answer `None`; so does a body no
-/// run returns from.
+/// body that ran, with the allocation sites those returns place (#46):
+/// locations that include anything else, or open ones that may be something
+/// no site places (#240), answer `None`; so does a body no run returns from.
 fn exec_heap_fns<T: Transfer>(
     transfer: &T,
     sites: Sites,
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
-) -> Option<T::Domain> {
+) -> Option<EnvVal<T::Domain>> {
     let mut ids: Vec<_> = sites.ids.into_iter().collect();
     ids.sort();
     let mut returned = (!sites.open).then(T::Domain::bottom);
+    // `None` until a body is run, as in [`returned_sites`].
+    let mut placed: Option<Option<Sites>> = None;
     for id in ids {
         if let Some(HeapValue::Fn {
             params,
@@ -899,11 +901,43 @@ fn exec_heap_fns<T: Transfer>(
             for p in &params {
                 sub_env.extend(p.clone(), T::Domain::top());
             }
-            let ret = exec_body_depth(transfer, &body_cfg, &sub_env, ctx, depth + 1);
-            returned = returned.map(|acc| acc.join(&ret));
+            let run = run_cfg(transfer, &body_cfg, sub_env, ctx, depth + 1);
+            let sites = returned_sites(transfer, &body_cfg, &run.exits, ctx);
+            placed = Some(match placed {
+                None => sites,
+                Some(acc) => Sites::join_opt(acc.as_ref(), sites.as_ref()),
+            });
+            returned = returned.map(|acc| acc.join(&run.ret));
         } else {
             returned = None;
         }
     }
-    returned.filter(|v| !v.is_bottom())
+    returned
+        .filter(|v| !v.is_bottom())
+        .map(|v| EnvVal::located(placed.flatten(), v))
+}
+
+/// The allocation sites a body run may return: the join over its reached
+/// `return`s, each allocated in the env it returns in (#233) — open where one
+/// returns something the heap does not place, as a name bound so on one path
+/// is (#240). What a memo points to, and what a call of a closure does (#46).
+pub(crate) fn returned_sites<T: Transfer>(
+    transfer: &T,
+    body: &CFG,
+    exits: &HashMap<BlockId, AbstractEnv<T::Domain>>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+) -> Option<Sites> {
+    // `None` until a return is reached.
+    let mut out: Option<Option<Sites>> = None;
+    for (b, block) in &body.blocks {
+        let (Terminator::Return(expr), Some(exit)) = (&block.term, exits.get(b)) else {
+            continue;
+        };
+        let sites = alloc_literal(transfer, expr, exit, ctx);
+        out = Some(match out {
+            None => sites,
+            Some(acc) => Sites::join_opt(acc.as_ref(), sites.as_ref()),
+        });
+    }
+    out.flatten()
 }

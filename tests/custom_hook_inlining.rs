@@ -1127,3 +1127,62 @@ fn a_setter_joined_with_an_unknown_value_is_still_written() {
         );
     }
 }
+
+#[test]
+fn a_setter_or_a_closure_a_call_returns_is_written_when_called() {
+    // #46: a callee that is itself a call is the value that call returns —
+    // the setter `get()` hands back, the closure `makeSetter()` builds, the
+    // setter a hook's member returns. In a no-deps effect: a loop Warning. In
+    // render: an Error when the call surely returns the setter, a Warning
+    // through a closure that only carries it, or a setter on one arm.
+    let hook = r#"
+        function useThing() {
+            const [v, setV] = useState(0);
+            return { v, get: () => setV };
+        }
+    "#;
+    use reactant::rules::Severity::{Error, Warning};
+    for (body, rule, expected) in [
+        (
+            "const [v, setV] = useState(0); const get = () => setV; useEffect(() => { get()(v + 1); }); return <div />;",
+            "infinite-loop",
+            Warning,
+        ),
+        (
+            "const [v, setV] = useState(0); const makeSetter = () => (x) => setV(x); useEffect(() => { makeSetter()(v + 1); }); return <div />;",
+            "infinite-loop",
+            Warning,
+        ),
+        (
+            "const api = useThing(); useEffect(() => { api.get()(api.v + 1); }); return <div />;",
+            "infinite-loop",
+            Warning,
+        ),
+        (
+            "const [v, setV] = useState(0); const get = () => setV; get()(v + 1); return <div />;",
+            "setter-in-render",
+            Error,
+        ),
+        (
+            "const [v, setV] = useState(0); const makeSetter = () => (x) => setV(x); makeSetter()(v + 1); return <div />;",
+            "setter-in-render",
+            Warning,
+        ),
+        (
+            "const [v, setV] = useState(0); const get = () => (c ? setV : (x) => {}); get()(v + 1); return <div />;",
+            "setter-in-render",
+            Warning,
+        ),
+    ] {
+        let found = rules_for(
+            &format!("{hook}\nfunction App({{ c }}) {{ {body} }}"),
+            "App",
+        );
+        let severity = found
+            .iter()
+            .filter(|(r, _)| r == rule)
+            .map(|(_, s)| *s)
+            .max_by_key(|s| *s == Error);
+        assert_eq!(severity, Some(expected), "{body}: {found:?}");
+    }
+}

@@ -6,14 +6,14 @@ use crate::{
     domains::{
         AbstractDomain, AnalysisCtx, Transfer,
         impls::{BoolVal, Interval, SetterVal, Stability, StateValue, StrConst},
-        interp::{alloc_literal, exec_stmt_with_callbacks, run_cfg},
+        interp::{alloc_literal, exec_stmt_with_callbacks, returned_sites, run_cfg},
         stores::{AbstractEnv, EnvVal, Heap, HeapValue, Sites, resolve_locs},
     },
     engine::component_registry::ChildLookup,
     ir::{
         ComponentId,
         bindings::binding_of,
-        cfg::{CFG, Terminator},
+        cfg::CFG,
         expr::{BinOp, CompOrigin, Expr, MarkerVal, Prim, UnaryOp},
         hooks::{Arity, DepsArg, HookEntry},
         stmt::Stmt,
@@ -83,31 +83,6 @@ impl Transfer for StateValueTransfer {
         let value = memo_value(component, deps, value, render_cfg, env, ctx);
         EnvVal::located(sites, value)
     }
-}
-
-/// The allocation sites a body run may return: the join over its reached
-/// `return`s, each allocated in the env it returns in (#233) — open where one
-/// returns something the heap does not place, as a name bound so on one path
-/// is (#240).
-fn returned_sites(
-    transfer: &StateValueTransfer,
-    body: &CFG,
-    exits: &HashMap<crate::ir::types::BlockId, AbstractEnv<StateValue>>,
-    ctx: &mut AnalysisCtx<StateValue>,
-) -> Option<Sites> {
-    // `None` until a return is reached.
-    let mut out: Option<Option<Sites>> = None;
-    for (b, block) in &body.blocks {
-        let (Terminator::Return(expr), Some(exit)) = (&block.term, exits.get(b)) else {
-            continue;
-        };
-        let sites = alloc_literal(transfer, expr, exit, ctx);
-        out = Some(match out {
-            None => sites,
-            Some(acc) => Sites::join_opt(acc.as_ref(), sites.as_ref()),
-        });
-    }
-    out.flatten()
 }
 
 /// What a recompute's `value` is as the memo's value: its kinds, with a

@@ -648,3 +648,45 @@ fn a_closure_passed_through_a_member_path_is_a_write_in_its_position_class() {
         assert!(rows[0].block.is_none(), "{effect}{jsx}: {:?}", rows[0]);
     }
 }
+
+#[test]
+fn a_call_whose_callee_is_a_call_writes_what_the_inner_call_returns() {
+    // #46: `get()(x)` binds the inner call's value to a temp the body's own
+    // converged envs read — the setter itself, or a closure whose body is
+    // walked. One effect row each; neither sits in render.
+    for (decl, call) in [
+        ("const get = () => setV;", "get()(v + 1)"),
+        (
+            "const makeSetter = () => (x) => setV(x);",
+            "makeSetter()(v + 1)",
+        ),
+    ] {
+        let src = format!(
+            r#"
+            import {{ useState, useEffect }} from "react";
+            export function App() {{
+              const [v, setV] = useState(0);
+              {decl}
+              useEffect(() => {{ {call}; }});
+              return <div>{{v}}</div>;
+            }}
+            "#
+        );
+        let r = parse_and_analyze(&src);
+        let c = comp(&r, "App");
+        let rows: Vec<&SlotWriter> = c
+            .slot_writers
+            .iter()
+            .filter(|w| matches!(w.region, WriterRegion::Effect(_)))
+            .collect();
+        assert_eq!(rows.len(), 1, "{call}: {:?}", c.slot_writers);
+        assert_eq!(rows[0].owner, None, "{call}");
+        assert!(
+            c.slot_writers
+                .iter()
+                .all(|w| w.region != WriterRegion::Render),
+            "{call}: {:?}",
+            c.slot_writers
+        );
+    }
+}

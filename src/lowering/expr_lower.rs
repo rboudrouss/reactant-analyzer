@@ -633,8 +633,27 @@ fn lower_arguments(arguments: &[Argument], builder: &mut BlockBuilder) -> Vec<Ex
     args
 }
 
+/// A callee that is itself a call (`get()(x)`, `makeSetter()(x)`, #46) is
+/// bound to a temp first, where it is evaluated — before the arguments, as
+/// JavaScript does: the call's value is then a name like any other, which
+/// the interpreter binds to what the call returns and every reader of a
+/// name's converged value resolves. The temp is named by its source offset,
+/// as a destructuring temp is (ADR-020 item 11), so no other body of the
+/// component binds it.
 fn lower_call(call: &CallExpression, builder: &mut BlockBuilder) -> Expr {
-    let fn_ = lower_expr(&call.callee, builder);
+    let fn_ = match lower_expr(&call.callee, builder) {
+        inner if matches!(inner.peel_ts(), Expr::Call { .. }) => {
+            let tmp = format!("__call_{}", call.callee.span().start);
+            let span = builder.span_at(call.callee.span().start);
+            builder.push_stmt(Stmt::Let {
+                var: tmp.clone(),
+                rhs: inner,
+                span,
+            });
+            Expr::Var(tmp)
+        }
+        other => other,
+    };
     let args = lower_arguments(&call.arguments, builder);
     let call_expr = Expr::Call {
         fn_: Box::new(fn_),
