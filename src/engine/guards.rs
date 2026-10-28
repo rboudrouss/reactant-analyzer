@@ -12,8 +12,9 @@
 //!   the write stores there, so the two sides are equal next render whatever
 //!   they evaluate to (`write_settles_comparison`), and stay equal when that
 //!   expression holds still across the loop (#209);
-//! - **member** — the guard tests a member of the slot, and the literal the
-//!   write puts at that member contradicts it (`write_settles_member_truth`).
+//! - **member** — the guard tests a member of the slot (`s.n`, or a name
+//!   destructured from it), and the literal the write puts at that member
+//!   contradicts it (`write_settles_member`, #244).
 //!
 //! Two callers feed it different values — the churn graph the reference part
 //! of an effect write, `setter-in-render` the whole value of a render write —
@@ -51,7 +52,7 @@ use crate::{
     engine::purity::{self, Callee, Kind},
     ir::{
         ComponentId, QualifiedSlot,
-        bindings::local_bindings,
+        bindings::{local_bindings, must_slot_path},
         cfg::{CFG, EdgeKind, Terminator},
         expr::{Expr, MarkerVal, Prim, SummaryValue, UnaryOp, mutation_receiver, object_member},
         free_vars::{call_free_key, collect_used_vars},
@@ -60,19 +61,48 @@ use crate::{
     },
 };
 
+/// A slot and the fields a name reads off it: `(l, [])` is the slot itself,
+/// `(l, ["n"])` its member `n` (#244).
+pub type SlotPath = (HookLabel, Vec<String>);
+
+/// The names the render binds on every path to a slot's read — `whole`, the
+/// must-alias table (`engine::setters::must_state_vals`) — or to a member
+/// path of one: `const { n } = s` binds `n` to `s.n` (#244). The same
+/// certificate as `whole`'s ([`must_slot_path`]): no body of `scopes`
+/// rebinds a name of the chain.
+pub(crate) fn must_slot_paths(
+    render_cfg: &CFG,
+    scopes: &[(&[Var], &CFG)],
+    whole: &HashMap<Var, HookLabel>,
+) -> HashMap<Var, SlotPath> {
+    let mut out: HashMap<Var, SlotPath> = whole
+        .iter()
+        .map(|(v, l)| (v.clone(), (*l, Vec::new())))
+        .collect();
+    for stmt in render_cfg.blocks.values().flat_map(|b| &b.stmts) {
+        if let Stmt::Let { var, .. } = stmt
+            && !out.contains_key(var)
+            && let Some(path) = must_slot_path(&Expr::Var(var.clone()), render_cfg, scopes)
+            && !path.1.is_empty()
+        {
+            out.insert(var.clone(), path);
+        }
+    }
+    out
+}
+
 /// True when the dominating guards of `call_block` provably kill the call
 /// once `written` sits in state slot `label` — the set fires at most once.
 ///
 /// `exit_env` is the env the guards are narrowed from, and must be the env
 /// of `cfg` itself (a render site); `eval` evaluates the literal the member
-/// arm reads, and nothing else. `state_vals` is the must-alias table
-/// (`engine::setters::must_state_vals`), as for
-/// [`converges_under_all_writes`] (#231).
+/// arm reads, and nothing else. `slots` is the must table
+/// (`must_slot_paths`), as for [`converges_under_all_writes`] (#231).
 #[allow(clippy::too_many_arguments)]
 pub fn converges_once_written(
     cfg: &CFG,
     call_block: BlockId,
-    state_vals: &HashMap<Var, HookLabel>,
+    slots: &HashMap<Var, SlotPath>,
     label: HookLabel,
     written: &StateValue,
     written_expr: Option<&Expr>,
@@ -94,7 +124,7 @@ pub fn converges_once_written(
         held: &|_| true,
     };
     // `exit_env` is this body's own env: nothing is shadowed.
-    dead_once_written(&guards, None, state_vals, &[own], exit_env, eval)
+    dead_once_written(&guards, None, slots, &[own], exit_env, eval)
 }
 
 /// A write site of a slot, as the multi-site proof reads it (#154, #160).
@@ -142,17 +172,17 @@ pub struct WriteSite<'a> {
 /// reference part of an effect write, since a `null` run stores no fresh
 /// reference; the site fixpoint reads the whole value. `props_hold` is
 /// handed to [`Invariance::holds`]: the caller says whether a loop can
-/// reach the component through its props at all. `state_vals` names the
-/// render names that read a slot on every path
-/// ([`must_slot_read`](crate::ir::bindings::must_slot_read)): a name rebound
-/// to the written value must be the slot, not a name tied to it on one arm.
+/// reach the component through its props at all. `slots` names the render
+/// names that read a slot, or a member path of one, on every path
+/// (`must_slot_paths`): a name rebound to the written value must be the
+/// slot, not a name tied to it on one arm.
 #[allow(clippy::too_many_arguments)]
 pub fn converges_under_all_writes(
     peers: &[WriteSite<'_>],
     i: usize,
     own_value: &StateValue,
     foreign: &HashSet<QualifiedSlot>,
-    state_vals: &HashMap<Var, HookLabel>,
+    slots: &HashMap<Var, SlotPath>,
     invariance: &Invariance<'_>,
     props_hold: bool,
     exit_env: &AbstractEnv<StateValue>,
@@ -183,6 +213,10 @@ pub fn converges_under_all_writes(
         })
         .collect();
     let mine = let_bindings(site.cfg);
+    let shadow = Shadow {
+        lets: &mine,
+        nested: nested_binders(site.cfg),
+    };
     // Does a part of a written expression of this body denote one value on
     // every run (#209)?
     let held_here = |e: &Expr| invariance.holds(e, &mine, props_hold);
@@ -209,7 +243,7 @@ pub fn converges_under_all_writes(
             }),
         }
     }
-    if !dead_once_written(&guards, Some(&mine), state_vals, &kill, exit_env, eval) {
+    if !dead_once_written(&guards, Some(&shadow), slots, &kill, exit_env, eval) {
         return false;
     }
     let held: Vec<(&Expr, bool)> = guards
@@ -269,7 +303,7 @@ pub fn converges_under_all_writes(
                 scope: same.then_some(site.cfg),
                 held: &held_here,
             });
-            if !dead_once_written(&guards, Some(&mine), state_vals, &rewrites, &env, eval) {
+            if !dead_once_written(&guards, Some(&shadow), slots, &rewrites, &env, eval) {
                 return false;
             }
         }
@@ -847,25 +881,30 @@ impl<'e> ReadScope<'e> {
                 _ => None,
             })
             .collect();
-        let mut nested = HashSet::new();
-        fn closures(e: &Expr, out: &mut HashSet<Var>) {
-            if let Expr::FnLit {
-                params, body_cfg, ..
-            } = e
-            {
-                out.extend(params.iter().cloned());
-                crate::engine::setters::collect_binders(body_cfg, out);
-                return;
-            }
-            e.for_each_child(&mut |c| closures(c, out));
-        }
-        cfg.for_each_expr(&mut |e| closures(e, &mut nested));
         ReadScope {
             bindings: local_bindings(cfg),
             conds,
-            nested,
+            nested: nested_binders(cfg),
         }
     }
+}
+
+/// Every name a function nested in `cfg` binds, its parameters included.
+fn nested_binders(cfg: &CFG) -> HashSet<Var> {
+    fn closures(e: &Expr, out: &mut HashSet<Var>) {
+        if let Expr::FnLit {
+            params, body_cfg, ..
+        } = e
+        {
+            out.extend(params.iter().cloned());
+            crate::engine::setters::collect_binders(body_cfg, out);
+            return;
+        }
+        e.for_each_child(&mut |c| closures(c, out));
+    }
+    let mut nested = HashSet::new();
+    cfg.for_each_expr(&mut |e| closures(e, &mut nested));
+    nested
 }
 
 /// The names a body binds: `Some(rhs)` for a name bound by exactly one `let`
@@ -980,32 +1019,90 @@ struct Rewrite<'a> {
     held: &'a dyn Fn(&Expr) -> bool,
 }
 
+/// The body a site's guards sit in, when the env they are narrowed from is
+/// not that body's own.
+struct Shadow<'a> {
+    /// What the body binds ([`let_bindings`]).
+    lets: &'a Bindings<'a>,
+    /// What a function nested in it binds ([`nested_binders`]): such a
+    /// closure may reassign a body name between its binding and the guard.
+    nested: HashSet<Var>,
+}
+
+/// What a guard's names read: the render's must table, under the bindings of
+/// the site's body.
+struct Names<'a> {
+    slots: &'a HashMap<Var, SlotPath>,
+    body: Option<&'a Shadow<'a>>,
+}
+
+impl Names<'_> {
+    /// The slot and member path `e` reads on every path at the guard: a name
+    /// the site's body binds once, never in a closure, reads what its
+    /// right-hand side reads (`const { n } = s`, #244); any other name the
+    /// body binds reads nothing certain; a name it does not bind is the
+    /// render's.
+    fn path(&self, e: &Expr) -> Option<SlotPath> {
+        self.go(e, crate::ir::bindings::MAX_ALIAS_HOPS)
+    }
+
+    fn go(&self, e: &Expr, depth: usize) -> Option<SlotPath> {
+        if depth == 0 {
+            return None;
+        }
+        match e.peel_ts() {
+            Expr::Var(v) => match self
+                .body
+                .and_then(|b| b.lets.get(v.as_str()).map(|r| (b, r)))
+            {
+                Some((b, Some(rhs))) if !b.nested.contains(v) => self.go(rhs, depth - 1),
+                Some(_) => None,
+                None => self.slots.get(v).cloned(),
+            },
+            Expr::FieldAccess { obj, field } => {
+                let (l, mut path) = self.go(obj, depth - 1)?;
+                path.push(field.clone());
+                Some((l, path))
+            }
+            _ => None,
+        }
+    }
+}
+
 /// True when `guards`, the conjuncts of one site, are all dead once every
 /// `rewrite` sits in its slot, starting from `env`.
 ///
-/// `shadowed` names what the site's body binds when `env` is not that
-/// body's env — the render exit env under an effect body. Those names read
-/// ⊤: the render may bind the same name to something else (a lowered
-/// short-circuit temp `__t0` most of all), and narrowing that value would
-/// pronounce a guard dead on a name it does not test (#162).
+/// `shadowed` is the site's body when `env` is not that body's env — the
+/// render exit env under an effect body. The names it binds read ⊤: the
+/// render may bind the same name to something else (a lowered short-circuit
+/// temp `__t0` most of all), and narrowing that value would pronounce a
+/// guard dead on a name it does not test (#162).
 fn dead_once_written(
     guards: &[(&Expr, bool)],
-    shadowed: Option<&HashMap<&str, Option<&Expr>>>,
-    state_vals: &HashMap<Var, HookLabel>,
+    shadowed: Option<&Shadow<'_>>,
+    slots: &HashMap<Var, SlotPath>,
     rewrites: &[Rewrite<'_>],
     env: &AbstractEnv<StateValue>,
     eval: &mut dyn FnMut(&Expr) -> StateValue,
 ) -> bool {
     let mut env = env.clone();
-    for name in shadowed.into_iter().flat_map(HashMap::keys) {
+    for name in shadowed.into_iter().flat_map(|s| s.lets.keys()) {
         env.extend((*name).to_string(), StateValue::top());
     }
-    // The names that read the slot at the guard: a name the site's body
-    // binds is that binding, not the render's read.
-    let slots_of = |label: HookLabel| -> HashSet<&Var> {
-        state_vals
+    let names = Names {
+        slots,
+        body: shadowed,
+    };
+    // The render names that read the whole slot at the guard: a name the
+    // site's body binds is that binding, not the render's read.
+    let slots_of = |label: HookLabel| -> Vec<&Var> {
+        slots
             .iter()
-            .filter(|(v, l)| **l == label && !shadowed.is_some_and(|s| s.contains_key(v.as_str())))
+            .filter(|(v, (l, path))| {
+                *l == label
+                    && path.is_empty()
+                    && !shadowed.is_some_and(|s| s.lets.contains_key(v.as_str()))
+            })
             .map(|(v, _)| v)
             .collect()
     };
@@ -1017,7 +1114,13 @@ fn dead_once_written(
 
     for &(cond, taken) in guards {
         for rewrite in rewrites {
-            let slots = slots_of(rewrite.label);
+            // The member path `e` reads off this rewrite's slot.
+            let path = |e: &Expr| {
+                names
+                    .path(e)
+                    .filter(|(l, _)| *l == rewrite.label)
+                    .map(|(_, path)| path)
+            };
             // Relational arm: the guard compares the slot against an
             // expression the write puts *into* the slot, so the two sides
             // are the same value on the next render whatever that value is
@@ -1026,16 +1129,16 @@ fn dead_once_written(
             // needs the two to be related, not bounded — but the spellings
             // can.
             if let (Some(arg), Some(scope)) = (rewrite.expr, rewrite.scope)
-                && write_settles_comparison(cond, taken, &slots, arg, scope, rewrite.held, eval)
+                && write_settles_comparison(cond, taken, &path, arg, scope, rewrite.held, eval)
             {
                 return true;
             }
             // Member arm: the guard tests a *member* of the slot, so the
             // value written at that member answers it — the whole-slot
             // lookup below cannot, since the slot is one abstract value
-            // (#90).
+            // (#90, #244).
             if let Some(arg) = rewrite.expr
-                && write_settles_member_truth(cond, taken, &slots, arg, eval)
+                && write_settles_member(cond, taken, &path, arg, eval)
             {
                 return true;
             }
@@ -1067,7 +1170,7 @@ fn dead_once_written(
 fn write_settles_comparison(
     cond: &Expr,
     taken: bool,
-    slots: &HashSet<&Var>,
+    slot_path: &dyn Fn(&Expr) -> Option<Vec<String>>,
     written_expr: &Expr,
     cfg: &CFG,
     held: &dyn Fn(&Expr) -> bool,
@@ -1091,7 +1194,7 @@ fn write_settles_comparison(
         return false; // the guard survives its own write; nothing proved
     }
     [(lhs, rhs), (rhs, lhs)].iter().any(|(side, other)| {
-        let Some(segs) = slot_path(side, slots) else {
+        let Some(segs) = slot_path(side) else {
             return false;
         };
         let Some(at) = written_at(written_expr, &segs) else {
@@ -1155,46 +1258,71 @@ fn value_keys(e: &Expr, cfg: &CFG) -> Vec<String> {
     out
 }
 
-/// The field chain `e` reads off a variable aliasing the written slot, or
-/// `None` when `e` is not rooted there.
-fn slot_path(e: &Expr, slots: &HashSet<&Var>) -> Option<Vec<String>> {
-    match e.peel_ts() {
-        Expr::Var(v) if slots.contains(v) => Some(Vec::new()),
-        Expr::FieldAccess { obj, field } => {
-            let mut segs = slot_path(obj, slots)?;
-            segs.push(field.clone());
-            Some(segs)
-        }
-        _ => None,
-    }
-}
-
-/// Does the value written at a *member* of the slot contradict a guard that
-/// reads that member?
+/// Does the value written at a path of the slot contradict a guard that reads
+/// that path?
 ///
 /// `if (!id && sheet.leadId) setSheet({ leadId: null, open: false })` reaches
 /// the write only while `sheet.leadId` is truthy, and leaves `null` there — so
-/// the guard cannot hold again. The whole-slot narrowing cannot see that: the
-/// slot is one abstract value, and `{ leadId: null, … }` is a truthy
-/// reference.
+/// the guard cannot hold again; `if (s.n === 0) setS({ n: 1 })` leaves `1`
+/// where the guard wants `0` (#244). The whole-slot narrowing cannot see a
+/// member: the slot is one abstract value, and `{ leadId: null, … }` is a
+/// truthy reference. So the guard is narrowed on a fresh name standing for
+/// the member, bound to the written literal: the engine's own narrowing,
+/// read on the member instead of the slot.
 ///
-/// Only a literal is read, so the answer never depends on which environment a
-/// body-local name would be looked up in.
-fn write_settles_member_truth(
+/// Only a literal is read, on either side, so the answer never depends on
+/// which environment a body-local name would be looked up in; a member the
+/// literal does not write, or writes after a spread, proves nothing.
+fn write_settles_member(
     cond: &Expr,
     taken: bool,
-    slots: &HashSet<&Var>,
+    slot_path: &dyn Fn(&Expr) -> Option<Vec<String>>,
     written_expr: &Expr,
     eval: &mut dyn FnMut(&Expr) -> StateValue,
 ) -> bool {
-    let (read, truthy) = match cond.peel_ts() {
+    use crate::ir::expr::BinOp::*;
+    const MEMBER: &str = "__written_member";
+    let member = || Box::new(Expr::Var(MEMBER.to_string()));
+    // The operand the guard tests, and the guard rebuilt with the member in
+    // its place, in the shape the narrowing reads (the name on the left).
+    let (read, rebuilt) = match cond.peel_ts() {
         Expr::UnaryOp {
             op: UnaryOp::Not,
             arg,
-        } => (arg.peel_ts(), !taken),
-        e => (e, taken),
+        } => (
+            arg.as_ref(),
+            Expr::UnaryOp {
+                op: UnaryOp::Not,
+                arg: member(),
+            },
+        ),
+        Expr::BinOp { op, lhs, rhs } => {
+            let flipped = match op {
+                Eq => Eq,
+                Neq => Neq,
+                Lt => Gt,
+                Gt => Lt,
+                Leq => Geq,
+                Geq => Leq,
+                _ => return false,
+            };
+            let (read, lit, op) = match (lhs.peel_ts(), rhs.peel_ts()) {
+                (read, lit @ Expr::Lit(_)) => (read, lit, op.clone()),
+                (lit @ Expr::Lit(_), read) => (read, lit, flipped),
+                _ => return false,
+            };
+            (
+                read,
+                Expr::BinOp {
+                    op,
+                    lhs: member(),
+                    rhs: Box::new(lit.clone()),
+                },
+            )
+        }
+        read => (read, Expr::Var(MEMBER.to_string())),
     };
-    let Some(segs) = slot_path(read, slots).filter(|s| !s.is_empty()) else {
+    let Some(segs) = slot_path(read) else {
         return false;
     };
     let Some(at) = written_at(written_expr, &segs) else {
@@ -1203,12 +1331,11 @@ fn write_settles_member_truth(
     if !matches!(at, Expr::Lit(_)) {
         return false;
     }
-    let val = eval(at);
-    if truthy {
-        val.narrow_truthy().is_bottom_value()
-    } else {
-        val.narrow_falsy().is_bottom_value()
-    }
+    let mut env = AbstractEnv::default();
+    env.extend(MEMBER.to_string(), eval(at));
+    narrow_env_for_branch(&env, &rebuilt, taken)
+        .lookup(MEMBER)
+        .is_bottom_value()
 }
 
 /// The sub-expression the written value places at `segments`: the argument

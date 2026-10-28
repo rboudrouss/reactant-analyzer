@@ -143,6 +143,33 @@ pub fn must_slot_read(expr: &Expr, scope: &CFG, elsewhere: &[(&[Var], &CFG)]) ->
     }
 }
 
+/// [`must_slot_read`] through member reads: the slot `expr` reads on every
+/// path and the fields it reads off it — `s.n`, or the `n` of a `const { n }
+/// = s` (#244). An empty path is the slot itself.
+pub fn must_slot_path(
+    expr: &Expr,
+    scope: &CFG,
+    elsewhere: &[(&[Var], &CFG)],
+) -> Option<(HookLabel, Vec<String>)> {
+    fn go(
+        expr: &Expr,
+        scope: &CFG,
+        elsewhere: &[(&[Var], &CFG)],
+        depth: usize,
+    ) -> Option<(HookLabel, Vec<String>)> {
+        match must_binding(expr, scope, elsewhere)? {
+            Expr::StateVal(l) => Some((*l, Vec::new())),
+            Expr::FieldAccess { obj, field } if depth > 0 => {
+                let (l, mut path) = go(obj, scope, elsewhere, depth - 1)?;
+                path.push(field.clone());
+                Some((l, path))
+            }
+            _ => None,
+        }
+    }
+    go(expr, scope, elsewhere, MAX_ALIAS_HOPS)
+}
+
 /// The value `expr` denotes on every path: itself when it is no name, or
 /// the end of the chain of sole bindings in `scope` a name starts, under the
 /// certificate [`must_slot_read`] states — no binder of a chain name in any

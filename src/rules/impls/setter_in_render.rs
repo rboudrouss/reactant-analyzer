@@ -112,7 +112,11 @@ impl SetterInRender {
         // convergence proof rebinds a name to the written value, which claims
         // the name IS the slot: the must-alias, never the may table (#231).
         let scopes = must_alias_scopes(&comp_result.render_cfg, &comp_result.hooks);
-        let state_vals = must_state_vals(&comp_result.render_cfg, &scopes);
+        let state_vals = crate::engine::guards::must_slot_paths(
+            &comp_result.render_cfg,
+            &scopes,
+            &must_state_vals(&comp_result.render_cfg, &scopes),
+        );
 
         // A closure the converged values put behind a called path
         // (`api.inc()`) runs at the call: its writes are render writes there.

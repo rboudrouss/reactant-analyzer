@@ -94,8 +94,8 @@ use crate::{
         SlotWriter, WriterPhase, WriterRegion,
         dominance::on_all_paths,
         guards::{
-            Invariance, WriteSite, call_may_differ, converges_under_all_writes, let_bindings,
-            mutated_roots, navigates, site_guards,
+            Invariance, SlotPath, WriteSite, call_may_differ, converges_under_all_writes,
+            let_bindings, must_slot_paths, mutated_roots, navigates, site_guards,
         },
         render_deps::written_names,
         setters::{
@@ -301,6 +301,10 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         /// other body rebinding them (`setters::must_state_vals`): what the
         /// proofs may read as the slot itself (#210, #222).
         must_state_vals: HashMap<Var, HookLabel>,
+        /// `must_state_vals` with the names bound to a member path of a
+        /// slot's read (`guards::must_slot_paths`, #244): what the
+        /// convergence proof reads a guard's names through.
+        slot_paths: HashMap<Var, SlotPath>,
         memo_vals: HashMap<Var, HookLabel>,
         memo_deps: HashMap<HookLabel, &'a [Expr]>,
         render_lets: HashMap<&'a str, Option<&'a Expr>>,
@@ -404,12 +408,15 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             mutated.extend(mutated_roots(body));
         }
         let state_vals = resolve_setter_aliases(cfg, &state_val_labels(cfg));
-        let must_state_vals = must_state_vals(cfg, &must_alias_scopes(cfg, &comp_result.hooks));
+        let scopes = must_alias_scopes(cfg, &comp_result.hooks);
+        let must_state_vals = must_state_vals(cfg, &scopes);
+        let slot_paths = must_slot_paths(cfg, &scopes, &must_state_vals);
         ctxs.insert(
             comp,
             CompCtx {
                 state_vals,
                 must_state_vals,
+                slot_paths,
                 memo_vals: resolve_setter_aliases(cfg, &memo_val_labels(cfg)),
                 memo_deps: comp_result
                     .hooks
@@ -804,7 +811,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     k,
                     peers[k].value,
                     &foreign,
-                    &ctx.must_state_vals,
+                    &ctx.slot_paths,
                     &invariance,
                     ctx.props_hold,
                     &ctx.exit,
@@ -929,7 +936,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     k,
                     &own_value,
                     &foreign,
-                    &ctx.must_state_vals,
+                    &ctx.slot_paths,
                     &invariance,
                     ctx.props_hold,
                     &ctx.exit,

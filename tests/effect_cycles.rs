@@ -2231,3 +2231,63 @@ fn a_call_returned_setter_in_a_closure_nested_in_an_effect_loops() {
     let never = infinite_loop_diags(&comp("", "const later = () => get()(v + 1);"), "App");
     assert!(never.is_empty(), "{never:?}");
 }
+
+#[test]
+fn a_guard_on_a_member_of_the_slot_dies_under_the_written_literal() {
+    // `{ n: 1 }` leaves `1` where the guard wants `0` (#244): through a
+    // member read, a render destructuring and a body destructuring.
+    for (decl, effect) in [
+        ("", "if (s.n === 0) setS({ n: 1 });"),
+        ("const { n } = s;", "if (n === 0) setS({ n: 1 });"),
+        ("", "const { n } = s; if (0 === n) setS({ n: 1 });"),
+        ("", "if (s.n < 1) setS({ n: 1 });"),
+    ] {
+        let src = format!(
+            r#"
+import {{ useState, useEffect }} from 'react';
+export function C() {{
+  const [s, setS] = useState({{ n: 0 }});
+  {decl}
+  useEffect(() => {{ {effect} }}, [s]);
+  return <div />;
+}}
+"#
+        );
+        let sevs = loop_severities(&src, "C");
+        assert!(sevs.is_empty(), "{decl} {effect}: {sevs:?}");
+    }
+}
+
+#[test]
+fn a_guard_on_a_member_of_the_slot_lives_when_the_write_does_not_kill_it() {
+    // The member written back, a member the literal does not write, a value
+    // that is no literal, another site writing the member back, and a body
+    // name a closure may reassign: no proof (#244).
+    for (decl, effect) in [
+        ("const { n } = s;", "if (n === 0) setS({ n: 0 });"),
+        ("", "if (s.n === 0) setS({ m: 1 });"),
+        ("", "if (s.n === 0) setS({ ...s, n: s.n });"),
+        (
+            "",
+            "if (s.n === 0) setS({ n: 1 }); if (s.n === 1) setS({ n: 0 });",
+        ),
+        (
+            "",
+            "let { n } = s; [1].forEach(() => { n = 0; }); if (n === 0) setS({ n: 1 });",
+        ),
+    ] {
+        let src = format!(
+            r#"
+import {{ useState, useEffect }} from 'react';
+export function C() {{
+  const [s, setS] = useState<any>({{ n: 0 }});
+  {decl}
+  useEffect(() => {{ {effect} }}, [s]);
+  return <div />;
+}}
+"#
+        );
+        let sevs = loop_severities(&src, "C");
+        assert!(!sevs.is_empty(), "{decl} {effect}");
+    }
+}

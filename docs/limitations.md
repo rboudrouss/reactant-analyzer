@@ -270,7 +270,8 @@ carries an Error.
   [#188](https://github.com/rboudrouss/reactant-analyzer/issues/188).
 - **The churn graph is slot-granular where a program is member-granular.** The self-churn arm reads
   the member (`[data.name]` is not re-triggered by `setData(prev => ({...prev, slug}))`, and a guard
-  on `sheet.leadId` is answered by the `null` the write puts there), but the multi-effect graph
+  on a member, `!sheet.leadId`, `s.n === 0` or a `const { n } = s`, is answered by the literal the
+  write puts there; a written value that is no object literal answers nothing), but the multi-effect graph
   cannot: whether effect A's write into `y` changes a dep of effect B is a property of an edge
   *pair*, not of an edge. A direct spread, `setData({...data, slug})`, is likewise unproved, since
   `data` is the value captured at that render rather than the current one
