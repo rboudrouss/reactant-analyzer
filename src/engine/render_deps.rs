@@ -951,6 +951,10 @@ impl<'a> Analyzer<'a> {
                             d.union_with(&self.eval(a, env).deps.ungated());
                         }
                     }
+                    // The result is held by decision (#161): an argument
+                    // computed through an unknown call moves it no more than
+                    // the hook's own state does.
+                    d.impure = false;
                     DVal::of(d)
                 }
                 _ => DVal::empty(),

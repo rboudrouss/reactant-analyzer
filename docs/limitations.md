@@ -168,8 +168,8 @@ that writes it (see *Cross-file limits*).
   callback that only names the ref or the binding in its body does not read it: its identity moves
   with its deps list [#227](https://github.com/rboudrouss/reactant-analyzer/issues/227). A dep
   that moves for another reason reads as held: a module binding written only behind a call the
-  analysis cannot see into, and, by decision, a hook's or a context's result
-  [#161](https://github.com/rboudrouss/reactant-analyzer/issues/161).
+  analysis cannot see into, and, by decision, a hook's or a context's result, whatever the hook's
+  arguments are computed through [#161](https://github.com/rboudrouss/reactant-analyzer/issues/161).
 - **Which calls are functions of their inputs.** A call computes the same content from the same
   inputs when its callee is a builtin the engine names — `JSON.stringify`/`parse`, `String`,
   `Number`, `Object.keys`, `Array.isArray`, `Math.*` but `random`, and the methods of a receiver

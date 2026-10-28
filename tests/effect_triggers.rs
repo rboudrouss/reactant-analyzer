@@ -714,11 +714,15 @@ fn a_dep_that_moves_with_no_slot_may_rerun_the_effect_every_render() {
             "s.split(\",\").map(format).join()",
             Rerun::Always(Always::MutableDep(0)),
         ),
+        // A hook's result is held by decision (#161), whatever its
+        // arguments are computed through.
+        ("const d = useThing(format(t));", "d", Rerun::OnSlots),
     ] {
         let src = format!(
             r#"
             import {{ useState, useEffect }} from "react";
             import {{ format }} from "date-fns";
+            import {{ useThing }} from "lib";
             const cache = new Map<number, number>();
             export function C() {{
               const [t, setT] = useState(false);
