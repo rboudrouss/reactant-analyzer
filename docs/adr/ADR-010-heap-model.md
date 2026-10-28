@@ -29,6 +29,8 @@ In both cases, the function body is unreachable because the IR doesn't link vari
 
 Each "allocating" node (`FnLit`, `ObjectLit`, `ArrayLit`) receives an `id: ExprId` (newtype `struct ExprId(pub usize)`) assigned by a counter in `BlockBuilder` at lowering time. This is the *allocation site*: same syntactic node → same ExprId across all fixpoint iterations.
 
+An id names one site in the whole program: one counter per file (#134), a splice shifts its callee above the caller ([`Offsets`](../../src/ir/remap.rs)), and the component registry places each component in a range of its own (`ComponentId::site_base`), since a child's heap holds its parents' sites and runs their closures (#243).
+
 ```rust
 // ir/types.rs
 pub struct ExprId(pub usize);

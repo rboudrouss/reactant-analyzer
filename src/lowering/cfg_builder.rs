@@ -30,7 +30,10 @@ use crate::{
 ///
 /// Cloning shares the counter, which is how it reaches a nested body without
 /// changing what a builder owns. One counter per file; the splice gives an
-/// inlined callee its own range (see [`crate::ir::Offsets`]).
+/// inlined callee its own range (see [`crate::ir::Offsets`]), and the
+/// component registry each component its own
+/// ([`crate::ir::ComponentId::site_base`]): a child's heap holds its parents'
+/// sites too (#243).
 #[derive(Debug, Clone, Default)]
 pub struct ExprIds(Rc<Cell<usize>>);
 

@@ -626,6 +626,104 @@ export function App() {
     );
 }
 
+/// `files` (`(path, source)`), each lowered on its own as the driver does:
+/// every file numbers its allocation sites from zero.
+fn analyze_files(files: &[(&str, &str)]) -> ProgramAnalysisResult {
+    use oxc_allocator::Allocator;
+    use oxc_parser::{ParseOptions, Parser};
+    use oxc_span::SourceType;
+    use reactant::lowering::lower_program;
+
+    let mut table = Default::default();
+    let mut components = Vec::new();
+    for (path, src) in files {
+        let alloc = Allocator::default();
+        let ret = Parser::new(&alloc, src, SourceType::tsx())
+            .with_options(ParseOptions::default())
+            .parse();
+        assert!(ret.diagnostics.is_empty(), "{:?}", ret.diagnostics);
+        components.extend(lower_program(
+            &ret.program,
+            src,
+            std::path::Path::new(path),
+            &mut table,
+        ));
+    }
+    analyze_program(
+        ComponentRegistry::from_components(components),
+        HookRegistry::new(),
+        RootStrategy::Heuristic,
+        &Config::default(),
+    )
+}
+
+#[test]
+fn a_parent_closure_is_not_the_child_closure_its_file_numbered_alike() {
+    // #247: the parent's `() => setV(…)` and the child's `g` were both their
+    // file's first closure; in the child's heap the one replaced the other.
+    use reactant::rules::{InfiniteLoop, Rule};
+    let app = r#"
+import { useState } from "react";
+import { Child } from "./Child";
+export function App() {
+  const [v, setV] = useState(0);
+  return <Child f={() => setV((x) => x + 1)} />;
+}
+"#;
+    let child = r#"
+import { useEffect } from "react";
+export function Child({ f }: { f: () => void }) {
+  const g = () => 0;
+  const h = () => 1;
+  useEffect(() => {
+    f();
+  });
+  return <div>{g() + h()}</div>;
+}
+"#;
+    let result = analyze_files(&[("/p/App.tsx", app), ("/p/Child.tsx", child)]);
+    let diags = InfiniteLoop.check(&RuleCtx::new(
+        &result,
+        result.component_named("Child").unwrap(),
+    ));
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.rule == "cross-component-infinite-loop"),
+        "{diags:?}"
+    );
+}
+
+#[test]
+fn a_parent_prop_is_not_the_child_closure_its_file_numbered_alike() {
+    // #247, the memos `PagedMemoList` shape: `props.render` read as the
+    // child's own `apply`, and `apply`'s write as a render write.
+    use reactant::rules::{Rule, SetterInRender};
+    let app = r#"
+import { List } from "./List";
+export function App() {
+  return <List render={(x: number) => <b key={x}>{x}</b>} />;
+}
+"#;
+    let list = r#"
+import { useLayoutEffect, useState, type ReactElement } from "react";
+export function List(props: { render: (x: number) => ReactElement }) {
+  const [wide, setWide] = useState(false);
+  useLayoutEffect(() => {
+    const apply = () => setWide(true);
+    apply();
+  }, []);
+  return <div>{[1, 2].map((x) => props.render(x))}{String(wide)}</div>;
+}
+"#;
+    let result = analyze_files(&[("/p/App.tsx", app), ("/p/List.tsx", list)]);
+    let diags = SetterInRender.check(&RuleCtx::new(
+        &result,
+        result.component_named("List").unwrap(),
+    ));
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
 #[test]
 fn fixture_inter_component_no_crash() {
     let src = std::fs::read_to_string("tests/fixtures/inter_component.tsx")

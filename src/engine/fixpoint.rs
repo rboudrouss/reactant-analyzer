@@ -254,7 +254,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     // a write site is caller-authored or wrapper-mediated.
     let mut inline_regions = crate::engine::setters::InlineRegions::default();
     // The identity supplies every splice in this component draws from.
-    let mut splice_salt = SpliceIds::for_component(&render_cfg, &hooks);
+    let mut splice_salt = SpliceIds::for_component(&render_cfg, &hooks, comp_id);
 
     // Utility-function inlining. Runs before `expand_custom_hooks` so utility
     // bodies containing hook calls become visible to the hook expansion pass.
@@ -985,10 +985,12 @@ pub(crate) struct SpliceIds {
 }
 
 impl SpliceIds {
-    fn for_component(render_cfg: &CFG, hooks: &[HookEntry]) -> Self {
+    /// Grafts land above the component's own sites, inside its range
+    /// ([`ComponentId::site_base`]) even when it allocates nothing itself.
+    fn for_component(render_cfg: &CFG, hooks: &[HookEntry], component: ComponentId) -> Self {
         SpliceIds {
             salt: 0,
-            next_alloc: alloc_span(render_cfg, hooks),
+            next_alloc: alloc_span(render_cfg, hooks).max(component.site_base()),
         }
     }
 

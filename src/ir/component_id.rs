@@ -50,6 +50,19 @@ impl ComponentId {
     pub fn index(self) -> u32 {
         self.0
     }
+
+    /// The first allocation-site id of this component's range: ids are
+    /// numbered per file and per splice from zero, yet a child's heap holds
+    /// its parents' sites and runs their closures, so each component's sites
+    /// live in a range of their own, `(index + 1)·2³²` up (#247). Below the
+    /// first range sit [`ExprId::fresh`](crate::ir::types::ExprId::fresh)
+    /// ids, and [`Self::SYNTHETIC`]'s, which analyses alone.
+    pub fn site_base(self) -> usize {
+        if self == Self::SYNTHETIC {
+            return 0;
+        }
+        (self.0 as usize + 1) << 32
+    }
 }
 
 /// Interning table `ComponentId ↔ (file, name)`, built once from the component

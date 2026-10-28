@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::ir::{
@@ -40,17 +41,24 @@ impl ComponentRegistry {
     }
 
     pub fn from_components(comps: Vec<ComponentIR>) -> Self {
-        let entries = KeyedRegistry::from_keyed(
-            comps
-                .into_iter()
-                .map(|comp| ((comp.file.clone(), comp.name.clone()), comp)),
-        );
+        // A later definition of a key overwrites an earlier one.
+        let by_key: BTreeMap<ComponentKey, ComponentIR> = comps
+            .into_iter()
+            .map(|comp| ((comp.file.clone(), comp.name.clone()), comp))
+            .collect();
         // Interned in sorted key order, so an id is reproducible across runs:
-        // the analysis iterates ids in places a report is ordered by.
+        // the analysis iterates ids in places a report is ordered by. Each
+        // component's allocation sites are placed in its id's range
+        // ([`ComponentId::site_base`]), so no heap confuses two components'
+        // literals (#247).
         let mut table = ComponentTable::default();
-        for (file, name) in entries.all_keys() {
-            table.intern(CompOrigin { file, name });
-        }
+        let entries = KeyedRegistry::from_keyed(by_key.into_iter().map(|((file, name), comp)| {
+            let id = table.intern(CompOrigin {
+                file: file.clone(),
+                name: name.clone(),
+            });
+            ((file, name), comp.placed_at(id.site_base()))
+        }));
         Self { entries, table }
     }
 
