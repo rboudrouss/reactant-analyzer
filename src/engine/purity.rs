@@ -152,8 +152,8 @@ const CALLS: &[Builtin] = &[
 /// are the mutating methods (`sort`, `push`, `set`): a call that moves its
 /// receiver is no function of it.
 const METHODS: &[Builtin] = &[
-    b(Kind::Global("JSON"), "stringify", S),
-    b(Kind::Global("JSON"), "parse", U),
+    cb(Kind::Global("JSON"), "stringify", S, 1),
+    cb(Kind::Global("JSON"), "parse", U, 1),
     b(Kind::Global("Object"), "keys", A),
     b(Kind::Global("Object"), "values", A),
     b(Kind::Global("Object"), "entries", A),

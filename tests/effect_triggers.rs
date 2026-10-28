@@ -685,6 +685,11 @@ fn a_dep_that_moves_with_no_slot_may_rerun_the_effect_every_render() {
         // inputs; one not known may not (#224).
         ("", "String(t)", Rerun::OnSlots),
         ("", "JSON.stringify({ t })", Rerun::OnSlots),
+        (
+            "",
+            "JSON.stringify({ t }, () => Math.random())",
+            Rerun::Always(Always::MutableDep(0)),
+        ),
         ("", "new Date(String(t)).getTime()", Rerun::OnSlots),
         (
             "",
