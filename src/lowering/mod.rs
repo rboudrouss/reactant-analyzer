@@ -156,6 +156,12 @@ impl Candidate<'_> {
             cfg_builder::build_fn_body_cfg(self.params, self.body, ctx)
         }
     }
+
+    /// The default of each parameter, aligned with [`Self::build_cfg`]'s
+    /// names.
+    pub(crate) fn param_defaults(&self, ctx: &LowerCtx) -> Vec<Option<crate::ir::expr::Expr>> {
+        cfg_builder::param_defaults(self.params, ctx)
+    }
 }
 
 /// Local names bound to the `react` module itself: `import React from
@@ -396,6 +402,7 @@ pub fn lower_custom_hooks_with_resolver(
         .into_iter()
         .map(|candidate| {
             let (params, mut body_cfg) = candidate.build_cfg(&ctx);
+            let param_defaults = candidate.param_defaults(&ctx);
             let (mut hooks, hook_provenance, mut next_label) =
                 extract_hooks(&mut body_cfg, &imports);
             extract_handlers(&body_cfg, &mut hooks, &mut next_label);
@@ -404,6 +411,7 @@ pub fn lower_custom_hooks_with_resolver(
                 file: file.to_path_buf(),
                 name: candidate.name,
                 params,
+                param_defaults,
                 body_cfg,
                 hooks,
                 hook_provenance,

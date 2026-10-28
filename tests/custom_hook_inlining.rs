@@ -1216,3 +1216,69 @@ fn a_call_returned_setter_of_a_hook_in_a_nested_closure_is_written() {
         );
     }
 }
+
+// ── A deps argument read off a parameter (#230) ──────────────────────────────
+
+/// The effect class and loop findings of `App` for one call of a hook whose
+/// effect is gated by `deps`, a parameter.
+fn deps_param_case(sig: &str, call: &str) -> (Option<reactant::engine::Rerun>, Vec<String>) {
+    let src = format!(
+        r#"
+        import {{ useEffect, useState }} from "react";
+        function useGated(fn, {sig}) {{
+            useEffect(() => {{ fn(); }}, deps);
+        }}
+        function App() {{
+            const [a] = useState(0);
+            const [b, setB] = useState({{}});
+            {call}
+            return <div>{{a}}</div>;
+        }}
+        "#
+    );
+    let result = parse_and_analyze(&src);
+    let id = result.component_named("App").unwrap();
+    let comp = &result.components[&id];
+    let effect = comp
+        .hooks
+        .iter()
+        .find_map(|h| match h {
+            reactant::ir::HookEntry::Effect { label, .. } => Some(*label),
+            _ => None,
+        })
+        .expect("the hook's effect is inlined");
+    let loops = diags_for(&result, "App")
+        .into_iter()
+        .filter(|d| {
+            d.rule.as_ref() == "infinite-loop" && d.severity() != reactant::rules::Severity::Info
+        })
+        .map(|d| d.message)
+        .collect();
+    (comp.rerun(effect), loops)
+}
+
+#[test]
+fn a_deps_parameter_is_the_callers_array_once_inlined() {
+    use reactant::engine::Rerun;
+    // `[a]`, which the write of `b` does not move; an omitted argument takes
+    // the parameter's default, `[]`.
+    let (class, loops) = deps_param_case("deps", "useGated(() => setB({}), [a]);");
+    assert_eq!(class, Some(Rerun::OnSlots));
+    assert!(loops.is_empty(), "{loops:?}");
+    let (class, loops) = deps_param_case("deps = []", "useGated(() => setB({}));");
+    assert_eq!(class, Some(Rerun::MountOnly));
+    assert!(loops.is_empty(), "{loops:?}");
+}
+
+#[test]
+fn a_deps_parameter_the_caller_moves_still_reruns_the_effect() {
+    use reactant::engine::{Always, Rerun};
+    // `[b]` is the slot the effect writes a new object into; an argument the
+    // caller cannot write, or a parameter the hook rebinds, stays unreadable.
+    let (_, loops) = deps_param_case("deps", "useGated(() => setB({}), [b]);");
+    assert!(!loops.is_empty());
+    let (class, _) = deps_param_case("deps", "useGated(() => setB({}), list());");
+    assert_eq!(class, Some(Rerun::Always(Always::OpaqueDeps)));
+    let (class, _) = deps_param_case("deps = [], x = (deps = [b])", "useGated(() => setB({}));");
+    assert_eq!(class, Some(Rerun::Always(Always::OpaqueDeps)));
+}

@@ -85,7 +85,8 @@ the loop without one), or `Always(why)` (re-runs after every render). `why` is
 certain for `NoDeps` (no deps argument) and `FreshDep(i)` (dep `i` is a new
 reference every render, `is_unstable_reference_only`, the fact
 `always-unstable-deps` reports), and possible for `OpaqueDeps` (a deps argument
-that is not a written array, #212) and `MutableDep(i)` (dep `i` reads a ref's
+that is not a written array, #212 — once a custom hook is inlined, a parameter
+is the call's argument or the parameter's default, #230) and `MutableDep(i)` (dep `i` reads a ref's
 contents a body can replace — `ref.current` itself only through a
 reassignment that is no lazy init, #228 — or a source the dependence
 analysis lost, #201;

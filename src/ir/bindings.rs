@@ -143,6 +143,37 @@ pub fn must_slot_read(expr: &Expr, scope: &CFG, elsewhere: &[(&[Var], &CFG)]) ->
     }
 }
 
+/// The parameter of `params` that `expr` denotes on every path: itself, or
+/// a name whose chain of sole bindings in `scope` ends at it — the `deps` of
+/// a `deps = []` parameter, which lowers to `let deps = __p1` (#230). No
+/// body binds a chain name again: not `scope` (the parameter itself
+/// included), not `elsewhere`, under the certificate [`must_slot_read`]
+/// states.
+pub fn must_param(
+    expr: &Expr,
+    scope: &CFG,
+    elsewhere: &[(&[Var], &CFG)],
+    params: &[Var],
+) -> Option<usize> {
+    let mut cur = expr.peel_ts();
+    for _ in 0..MAX_ALIAS_HOPS + 2 {
+        let Expr::Var(v) = cur else {
+            return None;
+        };
+        if elsewhere
+            .iter()
+            .any(|(ps, body)| ps.contains(v) || binds(v, body))
+        {
+            return None;
+        }
+        if let Some(i) = params.iter().position(|p| p == v) {
+            return (!binds(v, scope)).then_some(i);
+        }
+        cur = sole_binding_in(v, scope)?.1;
+    }
+    None
+}
+
 /// [`must_slot_read`] through member reads: the slot `expr` reads on every
 /// path and the fields it reads off it — `s.n`, or the `n` of a `const { n }
 /// = s` (#244). An empty path is the slot itself.

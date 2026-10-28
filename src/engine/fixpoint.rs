@@ -1196,9 +1196,33 @@ fn expand_custom_hooks(
             &caller_bound,
         );
 
+        // A deps argument the hook binds to one of its parameters is the
+        // call's argument there, or the parameter's default when the call
+        // omits it (#230). Read in the hook's own names: a default is one of
+        // them and takes the rename, an argument is the caller's and is put
+        // in after it.
+        use crate::ir::hooks::DepsArg;
+        let elsewhere =
+            crate::engine::setters::must_alias_scopes(&hook_ir.body_cfg, &hook_ir.hooks);
         let remapped: Vec<HookEntry> = remap_hooks(hook_ir.hooks.clone(), off)
             .into_iter()
-            .map(|h| {
+            .map(|mut h| {
+                let param = match h.deps_mut() {
+                    Some(DepsArg::Opaque(e)) => crate::ir::bindings::must_param(
+                        e,
+                        &hook_ir.body_cfg,
+                        &elsewhere,
+                        &hook_ir.params,
+                    ),
+                    _ => None,
+                };
+                let arg = param.and_then(|i| call_args.get(i).cloned());
+                let default = param
+                    .filter(|_| arg.is_none())
+                    .and_then(|i| hook_ir.param_defaults.get(i).cloned().flatten());
+                if let (Some(d), Some(deps)) = (default, h.deps_mut()) {
+                    *deps = DepsArg::from_expr(crate::ir::remap_expr(d, off));
+                }
                 let h = match h {
                     HookEntry::State {
                         label,
@@ -1213,7 +1237,11 @@ fn expand_custom_hooks(
                     },
                     other => other,
                 };
-                crate::ir::rename_hook_entry(h, &rename)
+                let mut h = crate::ir::rename_hook_entry(h, &rename);
+                if let (Some(arg), Some(deps)) = (arg, h.deps_mut()) {
+                    *deps = DepsArg::from_expr(arg);
+                }
+                h
             })
             .collect();
 

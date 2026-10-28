@@ -118,7 +118,7 @@ impl Rerun {
     pub fn of_shape(deps: &DepsArg) -> Option<Rerun> {
         match deps {
             DepsArg::Absent => Some(Rerun::Always(Always::NoDeps)),
-            DepsArg::Opaque => Some(Rerun::Always(Always::OpaqueDeps)),
+            DepsArg::Opaque(_) => Some(Rerun::Always(Always::OpaqueDeps)),
             DepsArg::List(l) if l.arity == Arity::Exact(0) => Some(Rerun::MountOnly),
             DepsArg::List(_) => None,
         }

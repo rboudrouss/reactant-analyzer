@@ -155,7 +155,7 @@ pub(crate) fn collect_slot_seeds(
             let covered = effects.iter().any(|l| {
                 effect_info.get(l).is_some_and(|i| match &i.deps {
                     DepsArg::Absent => true,
-                    DepsArg::Opaque => false,
+                    DepsArg::Opaque(_) => false,
                     DepsArg::List(d) => deps_cover_seed(&d.covering(), &seed, param, &bindings),
                 })
             });

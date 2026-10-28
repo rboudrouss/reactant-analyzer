@@ -1019,6 +1019,25 @@ fn lower_param_default(name: &str, init: &Expression, builder: &mut BlockBuilder
     builder.start_block(join);
 }
 
+/// The default of each formal parameter written `name = default`, aligned
+/// with the names [`inject_param_preamble`] returns: what an omitted argument
+/// stands for (#230). Lowered on its own, so `None` when lowering it emits a
+/// statement or a block (a call's temp, a short-circuit): the default is then
+/// no single expression. `None` too for a parameter with no default.
+pub(super) fn param_defaults(params: &FormalParameters, ctx: &LowerCtx) -> Vec<Option<Expr>> {
+    params
+        .items
+        .iter()
+        .map(|p| {
+            let init = p.initializer.as_deref()?;
+            let mut builder = BlockBuilder::new(ctx);
+            builder.start_block(0);
+            let default = lower_expr(init, &mut builder);
+            (builder.current_stmts.is_empty() && builder.blocks.is_empty()).then_some(default)
+        })
+        .collect()
+}
+
 /// Build a function body CFG with param destructuring preamble.
 pub fn build_fn_body_cfg(
     params: &FormalParameters,

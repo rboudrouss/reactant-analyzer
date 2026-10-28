@@ -104,6 +104,7 @@ mod tests {
             file: std::path::PathBuf::new(),
             name: name.to_string(),
             params: vec![],
+            param_defaults: vec![],
             body_cfg: trivial_cfg(),
             hooks: vec![],
             hook_provenance: vec![],

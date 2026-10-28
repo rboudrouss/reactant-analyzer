@@ -188,7 +188,8 @@ that writes it (see *Cross-file limits*).
   [#206](https://github.com/rboudrouss/reactant-analyzer/issues/206).
 - **What an effect's deps can move without a slot.** An effect re-runs after every render when it
   has no deps array or a dep that is a new reference every render, and may when its deps argument
-  is not a written array or a dep reads a ref's contents some body can replace (#189, #201,
+  is not a written array (a custom hook's parameter reads as the caller's argument, or its
+  default when the call omits it, #230) or a dep reads a ref's contents some body can replace (#189, #201,
   #212) — for `[ref.current]` itself, compared by identity, only a reassignment of `current`
   that is no lazy init (`ref.current ??= new Map()`) or a ref handed to other code (#228) — a
   module binding some body of the program writes (`[cache.size]`), or the result of a

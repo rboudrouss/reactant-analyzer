@@ -136,7 +136,7 @@ impl EffectInfo {
     /// incomplete array, so a rule must check it with *nothing* covered rather
     /// than skip it.
     pub fn deps_are_opaque(&self) -> bool {
-        matches!(self.deps, DepsArg::Opaque)
+        matches!(self.deps, DepsArg::Opaque(_))
     }
 
     /// Every deps element the IR can see, in declared order; empty when there
