@@ -50,7 +50,7 @@ impl Rule for SetterInRender {
         crate::rules::has_hook_kind(result, component, HookKind::State).then_some(
             crate::rules::SafeCheck {
                 rule: Self::NAME,
-                message: "no setter is called during render",
+                message: "no setter call during render fails to settle",
             },
         )
     }

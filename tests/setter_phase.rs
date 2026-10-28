@@ -114,3 +114,27 @@ fn a_setter_a_closure_only_carries_cannot_be_certified() {
          dominance cannot upgrade a may to a must:\n{out}"
     );
 }
+
+#[test]
+fn a_settling_render_write_is_not_verified_as_no_setter_call() {
+    let stdout = reactant(PHASE, &["--info"]).stdout;
+    let out = String::from_utf8_lossy(&stdout);
+    let section: Vec<&str> = out
+        .lines()
+        .skip_while(|l| !l.trim_start().starts_with("SettlingGuard"))
+        .skip(1)
+        .take_while(|l| l.starts_with("    "))
+        .collect();
+    assert!(
+        !section.iter().any(|l| l.contains("setter-in-render")
+            && l.contains("no setter is called during render")),
+        "`if (s) setS(null)` calls a setter during render; the rule drops it \
+         because it settles, and may claim only that:\n{out}"
+    );
+    assert!(
+        section.iter().any(|l| l.contains("verified")
+            && l.contains("setter-in-render")
+            && l.contains("fails to settle")),
+        "the rule did check the component, and says what it proved:\n{out}"
+    );
+}

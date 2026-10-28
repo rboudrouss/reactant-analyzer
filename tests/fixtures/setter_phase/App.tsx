@@ -31,3 +31,13 @@ export function DeferredWrite() {
   setTimeout(() => setN(1), 0);
   return <div>{n}</div>;
 }
+
+// A render-phase write under a guard the written value kills: React's
+// adjust-state-during-render idiom. The setter is called during render and the
+// rule drops it as converging, so the rule has proven only that no such call
+// fails to settle — never that none is made (#245).
+export function SettlingGuard() {
+  const [s, setS] = useState<null | { v: number }>(null);
+  if (s) setS(null);
+  return <div>{s?.v}</div>;
+}
