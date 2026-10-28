@@ -637,13 +637,14 @@ fn lower_arguments(arguments: &[Argument], builder: &mut BlockBuilder) -> Vec<Ex
 /// bound to a temp first, where it is evaluated — before the arguments, as
 /// JavaScript does: the call's value is then a name like any other, which
 /// the interpreter binds to what the call returns and every reader of a
-/// name's converged value resolves. The temp is named by its source offset,
-/// as a destructuring temp is (ADR-020 item 11), so no other body of the
-/// component binds it.
+/// name's converged value resolves. The temp is named by its source span, so
+/// no other body of the component binds it — the offset alone is shared by
+/// `get()` and `get()()`, whose temps would be one name bound twice.
 fn lower_call(call: &CallExpression, builder: &mut BlockBuilder) -> Expr {
     let fn_ = match lower_expr(&call.callee, builder) {
         inner if matches!(inner.peel_ts(), Expr::Call { .. }) => {
-            let tmp = format!("__call_{}", call.callee.span().start);
+            let at = call.callee.span();
+            let tmp = format!("__call_{}_{}", at.start, at.end);
             let span = builder.span_at(call.callee.span().start);
             builder.push_stmt(Stmt::Let {
                 var: tmp.clone(),
@@ -1284,6 +1285,24 @@ mod tests {
             _ => None,
         });
         func.expect("no function found")
+    }
+
+    #[test]
+    fn nested_callee_calls_bind_distinct_temps() {
+        // `get()` and `get()()` start at the same offset: one temp each, or
+        // the second `Let` rebinds the first's name to a call of itself.
+        let cfg = build("function f() { get()()(1); }");
+        let temps: Vec<&str> = cfg
+            .blocks
+            .values()
+            .flat_map(|b| &b.stmts)
+            .filter_map(|s| match s {
+                Stmt::Let { var, .. } if var.starts_with("__call_") => Some(var.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(temps.len(), 2, "{temps:?}");
+        assert_ne!(temps[0], temps[1]);
     }
 
     #[test]

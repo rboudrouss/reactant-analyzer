@@ -45,3 +45,11 @@ export function CallOfLocalFn() {
   getSetter()(n + 1);
   return <div />;
 }
+
+export function CallOfCall() {
+  const [n, setN] = useState(0);
+  const getSetter = () => setN;
+  const getGetter = () => getSetter;
+  getGetter()()(n + 1);
+  return <div />;
+}

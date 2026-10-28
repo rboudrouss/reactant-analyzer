@@ -184,3 +184,8 @@ fn the_trace_names_the_setter_as_the_message_does_and_json_keeps_the_variable() 
         "the machine-readable `callee` is the variable, unchanged:\n{json}"
     );
 }
+
+#[test]
+fn a_call_returned_by_a_call_is_named_through_both() {
+    assert_eq!(named_setter("CallOfCall"), "getGetter(…)(…)");
+}
