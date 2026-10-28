@@ -945,16 +945,19 @@ export function C({ flag }: { flag: boolean }) {
 
 #[test]
 fn a_render_phase_write_revives_an_effect_guard() {
-    // The render body writes `null` behind `cond`, the effect refills behind
-    // `!s`: with `cond` true the pair loops (`{…}` → null → `{…}`). The site
-    // list used to be built from effect rows alone, so the render write
-    // revived nothing and the effect edge was killed.
+    // The render body writes `null` behind `cond`, the effect (no deps array,
+    // so it runs at every commit) refills behind `!s`: with `cond` true the
+    // pair loops (`{…}` → null → `{…}`, oracle case
+    // `render-write-revives-effect-guard-on-a-prop`). The site list used to
+    // be built from effect rows alone, so the render write revived nothing
+    // and the effect edge was killed. (With `[s]` deps React converges: the
+    // reset lands before the commit, which sees `null` twice.)
     let src = r#"
 import { useState, useEffect } from 'react';
 export function C({ cond }: { cond: boolean }) {
   const [s, setS] = useState(null);
   if (cond && s) setS(null);
-  useEffect(() => { if (!s) setS({ fresh: true }); }, [s]);
+  useEffect(() => { if (!s) setS({ fresh: true }); });
   return <div>{s ? 'y' : 'n'}</div>;
 }
 "#;
@@ -964,6 +967,30 @@ export function C({ cond }: { cond: boolean }) {
             .iter()
             .any(|(rule, sev, _)| rule == "infinite-loop" && *sev == Severity::Warning),
         "the render write revives the guard: {diags:?}"
+    );
+}
+
+#[test]
+fn a_render_phase_write_that_keeps_the_effect_guard_dead_settles() {
+    // The render write is a site, but it stores `2`: the effect's
+    // `s === null` dies under both writes, so the effect fires once, and the
+    // render guard then dies under the one write left (oracle case
+    // `render-write-keeps-effect-guard-dead`).
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [s, setS] = useState<number | null>(null);
+  if (s === 1) setS(2);
+  useEffect(() => { if (s === null) setS(1); });
+  return <div>{s}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags
+            .iter()
+            .all(|(rule, sev, _)| rule != "infinite-loop" || *sev == Severity::Info),
+        "no write revives the effect guard: {diags:?}"
     );
 }
 
