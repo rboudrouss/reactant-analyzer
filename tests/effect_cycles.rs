@@ -2290,6 +2290,9 @@ fn a_guard_on_a_member_of_the_slot_dies_under_the_written_literal() {
         ("const { n } = s;", "if (n === 0) setS({ n: 1 });"),
         ("", "const { n } = s; if (0 === n) setS({ n: 1 });"),
         ("", "if (s.n < 1) setS({ n: 1 });"),
+        // An allocation at the member is truthy and not nullish (#228).
+        ("", "if (!s.m) setS({ n: 1, m: new Map() });"),
+        ("", "if (s.m == null) setS({ n: 1, m: [] });"),
     ] {
         let src = format!(
             r#"

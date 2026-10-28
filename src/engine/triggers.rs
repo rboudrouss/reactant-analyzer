@@ -39,18 +39,18 @@ use crate::{
     },
     engine::{
         AnalysisResult, FreshDeps,
-        guards::call_may_differ,
+        guards::{call_may_differ, site_guards, write_settles_member},
         render_deps::{Deps, Source},
         setters::{memo_val_labels, resolve_setter_aliases},
     },
     ir::{
         ComponentId, QualifiedSlot,
         bindings::{binding_of, must_slot_read},
-        cfg::CFG,
+        cfg::{CFG, Terminator},
         expr::{Expr, mutation_receiver},
         hooks::{Arity, DepsArg, HookEntry},
-        stmt::Stmt,
-        types::{HookLabel, Var},
+        stmt::{MemberKey, Stmt},
+        types::{BlockId, HookLabel, Var},
     },
 };
 
@@ -166,7 +166,7 @@ pub(crate) fn collect_effect_triggers(
         reruns: HashMap::new(),
         props: HashSet::new(),
     };
-    let mut refs_move: HashMap<HookLabel, bool> = HashMap::new();
+    let mut refs_move: HashMap<(HookLabel, bool), bool> = HashMap::new();
     for hook in hooks {
         // A memo's deps list gates its body exactly as an effect's does: React
         // compares both lists the same way, at the same render (#249).
@@ -262,9 +262,11 @@ pub(crate) fn collect_effect_triggers(
                 let lost = Deps::top();
                 let src = sources.get(label).and_then(|d| d.get(i)).unwrap_or(&lost);
                 let mut moving_ref = |l: HookLabel| {
+                    let names = ref_names(l, render_cfg);
+                    let identity = is_current_of(dep, &names);
                     *refs_move
-                        .entry(l)
-                        .or_insert_with(|| ref_may_move(l, render_cfg, hooks))
+                        .entry((l, identity))
+                        .or_insert_with(|| ref_may_move(l, &names, identity, render_cfg, hooks))
                 };
                 // A cell that moves with no slot: a ref's contents, a module
                 // binding some body writes (`cache.size`), or the result of a
@@ -318,71 +320,152 @@ pub(crate) fn collect_effect_triggers(
     out
 }
 
-/// Can the contents of ref `label` change? A primitive changes only by being
-/// replaced: through a member write or a mutating call on the ref's name, or
-/// by code the ref is handed to — a JSX `ref`, an argument, a rename. A ref
-/// that starts with a primitive and whose every use, in the render and in
-/// every hook body (closures included), is a member read keeps its initial
-/// contents. Fails closed: an object start (its members can be mutated
-/// through any alias of it) or a ref no name is bound to may move. A deps
-/// list only compares, so it is not scanned.
-fn ref_may_move(label: HookLabel, render_cfg: &CFG, hooks: &[HookEntry]) -> bool {
+/// The names the render binds to ref `label`.
+fn ref_names(label: HookLabel, render_cfg: &CFG) -> Vec<&str> {
+    render_cfg
+        .blocks
+        .values()
+        .flat_map(|b| &b.stmts)
+        .filter_map(|stmt| match stmt {
+            Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. }
+                if matches!(rhs.peel_ts(), Expr::HookMarker(l, _) if *l == label) =>
+            {
+                Some(var.as_str())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// `ref.current` itself, read through one of the ref's `names`.
+fn is_current_of(e: &Expr, names: &[&str]) -> bool {
+    matches!(e.peel_ts(), Expr::FieldAccess { obj, field }
+        if field == "current"
+            && matches!(obj.peel_ts(), Expr::Var(v) if names.contains(&v.as_str())))
+}
+
+/// Can the contents of ref `label`, as a dep reads them, change across the
+/// loop? `names` are the names the render binds to the ref.
+///
+/// Read through a member (`ref.current.n`), the contents change with any
+/// member write or mutating call rooted at the ref, and with an object's
+/// members, mutable through any alias of it: only a primitive start whose
+/// every use, in the render and in every hook body (closures included), is
+/// a member read keeps them. Compared by identity (`identity`: the dep is
+/// `ref.current` itself), they change only when `current` is reassigned:
+/// a mutation inside the object leaves it the same object, and a lazy init —
+/// a write under a guard the value it stores kills (`if (!ref.current)
+/// ref.current = {}`, `ref.current ??= new Map()`, the member arm of
+/// `guards::write_settles_member`) — runs at most once (#228). Either way,
+/// fails closed on a ref no name is bound to, or one handed to code no row
+/// describes — a JSX `ref`, an argument, a rename. A deps list only
+/// compares, so it is not scanned.
+fn ref_may_move(
+    label: HookLabel,
+    names: &[&str],
+    identity: bool,
+    render_cfg: &CFG,
+    hooks: &[HookEntry],
+) -> bool {
     let primitive_start = hooks.iter().any(|h| {
         matches!(h, HookEntry::Ref { label: l, init, .. }
             if *l == label && matches!(init.peel_ts(), Expr::Lit(_)))
     });
-    if !primitive_start {
+    if names.is_empty() || !(identity || primitive_start) {
         return true;
     }
-    let mut names: Vec<&str> = Vec::new();
-    for stmt in render_cfg.blocks.values().flat_map(|b| &b.stmts) {
-        if let Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. } = stmt
-            && matches!(rhs.peel_ts(), Expr::HookMarker(l, _) if *l == label)
-        {
-            names.push(var);
-        }
+    struct Scan<'a> {
+        names: &'a [&'a str],
+        identity: bool,
     }
-    if names.is_empty() {
-        return true;
-    }
-    let named = |e: &Expr| matches!(e.peel_ts(), Expr::Var(v) if names.contains(&v.as_str()));
-    let rooted = |e: &Expr| e.root_var().is_some_and(|v| names.contains(&v.as_str()));
-    /// Does `e` write through, or let escape, one of the names?
-    fn escapes(e: &Expr, named: &dyn Fn(&Expr) -> bool, rooted: &dyn Fn(&Expr) -> bool) -> bool {
-        if mutation_receiver(e).is_some_and(rooted) {
-            return true;
+    impl Scan<'_> {
+        fn named(&self, e: &Expr) -> bool {
+            matches!(e.peel_ts(), Expr::Var(v) if self.names.contains(&v.as_str()))
         }
-        match e.peel_ts() {
-            Expr::FieldAccess { obj, .. } if named(obj) => false,
-            v if named(v) => true,
-            Expr::FnLit { body_cfg, .. } => body_escapes(body_cfg, named, rooted),
-            other => {
-                let mut hit = false;
-                other.for_each_child(&mut |c| hit = hit || escapes(c, named, rooted));
-                hit
+        fn rooted(&self, e: &Expr) -> bool {
+            e.root_var()
+                .is_some_and(|v| self.names.contains(&v.as_str()))
+        }
+        /// Does `e` move what the dep reads, or let the ref escape?
+        fn expr(&self, e: &Expr) -> bool {
+            // A mutating call on the ref itself (`Object.assign(ref, …)`)
+            // may replace `current`; one inside its contents does not
+            // change their identity.
+            if let Some(recv) = mutation_receiver(e)
+                && self.rooted(recv)
+                && (!self.identity || self.named(recv))
+            {
+                return true;
+            }
+            match e.peel_ts() {
+                Expr::FieldAccess { obj, .. } if self.named(obj) => false,
+                v if self.named(v) => true,
+                Expr::FnLit { body_cfg, .. } => self.body(body_cfg),
+                other => {
+                    let mut hit = false;
+                    other.for_each_child(&mut |c| hit = hit || self.expr(c));
+                    hit
+                }
             }
         }
+        fn body(&self, cfg: &CFG) -> bool {
+            for (&block, b) in &cfg.blocks {
+                for stmt in &b.stmts {
+                    let hit = match stmt {
+                        // A write through the ref is judged as a write, its
+                        // target no escape.
+                        Stmt::MemberWrite { obj, key, rhs, .. } if self.rooted(obj) => {
+                            self.write_moves(cfg, block, obj, key, rhs)
+                                || matches!(key, MemberKey::Index(i) if self.expr(i))
+                                || self.expr(rhs)
+                        }
+                        other => {
+                            let mut hit = false;
+                            other.for_each_expr(&mut |e| hit = hit || self.expr(e));
+                            hit
+                        }
+                    };
+                    if hit {
+                        return true;
+                    }
+                }
+                if let Terminator::Return(e) | Terminator::Branch { cond: e, .. } = &b.term
+                    && self.expr(e)
+                {
+                    return true;
+                }
+            }
+            false
+        }
+        /// Does the member write `obj[key] = rhs`, rooted at the ref, move
+        /// what the dep reads? Under identity, only a write that may be a
+        /// reassignment of `current`, and is no lazy init.
+        fn write_moves(
+            &self,
+            cfg: &CFG,
+            block: BlockId,
+            obj: &Expr,
+            key: &MemberKey,
+            rhs: &Expr,
+        ) -> bool {
+            if !self.identity {
+                return true;
+            }
+            if !self.named(obj) || matches!(key, MemberKey::Field(f) if f != "current") {
+                return false;
+            }
+            let current = |e: &Expr| is_current_of(e, self.names).then(Vec::new);
+            matches!(key, MemberKey::Index(_))
+                || !site_guards(cfg, block).into_iter().any(|(cond, taken)| {
+                    write_settles_member(cond, taken, &current, rhs, &mut StateValue::from_init)
+                })
+        }
     }
-    fn body_escapes(
-        cfg: &CFG,
-        named: &dyn Fn(&Expr) -> bool,
-        rooted: &dyn Fn(&Expr) -> bool,
-    ) -> bool {
-        let written = cfg
-            .blocks
-            .values()
-            .flat_map(|b| &b.stmts)
-            .any(|s| matches!(s, Stmt::MemberWrite { obj, .. } if rooted(obj)));
-        let mut hit = written;
-        cfg.for_each_expr(&mut |e| hit = hit || escapes(e, named, rooted));
-        hit
-    }
-    body_escapes(render_cfg, &named, &rooted)
+    let scan = Scan { names, identity };
+    scan.body(render_cfg)
         || hooks.iter().any(|h| match h {
-            HookEntry::Custom { args, .. } => args.iter().any(|a| escapes(a, &named, &rooted)),
-            _ => h
-                .body_cfg()
-                .is_some_and(|b| body_escapes(b, &named, &rooted)),
+            HookEntry::Custom { args, .. } => args.iter().any(|a| scan.expr(a)),
+            _ => h.body_cfg().is_some_and(|b| scan.body(b)),
         })
 }
 

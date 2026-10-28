@@ -13,8 +13,8 @@
 //!   they evaluate to (`write_settles_comparison`), and stay equal when that
 //!   expression holds still across the loop (#209);
 //! - **member** — the guard tests a member of the slot (`s.n`, or a name
-//!   destructured from it), and the literal the write puts at that member
-//!   contradicts it (`write_settles_member`, #244).
+//!   destructured from it), and the literal or allocation the write puts at
+//!   that member contradicts it (`write_settles_member`, #244, #228).
 //!
 //! Two callers feed it different values — the churn graph the reference part
 //! of an effect write, `setter-in-render` the whole value of a render write —
@@ -1270,10 +1270,12 @@ fn value_keys(e: &Expr, cfg: &CFG) -> Vec<String> {
 /// the member, bound to the written literal: the engine's own narrowing,
 /// read on the member instead of the slot.
 ///
-/// Only a literal is read, on either side, so the answer never depends on
-/// which environment a body-local name would be looked up in; a member the
-/// literal does not write, or writes after a spread, proves nothing.
-fn write_settles_member(
+/// Only a literal or an allocation is read, on either side, so the answer
+/// never depends on which environment a body-local name would be looked up
+/// in; a member the literal does not write, or writes after a spread, proves
+/// nothing. The same question kills a ref's lazy init (`if (!ref.current)
+/// ref.current = {}`, #228), the path read off the ref's `current`.
+pub(crate) fn write_settles_member(
     cond: &Expr,
     taken: bool,
     slot_path: &dyn Fn(&Expr) -> Option<Vec<String>>,
@@ -1328,7 +1330,12 @@ fn write_settles_member(
     let Some(at) = written_at(written_expr, &segs) else {
         return false;
     };
-    if !matches!(at, Expr::Lit(_)) {
+    // A function literal is not among them: written whole, it is an updater,
+    // and what it stores is its return.
+    if !matches!(
+        at,
+        Expr::Lit(_) | Expr::ObjectLit { .. } | Expr::ArrayLit { .. } | Expr::New { .. }
+    ) {
         return false;
     }
     let mut env = AbstractEnv::default();

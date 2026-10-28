@@ -490,6 +490,18 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
         // counters, accumulators). Member targets (`obj.f`, `arr[i]`) emit
         // `Stmt::MemberWrite`: the cell is untracked but the *mutation* of the
         // object is an observable fact (state-mutation rule, heap field update).
+        Expression::AssignmentExpression(assign)
+            if assign.operator.is_logical()
+                && matches!(
+                    assign.left,
+                    AssignmentTarget::AssignmentTargetIdentifier(_)
+                        | AssignmentTarget::StaticMemberExpression(_)
+                        | AssignmentTarget::ComputedMemberExpression(_)
+                        | AssignmentTarget::PrivateFieldExpression(_)
+                ) =>
+        {
+            lower_logical_assignment(assign, builder)
+        }
         Expression::AssignmentExpression(assign) => {
             let rhs_val = lower_expr(&assign.right, builder);
             match assign_target_ident(&assign.left) {
@@ -1182,6 +1194,98 @@ fn lower_assignment_maybe_default(
     }
 }
 
+/// `a ??= v`, `a ||= v`, `a &&= v` on a name or a member: a short-circuit
+/// whose right arm evaluates `v` and writes it, the diamond [`lower_logical`]
+/// builds, and the target read back as the value. `ref.current ??= new Map()`
+/// writes only while `ref.current` is nullish, which is what makes it a lazy
+/// init (#228); writing `v` on every path was a write the program does not
+/// make. A member target's object and a computed key are read once: anything
+/// but a call-free path is bound to a temp first.
+fn lower_logical_assignment(assign: &AssignmentExpression, builder: &mut BlockBuilder) -> Expr {
+    let span = builder.span_at(assign.span.start);
+    let once = |e: Expr, builder: &mut BlockBuilder| {
+        if crate::ir::free_vars::call_free_key(&e).is_some() {
+            return e;
+        }
+        let tmp = builder.fresh_temp();
+        builder.push_stmt(Stmt::Let {
+            var: tmp.clone(),
+            rhs: e,
+            span,
+        });
+        Expr::Var(tmp)
+    };
+    let name = assign_target_ident(&assign.left);
+    let member = match name {
+        Some(_) => None,
+        None => assign_target_member(&assign.left, builder).map(|(obj, key)| {
+            let obj = once(obj, builder);
+            let key = match key {
+                MemberKey::Index(i) => MemberKey::Index(once(i, builder)),
+                field => field,
+            };
+            (obj, key)
+        }),
+    };
+    let read = match (&name, &member) {
+        (Some(name), _) => Expr::Var(name.clone()),
+        (None, Some((obj, MemberKey::Field(f)))) => Expr::FieldAccess {
+            obj: Box::new(obj.clone()),
+            field: f.clone(),
+        },
+        (None, Some((obj, MemberKey::Index(i)))) => Expr::IndexAccess {
+            arr: Box::new(obj.clone()),
+            idx: Box::new(i.clone()),
+        },
+        (None, None) => opaque(),
+    };
+    let rhs_id = builder.new_block();
+    let join_id = builder.new_block();
+    let (cond, then_, else_) = match assign.operator.to_logical_operator() {
+        Some(LogicalOperator::And) => (read.clone(), rhs_id, join_id),
+        Some(LogicalOperator::Or) => (read.clone(), join_id, rhs_id),
+        _ => (
+            Expr::BinOp {
+                op: IrBinOp::Eq,
+                lhs: Box::new(read.clone()),
+                rhs: Box::new(Expr::Lit(Prim::Null)),
+            },
+            rhs_id,
+            join_id,
+        ),
+    };
+    let bid = builder.seal_with(Terminator::Branch {
+        cond,
+        then_,
+        else_,
+        span,
+    });
+    builder.add_edge(bid, then_, EdgeKind::IfTrue);
+    builder.add_edge(bid, else_, EdgeKind::IfFalse);
+
+    builder.start_block(rhs_id);
+    let value = lower_expr(&assign.right, builder);
+    builder.push_stmt(match (name, member) {
+        (Some(var), _) => Stmt::Assign {
+            var,
+            rhs: value,
+            span,
+        },
+        (None, Some((obj, key))) => Stmt::MemberWrite {
+            obj,
+            key,
+            rhs: value,
+            span,
+        },
+        (None, None) => Stmt::ExprStmt(value, span),
+    });
+    let r = builder.seal_with(Terminator::Jump(join_id));
+    builder.add_edge(r, join_id, EdgeKind::Unconditional);
+
+    builder.start_block(join_id);
+    read
+}
+
 /// `IrBinOp` for a compound-assignment operator: `x op= e` lowers to
 /// `x = x op e`. Returns `None` for `=` and for the logical compounds
 /// (`&&=`, `||=`, `??=`), which are short-circuits, not binary operators.
@@ -1541,19 +1645,23 @@ mod tests {
     }
 
     #[test]
-    fn exotic_compound_havocs_target() {
-        // `x ||= 3` is a short-circuit, not a binary operator: no IrBinOp is
-        // faithful to it, so the target is havocked to opaque ⊤ — never
-        // silently aliased onto `Add`.
+    fn logical_compound_assignment_writes_on_its_short_circuit_arm() {
+        // `x ||= 3` is a short-circuit, not a binary operator: the write runs
+        // on the falsy arm of a branch on `x`, never on every path, and is
+        // never aliased onto `Add` (#228).
         let cfg = build("function f() { let x = 9; x ||= 3; }");
-        let assigns = entry_assigns(&cfg);
-        let (_, rhs) = assigns
-            .iter()
-            .find(|(v, _)| v == "x")
-            .expect("expected Assign for x");
         assert!(
-            matches!(rhs, Expr::SummaryVal(SummaryValue::Top)),
-            "exotic compound must havoc, got {rhs:?}"
+            entry_assigns(&cfg).iter().all(|(v, _)| v != "x"),
+            "the write is not on every path"
+        );
+        let Terminator::Branch { cond, else_, .. } = &cfg.blocks[&cfg.entry].term else {
+            panic!("expected a branch on `x`");
+        };
+        assert!(matches!(cond, Expr::Var(v) if v == "x"), "{cond:?}");
+        assert!(
+            cfg.blocks[else_].stmts.iter().any(|s| matches!(s,
+                Stmt::Assign { var, rhs: Expr::Lit(Prim::Int(3)), .. } if var == "x")),
+            "the falsy arm writes 3"
         );
     }
 

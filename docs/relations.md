@@ -86,7 +86,9 @@ certain for `NoDeps` (no deps argument) and `FreshDep(i)` (dep `i` is a new
 reference every render, `is_unstable_reference_only`, the fact
 `always-unstable-deps` reports), and possible for `OpaqueDeps` (a deps argument
 that is not a written array, #212) and `MutableDep(i)` (dep `i` reads a ref's
-contents a body can replace or a source the dependence analysis lost, #201;
+contents a body can replace — `ref.current` itself only through a
+reassignment that is no lazy init, #228 — or a source the dependence
+analysis lost, #201;
 or it is a fresh reference not certified fresh at the call — a name bound on
 two paths — or a spread whose source is not a reference only slots move). The churn graph reads `Always` the way it
 reads no deps array, at strength `min(why, must(write))`; for `FreshDep` it

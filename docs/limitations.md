@@ -189,7 +189,9 @@ that writes it (see *Cross-file limits*).
 - **What an effect's deps can move without a slot.** An effect re-runs after every render when it
   has no deps array or a dep that is a new reference every render, and may when its deps argument
   is not a written array or a dep reads a ref's contents some body can replace (#189, #201,
-  #212), a module binding some body of the program writes (`[cache.size]`), or the result of a
+  #212) — for `[ref.current]` itself, compared by identity, only a reassignment of `current`
+  that is no lazy init (`ref.current ??= new Map()`) or a ref handed to other code (#228) — a
+  module binding some body of the program writes (`[cache.size]`), or the result of a
   call not known pure its value does not pin to one value: `[Math.random()]` and `[format(x)]`
   over an import may re-run the effect, a Warning on an effect that writes state, while
   `[JSON.stringify(filters)]` moves with `filters` alone

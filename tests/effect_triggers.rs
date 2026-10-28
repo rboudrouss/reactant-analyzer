@@ -444,6 +444,53 @@ fn a_ref_nothing_writes_keeps_its_primitive_contents() {
 }
 
 #[test]
+fn the_identity_of_a_ref_moves_only_on_a_reassignment_that_is_no_lazy_init() {
+    // `[ref.current]` compares the object itself: a lazy init runs at most
+    // once and an in-place mutation keeps the object (#228). A reassignment
+    // its guard does not kill, a computed key, a mutation of the ref itself,
+    // or a dep reading a member of an object start may move.
+    const CUR: &str = "ref.current";
+    for (uses, dep, moves) in [
+        ("ref.current ??= new Map();", CUR, false),
+        ("if (!ref.current) ref.current = {};", CUR, false),
+        ("if (ref.current == null) ref.current = [];", CUR, false),
+        ("Object.assign(ref.current, { n: 1 });", CUR, false),
+        ("ref.current.n = 1;", CUR, false),
+        ("ref.current = {};", CUR, true),
+        ("if (ref.current) ref.current = {};", CUR, true),
+        ("if (!ref.current) ref.current = make();", CUR, true),
+        ("if (!ref.current) ref.current = 0;", CUR, true),
+        ("ref[k] = {};", CUR, true),
+        ("Object.assign(ref, { current: {} });", CUR, true),
+        ("ref.current ??= new Map();", "ref.current.size", true),
+    ] {
+        let class = if moves {
+            Rerun::Always(Always::MutableDep(0))
+        } else {
+            Rerun::OnSlots
+        };
+        let src = format!(
+            r#"
+            import {{ useState, useEffect, useRef }} from "react";
+            import {{ make, k }} from "ext";
+            export function C() {{
+              const ref = useRef<any>(null);
+              const [t, setT] = useState(false);
+              useEffect(() => {{ {uses} setT(!t); }}, [{dep}]);
+              return <div />;
+            }}
+            "#
+        );
+        let r = parse_and_analyze(&src);
+        assert_eq!(
+            only_effect_class(comp(&r, "C")),
+            class,
+            "`{uses}` under [{dep}]"
+        );
+    }
+}
+
+#[test]
 fn a_dep_holding_one_value_is_no_trigger() {
     // `m` is `3` at every render, whatever `s` does: `Object.is` never fails
     // on it, so the effect writing `s` does not re-run itself.
