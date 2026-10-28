@@ -1711,6 +1711,49 @@ function A() {
 }
 
 #[test]
+fn a_setter_name_a_sync_closure_rebinds_is_no_certain_write() {
+    // The `forEach` callback runs during render and rebinds `set` to the
+    // no-op: `set(1)` writes nothing (#235).
+    let src = r#"
+function A() {
+  const [v, setV] = useState(0);
+  const noop = (_) => {};
+  let set = setV;
+  [1].forEach(() => { set = noop; });
+  set(1);
+  return <div>{v}</div>;
+}
+"#;
+    let diags = diagnostics_sev(src);
+    assert!(
+        diags
+            .iter()
+            .filter(|(r, _, _)| r == "setter-in-render")
+            .all(|(_, s, _)| *s != Severity::Error),
+        "a setter name a closure rebinds is at most a Warning: {diags:?}"
+    );
+}
+
+#[test]
+fn a_setter_alias_bound_once_stays_an_error() {
+    let src = r#"
+function A() {
+  const [v, setV] = useState(0);
+  const set = setV;
+  set(1);
+  return <div>{v}</div>;
+}
+"#;
+    let diags = diagnostics_sev(src);
+    assert!(
+        diags
+            .iter()
+            .any(|(r, s, _)| r == "setter-in-render" && *s == Severity::Error),
+        "a setter alias bound once is a certain write: {diags:?}"
+    );
+}
+
+#[test]
 fn unconditional_render_setter_still_error() {
     let src = r#"
 function A() {

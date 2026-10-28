@@ -79,13 +79,11 @@ impl Rule for SetterInRender {
             return vec![];
         }
 
-        // The convergence proof rebinds a name to the written value, which
-        // claims the name IS the slot: the must-alias, never the may table
-        // (#231).
-        let state_vals = must_state_vals(
-            &comp_result.render_cfg,
-            &must_alias_scopes(&comp_result.render_cfg, &comp_result.hooks),
-        );
+        // The bodies a binder in refuses a render name's must-alias. The
+        // convergence proof rebinds a name to the written value, which claims
+        // the name IS the slot: the must-alias, never the may table (#231).
+        let scopes = must_alias_scopes(&comp_result.render_cfg, &comp_result.hooks);
+        let state_vals = must_state_vals(&comp_result.render_cfg, &scopes);
 
         // Dominance over exits, built once (not per call × exit). A call block
         // dominating every exit ⟹ it runs unconditionally ⟹ the certified Error;
@@ -141,10 +139,15 @@ impl Rule for SetterInRender {
                 // alias table is a may-map (first binding wins), and a name
                 // bound to the setter on one path and to anything else on
                 // another — `if (c) set = setV`, a hook returning `[v, setV]`
-                // or `[v, noop]` — writes on some renders only.
+                // or `[v, noop]`, a closure the render runs that rebinds it
+                // (#235) — writes on some renders only.
                 let certainly_the_setter = !local_setter_info.contains_key(&call.var)
                     || matches!(
-                        crate::ir::bindings::binding_of(&call.var, &comp_result.render_cfg),
+                        crate::ir::bindings::must_binding(
+                            &Expr::Var(call.var.clone()),
+                            &comp_result.render_cfg,
+                            &scopes
+                        ),
                         Some(Expr::StateSetter(_))
                     );
                 let certain_write = call.class == SetterCallPhase::Sync

@@ -137,11 +137,26 @@ pub fn binding_site_of<'c>(var: &str, cfg: &'c CFG) -> Option<(BlockId, &'c Expr
 /// parameter) refuses the certificate, since the name a read there sees may
 /// be another value.
 pub fn must_slot_read(expr: &Expr, scope: &CFG, elsewhere: &[(&[Var], &CFG)]) -> Option<HookLabel> {
+    match must_binding(expr, scope, elsewhere)? {
+        Expr::StateVal(l) => Some(*l),
+        _ => None,
+    }
+}
+
+/// The value `expr` denotes on every path: itself when it is no name, or
+/// the end of the chain of sole bindings in `scope` a name starts, under the
+/// certificate [`must_slot_read`] states — no binder of a chain name in any
+/// body of `elsewhere`. What a name is *certainly* bound to, whatever it is
+/// (a slot's read, a setter: #235).
+pub fn must_binding<'e>(
+    expr: &'e Expr,
+    scope: &'e CFG,
+    elsewhere: &[(&[Var], &CFG)],
+) -> Option<&'e Expr> {
     let mut cur = expr.peel_ts();
     // The name's own binding, then the hops `binding_of` follows.
     for _ in 0..MAX_ALIAS_HOPS + 2 {
         match cur {
-            Expr::StateVal(l) => return Some(*l),
             Expr::Var(v) => {
                 if elsewhere
                     .iter()
@@ -151,7 +166,7 @@ pub fn must_slot_read(expr: &Expr, scope: &CFG, elsewhere: &[(&[Var], &CFG)]) ->
                 }
                 cur = sole_binding_in(v, scope)?.1;
             }
-            _ => return None,
+            other => return Some(other),
         }
     }
     None
