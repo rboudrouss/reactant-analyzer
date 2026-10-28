@@ -45,6 +45,12 @@ pub trait QueryContext {
     fn reducer(&self, _owner: ComponentId, _label: crate::ir::types::HookLabel) -> Option<Reducer> {
         None
     }
+
+    /// Some body of the program fires event listeners itself (`dispatchEvent`,
+    /// `emit`, #219): a listener may then run in the pass that registers it.
+    fn dispatches(&self) -> bool {
+        false
+    }
 }
 
 // ── NullCtx ───────────────────────────────────────────────────────────────────
@@ -300,7 +306,8 @@ impl<'a, D: AbstractDomain> AnalysisCtx<'a, D> {
 // ── FixpointCtx ───────────────────────────────────────────────────────────────
 
 /// What a component's fixpoint knows that a body cannot read off its own
-/// syntax: the `useCallback` bodies and the `useReducer` reducers in reach.
+/// syntax: the `useCallback` bodies and the `useReducer` reducers in reach,
+/// and whether the program dispatches its own events.
 /// Fixed for the whole fixpoint — built once, borrowed by every pass.
 pub struct FixpointCtx<'a> {
     /// `useCallback` body CFGs by hook label (see `QueryContext::callback_body`).
@@ -311,6 +318,8 @@ pub struct FixpointCtx<'a> {
     /// `useReducer` reducers reachable from this component (see
     /// `QueryContext::reducer`).
     pub reducers: &'a Reducers<'a>,
+    /// See `QueryContext::dispatches`.
+    pub dispatches: bool,
 }
 
 impl QueryContext for FixpointCtx<'_> {
@@ -323,5 +332,9 @@ impl QueryContext for FixpointCtx<'_> {
 
     fn reducer(&self, owner: ComponentId, label: crate::ir::types::HookLabel) -> Option<Reducer> {
         self.reducers.get(owner, label)
+    }
+
+    fn dispatches(&self) -> bool {
+        self.dispatches
     }
 }

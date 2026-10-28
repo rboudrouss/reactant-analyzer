@@ -15,7 +15,8 @@ pub enum TriggerClass {
     /// Its closure arguments ARE descended into.
     InCycle,
     /// Event subscription (`addEventListener`/`removeEventListener`) triggered
-    /// externally, NOT part of the render→effect→render cycle. Not descended.
+    /// externally, NOT part of the render→effect→render cycle — unless the
+    /// program dispatches its own events (`classify_callee`). Not descended.
     Subscription,
     /// Unrecognized callee (custom helper/hook). Conservatively NOT descended
     /// (FP-averse: avoids flagging custom subscription wrappers).
@@ -25,7 +26,15 @@ pub enum TriggerClass {
 /// Classify a call's callee to decide whether its closure arguments run as a
 /// consequence of the current render/effect (and so must be descended into for
 /// their side effects).
-pub fn classify_callee<D: AbstractDomain>(fn_: &Expr, env: &AbstractEnv<D>) -> TriggerClass {
+///
+/// `dispatches`: some body of the program fires event listeners itself
+/// (#219). A listener `addEventListener` registers may then run in the pass
+/// that registers it, as a timer callback may, so it is in-cycle (#250).
+pub fn classify_callee<D: AbstractDomain>(
+    fn_: &Expr,
+    env: &AbstractEnv<D>,
+    dispatches: bool,
+) -> TriggerClass {
     match fn_ {
         Expr::Var(name) => {
             if env.setter_labels(name).is_some() {
@@ -48,6 +57,7 @@ pub fn classify_callee<D: AbstractDomain>(fn_: &Expr, env: &AbstractEnv<D>) -> T
             // synchronously. Receiver-restricted — a bare `.from` on an
             // unknown object could be anything.
             "from" if matches!(obj.as_ref(), Expr::Var(v) if v == "Array") => TriggerClass::InCycle,
+            "addEventListener" if dispatches => TriggerClass::InCycle,
             "addEventListener" | "removeEventListener" => TriggerClass::Subscription,
             _ => TriggerClass::Unknown,
         },
@@ -84,7 +94,7 @@ mod tests {
             "reduceRight",
         ] {
             assert_eq!(
-                classify_callee(&method("arr", f), &env()),
+                classify_callee(&method("arr", f), &env(), false),
                 TriggerClass::InCycle,
                 "{f} must be in-cycle"
             );
@@ -94,11 +104,11 @@ mod tests {
     #[test]
     fn string_replacer_callbacks_are_in_cycle() {
         assert_eq!(
-            classify_callee(&method("s", "replace"), &env()),
+            classify_callee(&method("s", "replace"), &env(), false),
             TriggerClass::InCycle
         );
         assert_eq!(
-            classify_callee(&method("s", "replaceAll"), &env()),
+            classify_callee(&method("s", "replaceAll"), &env(), false),
             TriggerClass::InCycle
         );
     }
@@ -106,13 +116,13 @@ mod tests {
     #[test]
     fn array_from_is_receiver_restricted() {
         assert_eq!(
-            classify_callee(&method("Array", "from"), &env()),
+            classify_callee(&method("Array", "from"), &env(), false),
             TriggerClass::InCycle
         );
         // `.from` on an unknown receiver could be anything (e.g. a query
         // builder) — stays Unknown, FP-averse.
         assert_eq!(
-            classify_callee(&method("router", "from"), &env()),
+            classify_callee(&method("router", "from"), &env(), false),
             TriggerClass::Unknown
         );
     }
@@ -120,12 +130,26 @@ mod tests {
     #[test]
     fn subscriptions_and_unknowns_unchanged() {
         assert_eq!(
-            classify_callee(&method("el", "addEventListener"), &env()),
+            classify_callee(&method("el", "addEventListener"), &env(), false),
             TriggerClass::Subscription
         );
         assert_eq!(
-            classify_callee(&method("api", "subscribe"), &env()),
+            classify_callee(&method("api", "subscribe"), &env(), false),
             TriggerClass::Unknown
+        );
+    }
+
+    #[test]
+    fn a_listener_is_in_cycle_where_the_program_dispatches_events() {
+        // #250: a dispatch may run the listener in the registering pass. A
+        // teardown takes it back and runs nothing.
+        assert_eq!(
+            classify_callee(&method("el", "addEventListener"), &env(), true),
+            TriggerClass::InCycle
+        );
+        assert_eq!(
+            classify_callee(&method("el", "removeEventListener"), &env(), true),
+            TriggerClass::Subscription
         );
     }
 }

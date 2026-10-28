@@ -716,7 +716,7 @@ fn exec_callbacks_depth<T: Transfer>(
     }
     match expr {
         Expr::Call { fn_, args } => {
-            let class = classify_callee(fn_, env);
+            let class = classify_callee(fn_, env, ctx.query.dispatches());
             // Descend the receiver: handles chains like `a.then(x).then(y)`.
             exec_callbacks_depth(transfer, fn_, env, ctx, depth);
             for arg in args {

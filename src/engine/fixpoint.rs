@@ -374,9 +374,16 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     // body is an effect's, whose returned cleanup React calls too (#171);
     // what the fixpoint knows beyond the body's syntax (callback bodies,
     // reducers) and how loops widen are the same for all of them.
+    // A listener may run synchronously wherever the program dispatches
+    // events (#219): this component's own bodies, inlined hooks and utilities
+    // included, or any other body of the program. Every pass then runs a
+    // registered listener where it is registered (#250).
+    let dispatches = program.dispatches
+        || crate::engine::registrations::body_dispatches_events(&render_cfg, &hooks);
     let query = FixpointCtx {
         callbacks: &callback_bodies,
         reducers: &reducers,
+        dispatches,
     };
     let widening = crate::domains::Widening {
         after: config.widen_threshold,
@@ -699,11 +706,6 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         effect_exits: &effect_block_states,
         handler_exits: &handler_block_states,
     };
-    // A listener may run synchronously wherever the program dispatches
-    // events (#219): this component's own bodies, inlined hooks and utilities
-    // included, or any other body of the program.
-    let dispatches = program.dispatches
-        || crate::engine::registrations::body_dispatches_events(&render_cfg, &hooks);
     let slot_writers = crate::engine::setters::collect_slot_writers(
         &render_cfg,
         render_params,

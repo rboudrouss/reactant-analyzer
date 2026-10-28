@@ -323,6 +323,49 @@ fn a_listener_the_effect_dispatches_to_runs_in_the_effect() {
 }
 
 #[test]
+fn a_listener_the_program_fires_runs_in_the_slot_fixpoint() {
+    // #250: the listener is passed by name, so no handler entry runs it. In
+    // a program that dispatches, the pass that registers it runs it: the slot
+    // moves with its write, and `v + 1` is no single value stored once.
+    use reactant::engine::Change;
+    let src = r#"
+        import { useState, useEffect } from "react";
+        export function C() {
+            const [v, setV] = useState(0);
+            useEffect(() => {
+                const h = () => { setV(v + 1); };
+                window.addEventListener("ping", h);
+                window.dispatchEvent(new Event("ping"));
+                return () => window.removeEventListener("ping", h);
+            });
+            return <div>{v}</div>;
+        }
+    "#;
+    let changes = |src: &str| -> Vec<Change> {
+        let r = analyze(src);
+        r.components[&r.component_named("C").unwrap()]
+            .slot_writers
+            .iter()
+            .filter(|w| reactant::ir::source_name(&w.setter) == "setV")
+            .map(|w| w.written.change)
+            .collect()
+    };
+    assert_eq!(
+        changes(src),
+        vec![Change::May],
+        "the listener's write moves `v`"
+    );
+    assert!(infinite_loop_hits(src) > 0, "React loops on this program");
+    let quiet = src.replace("window.dispatchEvent(new Event(\"ping\"));", "");
+    assert_eq!(
+        effect_phases(&analyze(&quiet), "C", "setV"),
+        vec![reactant::engine::WriterPhase::Handler],
+        "no dispatch: the listener needs a user event"
+    );
+    assert_eq!(infinite_loop_hits(&quiet), 0, "no dispatch: no loop");
+}
+
+#[test]
 fn a_dispatch_anywhere_in_the_program_makes_every_listener_top() {
     use reactant::engine::WriterPhase;
     let listener = r#"

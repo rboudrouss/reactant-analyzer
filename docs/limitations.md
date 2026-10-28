@@ -285,7 +285,10 @@ carries an Error.
 - **One `dispatchEvent` anywhere makes every `addEventListener` listener ⊤.** A listener is
   event-only (no churn edge) only while no body of the program calls `dispatchEvent` (or `emit`
   on a receiver): a dispatch runs the listeners before it returns, and which listener it reaches
-  is a question of event names and targets the analysis does not resolve (#219). A dispatch
+  is a question of event names and targets the analysis does not resolve (#219). In such a
+  program the fixpoint runs every listener where it is registered, as it runs a timer callback, so
+  the slot a listener writes moves with its writes, a listener passed by name included
+  [#250](https://github.com/rboudrouss/reactant-analyzer/issues/250). A dispatch
   hidden in an opaque callee is not seen. A JSX handler (`onClick`) stays event-only even then,
   though dispatching on a DOM node React manages would run it synchronously too.
 - **`frozen-initial-state`** still fires on a child remounted by machinery it cannot see: a dialog
