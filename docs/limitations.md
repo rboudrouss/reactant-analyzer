@@ -122,10 +122,11 @@ that writes it (see *Cross-file limits*).
   its cached value. React documents the cache as a performance hint, not a guarantee: a React that
   dropped it would recompute a fresh value the proof reads as held
   [#188](https://github.com/rboudrouss/reactant-analyzer/issues/188).
-- A child's mount-only effect is read as firing once when the parent renders the child on every
-  path, or behind guards that hold still, without a `key` that moves. A child rendered from a
-  `.map` callback or reached through an intermediate component is read as remounting, the
-  fail-closed side [#162](https://github.com/rboudrouss/reactant-analyzer/issues/162).
+- A child's mount-only effect is read as firing once when every element that mounts it sits
+  outside closures, on every path or behind guards that hold still, without a `key` that moves,
+  and its parent stays mounted in turn ([#213](https://github.com/rboudrouss/reactant-analyzer/issues/213)).
+  A child rendered from a `.map` callback (any closure) is read as remounting, the fail-closed
+  side [#162](https://github.com/rboudrouss/reactant-analyzer/issues/162).
 - `x.slice()` and `x.concat()` are proven fresh only when `x` can only be an object: on a string they
   return a primitive, so a receiver of unknown kind (a prop, a nullable value) leaves the result
   unknown [#22](https://github.com/rboudrouss/reactant-analyzer/issues/22).

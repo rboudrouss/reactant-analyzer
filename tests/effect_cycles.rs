@@ -1049,6 +1049,35 @@ export function Parent({ ready }: { ready: boolean }) {
 }
 
 #[test]
+fn a_mount_effect_of_a_child_kept_through_an_intermediate_fires_once() {
+    // `Mid` mounts `Child` on every path and is itself mounted on every path:
+    // `stays` holds up the tree (#213), so the foreign `[]` row is not a site
+    // and the refill settles (oracle case `kept-child-mount-effect-fires-once`).
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Child({ onReady }: { onReady: (v: boolean) => void }) {
+  useEffect(() => { onReady(false); }, []);
+  return null;
+}
+function Mid({ onReady }: { onReady: (v: boolean) => void }) {
+  return <Child onReady={onReady} />;
+}
+export function App() {
+  const [s, setS] = useState(true);
+  useEffect(() => { if (!s) setS(true); }, [s]);
+  return <Mid onReady={setS} />;
+}
+"#;
+    let diags = infinite_loop_diags(src, "App");
+    assert!(
+        diags
+            .iter()
+            .all(|(rule, sev, _)| rule != "infinite-loop" || *sev == Severity::Info),
+        "a child every ancestor keeps mounted fires its `[]` effect once: {diags:?}"
+    );
+}
+
+#[test]
 fn a_child_keyed_by_the_slot_remounts_with_it() {
     // Mounted on every path, but its `key` reads the slot: React remounts
     // it on every write, and its `[]` effect fires again each time.
