@@ -311,26 +311,47 @@ struct Target {
 ///
 /// Used by cross-component rules to find props that are parent setters.
 ///
-/// **Blocks are visited in `CFG::blocks` order, not `block_states` order.**
-/// The first env that resolves a var decides its row, and `block_states` is a
-/// `HashMap` — reading it directly made the answer depend on Rust's per-process
-/// hash seed whenever two blocks disagreed (#120). Program order is the one
-/// stable order available here. Which block *should* win is a separate
-/// question, filed as #119.
+/// No block wins: a name's row is every setter some block exit binds it to
+/// (the may side), and a setter is a `must_write` only when every exit
+/// binding the name to anything but ⊥ surely writes it (the must side, #233).
+/// A member path is visited once per object its root may point to, so
+/// `t[1]` of `c ? [v, setV] : [v, noop]` is the setter at one visit and a
+/// closure at the other — a possible write, never a certain one. Blocks are
+/// visited in `CFG::blocks` order, so the rows are deterministic (#120).
 pub(crate) fn collect_component_setter_vars(
     cfg: &CFG,
     block_states: &HashMap<BlockId, AbstractEnv<StateValue>>,
     heap: &Heap,
 ) -> HashMap<Var, Vec<SetterProp>> {
     let mut result: HashMap<Var, Vec<SetterProp>> = HashMap::new();
+    let mut unsure: HashSet<Var> = HashSet::new();
     for_each_converged_path(cfg, block_states, heap, |name, ev| {
-        if !result.contains_key(name) {
-            let props = setter_of(ev, heap);
-            if !props.is_empty() {
-                result.insert(name.clone(), props);
+        let props = setter_of(ev, heap);
+        if props.is_empty() {
+            if !ev.as_val().is_bottom_value() {
+                unsure.insert(name.clone());
+            }
+            return;
+        }
+        let row = result.entry(name.clone()).or_default();
+        for p in props {
+            match row
+                .iter_mut()
+                .find(|q| (q.component, q.label, q.closure) == (p.component, p.label, p.closure))
+            {
+                Some(q) => q.must_write &= p.must_write,
+                None => row.push(p),
             }
         }
     });
+    for (name, row) in &mut result {
+        row.sort_by_key(|p| (p.component, p.label, p.closure));
+        if row.len() > 1 || unsure.contains(name) {
+            for p in row.iter_mut() {
+                p.must_write = false;
+            }
+        }
+    }
     result
 }
 

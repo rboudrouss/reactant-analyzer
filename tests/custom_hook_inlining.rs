@@ -947,3 +947,40 @@ fn a_setter_read_off_a_hook_value_called_in_render_is_setter_in_render() {
         assert!(fires(&found, "setter-in-render"), "{decl}: {found:?}");
     }
 }
+
+#[test]
+fn a_member_that_is_the_setter_on_one_path_only_is_no_certain_write() {
+    // #233: `t[1]` is the setter at one block exit and a no-op at another;
+    // the table is the meet of every exit, so the render call is a Warning.
+    for src in [
+        r#"
+        function useThing(c) {
+            const [v, setV] = useState(0);
+            return c ? [v, setV] : [v, (x) => {}];
+        }
+        function App({ c }) {
+            const t = useThing(c);
+            t[1](1);
+            return <div>{t[0]}</div>;
+        }
+        "#,
+        r#"
+        function App({ c }) {
+            const [v, setV] = useState(0);
+            let t = [v, (x) => {}];
+            if (c) t = [v, setV];
+            t[1](1);
+            return <div>{t[0]}</div>;
+        }
+        "#,
+    ] {
+        let found = rules_for(src, "App");
+        assert!(fires(&found, "setter-in-render"), "{found:?}");
+        assert!(
+            found
+                .iter()
+                .all(|(_, s)| *s != reactant::rules::Severity::Error),
+            "{found:?}"
+        );
+    }
+}
