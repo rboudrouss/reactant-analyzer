@@ -1,6 +1,6 @@
 {
-  "total": 2270,
-  "digest": "54c906374bf34919307d86eb0fb3df3a174f34a8f371eb7860b2a764ef8321bb",
+  "total": 2273,
+  "digest": "1610abc46f47d3d316b37ed14ddfeb5a02cae73562997f66a854507e2c35193f",
   "by_rule": {
     "always-unstable-deps": 601,
     "conditional-hook": 10,
@@ -12,7 +12,7 @@
     "missing-cleanup": 3,
     "missing-deps": 463,
     "redundant-set-state": 6,
-    "setter-in-render": 27,
+    "setter-in-render": 30,
     "stale-closure": 1,
     "state-lifted-too-high": 95,
     "state-mutation": 15,
@@ -25,7 +25,7 @@
     "bulletproof-react": 3,
     "chakra-ui": 31,
     "commerce": 5,
-    "dub": 682,
+    "dub": 683,
     "excalidraw": 39,
     "mantine": 434,
     "memos": 88,
@@ -33,7 +33,7 @@
     "novel": 6,
     "precedent": 1,
     "shadcn-admin": 20,
-    "twenty": 918,
+    "twenty": 920,
     "zustand": 4
   },
   "corpus": "00e5fa79fa000c85"
