@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::Arc,
+};
 
 use crate::{
     domains::{AbstractDomain, impls::StateValue},
@@ -22,6 +25,10 @@ pub enum HeapValue {
         body_cfg: Arc<CFG>,
         /// Free variables captured from the enclosing scope when this function was created.
         captured: HashMap<Symbol, StateValue>,
+        /// The allocation sites the captured names pointed to at creation: a
+        /// closure the body calls through one runs wherever the closure is
+        /// called, out of the body that created it too (#254).
+        captured_locs: HashMap<Symbol, Sites>,
         /// The component whose scope the closure was created in. A call in
         /// that same component reads a captured variable as it is at the
         /// call too: JavaScript closures capture variables, not values, so an
@@ -153,8 +160,17 @@ impl Members {
 
 /// Abstract heap: maps allocation-site `ExprId`s to `HeapValue`s.
 /// Populated by `eval_expr` for `FnLit`/`ObjectLit`/`ArrayLit` nodes.
+///
+/// `escaped` are the sites code the analysis does not see holds a reference
+/// to (#254): an argument of a callee it does not run, a hook's argument, a
+/// member written into an object it does not place, what such a closure
+/// returns. That code may call every closure they reach, at any time —
+/// [`Heap::escaped_fns`].
 #[derive(Debug, Clone, Default)]
-pub struct Heap(HashMap<ExprId, HeapValue>);
+pub struct Heap {
+    cells: HashMap<ExprId, HeapValue>,
+    escaped: BTreeSet<ExprId>,
+}
 
 impl Heap {
     pub fn new() -> Self {
@@ -162,7 +178,28 @@ impl Heap {
     }
 
     pub fn insert(&mut self, id: ExprId, val: HeapValue) {
-        self.0.insert(id, val);
+        self.cells.insert(id, val);
+    }
+
+    /// Code the analysis does not see now holds `sites`.
+    pub fn escape(&mut self, sites: &Sites) {
+        self.escaped.extend(sites.ids.iter().copied());
+    }
+
+    /// The closures an escaped site reaches, through the members of the
+    /// objects on the way, in site order. Read when they are run, not when
+    /// they escape: a member written after the object escaped is reachable
+    /// too.
+    pub fn escaped_fns(&self) -> Vec<ExprId> {
+        let reached = self.reachable(self.escaped.iter().copied());
+        let mut fns: Vec<ExprId> = reached
+            .cells
+            .iter()
+            .filter(|(_, hv)| matches!(hv, HeapValue::Fn { .. }))
+            .map(|(id, _)| *id)
+            .collect();
+        fns.sort();
+        fns
     }
 
     /// Allocate a `HeapValue::Fn` at site `id`, snapshotting the closure's
@@ -183,6 +220,13 @@ impl Heap {
             .iter()
             .filter_map(|v| env.lookup(v).as_state_value().map(|sv| (v.clone(), sv)))
             .collect();
+        let captured_locs = free
+            .iter()
+            .filter_map(|v| {
+                let sites = env.lookup_env_val(v)?.sites()?.clone();
+                Some((v.clone(), sites))
+            })
+            .collect();
         let captured_slots = free
             .iter()
             .filter_map(|v| env.slot_label(v).map(|l| (v.clone(), l)))
@@ -193,6 +237,7 @@ impl Heap {
                 params: params.to_vec(),
                 body_cfg: Arc::clone(body_cfg),
                 captured,
+                captured_locs,
                 owner,
                 captured_slots,
             },
@@ -200,7 +245,7 @@ impl Heap {
     }
 
     pub fn get(&self, id: ExprId) -> Option<&HeapValue> {
-        self.0.get(&id)
+        self.cells.get(&id)
     }
 
     /// What `member` of a value pointing to `sites` may be: the entry of each
@@ -232,21 +277,27 @@ impl Heap {
     }
 
     /// The part of the heap reachable from `roots`: every location a member
-    /// of a reachable object points to, transitively. What a child receives
-    /// with its props — a closure inside an object prop
-    /// (`api={{ tick: cb }}`) is as callable as one passed directly (#216).
+    /// of a reachable object or a capture of a reachable closure points to,
+    /// transitively. What a child receives with its props — a closure inside
+    /// an object prop (`api={{ tick: cb }}`) is as callable as one passed
+    /// directly (#216), and so is one a closure prop calls (#254).
     pub fn reachable(&self, roots: impl IntoIterator<Item = ExprId>) -> Heap {
         let mut out = Heap::new();
         let mut stack: Vec<ExprId> = roots.into_iter().collect();
         while let Some(id) = stack.pop() {
-            if out.0.contains_key(&id) {
+            if out.cells.contains_key(&id) {
                 continue;
             }
             let Some(hv) = self.get(id) else {
                 continue;
             };
-            if let HeapValue::Obj(obj) = hv {
-                stack.extend(obj.values().filter_map(EnvVal::locs).flatten().copied());
+            match hv {
+                HeapValue::Obj(obj) => {
+                    stack.extend(obj.values().filter_map(EnvVal::locs).flatten().copied());
+                }
+                HeapValue::Fn { captured_locs, .. } => {
+                    stack.extend(captured_locs.values().flat_map(|s| s.ids.iter().copied()));
+                }
             }
             out.insert(id, hv.clone());
         }
@@ -254,20 +305,21 @@ impl Heap {
     }
 
     pub fn get_mut(&mut self, id: ExprId) -> Option<&mut HeapValue> {
-        self.0.get_mut(&id)
+        self.cells.get_mut(&id)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&ExprId, &HeapValue)> {
-        self.0.iter()
+        self.cells.iter()
     }
 
     /// Pointwise join: union of keys, join values at shared keys.
     /// `Fn` entries join their captured env (body CFG is structural: same site → same body);
     /// `Obj` entries join member by member — one literal evaluated in two
-    /// envs (two call sites of a child, #175) is either object.
+    /// envs (two call sites of a child, #175) is either object. A site that
+    /// escaped in either heap has escaped.
     pub fn join(&self, other: &Self) -> Self {
-        let mut result = self.0.clone();
-        for (id, val) in &other.0 {
+        let mut result = self.cells.clone();
+        for (id, val) in &other.cells {
             match result.get(id) {
                 None => {
                     result.insert(*id, val.clone());
@@ -276,11 +328,13 @@ impl Heap {
                     params,
                     body_cfg,
                     captured: cap_self,
+                    captured_locs: locs_self,
                     owner,
                     captured_slots: slots_self,
                 }) => {
                     if let HeapValue::Fn {
                         captured: cap_other,
+                        captured_locs: locs_other,
                         captured_slots: slots_other,
                         ..
                     } = val
@@ -290,6 +344,14 @@ impl Heap {
                             let cur = map_get_or(&joined_cap, k, StateValue::bottom);
                             joined_cap.insert(k.clone(), cur.join(v));
                         }
+                        let joined_locs = locs_self
+                            .keys()
+                            .chain(locs_other.keys())
+                            .filter_map(|k| {
+                                let s = Sites::join_opt(locs_self.get(k), locs_other.get(k))?;
+                                Some((k.clone(), s))
+                            })
+                            .collect();
                         // A certificate survives only where both agree.
                         let joined_slots = slots_self
                             .iter()
@@ -302,6 +364,7 @@ impl Heap {
                                 params: params.clone(),
                                 body_cfg: Arc::clone(body_cfg),
                                 captured: joined_cap,
+                                captured_locs: joined_locs,
                                 owner: *owner,
                                 captured_slots: joined_slots,
                             },
@@ -315,7 +378,10 @@ impl Heap {
                 }
             }
         }
-        Heap(result)
+        Heap {
+            cells: result,
+            escaped: self.escaped.union(&other.escaped).copied().collect(),
+        }
     }
 
     /// Widening: same as join (heap entries are structurally fixed at
@@ -325,18 +391,37 @@ impl Heap {
     }
 
     /// `self ⊑ other`: every entry of `self` is in `other`, a closure's
-    /// captures and an object's members each below the other's.
+    /// captures and an object's members each below the other's, and every
+    /// escaped site of `self` escaped in `other`.
     pub fn leq(&self, other: &Self) -> bool {
-        self.0.iter().all(|(id, hv)| match (hv, other.0.get(id)) {
-            (HeapValue::Fn { captured: a, .. }, Some(HeapValue::Fn { captured: b, .. })) => {
-                a.iter().all(|(k, v)| {
-                    let w = map_get_or(b, k, StateValue::bottom);
-                    v.join(&w) == w
+        self.escaped.is_subset(&other.escaped)
+            && self
+                .cells
+                .iter()
+                .all(|(id, hv)| match (hv, other.cells.get(id)) {
+                    (
+                        HeapValue::Fn {
+                            captured: a,
+                            captured_locs: la,
+                            ..
+                        },
+                        Some(HeapValue::Fn {
+                            captured: b,
+                            captured_locs: lb,
+                            ..
+                        }),
+                    ) => {
+                        a.iter().all(|(k, v)| {
+                            let w = map_get_or(b, k, StateValue::bottom);
+                            v.join(&w) == w
+                        }) && la.iter().all(|(k, s)| {
+                            lb.get(k)
+                                .is_some_and(|t| s.ids.is_subset(&t.ids) && (!s.open || t.open))
+                        })
+                    }
+                    (HeapValue::Obj(a), Some(HeapValue::Obj(b))) => a.leq(b),
+                    _ => false,
                 })
-            }
-            (HeapValue::Obj(a), Some(HeapValue::Obj(b))) => a.leq(b),
-            _ => false,
-        })
     }
 }
 

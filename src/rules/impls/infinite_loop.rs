@@ -1266,8 +1266,11 @@ mod tests {
     }
 
     #[test]
-    fn unknown_callee_setter_does_not_loop() {
-        // useEffect(() => { myHelper(() => setN(n + 1)) }) unknown callee not descended
+    fn unknown_callee_setter_may_loop() {
+        // useEffect(() => { myHelper(() => setN(n + 1)) }): the closure
+        // escapes into the unknown callee and runs with the handlers (#254).
+        // Its write moves `n` but is no in-cycle growth; `myHelper` may call
+        // it at once, so the loop is possible: a Warning.
         let call = Expr::Call {
             fn_: Box::new(Expr::Var("myHelper".to_string())),
             args: vec![incrementing_setter_cb("setN")],
@@ -1282,10 +1285,10 @@ mod tests {
             },
         );
         assert!(!result.widen_trace.contains_key(&0));
+        let diags = InfiniteLoop.check(&RuleCtx::new(&prog("C", &result), crate::test_support::C));
         assert!(
-            InfiniteLoop
-                .check(&RuleCtx::new(&prog("C", &result), crate::test_support::C))
-                .is_empty()
+            !diags.is_empty() && diags.iter().all(|d| d.severity() == Severity::Warning),
+            "{diags:?}"
         );
     }
 

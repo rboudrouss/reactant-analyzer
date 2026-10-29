@@ -53,6 +53,13 @@ pub trait QueryContext {
     fn dispatches(&self) -> bool {
         false
     }
+
+    /// The arguments of the custom hook `label` when the fixpoint did not
+    /// inline it: its call hands them to code the analysis does not see
+    /// (#254).
+    fn hook_args(&self, _label: crate::ir::types::HookLabel) -> &[crate::ir::expr::Expr] {
+        &[]
+    }
 }
 
 // ── NullCtx ───────────────────────────────────────────────────────────────────
@@ -316,7 +323,8 @@ impl<'a, D: AbstractDomain> AnalysisCtx<'a, D> {
 
 /// What a component's fixpoint knows that a body cannot read off its own
 /// syntax: the `useCallback` bodies and the `useReducer` reducers in reach,
-/// and whether the program dispatches its own events.
+/// whether the program dispatches its own events, and the arguments of the
+/// hooks it did not inline.
 /// Fixed for the whole fixpoint — built once, borrowed by every pass.
 pub struct FixpointCtx<'a> {
     /// `useCallback` body CFGs by hook label (see `QueryContext::callback_body`).
@@ -329,6 +337,9 @@ pub struct FixpointCtx<'a> {
     pub reducers: &'a Reducers<'a>,
     /// See `QueryContext::dispatches`.
     pub dispatches: bool,
+    /// See `QueryContext::hook_args`.
+    pub hook_args:
+        &'a std::collections::HashMap<crate::ir::types::HookLabel, Vec<crate::ir::expr::Expr>>,
 }
 
 impl QueryContext for FixpointCtx<'_> {
@@ -345,5 +356,9 @@ impl QueryContext for FixpointCtx<'_> {
 
     fn dispatches(&self) -> bool {
         self.dispatches
+    }
+
+    fn hook_args(&self, label: crate::ir::types::HookLabel) -> &[crate::ir::expr::Expr] {
+        self.hook_args.get(&label).map_or(&[], Vec::as_slice)
     }
 }

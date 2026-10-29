@@ -53,9 +53,16 @@ that writes it (see *Cross-file limits*).
 
 ## What reactant may miss (false negatives)
 
-- Hooks and callees it cannot reach: npm-package callees and utilities cut off by the inlining depth
-  [#19](https://github.com/rboudrouss/reactant-analyzer/issues/19), silently: `pkgFn(() => setN(n + 1))` in an effect gets no
-  analysis-limit, and `infinite-loop` is reported verified; utility *inlining* is statement-position only [#52](https://github.com/rboudrouss/reactant-analyzer/issues/52). A setter
+- Hooks and callees it cannot reach. A function handed to code the analysis does not see — an
+  npm-package callee (`pkgFn(() => setN(1))`, `new IntersectionObserver(cb)`), a hook it does not
+  inline (`useTable({ onClick })`), React through an element's `on*` or `ref`, an object the heap
+  does not place (`ref.current = cb`), what such a function returns, a callback past the inlining
+  depth, and every `useCallback` body, whose value the heap does not follow — runs with the
+  handlers, at an unknown time [#254](https://github.com/rboudrouss/reactant-analyzer/issues/254):
+  its writes reach the state store as possible writes, never as writes of the body that handed it
+  over. So a loop it closes in an effect is claimed only through the slot values it moves, as a
+  Warning, and its writes can mask the in-cycle growth a widening claim reads, as a handler's do
+  [#19](https://github.com/rboudrouss/reactant-analyzer/issues/19). Utility *inlining* is statement-position only [#52](https://github.com/rboudrouss/reactant-analyzer/issues/52). A setter
   or a closure called through a call that returns it (`get()(x)`, `makeSetter()(x)`,
   `api.get()(x)`) is written where the call's value is read: off the converged envs of the render,
   an effect or a handler [#46](https://github.com/rboudrouss/reactant-analyzer/issues/46), and off a

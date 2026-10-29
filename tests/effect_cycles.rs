@@ -2473,3 +2473,58 @@ fn a_member_a_spread_of_a_known_object_overrides_is_gone() {
     let sevs = loop_severities(&member_callee_src(decl, "api.inc();"), "C");
     assert!(sevs.is_empty(), "{sevs:?}");
 }
+
+// ── #254: a write in a closure the passes never run moves its slot ──────────
+
+/// `runNow` and `useRun` are code the analysis does not see; the closure
+/// handed to each writes `k = 1`, so `setN(n + k)` grows `n` on every render.
+/// The write's timing is unknown, so the slot only *may* be 1: a Warning.
+/// While the write was lost, `k` stayed 0 and `setN(n + k)` read as a no-op.
+#[test]
+fn a_write_in_an_escaped_closure_feeds_the_loop() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+import { runNow, useRun } from 'ext';
+export function Callee() {
+  const [k, setK] = useState(0);
+  const [n, setN] = useState(0);
+  useEffect(() => { runNow(() => setK(1)); }, []);
+  useEffect(() => { setN(n + k); });
+  return <div>{n}</div>;
+}
+export function HookArg() {
+  const [k, setK] = useState(0);
+  const [n, setN] = useState(0);
+  useRun({ onRow: () => setK(1) });
+  useEffect(() => { setN(n + k); });
+  return <div>{n}</div>;
+}
+"#;
+    for c in ["Callee", "HookArg"] {
+        let diags = infinite_loop_diags(src, c);
+        assert!(
+            diags.iter().any(|(_, s, _)| *s == Severity::Warning)
+                && !diags.iter().any(|(_, s, _)| *s == Severity::Error),
+            "{c}: {diags:?}"
+        );
+    }
+}
+
+/// The negative: the escaped closure writes the value the slot holds, so
+/// `setN(n + k)` stays the bail-out `setN(n)`.
+#[test]
+fn an_escaped_closure_writing_the_held_value_feeds_nothing() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+import { runNow } from 'ext';
+export function App() {
+  const [k, setK] = useState(0);
+  const [n, setN] = useState(0);
+  useEffect(() => { runNow(() => setK(0)); }, []);
+  useEffect(() => { setN(n + k); });
+  return <div>{n}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "App");
+    assert!(diags.is_empty(), "{diags:?}");
+}

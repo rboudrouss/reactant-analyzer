@@ -380,11 +380,32 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     // registered listener where it is registered (#250).
     let dispatches = program.dispatches
         || crate::engine::registrations::body_dispatches_events(&render_cfg, &hooks);
+    // The hooks expansion left: their arguments escape at their call (#254).
+    let hook_args: HashMap<HookLabel, Vec<Expr>> = hooks
+        .iter()
+        .filter_map(|h| match h {
+            HookEntry::Custom { label, args, .. } => Some((*label, args.clone())),
+            _ => None,
+        })
+        .collect();
     let query = FixpointCtx {
         callbacks: &callback_bodies,
         reducers: &reducers,
         dispatches,
+        hook_args: &hook_args,
     };
+    // A `useCallback` value is a function the heap does not place — its body
+    // lives in the hook entry — so where it goes is not followed: its body
+    // may run wherever an escaped closure may (#254).
+    let escaped_bodies: Vec<(&[Var], &CFG)> = hooks
+        .iter()
+        .filter_map(|h| match h {
+            HookEntry::Callback {
+                params, body_cfg, ..
+            } => Some((params.as_slice(), body_cfg)),
+            _ => None,
+        })
+        .collect();
     let widening = crate::domains::Widening {
         after: config.widen_threshold,
         thresholds: &thresholds,
@@ -580,6 +601,26 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 handler_block_states.insert(*label, h_bs);
                 state_from_handlers = state_from_handlers.join(&h_state);
             }
+        }
+        // The functions code the analysis does not see may call — handed to
+        // a callee or a hook it does not run, to React through an element,
+        // stored where the heap does not follow — run as handlers do, from
+        // the render's exit env (#254). Every pass above has run, so every
+        // closure this iteration let escape runs in it.
+        {
+            let mut out = state_store.clone();
+            let mut ac = AnalysisCtx {
+                component: comp_id,
+                state: &mut out,
+                memo: &memo_store,
+                start: Some(&state_store),
+                heap: &mut heap,
+                query: &query,
+                inter,
+                widening,
+            };
+            crate::domains::interp::run_escaped(transfer, &escaped_bodies, &env_exit, &mut ac);
+            state_from_handlers = state_from_handlers.join(&out);
         }
 
         // ── Convergence check ─────────────────────────────────────────────────

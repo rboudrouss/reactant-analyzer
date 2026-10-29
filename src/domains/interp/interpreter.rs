@@ -372,6 +372,15 @@ fn exec_stmt_core<T: Transfer>(
         // join, never replace.
         Stmt::MemberWrite { obj, key, rhs, .. } => {
             let rhs_sites = alloc_literal(transfer, rhs, env, ctx);
+            // An object the heap does not place (`ref.current = cb`, a
+            // parameter's member) is one code the analysis does not see may
+            // read: what is written there escapes (#254).
+            let placed = resolve_locs(obj, env, ctx.heap);
+            if placed.as_ref().is_none_or(|s| s.open)
+                && let Some(sites) = &rhs_sites
+            {
+                ctx.heap.escape(sites);
+            }
             let val = transfer.eval_expr(rhs, env, ctx);
             let Some(sv) = val.as_state_value() else {
                 return;
@@ -384,10 +393,7 @@ fn exec_stmt_core<T: Transfer>(
                 MemberKey::Field(field) => Some(field.clone()),
                 MemberKey::Index(idx) => member_key(idx, env),
             };
-            for id in resolve_locs(obj, env, ctx.heap)
-                .map(|s| s.ids)
-                .unwrap_or_default()
-            {
+            for id in placed.map(|s| s.ids).unwrap_or_default() {
                 if let Some(HeapValue::Obj(obj)) = ctx.heap.get_mut(id) {
                     match &member {
                         Some(m) => {
@@ -795,29 +801,24 @@ fn exec_callbacks_depth<T: Transfer>(
             let class = classify_callee(fn_, env, ctx.query.dispatches());
             // Descend the receiver: handles chains like `a.then(x).then(y)`.
             exec_callbacks_depth(transfer, fn_, env, ctx, depth);
+            let runs_args = class == TriggerClass::InCycle && !capped;
             for arg in args {
-                match arg {
-                    Expr::FnLit {
-                        params, body_cfg, ..
-                    } if class == TriggerClass::InCycle && !capped => {
-                        let mut sub_env = env.clone();
-                        for p in params {
-                            sub_env.extend(p.clone(), T::Domain::top());
-                        }
-                        let _ = exec_body_depth(transfer, body_cfg, &sub_env, ctx, depth + 1);
-                    }
-                    // Setter/Subscription/Unknown inline closures not descended:
-                    // a setter's updater runs in the slot write below.
-                    Expr::FnLit { .. } => {}
-                    other => {
-                        exec_callbacks_depth(transfer, other, env, ctx, depth);
-                        // B5: a callback passed by name or member chain
-                        // (`setTimeout(tick)`, `setTimeout(api.tick)`) runs
-                        // the heap closures it resolves to.
-                        if class == TriggerClass::InCycle && !capped {
-                            exec_fn_value(transfer, other, env, ctx, depth);
-                        }
-                    }
+                if !matches!(arg, Expr::FnLit { .. }) {
+                    exec_callbacks_depth(transfer, arg, env, ctx, depth);
+                }
+                // An in-cycle callback runs here — inline, or by name or
+                // member chain (B5: `setTimeout(tick)`, `setTimeout(api.tick)`)
+                // through the heap closures it resolves to — and what it
+                // returns goes back to the callee. Any other argument —
+                // of a setter, whose updater also runs in the slot write
+                // below, of a subscription, of an unknown callee, or past
+                // the inlining budget — is handed to code the analysis does
+                // not run (#254).
+                if runs_args {
+                    let returned = exec_fn_value(transfer, arg, env, ctx, depth);
+                    escape_returned(returned.as_ref(), ctx);
+                } else {
+                    escape(transfer, arg, env, ctx);
                 }
             }
             if let Some(receiver) = crate::ir::expr::mutation_receiver(expr) {
@@ -825,10 +826,16 @@ fn exec_callbacks_depth<T: Transfer>(
             }
             // B6: direct local call inlining — an Unknown callee that resolves
             // to a heap Fn, or a literal called where it is written (#186).
-            // External/imported functions have no Loc → skipped (no FP).
+            // External/imported functions have no Loc → skipped (no FP). Past
+            // the budget, the callee is not run here: it escapes, and runs
+            // from the top of the budget with the handlers (#254).
             let mut returned = None;
-            if class == TriggerClass::Unknown && !capped {
-                returned = exec_fn_value(transfer, fn_, env, ctx, depth);
+            if class == TriggerClass::Unknown {
+                if capped {
+                    escape(transfer, fn_, env, ctx);
+                } else {
+                    returned = exec_fn_value(transfer, fn_, env, ctx, depth);
+                }
             }
             // Arguments first, then the call itself.
             exec_slot_write(transfer, fn_, args, env, ctx, depth);
@@ -843,6 +850,41 @@ fn exec_callbacks_depth<T: Transfer>(
             None
         }
         Expr::TSAnnotated(inner) => exec_callbacks_depth(transfer, inner, env, ctx, depth),
+        // `new X(…)` hands its arguments to a constructor the analysis does
+        // not run — an observer's callback, a promise executor (#254).
+        Expr::New { args, .. } => {
+            expr.for_each_child(&mut |c| {
+                exec_callbacks_depth(transfer, c, env, ctx, depth);
+            });
+            for arg in args {
+                escape(transfer, arg, env, ctx);
+            }
+            None
+        }
+        // A hook the fixpoint did not inline receives its arguments at its
+        // call (#254).
+        Expr::HookMarker(label, _) => {
+            let query = ctx.query;
+            for arg in query.hook_args(*label) {
+                escape(transfer, arg, env, ctx);
+            }
+            None
+        }
+        // A native element hands React the props it invokes (`on*`, `ref`).
+        // A child component receives its props through its own analysis.
+        Expr::NativeElem { props, .. } => {
+            expr.for_each_child(&mut |c| {
+                exec_callbacks_depth(transfer, c, env, ctx, depth);
+            });
+            if let Expr::ObjectLit { fields, .. } = props.peel_ts() {
+                for (name, val) in fields {
+                    if crate::lowering::hook_extractor::invoked_prop(true, name) {
+                        escape(transfer, val, env, ctx);
+                    }
+                }
+            }
+            None
+        }
         // Bare FnLit outside a call: never runs by itself — not descended.
         // Everything else: generic child descent.
         other => {
@@ -850,6 +892,68 @@ fn exec_callbacks_depth<T: Transfer>(
                 exec_callbacks_depth(transfer, c, env, ctx, depth);
             });
             None
+        }
+    }
+}
+
+/// Code the analysis does not see receives the value of `expr` (#254): a
+/// callee it does not run, a hook it does not inline, React for an element's
+/// handler, an object it does not place. Every closure the value reaches may
+/// be called there, at any time; [`run_escaped`] runs them.
+fn escape<T: Transfer>(
+    transfer: &T,
+    expr: &Expr,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+) {
+    if let Some(sites) = alloc_literal(transfer, expr, env, ctx) {
+        ctx.heap.escape(&sites);
+    }
+}
+
+/// What a body returns to code the analysis does not see escapes with it.
+fn escape_returned<D: AbstractDomain>(returned: Option<&EnvVal<D>>, ctx: &mut AnalysisCtx<D>) {
+    if let Some(sites) = returned.and_then(EnvVal::sites) {
+        ctx.heap.escape(sites);
+    }
+}
+
+/// Run, for their effects, the functions code the analysis does not see may
+/// call (#254): every closure an escaped site reaches, and `bodies`, functions
+/// whose identity the heap does not follow. They run as a handler does (ADR-009)
+/// — at no time the analysis knows, from `env`, every parameter ⊤ — and what
+/// each returns goes back to that code, so it escapes in turn: the worklist
+/// runs until no new closure escapes.
+pub(crate) fn run_escaped<T: Transfer>(
+    transfer: &T,
+    bodies: &[(&[Symbol], &CFG)],
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+) {
+    for (params, body) in bodies {
+        let mut sub_env = env.clone();
+        for p in *params {
+            sub_env.extend(p.clone(), T::Domain::top());
+        }
+        let run = run_cfg(transfer, body, sub_env, ctx, 1);
+        if let Some(sites) = returned_sites(transfer, body, &run.exits, ctx) {
+            ctx.heap.escape(&sites);
+        }
+    }
+    let mut ran = HashSet::new();
+    loop {
+        let pending: Vec<_> = ctx
+            .heap
+            .escaped_fns()
+            .into_iter()
+            .filter(|id| ran.insert(*id))
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        for id in pending {
+            let returned = exec_heap_fns(transfer, Sites::closed([id]), env, ctx, 0);
+            escape_returned(returned.as_ref(), ctx);
         }
     }
 }
@@ -937,6 +1041,7 @@ fn exec_heap_fns<T: Transfer>(
             params,
             body_cfg,
             captured,
+            captured_locs,
             owner,
             captured_slots,
         }) = ctx.heap.get(id)
@@ -944,6 +1049,7 @@ fn exec_heap_fns<T: Transfer>(
             let params = params.clone();
             let body_cfg = Arc::clone(body_cfg);
             let captured = captured.clone();
+            let captured_locs = captured_locs.clone();
             let captured_slots = captured_slots.clone();
             // A closure captures variables (#215): called in the component
             // that created it, a captured name is also what it holds at the
@@ -961,9 +1067,14 @@ fn exec_heap_fns<T: Transfer>(
             let mut sub_env = env.clone();
             for (var, val) in captured {
                 let mut val = T::Domain::from_state_value(val);
+                let mut sites = captured_locs.get(&var).cloned();
                 if live.contains(&var) {
                     val = val.join(&env.lookup(&var));
+                    let at_call = env.lookup_env_val(&var);
+                    sites =
+                        Sites::join_opt(sites.as_ref(), at_call.as_ref().and_then(EnvVal::sites));
                 }
+                sub_env.bind_locs(var.clone(), sites);
                 sub_env.extend(var, val);
             }
             // The creation-time certificates, not the call site's: the
