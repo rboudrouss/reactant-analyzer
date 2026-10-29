@@ -524,6 +524,37 @@ export function PastTheBudget() {
     assert_eq!(result.components[&id].state_store.get(0), StateValue::top());
 }
 
+/// #253: a closure reached through an array's entries or through a local
+/// function's parameter runs where the effect runs it — an effect write, not
+/// an escaped one — and so it drives the slot's widening.
+#[test]
+fn a_closure_passed_through_an_array_or_a_parameter_is_an_effect_write() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function Named() {
+  const [n, setN] = useState(0);
+  const fs = [() => setN(n + 1)];
+  useEffect(() => { fs.forEach((f) => f()); });
+  return <div>{n}</div>;
+}
+export function Param() {
+  const [n, setN] = useState(0);
+  const f = (g: () => void) => g();
+  useEffect(() => { f(() => setN(n + 1)); });
+  return <div>{n}</div>;
+}
+"#;
+    let result = analyze(src);
+    for c in ["Named", "Param"] {
+        let comp = &result.components[&result.component_named(c).unwrap()];
+        assert!(
+            !comp.effect_setter_writes.get(0).is_bottom(),
+            "{c}: no effect write"
+        );
+        assert!(comp.widen_trace.contains_key(&0), "{c}: `n` did not widen");
+    }
+}
+
 /// What an escaped closure writes is what the slot gets, nothing more: a
 /// write of the value the slot holds leaves it exact.
 #[test]

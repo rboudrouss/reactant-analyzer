@@ -971,3 +971,38 @@ fn a_name_bound_in_a_closure_under_a_memo_or_a_callback_is_read_off_its_run() {
         assert_eq!(rows[0].owner, None, "{decl}");
     }
 }
+
+/// #253: an array method's callback receives the array's entries, so a call
+/// of its parameter runs the closures the array holds — a row of the effect,
+/// unplaced: which entry a call runs is not one closure for sure.
+#[test]
+fn a_callback_parameter_is_an_entry_of_the_array_it_iterates() {
+    let r = parse_and_analyze(
+        r#"
+        import { useState, useEffect } from "react";
+        export function Named() {
+          const [n, setN] = useState(0);
+          const fs = [() => setN(n + 1)];
+          useEffect(() => { fs.forEach((f) => f()); });
+          return <div>{n}</div>;
+        }
+        export function Literal() {
+          const [n, setN] = useState(0);
+          useEffect(() => { [() => setN(n + 1)].forEach((f) => f()); });
+          return <div>{n}</div>;
+        }
+        export function Reduced() {
+          const [n, setN] = useState(0);
+          const fs = [() => setN(n + 1)];
+          useEffect(() => { fs.reduce((acc, f) => { f(); return acc; }, 0); });
+          return <div>{n}</div>;
+        }
+        "#,
+    );
+    for name in ["Named", "Literal", "Reduced"] {
+        let c = comp(&r, name);
+        let rows = effect_rows(c, "setN");
+        assert!(!rows.is_empty(), "{name}: {:?}", c.slot_writers);
+        assert!(rows.iter().all(|w| w.block.is_none()), "{name}: {rows:?}");
+    }
+}

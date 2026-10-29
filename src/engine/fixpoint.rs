@@ -436,7 +436,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                     if let Terminator::Return(ret) = &block.term
                         && let Some(env) = envs.get(bid)
                     {
-                        let _ = exec_fn_value(transfer, ret, env, &mut ac, 0);
+                        let _ = exec_fn_value(transfer, ret, &[], env, &mut ac, 0);
                     }
                 }
             }

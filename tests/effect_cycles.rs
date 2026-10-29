@@ -2528,3 +2528,63 @@ export function App() {
     let diags = infinite_loop_diags(src, "App");
     assert!(diags.is_empty(), "{diags:?}");
 }
+
+// ── #253: a closure reached through a local array or a local higher-order fn ─
+
+/// The closure runs in the effect, every run: through the array's entries an
+/// array method passes its callback, or through the parameter a local
+/// function is called with. Neither call is surely of that one closure, so
+/// the loop is a Warning; so is its conditional twin.
+#[test]
+fn a_closure_run_through_an_array_or_a_parameter_feeds_the_loop() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function Named() {
+  const [n, setN] = useState(0);
+  const fs = [() => setN(n + 1)];
+  useEffect(() => { fs.forEach((f) => f()); });
+  return <div>{n}</div>;
+}
+export function Literal() {
+  const [n, setN] = useState(0);
+  useEffect(() => { [() => setN(n + 1)].forEach((f) => f()); });
+  return <div>{n}</div>;
+}
+export function Param() {
+  const [n, setN] = useState(0);
+  const f = (g: () => void) => g();
+  useEffect(() => { f(() => setN(n + 1)); });
+  return <div>{n}</div>;
+}
+export function Guarded({ on }: { on: boolean }) {
+  const [n, setN] = useState(0);
+  const fs = [() => setN(n + 1)];
+  useEffect(() => { if (on) fs.forEach((f) => f()); });
+  return <div>{n}</div>;
+}
+"#;
+    for c in ["Named", "Literal", "Param", "Guarded"] {
+        let diags = infinite_loop_diags(src, c);
+        assert!(
+            diags.iter().any(|(_, s, _)| *s == Severity::Warning)
+                && !diags.iter().any(|(_, s, _)| *s == Severity::Error),
+            "{c}: {diags:?}"
+        );
+    }
+}
+
+/// The negative: the closures the array holds write a constant.
+#[test]
+fn an_array_of_settling_closures_feeds_nothing() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function App() {
+  const [n, setN] = useState(0);
+  const fs = [() => setN(0)];
+  useEffect(() => { fs.forEach((f) => f()); });
+  return <div>{n}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "App");
+    assert!(diags.is_empty(), "{diags:?}");
+}

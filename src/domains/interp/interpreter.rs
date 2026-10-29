@@ -802,39 +802,52 @@ fn exec_callbacks_depth<T: Transfer>(
             // Descend the receiver: handles chains like `a.then(x).then(y)`.
             exec_callbacks_depth(transfer, fn_, env, ctx, depth);
             let runs_args = class == TriggerClass::InCycle && !capped;
-            for arg in args {
+            let binds_args = class == TriggerClass::Unknown && !capped;
+            // What a local callee's parameters are bound to (#253).
+            let mut passed: Vec<EnvVal<T::Domain>> = Vec::new();
+            for (i, arg) in args.iter().enumerate() {
                 if !matches!(arg, Expr::FnLit { .. }) {
                     exec_callbacks_depth(transfer, arg, env, ctx, depth);
                 }
                 // An in-cycle callback runs here — inline, or by name or
                 // member chain (B5: `setTimeout(tick)`, `setTimeout(api.tick)`)
-                // through the heap closures it resolves to — and what it
-                // returns goes back to the callee. Any other argument —
-                // of a setter, whose updater also runs in the slot write
-                // below, of a subscription, of an unknown callee, or past
-                // the inlining budget — is handed to code the analysis does
-                // not run (#254).
+                // through the heap closures it resolves to — with what the
+                // callee passes it, and what it returns goes back to the
+                // callee. Any other argument — of a setter, whose updater
+                // also runs in the slot write below, of a subscription, of an
+                // unknown callee, or past the inlining budget — is handed to
+                // code the analysis does not run (#254). So is one a local
+                // function receives as a parameter below: the lowering drops
+                // a spread argument, so the position it binds is not sure.
                 if runs_args {
-                    let returned = exec_fn_value(transfer, arg, env, ctx, depth);
+                    let given = callback_args(transfer, fn_, i, env, ctx);
+                    let returned = exec_fn_value(transfer, arg, &given, env, ctx, depth);
                     escape_returned(returned.as_ref(), ctx);
                 } else {
-                    escape(transfer, arg, env, ctx);
+                    let sites = alloc_literal(transfer, arg, env, ctx);
+                    if let Some(sites) = &sites {
+                        ctx.heap.escape(sites);
+                    }
+                    if binds_args {
+                        passed.push(EnvVal::located(sites, transfer.eval_expr(arg, env, ctx)));
+                    }
                 }
             }
             if let Some(receiver) = crate::ir::expr::mutation_receiver(expr) {
                 havoc_members(transfer, receiver, args, env, ctx);
             }
             // B6: direct local call inlining — an Unknown callee that resolves
-            // to a heap Fn, or a literal called where it is written (#186).
-            // External/imported functions have no Loc → skipped (no FP). Past
-            // the budget, the callee is not run here: it escapes, and runs
-            // from the top of the budget with the handlers (#254).
+            // to a heap Fn, or a literal called where it is written (#186),
+            // its parameters bound to the arguments (#253). External/imported
+            // functions have no Loc → skipped (no FP). Past the budget, the
+            // callee is not run here: it escapes, and runs from the top of
+            // the budget with the handlers (#254).
             let mut returned = None;
             if class == TriggerClass::Unknown {
                 if capped {
                     escape(transfer, fn_, env, ctx);
                 } else {
-                    returned = exec_fn_value(transfer, fn_, env, ctx, depth);
+                    returned = exec_fn_value(transfer, fn_, &passed, env, ctx, depth);
                 }
             }
             // Arguments first, then the call itself.
@@ -932,9 +945,7 @@ pub(crate) fn run_escaped<T: Transfer>(
 ) {
     for (params, body) in bodies {
         let mut sub_env = env.clone();
-        for p in *params {
-            sub_env.extend(p.clone(), T::Domain::top());
-        }
+        bind_params(&mut sub_env, params, &[]);
         let run = run_cfg(transfer, body, sub_env, ctx, 1);
         if let Some(sites) = returned_sites(transfer, body, &run.exits, ctx) {
             ctx.heap.escape(&sites);
@@ -952,9 +963,83 @@ pub(crate) fn run_escaped<T: Transfer>(
             return;
         }
         for id in pending {
-            let returned = exec_heap_fns(transfer, Sites::closed([id]), env, ctx, 0);
+            let returned = exec_heap_fns(transfer, Sites::closed([id]), &[], env, ctx, 0);
             escape_returned(returned.as_ref(), ctx);
         }
+    }
+}
+
+/// Bind `params` in `env` to what a call passes them (#253): the argument at
+/// each position — its value and the sites it points to, so a closure passed
+/// in is the one a call of the parameter runs — and ⊤ past the arguments
+/// given. A parameter shadows a name of the enclosing scope, sites included.
+pub(crate) fn bind_params<D: AbstractDomain>(
+    env: &mut AbstractEnv<D>,
+    params: &[Symbol],
+    args: &[EnvVal<D>],
+) {
+    for (i, p) in params.iter().enumerate() {
+        let (sites, val) = match args.get(i) {
+            Some(arg) => (arg.sites().cloned(), arg.as_val()),
+            None => (None, D::top()),
+        };
+        env.bind_locs(p.clone(), sites);
+        env.extend(p.clone(), val);
+    }
+}
+
+/// What an in-cycle callee passes its function argument at `index` (#253).
+/// An array method's callback receives the receiver's entries: the join of
+/// the entries of every array the heap places the receiver at, ⊤ joined in
+/// where it may be anything else — at position 0, at position 1 for
+/// `reduce`'s accumulator-first callback, at both for `sort`'s comparator.
+/// Every other position, and every other callee's callback, gets ⊤.
+pub(crate) fn callback_args<T: Transfer>(
+    transfer: &T,
+    callee: &Expr,
+    index: usize,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+) -> Vec<EnvVal<T::Domain>> {
+    let Expr::FieldAccess { obj, field } = callee.peel_ts() else {
+        return Vec::new();
+    };
+    if index != 0 || !crate::engine::setters::SYNC_HOF_METHODS.contains(&field.as_str()) {
+        return Vec::new();
+    }
+    let top = EnvVal::Val(StateValue::top());
+    let entry = match alloc_literal(transfer, obj, env, ctx) {
+        Some(sites) => {
+            let mut ids: Vec<_> = sites.ids.iter().copied().collect();
+            ids.sort();
+            let mut entry: Option<EnvVal<StateValue>> = sites.open.then(|| top.clone());
+            for id in ids {
+                let members: Vec<EnvVal<StateValue>> = match ctx.heap.get(id) {
+                    Some(HeapValue::Obj(o)) if o.open => {
+                        o.values().cloned().chain([top.clone()]).collect()
+                    }
+                    Some(HeapValue::Obj(o)) => o.values().cloned().collect(),
+                    _ => vec![top.clone()],
+                };
+                for m in members {
+                    entry = Some(entry.map_or_else(|| m.clone(), |e| e.join(&m)));
+                }
+            }
+            // No entry: the callback never runs, and its parameter holds
+            // nothing.
+            entry.unwrap_or_else(|| EnvVal::Val(StateValue::bottom()))
+        }
+        None => top,
+    };
+    let entry = EnvVal::located(
+        entry.sites().cloned(),
+        T::Domain::from_state_value(entry.as_val()),
+    );
+    let any = EnvVal::Val(T::Domain::top());
+    match field.as_str() {
+        "reduce" | "reduceRight" => vec![any, entry],
+        "sort" => vec![entry.clone(), entry],
+        _ => vec![entry],
     }
 }
 
@@ -962,12 +1047,14 @@ pub(crate) fn run_escaped<T: Transfer>(
 /// directly (an IIFE, `(() => setN(1))()`, #186), a name or a member chain
 /// (`api.tick()`, `t[1]()`, #216) through the heap closures it resolves to
 /// ([`exec_heap_fns`]), a `useCallback` name through its hook body.
-/// Parameters are ⊤. Also how an effect's returned cleanup runs, which React
-/// calls (#171). Returns what the call returns, with the allocation sites
-/// its returns place (#46); `None` when no body ran whole.
+/// Parameters are bound to `args` ([`bind_params`]). Also how an effect's
+/// returned cleanup runs, which React calls (#171). Returns what the call
+/// returns, with the allocation sites its returns place (#46); `None` when no
+/// body ran whole.
 pub(crate) fn exec_fn_value<T: Transfer>(
     transfer: &T,
     callee: &Expr,
+    args: &[EnvVal<T::Domain>],
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
@@ -977,9 +1064,7 @@ pub(crate) fn exec_fn_value<T: Transfer>(
             params, body_cfg, ..
         } => {
             let mut sub_env = env.clone();
-            for p in params {
-                sub_env.extend(p.clone(), T::Domain::top());
-            }
+            bind_params(&mut sub_env, params, args);
             let run = run_cfg(transfer, body_cfg, sub_env, ctx, depth + 1);
             let sites = returned_sites(transfer, body_cfg, &run.exits, ctx);
             Some(run.ret)
@@ -988,7 +1073,7 @@ pub(crate) fn exec_fn_value<T: Transfer>(
         }
         other => {
             if let Some(sites) = resolve_locs(other, env, ctx.heap) {
-                return exec_heap_fns(transfer, sites, env, ctx, depth);
+                return exec_heap_fns(transfer, sites, args, env, ctx, depth);
             }
             // useCallback binding: the body lives in the hook entry, not the
             // heap (the rewrite to `CallbackVal` moved it out of the
@@ -1027,6 +1112,7 @@ pub(crate) fn exec_fn_value<T: Transfer>(
 fn exec_heap_fns<T: Transfer>(
     transfer: &T,
     sites: Sites,
+    args: &[EnvVal<T::Domain>],
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
@@ -1085,9 +1171,7 @@ fn exec_heap_fns<T: Transfer>(
                     sub_env.bind_slot(var, label);
                 }
             }
-            for p in &params {
-                sub_env.extend(p.clone(), T::Domain::top());
-            }
+            bind_params(&mut sub_env, &params, args);
             let run = run_cfg(transfer, &body_cfg, sub_env, ctx, depth + 1);
             let sites = returned_sites(transfer, &body_cfg, &run.exits, ctx);
             placed = Some(match placed {

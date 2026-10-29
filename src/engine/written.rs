@@ -20,8 +20,8 @@ use std::collections::HashMap;
 use crate::{
     domains::{
         AbstractDomain, AnalysisCtx, Stability, StateValue, StateValueTransfer, Transfer,
-        interp::{entry_env_of, exit_env_of, run_cfg},
-        stores::{AbstractEnv, Heap, MemoStore, StateStore},
+        interp::{bind_params, callback_args, entry_env_of, exit_env_of, run_cfg},
+        stores::{AbstractEnv, EnvVal, Heap, MemoStore, StateStore},
     },
     engine::{
         Reducer,
@@ -413,12 +413,12 @@ impl SiteEnvs<'_> {
                         }
                     }
                     HookEntry::Memo { body_cfg, .. } => {
-                        run_literal(&mut ac, body_cfg, &[], self.exit.clone(), &mut out);
+                        run_literal(&mut ac, body_cfg, &[], &[], self.exit.clone(), &mut out);
                     }
                     HookEntry::Callback {
                         body_cfg, params, ..
                     } => {
-                        run_literal(&mut ac, body_cfg, params, self.exit.clone(), &mut out);
+                        run_literal(&mut ac, body_cfg, params, &[], self.exit.clone(), &mut out);
                     }
                     _ => {}
                 }
@@ -447,15 +447,22 @@ fn reach_literals<'c>(
     exits: &HashMap<BlockId, AbstractEnv<StateValue>>,
     out: &mut Vec<ClosureEnv<'c>>,
 ) {
-    fn literals<'c>(e: &'c Expr, out: &mut Vec<(&'c [Var], &'c CFG)>) {
-        if let Expr::FnLit {
-            params, body_cfg, ..
-        } = e
-        {
-            out.push((params, body_cfg));
-            return;
+    // Each literal with the call and position it is an argument at, if any:
+    // an in-cycle callee passes it arguments (#253).
+    type Literal<'c> = (&'c [Var], &'c CFG, Option<(&'c Expr, usize)>);
+    fn literals<'c>(e: &'c Expr, at: Option<(&'c Expr, usize)>, out: &mut Vec<Literal<'c>>) {
+        match e {
+            Expr::FnLit {
+                params, body_cfg, ..
+            } => out.push((params, body_cfg, at)),
+            Expr::Call { fn_, args } => {
+                literals(fn_, None, out);
+                for (i, a) in args.iter().enumerate() {
+                    literals(a, Some((&**fn_, i)), out);
+                }
+            }
+            _ => e.for_each_child(&mut |c| literals(c, None, out)),
         }
-        e.for_each_child(&mut |c| literals(c, out));
     }
     let after = exit_env_of(body, exits);
     let reached = |env: &AbstractEnv<StateValue>| match &after {
@@ -467,18 +474,18 @@ fn reach_literals<'c>(
             continue;
         }
         // The literals of each statement, the terminator's last.
-        let mut at: Vec<Vec<(&'c [Var], &'c CFG)>> = block
+        let mut at: Vec<Vec<Literal<'c>>> = block
             .stmts
             .iter()
             .map(|s| {
                 let mut lits = Vec::new();
-                s.for_each_expr(&mut |e| literals(e, &mut lits));
+                s.for_each_expr(&mut |e| literals(e, None, &mut lits));
                 lits
             })
             .collect();
         let mut term = Vec::new();
         if let Terminator::Return(e) | Terminator::Branch { cond: e, .. } = &block.term {
-            literals(e, &mut term);
+            literals(e, None, &mut term);
         }
         at.push(term);
         let Some(last) = at.iter().rposition(|lits| !lits.is_empty()) else {
@@ -486,8 +493,12 @@ fn reach_literals<'c>(
         };
         let mut env = entry_env_of(body, bid, entry, exits);
         for (i, lits) in at.iter().enumerate().take(last + 1) {
-            for &(params, lit) in lits {
-                run_literal(ac, lit, params, reached(&env), out);
+            for &(params, lit, call) in lits {
+                let env = reached(&env);
+                let args = call.map_or_else(Vec::new, |(callee, index)| {
+                    callback_args(&StateValueTransfer, callee, index, &env, ac)
+                });
+                run_literal(ac, lit, params, &args, env, out);
             }
             if let Some(stmt) = block.stmts.get(i).filter(|_| i < last) {
                 StateValueTransfer.exec_stmt(stmt, &mut env, ac);
@@ -496,17 +507,17 @@ fn reach_literals<'c>(
     }
 }
 
-/// Run one body from `env`, its parameters ⊤, then the literals it holds.
+/// Run one body from `env`, its parameters bound to `args` and ⊤ past them,
+/// then the literals it holds.
 fn run_literal<'c>(
     ac: &mut AnalysisCtx<'_, StateValue>,
     body: &'c CFG,
     params: &'c [Var],
+    args: &[EnvVal<StateValue>],
     mut env: AbstractEnv<StateValue>,
     out: &mut Vec<ClosureEnv<'c>>,
 ) {
-    for p in params {
-        env.extend(p.clone(), StateValue::top());
-    }
+    bind_params(&mut env, params, args);
     let exits = run_cfg(&StateValueTransfer, body, env.clone(), ac, 0).exits;
     reach_literals(ac, body, &env, &exits, out);
     out.push(ClosureEnv {

@@ -62,7 +62,13 @@ that writes it (see *Cross-file limits*).
   its writes reach the state store as possible writes, never as writes of the body that handed it
   over. So a loop it closes in an effect is claimed only through the slot values it moves, as a
   Warning, and its writes can mask the in-cycle growth a widening claim reads, as a handler's do
-  [#19](https://github.com/rboudrouss/reactant-analyzer/issues/19). Utility *inlining* is statement-position only [#52](https://github.com/rboudrouss/reactant-analyzer/issues/52). A setter
+  [#19](https://github.com/rboudrouss/reactant-analyzer/issues/19). A closure reached through a
+  local function's parameter (`const f = (g) => g(); f(() => setN(1))`) or an array method's
+  callback parameter (`fs.forEach((f) => f())`, the parameter being the array's entries) runs
+  where it is called [#253](https://github.com/rboudrouss/reactant-analyzer/issues/253), a possible
+  write: the call is not proven to be of that one closure. In render, `setter-in-render` does
+  not read the callback parameter, so `[() => setN(1)].forEach((f) => f())` there is not its
+  finding. Utility *inlining* is statement-position only [#52](https://github.com/rboudrouss/reactant-analyzer/issues/52). A setter
   or a closure called through a call that returns it (`get()(x)`, `makeSetter()(x)`,
   `api.get()(x)`) is written where the call's value is read: off the converged envs of the render,
   an effect or a handler [#46](https://github.com/rboudrouss/reactant-analyzer/issues/46), and off a
@@ -154,8 +160,11 @@ that writes it (see *Cross-file limits*).
   read or a destructuring, when its value is one string (`const { [k]: v } = o`); in an object
   literal it may be any member. Not modeled: an array entry past a spread (its index is ⊤), a
   spread argument `f(...args)`, kept for its reads, so a setter forwarded through
-  `f(...handlers)` is not seen, and a parameter's default as the parameter's value outside a
-  spliced hook [#76](https://github.com/rboudrouss/reactant-analyzer/issues/76).
+  `f(...handlers)` is not seen, nor do the closures it holds escape, and a parameter's default as
+  the parameter's value outside a spliced hook [#76](https://github.com/rboudrouss/reactant-analyzer/issues/76).
+  Because the call keeps no trace of the spread, the arguments after it may sit at other
+  positions: a local function's parameters are bound to its arguments (#253), and the arguments
+  still run with the handlers.
 - A destructuring default (`const { f = g } = o`) runs when the member is `undefined`, so its
   reads and writes are seen, but its value is not stored: `f` reads as `o.f`, and a closure the
   default supplies is not called through `f`
