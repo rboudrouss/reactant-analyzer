@@ -256,7 +256,9 @@ mount-only effect's row that writes its own component's slot, or another's
 from a component that stays: those fire once per instance (#162, a new
 instance is the mount edge's). A name the site's body binds reads ⊤ in the
 render exit env the proof starts from, since the render may bind it to
-something else. What the graph does not see is recorded, not guessed: a
+something else. A guard on a member of the slot also dies under every
+in-place write into the slot's object, in any body of the component, handlers
+included (`MemberWrites`, #252). What the graph does not see is recorded, not guessed: a
 prop-mediated edge needs the parent in the component tree (an element whose
 origin resolves, #20), and a slot with a site in another component is never
 killed, since that site's guards live in bodies this component's env cannot

@@ -96,8 +96,9 @@ use crate::{
         SlotWriter, WriterPhase, WriterRegion,
         dominance::on_all_paths,
         guards::{
-            Invariance, SlotPath, WriteSite, call_may_differ, converges_under_all_writes,
-            let_bindings, must_slot_paths, mutated_roots, navigates, site_guards,
+            Invariance, MemberWrites, SlotPath, WriteSite, call_may_differ,
+            converges_under_all_writes, let_bindings, must_slot_paths, mutated_roots, navigates,
+            site_guards,
         },
         render_deps::written_names,
         setters::{
@@ -333,6 +334,8 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         /// slot's read (`guards::must_slot_paths`, #244): what the
         /// convergence proof reads a guard's names through.
         slot_paths: HashMap<Var, SlotPath>,
+        /// The member writes into each slot's object, in any body (#252).
+        members: MemberWrites<'a>,
         memo_vals: HashMap<Var, HookLabel>,
         memo_deps: HashMap<HookLabel, &'a [Expr]>,
         render_lets: HashMap<&'a str, Option<&'a Expr>>,
@@ -445,6 +448,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 state_vals,
                 must_state_vals,
                 slot_paths,
+                members: MemberWrites::of(comp_result),
                 memo_vals: resolve_setter_aliases(cfg, &memo_val_labels(cfg)),
                 memo_deps: comp_result
                     .hooks
@@ -840,6 +844,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     peers[k].value,
                     &foreign,
                     &ctx.slot_paths,
+                    &ctx.members,
                     &invariance,
                     ctx.props_hold,
                     &ctx.exit,
@@ -971,6 +976,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     &own_value,
                     &foreign,
                     &ctx.slot_paths,
+                    &ctx.members,
                     &invariance,
                     ctx.props_hold,
                     &ctx.exit,

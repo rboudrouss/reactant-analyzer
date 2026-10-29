@@ -117,6 +117,7 @@ impl SetterInRender {
             &scopes,
             &must_state_vals(&comp_result.render_cfg, &scopes),
         );
+        let members = crate::engine::guards::MemberWrites::of(comp_result);
 
         // A closure the converged values put behind a called path
         // (`api.inc()`) runs at the call: its writes are render writes there.
@@ -217,6 +218,7 @@ impl SetterInRender {
                     &comp_result.render_cfg,
                     bid,
                     &state_vals,
+                    &members,
                     label,
                     &eval_in_exit_env(arg, comp_result),
                     Some(arg),

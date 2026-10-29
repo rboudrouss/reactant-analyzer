@@ -274,8 +274,13 @@ carries an Error.
 - **The churn graph is slot-granular where a program is member-granular.** The self-churn arm reads
   the member (`[data.name]` is not re-triggered by `setData(prev => ({...prev, slug}))`, and a guard
   on a member, `!sheet.leadId`, `s.n === 0` or a `const { n } = s`, is answered by the literal the
-  write puts there; a written value that is no object literal answers nothing), but the multi-effect graph
-  cannot: whether effect A's write into `y` changes a dep of effect B is a property of an edge
+  write puts there, joined with what every in-place write into the slot's object stores at it —
+  `s.ok = false` in any body of the component, through an alias, an updater's parameter or a
+  mutating call; a written value that is no object literal answers nothing). An in-place write
+  through a name the component's bindings do not tie to the slot (a callback's parameter, a
+  child's prop, a call's result) is not seen, the escaped alias of
+  [#23](https://github.com/rboudrouss/reactant-analyzer/issues/23) ([#252](https://github.com/rboudrouss/reactant-analyzer/issues/252)). The multi-effect graph
+  cannot read the member: whether effect A's write into `y` changes a dep of effect B is a property of an edge
   *pair*, not of an edge. A direct spread, `setData({...data, slug})`, is likewise unproved, since
   `data` is the value captured at that render rather than the current one
   [precision-log](precision-log.md#2026-09-03-a-member-is-not-the-slot).

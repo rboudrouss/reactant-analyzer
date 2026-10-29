@@ -2344,6 +2344,59 @@ export function C() {{
     }
 }
 
+/// A component whose second effect is killed by the member arm, beside a
+/// body `other` that may write into the slot's object in place.
+fn member_mutation_src(other: &str, guarded: &str) -> String {
+    format!(
+        r#"
+import {{ useState, useEffect }} from 'react';
+export function C({{ id }}: {{ id: string }}) {{
+  const [s, setS] = useState<any>({{ ok: false, id: "", n: 0 }});
+  useEffect(() => {{ {other} }});
+  useEffect(() => {{ {guarded} }}, [s]);
+  return <div />;
+}}
+"#
+    )
+}
+
+#[test]
+fn a_member_write_into_the_slot_object_revives_a_member_guard() {
+    // The guard is dead under the setter's literal, but another body writes
+    // the member back in place: through the slot, an alias, a computed
+    // constant key, a `delete`, a mutating call, a functional updater's
+    // parameter, and for the relational arm as well (#252).
+    let kill = "if (!s.ok) setS({ ok: true });";
+    for (other, guarded) in [
+        ("s.ok = false;", kill),
+        ("const t = s; t.ok = false;", kill),
+        ("s['ok'] = false;", kill),
+        ("delete s.ok;", kill),
+        ("Object.assign(s, { ok: false });", kill),
+        ("setS((p: any) => { p.ok = false; return p; });", kill),
+        ("s.ok = id;", kill),
+        ("s.id = 'x';", "if (s.id !== id) setS({ id, ok: true });"),
+        (
+            "let n: any = s; while (n.next) n = n.next; n.ok = false;",
+            "if (!s.next.ok) setS({ next: { ok: true } });",
+        ),
+    ] {
+        let sevs = loop_severities(&member_mutation_src(other, guarded), "C");
+        assert!(!sevs.is_empty(), "{other} {guarded}");
+        assert!(!sevs.contains(&Severity::Error), "{other}: {sevs:?}");
+    }
+}
+
+#[test]
+fn a_member_write_that_keeps_the_guard_dead_is_no_reviver() {
+    // The write stores the killing value, or moves another member (#252).
+    for other in ["s.ok = true;", "s.n = 1;", "s.n++;"] {
+        let src = member_mutation_src(other, "if (!s.ok) setS({ ok: true, n: 0 });");
+        let sevs = loop_severities(&src, "C");
+        assert!(sevs.is_empty(), "{other}: {sevs:?}");
+    }
+}
+
 #[test]
 fn a_parameter_default_that_writes_state_is_a_write() {
     // `go()` omits `v`, so its default runs and stores a new object into the

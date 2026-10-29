@@ -457,7 +457,16 @@ fn ref_may_move(
             let current = |e: &Expr| is_current_of(e, self.names).then(Vec::new);
             matches!(key, MemberKey::Index(_))
                 || !site_guards(cfg, block).into_iter().any(|(cond, taken)| {
-                    write_settles_member(cond, taken, &current, rhs, &mut StateValue::from_init)
+                    // A write inside the object leaves `current` the same
+                    // object: no member write moves what identity reads.
+                    write_settles_member(
+                        cond,
+                        taken,
+                        &current,
+                        rhs,
+                        &|_| Some(Vec::new()),
+                        &mut StateValue::from_init,
+                    )
                 })
         }
     }
