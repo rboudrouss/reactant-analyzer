@@ -785,13 +785,14 @@ fn a_short_circuit_inside_a_prop_is_not_a_mount_guard() {
         "#,
         "Row",
     );
-    // `label || fallback` joins the versioned slot with a fresh object, so the
-    // motion is unproven and the tier is Warning either way. What matters is
-    // that it is not Info: no mount coupling was inferred from that branch.
+    // `label` holds an object, so `label || fallback` is `label`: the
+    // fallback side is never taken and the seed is the parent's slot. What
+    // matters is that it is not Info: no mount coupling was inferred from
+    // that branch.
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
-    assert_eq!(
+    assert_ne!(
         d[0].severity(),
-        Severity::Warning,
+        Severity::Info,
         "a short-circuit in a prop must not read as a mount guard: {d:?}"
     );
 }

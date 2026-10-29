@@ -115,7 +115,9 @@ fn a_field_read_and_a_memo_are_versioned_triggers_not_exact_ones() {
 fn a_value_a_branch_selects_is_versioned_by_the_condition_and_never_exact() {
     // `v` is `obj` or `null` as `a` says: a change of `a` flips it, so `a`
     // moves the dep too (#197). The ternary lowers to a temporary bound once
-    // per arm; a name bound twice is no exact alias of either binding.
+    // per arm; a name bound twice is no exact alias of either binding. The
+    // handler is what lets `a` be true: an `a` nothing writes is `false`, and
+    // the `obj` arm is never taken.
     let r = parse_and_analyze(
         r#"
         import { useState, useEffect } from "react";
@@ -124,7 +126,7 @@ fn a_value_a_branch_selects_is_versioned_by_the_condition_and_never_exact() {
           const [obj, setObj] = useState({ k: 1 });
           const v = a ? obj : null;
           useEffect(() => { console.log(v); }, [v]);
-          return <div />;
+          return <button onClick={() => setA(true)} />;
         }
         "#,
     );

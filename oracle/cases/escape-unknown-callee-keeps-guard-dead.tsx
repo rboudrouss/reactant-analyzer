@@ -1,7 +1,7 @@
 // oracle: react=converges
 // #254, the negative: the escaped closure writes `null`, the value that keeps
-// `if (sel)` false. Its write joins the store and kills nothing; the claim
-// left here is #255's (both sides of every branch run), tn once it lands.
+// `if (sel)` false. Its write joins the store and kills nothing, and no
+// value of `sel` takes the guarded side (#255).
 import { useEffect, useState } from "react";
 import { runNow } from "ext";
 

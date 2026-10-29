@@ -15,6 +15,12 @@ use crate::{
 
 /// The env each successor of `b` receives when `b` exits with `env_out`: a
 /// branch narrows on its condition, a jump passes the env on unchanged.
+///
+/// A side whose narrowing leaves the tested name no value is not taken: it
+/// hands its successor nothing, so the successor's entry is the join of its
+/// other edges, ⊥ when it has none. The edge is dead under this `env_out`
+/// only — a later run of `b` under a larger env re-reads it, so a fixpoint
+/// that grows the name brings the side back.
 pub(crate) fn outgoing<D: AbstractDomain>(
     cfg: &CFG,
     b: BlockId,
@@ -24,10 +30,16 @@ pub(crate) fn outgoing<D: AbstractDomain>(
         match &block.term {
             Terminator::Branch {
                 cond, then_, else_, ..
-            } => vec![
-                (*then_, narrow_env_for_branch(env_out, cond, true)),
-                (*else_, narrow_env_for_branch(env_out, cond, false)),
-            ],
+            } => [(*then_, true), (*else_, false)]
+                .into_iter()
+                .filter_map(|(succ, taken)| {
+                    let narrowed = narrow_env_for_branch(env_out, cond, taken);
+                    let dead = narrowed_var(cond).is_some_and(|x| {
+                        narrowed.lookup(x).is_bottom() && !env_out.lookup(x).is_bottom()
+                    });
+                    (!dead).then_some((succ, narrowed))
+                })
+                .collect(),
             Terminator::Jump(succ) => vec![(*succ, env_out.clone())],
             Terminator::Return(_) | Terminator::Unreachable => vec![],
         }
@@ -89,6 +101,24 @@ pub(crate) fn exit_env_of<D: AbstractDomain>(
 }
 
 // ── Branch narrowing ──────────────────────────────────────────────────────────
+
+/// The name [`narrow_env_for_branch`] refines on `cond`, when it refines one:
+/// the left operand of a comparison, a tested name, a negated one. A side of
+/// the branch under which that name has no value is not taken.
+pub(crate) fn narrowed_var(cond: &Expr) -> Option<&str> {
+    match cond {
+        Expr::Var(x) => Some(x),
+        Expr::BinOp { lhs, .. }
+        | Expr::UnaryOp {
+            op: UnaryOp::Not,
+            arg: lhs,
+        } => match lhs.as_ref() {
+            Expr::Var(x) => Some(x),
+            _ => None,
+        },
+        _ => None,
+    }
+}
 
 /// Refine `env` by applying the constraint implied by `cond` on the chosen branch.
 ///

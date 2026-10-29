@@ -35,11 +35,12 @@ export function DeferredWrite() {
 // A render-phase write under a guard the written value kills: React's
 // adjust-state-during-render idiom. The setter is called during render and the
 // rule drops it as converging, so the rule has proven only that no such call
-// fails to settle — never that none is made (#245).
+// fails to settle — never that none is made (#245). The click is what lets `s`
+// hold an object: a slot only `null` is written to never takes the guard.
 export function SettlingGuard() {
   const [s, setS] = useState<null | { v: number }>(null);
   if (s) setS(null);
-  return <div>{s?.v}</div>;
+  return <div onClick={() => setS({ v: 1 })}>{s?.v}</div>;
 }
 
 // #249 — a memo body runs during render. With no deps array it runs at every

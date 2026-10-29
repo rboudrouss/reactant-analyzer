@@ -49,7 +49,9 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::{
     domains::{
-        AbstractDomain, Stability, StateValue, interp::narrow_env_for_branch, stores::AbstractEnv,
+        AbstractDomain, Stability, StateValue,
+        interp::{narrow_env_for_branch, narrowed_var},
+        stores::AbstractEnv,
     },
     engine::purity::{self, Callee, Kind},
     ir::{
@@ -1387,7 +1389,7 @@ fn dead_once_written(
             }
         }
         let narrowed = narrow_env_for_branch(&env, cond, taken);
-        if let Some(x) = guard_var(cond)
+        if let Some(x) = narrowed_var(cond)
             && narrowed.lookup(x).is_bottom_value()
         {
             return true;
@@ -1707,24 +1709,5 @@ fn expand_guard<'a>(
             }
         }
         _ => out.push((cond, taken)),
-    }
-}
-
-/// The variable a guard condition constrains, if the narrowing recognises it.
-fn guard_var(cond: &Expr) -> Option<&str> {
-    match cond {
-        Expr::Var(x) => Some(x),
-        Expr::BinOp { lhs, .. } => match lhs.as_ref() {
-            Expr::Var(x) => Some(x),
-            _ => None,
-        },
-        Expr::UnaryOp {
-            op: UnaryOp::Not,
-            arg,
-        } => match arg.as_ref() {
-            Expr::Var(x) => Some(x),
-            _ => None,
-        },
-        _ => None,
     }
 }

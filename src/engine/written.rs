@@ -329,17 +329,22 @@ impl SiteEnvs<'_> {
         let mut state = self.state.clone();
         let mut heap = self.heap.clone();
         let mut ac = AnalysisCtx::null(self.component, &mut state, self.memo, &mut heap);
-        let env = self.env_at(region, cfg, at, &mut ac);
-        StateValueTransfer.eval_expr(expr, &env, &mut ac)
+        match self.env_at(region, cfg, at, &mut ac) {
+            Some(env) => StateValueTransfer.eval_expr(expr, &env, &mut ac),
+            None => StateValue::bottom(),
+        }
     }
 
+    /// `None` for a site in a block the converged run never reaches — a side
+    /// of a branch no value takes: the write never runs, so it stores
+    /// nothing.
     fn env_at(
         &self,
         region: WriterRegion,
         cfg: &CFG,
         at: Option<(BlockId, usize)>,
         ac: &mut AnalysisCtx<'_, StateValue>,
-    ) -> AbstractEnv<StateValue> {
+    ) -> Option<AbstractEnv<StateValue>> {
         let (entry, exits) = match region {
             WriterRegion::Render => (self.render_entry, Some(self.render_exits)),
             WriterRegion::Effect(l) => (self.exit, self.effect_exits.get(&l)),
@@ -348,17 +353,22 @@ impl SiteEnvs<'_> {
             WriterRegion::Memo(_) | WriterRegion::Callback(_) => (self.exit, None),
         };
         let (Some((block, stmt)), Some(exits)) = (at, exits) else {
-            return exits
-                .and_then(|ex| exit_env_of(cfg, ex))
-                .unwrap_or_else(|| self.exit.clone());
+            return Some(
+                exits
+                    .and_then(|ex| exit_env_of(cfg, ex))
+                    .unwrap_or_else(|| self.exit.clone()),
+            );
         };
+        if !exits.is_empty() && !exits.contains_key(&block) {
+            return None;
+        }
         let mut env = entry_env_of(cfg, block, entry, exits);
         if let Some(b) = cfg.blocks.get(&block) {
             for s in b.stmts.iter().take(stmt) {
                 StateValueTransfer.exec_stmt(s, &mut env, ac);
             }
         }
-        env
+        Some(env)
     }
 
     /// Every body of the component the fixpoint keeps no per-block envs for

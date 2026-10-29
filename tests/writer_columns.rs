@@ -375,14 +375,15 @@ fn a_closure_carrying_a_parent_setter_stores_what_the_closure_passes() {
 #[test]
 fn a_prop_bound_to_one_of_two_setters_writes_both_slots() {
     // The join of `setA` and `setB` is both setters, not "some setter": a
-    // row per candidate slot.
+    // row per candidate slot. (`c` is a root's prop, either value: a test the
+    // slot `b` decides would never pick `setB`, `b` staying `0`.)
     let r = parse_and_analyze(
         r#"
         import { useState, useEffect } from "react";
-        export function Parent() {
+        export function Parent({ c }: { c: boolean }) {
           const [a, setA] = useState({});
           const [b, setB] = useState(0);
-          return <Child v={a} set={b > 5 ? setB : setA} />;
+          return <Child v={a} set={c ? setB : setA} />;
         }
         function Child({ v, set }: { v: object; set: (x: object) => void }) {
           useEffect(() => {

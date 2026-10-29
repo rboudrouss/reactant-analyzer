@@ -117,7 +117,7 @@ fn a_setter_a_closure_only_carries_cannot_be_certified() {
 
 #[test]
 fn a_settling_render_write_is_not_verified_as_no_setter_call() {
-    let stdout = reactant(PHASE, &["--info"]).stdout;
+    let stdout = reactant(PHASE, &["--info", "--show-clean"]).stdout;
     let out = String::from_utf8_lossy(&stdout);
     let section: Vec<&str> = out
         .lines()

@@ -725,10 +725,156 @@ mod tests {
         let (exit_envs, _) = run(&cfg, entry_env, &StateStore::bottom(), &[]);
 
         let then_x = exit_envs[&1].lookup("x");
-        let else_x = exit_envs[&2].lookup("x");
         assert!(!then_x.num.is_bottom());
-        // else-branch: x >= 10 on [0,0] → bottom
-        assert!(else_x.num.is_bottom());
+        // else-branch: x >= 10 on [0,0] leaves `x` no value, so the side is
+        // not taken and its block never runs.
+        assert!(!exit_envs.contains_key(&2), "{:?}", exit_envs.get(&2));
+    }
+
+    /// A CFG from `(id, stmts, terminator)` blocks, entry 0; the edges are
+    /// read off the terminators, `back` marking the back edges.
+    fn cfg_of(blocks: Vec<(usize, Vec<Stmt>, Terminator)>, back: &[(usize, usize)]) -> CFG {
+        let mut edges = Vec::new();
+        let mut map = std::collections::BTreeMap::new();
+        for (id, stmts, term) in blocks {
+            let succ: Vec<(usize, EdgeKind)> = match &term {
+                Terminator::Branch { then_, else_, .. } => {
+                    vec![(*then_, EdgeKind::IfTrue), (*else_, EdgeKind::IfFalse)]
+                }
+                Terminator::Jump(s) => vec![(*s, EdgeKind::Unconditional)],
+                _ => vec![],
+            };
+            for (to, kind) in succ {
+                let kind = if back.contains(&(id, to)) {
+                    EdgeKind::Back
+                } else {
+                    kind
+                };
+                edges.push(Edge { from: id, to, kind });
+            }
+            map.insert(id, BasicBlock { id, stmts, term });
+        }
+        CFG {
+            entry: 0,
+            blocks: map,
+            edges,
+        }
+    }
+
+    fn set_n(v: i32) -> Stmt {
+        Stmt::ExprStmt(
+            Expr::Call {
+                fn_: Box::new(Expr::Var("setN".to_string())),
+                args: vec![Expr::Lit(Prim::Int(v))],
+            },
+            None,
+        )
+    }
+
+    fn branch(cond: Expr, then_: usize, else_: usize) -> Terminator {
+        Terminator::Branch {
+            cond,
+            then_,
+            else_,
+            span: None,
+        }
+    }
+
+    fn let_(var: &str, rhs: Expr) -> Stmt {
+        Stmt::Let {
+            var: var.to_string(),
+            rhs,
+            span: None,
+        }
+    }
+
+    /// `let x = null; if (x) setN(1)`: no value of `x` is truthy, so the
+    /// write never runs (#255). A literal test is no narrowing and keeps
+    /// both sides: the lowering puts `true` where a condition is unknown.
+    #[test]
+    fn a_side_no_value_takes_runs_nothing_a_literal_test_keeps_both() {
+        let ret = || Terminator::Return(Expr::Lit(Prim::Unit));
+        let program = |cond: Expr| {
+            cfg_of(
+                vec![
+                    (
+                        0,
+                        vec![
+                            let_("setN", Expr::StateSetter(0)),
+                            let_("x", Expr::Lit(Prim::Null)),
+                        ],
+                        branch(cond, 1, 2),
+                    ),
+                    (1, vec![set_n(1)], ret()),
+                    (2, vec![], ret()),
+                ],
+                &[],
+            )
+        };
+        let (exits, state) = run(
+            &program(Expr::Var("x".to_string())),
+            AbstractEnv::bottom(),
+            &StateStore::bottom(),
+            &[],
+        );
+        assert!(!exits.contains_key(&1), "{exits:?}");
+        assert!(state.get(0).is_bottom(), "{:?}", state.get(0));
+
+        let (exits, state) = run(
+            &program(Expr::Lit(Prim::Bool(false))),
+            AbstractEnv::bottom(),
+            &StateStore::bottom(),
+            &[],
+        );
+        assert!(exits.contains_key(&1));
+        assert!(!state.get(0).is_bottom());
+    }
+
+    /// `let x = 0; while (x < 3) { if (x > 0) setN(1); x = x + 1 }`: the
+    /// first run of the test leaves `x > 0` no value, the run after the back
+    /// edge gives it one, and the write lands (#255).
+    #[test]
+    fn a_dead_side_comes_back_when_a_later_run_grows_the_name() {
+        use crate::ir::expr::BinOp;
+        let x = || Box::new(Expr::Var("x".to_string()));
+        let cmp = |op, n| Expr::BinOp {
+            op,
+            lhs: x(),
+            rhs: Box::new(Expr::Lit(Prim::Int(n))),
+        };
+        let cfg = cfg_of(
+            vec![
+                (
+                    0,
+                    vec![
+                        let_("setN", Expr::StateSetter(0)),
+                        let_("x", Expr::Lit(Prim::Int(0))),
+                    ],
+                    Terminator::Jump(1),
+                ),
+                (1, vec![], branch(cmp(BinOp::Lt, 3), 2, 5)),
+                (2, vec![], branch(cmp(BinOp::Gt, 0), 3, 4)),
+                (3, vec![set_n(1)], Terminator::Jump(4)),
+                (
+                    4,
+                    vec![Stmt::Assign {
+                        var: "x".to_string(),
+                        rhs: Expr::BinOp {
+                            op: BinOp::Add,
+                            lhs: x(),
+                            rhs: Box::new(Expr::Lit(Prim::Int(1))),
+                        },
+                        span: None,
+                    }],
+                    Terminator::Jump(1),
+                ),
+                (5, vec![], Terminator::Return(Expr::Lit(Prim::Unit))),
+            ],
+            &[(4, 1)],
+        );
+        let (exits, state) = run(&cfg, AbstractEnv::bottom(), &StateStore::bottom(), &[3.0]);
+        assert!(exits.contains_key(&3), "{exits:?}");
+        assert!(!state.get(0).is_bottom());
     }
 
     /// Setter call in Return terminator updates state (`() => setN(99)` concise-arrow).

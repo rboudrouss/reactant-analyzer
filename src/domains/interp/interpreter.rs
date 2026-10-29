@@ -85,8 +85,10 @@ pub(crate) struct Run<D: AbstractDomain> {
 ///
 /// A worklist over the blocks in reverse post-order: each block runs its
 /// statements and its terminator's effects on the join of what its
-/// predecessors hand it, a branch narrows each side on its condition, and a
-/// loop header widens after `ctx.widening.after` arrivals over a back edge.
+/// predecessors hand it, a branch narrows each side on its condition — a side
+/// under which the tested name has no value is not taken, until a later run
+/// of the branch gives it one — and a loop header widens after
+/// `ctx.widening.after` arrivals over a back edge.
 /// The envs it settles on are a post-fixpoint, so a loop-carried value — a
 /// `setN(acc)` after `for (…) acc += x` — is the value every iteration may
 /// produce (#21), and so is a body's return value.
