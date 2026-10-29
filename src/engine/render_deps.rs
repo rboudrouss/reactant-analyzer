@@ -35,8 +35,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
+use imbl::{OrdMap, ordmap::DiffItem};
+
 use crate::domains::AbstractDomain;
-use crate::engine::{AnalysisResult, HookKind, dominance::controlling_branches};
+use crate::engine::{
+    AnalysisResult, HookKind,
+    dominance::controlling_branches,
+    purity::{self, Callee, Kind},
+};
 use crate::ir::{
     cfg::{CFG, Terminator},
     expr::{CompOrigin, Expr, Prim, SPREAD_KEY_PREFIX, mutation_receiver},
@@ -126,8 +132,36 @@ pub struct Deps {
     /// has `f` here). A must-fact: one ungated contributor takes a source
     /// out.
     pub gated: BTreeSet<Source>,
+    /// The part of `set` a function value only captures: named in its body,
+    /// not read when the value is computed (`() => ref.current` holds the
+    /// ref's contents here, unread until a call). A must-fact like `gated`.
+    pub captured: BTreeSet<Source>,
     /// For a function value: what calling it writes besides state.
     pub writes: Writes,
+    /// The value may be computed through a call not known to compute the
+    /// same content from the same inputs ([`purity`]: `Math.random()`, an
+    /// import), so it may move with none of its sources (#224); whether it
+    /// does is also a question about the value
+    /// ([`call_may_differ`](crate::engine::guards::call_may_differ)). Whether
+    /// a known builtin's result is a new reference is the value's alone.
+    pub impure: bool,
+}
+
+/// `mine ∪ theirs` restricted to the sources no contributor holds outside
+/// its own tag: the join of two must-tags over `set`s.
+fn join_must_tag(
+    mine: &mut BTreeSet<Source>,
+    my_set: &BTreeSet<Source>,
+    theirs: &BTreeSet<Source>,
+    their_set: &BTreeSet<Source>,
+) {
+    let untagged: BTreeSet<Source> = my_set
+        .difference(mine)
+        .chain(their_set.difference(theirs))
+        .cloned()
+        .collect();
+    mine.extend(theirs.iter().cloned());
+    mine.retain(|s| !untagged.contains(s));
 }
 
 impl Deps {
@@ -152,30 +186,27 @@ impl Deps {
 
     pub fn union_with(&mut self, other: &Deps) {
         self.top |= other.top;
+        self.impure |= other.impure;
         self.writes.union_with(&other.writes);
         if self.top {
             self.set.clear();
             self.gated.clear();
+            self.captured.clear();
             return;
         }
-        let ungated: BTreeSet<Source> = self
-            .set
-            .difference(&self.gated)
-            .chain(other.set.difference(&other.gated))
-            .cloned()
-            .collect();
-        self.gated.extend(other.gated.iter().cloned());
-        self.gated.retain(|s| !ungated.contains(s));
+        join_must_tag(&mut self.gated, &self.set, &other.gated, &other.set);
+        join_must_tag(&mut self.captured, &self.set, &other.captured, &other.set);
         self.set.extend(other.set.iter().cloned());
     }
 
-    /// The same sources, none of them gated: the value is no longer the
-    /// function whose calls the gating described. Its writes stay: a call
-    /// may return a function that calls its arguments (`debounce(fn)`, a
-    /// hook handed a callback), and a may-fact survives what a must-fact
-    /// cannot.
+    /// The same sources, none of them gated or merely captured: the value is
+    /// no longer the function those tags described — a call may have run it,
+    /// reading what it captures. Its writes stay: a call may return a
+    /// function that calls its arguments (`debounce(fn)`, a hook handed a
+    /// callback), and a may-fact survives what a must-fact cannot.
     fn ungated(mut self) -> Self {
         self.gated.clear();
+        self.captured.clear();
         self
     }
 
@@ -311,6 +342,11 @@ pub struct RenderDeps {
     /// Per effect, the module names its body (callbacks it registers
     /// included) may write: what a write it makes to a slot travels with.
     pub effect_writes: BTreeMap<HookLabel, Writes>,
+    /// Per effect or memo with a written deps list, what each element (in
+    /// `elems` order) may be computed from, read where the hook is called:
+    /// what the re-run class of a dep the value domain cannot label is read
+    /// off (`engine::triggers`).
+    pub effect_deps: BTreeMap<HookLabel, Vec<Deps>>,
 }
 
 impl RenderDeps {
@@ -329,11 +365,14 @@ const MAX_NESTING: usize = 8;
 
 /// Abstract value: its sources, plus the object shape when the analysis knows
 /// one (the props object, or a local object literal whose members keep their
-/// own sources, which is what a destructured custom-hook return needs).
+/// own sources, which is what a destructured custom-hook return needs), and
+/// what kind of value it is known to be, for the builtins a call through it
+/// can name ([`purity`]).
 #[derive(Debug, Clone, PartialEq)]
 struct DVal {
     deps: Deps,
     shape: Shape,
+    kind: Kind,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -341,19 +380,30 @@ enum Shape {
     None,
     Props,
     Members(Arc<BTreeMap<Symbol, DVal>>),
+    /// An object literal with spreads: a member it names is that value and
+    /// whatever a later spread may put there; a name it does not write is
+    /// whatever a spread may put there.
+    Spread {
+        members: Arc<BTreeMap<Symbol, DVal>>,
+        spreads: Arc<Vec<DVal>>,
+    },
 }
 
 impl DVal {
     fn empty() -> Self {
-        DVal {
-            deps: Deps::default(),
-            shape: Shape::None,
-        }
+        DVal::of(Deps::default())
     }
     fn of(deps: Deps) -> Self {
         DVal {
             deps,
             shape: Shape::None,
+            kind: Kind::Unknown,
+        }
+    }
+    fn of_kind(deps: Deps, kind: Kind) -> Self {
+        DVal {
+            kind,
+            ..DVal::of(deps)
         }
     }
     fn join(&self, other: &DVal) -> DVal {
@@ -374,28 +424,39 @@ impl DVal {
             }
             _ => Shape::None,
         };
-        DVal { deps, shape }
+        DVal {
+            deps,
+            shape,
+            kind: self.kind.join(other.kind),
+        }
     }
 }
 
-type Env = HashMap<Var, DVal>;
+/// One block's bindings: a persistent map, so the env of every block shares
+/// with its predecessor's whatever the block did not rebind (ADR-045), and a
+/// join walks only the names that differ.
+type Env = OrdMap<Var, Arc<DVal>>;
 
+/// Join `b` into `a`; `true` when `a` grew. A name bound to the same value
+/// on both sides is left as it is: the join is idempotent.
 fn join_env(a: &mut Env, b: &Env) -> bool {
-    let mut changed = false;
-    for (k, v) in b {
-        match a.get(k) {
-            Some(x) => {
+    let grown: Vec<(Var, Arc<DVal>)> = a
+        .diff(b)
+        .filter_map(|item| match item {
+            DiffItem::Update {
+                old: (k, x),
+                new: (_, v),
+            } => {
                 let j = x.join(v);
-                if j != *x {
-                    a.insert(k.clone(), j);
-                    changed = true;
-                }
+                (j != **x).then(|| (k.clone(), Arc::new(j)))
             }
-            None => {
-                a.insert(k.clone(), v.clone());
-                changed = true;
-            }
-        }
+            DiffItem::Add(k, v) => Some((k.clone(), v.clone())),
+            DiffItem::Remove(..) => None,
+        })
+        .collect();
+    let changed = !grown.is_empty();
+    for (k, v) in grown {
+        a.insert(k, v);
     }
     changed
 }
@@ -412,8 +473,18 @@ pub fn provided_context_name(element: &str) -> &str {
 /// in its render and in every hook body, nested closures included. The union
 /// over the program is what [`render_deps`] reads a free name against.
 pub fn written_names(result: &AnalysisResult<impl AbstractDomain>) -> HashSet<Var> {
-    let mut out = written_roots(std::slice::from_ref(&result.param), &result.render_cfg);
-    for body in result.hooks.iter().filter_map(HookEntry::body_cfg) {
+    written_in(
+        std::slice::from_ref(&result.param),
+        &result.render_cfg,
+        &result.hooks,
+    )
+}
+
+/// [`written_names`] of a body with its parameters and its hook table, before
+/// it is an [`AnalysisResult`]: a component or a custom hook as lowered.
+pub(crate) fn written_in(params: &[Var], body: &CFG, hooks: &[HookEntry]) -> HashSet<Var> {
+    let mut out = written_roots(params, body);
+    for body in hooks.iter().filter_map(HookEntry::body_cfg) {
         out.extend(written_roots(&[], body));
     }
     out
@@ -455,10 +526,10 @@ pub fn render_deps(
     let mut entry = Env::new();
     entry.insert(
         result.param.clone(),
-        DVal {
-            deps: Deps::one(Source::AllProps),
+        Arc::new(DVal {
             shape: Shape::Props,
-        },
+            ..DVal::of(Deps::one(Source::AllProps))
+        }),
     );
     let top_frame = Collect {
         pc: Deps::default(),
@@ -484,9 +555,11 @@ pub fn render_deps(
                     used.union_with(&a.var(&env, v).deps);
                 }
                 if let Some(l) = deps.list() {
-                    for e in &l.elems {
-                        used.union_with(&a.eval(e, &env).deps);
+                    let per_dep: Vec<Deps> = l.elems.iter().map(|e| a.eval(e, &env).deps).collect();
+                    for d in &per_dep {
+                        used.union_with(d);
                     }
+                    a.out.effect_deps.insert(call.label, per_dep);
                 }
                 let writes = a.writes_of(&[], body_cfg, &env);
                 a.out.effect_writes.insert(call.label, writes);
@@ -499,12 +572,25 @@ pub fn render_deps(
                 }
                 a.out.any_context |= a.reads_unnamed_context(hook, &env, &inlined);
             }
+            // A memo's list gates its body as an effect's does (#249). What
+            // the memo makes is used only where its value is, so its deps
+            // are recorded for the re-run class and used by nothing here.
+            HookEntry::Memo { deps, .. } => {
+                if let Some(l) = deps.list() {
+                    let per_dep: Vec<Deps> = l.elems.iter().map(|e| a.eval(e, &env).deps).collect();
+                    a.out.effect_deps.insert(call.label, per_dep);
+                }
+                continue;
+            }
             _ => continue,
         }
         a.out.genuine.union_with(&used);
     }
     if a.top {
         a.out.genuine = Deps::top();
+        for d in a.out.effect_deps.values_mut().flatten() {
+            *d = Deps::top();
+        }
     }
     a.out.any_context |= a.inline_hook.get();
     a.out
@@ -557,8 +643,8 @@ impl<'a> Analyzer<'a> {
         f
     }
 
-    /// A function value: what its body captures, with the captures it reaches
-    /// only behind a test of `params` gated.
+    /// A function value: what its body captures, all of it `captured`, with
+    /// the captures it reaches only behind a test of `params` gated.
     fn closure(&self, params: &[Var], body: &CFG, env: &Env) -> Deps {
         let key = body as *const CFG as usize;
         let cached = self.gated.borrow().get(&key).cloned();
@@ -578,6 +664,7 @@ impl<'a> Analyzer<'a> {
             }
             d.union_with(&c);
         }
+        d.captured = d.set.clone();
         d.writes.union_with(&self.writes_of(params, body, env));
         d
     }
@@ -610,17 +697,18 @@ impl<'a> Analyzer<'a> {
 
     fn var(&self, env: &Env, v: &Var) -> DVal {
         if v == self.param {
-            return env.get(v).cloned().unwrap_or(DVal {
-                deps: Deps::one(Source::AllProps),
+            return env.get(v).map(|d| (**d).clone()).unwrap_or(DVal {
                 shape: Shape::Props,
+                ..DVal::of(Deps::one(Source::AllProps))
             });
         }
         // Not bound here: module scope, an import or a global. A proven
         // context object reads as its context, whose value its provider
         // sets; a name some function writes as the name itself; anything
-        // else is constant across renders and reads as nothing.
+        // else is constant across renders and reads as nothing, and may be
+        // a global the builtin table knows.
         env.get(v)
-            .cloned()
+            .map(|d| (**d).clone())
             .unwrap_or_else(|| match self.consts.get(v) {
                 Some(ModuleConstInit::Context(id)) => {
                     DVal::of(Deps::one(Source::Context(id.clone())))
@@ -628,8 +716,23 @@ impl<'a> Analyzer<'a> {
                 _ if self.module_written.contains(v) => {
                     DVal::of(Deps::one(Source::Module(v.clone())))
                 }
-                _ => DVal::empty(),
+                Some(_) => DVal::empty(),
+                None => DVal::of_kind(Deps::default(), purity::global(v)),
             })
+    }
+
+    /// [`Self::var`]'s kind alone.
+    fn var_kind(&self, env: &Env, v: &str) -> Kind {
+        match env.get(v) {
+            Some(d) => d.kind,
+            None if v == self.param.as_str()
+                || self.consts.contains_key(v)
+                || self.module_written.contains(v) =>
+            {
+                Kind::Unknown
+            }
+            None => purity::global(v),
+        }
     }
 
     /// The proven context a name denotes here (not shadowed by a local).
@@ -687,45 +790,60 @@ impl<'a> Analyzer<'a> {
         let mut out_env: HashMap<BlockId, Env> = HashMap::new();
         let mut pc: HashMap<BlockId, Deps> = HashMap::new();
         let order = cfg.rpo();
-        let mut converged = false;
-        for _ in 0..MAX_ROUNDS {
-            let mut changed = false;
-            for &b in &order {
-                let Some(block) = cfg.blocks.get(&b) else {
-                    continue;
-                };
-                let mut p = outer.pc.clone();
-                for br in controllers.get(&b).into_iter().flatten() {
-                    if let (Some(env), Some(Terminator::Branch { cond, .. })) =
-                        (out_env.get(br), cfg.blocks.get(br).map(|x| &x.term))
-                    {
-                        p.union_with(&self.eval(cond, env).deps);
-                    }
+        let succs = cfg.successor_map();
+        // Worklist in RPO priority: a block is revisited only when its input
+        // env or one of its controlling conditions changed. A sweep of every
+        // block per round re-cloned and re-compared each block's whole env
+        // just to confirm nothing moved, which a large render body (many
+        // spliced hooks: many blocks, many names) cannot afford.
+        let pos: HashMap<BlockId, usize> = order.iter().enumerate().map(|(i, b)| (*b, i)).collect();
+        let mut controls: HashMap<BlockId, Vec<usize>> = HashMap::new();
+        for (b, brs) in &controllers {
+            if let Some(&i) = pos.get(b) {
+                for br in brs {
+                    controls.entry(*br).or_default().push(i);
                 }
-                if pc.get(&b) != Some(&p) {
-                    pc.insert(b, p.clone());
-                    changed = true;
-                }
-                let mut env = in_env.get(&b).cloned().unwrap_or_default();
-                for stmt in &block.stmts {
-                    self.transfer(stmt, &mut env, &p);
-                }
-                for s in cfg.successors(b) {
-                    let slot = in_env.entry(s).or_default();
-                    changed |= join_env(slot, &env);
-                }
-                if out_env.get(&b) != Some(&env) {
-                    out_env.insert(b, env);
-                    changed = true;
-                }
-            }
-            if !changed {
-                converged = true;
-                break;
             }
         }
-        if !converged {
-            self.top = true;
+        let mut dirty: BTreeSet<usize> = (0..order.len()).collect();
+        // The same budget as `MAX_ROUNDS` sweeps of every block.
+        let mut budget = MAX_ROUNDS * order.len();
+        while let Some(i) = dirty.pop_first() {
+            if budget == 0 {
+                // Fail closed: the summary degrades to ⊤.
+                self.top = true;
+                break;
+            }
+            budget -= 1;
+            let b = order[i];
+            let Some(block) = cfg.blocks.get(&b) else {
+                continue;
+            };
+            let mut p = outer.pc.clone();
+            for br in controllers.get(&b).into_iter().flatten() {
+                if let (Some(env), Some(Terminator::Branch { cond, .. })) =
+                    (out_env.get(br), cfg.blocks.get(br).map(|x| &x.term))
+                {
+                    p.union_with(&self.eval(cond, env).deps);
+                }
+            }
+            let mut env = in_env.get(&b).cloned().unwrap_or_default();
+            for stmt in &block.stmts {
+                self.transfer(stmt, &mut env, &p);
+            }
+            pc.insert(b, p);
+            for &s in succs.get(&b).into_iter().flatten() {
+                let slot = in_env.entry(s).or_default();
+                if join_env(slot, &env)
+                    && let Some(&j) = pos.get(&s)
+                {
+                    dirty.insert(j);
+                }
+            }
+            if out_env.get(&b) != Some(&env) {
+                out_env.insert(b, env);
+                dirty.extend(controls.get(&b).into_iter().flatten().copied());
+            }
         }
         // Collection pass: sites, and what the CFG uses.
         for &b in &order {
@@ -787,7 +905,7 @@ impl<'a> Analyzer<'a> {
             Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. } => {
                 let mut v = self.eval(rhs, env);
                 v.deps.union_with(pc);
-                env.insert(var.clone(), v);
+                env.insert(var.clone(), Arc::new(v));
             }
             // A write through a member: the root binding may now hold the
             // written value (weak update), and loses any shape it had.
@@ -799,7 +917,7 @@ impl<'a> Analyzer<'a> {
                         d.union_with(&self.eval(i, env).deps);
                     }
                     d.union_with(pc);
-                    env.insert(root, DVal::of(d));
+                    env.insert(root, Arc::new(DVal::of(d)));
                 }
             }
             // `xs.push(v)`: a method call may store its arguments in the
@@ -813,16 +931,37 @@ impl<'a> Analyzer<'a> {
                     for a in args {
                         d.union_with(&self.eval(a, env).deps);
                     }
-                    env.insert(root, DVal::of(d));
+                    env.insert(root, Arc::new(DVal::of(d)));
                 }
             }
             Stmt::ExprStmt(..) => {}
         }
     }
 
+    /// The member `field` of a value.
+    fn member(base: &DVal, field: &str) -> DVal {
+        match &base.shape {
+            Shape::Props => DVal::of(Deps::one(Source::Prop(field.to_string()))),
+            Shape::Members(m) => match m.get(field) {
+                Some(v) => v.clone(),
+                None => DVal::of(base.deps.clone()),
+            },
+            Shape::Spread { members, spreads } => match members.get(field) {
+                Some(v) => v.clone(),
+                None => spreads
+                    .iter()
+                    .map(|s| Self::member(s, field))
+                    .reduce(|a, b| a.join(&b))
+                    .unwrap_or_else(|| DVal::of(base.deps.clone())),
+            },
+            Shape::None => DVal::of(base.deps.clone()),
+        }
+    }
+
     fn eval(&self, e: &Expr, env: &Env) -> DVal {
         match e {
-            Expr::Lit(_) | Expr::SummaryVal(_) => DVal::empty(),
+            Expr::Lit(p) => DVal::of_kind(Deps::default(), purity::lit(p)),
+            Expr::SummaryVal(_) => DVal::empty(),
             Expr::Var(v) => self.var(env, v),
             Expr::StateVal(l) => DVal::of(Deps::one(Source::Slot(*l))),
             Expr::StateSetter(l) => DVal::of(Deps::one(Source::Setter(*l))),
@@ -832,23 +971,40 @@ impl<'a> Analyzer<'a> {
                 // like any call's (`useContext(Ctx)` reads `Ctx`'s value).
                 Some(HookKind::Custom) | None => {
                     let mut d = Deps::one(Source::Hook(*l));
-                    if let Some(HookEntry::Custom { args, .. }) = self.hooks.get(l) {
+                    let mut kind = Kind::Unknown;
+                    if let Some(HookEntry::Custom {
+                        args,
+                        name,
+                        import_source,
+                        ..
+                    }) = self.hooks.get(l)
+                    {
                         for a in args {
                             d.union_with(&self.eval(a, env).deps.ungated());
                         }
+                        kind = purity::hook_result(import_source.as_deref(), name);
                     }
-                    DVal::of(d)
+                    // The result is held by decision (#161): an argument
+                    // computed through an unknown call moves it no more than
+                    // the hook's own state does.
+                    d.impure = false;
+                    DVal::of_kind(d, kind)
                 }
                 _ => DVal::empty(),
             },
             // A memoised value or callback is computed from what its body
-            // reads and what its deps list names.
+            // reads and what its deps list names. A memo's body runs in the
+            // render, so what it names is read (a function it names may be
+            // called); a callback's body only captures, and a readable deps
+            // list is what its identity changes with.
             Expr::MemoVal(l) | Expr::CallbackVal(l) => {
                 let mut d = Deps::default();
                 match self.hooks.get(l) {
                     Some(HookEntry::Memo { body_cfg, deps, .. }) => {
                         for v in self.free_vars(body_cfg).iter() {
-                            d.union_with(&self.var(env, v).deps);
+                            let mut read = self.var(env, v).deps;
+                            read.captured.clear();
+                            d.union_with(&read);
                         }
                         for e in deps.list().map(|l| l.elems.as_slice()).unwrap_or(&[]) {
                             d.union_with(&self.eval(e, env).deps);
@@ -861,8 +1017,13 @@ impl<'a> Analyzer<'a> {
                         ..
                     }) => {
                         d = self.closure(params, body_cfg, env);
-                        for e in deps.list().map(|l| l.elems.as_slice()).unwrap_or(&[]) {
-                            d.union_with(&self.eval(e, env).deps);
+                        match deps.list() {
+                            Some(list) => {
+                                for e in &list.elems {
+                                    d.union_with(&self.eval(e, env).deps);
+                                }
+                            }
+                            None => d.captured.clear(),
                         }
                     }
                     _ => d = Deps::top(),
@@ -872,65 +1033,90 @@ impl<'a> Analyzer<'a> {
             Expr::FnLit {
                 params, body_cfg, ..
             } => DVal::of(self.closure(params, body_cfg, env)),
-            Expr::FieldAccess { obj, field } => {
-                let base = self.eval(obj, env);
-                match &base.shape {
-                    Shape::Props => DVal::of(Deps::one(Source::Prop(field.clone()))),
-                    Shape::Members(m) => match m.get(field) {
-                        Some(v) => v.clone(),
-                        None => DVal::of(base.deps),
-                    },
-                    Shape::None => DVal::of(base.deps),
-                }
-            }
+            Expr::FieldAccess { obj, field } => Self::member(&self.eval(obj, env), field),
             Expr::IndexAccess { arr, idx } => {
-                let mut d = self.eval(arr, env).deps;
+                let a = self.eval(arr, env);
+                let mut d = a.deps;
                 d.union_with(&self.eval(idx, env).deps);
-                DVal::of(d)
+                DVal::of_kind(d, purity::element(a.kind, idx))
             }
-            Expr::BinOp { lhs, rhs, .. } => {
-                let mut d = self.eval(lhs, env).deps;
-                d.union_with(&self.eval(rhs, env).deps);
-                DVal::of(d)
+            Expr::BinOp { op, lhs, rhs } => {
+                let (l, r) = (self.eval(lhs, env), self.eval(rhs, env));
+                let mut d = l.deps;
+                d.union_with(&r.deps);
+                DVal::of_kind(d, purity::binop(op, l.kind, r.kind))
             }
-            Expr::UnaryOp { arg, .. } | Expr::TSAnnotated(arg) => {
-                DVal::of(self.eval(arg, env).deps)
+            Expr::UnaryOp { op, arg } => DVal::of_kind(self.eval(arg, env).deps, purity::unary(op)),
+            Expr::TSAnnotated(arg) => {
+                let v = self.eval(arg, env);
+                DVal::of_kind(v.deps, v.kind)
             }
             Expr::Call { fn_, args } | Expr::New { fn_, args, .. } => {
-                let callee = match fn_.peel_ts() {
+                let name = match fn_.peel_ts() {
                     Expr::Var(v) => Some(v.as_str()),
                     Expr::FieldAccess { field, .. } => Some(field.as_str()),
                     _ => None,
                 };
-                if callee.is_some_and(|n| n == "use" || is_hook_name(n)) {
+                if name.is_some_and(|n| n == "use" || is_hook_name(n)) {
                     self.inline_hook.set(true);
                 }
-                let mut d = self.eval(fn_, env).deps.ungated();
-                for a in args {
-                    d.union_with(&self.eval(a, env).deps.ungated());
+                let (f, callee) = match fn_.peel_ts() {
+                    Expr::FieldAccess { obj, field } => {
+                        let recv = self.eval(obj, env);
+                        let kind = recv.kind;
+                        (Self::member(&recv, field), Callee::Method(kind, field))
+                    }
+                    other => {
+                        let f = self.eval(other, env);
+                        let kind = f.kind;
+                        (f, Callee::Value(kind))
+                    }
+                };
+                let mut d = f.deps.ungated();
+                let vals: Vec<DVal> = args.iter().map(|a| self.eval(a, env)).collect();
+                for v in &vals {
+                    d.union_with(&v.deps.clone().ungated());
                 }
-                DVal::of(d)
+                // The result holds while its inputs do only through a callee
+                // known to be a function of them (#224).
+                let known = purity::call(
+                    callee,
+                    matches!(e, Expr::New { .. }),
+                    args,
+                    &|i| vals[i].kind,
+                    &|v| self.var_kind(env, v),
+                );
+                d.impure |= known.is_none();
+                DVal::of_kind(d, known.unwrap_or_default())
             }
             Expr::ObjectLit { fields, .. } => {
                 let mut d = Deps::default();
-                let mut members = BTreeMap::new();
-                let mut spread = false;
+                let mut members: BTreeMap<Symbol, DVal> = BTreeMap::new();
+                let mut spreads: Vec<DVal> = Vec::new();
                 for (k, v) in fields {
                     let val = self.eval(v, env);
                     d.union_with(&val.deps);
                     if k.starts_with(SPREAD_KEY_PREFIX) {
-                        spread = true;
+                        // What it may put over every member written so far.
+                        for (name, m) in members.iter_mut() {
+                            *m = m.join(&Self::member(&val, name));
+                        }
+                        spreads.push(val);
                     } else {
                         members.insert(k.clone(), val);
                     }
                 }
+                let members = Arc::new(members);
                 DVal {
-                    deps: d,
-                    shape: if spread {
-                        Shape::None
+                    shape: if spreads.is_empty() {
+                        Shape::Members(members)
                     } else {
-                        Shape::Members(Arc::new(members))
+                        Shape::Spread {
+                            members,
+                            spreads: Arc::new(spreads),
+                        }
                     },
+                    ..DVal::of(d)
                 }
             }
             Expr::ArrayLit { elems, .. } => {
@@ -938,7 +1124,7 @@ impl<'a> Analyzer<'a> {
                 for x in elems {
                     d.union_with(&self.eval(x, env).deps);
                 }
-                DVal::of(d)
+                DVal::of_kind(d, Kind::Array)
             }
             // The element's props are the child's inputs, attributed to the
             // site: the element value itself is not a use.
@@ -1106,7 +1292,7 @@ impl<'a> Analyzer<'a> {
             .filter_map(|v| env.get(v).map(|d| (v.clone(), d.clone())))
             .collect();
         for p in params {
-            inner.insert(p.clone(), DVal::of(feed.clone()));
+            inner.insert(p.clone(), Arc::new(DVal::of(feed.clone())));
         }
         let frame = Collect {
             in_list: ctx.in_list || list,

@@ -33,7 +33,9 @@ impl Rule for WideningInfo {
                 )
                 // Witness (ADR-019): the engine's own record of the widening.
                 .with_notes(crate::rules::api::witness::slot_history(
-                    result, label, &name_of,
+                    result,
+                    label,
+                    &ctx.names(&name_of),
                 ))
             })
             .collect()

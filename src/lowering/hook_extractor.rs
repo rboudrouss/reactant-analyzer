@@ -171,7 +171,7 @@ fn collect_handlers_in_expr(
                     // on native elements: React calls them at arbitrary times
                     // (events / mount-unmount). Other native props are DOM
                     // data, never invoked.
-                    if is_event_prop(name) || name == "ref" {
+                    if invoked_prop(true, name) {
                         if let Some(body_cfg) = handler_body(val, var_bodies) {
                             let label = *next_label;
                             *next_label += 1;
@@ -240,6 +240,13 @@ fn collect_handlers_in_expr(
     }
 }
 
+/// A JSX prop whose function value may be invoked: a native element's `on*`
+/// events and `ref` (the only native props React calls), and any prop a
+/// component receives (the child may call whatever it is given).
+pub(crate) fn invoked_prop(native: bool, name: &str) -> bool {
+    !native || is_event_prop(name) || name == "ref"
+}
+
 pub(crate) fn is_event_prop(name: &str) -> bool {
     let mut chars = name.chars();
     chars.next() == Some('o')
@@ -269,194 +276,427 @@ pub fn extract_hooks(
     cfg: &mut CFG,
     imports: &ImportCtx<'_>,
 ) -> (Vec<HookEntry>, Vec<HookProvenance>, HookLabel) {
-    let mut label: HookLabel = 0;
-    let mut hooks: Vec<HookEntry> = Vec::new();
-    let mut provenance: Vec<HookProvenance> = Vec::new();
-    // Maps array-destructuring temps (e.g. "__arr_42") → hook label, for useState/useReducer.
-    let mut state_temps: HashMap<String, HookLabel> = HashMap::new();
+    let mut ex = Extractor {
+        hooks: Vec::new(),
+        provenance: Vec::new(),
+        label: 0,
+        state_temps: HashMap::new(),
+        staged: 0,
+        imports,
+    };
 
     // Collected up front because the loop takes `&mut cfg.blocks` — the ids
     // already come out in order (`CFG::blocks` is a `BTreeMap`).
-    hoist_terminator_hooks(cfg, imports);
-
     let ids: Vec<BlockId> = cfg.blocks.keys().copied().collect();
 
-    for id in ids {
-        let old = std::mem::take(&mut cfg.blocks.get_mut(&id).unwrap().stmts);
-        let mut new: Vec<Stmt> = Vec::with_capacity(old.len());
-
-        for stmt in old {
-            process_stmt(
-                stmt,
-                &mut new,
-                &mut hooks,
-                &mut provenance,
-                &mut label,
-                &mut state_temps,
-                imports,
-            );
-        }
-
-        cfg.blocks.get_mut(&id).unwrap().stmts = new;
-    }
-
-    (hooks, provenance, label)
-}
-
-/// Move a hook call out of a terminator and into a statement (#4).
-///
-/// The extractor below rewrites `block.stmts` and never looks at terminators,
-/// so a hook reached only through `return useThing()` or `if (useThing())`
-/// produced no [`HookEntry`] at all: the component reported zero hooks and
-/// every rule passed it in silence. Teaching the extractor to also walk
-/// terminators would mean duplicating its destructuring, labelling and
-/// marker-rewriting over a second position, so the CFG is normalised instead —
-/// the expression is bound to a temp in the block's statement list and the
-/// terminator reads that temp. What the extractor then sees is an ordinary
-/// `Let`, and nothing downstream has to know this happened.
-///
-/// Statements run before the terminator, so appending is the correct place.
-/// Only bodies that actually put a hook there are touched; the common CFG is
-/// returned unchanged.
-fn hoist_terminator_hooks(cfg: &mut CFG, imports: &ImportCtx<'_>) {
-    let ids: Vec<BlockId> = cfg.blocks.keys().copied().collect();
     for id in ids {
         let block = cfg.blocks.get_mut(&id).unwrap();
-        let (expr, span) = match &mut block.term {
-            Terminator::Return(e) => (e, None),
-            Terminator::Branch { cond, span, .. } => (cond, *span),
-            Terminator::Jump(_) | Terminator::Unreachable => continue,
-        };
-        if !contains_hook_call(expr, imports) {
-            continue;
+        let old = std::mem::take(&mut block.stmts);
+        let mut new = BlockOut::default();
+        for stmt in old {
+            ex.stmt(stmt, &mut new);
         }
-        let var = format!("__term_{id}");
-        let hoisted = std::mem::replace(expr, Expr::Var(var.clone()));
-        block.stmts.push(Stmt::Let {
-            var,
-            rhs: hoisted,
-            span,
-        });
+        // A hook reached only through `return useThing()` or
+        // `if (useThing())` runs too (#4): the terminator's hook calls are
+        // staged like a statement's, after the block's statements.
+        let block = cfg.blocks.get_mut(&id).unwrap();
+        match &mut block.term {
+            Terminator::Return(e) => {
+                let staged =
+                    ex.stage_hooks(std::mem::replace(e, Expr::Lit(Prim::Unit)), None, &mut new);
+                *e = staged;
+            }
+            Terminator::Branch { cond, span, .. } => {
+                let span = *span;
+                let staged = ex.stage_hooks(
+                    std::mem::replace(cond, Expr::Lit(Prim::Unit)),
+                    span,
+                    &mut new,
+                );
+                *cond = staged;
+            }
+            Terminator::Jump(_) | Terminator::Unreachable => {}
+        }
+        new.install(cfg, id);
     }
+
+    (ex.hooks, ex.provenance, ex.label)
 }
 
-/// Does this expression call a hook anywhere inside it?
+/// What one block's statements become once its hooks are extracted.
 ///
-/// Deliberately a *containment* test rather than "is a hook call": the whole
-/// expression is what gets hoisted, so `return cond ? useA() : useB()` moves as
-/// one piece and keeps its meaning. Conditional hook calls are the point of
-/// `conditional-hook`, and it cannot fire on a hook nobody extracted.
-fn contains_hook_call(expr: &Expr, imports: &ImportCtx<'_>) -> bool {
-    if let Expr::Call { fn_, .. } = expr
-        && imports.classify_callee(fn_).is_some()
-    {
-        return true;
-    }
-    let mut found = false;
-    expr.for_each_child(&mut |child| found |= contains_hook_call(child, imports));
-    found
+/// A lazy initializer (`useState(() => …)`) runs during the mount render
+/// only, so it cannot sit among the block's statements, which run at every
+/// render. Each one cuts the block: the statements before it end in a branch
+/// on ⊤ whose taken side runs the initializer, and the rest of the block
+/// follows the join — a site that runs on some renders, which is what "the
+/// mount render" is to an analysis of every render.
+#[derive(Default)]
+struct BlockOut {
+    stmts: Vec<Stmt>,
+    /// The closed segments, each followed by the statement of a lazy
+    /// initializer.
+    cuts: Vec<(Vec<Stmt>, Stmt)>,
 }
 
-fn process_stmt(
-    stmt: Stmt,
-    out: &mut Vec<Stmt>,
-    hooks: &mut Vec<HookEntry>,
-    provenance: &mut Vec<HookProvenance>,
-    label: &mut HookLabel,
-    state_temps: &mut HashMap<String, HookLabel>,
-    imports: &ImportCtx<'_>,
-) {
-    match stmt {
-        Stmt::Let {
-            var,
-            rhs,
-            span: stmt_span,
-        } => match try_consume_hook_call(rhs, imports) {
-            Ok((call, args)) => {
-                let lbl = *label;
-                *label += 1;
-                let is_state_like =
-                    call.is_react && matches!(call.origin_name.as_str(), "useState" | "useReducer");
-                let is_arr_temp = var.starts_with("__arr_");
+impl BlockOut {
+    fn push(&mut self, stmt: Stmt) {
+        self.stmts.push(stmt);
+    }
 
-                let entry = make_hook_entry(&call, lbl, args, stmt_span);
-                let marker = hook_result_expr(&call, lbl, entry.as_ref());
-                provenance.push(call.provenance(lbl, stmt_span));
-                if let Some(entry) = entry {
-                    hooks.push(entry);
-                }
+    /// `stmt` runs at the mount render only, after everything pushed so far.
+    fn push_on_mount(&mut self, stmt: Stmt) {
+        let before = std::mem::take(&mut self.stmts);
+        self.cuts.push((before, stmt));
+    }
 
-                // Record the binding variable on Custom hooks (their import
-                // source and resolved file come from the classification).
-                if let Some(HookEntry::Custom { binding, .. }) = hooks.last_mut() {
-                    // `__arr_N` is a lowering temp, never a source name.
-                    if !is_arr_temp {
-                        *binding = Some(var.clone());
+    /// Write the statements back as block `id`, cut into fresh blocks where
+    /// a mount-only statement runs. The block's terminator and its outgoing
+    /// edges move to the last segment; its incoming edges stay on `id`.
+    fn install(self, cfg: &mut CFG, id: BlockId) {
+        use crate::ir::cfg::{Edge, EdgeKind};
+        if self.cuts.is_empty() {
+            cfg.blocks.get_mut(&id).unwrap().stmts = self.stmts;
+            return;
+        }
+        let mut next: BlockId = cfg.blocks.keys().max().map_or(0, |m| m + 1);
+        let term = std::mem::replace(
+            &mut cfg.blocks.get_mut(&id).unwrap().term,
+            Terminator::Unreachable,
+        );
+        let outgoing: Vec<usize> = (0..cfg.edges.len())
+            .filter(|&i| cfg.edges[i].from == id)
+            .collect();
+        let mut cur = id;
+        for (stmts, on_mount) in self.cuts {
+            let (then_, join) = (next, next + 1);
+            next += 2;
+            let block = cfg.blocks.get_mut(&cur).unwrap();
+            block.stmts = stmts;
+            block.term = Terminator::Branch {
+                cond: Expr::SummaryVal(crate::ir::expr::SummaryValue::Top),
+                then_,
+                else_: join,
+                span: None,
+            };
+            cfg.blocks.insert(
+                then_,
+                BasicBlock {
+                    id: then_,
+                    stmts: vec![on_mount],
+                    term: Terminator::Jump(join),
+                },
+            );
+            cfg.blocks.insert(
+                join,
+                BasicBlock {
+                    id: join,
+                    stmts: vec![],
+                    term: Terminator::Unreachable,
+                },
+            );
+            for (from, to, kind) in [
+                (cur, then_, EdgeKind::IfTrue),
+                (cur, join, EdgeKind::IfFalse),
+                (then_, join, EdgeKind::Unconditional),
+            ] {
+                cfg.edges.push(Edge { from, to, kind });
+            }
+            cur = join;
+        }
+        let last = cfg.blocks.get_mut(&cur).unwrap();
+        last.stmts = self.stmts;
+        last.term = term;
+        for i in outgoing {
+            cfg.edges[i].from = cur;
+        }
+    }
+}
+
+/// The state of one body's hook extraction.
+struct Extractor<'i, 'a> {
+    hooks: Vec<HookEntry>,
+    provenance: Vec<HookProvenance>,
+    label: HookLabel,
+    /// Array-destructuring temps (e.g. "__arr_42") → hook label, for
+    /// useState/useReducer.
+    state_temps: HashMap<String, HookLabel>,
+    /// Hook arguments staged so far, for fresh temp names.
+    staged: usize,
+    imports: &'i ImportCtx<'a>,
+}
+
+impl Extractor<'_, '_> {
+    fn stmt(&mut self, stmt: Stmt, out: &mut BlockOut) {
+        match stmt {
+            Stmt::Let {
+                var,
+                rhs,
+                span: stmt_span,
+            } => match try_consume_hook_call(rhs, self.imports) {
+                Ok((call, args)) => {
+                    let (lbl, entry) = self.hook_call(&call, args, stmt_span, out);
+                    let is_state_like = call.is_react
+                        && matches!(call.origin_name.as_str(), "useState" | "useReducer");
+                    let is_arr_temp = var.starts_with("__arr_");
+                    let marker = hook_result_expr(&call, lbl, entry.as_ref());
+                    if let Some(entry) = entry {
+                        self.hooks.push(entry);
+                    }
+
+                    // Record the binding variable on Custom hooks (their import
+                    // source and resolved file come from the classification).
+                    if let Some(HookEntry::Custom { binding, .. }) = self.hooks.last_mut() {
+                        // `__arr_N` / `__obj_N` is a lowering temp, never a source name.
+                        if !crate::ir::splice::is_destructuring_temp(&var) {
+                            *binding = Some(var.clone());
+                        }
+                    }
+
+                    if is_state_like && is_arr_temp {
+                        // Array-destructured useState/useReducer: drop the temp Let,
+                        // subsequent IndexAccess stmts will be rewritten by rewrite_expr.
+                        self.state_temps.insert(var, lbl);
+                    } else {
+                        out.push(Stmt::Let {
+                            var,
+                            rhs: marker,
+                            span: stmt_span,
+                        });
                     }
                 }
-
-                if is_state_like && is_arr_temp {
-                    // Array-destructured useState/useReducer: drop the temp Let,
-                    // subsequent IndexAccess stmts will be rewritten by rewrite_expr.
-                    state_temps.insert(var, lbl);
-                } else {
+                Err(rhs) => {
+                    let rhs = self.stage_hooks(rhs, stmt_span, out);
                     out.push(Stmt::Let {
                         var,
-                        rhs: marker,
+                        rhs: rewrite_expr(rhs, &self.state_temps),
                         span: stmt_span,
                     });
                 }
-            }
-            Err(rhs) => {
-                out.push(Stmt::Let {
+            },
+            Stmt::ExprStmt(expr, stmt_span) => match try_consume_hook_call(expr, self.imports) {
+                Ok((call, args)) => {
+                    let (lbl, entry) = self.hook_call(&call, args, stmt_span, out);
+                    let marker = marker_val(entry.as_ref());
+                    if let Some(entry) = entry {
+                        self.hooks.push(entry);
+                    }
+                    // Void hooks (useEffect, bare custom calls): leave a marker so
+                    // the call-site block stays recoverable from the CFG.
+                    out.push(Stmt::ExprStmt(Expr::HookMarker(lbl, marker), stmt_span));
+                }
+                Err(expr) => {
+                    let expr = self.stage_hooks(expr, stmt_span, out);
+                    out.push(Stmt::ExprStmt(
+                        rewrite_expr(expr, &self.state_temps),
+                        stmt_span,
+                    ));
+                }
+            },
+            Stmt::Assign { var, rhs, span } => {
+                let rhs = self.stage_hooks(rhs, span, out);
+                out.push(Stmt::Assign {
                     var,
-                    rhs: rewrite_expr(rhs, state_temps),
-                    span: stmt_span,
+                    rhs: rewrite_expr(rhs, &self.state_temps),
+                    span,
                 });
             }
-        },
-        Stmt::ExprStmt(expr, stmt_span) => match try_consume_hook_call(expr, imports) {
-            Ok((call, args)) => {
-                let lbl = *label;
-                *label += 1;
-                let entry = make_hook_entry(&call, lbl, args, stmt_span);
-                let marker = marker_val(entry.as_ref());
-                provenance.push(call.provenance(lbl, stmt_span));
-                if let Some(entry) = entry {
-                    hooks.push(entry);
-                }
-                // Void hooks (useEffect, bare custom calls): leave a marker so
-                // the call-site block stays recoverable from the CFG.
-                out.push(Stmt::ExprStmt(Expr::HookMarker(lbl, marker), stmt_span));
-            }
-            Err(expr) => {
-                out.push(Stmt::ExprStmt(rewrite_expr(expr, state_temps), stmt_span));
-            }
-        },
-        Stmt::Assign { var, rhs, span } => {
-            out.push(Stmt::Assign {
-                var,
-                rhs: rewrite_expr(rhs, state_temps),
+            Stmt::MemberWrite {
+                obj,
+                key,
+                rhs,
                 span,
-            });
-        }
-        Stmt::MemberWrite {
-            obj,
-            key,
-            rhs,
-            span,
-        } => {
-            out.push(Stmt::MemberWrite {
-                obj: rewrite_expr(obj, state_temps),
-                key: match key {
+            } => {
+                let obj = self.stage_hooks(obj, span, out);
+                let key = match key {
                     MemberKey::Field(f) => MemberKey::Field(f),
-                    MemberKey::Index(idx) => MemberKey::Index(rewrite_expr(idx, state_temps)),
-                },
-                rhs: rewrite_expr(rhs, state_temps),
-                span,
-            });
+                    MemberKey::Index(idx) => MemberKey::Index(self.stage_hooks(idx, span, out)),
+                };
+                let rhs = self.stage_hooks(rhs, span, out);
+                out.push(Stmt::MemberWrite {
+                    obj: rewrite_expr(obj, &self.state_temps),
+                    key: match key {
+                        MemberKey::Field(f) => MemberKey::Field(f),
+                        MemberKey::Index(idx) => {
+                            MemberKey::Index(rewrite_expr(idx, &self.state_temps))
+                        }
+                    },
+                    rhs: rewrite_expr(rhs, &self.state_temps),
+                    span,
+                });
+            }
         }
     }
+
+    /// Bind every hook call inside `expr` to a temp of its own, extracted by a
+    /// statement right before the one `expr` belongs to, and return `expr`
+    /// reading the temps (#233). A hook nested in an expression — `[v,
+    /// useCallback(…)]`, `f(useMemo(…))`, `x = c && useX()`'s arm — or
+    /// written in a terminator (`return useThing()`, `if (useThing())`, #4)
+    /// runs at that render like any other, and only a statement that is the
+    /// hook call is one the extractor takes: left nested, it was a call of
+    /// an unknown function, its hook missing from every rule. Calls are
+    /// staged in evaluation order; the statement's other operands run after
+    /// them, the reordering hook arguments already take (#193) — a hook call
+    /// has no effect a sibling operand of the same statement can observe. A
+    /// function literal is not entered: its hooks run when it is called.
+    fn stage_hooks(&mut self, expr: Expr, span: Option<SourceRange>, out: &mut BlockOut) -> Expr {
+        let is_hook_call = |e: &Expr| match e {
+            Expr::Call { fn_, .. } => self.imports.classify_callee(fn_).is_some(),
+            Expr::TSAnnotated(inner) => matches!(&**inner,
+                Expr::Call { fn_, .. } if self.imports.classify_callee(fn_).is_some()),
+            _ => false,
+        };
+        if is_hook_call(&expr) {
+            let var = format!("__hook_{}", self.staged);
+            self.staged += 1;
+            self.stmt(
+                Stmt::Let {
+                    var: var.clone(),
+                    rhs: expr,
+                    span,
+                },
+                out,
+            );
+            return Expr::Var(var);
+        }
+        let mut expr = expr;
+        expr.for_each_child_mut(&mut |child| {
+            let taken = std::mem::replace(child, Expr::Lit(Prim::Unit));
+            *child = self.stage_hooks(taken, span, out);
+        });
+        expr
+    }
+
+    /// Label one hook call and build its entry, once its arguments are
+    /// staged in the render body.
+    fn hook_call(
+        &mut self,
+        call: &ResolvedHookCall,
+        args: Vec<Expr>,
+        span: Option<SourceRange>,
+        out: &mut BlockOut,
+    ) -> (HookLabel, Option<HookEntry>) {
+        let staged = self.stage_args(call, &args, span, out);
+        let lbl = self.label;
+        self.label += 1;
+        self.provenance.push(call.provenance(lbl, span));
+        let mut entry = make_hook_entry(call, lbl, args, span);
+        if let Some(HookEntry::Custom { args, .. }) = &mut entry {
+            *args = staged;
+        }
+        (lbl, entry)
+    }
+
+    /// Evaluate a hook call's arguments where React does: in the render body,
+    /// before the hook, at every render (#193).
+    ///
+    /// The entry takes the arguments out of the render CFG, so a call written
+    /// in one — `useState(setA(1))`, `useMemo(f, [setA(1)])`,
+    /// `useThing(load())` — was a call no render pass ran: no write in the
+    /// render phase, a `verified setter-in-render`. An argument that runs a
+    /// call (outside a function literal, which only creates a closure) is now
+    /// bound to a temp by a render statement ahead of the hook's marker, so
+    /// the interpreter, the writer relation and every render-body rule see it
+    /// run. Returns what stands for each argument's value there: the temp, or
+    /// the argument itself when evaluating it runs nothing.
+    ///
+    /// A custom hook receives the values — its body is spliced with its
+    /// parameters bound to its arguments — so its entry takes them and the
+    /// call runs once. A modeled React hook's entry keeps the expressions,
+    /// which its readers take syntactically (`lazy-init`, the deps rules) and
+    /// the engine evaluates without effects.
+    ///
+    /// A lazy initializer — a function handed to `useState`, or `useReducer`'s
+    /// third argument — runs during the mount render only, which
+    /// [`BlockOut::push_on_mount`] models.
+    fn stage_args(
+        &mut self,
+        call: &ResolvedHookCall,
+        args: &[Expr],
+        span: Option<SourceRange>,
+        out: &mut BlockOut,
+    ) -> Vec<Expr> {
+        let mut values: Vec<Expr> = Vec::with_capacity(args.len());
+        for arg in args {
+            if !runs_a_call(arg) {
+                values.push(arg.clone());
+                continue;
+            }
+            let var = format!("__hookarg_{}", self.staged);
+            self.staged += 1;
+            self.stmt(
+                Stmt::Let {
+                    var: var.clone(),
+                    rhs: arg.clone(),
+                    span,
+                },
+                out,
+            );
+            values.push(Expr::Var(var));
+        }
+        if let Some(lazy) = lazy_initializer(call, args) {
+            let fn_ = values[lazy.callee].clone();
+            let args = lazy.args.iter().map(|&i| values[i].clone()).collect();
+            out.push_on_mount(Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(fn_),
+                    args,
+                },
+                span,
+            ));
+        }
+        values
+    }
+}
+
+/// The call React makes at mount to a hook's lazy initializer: argument
+/// `callee`, applied to arguments `args` (positions in the hook call).
+struct LazyInit {
+    callee: usize,
+    args: Vec<usize>,
+}
+
+/// `useState(init)` calls `init()` at mount when it is a function;
+/// `useReducer(r, arg, init)` calls `init(arg)`. Fail-closed: anything that
+/// may evaluate to a function is called.
+fn lazy_initializer(call: &ResolvedHookCall, args: &[Expr]) -> Option<LazyInit> {
+    if !call.is_react {
+        return None;
+    }
+    let (callee, applied) = match call.origin_name.as_str() {
+        "useState" => (0, vec![]),
+        "useReducer" if args.len() > 2 => (2, vec![1]),
+        _ => return None,
+    };
+    let may_be_function = !matches!(
+        args.get(callee).map(Expr::peel_ts),
+        None | Some(
+            Expr::Lit(_)
+                | Expr::ObjectLit { .. }
+                | Expr::ArrayLit { .. }
+                | Expr::BinOp { .. }
+                | Expr::UnaryOp { .. }
+                | Expr::NativeElem { .. }
+                | Expr::CompApp { .. }
+                | Expr::New { .. }
+        )
+    );
+    may_be_function.then_some(LazyInit {
+        callee,
+        args: applied,
+    })
+}
+
+/// Does evaluating `e` run a call? Not inside a function literal: evaluating
+/// one creates a closure and runs nothing.
+fn runs_a_call(e: &Expr) -> bool {
+    if matches!(e, Expr::Call { .. } | Expr::New { .. }) {
+        return true;
+    }
+    let mut found = false;
+    e.for_each_child(&mut |c| found = found || runs_a_call(c));
+    found
 }
 
 // ── Hook call detection ───────────────────────────────────────────────────────
@@ -698,17 +938,18 @@ fn make_hook_entry(
             // No `FnLit` means no parameter list either: an empty one
             // subtracts nothing from the body's free variables, so captures are
             // over-approximated rather than missed.
-            let (params, body_cfg) = match it.next() {
+            let (params, body_cfg, literal) = match it.next() {
                 Some(Expr::FnLit {
                     params, body_cfg, ..
-                }) => (params, unwrap_body(body_cfg)),
-                other => (vec![], hook_body_cfg(other)),
+                }) => (params, unwrap_body(body_cfg), true),
+                other => (vec![], hook_body_cfg(other), false),
             };
             let deps = it.next().map_or(DepsArg::Absent, DepsArg::from_expr);
             Some(HookEntry::Callback {
                 label,
                 body_cfg,
                 params,
+                literal,
                 deps,
                 span,
             })
@@ -812,33 +1053,31 @@ fn unwrap_body(body_cfg: std::sync::Arc<CFG>) -> CFG {
 ///
 /// A literal `() => {…}` contributes its own CFG. Anything else — a variable, a
 /// member access, a call returning a function — is *not* unanalysable: the hook
-/// invokes it, so the body is exactly that invocation, and the engine resolves
-/// the callee from the env like any other call.
+/// invokes it, so the body is exactly that invocation, returning what it
+/// returns (a memo's value, an effect's cleanup), and the engine resolves the
+/// callee from the env like any other call.
 ///
 /// The previous fallback handed back an `Unreachable` CFG, which claimed the
 /// callback did nothing at all: ⊥ where ⊤ was required. `useEffect(handler)`
 /// came out clean *and certified* `verified infinite-loop`, while the same body
 /// written inline was reported.
 fn hook_body_cfg(arg: Option<Expr>) -> CFG {
-    let stmts = match arg {
+    let ret = match arg {
         Some(Expr::FnLit { body_cfg, .. }) => return unwrap_body(body_cfg),
-        Some(callee) => vec![Stmt::ExprStmt(
-            Expr::Call {
-                fn_: Box::new(callee),
-                args: vec![],
-            },
-            None,
-        )],
+        Some(callee) => Expr::Call {
+            fn_: Box::new(callee),
+            args: vec![],
+        },
         // No callback argument at all — not valid React; nothing runs.
-        None => vec![],
+        None => Expr::Lit(Prim::Unit),
     };
     let mut blocks = std::collections::BTreeMap::new();
     blocks.insert(
         0,
         BasicBlock {
             id: 0,
-            stmts,
-            term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            stmts: vec![],
+            term: Terminator::Return(ret),
         },
     );
     CFG {
@@ -993,14 +1232,15 @@ mod tests {
             !matches!(body.blocks[&body.entry].term, Terminator::Unreachable),
             "an indirect callback body must not be unreachable"
         );
+        // The call is the body's return: a memo's value, an effect's cleanup.
         assert!(
-            body.blocks[&body.entry].stmts.iter().any(|s| matches!(
-                s,
-                Stmt::ExprStmt(Expr::Call { fn_, .. }, _)
+            matches!(
+                &body.blocks[&body.entry].term,
+                Terminator::Return(Expr::Call { fn_, .. })
                     if matches!(fn_.as_ref(), Expr::Var(v) if v == "handler")
-            )),
-            "the body must call the callback it was handed: {:?}",
-            body.blocks[&body.entry].stmts
+            ),
+            "the body must call and return the callback it was handed: {:?}",
+            body.blocks[&body.entry].term
         );
     }
 
@@ -1053,6 +1293,85 @@ mod tests {
             find_let_rhs(stmts, "pair"),
             Some(Expr::StateVal(0))
         ));
+    }
+
+    // ── render-evaluated arguments (#193) ───────────────────────────────────
+
+    #[test]
+    fn a_call_in_a_hook_argument_stays_a_render_statement_before_the_marker() {
+        let (cfg, hooks) = parse_and_extract(
+            "function C() { const v = useMemo(() => 1, [f(x)]); return <div/>; }",
+        );
+        let stmts = entry_stmts(&cfg);
+        let call = stmts
+            .iter()
+            .position(|s| {
+                matches!(
+                    s,
+                    Stmt::Let {
+                        rhs: Expr::ArrayLit { .. },
+                        ..
+                    }
+                )
+            })
+            .expect("the deps list runs in render");
+        let marker = stmts
+            .iter()
+            .position(|s| {
+                matches!(
+                    s,
+                    Stmt::Let {
+                        rhs: Expr::MemoVal(0),
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert!(call < marker, "{stmts:?}");
+        // The entry keeps the deps as written.
+        assert!(
+            matches!(&hooks[0], HookEntry::Memo { deps: DepsArg::List(d), .. } if d.len() == 1)
+        );
+    }
+
+    #[test]
+    fn a_custom_hook_receives_its_staged_argument() {
+        let (cfg, hooks) =
+            parse_and_extract("function C() { const v = useThing(load()); return <div/>; }");
+        let HookEntry::Custom { args, .. } = &hooks[0] else {
+            panic!("{hooks:?}");
+        };
+        let [Expr::Var(t)] = args.as_slice() else {
+            panic!("{args:?}");
+        };
+        assert!(
+            matches!(find_let_rhs(entry_stmts(&cfg), t), Some(Expr::Call { .. })),
+            "the call runs once, in render, bound to what the hook receives"
+        );
+    }
+
+    #[test]
+    fn a_lazy_initializer_runs_on_a_branch_and_the_block_continues_after_it() {
+        let (cfg, _) = parse_and_extract(
+            "function C() { const [a] = useState(() => 0); if (a) { g(); } return <div/>; }",
+        );
+        let entry = &cfg.blocks[&cfg.entry];
+        let Terminator::Branch { then_, else_, .. } = entry.term else {
+            panic!("the entry ends on the mount branch: {:?}", entry.term);
+        };
+        assert!(matches!(
+            cfg.blocks[&then_].stmts.as_slice(),
+            [Stmt::ExprStmt(Expr::Call { fn_, .. }, _)] if matches!(**fn_, Expr::FnLit { .. })
+        ));
+        // The rest of the block — the binding and the `if` — follows the join.
+        let join = &cfg.blocks[&else_];
+        assert!(matches!(
+            find_let_rhs(&join.stmts, "a"),
+            Some(Expr::StateVal(0))
+        ));
+        assert!(matches!(join.term, Terminator::Branch { .. }));
+        assert_eq!(cfg.successors(else_).len(), 2, "the `if` edges moved along");
+        assert_eq!(cfg.successors(cfg.entry), vec![then_, else_]);
     }
 
     // ── useEffect ────────────────────────────────────────────────────────────

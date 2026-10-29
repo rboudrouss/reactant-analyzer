@@ -123,8 +123,8 @@ pub(crate) enum EntityVal<'a, 'b> {
 pub(crate) struct EntityCtx<'a> {
     pub ctx: &'a RuleCtx<'a>,
     pub comp: &'a AnalysisResult<StateValue>,
-    /// Canonical alias-resolved setter → slot relation (`all_setter_labels`).
-    pub setter_labels: HashMap<Var, HookLabel>,
+    /// Canonical alias-resolved setter → slots relation (`all_setter_labels`).
+    pub setter_labels: crate::engine::setters::SetterTargets,
     pub setter_vars: HashSet<Var>,
     /// State-value bindings in the render CFG (alias-resolved) — the naming
     /// table for slots.
@@ -141,7 +141,7 @@ pub(crate) struct EntityCtx<'a> {
     provenance: OnceCell<HashMap<HookLabel, usize>>,
     /// `ComponentSetter`-valued props (#107), resolved on first use by the
     /// ownership-aware enumeration.
-    cross_setters: OnceCell<HashMap<Var, crate::engine::setters::SetterProp>>,
+    cross_setters: OnceCell<HashMap<Var, Vec<crate::engine::setters::SetterProp>>>,
     /// The slot → readers relation (#127), computed on first use: unlike the
     /// writers, it is not needed by any native rule, so a component no pack
     /// asks about never walks for it.
@@ -156,7 +156,7 @@ impl<'a> EntityCtx<'a> {
     pub fn new(ctx: &'a RuleCtx<'a>) -> Self {
         let comp = ctx.comp();
         let setter_labels = all_setter_labels(comp);
-        let setter_vars = setter_labels.keys().cloned().collect();
+        let setter_vars = setter_labels.names().cloned().collect();
         let state_names =
             resolve_setter_aliases(&comp.render_cfg, &state_val_labels(&comp.render_cfg));
         EntityCtx {
@@ -221,7 +221,7 @@ impl<'a> EntityCtx<'a> {
     /// `var → (owning component, slot)` for every `ComponentSetter`-valued
     /// prop of this component — the engine resolution the native
     /// `setter-in-render` rule consumes, read once and shared (ADR-027 §1).
-    fn cross_setters(&self) -> &HashMap<Var, crate::engine::setters::SetterProp> {
+    fn cross_setters(&self) -> &HashMap<Var, Vec<crate::engine::setters::SetterProp>> {
         self.cross_setters
             .get_or_init(|| cross_component_setters(self.comp, self.ctx.component()))
     }
@@ -584,20 +584,18 @@ impl<'a> EntityCtx<'a> {
                 // A custom hook is called by its own name; every other kind is
                 // called by the variable it binds.
                 EntityVal::Hook(h) => match h.entry {
-                    Some(HookEntry::Custom { name, .. }) => {
-                        Some(crate::ir::source_name(name).to_string())
-                    }
+                    Some(HookEntry::Custom { name, .. }) => Some(self.var_name(name)),
                     _ => self.binding_name(h.info.label),
                 },
                 // The origin hook's own name — the resolved identity, never a
                 // binding variable (there may be none: the row survives
                 // inlining). A provider's name is its context binding.
                 EntityVal::Origin(p) => Some(p.origin_hook.clone()),
-                EntityVal::Provider(p) => Some(crate::ir::source_name(p.context).to_string()),
+                EntityVal::Provider(p) => Some(self.var_name(p.context)),
                 EntityVal::JsxProp(j) => Some(j.element.to_string()),
                 EntityVal::Element(e) => Some(e.name.to_string()),
                 // The local binding the call reads the context through.
-                EntityVal::Consumer(c) => Some(crate::ir::source_name(&c.name).to_string()),
+                EntityVal::Consumer(c) => Some(self.var_name(&c.name)),
                 // A registration is named by its registrar — the table key,
                 // matchable by a `name` guard. The receiver-qualified form
                 // (`socket.addEventListener`) stays internal to the native
@@ -611,7 +609,7 @@ impl<'a> EntityCtx<'a> {
                 EntityVal::Call(c) => Some(c.name.clone()),
                 // A read row is named by the binding it went through — the
                 // slot's own name, or the alias the site actually wrote.
-                EntityVal::Read(r) => Some(crate::ir::source_name(&r.name).to_string()),
+                EntityVal::Read(r) => Some(self.var_name(&r.name)),
                 EntityVal::Setter(_)
                 | EntityVal::Dep(_)
                 | EntityVal::Arg(_)
@@ -679,8 +677,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Call(_) => None,
             },
             Field::Setter => match v {
-                EntityVal::Setter(s) => Some(crate::ir::source_name(&s.var).to_string()),
-                EntityVal::Writer(w) => Some(crate::ir::source_name(&w.setter).to_string()),
+                EntityVal::Setter(s) => Some(self.var_name(&s.var)),
+                EntityVal::Writer(w) => Some(self.var_name(&w.setter)),
                 EntityVal::Hook(_)
                 | EntityVal::Dep(_)
                 | EntityVal::Arg(_)
@@ -786,7 +784,7 @@ impl<'a> EntityCtx<'a> {
                     WriteProvenance::Direct => "direct".to_string(),
                     WriteProvenance::Via(chain) => chain
                         .iter()
-                        .map(|n| crate::ir::source_name(n).to_string())
+                        .map(|n| self.var_name(n))
                         .collect::<Vec<_>>()
                         .join(" → "),
                     WriteProvenance::Unknown => "unknown".to_string(),
@@ -946,7 +944,7 @@ impl<'a> EntityCtx<'a> {
             | Field::Identity
             | Field::Cleanup
             | Field::Firing
-            | Field::Cycle => raw.unwrap_or_else(|| anonymous(v)),
+            | Field::Cycle => raw.unwrap_or_else(|| anonymous(v, self.ctx.source_names())),
             // Source identifiers are quoted, verdict words are not.
             Field::Name
             | Field::Slot
@@ -955,7 +953,7 @@ impl<'a> EntityCtx<'a> {
             | Field::Prop
             | Field::Owner => match raw {
                 Some(s) => format!("`{s}`"),
-                None => anonymous(v),
+                None => anonymous(v, self.ctx.source_names()),
             },
         }
     }
@@ -976,6 +974,11 @@ impl<'a> EntityCtx<'a> {
         pick_name(&names, label)
     }
 
+    /// A variable as the source names it ([`RuleCtx::source_names`]).
+    fn var_name(&self, var: &str) -> String {
+        self.ctx.source_names().name(var).into_owned()
+    }
+
     /// The unquoted source name of the variable a hook's result binds to.
     fn binding_name(&self, label: HookLabel) -> Option<String> {
         pick_name(&self.hook_names, label)
@@ -990,28 +993,35 @@ impl<'a> EntityCtx<'a> {
     fn sorted_setters(
         &self,
         calls: Vec<SetterCall>,
-        cross: &HashMap<Var, crate::engine::setters::SetterProp>,
+        cross: &HashMap<Var, Vec<crate::engine::setters::SetterProp>>,
     ) -> Vec<SetterEntity> {
         let mut setters: Vec<SetterEntity> = calls
             .into_iter()
-            .map(|c| {
+            .flat_map(|c| {
                 // A local binding wins: a component passing its own setter down
                 // is not a foreign write, and `cross_component_setters` already
-                // filtered self-owned entries out.
-                let (slot, owner) = match self.setter_labels.get(&c.var) {
-                    Some(&label) => (Some(label), None),
-                    None => match cross.get(&c.var) {
-                        Some(prop) => (Some(prop.label), Some(prop.component)),
-                        None => (None, None),
+                // filtered self-owned entries out. A prop that may be several
+                // parents' setters is one entity per candidate, and so is a
+                // local name bound to several setters (#202).
+                let local: Vec<_> = self.setter_labels.targets(&c.var).collect();
+                let targets: Vec<(Option<HookLabel>, Option<ComponentId>)> = match local.is_empty()
+                {
+                    false => local.into_iter().map(|l| (Some(l), None)).collect(),
+                    true => match cross.get(&c.var) {
+                        Some(props) => props
+                            .iter()
+                            .map(|p| (Some(p.label), Some(p.component)))
+                            .collect(),
+                        None => vec![(None, None)],
                     },
                 };
-                SetterEntity {
+                targets.into_iter().map(move |(slot, owner)| SetterEntity {
                     slot,
                     owner,
-                    var: c.var,
+                    var: c.var.clone(),
                     span: c.span,
                     block_id: c.block_id,
-                }
+                })
             })
             .collect();
         setters.sort_by(|a, b| {
@@ -1037,12 +1047,12 @@ fn region_of(row: &HookRow<'_>) -> WriterRegion {
 
 /// How an entity is named when it has no source name. Mirrors the native
 /// discipline: an identifier the reader can act on, never a bare label.
-fn anonymous(v: &EntityVal<'_, '_>) -> String {
+fn anonymous(v: &EntityVal<'_, '_>, names: &crate::ir::SourceNames) -> String {
     match v {
         EntityVal::Hook(h) => format!("{} #{}", hook_kind_word(h.info.kind), h.info.label),
         EntityVal::Setter(s) => match s.slot {
             Some(label) => format!("state #{label}"),
-            None => format!("`{}`", crate::ir::source_name(&s.var)),
+            None => format!("`{}`", names.name(&s.var)),
         },
         // The dependency as written, never its position: an index into `elems`
         // stops being an index into the source array once lowering drops an
@@ -1050,18 +1060,18 @@ fn anonymous(v: &EntityVal<'_, '_>) -> String {
         EntityVal::Dep(d) => format!("`{}`", d.expr.describe()),
         EntityVal::Arg(a) => format!("argument #{}", a.index),
         EntityVal::Origin(p) => format!("`{}`", p.origin_hook),
-        EntityVal::Writer(w) => format!("`{}`", crate::ir::source_name(&w.setter)),
+        EntityVal::Writer(w) => format!("`{}`", names.name(&w.setter)),
         EntityVal::Provider(p) => format!("`{}`", p.element),
         EntityVal::JsxProp(j) => format!("`{}` of `<{}>`", j.prop, j.element),
         EntityVal::Cycle(c) => format!("the loop through effect #{}", c.effect),
-        EntityVal::Read(r) => format!("`{}`", crate::ir::source_name(&r.name)),
+        EntityVal::Read(r) => format!("`{}`", names.name(&r.name)),
         EntityVal::Element(e) => format!("`<{}>`", e.name),
         EntityVal::Call(c) => match &c.receiver {
             Some(r) => format!("`{}.{}()`", r, c.name),
             None => format!("`{}()`", c.name),
         },
         EntityVal::Seed(s) => format!("`{}`", s.path),
-        EntityVal::Consumer(c) => format!("`{}`", crate::ir::source_name(&c.name)),
+        EntityVal::Consumer(c) => format!("`{}`", names.name(&c.name)),
         EntityVal::Registration(r) => format!("`{}`", r.display),
     }
 }

@@ -6,14 +6,16 @@ use crate::{
     domains::{
         AbstractDomain, AnalysisCtx, Transfer,
         impls::{BoolVal, Interval, SetterVal, Stability, StateValue, StrConst},
-        interp::exec_stmt_with_callbacks,
-        stores::{AbstractEnv, EnvVal, Heap, HeapValue, resolve_locs},
+        interp::{alloc_literal, exec_stmt_with_callbacks, returned_sites, run_cfg},
+        stores::{AbstractEnv, EnvVal, Heap, HeapValue, Sites, member_key, resolve_locs},
     },
     engine::component_registry::ChildLookup,
     ir::{
         ComponentId,
+        bindings::binding_of,
+        cfg::CFG,
         expr::{BinOp, CompOrigin, Expr, MarkerVal, Prim, UnaryOp},
-        hooks::{Arity, DepsArg},
+        hooks::{Arity, DepsArg, HookEntry},
         stmt::Stmt,
         types::{ExprId, Symbol},
     },
@@ -44,52 +46,144 @@ impl Transfer for StateValueTransfer {
         exec_stmt_with_callbacks(self, stmt, env, ctx);
     }
 
+    /// A memo holds what some recompute handed back, so its kinds are those of
+    /// one recompute, and its reference changes only when the deps let it
+    /// recompute: the deps' **may** bound. Recomputing is not changing
+    /// (`useMemo(() => 0, [{}])` is `0` at every render, #199), so the memo is
+    /// a new reference every render only when it surely recomputes (a dep is
+    /// a new reference every render) and each recompute surely allocates. A
+    /// value whose kinds were `reference` alone made `useMemo(() => 0, [])`
+    /// an object, which a truthiness guard then killed (#198).
     fn recompute_memo(
         &self,
         component: ComponentId,
-        deps: &DepsArg,
+        memo: &HookEntry,
+        render_cfg: &CFG,
         env: &AbstractEnv<StateValue>,
         ctx: &mut AnalysisCtx<StateValue>,
-    ) -> StateValue {
-        // No readable deps array: the memo may recompute on any render and may
-        // equally never recompute — ⊤. `Stable` here would be a *must* claim
-        // about a list the IR never saw, which is how `useMemo(fn, deps)` used
-        // to read as pinned forever.
-        let Some(deps) = deps.list() else {
-            return StateValue::reference(Stability::Unknown);
-        };
-        if deps.arity == Arity::Exact(0) {
-            // `[]` pins the memo — but only an array *known* to be empty.
-            return StateValue::reference(Stability::Stable);
-        }
-        if deps.is_empty() {
-            // Every entry is a spread whose source the fold cannot reach.
-            return StateValue::reference(Stability::Unknown);
-        }
-        let stability = deps.as_slice().iter().fold(Stability::Bottom, |acc, dep| {
-            // Structural projection (ADR-017): a dep that IS a state slot
-            // versions the memo by that slot regardless of the slot's kind —
-            // it changes only at the slot's setter events, `Versioned({l})`.
-            // `eval_state_value` can't express this: version labels live on
-            // the reference slot, so a numeric/bool state dep would collapse
-            // to a plain `Stable`/`PerRender` via `to_stability`. Not a store
-            // workaround — a genuine memo-side projection.
-            if let Expr::StateVal(l) = dep.peel_ts() {
-                return acc.join(&Stability::versioned_by(component, *l));
+    ) -> EnvVal<StateValue> {
+        // One recompute: a memo's body, run against the real stores (ADR-020
+        // item 8), with the sites it returns; a new function for a callback
+        // literal; for any other callback, its argument, which nothing here
+        // reads. A body no run returns from bounds nothing.
+        let (deps, value, sites) = match memo {
+            HookEntry::Memo { body_cfg, deps, .. } => {
+                let run = run_cfg(self, body_cfg, env.clone(), ctx, 0);
+                let sites = returned_sites(self, body_cfg, &run.exits, ctx);
+                (deps, run.ret, sites)
             }
-            // Every other dep is evaluated through the normal path against the
-            // real fixpoint stores in `ctx` (so `MemoVal`, heap fields, and
-            // compound deps resolve instead of reading a fabricated ⊥ store).
-            let val = eval_state_value(dep, env, ctx);
-            // A dep whose reference kind is already versioned keeps its
-            // labels (`to_stability` would erase them if another slot is ⊤).
-            acc.join(
-                &val.versioned_reference()
-                    .unwrap_or_else(|| val.to_stability()),
-            )
-        });
-        StateValue::reference(stability)
+            HookEntry::Callback {
+                literal: true,
+                deps,
+                ..
+            } => (deps, StateValue::reference(Stability::PerRender), None),
+            HookEntry::Callback { deps, .. } => (deps, StateValue::top(), None),
+            _ => return EnvVal::Val(StateValue::top()),
+        };
+        let value = memo_value(component, deps, value, render_cfg, env, ctx);
+        EnvVal::located(sites, value)
     }
+}
+
+/// What a recompute's `value` is as the memo's value: its kinds, with a
+/// reference that changes only when `deps` let the memo recompute.
+fn memo_value(
+    component: ComponentId,
+    deps: &DepsArg,
+    value: StateValue,
+    render_cfg: &CFG,
+    env: &AbstractEnv<StateValue>,
+    ctx: &mut AnalysisCtx<StateValue>,
+) -> StateValue {
+    let value = if value.is_bottom_value() {
+        StateValue::top()
+    } else {
+        value
+    };
+    // No deps argument: React recomputes at every render, so the memo is
+    // what its body is at that render.
+    if matches!(deps, DepsArg::Absent) {
+        return value;
+    }
+    let (may, fresh_dep) = deps_change(component, deps, render_cfg, env, ctx);
+    if fresh_dep && value.is_unstable_reference_only() {
+        return value;
+    }
+    if value.reference.is_bottom() {
+        return value;
+    }
+    StateValue {
+        reference: may,
+        ..value
+    }
+}
+
+/// The renders at which a deps list may let its hook recompute (a may bound),
+/// and whether some dep is surely a new reference at every render, so the
+/// hook surely recomputes at every render.
+///
+/// No readable list bounds nothing: `Stable` would be a *must* claim about a
+/// list the IR never saw, which is how `useMemo(fn, deps)` used to read as
+/// pinned forever; `[]` pins the hook, but only an array *known* to be empty.
+fn deps_change(
+    component: ComponentId,
+    deps: &DepsArg,
+    render_cfg: &CFG,
+    env: &AbstractEnv<StateValue>,
+    ctx: &mut AnalysisCtx<StateValue>,
+) -> (Stability, bool) {
+    let Some(list) = deps.list() else {
+        return (Stability::Unknown, false);
+    };
+    if list.arity == Arity::Exact(0) {
+        return (Stability::Stable, false);
+    }
+    if list.is_empty() {
+        // Every entry is a spread whose source the fold cannot reach.
+        return (Stability::Unknown, false);
+    }
+    let mut may = Stability::Bottom;
+    let mut fresh = false;
+    for (i, dep) in list.as_slice().iter().enumerate() {
+        // Structural projection (ADR-017): a dep that IS a state slot moves
+        // only at the slot's setter events, whatever the slot's kind; its
+        // value cannot say so, version labels living on the reference slot.
+        if let Expr::StateVal(l) = dep.peel_ts() {
+            may = may.join(&Stability::versioned_by(component, *l));
+            continue;
+        }
+        let val = eval_state_value(dep, env, ctx);
+        // A spread's source is not compared, its elements are: they hold
+        // only while the source is a reference that moves at slot events.
+        if list.spread_at.contains(&i) {
+            let held = val.is_reference_only()
+                && matches!(val.reference, Stability::Stable | Stability::Versioned(_));
+            may = may.join(&if held {
+                val.reference.clone()
+            } else {
+                Stability::Unknown
+            });
+            continue;
+        }
+        // A name is read at the render's exit, so its value there is its
+        // value at the call only when it is bound once.
+        let bound_once = match dep.peel_ts() {
+            Expr::Var(v) => binding_of(v, render_cfg).is_some(),
+            _ => true,
+        };
+        fresh |= bound_once && val.is_unstable_reference_only();
+        // A dep whose reference is versioned keeps its labels (`to_stability`
+        // would erase them if another slot is ⊤); a dep in motion may move at
+        // any render, which is the may side of `PerRender`.
+        may = may.join(&match val.versioned_reference() {
+            Some(v) => v,
+            None => match val.to_stability() {
+                Stability::PerRender => Stability::Unknown,
+                s => s,
+            },
+        });
+    }
+    (may, fresh)
 }
 
 // ── Expression evaluator ──────────────────────────────────────────────────────
@@ -144,14 +238,19 @@ fn eval_state_value(
         Expr::ObjectLit { .. } => StateValue::reference(Stability::PerRender),
         Expr::ArrayLit { .. } => StateValue::reference(Stability::PerRender),
         Expr::FnLit { .. } => StateValue::reference(Stability::PerRender),
-        Expr::NativeElem { .. } => StateValue::reference(Stability::Stable),
+        // An element is an object `createElement` allocates at every render
+        // (#200); a component's is evaluated for what its child does.
+        Expr::NativeElem { .. } => StateValue::reference(Stability::PerRender),
 
         Expr::CompApp {
             name,
             props,
             origin,
-            ..
-        } => eval_comp_app(name, props, origin.as_deref(), env, ctx),
+            span,
+        } => {
+            eval_comp_app(name, props, origin.as_deref(), *span, env, ctx);
+            StateValue::reference(Stability::PerRender)
+        }
 
         Expr::BinOp { op, lhs, rhs } => {
             let l = eval_state_value(lhs, env, ctx);
@@ -164,7 +263,7 @@ fn eval_state_value(
             eval_unary(op, v)
         }
 
-        Expr::Call { fn_, .. } if returns_fresh_reference(fn_) => {
+        Expr::Call { fn_, .. } if returns_fresh_reference(fn_, env, ctx) => {
             StateValue::reference(Stability::PerRender)
         }
         Expr::Call { .. } => StateValue::top(),
@@ -218,15 +317,21 @@ fn summary_value(sv: &crate::ir::expr::SummaryValue) -> StateValue {
 /// lets `always-unstable-deps` *prove* that `const items = arr.map(f)` in a
 /// deps array defeats memoization.
 ///
-/// Two exclusions keep the proof honest (FP-averse):
+/// Two cases keep the proof honest (FP-averse):
 /// - **kind-ambiguous methods** (`slice`, `concat`): on a string receiver
 ///   they return a *primitive*, which `Object.is` value-compares — claiming
-///   a per-render reference for `id.slice(0, 8)` would be a false proof.
-///   They stay ⊤ (silent).
+///   a per-render reference for `id.slice(0, 8)` would be a false proof. So
+///   the receiver decides: one that can only be a reference is copied; any
+///   other leaves the result ⊤ (#22). A nullish receiver is excluded too:
+///   `xs?.slice()` lowers as `xs.slice()` and hands back `undefined`.
 /// - **in-place methods** (`sort`, `reverse`, `fill`, `copyWithin`,
 ///   `Object.assign`): they return the receiver itself — same identity, the
 ///   opposite fact.
-fn returns_fresh_reference(callee: &Expr) -> bool {
+fn returns_fresh_reference(
+    callee: &Expr,
+    env: &AbstractEnv<StateValue>,
+    ctx: &mut AnalysisCtx<StateValue>,
+) -> bool {
     match callee {
         // `structuredClone(x)` always allocates a deep copy.
         Expr::Var(v) => v == "structuredClone",
@@ -235,6 +340,7 @@ fn returns_fresh_reference(callee: &Expr) -> bool {
             // string receiver has none of these).
             "map" | "filter" | "flat" | "flatMap" | "toSorted" | "toReversed" | "toSpliced"
             | "with" | "split" => true,
+            "slice" | "concat" => eval_state_value(obj, env, ctx).is_reference_only(),
             // Static allocators — receiver-restricted: a bare `.from`/`.keys`
             // on an unknown object could be anything.
             "from" | "of" => matches!(obj.as_ref(), Expr::Var(v) if v == "Array"),
@@ -244,7 +350,7 @@ fn returns_fresh_reference(callee: &Expr) -> bool {
             "parse" => matches!(obj.as_ref(), Expr::Var(v) if v == "JSON"),
             _ => false,
         },
-        Expr::TSAnnotated(inner) => returns_fresh_reference(inner),
+        Expr::TSAnnotated(inner) => returns_fresh_reference(inner, env, ctx),
         _ => false,
     }
 }
@@ -267,10 +373,7 @@ fn havoc_setter_props(
         // Bare setter prop (`<X onOpenChange={setOpen}/>`): the value
         // carries its owner (`StateSetter` always evals to a
         // `component_setter`, intra included).
-        let val = eval_state_value(v, env, ctx);
-        if let Some((c, l)) = val.as_setter() {
-            setters.push((*c, *l));
-        }
+        setters.extend(eval_state_value(v, env, ctx).setters());
         // Everything a function value can smuggle a setter through: spread
         // objects, closures wrapping a setter call, heap-allocated FnLits.
         collect_escaping_setters(v, env, ctx.heap, own, &mut setters, &mut HashSet::new());
@@ -309,7 +412,11 @@ fn collect_escaping_setters(
             setter_calls_in_cfg(body_cfg, env, None, heap, own, out, walked);
         }
         Expr::Var(name) => {
-            let Some(EnvVal::Loc { ids, .. }) = env.lookup_env_val(name) else {
+            let Some(EnvVal::Loc {
+                sites: Sites { ids, .. },
+                ..
+            }) = env.lookup_env_val(name)
+            else {
                 return;
             };
             for id in ids.iter().copied().collect::<Vec<_>>() {
@@ -319,11 +426,9 @@ fn collect_escaping_setters(
                     }) => {
                         setter_calls_in_cfg(body_cfg, env, Some(captured), heap, own, out, walked);
                     }
-                    Some(HeapValue::Obj(obj_fields)) => {
-                        for ev in obj_fields.values() {
-                            if let Some((c, l)) = ev.as_val().as_setter() {
-                                out.push((*c, *l));
-                            }
+                    Some(HeapValue::Obj(obj)) => {
+                        for ev in obj.values() {
+                            out.extend(ev.as_val().setters());
                         }
                     }
                     _ => {}
@@ -387,9 +492,7 @@ fn setter_calls_in_expr(
 ) {
     match e {
         Expr::Call { fn_, .. } => {
-            if let Some((c, l)) = callee_setter(fn_, env, captured, heap, own) {
-                out.push((c, l));
-            }
+            out.extend(callee_setter(fn_, env, captured, heap, own));
             e.for_each_child(&mut |c| {
                 setter_calls_in_expr(c, env, captured, heap, own, out, walked)
             });
@@ -405,7 +508,7 @@ fn setter_calls_in_expr(
     }
 }
 
-/// Resolve a call target to a setter, if it is one. Resolution order for
+/// Resolve a call target to the setters it may be. Resolution order for
 /// variables: the closure's captured environment (creation-time values),
 /// then the live env.
 fn callee_setter(
@@ -414,57 +517,62 @@ fn callee_setter(
     captured: Option<&HashMap<Symbol, StateValue>>,
     heap: &Heap,
     own: ComponentId,
-) -> Option<(ComponentId, crate::ir::types::HookLabel)> {
+) -> Vec<(ComponentId, crate::ir::types::HookLabel)> {
     match fn_ {
         // Direct state-binding reference: always the current component's.
-        Expr::StateSetter(l) => Some((own, *l)),
+        Expr::StateSetter(l) => vec![(own, *l)],
         Expr::Var(name) => {
             if let Some(cap) = captured
                 && let Some(v) = cap.get(name.as_str())
-                && let Some((c, l)) = v.as_setter()
             {
-                return Some((*c, *l));
+                let s = v.setters();
+                if !s.is_empty() {
+                    return s;
+                }
             }
-            env.lookup(name).as_setter().map(|(c, l)| (*c, *l))
+            env.lookup(name).setters()
         }
         // `props.onDone(...)`: chase the object's heap fields.
         Expr::FieldAccess { obj, field } => {
             let Expr::Var(o) = obj.as_ref() else {
-                return None;
+                return Vec::new();
             };
-            let Some(EnvVal::Loc { ids, .. }) = env.lookup_env_val(o) else {
-                return None;
+            let Some(EnvVal::Loc { sites, .. }) = env.lookup_env_val(o) else {
+                return Vec::new();
             };
-            for id in ids.iter().copied() {
-                if let Some(HeapValue::Obj(obj_fields)) = heap.get(id)
-                    && let Some(ev) = obj_fields.get(field)
-                    && let Some((c, l)) = ev.as_val().as_setter()
-                {
-                    return Some((*c, *l));
-                }
-            }
-            None
+            let (entries, _) = heap.members(&sites, field);
+            entries
+                .into_iter()
+                .flat_map(|ev| ev.as_val().setters())
+                .collect()
         }
         Expr::TSAnnotated(inner) => callee_setter(inner, env, captured, heap, own),
-        _ => None,
+        _ => Vec::new(),
     }
 }
 
-/// Evaluate a component application: inline child analysis if inter-component context present.
+/// Evaluate a component application for its effects: inline child analysis
+/// if inter-component context present.
 fn eval_comp_app(
     name: &Symbol,
     props_expr: &Expr,
     origin: Option<&CompOrigin>,
+    span: Option<crate::ir::SourceRange>,
     env: &AbstractEnv<StateValue>,
     ctx: &mut AnalysisCtx<StateValue>,
-) -> StateValue {
+) {
     let Some(inter) = ctx.inter else {
         // Intra-component analysis: every child is unanalyzable, so any
         // setter escaping into props may be invoked with any argument —
         // same argument as the unknown-child branch below (TODO.md B).
         havoc_setter_props(props_expr, env, ctx);
-        return StateValue::reference(Stability::Stable);
+        return;
     };
+    // What this element hands its child, and what the child writes back
+    // through it, were recorded when the input above this one was analysed.
+    if inter.probe {
+        return;
+    }
 
     // Registry lookup. The JSX callee name is only how the child was
     // *written*; who it is, is the `ComponentId` the registry resolves it to,
@@ -475,7 +583,7 @@ fn eval_comp_app(
             Some(id) => id,
             // Unreachable: `resolve_child` only answers with a key this
             // registry holds, and every one of those was interned.
-            None => return StateValue::reference(Stability::Stable),
+            None => return,
         },
         // A child the analysis cannot pin down may invoke any setter it
         // receives, with any argument, at any time (`<Sheet
@@ -497,7 +605,7 @@ fn eval_comp_app(
                 refs.insert((inter.component, name.clone()));
             }
             havoc_setter_props(props_expr, env, ctx);
-            return StateValue::reference(Stability::Stable);
+            return;
         }
     };
 
@@ -508,14 +616,14 @@ fn eval_comp_app(
         stats
             .recursive_component_refs
             .insert((inter.component, child));
-        return StateValue::reference(Stability::Stable);
+        return;
     }
     // Unreachable — `resolve_child` just resolved it — but an unknown child may
     // invoke any setter it received, so the fallback is the unknown-child one,
     // never a silent skip.
     let Some(child_ir) = inter.registry.ir_of(child).cloned() else {
         havoc_setter_props(props_expr, env, ctx);
-        return StateValue::reference(Stability::Stable);
+        return;
     };
 
     // Evaluate props → abstract map (EnvVals, preserving heap Locs for FnLit props)
@@ -526,77 +634,138 @@ fn eval_comp_app(
         .iter()
         .map(|(k, ev)| (k.clone(), ev.as_val()))
         .collect();
+    // The heap the child receives: everything its props reach, so a closure
+    // inside an object prop (`api={{ tick: cb }}`) is callable there (#216).
+    let props_heap = ctx.heap.reachable(
+        abstract_props_full
+            .values()
+            .filter_map(EnvVal::locs)
+            .flatten()
+            .copied(),
+    );
+    let cache_key = props_cache_key(&abstract_props, &props_heap);
+    record_call_site(inter, child, abstract_props, span);
+    record_site_input(inter, child, span, &abstract_props_full, &props_heap);
 
     // Cache lookup (strict equality)
-    if inter
-        .cache
-        .borrow()
-        .lookup(child, &abstract_props)
-        .is_some()
-    {
+    if inter.cache.borrow().contains(child, &cache_key) {
         inter.stats.borrow_mut().cache_hits += 1;
-        record_call_site(inter, child, abstract_props, None);
-        return StateValue::reference(Stability::Stable);
+        return;
     }
     inter.stats.borrow_mut().cache_misses += 1;
 
-    // Build child initial env + heap:
-    // - copy heap entries for any Loc-valued props (FnLit bodies) into child's heap
-    // - insert the Obj (with full EnvVals) so the child can resolve FieldAccess → Loc
-    let mut child_env = AbstractEnv::bottom();
-    let props_id = ExprId::fresh();
-    let mut initial_heap = crate::domains::stores::Heap::new();
-    for ev in abstract_props_full.values() {
-        if let EnvVal::Loc { ids, .. } = ev {
-            for &id in ids {
-                if let Some(hv) = ctx.heap.get(id) {
-                    initial_heap.insert(id, hv.clone());
+    // The child's entry in `results` is its analysis under the join of every
+    // call site's input (#175): one table slot per child, so the last site
+    // must not overwrite the others. A site the stored join covers adds
+    // nothing; any other re-runs the child under the new join.
+    let input = {
+        let mut inputs = inter.inputs.borrow_mut();
+        let joined = match inputs.get(&child) {
+            Some(stored) if stored.covers(&abstract_props_full, &props_heap) => None,
+            Some(stored) => Some(stored.join(&abstract_props_full, &props_heap)),
+            None => Some(crate::domains::ChildInput {
+                props_id: ExprId::fresh(),
+                props: abstract_props_full,
+                heap: props_heap,
+            }),
+        };
+        if let Some(j) = &joined {
+            inputs.insert(child, j.clone());
+        }
+        joined
+    };
+    let Some(input) = input else {
+        return;
+    };
+
+    let child_result = inter.child(child).analyze_under(&child_ir, input);
+
+    // Store result in the program-level results map and cache
+    inter.results.borrow_mut().insert(child, child_result);
+    inter.cache.borrow_mut().insert(child, cache_key);
+}
+
+/// Join one evaluation of an element into what it hands its child
+/// ([`crate::domains::InterCtx::site_inputs`]).
+fn record_site_input(
+    inter: &crate::domains::InterCtx<'_>,
+    child: ComponentId,
+    span: Option<crate::ir::SourceRange>,
+    props: &HashMap<Symbol, EnvVal<StateValue>>,
+    heap: &Heap,
+) {
+    let mut sites = inter.site_inputs.borrow_mut();
+    let site = sites
+        .entry((child, inter.component, span))
+        .or_insert_with(|| crate::domains::ChildInput {
+            props_id: ExprId::fresh(),
+            props: props.clone(),
+            heap: heap.clone(),
+        });
+    if !site.covers(props, heap) {
+        *site = site.join(props, heap);
+    }
+}
+
+/// What a child's analysis depends on, as the cache compares it: the props'
+/// values and the contents of the heap they reach — a closure's captured
+/// values, an object's members — under keys no prop name can take. Two
+/// renders passing `() => setN(n + 1)` pass the same reference, but the
+/// child runs the body under each `n`: a key without the captures answered
+/// the first one's result for every later `n`, and the loop it drives was
+/// never seen.
+fn props_cache_key(
+    props: &HashMap<Symbol, StateValue>,
+    reached: &Heap,
+) -> HashMap<Symbol, StateValue> {
+    let mut key = props.clone();
+    for (id, hv) in reached.iter() {
+        match hv {
+            HeapValue::Fn { captured, .. } => key.extend(
+                captured
+                    .iter()
+                    .map(|(v, val)| (format!("@{}:{v}", id.0), val.clone())),
+            ),
+            HeapValue::Obj(obj) => {
+                key.extend(
+                    obj.named
+                        .iter()
+                        .map(|(m, ev)| (format!("@{}.{m}", id.0), ev.as_val())),
+                );
+                key.extend(
+                    obj.others
+                        .iter()
+                        .map(|ev| (format!("@{}.*", id.0), ev.as_val())),
+                );
+                if obj.open {
+                    key.insert(format!("@{}.?", id.0), StateValue::top());
                 }
             }
         }
     }
-    initial_heap.insert(props_id, HeapValue::Obj(abstract_props_full.clone()));
-    child_env.extend_loc(child_ir.param.clone(), props_id);
-
-    // Create child inter context and analyze
-    let child_inter = inter.child(child);
-    let analyze_child = inter.analyze_child;
-    let child_result = analyze_child(&child_ir, child, child_env, initial_heap, &child_inter);
-
-    // Store result in the program-level results map and cache
-    inter
-        .results
-        .borrow_mut()
-        .insert(child, child_result.clone());
-    inter
-        .cache
-        .borrow_mut()
-        .insert(child, abstract_props.clone(), child_result);
-    record_call_site(inter, child, abstract_props, None);
-
-    StateValue::reference(Stability::Stable)
+    key
 }
 
 /// Evaluate field access: read the member off every heap object the receiver
-/// may denote (a whole member chain, not just a bare variable).
+/// may denote (a whole member chain, not just a bare variable), and, when the
+/// receiver may also be something no site places or a site does not record
+/// the member, what the member of anything is (#240).
 fn eval_field_access(
     obj: &Expr,
     field: &Symbol,
     env: &AbstractEnv<StateValue>,
     ctx: &mut AnalysisCtx<StateValue>,
 ) -> StateValue {
-    if let Some(ids) = resolve_locs(obj, env, ctx.heap) {
-        let vals: Vec<StateValue> = ids
-            .iter()
-            .filter_map(|id| ctx.heap.get(*id))
-            .filter_map(|hv| match hv {
-                HeapValue::Obj(fields) => fields.get(field).map(EnvVal::as_val),
-                _ => None,
-            })
-            .collect();
-        if !vals.is_empty() {
-            return vals.into_iter().reduce(|a, b| a.join(&b)).unwrap();
+    let (vals, open) = match resolve_locs(obj, env, ctx.heap) {
+        Some(sites) => {
+            let (entries, open) = ctx.heap.members(&sites, field);
+            (entries.into_iter().map(EnvVal::as_val).collect(), open)
         }
+        None => (Vec::new(), true),
+    };
+    let placed = vals.into_iter().reduce(|a: StateValue, b| a.join(&b));
+    if let Some(placed) = placed.as_ref().filter(|_| !open) {
+        return placed.clone();
     }
     // A field of a versioned object can change only at the object's own
     // setter events: keep the version labels instead of degrading to ⊤
@@ -605,10 +774,11 @@ fn eval_field_access(
     // conversion above; in-place writes have their own diagnostics
     // (`state-mutation`). ADR-017 §Limitations, member-deps.
     let obj_val = eval_state_value(obj, env, ctx);
-    StateValue {
+    let any = StateValue {
         reference: obj_val.versioned_reference().unwrap_or(Stability::Unknown),
         ..StateValue::top()
-    }
+    };
+    placed.map_or(any.clone(), |p| p.join(&any))
 }
 
 /// A **constant** index is a member read, and the heap answers it exactly as it
@@ -620,17 +790,18 @@ fn eval_field_access(
 /// per-member map a named member already uses (#37). Before this, every indexed
 /// read was ⊤, which is why jotai's setter looked unstable.
 ///
-/// A non-constant index stays ⊤: which element `xs[i]` denotes is #76's
-/// question, not this one. A negative index is not a member either.
+/// A key that is one string names that member too (`o["k"]`, `o[k]` with `k`
+/// one constant, #76). Any other index stays ⊤: which element `xs[i]`
+/// denotes is not a member read. A negative index is not a member either.
 fn eval_index_access(
     arr: &Expr,
     idx: &Expr,
     env: &AbstractEnv<StateValue>,
     ctx: &mut AnalysisCtx<StateValue>,
 ) -> StateValue {
-    match idx.peel_ts() {
-        Expr::Lit(Prim::Int(i)) if *i >= 0 => eval_field_access(arr, &i.to_string(), env, ctx),
-        _ => StateValue::top(),
+    match member_key(idx, env) {
+        Some(m) => eval_field_access(arr, &m, env, ctx),
+        None => StateValue::top(),
     }
 }
 
@@ -638,7 +809,8 @@ fn eval_index_access(
 ///
 /// Every prop carries its evaluated value; a prop that is (or aliases) a
 /// literal also carries the allocation sites, so the child can inline a
-/// callback prop's body or resolve a member of an object prop.
+/// callback prop's body or resolve a member of an object prop — an inline
+/// literal (`api={{ tick: cb }}`) is allocated as any literal is (#216).
 fn eval_props_map(
     props_expr: &Expr,
     env: &AbstractEnv<StateValue>,
@@ -648,24 +820,9 @@ fn eval_props_map(
         Expr::ObjectLit { fields, .. } => fields
             .iter()
             .map(|(k, v)| {
-                let ids = match v {
-                    // Inline FnLit prop: allocate a heap entry so the child can inline it.
-                    Expr::FnLit {
-                        id,
-                        params,
-                        body_cfg,
-                    } => {
-                        ctx.heap.alloc_fn(*id, params, body_cfg, env);
-                        Some(std::iter::once(*id).collect())
-                    }
-                    _ => resolve_locs(v, env, ctx.heap),
-                };
+                let sites = alloc_literal(&StateValueTransfer, v, env, ctx);
                 let val = eval_state_value(v, env, ctx);
-                let env_val = match ids {
-                    Some(ids) => EnvVal::Loc { ids, val },
-                    None => EnvVal::Val(val),
-                };
-                (k.clone(), env_val)
+                (k.clone(), EnvVal::located(sites, val))
             })
             .collect(),
         _ => HashMap::new(),
@@ -685,6 +842,7 @@ fn record_call_site(
             callee,
             props,
             location,
+            own: None,
         },
     );
 }
@@ -737,7 +895,10 @@ fn eval_binop(op: &BinOp, lhs: StateValue, rhs: StateValue) -> StateValue {
     match op {
         BinOp::Add => {
             if let (Some(a), Some(b)) = (as_arith(&lhs), as_arith(&rhs)) {
-                return StateValue::number(a.add(&b));
+                return a
+                    .add(&b)
+                    .map(StateValue::number)
+                    .unwrap_or_else(StateValue::top);
             }
             match (as_str_only(&lhs), as_str_only(&rhs)) {
                 (Some(StrConst::Set(a)), Some(StrConst::Set(b))) => {
@@ -751,18 +912,24 @@ fn eval_binop(op: &BinOp, lhs: StateValue, rhs: StateValue) -> StateValue {
                 _ => StateValue::top(),
             }
         }
+        // Exact on the numeric operands the interval domain can follow; where
+        // the result may be `NaN` (`∞ − ∞`, `0 × ∞`, `x % 0`, `(−1) ** 0.5`),
+        // which no interval holds, it is ⊤ like `/`.
         BinOp::Sub => match (as_arith(&lhs), as_arith(&rhs)) {
-            (Some(a), Some(b)) => StateValue::number(a.sub(&b)),
+            (Some(a), Some(b)) => a
+                .sub(&b)
+                .map(StateValue::number)
+                .unwrap_or_else(StateValue::top),
             _ => StateValue::top(),
         },
         BinOp::Mul => match (as_arith(&lhs), as_arith(&rhs)) {
-            (Some(a), Some(b)) => StateValue::number(a.mul(&b)),
+            (Some(a), Some(b)) => a
+                .mul(&b)
+                .map(StateValue::number)
+                .unwrap_or_else(StateValue::top),
             _ => StateValue::top(),
         },
         BinOp::Div => StateValue::top(),
-        // `%` and `**` are exact on the numeric operands the interval domain
-        // can follow (`Interval::rem`, `Interval::pow`); where the result may
-        // be `NaN`, which no interval holds, they are ⊤ like `/`.
         BinOp::Mod => match (as_arith(&lhs), as_arith(&rhs)) {
             (Some(a), Some(b)) => a
                 .rem(&b)
@@ -798,23 +965,26 @@ const I32_MIN: f64 = i32::MIN as f64;
 const I32_MAX: f64 = i32::MAX as f64;
 const U32_MAX: f64 = u32::MAX as f64;
 
+/// The integers in `[lo, hi]`, none of them `-0`: what a bitwise or shift
+/// operator returns (`ToInt32(-0)` is `+0`), or a boolean's `ToNumber`.
+fn int_range(lo: f64, hi: f64) -> Interval {
+    Interval {
+        lo,
+        hi,
+        is_int: true,
+        may_neg_zero: false,
+    }
+}
+
 /// Every value `x` such that `x = ToInt32(_)` — the range every bitwise and
 /// shift operator but `>>>` lands in.
 fn int32_range() -> Interval {
-    Interval {
-        lo: I32_MIN,
-        hi: I32_MAX,
-        is_int: true,
-    }
+    int_range(I32_MIN, I32_MAX)
 }
 
 /// The `>>>` range: unsigned, so a uint32.
 fn uint32_range() -> Interval {
-    Interval {
-        lo: 0.0,
-        hi: U32_MAX,
-        is_int: true,
-    }
+    int_range(0.0, U32_MAX)
 }
 
 /// The constant an operand denotes, when it denotes exactly one number.
@@ -851,20 +1021,12 @@ fn eval_bitwise(op: &BinOp, lhs: &StateValue, rhs: &StateValue) -> StateValue {
         BinOp::BitAnd => const_of(&r)
             .or_else(|| const_of(&l))
             .filter(|m| (0.0..=I32_MAX).contains(m))
-            .map(|m| Interval {
-                lo: 0.0,
-                hi: m,
-                is_int: true,
-            }),
+            .map(|m| int_range(0.0, m)),
         // `x | y` and `x ^ y` on non-negative operands cannot set a bit above
         // the highest one either operand could have.
         BinOp::BitOr | BinOp::BitXor => match (&l, &r) {
             (Some(a), Some(b)) if in_i32(a) && in_i32(b) && a.lo >= 0.0 && b.lo >= 0.0 => {
-                Some(Interval {
-                    lo: 0.0,
-                    hi: all_ones_above(a.hi.max(b.hi)),
-                    is_int: true,
-                })
+                Some(int_range(0.0, all_ones_above(a.hi.max(b.hi))))
             }
             _ => None,
         },
@@ -875,11 +1037,7 @@ fn eval_bitwise(op: &BinOp, lhs: &StateValue, rhs: &StateValue) -> StateValue {
             (Some(a), Some(k)) if in_i32(a) => {
                 let f = (1u64 << k) as f64;
                 let (lo, hi) = (a.lo * f, a.hi * f);
-                (lo >= I32_MIN && hi <= I32_MAX).then_some(Interval {
-                    lo,
-                    hi,
-                    is_int: true,
-                })
+                (lo >= I32_MIN && hi <= I32_MAX).then_some(int_range(lo, hi))
             }
             _ => None,
         },
@@ -888,21 +1046,15 @@ fn eval_bitwise(op: &BinOp, lhs: &StateValue, rhs: &StateValue) -> StateValue {
         BinOp::Shr => match (&l, const_of(&r).and_then(shift_amount)) {
             (Some(a), Some(k)) if in_i32(a) => {
                 let f = (1u64 << k) as f64;
-                Some(Interval {
-                    lo: (a.lo / f).floor(),
-                    hi: (a.hi / f).floor(),
-                    is_int: true,
-                })
+                Some(int_range((a.lo / f).floor(), (a.hi / f).floor()))
             }
             _ => None,
         },
         // `x >>> k` is unsigned: whatever `x` is, the result fits in the low
         // `32 - k` bits.
-        BinOp::UShr => const_of(&r).and_then(shift_amount).map(|k| Interval {
-            lo: 0.0,
-            hi: (u32::MAX >> k) as f64,
-            is_int: true,
-        }),
+        BinOp::UShr => const_of(&r)
+            .and_then(shift_amount)
+            .map(|k| int_range(0.0, (u32::MAX >> k) as f64)),
         _ => None,
     };
 
@@ -967,11 +1119,8 @@ fn eval_unary(op: &UnaryOp, val: StateValue) -> StateValue {
                 return StateValue::bottom();
             }
             let refined = as_arith(&val).filter(|i| !i.is_bottom()).and_then(|i| {
-                (i.lo >= I32_MIN && i.hi <= I32_MAX).then_some(Interval {
-                    lo: -i.hi.ceil() - 1.0,
-                    hi: -i.lo.floor() - 1.0,
-                    is_int: true,
-                })
+                (i.lo >= I32_MIN && i.hi <= I32_MAX)
+                    .then_some(int_range(-i.hi.ceil() - 1.0, -i.lo.floor() - 1.0))
             });
             StateValue::number(refined.unwrap_or_else(int32_range))
         }
@@ -998,11 +1147,7 @@ fn coerce_to_number(val: &StateValue) -> Option<StateValue> {
         return Some(StateValue::number(match val.boolean {
             BoolVal::True => Interval::point(1.0),
             BoolVal::False => Interval::point(0.0),
-            _ => Interval {
-                lo: 0.0,
-                hi: 1.0,
-                is_int: true,
-            },
+            _ => int_range(0.0, 1.0),
         }));
     }
     if let Some(StrConst::Set(set)) = as_str_only(val) {
@@ -1150,11 +1295,25 @@ mod tests {
             eval_binop(&BinOp::Mod, num(0.0, f64::INFINITY), num(3.0, 3.0)),
             num(0.0, 2.0)
         );
-        // Sign follows the dividend, and a small dividend bounds it further.
-        assert_eq!(
-            eval_binop(&BinOp::Mod, num(-5.0, 1.0), num(4.0, 4.0)),
-            num(-3.0, 1.0)
-        );
+        // Sign follows the dividend, and a small dividend bounds it further:
+        // `-4 % 4` is `-0` (#208).
+        let r = eval_binop(&BinOp::Mod, num(-5.0, 1.0), num(4.0, 4.0));
+        assert_eq!((r.num.lo, r.num.hi), (-3.0, 1.0));
+        assert!(r.num.neg_zero());
+    }
+
+    /// `-0` is the negation of `0`, which `Object.is` tells from `0`: a
+    /// negated zero is not the single value a literal `0` is (#208).
+    #[test]
+    fn a_negated_zero_is_not_a_single_value() {
+        let zero = StateValue::number(Interval::point(0.0));
+        assert!(zero.is_single_value());
+        let neg = eval_unary(&UnaryOp::Neg, zero.clone());
+        assert!(!neg.is_single_value());
+        assert_ne!(neg, zero);
+        assert!(!neg.is_same_value(&neg));
+        assert!(!neg.varying_primitives().is_bottom_value());
+        assert_eq!(neg.to_stability(), Stability::PerRender);
     }
 
     /// A divisor that may be zero makes the result `NaN`, which no interval
@@ -1189,6 +1348,30 @@ mod tests {
         );
     }
 
+    /// `0 × ∞` and `∞ − ∞` are `NaN`: ⊤, never the ⊥ the corner folds used to
+    /// give, which silently killed every value computed from it (#217).
+    #[test]
+    fn eval_binop_nan_from_infinite_bounds_is_top_not_bottom() {
+        let widened = num(f64::NEG_INFINITY, f64::INFINITY);
+        assert_eq!(
+            eval_binop(&BinOp::Mul, num(0.0, 0.0), widened.clone()),
+            StateValue::top()
+        );
+        assert_eq!(
+            eval_binop(&BinOp::Add, widened.clone(), widened.clone()),
+            StateValue::top()
+        );
+        assert_eq!(
+            eval_binop(&BinOp::Sub, widened.clone(), widened.clone()),
+            StateValue::top()
+        );
+        // One bounded side keeps the widened counter a number.
+        assert_eq!(
+            eval_binop(&BinOp::Add, num(0.0, f64::INFINITY), num(1.0, 1.0)),
+            num(1.0, f64::INFINITY)
+        );
+    }
+
     /// `in` and `instanceof` are always booleans: nothing else is known, but
     /// `num` and `str` stay ⊥, so a guard over them still narrows.
     #[test]
@@ -1215,6 +1398,7 @@ mod tests {
             lo,
             hi,
             is_int: true,
+            may_neg_zero: false,
         })
     }
 
@@ -1499,7 +1683,8 @@ mod tests {
             StateValue::number(Interval {
                 lo: 5.0,
                 hi: 6.0,
-                is_int: true
+                is_int: true,
+                may_neg_zero: false
             })
         );
     }
@@ -1679,7 +1864,8 @@ mod tests {
             StateValue::number(Interval {
                 lo: 0.0,
                 hi: 3.0,
-                is_int: true
+                is_int: true,
+                may_neg_zero: false
             })
         );
     }
@@ -1834,7 +2020,8 @@ mod tests {
             StateValue::number(Interval {
                 lo: 0.0,
                 hi: 1.0,
-                is_int: true
+                is_int: true,
+                may_neg_zero: false
             })
         );
         // The exit block returns `undefined`, loop or no loop.
@@ -1879,7 +2066,8 @@ mod tests {
             StateValue::number(Interval {
                 lo: 0.0,
                 hi: f64::INFINITY,
-                is_int: true
+                is_int: true,
+                may_neg_zero: false
             })
         );
     }
@@ -2061,7 +2249,8 @@ mod tests {
             StateValue::number(Interval {
                 lo: 0.0,
                 hi: 1.0,
-                is_int: true
+                is_int: true,
+                may_neg_zero: false
             })
         );
         assert_eq!(ret, StateValue::undefined());
@@ -2114,7 +2303,8 @@ mod tests {
             StateValue::number(Interval {
                 lo: 5.0,
                 hi: 6.0,
-                is_int: true
+                is_int: true,
+                may_neg_zero: false
             })
         );
         // The inner setOther(1) fired during the side-effect traversal.
@@ -2551,6 +2741,8 @@ mod tests {
                 params: vec![],
                 body_cfg: Arc::new(cb_body),
                 captured: std::collections::HashMap::new(),
+                captured_locs: std::collections::HashMap::new(),
+                owner: crate::test_support::C,
                 captured_slots: std::collections::HashMap::new(),
             },
         );

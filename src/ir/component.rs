@@ -81,3 +81,20 @@ pub struct ComponentIR {
     /// with their own machinery.
     pub module_consts: Arc<HashMap<Var, ModuleConstInit>>,
 }
+
+impl ComponentIR {
+    /// This component with every allocation site shifted by `base`: its
+    /// render body's and its hook bodies', which one file counter numbered
+    /// from zero ([`crate::ir::types::ExprId`]).
+    pub fn placed_at(self, base: u64) -> Self {
+        let off = crate::ir::Offsets {
+            labels: 0,
+            ids: base,
+        };
+        ComponentIR {
+            render_cfg: crate::ir::remap_cfg(self.render_cfg, off),
+            hooks: crate::ir::remap_hooks(self.hooks, off),
+            ..self
+        }
+    }
+}

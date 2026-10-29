@@ -121,7 +121,7 @@ impl Rule for MissingDeps {
                         },
                         Some(*label),
                         info.span,
-                        &crate::rules::api::witness::fallback_name,
+                        &ctx.names(&crate::rules::api::witness::fallback_name),
                     );
                     diags.push(d);
                 }

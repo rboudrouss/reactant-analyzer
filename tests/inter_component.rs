@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use reactant::{
     domains::{
         impls::{Stability, StateValue, interval::Interval},
-        stores::{AbstractEnv, EnvVal, MemoStore, StateStore},
+        stores::{AbstractEnv, EnvVal, MemoStore, Sites, StateStore},
     },
     engine::{
         ComponentRegistry, Config, HookRegistry, ProgramAnalysisResult, RootStrategy,
@@ -402,11 +402,16 @@ fn field_access_resolves_abstract_object_in_heap() {
         "onClick".to_string(),
         EnvVal::Val(StateValue::component_setter(parent, 0)),
     );
-    heap.insert(ExprId(1), reactant::domains::stores::HeapValue::Obj(fields));
+    heap.insert(
+        ExprId(1),
+        reactant::domains::stores::HeapValue::Obj(reactant::domains::stores::Members::exactly(
+            fields,
+        )),
+    );
 
     // Build env: props → loc ExprId(1)
     let mut env = AbstractEnv::bottom();
-    env.extend_loc("props".to_string(), ExprId(1));
+    env.bind_locs("props".to_string(), Some(Sites::closed([ExprId(1)])));
 
     let mut state = StateStore::bottom();
     let memo = MemoStore::new();
@@ -437,10 +442,15 @@ fn field_access_unknown_field_returns_top() {
         "onClick".to_string(),
         EnvVal::Val(StateValue::reference(Stability::Stable)),
     );
-    heap.insert(ExprId(1), reactant::domains::stores::HeapValue::Obj(fields));
+    heap.insert(
+        ExprId(1),
+        reactant::domains::stores::HeapValue::Obj(reactant::domains::stores::Members::exactly(
+            fields,
+        )),
+    );
 
     let mut env = AbstractEnv::bottom();
-    env.extend_loc("props".to_string(), ExprId(1));
+    env.bind_locs("props".to_string(), Some(Sites::closed([ExprId(1)])));
 
     let mut state = StateStore::bottom();
     let memo = MemoStore::new();
@@ -489,6 +499,239 @@ fn parse_and_analyze_with_strategy(src: &str, strategy: RootStrategy) -> Program
     );
     let reg = ComponentRegistry::from_components(components);
     analyze_program(reg, HookRegistry::new(), strategy, &Config::default())
+}
+
+// ── #175: a child's result covers every call site ─────────────────────────────
+
+/// The `infinite-loop` / `cross-component-infinite-loop` messages on
+/// `component`, sorted.
+fn loop_messages(src: &str, component: &str) -> Vec<String> {
+    use reactant::rules::{InfiniteLoop, Rule};
+    let result = parse_and_analyze(src);
+    let mut out: Vec<String> = InfiniteLoop
+        .check(&RuleCtx::new(
+            &result,
+            result.component_named(component).unwrap(),
+        ))
+        .into_iter()
+        .map(|d| d.message)
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn a_child_two_parents_render_reports_both_parents_in_any_order() {
+    let child = r#"
+import { useState, useEffect } from 'react';
+function Child({ v, set }: { v: object; set: (x: object) => void }) {
+  useEffect(() => { set({}); }, [v]);
+  return null;
+}
+"#;
+    let a = r#"
+export function A() {
+  const [a, setA] = useState({});
+  return <Child v={a} set={setA} />;
+}
+"#;
+    let b = r#"
+export function B() {
+  const [b, setB] = useState({});
+  return <Child v={b} set={setB} />;
+}
+"#;
+    for src in [format!("{child}{a}{b}"), format!("{child}{b}{a}")] {
+        let msgs = loop_messages(&src, "Child");
+        for parent in ["`A`", "`B`"] {
+            assert!(
+                msgs.iter().any(|m| m.contains(parent)),
+                "parent {parent} is reported: {msgs:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_last_call_site_of_a_child_does_not_hide_the_first() {
+    // L8: `step={0}` settles at once; analysed last, it used to be the only
+    // analysis of `Counter` left in the table.
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Counter({ step }: { step: number }) {
+  const [n, setN] = useState(0);
+  useEffect(() => { setN(n + step); }, [n]);
+  return <p>{n}</p>;
+}
+export function App() {
+  return (<div><Counter step={1} /><Counter step={0} /></div>);
+}
+"#;
+    assert!(
+        !loop_messages(src, "Counter").is_empty(),
+        "the `step={{1}}` instance loops"
+    );
+}
+
+// ── #243: a prop called through the props object ──────────────────────────────
+
+/// A child whose parameter is `param` calling the parent's closure as `call`
+/// in an effect whose deps argument is `deps`.
+fn props_member_child(param: &str, call: &str, deps: &str) -> String {
+    format!(
+        r#"
+import {{ useState, useEffect }} from 'react';
+function Child({param}: {{ f: () => void }}) {{
+  useEffect(() => {{ {call}; }}{deps});
+  return <div />;
+}}
+export function App() {{
+  const [v, setV] = useState(0);
+  return <Child f={{() => setV((x) => x + 1)}} />;
+}}
+"#
+    )
+}
+
+#[test]
+fn a_prop_called_through_the_props_object_closes_the_loop_as_destructured() {
+    let member = loop_messages(&props_member_child("props", "props.f()", ""), "Child");
+    assert_eq!(member.len(), 1, "{member:?}");
+    assert!(member[0].contains("`App`"), "{member:?}");
+    let destructured = loop_messages(&props_member_child("{ f }", "f()", ""), "Child");
+    assert_eq!(destructured.len(), 1, "{destructured:?}");
+}
+
+#[test]
+fn a_prop_called_through_the_props_object_in_a_mount_only_effect_is_no_loop() {
+    let msgs = loop_messages(&props_member_child("props", "props.f()", ", []"), "Child");
+    assert!(msgs.is_empty(), "{msgs:?}");
+}
+
+#[test]
+fn a_prop_called_through_the_props_object_in_render_writes_the_parent() {
+    use reactant::rules::{Rule, SetterInRender};
+    let src = r#"
+import { useState } from 'react';
+function Child(props: { onChange: (d: number) => void }) {
+  props.onChange(1);
+  return <div />;
+}
+export function App() {
+  const [v, setV] = useState(0);
+  return <Child onChange={(d) => setV((x) => x + d)} />;
+}
+"#;
+    let result = parse_and_analyze(src);
+    let diags = SetterInRender.check(&RuleCtx::new(
+        &result,
+        result.component_named("Child").unwrap(),
+    ));
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.rule == "cross-setter-in-render"
+                && d.var.as_deref() == Some("props.onChange")),
+        "{diags:?}"
+    );
+}
+
+/// `files` (`(path, source)`), each lowered on its own as the driver does:
+/// every file numbers its allocation sites from zero.
+fn analyze_files(files: &[(&str, &str)]) -> ProgramAnalysisResult {
+    use oxc_allocator::Allocator;
+    use oxc_parser::{ParseOptions, Parser};
+    use oxc_span::SourceType;
+    use reactant::lowering::lower_program;
+
+    let mut table = Default::default();
+    let mut components = Vec::new();
+    for (path, src) in files {
+        let alloc = Allocator::default();
+        let ret = Parser::new(&alloc, src, SourceType::tsx())
+            .with_options(ParseOptions::default())
+            .parse();
+        assert!(ret.diagnostics.is_empty(), "{:?}", ret.diagnostics);
+        components.extend(lower_program(
+            &ret.program,
+            src,
+            std::path::Path::new(path),
+            &mut table,
+        ));
+    }
+    analyze_program(
+        ComponentRegistry::from_components(components),
+        HookRegistry::new(),
+        RootStrategy::Heuristic,
+        &Config::default(),
+    )
+}
+
+#[test]
+fn a_parent_closure_is_not_the_child_closure_its_file_numbered_alike() {
+    // #247: the parent's `() => setV(…)` and the child's `g` were both their
+    // file's first closure; in the child's heap the one replaced the other.
+    use reactant::rules::{InfiniteLoop, Rule};
+    let app = r#"
+import { useState } from "react";
+import { Child } from "./Child";
+export function App() {
+  const [v, setV] = useState(0);
+  return <Child f={() => setV((x) => x + 1)} />;
+}
+"#;
+    let child = r#"
+import { useEffect } from "react";
+export function Child({ f }: { f: () => void }) {
+  const g = () => 0;
+  const h = () => 1;
+  useEffect(() => {
+    f();
+  });
+  return <div>{g() + h()}</div>;
+}
+"#;
+    let result = analyze_files(&[("/p/App.tsx", app), ("/p/Child.tsx", child)]);
+    let diags = InfiniteLoop.check(&RuleCtx::new(
+        &result,
+        result.component_named("Child").unwrap(),
+    ));
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.rule == "cross-component-infinite-loop"),
+        "{diags:?}"
+    );
+}
+
+#[test]
+fn a_parent_prop_is_not_the_child_closure_its_file_numbered_alike() {
+    // #247, the memos `PagedMemoList` shape: `props.render` read as the
+    // child's own `apply`, and `apply`'s write as a render write.
+    use reactant::rules::{Rule, SetterInRender};
+    let app = r#"
+import { List } from "./List";
+export function App() {
+  return <List render={(x: number) => <b key={x}>{x}</b>} />;
+}
+"#;
+    let list = r#"
+import { useLayoutEffect, useState, type ReactElement } from "react";
+export function List(props: { render: (x: number) => ReactElement }) {
+  const [wide, setWide] = useState(false);
+  useLayoutEffect(() => {
+    const apply = () => setWide(true);
+    apply();
+  }, []);
+  return <div>{[1, 2].map((x) => props.render(x))}{String(wide)}</div>;
+}
+"#;
+    let result = analyze_files(&[("/p/App.tsx", app), ("/p/List.tsx", list)]);
+    let diags = SetterInRender.check(&RuleCtx::new(
+        &result,
+        result.component_named("List").unwrap(),
+    ));
+    assert!(diags.is_empty(), "{diags:?}");
 }
 
 #[test]
@@ -772,7 +1015,8 @@ fn nativeelem_children_compapps_are_analyzed() {
         StateValue::number(Interval {
             lo: 1.0,
             hi: 2.0,
-            is_int: true
+            is_int: true,
+            may_neg_zero: false
         }),
         "Both CompApp children inside NativeElem should be analyzed; \
          SharedStateStore[(App,0)] = join(1,2) = [1,2]"

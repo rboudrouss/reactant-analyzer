@@ -84,7 +84,7 @@ pub(crate) fn collect_slot_seeds(
     render_cfg: &CFG,
     hooks: &[HookEntry],
     param: &Var,
-    setter_labels: &HashMap<Var, HookLabel>,
+    setter_labels: &crate::engine::setters::SetterTargets,
     slot_writers: &[SlotWriter],
     effect_info: &HashMap<HookLabel, EffectInfo>,
 ) -> Vec<SlotSeed> {
@@ -100,11 +100,7 @@ pub(crate) fn collect_slot_seeds(
             continue;
         }
 
-        let aliases: HashSet<Var> = setter_labels
-            .iter()
-            .filter(|(_, l)| **l == *label)
-            .map(|(v, _)| v.clone())
-            .collect();
+        let aliases: HashSet<Var> = setter_labels.aliases_of(*label);
 
         // The two slot-level kills, read off the writer relation: a
         // render-time write (the adjust-during-render pattern — a sync path
@@ -159,7 +155,7 @@ pub(crate) fn collect_slot_seeds(
             let covered = effects.iter().any(|l| {
                 effect_info.get(l).is_some_and(|i| match &i.deps {
                     DepsArg::Absent => true,
-                    DepsArg::Opaque => false,
+                    DepsArg::Opaque(_) => false,
                     DepsArg::List(d) => deps_cover_seed(&d.covering(), &seed, param, &bindings),
                 })
             });
@@ -491,6 +487,33 @@ mod chase_tests {
         assert!(
             got.iter().all(|(_, exact)| !exact),
             "a member behind a spread cannot be claimed exact: {got:?}"
+        );
+    }
+
+    #[test]
+    fn a_member_a_computed_key_may_have_overwritten_is_not_resolved() {
+        // `{ seed, [k]: other }`: `k` may be `"seed"` (#76).
+        let cfg = single_block_cfg(vec![
+            let_("__obj", Expr::Var("__p0".to_string())),
+            let_("seed", field("__obj", "seed")),
+            let_(
+                "opts",
+                Expr::ObjectLit {
+                    id: ExprId(0),
+                    fields: vec![
+                        ("seed".to_string(), Expr::Var("seed".to_string())),
+                        (
+                            format!("{}0", crate::ir::expr::COMPUTED_KEY_PREFIX),
+                            Expr::Var("other".to_string()),
+                        ),
+                    ],
+                },
+            ),
+        ]);
+        let got = chase(&cfg, path("opts", &["seed"]));
+        assert!(
+            got.iter().all(|(_, exact)| !exact),
+            "a member behind a computed key cannot be claimed exact: {got:?}"
         );
     }
 

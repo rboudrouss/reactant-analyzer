@@ -97,12 +97,14 @@ impl Arity {
 ///   a declared-but-incomplete array; the engine simply cannot see one element
 ///   of it. Reading this as `Absent` skips the hook; reading it as an empty
 ///   list claims it declares nothing. Both are wrong, in opposite directions.
+///   The argument is kept: a custom hook's parameter becomes the caller's
+///   written array once the hook is inlined (#230).
 /// - [`DepsArg::List`] — a written array literal, with whatever the lowering
 ///   could keep of it.
 #[derive(Debug, Clone)]
 pub enum DepsArg {
     Absent,
-    Opaque,
+    Opaque(Expr),
     List(DepsList),
 }
 
@@ -122,7 +124,7 @@ impl DepsArg {
                 arity,
                 spread_at,
             }),
-            _ => DepsArg::Opaque,
+            other => DepsArg::Opaque(other),
         }
     }
 
@@ -138,7 +140,7 @@ impl DepsArg {
     pub fn list(&self) -> Option<&DepsList> {
         match self {
             DepsArg::List(l) => Some(l),
-            DepsArg::Absent | DepsArg::Opaque => None,
+            DepsArg::Absent | DepsArg::Opaque(_) => None,
         }
     }
 
@@ -149,10 +151,11 @@ impl DepsArg {
         !matches!(self, DepsArg::Absent)
     }
 
-    pub fn map_exprs(self, f: impl FnMut(Expr) -> Expr) -> Self {
+    pub fn map_exprs(self, mut f: impl FnMut(Expr) -> Expr) -> Self {
         match self {
             DepsArg::List(l) => DepsArg::List(l.map_exprs(f)),
-            other => other,
+            DepsArg::Opaque(e) => DepsArg::Opaque(f(e)),
+            DepsArg::Absent => DepsArg::Absent,
         }
     }
 }
@@ -279,6 +282,10 @@ pub enum HookEntry {
         /// of any same-named outer binding (`(options) => …` shadowing a
         /// component-scope `options`).
         params: Vec<Var>,
+        /// The argument is a function literal, so every recompute hands back
+        /// a new function. Any other argument (`useCallback(f, deps)`) is
+        /// handed back as it is, whatever it is.
+        literal: bool,
         /// See [`HookEntry::Memo`]'s `deps`.
         deps: DepsArg,
         span: Option<SourceRange>,
@@ -357,6 +364,18 @@ impl HookEntry {
             | HookEntry::Callback { body_cfg, .. }
             | HookEntry::Handler { body_cfg, .. } => Some(body_cfg),
             HookEntry::State { .. } | HookEntry::Ref { .. } | HookEntry::Custom { .. } => None,
+        }
+    }
+
+    /// The deps argument of the hook kinds that take one (`Effect`, `Memo`,
+    /// `Callback`, `Custom`). Exhaustive for the reason [`Self::body_cfg`] is.
+    pub fn deps_mut(&mut self) -> Option<&mut DepsArg> {
+        match self {
+            HookEntry::Effect { deps, .. }
+            | HookEntry::Memo { deps, .. }
+            | HookEntry::Callback { deps, .. }
+            | HookEntry::Custom { deps, .. } => Some(deps),
+            HookEntry::State { .. } | HookEntry::Ref { .. } | HookEntry::Handler { .. } => None,
         }
     }
 }

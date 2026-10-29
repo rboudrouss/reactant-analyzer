@@ -9,22 +9,32 @@
 //! (`written::Change`), and an edge exists unless its convergence is proven
 //! — the graph no longer looks for growth: a toggle `!on` closes an edge as
 //! surely as a counter. What settles a write: it stores the slot's own
-//! content; it stores one value known in advance and no other write moves
+//! content; every write of its slot stores a value the slot held, current
+//! or stale, so the slot never leaves its initial value (#223); it stores
+//! one value known in advance and no other write moves
 //! the slot away; it reads neither the trigger nor its own slot
-//! (`Invariance::reads`), so the re-run stores what the last run did; every
+//! (`Invariance::reads`) and crosses no call whose result may differ on
+//! the same inputs (`guards::call_may_differ`, #218, #224), so
+//! the re-run stores what the last run did — unless a read moved in
+//! between, which is why every slot such a write reads is an edge into its
+//! slot, trigger or not (#204); every
 //! write of the slot moves it one way by a constant into a finite interval
 //! (`moves_one_way`); or the guard proofs below.
 //!
 //! Nothing is walked here. The writes are the effect-region rows of
 //! `slot_writers`, the re-run triggers the rows of `effect_triggers`, and the
-//! graph is the product of the two, per effect, program-wide. Edge strength:
-//! - `Must`: the dep on x is the exact slot (must-rerun) ∧ the fresh write to
+//! graph is the product of the two, per effect, program-wide. An effect whose
+//! re-run class (`triggers::Rerun`) is `Always` is read as one with no
+//! dependency array: an edge from every slot its write reads. Edge strength:
+//! - `Must`: the dep on x is the exact slot (must-rerun), or the effect
+//!   surely re-runs after every render (no deps array, a fresh dep) ∧ the fresh write to
 //!   y sits in a block on all paths of the body (must-reach) ∧ the written
 //!   value is a new reference every call (`Change::Must`) ∧ so is every
 //!   other write of y, program-wide: React re-renders on the batch's last
 //!   value, and a later `setY(y)` in the same batch undoes the fresh one
-//!   (#188) ∧ every parent keeps the component mounted, or it is a root.
-//!   An all-must cycle ⇒ Error.
+//!   (#188) ∧ the component stays mounted: every element that mounts it
+//!   keeps it, and its parent stays in turn (#213). An all-must cycle ⇒
+//!   Error.
 //! - `May`: the dep is merely versioned by x, or the write is conditional,
 //!   nested, deferred or imprecise.
 //!
@@ -45,10 +55,19 @@
 //! in another component has guards this component's env cannot read, so
 //! such a slot is never killed; a handler row needs a user event and is not
 //! a site. One kill, one proof, for the dep-driven same-slot edge too. The
-//! proof reads facts over props only in a component no effect of which
-//! reacts to a parent slot: a loop can enter a component through its props
-//! only by such a dep, and then the props may move on any cycle through it,
-//! whichever edge the cycle takes.
+//! proof reads facts over props only in a component whose props hold: no
+//! write the loop can run moves a slot of an ancestor on the component tree,
+//! and no effect of it reacts to another component's slot. Otherwise the
+//! props may move on any cycle through it, whichever edge the cycle takes —
+//! an effect with no deps array re-runs on them with no trigger row (#206).
+//!
+//! **The props node** `P_c` (#207): its in-edges are the ancestors' slots a
+//! write the loop runs moves, so the props hold exactly when none enters
+//! it. Out of it go an edge into a write that reads a prop of an effect a
+//! prop re-runs, and a mount edge into every effect write of a component
+//! that does not stay mounted, which fires again at each mount whatever its
+//! certificates say. The node is eliminated: its out-edges are pushed from
+//! each in-edge's slot, so every edge keeps its carrying effect.
 //!
 //! **What is a site** (#162): every non-handler row of an effect, render
 //! or memo body — a `setter-in-render` write revives what it revives — and,
@@ -68,29 +87,34 @@
 //! partition. The cycle search skips it; the self-churn arm reads only it.
 //! Every other edge is the graph arm's.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::{
     domains::{AbstractEnv, StateValue},
     engine::{
-        AnalysisResult, Change, ConvergedEval, EffectTrigger, ProgramAnalysisResult, SlotWriter,
-        WriterPhase, WriterRegion,
+        AnalysisResult, Change, ConvergedEval, EffectTrigger, HookKind, ProgramAnalysisResult,
+        SlotWriter, WriterPhase, WriterRegion,
         dominance::on_all_paths,
         guards::{
-            Invariance, WriteSite, converges_under_all_writes, let_bindings, mutated_roots,
-            navigates, site_guards,
+            Invariance, MemberWrites, SlotPath, WriteSite, call_may_differ,
+            converges_under_all_writes, let_bindings, must_slot_paths, mutated_roots, navigates,
+            site_guards,
         },
         render_deps::written_names,
-        setters::{memo_val_labels, resolve_setter_aliases, state_val_labels},
+        setters::{
+            memo_val_labels, must_alias_scopes, must_state_vals, resolve_setter_aliases,
+            state_val_labels,
+        },
+        triggers::{Always, Rerun},
         triggers_of,
-        written::churning_part,
+        written::{Written, churning_part, keeps_initial},
     },
     ir::{
         ComponentId, QualifiedSlot, SourceRange,
         bindings::local_bindings,
         cfg::{CFG, Terminator},
-        expr::{CompOrigin, Expr, SPREAD_KEY_PREFIX, object_member},
-        hooks::{Arity, HookEntry},
+        expr::{Expr, SPREAD_KEY_PREFIX, object_member},
+        hooks::HookEntry,
         types::{BlockId, HookLabel, Symbol, Var},
     },
 };
@@ -112,11 +136,28 @@ pub struct ChurnEdge {
     pub component: ComponentId,
     pub effect_label: HookLabel,
     pub write_span: Option<SourceRange>,
-    /// The carrying effect has no dependency array.
-    pub no_deps: bool,
+    /// The edge exists because the carrying effect re-runs after every render
+    /// (its re-run class, `engine::triggers::Rerun::Always`, or a call
+    /// site's own), and why.
+    pub always: Option<EveryRender>,
     /// A dep-driven edge from a slot into itself: the self-churn arm's
     /// partition (ADR-020 item 2). Never part of a cycle the graph reports.
     pub self_slot: bool,
+}
+
+/// Why an effect re-runs after every render, as the edges it carries say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EveryRender {
+    /// No dependency array, a dep that is a new reference every render, …
+    pub why: Always,
+    /// It surely does: a fresh dep the parent allocates is new only when the
+    /// parent re-renders.
+    pub surely: bool,
+    /// Empty: the component's result says it, wherever it renders. Otherwise
+    /// the parents through whose elements alone the dep is a new reference
+    /// at every render, a fact their join loses (#175, #237): it re-runs
+    /// after every render there, and only may elsewhere.
+    pub through: BTreeSet<ComponentId>,
 }
 
 /// One churn cycle: indices into the edge list, in cycle order
@@ -168,20 +209,143 @@ fn node_of(component: ComponentId, w: &SlotWriter) -> QualifiedSlot {
     (w.owner.unwrap_or(component), w.slot)
 }
 
+/// The slots that never leave their initial value: every write of the slot,
+/// program-wide, stores a value it held, and its setter reaches nothing the
+/// rows do not describe (`written::keeps_initial`, #223).
+fn initial_only_slots(result: &ProgramAnalysisResult) -> HashSet<QualifiedSlot> {
+    let mut rows: HashMap<QualifiedSlot, Vec<&Written>> = HashMap::new();
+    for (&c, r) in &result.components {
+        for w in &r.slot_writers {
+            rows.entry(node_of(c, w)).or_default().push(&w.written);
+        }
+    }
+    let mut escaping: HashMap<ComponentId, HashSet<HookLabel>> = HashMap::new();
+    rows.into_iter()
+        .filter(|((owner, label), written)| {
+            let escapes = match result.components.get(owner) {
+                Some(r) => escaping
+                    .entry(*owner)
+                    .or_insert_with(|| r.escaping_slots())
+                    .contains(label),
+                None => true,
+            };
+            keeps_initial(written.iter().copied(), escapes)
+        })
+        .map(|(slot, _)| slot)
+        .collect()
+}
+
+/// One element of a component in another one's render: where it mounts.
+struct Element<'a> {
+    /// The component whose render builds the element, and hands it its
+    /// props.
+    parent: ComponentId,
+    /// The element is built inside a closure (`items.map(i => <Child/>)`),
+    /// which mounts it once per item the loop may add.
+    closure: bool,
+    /// What must hold still in the parent for the element to stay mounted:
+    /// the guards of its block and its `key`.
+    held: Vec<&'a Expr>,
+}
+
+/// The program's component tree, child → the elements that mount it (#213).
+/// A component another one renders only through a value the lowering cannot
+/// place (`origin: None`) has no element here.
+type ComponentTree<'a> = HashMap<ComponentId, Vec<Element<'a>>>;
+
+fn component_tree(result: &ProgramAnalysisResult) -> ComponentTree<'_> {
+    /// Every node under `e`, with whether it sits inside a closure.
+    fn walk<'a>(e: &'a Expr, closure: bool, f: &mut dyn FnMut(&'a Expr, bool)) {
+        f(e, closure);
+        if let Expr::FnLit { body_cfg, .. } = e {
+            body_cfg.for_each_expr(&mut |x| walk(x, true, f));
+        }
+        e.for_each_child(&mut |c| walk(c, closure, f));
+    }
+    let mut tree: ComponentTree = HashMap::new();
+    for (&parent, r) in &result.components {
+        let cfg = &r.render_cfg;
+        for block in cfg.blocks.values() {
+            let guards: Vec<&Expr> = site_guards(cfg, block.id)
+                .into_iter()
+                .map(|(c, _)| c)
+                .collect();
+            block.for_each_expr(&mut |e| {
+                walk(e, false, &mut |e, closure| {
+                    let Expr::CompApp {
+                        origin: Some(o),
+                        props,
+                        ..
+                    } = e
+                    else {
+                        return;
+                    };
+                    let Some(child) = result.component_table.id_of(o) else {
+                        return;
+                    };
+                    if child == parent {
+                        return;
+                    }
+                    let mut held = guards.clone();
+                    if let Expr::ObjectLit { fields, .. } = props.peel_ts()
+                        && let Some(key) = object_member(fields, "key")
+                    {
+                        held.push(key);
+                    }
+                    tree.entry(child).or_default().push(Element {
+                        parent,
+                        closure,
+                        held,
+                    });
+                });
+            });
+        }
+    }
+    tree
+}
+
+/// Every component whose render builds `c`'s element or an ancestor's: the
+/// components whose re-render may hand `c` new props.
+fn ancestors(c: ComponentId, tree: &ComponentTree<'_>) -> HashSet<ComponentId> {
+    let mut seen: HashSet<ComponentId> = HashSet::new();
+    let mut stack = vec![c];
+    while let Some(x) = stack.pop() {
+        for e in tree.get(&x).into_iter().flatten() {
+            if seen.insert(e.parent) {
+                stack.push(e.parent);
+            }
+        }
+    }
+    seen
+}
+
 /// Build all churn edges of the program.
 pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
     // Per-component facts the proofs read.
     struct CompCtx<'a> {
+        /// The names some render binding ties to a slot's read: a may
+        /// reading, for what may move.
         state_vals: HashMap<Var, HookLabel>,
+        /// The names the render binds to a slot's read on every path, no
+        /// other body rebinding them (`setters::must_state_vals`): what the
+        /// proofs may read as the slot itself (#210, #222).
+        must_state_vals: HashMap<Var, HookLabel>,
+        /// `must_state_vals` with the names bound to a member path of a
+        /// slot's read (`guards::must_slot_paths`, #244): what the
+        /// convergence proof reads a guard's names through.
+        slot_paths: HashMap<Var, SlotPath>,
+        /// The member writes into each slot's object, in any body (#252).
+        members: MemberWrites<'a>,
         memo_vals: HashMap<Var, HookLabel>,
         memo_deps: HashMap<HookLabel, &'a [Expr]>,
         render_lets: HashMap<&'a str, Option<&'a Expr>>,
         mutated: HashSet<Var>,
-        /// No effect of the component reacts to another component's slot, so
-        /// no loop enters it through its props: they hold across every loop
-        /// its edges can be on. One dep versioned by a parent slot, and the
-        /// props may move on any cycle through the component — the proofs
-        /// then read no fact over them.
+        /// The props hold across every loop the component's edges can be on:
+        /// no write the loop can run moves a slot of an ancestor (#206), and
+        /// no effect of the component reacts to another component's slot.
+        /// Otherwise the props may move on any cycle through the component —
+        /// the proofs then read no fact over them. An effect with no deps
+        /// array has no trigger row, so the rows alone cannot say it.
         props_hold: bool,
         /// The render exit env: what the proofs narrow from.
         exit: AbstractEnv<StateValue>,
@@ -194,11 +358,15 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         comp_result: &'a AnalysisResult<StateValue>,
         body_cfg: &'a CFG,
         effect_label: HookLabel,
-        no_deps: bool,
+        /// The effect re-runs after every render, why, and whether that is
+        /// certain: what its no-dependency-array path reads.
+        always: Option<EveryRender>,
         deps: &'a [Expr],
         triggers: Vec<&'a EffectTrigger>,
         exact_local: HashSet<HookLabel>,
         versioned: HashSet<QualifiedSlot>,
+        /// A dep may move with the props: `P_c` is a trigger (#207).
+        props: bool,
         writes: Vec<&'a SlotWriter>,
     }
     /// One write site of a slot, with the body it sits in (module doc,
@@ -229,6 +397,40 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 .any(|b| navigates(b, &render))
     });
 
+    // The component tree (#213), and the components a write the loop can run
+    // may move a slot of: a write through a callback prop included, so
+    // wherever it sits — the child itself, a sibling subtree (#206).
+    let tree = component_tree(result);
+    let moved: HashSet<QualifiedSlot> = result
+        .components
+        .iter()
+        .flat_map(|(&c, r)| {
+            r.slot_writers
+                .iter()
+                .filter(|w| w.phase != WriterPhase::Handler)
+                .map(move |w| node_of(c, w))
+        })
+        .collect();
+    // The props node `P_c` (#207), by its in-edges: every slot of an
+    // ancestor some write the loop can run moves — `P_parent → P_c` is
+    // folded in, the ancestors being transitive. An edge out of `P_c` is
+    // pushed from each of them, so every edge stays a slot-to-slot write
+    // edge with its carrying effect.
+    let props_in: HashMap<ComponentId, Vec<QualifiedSlot>> = result
+        .components
+        .keys()
+        .map(|&c| {
+            let up = ancestors(c, &tree);
+            let mut v: Vec<QualifiedSlot> = moved
+                .iter()
+                .filter(|s| up.contains(&s.0))
+                .copied()
+                .collect();
+            v.sort();
+            (c, v)
+        })
+        .collect();
+
     for (&comp, comp_result) in &result.components {
         let cfg = &comp_result.render_cfg;
         let mut mutated = module_written.clone();
@@ -236,10 +438,17 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         for body in comp_result.hooks.iter().filter_map(HookEntry::body_cfg) {
             mutated.extend(mutated_roots(body));
         }
+        let state_vals = resolve_setter_aliases(cfg, &state_val_labels(cfg));
+        let scopes = must_alias_scopes(cfg, &comp_result.hooks);
+        let must_state_vals = must_state_vals(cfg, &scopes);
+        let slot_paths = must_slot_paths(cfg, &scopes, &must_state_vals);
         ctxs.insert(
             comp,
             CompCtx {
-                state_vals: resolve_setter_aliases(cfg, &state_val_labels(cfg)),
+                state_vals,
+                must_state_vals,
+                slot_paths,
+                members: MemberWrites::of(comp_result),
                 memo_vals: resolve_setter_aliases(cfg, &memo_val_labels(cfg)),
                 memo_deps: comp_result
                     .hooks
@@ -255,35 +464,44 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     .collect(),
                 render_lets: let_bindings(cfg),
                 mutated,
-                props_hold: comp_result.effect_triggers.iter().all(|t| t.slot.0 == comp),
+                // An effect's rows: a memo's write is a render-phase write,
+                // whose re-runs the render's own sites already stand for.
+                props_hold: comp_result
+                    .effect_triggers
+                    .iter()
+                    .filter(|t| {
+                        comp_result
+                            .effect_info
+                            .get(&t.hook)
+                            .is_some_and(|i| i.kind == HookKind::Effect)
+                    })
+                    .all(|t| t.slot.0 == comp)
+                    && props_in[&comp].is_empty(),
                 exit: comp_result.exit_env(),
             },
         );
     }
+
+    // Which components stay mounted across the loop, on the component tree
+    // (#162, #213).
+    let mut stays_memo: HashMap<ComponentId, bool> = HashMap::new();
+    let kept_mounted: HashMap<ComponentId, bool> = result
+        .components
+        .keys()
+        .map(|&c| {
+            (
+                c,
+                stays(c, &tree, result, &ctxs, navigates, &mut stays_memo),
+            )
+        })
+        .collect();
 
     for (&comp, comp_result) in &result.components {
         let cfg = &comp_result.render_cfg;
         let hook = |label: HookLabel| comp_result.hooks.iter().find(|h| h.label() == label);
         // Mount-only effects fire once for a component that stays mounted —
         // but only an array the engine knows is empty says so.
-        let mount_only = |label: HookLabel| {
-            matches!(hook(label), Some(HookEntry::Effect { deps, .. })
-                if matches!(deps.list(), Some(d) if d.arity == Arity::Exact(0)))
-        };
-        // Does the owner of a slot this component writes from a mount-only
-        // effect keep this component mounted across the loop (#162)? An
-        // owner that renders it nowhere — the child reached through another
-        // component — fails closed.
-        let stays_mounted = |owner: ComponentId| {
-            let Some(child) = result.component_table.origin(comp) else {
-                return false;
-            };
-            let (Some(parent), Some(pctx)) = (result.components.get(&owner), ctxs.get(&owner))
-            else {
-                return false;
-            };
-            stays_mounted(parent, pctx, &invariance_of(pctx, navigates), child) == Some(true)
-        };
+        let mount_only = |label: HookLabel| comp_result.rerun(label) == Some(Rerun::MountOnly);
         for w in comp_result
             .slot_writers
             .iter()
@@ -296,7 +514,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     None => None,
                     // A child the loop mounts and unmounts fires it every
                     // round.
-                    Some(owner) if stays_mounted(owner) => None,
+                    Some(_) if kept_mounted[&comp] => None,
                     Some(_) => hook(l).and_then(HookEntry::body_cfg),
                 },
                 WriterRegion::Effect(l) | WriterRegion::Memo(l) => {
@@ -349,19 +567,55 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     versioned.insert(t.slot);
                 }
             }
+            let deps = deps.list().map_or(&[][..], |d| d.as_slice());
+            // An effect that re-runs after every render is read the way one
+            // with no deps array is. Certain when it has none, or when a dep
+            // is a new reference at every render — the same reading of
+            // "fresh" as a write's (`restorable` below): a reference that
+            // holds while props hold is a prop the parent allocated, the same
+            // when the component re-renders alone. An unreadable deps
+            // argument or a ref's contents only may re-run it (#212, #201).
+            // Where the result, the join of every call site's input, says
+            // nothing, a dep fresh under one element's input alone re-runs it
+            // after every render through that element (#237): a possible
+            // re-run, since another element may hand it a stable value.
+            let always = match comp_result.rerun(*label).and_then(Rerun::always) {
+                Some(why) => Some(EveryRender {
+                    why,
+                    surely: match why {
+                        Always::FreshDep(i) => deps.get(i).is_some_and(|d| {
+                            !invariance_of(&ctxs[&comp], navigates).holds(
+                                d,
+                                &ctxs[&comp].render_lets,
+                                true,
+                            )
+                        }),
+                        _ => why.certain(),
+                    },
+                    through: BTreeSet::new(),
+                }),
+                None => result
+                    .call_graph
+                    .fresh_through(comp, *label)
+                    .into_iter()
+                    .next()
+                    .map(|(i, through)| EveryRender {
+                        why: Always::FreshDep(i),
+                        surely: false,
+                        through,
+                    }),
+            };
             facts.push(EffectFacts {
                 comp,
                 comp_result,
                 body_cfg,
                 effect_label: *label,
-                // An unreadable deps argument gates the effect by a list the
-                // engine cannot use, so it is read the same way as no list at
-                // all: the self-edge stays, which is the fire-more direction.
-                no_deps: deps.list().is_none(),
-                deps: deps.list().map_or(&[][..], |d| d.as_slice()),
+                always,
+                deps,
                 triggers,
                 exact_local,
                 versioned,
+                props: comp_result.effect_props.contains(label),
                 writes,
             });
         }
@@ -394,55 +648,39 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             navigates,
         }
     }
-    /// Does `parent` mount `child` once and keep it mounted across the
-    /// loop? Every element of `child` in the parent's render sits under
-    /// guards that hold still, carries no `key` or one that holds, and is
-    /// outside any closure. `None` when the parent renders no element of
-    /// `child`: whether that keeps it mounted is the caller's reading.
-    fn stays_mounted(
-        parent: &AnalysisResult<StateValue>,
-        ctx: &CompCtx<'_>,
-        invariance: &Invariance<'_>,
-        child: &CompOrigin,
-    ) -> Option<bool> {
-        /// Every node under `e`, with whether it sits inside a closure.
-        fn walk(e: &Expr, closure: bool, f: &mut dyn FnMut(&Expr, bool)) {
-            f(e, closure);
-            if let Expr::FnLit { body_cfg, .. } = e {
-                body_cfg.for_each_expr(&mut |x| walk(x, true, f));
-            }
-            e.for_each_child(&mut |c| walk(c, closure, f));
+    /// Does every element that mounts `c` keep it mounted across the loop,
+    /// and is its parent kept mounted in turn (#213)? An element keeps its
+    /// child when it sits outside any closure, under guards that hold still
+    /// in the parent, with no `key` or one that holds. A component no
+    /// element mounts is a root and stays; one the table cannot place, or
+    /// one met again while its own answer is pending (a component that
+    /// renders an ancestor of itself), fails closed.
+    fn stays(
+        c: ComponentId,
+        tree: &ComponentTree<'_>,
+        result: &ProgramAnalysisResult,
+        ctxs: &HashMap<ComponentId, CompCtx<'_>>,
+        navigates: bool,
+        memo: &mut HashMap<ComponentId, bool>,
+    ) -> bool {
+        if let Some(&s) = memo.get(&c) {
+            return s;
         }
-        let cfg = &parent.render_cfg;
-        let held = |e: &Expr| invariance.holds(e, &ctx.render_lets, ctx.props_hold);
-        let mut found = false;
-        let mut ok = true;
-        for block in cfg.blocks.values() {
-            let mut visit = |e: &Expr| {
-                walk(e, false, &mut |e, closure| {
-                    if let Expr::CompApp {
-                        origin: Some(o),
-                        props,
-                        ..
-                    } = e
-                        && **o == *child
-                    {
-                        found = true;
-                        // An element a callback renders (`items.map(i =>
-                        // <Child/>)`) mounts once per item the loop may add.
-                        ok &= !closure;
-                        ok &= site_guards(cfg, block.id).iter().all(|(c, _)| held(c));
-                        if let Expr::ObjectLit { fields, .. } = props.peel_ts()
-                            && let Some(key) = object_member(fields, "key")
-                        {
-                            ok &= held(key);
-                        }
-                    }
-                });
-            };
-            block.for_each_expr(&mut visit);
-        }
-        found.then_some(ok)
+        memo.insert(c, false);
+        let s = result.component_table.origin(c).is_some()
+            && tree.get(&c).is_none_or(|els| {
+                els.iter().all(|e| {
+                    let ctx = &ctxs[&e.parent];
+                    let invariance = invariance_of(ctx, navigates);
+                    !e.closure
+                        && e.held
+                            .iter()
+                            .all(|x| invariance.holds(x, &ctx.render_lets, ctx.props_hold))
+                        && stays(e.parent, tree, result, ctxs, navigates, memo)
+                })
+            });
+        memo.insert(c, s);
+        s
     }
     fn site_of<'a>(s: &SiteRef<'a>, convergent: bool) -> WriteSite<'a> {
         WriteSite {
@@ -486,8 +724,15 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             let Some(ctx) = ctxs.get(&s.comp) else {
                 return false;
             };
+            // A name reads the slot when the render binds it to the read on
+            // every path and the write's own body does not rebind it.
+            let local = (s.row.region != WriterRegion::Render).then(|| let_bindings(s.cfg));
+            let reads_slot = |v: &Var| {
+                ctx.must_state_vals.get(v) == Some(&slot.1)
+                    && !local.as_ref().is_some_and(|b| b.contains_key(v.as_str()))
+            };
             let step = match (s.row.owner, s.row.written.expr.as_ref()) {
-                (None, Some(e)) => step_of(e, slot.1, &ctx.state_vals),
+                (None, Some(e)) => step_of(e, slot.1, &reads_slot),
                 _ => None,
             };
             match (step, way) {
@@ -501,7 +746,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
 
         /// `+1` / `-1` when `e` adds to / subtracts from `label`'s read a
         /// positive constant, directly or as an updater's only return.
-        fn step_of(e: &Expr, label: HookLabel, states: &HashMap<Var, HookLabel>) -> Option<i8> {
+        fn step_of(e: &Expr, label: HookLabel, reads_slot: &dyn Fn(&Var) -> bool) -> Option<i8> {
             let positive = |e: &Expr| match e.peel_ts() {
                 Expr::Lit(crate::ir::expr::Prim::Int(n)) => *n > 0,
                 Expr::Lit(crate::ir::expr::Prim::Float(f)) => f.is_finite() && *f > 0.0,
@@ -538,28 +783,38 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 }
                 other => step(other, &|x| match x.peel_ts() {
                     Expr::StateVal(l) => *l == label,
-                    Expr::Var(v) => states.get(v) == Some(&label),
+                    Expr::Var(v) => reads_slot(v),
                     _ => false,
                 }),
             }
         }
     }
     /// Can the loop re-run the body `s` sits in? A render or memo body, an
-    /// effect with no dependency array, or one with a slot among its
-    /// triggers. An effect whose deps no slot moves re-runs only when
-    /// something outside the loop changes.
-    fn reruns_in_loop(s: &SiteRef<'_>, result: &ProgramAnalysisResult) -> bool {
+    /// effect that re-runs after every render, one with a slot among its
+    /// triggers or with props a loop moves (#207), or a mount-only effect of
+    /// a component the loop may remount. An effect whose deps no slot moves
+    /// re-runs only when something outside the loop changes.
+    fn reruns_in_loop(
+        s: &SiteRef<'_>,
+        result: &ProgramAnalysisResult,
+        props_in: &HashMap<ComponentId, Vec<QualifiedSlot>>,
+        kept_mounted: &HashMap<ComponentId, bool>,
+    ) -> bool {
         let WriterRegion::Effect(l) = s.row.region else {
             return true;
         };
         let Some(r) = result.components.get(&s.comp) else {
             return true;
         };
-        let no_deps = r
-            .hooks
-            .iter()
-            .any(|h| matches!(h, HookEntry::Effect { label, deps, .. } if *label == l && deps.list().is_none()));
-        no_deps || triggers_of(&r.effect_triggers, l).next().is_some()
+        match r.rerun(l) {
+            Some(Rerun::Always(_)) => true,
+            Some(Rerun::MountOnly) => kept_mounted.get(&s.comp) != Some(&true),
+            Some(Rerun::OnSlots) | None => {
+                triggers_of(&r.effect_triggers, l).next().is_some()
+                    || (r.effect_props.contains(&l)
+                        && props_in.get(&s.comp).is_none_or(|p| !p.is_empty()))
+            }
+        }
     }
     let invariance_of = |ctx| invariance_of(ctx, navigates);
 
@@ -588,7 +843,8 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     k,
                     peers[k].value,
                     &foreign,
-                    &ctx.state_vals,
+                    &ctx.slot_paths,
+                    &ctx.members,
                     &invariance,
                     ctx.props_hold,
                     &ctx.exit,
@@ -646,25 +902,11 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             }
         }
     }
-    // The re-render a loop needs happens only if its component is still
-    // mounted, and a parent whose guard or key moves may unmount it in the
-    // very batch that should re-run it: every parent that renders it keeps
-    // it mounted (#162's proof), or none renders it and it is a root.
-    let mut kept_mounted: HashMap<ComponentId, bool> = HashMap::new();
-    let mut stays_mounted_everywhere = |comp: ComponentId| {
-        *kept_mounted.entry(comp).or_insert_with(|| {
-            let Some(child) = result.component_table.origin(comp) else {
-                return false;
-            };
-            result
-                .components
-                .iter()
-                .filter(|(p, _)| **p != comp)
-                .all(|(p, parent)| {
-                    let pctx = &ctxs[p];
-                    stays_mounted(parent, pctx, &invariance_of(pctx), child) != Some(false)
-                })
-        })
+    // A write that cannot change its slot closes no edge: it stores the
+    // slot's own content, or its slot never leaves its initial value (#223).
+    let keeps = initial_only_slots(result);
+    let never = |comp: ComponentId, w: &SlotWriter| {
+        w.written.change == Change::Never || keeps.contains(&node_of(comp, w))
     };
     for f in &facts {
         let ctx = &ctxs[&f.comp];
@@ -677,7 +919,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             .map(|&j| site_of(&all_sites[j], convergent[j]))
             .collect();
         for w in &f.writes {
-            if w.written.change == Change::Never {
+            if never(f.comp, w) {
                 continue;
             }
             let node = node_of(f.comp, w);
@@ -694,7 +936,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     node_of(s.comp, s.row) == node
                         && !std::ptr::eq(s.row, *w)
                         && !convergent[*j]
-                        && reruns_in_loop(s, result)
+                        && reruns_in_loop(s, result, &props_in, &kept_mounted)
                 })
                 .any(|(_, s)| match s.row.written.change {
                     Change::Never => false,
@@ -733,7 +975,8 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     k,
                     &own_value,
                     &foreign,
-                    &ctx.state_vals,
+                    &ctx.slot_paths,
+                    &ctx.members,
                     &invariance,
                     ctx.props_hold,
                     &ctx.exit,
@@ -754,7 +997,23 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 }
                 _ => None,
             }
-            .filter(|r| !(node.0 == f.comp && r.slots.contains(&node.1)));
+            .filter(|r| !(node.0 == f.comp && r.slots.contains(&node.1)))
+            // A call over the reads is a function of them only when the
+            // value it stores cannot differ on them (#218, #224).
+            .filter(|r| {
+                !r.call
+                    || !call_may_differ(
+                        &w.written.value,
+                        |(c, l)| {
+                            if c == f.comp {
+                                r.slots.contains(&l)
+                            } else {
+                                r.props
+                            }
+                        },
+                        r.impure,
+                    )
+            });
             let reads_slot = |x: QualifiedSlot| match &reads {
                 None => true,
                 Some(r) if x.0 == f.comp => r.slots.contains(&x.1),
@@ -770,66 +1029,75 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 && w.block.is_some()
                 && on_all_paths(f.body_cfg, &fresh_blocks)
                 && !restorable.contains(&node)
-                && stays_mounted_everywhere(f.comp);
+                // The re-render a loop needs happens only if its component
+                // is still mounted: an ancestor whose guard or key moves may
+                // unmount it in the very batch that should re-run it.
+                && kept_mounted[&f.comp];
             let strength = if must_write {
                 EdgeStrength::Must
             } else {
                 EdgeStrength::May
             };
 
-            let mut push = |from: QualifiedSlot, strength: EdgeStrength, self_slot: bool| {
-                let key = (from, node, f.comp, f.effect_label);
-                let edge = ChurnEdge {
-                    from,
-                    to: node,
-                    strength,
-                    component: f.comp,
-                    effect_label: f.effect_label,
-                    write_span: w.span,
-                    no_deps: f.no_deps,
-                    self_slot,
-                };
-                best.entry(key)
-                    .and_modify(|e| {
-                        if (strength, std::cmp::Reverse(pos(w.span)))
-                            > (e.strength, std::cmp::Reverse(pos(e.write_span)))
-                        {
-                            *e = edge.clone();
-                        }
-                    })
-                    .or_insert(edge);
+            let mut push = |from: QualifiedSlot,
+                            strength: EdgeStrength,
+                            self_slot: bool,
+                            always: Option<&EveryRender>| {
+                insert_edge(
+                    &mut best,
+                    ChurnEdge {
+                        from,
+                        to: node,
+                        strength,
+                        component: f.comp,
+                        effect_label: f.effect_label,
+                        write_span: w.span,
+                        always: always.cloned(),
+                        self_slot,
+                    },
+                );
             };
 
-            if f.no_deps {
-                // Re-runs after every render → a change of anything the
-                // write reads re-runs it (a handler row was dropped above):
-                // each slot it reads is an edge into its own, and a write
-                // that reads everything or a prop re-triggers itself,
-                // whichever turn it runs on.
-                if killed {
-                    continue;
+            if killed {
+                continue;
+            }
+            // The props node's edges into this write (#207): a write that
+            // reads a prop, or anything, changes when `P_c` moves. Where no
+            // edge enters `P_c` — a root, or a component rendered through a
+            // value the tree cannot place — the write's own slot stands in
+            // for it, a self-edge, as before the node existed.
+            let p_in = &props_in[&f.comp];
+            let reads_props = reads.as_ref().is_none_or(|r| r.props);
+            let from_props: &[QualifiedSlot] = if reads_props { p_in } else { &[] };
+            // An effect that re-runs after every render: a change of anything
+            // the write reads re-runs it (a handler row was dropped above), so
+            // each slot it reads is an edge into its own, and a write that
+            // reads everything re-triggers itself, whichever turn it runs on.
+            let every_render: Vec<QualifiedSlot> = match &reads {
+                Some(r) => {
+                    let props = (r.props && p_in.is_empty()).then_some(node);
+                    r.slots.iter().map(|&l| (f.comp, l)).chain(props).collect()
                 }
-                match &reads {
-                    Some(r) => {
-                        for &l in &r.slots {
-                            push((f.comp, l), strength, false);
-                        }
-                        if r.props {
-                            push(node, strength, false);
-                        }
-                    }
-                    None => push(node, strength, false),
+                None => vec![node],
+            };
+            // A certain re-run reads every row already.
+            let always = f.always.as_ref();
+            if always.is_some_and(|a| a.surely) {
+                for &x in &every_render {
+                    push(x, strength, false, always);
+                }
+                for &x in from_props {
+                    push(x, EdgeStrength::May, false, always);
                 }
                 continue;
             }
+            let retrigger = || write_can_retrigger(f, &ctx.must_state_vals, w);
             for &l in &f.exact_local {
                 let x: QualifiedSlot = (f.comp, l);
                 let self_slot = x == node;
-                let dropped = killed
-                    || !reads_slot(x)
-                    || (self_slot && !write_can_retrigger(f, &ctx.state_vals, w));
+                let dropped = !reads_slot(x) || (self_slot && !retrigger());
                 if !dropped {
-                    push(x, strength, self_slot);
+                    push(x, strength, self_slot, None);
                 }
             }
             for &x in &f.versioned {
@@ -837,12 +1105,73 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     continue; // already pushed as exact
                 }
                 let self_slot = x == node && x.0 == f.comp;
-                let dropped = killed
-                    || !reads_slot(x)
-                    || (self_slot && !write_can_retrigger(f, &ctx.state_vals, w));
+                let dropped = !reads_slot(x) || (self_slot && !retrigger());
                 if !dropped {
-                    push(x, EdgeStrength::May, self_slot);
+                    push(x, EdgeStrength::May, self_slot, None);
                 }
+            }
+            // A dep the props move: `P_c` is a trigger.
+            if f.props {
+                for &x in from_props {
+                    push(x, EdgeStrength::May, false, None);
+                }
+            }
+            // A re-run that is only possible adds May edges beside the rows'
+            // own, which keep their partition on a tie (pushed first).
+            if always.is_some_and(|a| !a.surely) {
+                for &x in every_render.iter().chain(from_props) {
+                    push(x, EdgeStrength::May, false, always);
+                }
+            }
+            // The reads-kill says a re-run stores what the last run stored,
+            // which holds only if nothing the write reads moved in between. A
+            // read that is no trigger moves without re-running the effect,
+            // and the next re-run a trigger causes stores its new value: the
+            // write's edges come from what it reads, trigger or not (#204),
+            // the props node included.
+            if let Some(r) = &reads
+                && (!f.triggers.is_empty() || f.props)
+            {
+                for &l in &r.slots {
+                    push((f.comp, l), EdgeStrength::May, false, None);
+                }
+                for &x in from_props {
+                    push(x, EdgeStrength::May, false, None);
+                }
+            }
+        }
+    }
+
+    // Mount edges `P_c → y` (#207): a component the loop may remount runs
+    // every effect again at each mount, its mount-only ones included, and
+    // its fresh instance's writes are bounded by no certificate of the old
+    // one — only an identity changes nothing.
+    for (&comp, r) in &result.components {
+        if kept_mounted[&comp] {
+            continue;
+        }
+        for w in r.slot_writers.iter().filter(|w| {
+            matches!(w.region, WriterRegion::Effect(_))
+                && w.phase != WriterPhase::Handler
+                && !never(comp, w)
+        }) {
+            let WriterRegion::Effect(effect_label) = w.region else {
+                continue;
+            };
+            for &from in &props_in[&comp] {
+                insert_edge(
+                    &mut best,
+                    ChurnEdge {
+                        from,
+                        to: node_of(comp, w),
+                        strength: EdgeStrength::May,
+                        component: comp,
+                        effect_label,
+                        write_span: w.span,
+                        always: None,
+                        self_slot: false,
+                    },
+                );
             }
         }
     }
@@ -861,6 +1190,24 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
     /// A position to rank spans by; a spanless site ranks last.
     fn pos(s: Option<SourceRange>) -> (u32, u32) {
         s.map_or((u32::MAX, u32::MAX), |r| r.pos_key())
+    }
+
+    /// Keep, per (from, to, component, effect), the strongest edge, and
+    /// among equals the earliest write site.
+    fn insert_edge(
+        best: &mut HashMap<(QualifiedSlot, QualifiedSlot, ComponentId, HookLabel), ChurnEdge>,
+        edge: ChurnEdge,
+    ) {
+        let key = (edge.from, edge.to, edge.component, edge.effect_label);
+        best.entry(key)
+            .and_modify(|e| {
+                if (edge.strength, std::cmp::Reverse(pos(edge.write_span)))
+                    > (e.strength, std::cmp::Reverse(pos(e.write_span)))
+                {
+                    *e = edge.clone();
+                }
+            })
+            .or_insert(edge);
     }
 
     /// Can a write of `w` into its own slot change any dep of this effect?
@@ -1159,6 +1506,8 @@ fn named_key(key: &Symbol) -> Option<&Symbol> {
 /// The first member a dep reads off state slot `label`: `data.name.first`
 /// answers `name`. `None` when the dep is not a plain member chain on that
 /// slot — the bare slot included, since every fresh write changes it.
+/// `state_vals` must be the must-alias map: a dep rooted at a name the slot's
+/// read is bound to on one arm only reads something else on the other (#222).
 fn slot_member(
     dep: &Expr,
     label: HookLabel,

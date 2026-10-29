@@ -134,6 +134,8 @@ pub(crate) fn analysis_result(render_cfg: CFG) -> AnalysisResult<StateValue> {
         slot_seeds: vec![],
         registrations: vec![],
         effect_triggers: vec![],
+        effect_reruns: HashMap::new(),
+        effect_props: HashSet::new(),
         custom_arg_returns: HashMap::new(),
         iterations: 0,
         effect_setter_writes: StateStore::bottom(),

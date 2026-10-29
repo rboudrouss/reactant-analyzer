@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use crate::ir::{
     cfg::CFG,
+    expr::Expr,
     hooks::{HookEntry, HookProvenance},
     types::{Symbol, Var},
 };
@@ -14,6 +15,10 @@ pub struct HookIR {
     pub file: PathBuf,
     pub name: Symbol,
     pub params: Vec<Var>,
+    /// What an omitted argument stands for, aligned with `params`: the
+    /// default of a parameter written `name = default` (#230). `None` for a
+    /// parameter with none, or whose default is no single expression.
+    pub param_defaults: Vec<Option<Expr>>,
     pub body_cfg: CFG,
     /// Hook calls declared inside this hook's body (useState, useEffect, etc.).
     pub hooks: Vec<HookEntry>,

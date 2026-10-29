@@ -1,12 +1,12 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::{
-    domains::{impls::StateValue, stores::SharedStateStore},
+    domains::{AbstractDomain, impls::StateValue, stores::SharedStateStore},
     engine::analysis_result::AnalysisResult,
     ir::{
         ComponentId, ComponentTable, ModuleTable,
         source_range::{FileTable, SourceRange},
-        types::Symbol,
+        types::{HookLabel, Symbol},
     },
 };
 
@@ -163,10 +163,12 @@ impl ProgramAnalysisResult {
     }
 }
 
-/// Directed call graph: caller → list of call sites.
+/// Directed call graph: caller → its call sites, one row per element.
 #[derive(Debug, Default, Clone)]
 pub struct ComponentCallGraph {
     pub edges: HashMap<ComponentId, Vec<CallSite>>,
+    /// Callee → `(caller, index in edges[caller])`, the reverse index.
+    by_callee: HashMap<ComponentId, Vec<(ComponentId, usize)>>,
 }
 
 impl ComponentCallGraph {
@@ -174,8 +176,28 @@ impl ComponentCallGraph {
         Self::default()
     }
 
+    /// Record one evaluation of an element. An element is evaluated once per
+    /// pass of its caller's fixpoint and once per input the caller is
+    /// analysed under, so a second evaluation of the same `(callee,
+    /// location)` joins its props into the row.
     pub fn add_edge(&mut self, caller: ComponentId, site: CallSite) {
-        self.edges.entry(caller).or_default().push(site);
+        let rows = self.edges.entry(caller).or_default();
+        if let Some(row) = rows
+            .iter_mut()
+            .find(|r| r.callee == site.callee && r.location == site.location)
+        {
+            let absent = StateValue::undefined();
+            for (k, v) in site.props {
+                let joined = row.props.get(&k).unwrap_or(&absent).join(&v);
+                row.props.insert(k, joined);
+            }
+            return;
+        }
+        self.by_callee
+            .entry(site.callee)
+            .or_default()
+            .push((caller, rows.len()));
+        rows.push(site);
     }
 
     pub fn callees_of(&self, comp: ComponentId) -> &[CallSite] {
@@ -183,21 +205,90 @@ impl ComponentCallGraph {
     }
 
     pub fn callers_of(&self, comp: ComponentId) -> Vec<ComponentId> {
-        self.edges
-            .iter()
-            .filter(|(_, sites)| sites.iter().any(|s| s.callee == comp))
+        let mut callers: Vec<ComponentId> = self
+            .by_callee
+            .get(&comp)
+            .into_iter()
+            .flatten()
             .map(|(caller, _)| *caller)
-            .collect()
+            .collect();
+        callers.sort();
+        callers.dedup();
+        callers
+    }
+
+    /// Every analysed element that renders `comp`, with the component whose
+    /// render builds it.
+    pub fn sites_of(&self, comp: ComponentId) -> impl Iterator<Item = (ComponentId, &CallSite)> {
+        self.by_callee
+            .get(&comp)
+            .into_iter()
+            .flatten()
+            .map(|(caller, i)| (*caller, &self.edges[caller][*i]))
+    }
+
+    /// The deps of `hook` in `comp` that are a new reference at every render
+    /// under one element's input alone, each with the components whose
+    /// render builds such an element (#175, #237). What the joined result
+    /// loses: a reader quantifying "always fresh" over a prop-derived dep
+    /// reads it where the result does not say so, and names the parents.
+    pub fn fresh_through(
+        &self,
+        comp: ComponentId,
+        hook: HookLabel,
+    ) -> BTreeMap<usize, BTreeSet<ComponentId>> {
+        let mut out: BTreeMap<usize, BTreeSet<ComponentId>> = BTreeMap::new();
+        for (caller, site) in self.sites_of(comp) {
+            let fresh = site.own.as_ref().and_then(|o| o.fresh_deps.get(&hook));
+            for &i in fresh.into_iter().flatten() {
+                out.entry(i).or_default().insert(caller);
+            }
+        }
+        out
+    }
+
+    /// The row of one element, to record what the callee does under it.
+    pub fn site_mut(
+        &mut self,
+        caller: ComponentId,
+        callee: ComponentId,
+        location: Option<SourceRange>,
+    ) -> Option<&mut CallSite> {
+        self.edges
+            .get_mut(&caller)?
+            .iter_mut()
+            .find(|r| r.callee == callee && r.location == location)
     }
 }
 
-/// One instantiation of a child component inside a parent.
+/// The deps of a component's hooks that are a new reference at every render:
+/// hook → indices in its deps list.
+pub type FreshDeps =
+    std::collections::BTreeMap<crate::ir::types::HookLabel, std::collections::BTreeSet<usize>>;
+
+/// One element instantiating a child component inside a parent.
 #[derive(Debug, Clone)]
 pub struct CallSite {
     pub callee: ComponentId,
-    /// Abstract props at this call site (evaluated in parent's abstract env).
+    /// Abstract props at this element: the join of every evaluation of it.
     pub props: HashMap<Symbol, StateValue>,
+    /// The element's span; `None` for an element lowering could not place,
+    /// all of which share one row per callee.
     pub location: Option<SourceRange>,
+    /// What the callee does when this element alone renders it, where that
+    /// differs from its result. The callee's entry in the results is its
+    /// analysis under the join of every site's input (#175), and a fact that
+    /// holds at one site — a dep that is a new reference at every render —
+    /// is lost in that join. `None`: no other input reaches the callee, or
+    /// this one was not re-analysed.
+    pub own: Option<SiteFacts>,
+}
+
+/// The callee's facts under one call site's input alone (must, for that
+/// site).
+#[derive(Debug, Clone, Default)]
+pub struct SiteFacts {
+    pub fresh_deps: FreshDeps,
 }
 
 #[derive(Debug, Default, Clone)]

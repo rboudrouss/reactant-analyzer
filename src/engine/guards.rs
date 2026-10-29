@@ -10,9 +10,13 @@
 //!   ⊥, the branch is dead in every later run;
 //! - **relational** — the guard compares the slot against the very expression
 //!   the write stores there, so the two sides are equal next render whatever
-//!   they evaluate to (`write_settles_comparison`);
-//! - **member** — the guard tests a member of the slot, and the literal the
-//!   write puts at that member contradicts it (`write_settles_member_truth`).
+//!   they evaluate to (`write_settles_comparison`), and stay equal when that
+//!   expression holds still across the loop (#209);
+//! - **member** — the guard tests a member of the slot (`s.n`, or a name
+//!   destructured from it), and the literal or allocation the write puts at
+//!   that member contradicts it (`write_settles_member`, #244, #228), and so
+//!   does what every in-place write into the slot's object stores there
+//!   ([`MemberWrites`], #252).
 //!
 //! Two callers feed it different values — the churn graph the reference part
 //! of an effect write, `setter-in-render` the whole value of a render write —
@@ -44,29 +48,66 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::{
-    domains::{AbstractDomain, StateValue, interp::narrow_env_for_branch, stores::AbstractEnv},
+    domains::{
+        AbstractDomain, Stability, StateValue, interp::narrow_env_for_branch, stores::AbstractEnv,
+    },
+    engine::purity::{self, Callee, Kind},
     ir::{
         ComponentId, QualifiedSlot,
-        bindings::local_bindings,
+        bindings::{local_bindings, must_slot_path, nested_bodies},
         cfg::{CFG, EdgeKind, Terminator},
         expr::{Expr, MarkerVal, Prim, SummaryValue, UnaryOp, mutation_receiver, object_member},
         free_vars::{call_free_key, collect_used_vars},
-        stmt::Stmt,
+        hooks::HookEntry,
+        stmt::{MemberKey, Stmt},
         types::{BlockId, HookLabel, Var},
     },
 };
+
+/// A slot and the fields a name reads off it: `(l, [])` is the slot itself,
+/// `(l, ["n"])` its member `n` (#244).
+pub type SlotPath = (HookLabel, Vec<String>);
+
+/// The names the render binds on every path to a slot's read — `whole`, the
+/// must-alias table (`engine::setters::must_state_vals`) — or to a member
+/// path of one: `const { n } = s` binds `n` to `s.n` (#244). The same
+/// certificate as `whole`'s ([`must_slot_path`]): no body of `scopes`
+/// rebinds a name of the chain.
+pub(crate) fn must_slot_paths(
+    render_cfg: &CFG,
+    scopes: &[(&[Var], &CFG)],
+    whole: &HashMap<Var, HookLabel>,
+) -> HashMap<Var, SlotPath> {
+    let mut out: HashMap<Var, SlotPath> = whole
+        .iter()
+        .map(|(v, l)| (v.clone(), (*l, Vec::new())))
+        .collect();
+    for stmt in render_cfg.blocks.values().flat_map(|b| &b.stmts) {
+        if let Stmt::Let { var, .. } = stmt
+            && !out.contains_key(var)
+            && let Some(path) = must_slot_path(&Expr::Var(var.clone()), render_cfg, scopes)
+            && !path.1.is_empty()
+        {
+            out.insert(var.clone(), path);
+        }
+    }
+    out
+}
 
 /// True when the dominating guards of `call_block` provably kill the call
 /// once `written` sits in state slot `label` — the set fires at most once.
 ///
 /// `exit_env` is the env the guards are narrowed from, and must be the env
 /// of `cfg` itself (a render site); `eval` evaluates the literal the member
-/// arm reads, and nothing else.
+/// arm reads, and nothing else. `slots` is the must table
+/// (`must_slot_paths`) and `members` the member writes of the slots'
+/// objects, as for [`converges_under_all_writes`] (#231, #252).
 #[allow(clippy::too_many_arguments)]
 pub fn converges_once_written(
     cfg: &CFG,
     call_block: BlockId,
-    state_vals: &HashMap<Var, HookLabel>,
+    slots: &HashMap<Var, SlotPath>,
+    members: &MemberWrites<'_>,
     label: HookLabel,
     written: &StateValue,
     written_expr: Option<&Expr>,
@@ -77,14 +118,18 @@ pub fn converges_once_written(
     if guards.is_empty() {
         return false;
     }
+    // Between two passes of a render-phase loop only render writes run, and
+    // each of them is a site the caller judges on its own: the written
+    // expression is read as holding across the passes this site sees.
     let own = Rewrite {
         label,
         value: written.clone(),
         expr: written_expr,
         scope: Some(cfg),
+        held: &|_| true,
     };
     // `exit_env` is this body's own env: nothing is shadowed.
-    dead_once_written(&guards, None, state_vals, &[own], exit_env, eval)
+    dead_once_written(&guards, None, slots, members, &[own], exit_env, eval)
 }
 
 /// A write site of a slot, as the multi-site proof reads it (#154, #160).
@@ -132,14 +177,20 @@ pub struct WriteSite<'a> {
 /// reference part of an effect write, since a `null` run stores no fresh
 /// reference; the site fixpoint reads the whole value. `props_hold` is
 /// handed to [`Invariance::holds`]: the caller says whether a loop can
-/// reach the component through its props at all.
+/// reach the component through its props at all. `slots` names the render
+/// names that read a slot, or a member path of one, on every path
+/// (`must_slot_paths`): a name rebound to the written value must be the
+/// slot, not a name tied to it on one arm. `members` are the member writes
+/// of the slots' objects in any body of the component: a member a guard
+/// tests holds what they store there as well as what a setter wrote (#252).
 #[allow(clippy::too_many_arguments)]
 pub fn converges_under_all_writes(
     peers: &[WriteSite<'_>],
     i: usize,
     own_value: &StateValue,
     foreign: &HashSet<QualifiedSlot>,
-    state_vals: &HashMap<Var, HookLabel>,
+    slots: &HashMap<Var, SlotPath>,
+    members: &MemberWrites<'_>,
     invariance: &Invariance<'_>,
     props_hold: bool,
     exit_env: &AbstractEnv<StateValue>,
@@ -169,11 +220,20 @@ pub fn converges_under_all_writes(
                 && p.block.is_some_and(|b| chain.contains(&b))
         })
         .collect();
+    let mine = let_bindings(site.cfg);
+    let shadow = Shadow {
+        lets: &mine,
+        nested: nested_binders(site.cfg),
+    };
+    // Does a part of a written expression of this body denote one value on
+    // every run (#209)?
+    let held_here = |e: &Expr| invariance.holds(e, &mine, props_hold);
     let mut kill: Vec<Rewrite> = vec![Rewrite {
         label: site.slot.1,
         value: own_value.clone(),
         expr: site.expr,
         scope: Some(site.cfg),
+        held: &held_here,
     }];
     for &j in &co {
         let p = &peers[j];
@@ -187,11 +247,19 @@ pub fn converges_under_all_writes(
                 value: p.value.clone(),
                 expr: p.expr,
                 scope: Some(site.cfg),
+                held: &held_here,
             }),
         }
     }
-    let mine = let_bindings(site.cfg);
-    if !dead_once_written(&guards, Some(&mine), state_vals, &kill, exit_env, eval) {
+    if !dead_once_written(
+        &guards,
+        Some(&shadow),
+        slots,
+        members,
+        &kill,
+        exit_env,
+        eval,
+    ) {
         return false;
     }
     let held: Vec<(&Expr, bool)> = guards
@@ -247,9 +315,19 @@ pub fn converges_under_all_writes(
                 label: k.label,
                 value: other.value.clone(),
                 expr: other.expr,
+                // The relational arm reads it in this body only (`scope`).
                 scope: same.then_some(site.cfg),
+                held: &held_here,
             });
-            if !dead_once_written(&guards, Some(&mine), state_vals, &rewrites, &env, eval) {
+            if !dead_once_written(
+                &guards,
+                Some(&shadow),
+                slots,
+                members,
+                &rewrites,
+                &env,
+                eval,
+            ) {
                 return false;
             }
         }
@@ -339,7 +417,15 @@ impl Invariance<'_> {
     /// A name bound once reads what its right-hand side reads. A name bound
     /// more than once (a lowered `?:` or `&&` temp, a reassignment) also
     /// reads every branch condition of its body, which over-approximates the
-    /// conditions that chose the binding: `x ? "a" : "b"` reads `x`.
+    /// conditions that chose the binding: `x ? "a" : "b"` reads `x`. A state
+    /// name is no exception: the alias table is a may reading, and a name
+    /// bound to the read on one path only reads its other paths too (#222).
+    ///
+    /// A call is read as a function of its inputs: [`Reads::call`] says one
+    /// was crossed, [`Reads::impure`] one whose callee is not known to be
+    /// one ([`purity`], #224), and a global the builtin table knows reads
+    /// nothing. Whether the value differs is the caller's question
+    /// ([`call_may_differ`]).
     pub fn reads(
         &self,
         e: &Expr,
@@ -393,10 +479,8 @@ impl Invariance<'_> {
                 true
             }
             Expr::Var(v) => {
-                if let Some(l) = self.state_vals.get(v) {
-                    out.slots.insert(*l);
-                    return true;
-                }
+                // A state name reads the slot through its binding
+                // (`let s = StateVal(l)`), and every other binding with it.
                 if self.memo_vals.contains_key(v)
                     || self.mutated.contains(v)
                     || scopes.iter().any(|s| s.nested.contains(v))
@@ -445,12 +529,54 @@ impl Invariance<'_> {
                 seen,
             ),
             Expr::UnaryOp { arg, .. } => self.read_into(arg, scopes, free, out, seen, next),
-            Expr::Call { fn_, args } => all(
-                &mut std::iter::once(fn_.as_ref()).chain(args.iter()),
-                scopes,
-                out,
-                seen,
-            ),
+            Expr::Call { fn_, args } => {
+                // A name's kind: a global nothing binds, or what its one
+                // binding's right-hand side is, its own names left unknown.
+                let unbound = |v: &str| {
+                    !free(v)
+                        && !self.mutated.contains(v)
+                        && scopes
+                            .iter()
+                            .all(|s| !s.bindings.contains_key(v) && !s.nested.contains(v))
+                };
+                let shallow = |v: &str| {
+                    if unbound(v) {
+                        purity::global(v)
+                    } else {
+                        Kind::Unknown
+                    }
+                };
+                let var = |v: &str| match scopes.iter().find_map(|s| s.bindings.get(v)) {
+                    Some(rhs) if rhs.len() == 1 && !self.mutated.contains(v) => {
+                        purity::kind_of(rhs[0], &shallow)
+                    }
+                    _ => shallow(v),
+                };
+                let callee = Callee::of(fn_, &mut |x| purity::kind_of(x, &var));
+                let known = purity::call(
+                    callee,
+                    false,
+                    args,
+                    &|i| purity::kind_of(&args[i], &var),
+                    &var,
+                );
+                out.call = true;
+                out.impure |= known.is_none();
+                // A global holds: nothing of it to read.
+                let global = matches!(
+                    callee,
+                    Callee::Value(Kind::Global(_)) | Callee::Method(Kind::Global(_), _)
+                );
+                all(
+                    &mut (!global)
+                        .then_some(fn_.as_ref())
+                        .into_iter()
+                        .chain(args.iter()),
+                    scopes,
+                    out,
+                    seen,
+                )
+            }
             Expr::HookMarker(_, MarkerVal::Summary(sv)) | Expr::SummaryVal(sv) => {
                 matches!(sv, SummaryValue::Held) && !self.navigates
             }
@@ -730,6 +856,32 @@ pub struct Reads {
     pub slots: BTreeSet<HookLabel>,
     /// It reads a prop, which moves with another component's slots.
     pub props: bool,
+    /// It passes through a call, whose result may be a new reference
+    /// ([`call_may_differ`], #218).
+    pub call: bool,
+    /// One of those calls is not known to compute the same content from the
+    /// same inputs ([`purity`], #224).
+    pub impure: bool,
+}
+
+/// May a value that passed through a call differ between two runs over the
+/// same inputs? In content, when a callee is not known to be a function of
+/// its inputs (`impure`: `Math.random()`, an import): only the value can say
+/// no, one value at every run. In identity, when it may be a reference the
+/// call allocated: not when it holds no reference or a stable one. Either
+/// way a reference versioned only by slots `covered` says the caller
+/// already follows holds (#218, #224).
+pub fn call_may_differ(
+    v: &StateValue,
+    covered: impl Fn(QualifiedSlot) -> bool,
+    impure: bool,
+) -> bool {
+    let followed = matches!(&v.reference, Stability::Versioned(s) if s.iter().all(|&q| covered(q)));
+    if impure {
+        !(v.is_single_value() || (v.is_reference_only() && followed))
+    } else {
+        v.other || !(followed || matches!(v.reference, Stability::Bottom | Stability::Stable))
+    }
 }
 
 /// One scope [`Invariance::reads`] resolves names in.
@@ -753,25 +905,30 @@ impl<'e> ReadScope<'e> {
                 _ => None,
             })
             .collect();
-        let mut nested = HashSet::new();
-        fn closures(e: &Expr, out: &mut HashSet<Var>) {
-            if let Expr::FnLit {
-                params, body_cfg, ..
-            } = e
-            {
-                out.extend(params.iter().cloned());
-                crate::engine::setters::collect_binders(body_cfg, out);
-                return;
-            }
-            e.for_each_child(&mut |c| closures(c, out));
-        }
-        cfg.for_each_expr(&mut |e| closures(e, &mut nested));
         ReadScope {
             bindings: local_bindings(cfg),
             conds,
-            nested,
+            nested: nested_binders(cfg),
         }
     }
+}
+
+/// Every name a function nested in `cfg` binds, its parameters included.
+fn nested_binders(cfg: &CFG) -> HashSet<Var> {
+    fn closures(e: &Expr, out: &mut HashSet<Var>) {
+        if let Expr::FnLit {
+            params, body_cfg, ..
+        } = e
+        {
+            out.extend(params.iter().cloned());
+            crate::engine::setters::collect_binders(body_cfg, out);
+            return;
+        }
+        e.for_each_child(&mut |c| closures(c, out));
+    }
+    let mut nested = HashSet::new();
+    cfg.for_each_expr(&mut |e| closures(e, &mut nested));
+    nested
 }
 
 /// The names a body binds: `Some(rhs)` for a name bound by exactly one `let`
@@ -820,6 +977,219 @@ pub(crate) fn mutated_roots(body: &CFG) -> HashSet<Var> {
     }
     body.for_each_expr(&mut |e| exprs(e, &mut out));
     out
+}
+
+/// One in-place write into the object a slot holds (#252): the member path
+/// below the slot it writes, `None` for a segment no name settles (a computed
+/// key), and what it stores there — the right-hand side of a member
+/// assignment, `None` for a mutating call, which may change any member of
+/// its receiver.
+struct MemberWrite<'a> {
+    path: Vec<Option<String>>,
+    value: Option<&'a Expr>,
+}
+
+/// A slot an expression may read the object of, and the member path below
+/// the slot it reads.
+type Root = (HookLabel, Vec<Option<String>>);
+
+/// The member writes of every slot's object in one component, in any of its
+/// bodies, handlers and closures included (#252): what a guard on a member
+/// of the slot may read besides what a setter wrote there.
+///
+/// A receiver roots at a slot when it reads the slot through names, members
+/// and indices: a binding of its name in any body, a functional updater's
+/// or a reducer's state parameter. Names are not scoped — a spelling is
+/// every binding of it in the component, a may reading. A receiver whose
+/// chase meets a name bound through itself (`n = n.next`), or runs past the
+/// alias depth, may sit at any depth of any slot, and leaves every member
+/// unknown (`deep`).
+#[derive(Default)]
+pub struct MemberWrites<'a> {
+    by_slot: HashMap<HookLabel, Vec<MemberWrite<'a>>>,
+    deep: bool,
+}
+
+impl<'a> MemberWrites<'a> {
+    pub(crate) fn of(comp: &'a crate::engine::AnalysisResult<StateValue>) -> Self {
+        /// The function literals `e` holds, outside one another.
+        fn fns<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+            match e {
+                Expr::FnLit { .. } => out.push(e),
+                _ => e.for_each_child(&mut |c| fns(c, out)),
+            }
+        }
+        let setters = crate::engine::setters::all_setter_labels(comp);
+        // The state parameter of a reducer or a functional updater: the
+        // slot's object, handed in by React.
+        let mut held: HashMap<&'a str, Vec<HookLabel>> = HashMap::new();
+        let mut hold = |f: &'a Expr, slots: &mut dyn Iterator<Item = HookLabel>| {
+            if let Expr::FnLit { params, .. } = f
+                && let Some(p) = params.first()
+            {
+                held.entry(p.as_str()).or_default().extend(slots);
+            }
+        };
+        let mut lits: Vec<&'a Expr> = Vec::new();
+        let mut bodies: Vec<&'a CFG> = vec![&comp.render_cfg];
+        for hook in &comp.hooks {
+            match hook {
+                HookEntry::State {
+                    label,
+                    reducer: Some(r),
+                    ..
+                } => {
+                    hold(r.peel_ts(), &mut std::iter::once(*label));
+                    fns(r, &mut lits);
+                }
+                HookEntry::Custom { args, .. } => args.iter().for_each(|a| fns(a, &mut lits)),
+                _ => bodies.extend(hook.body_cfg()),
+            }
+        }
+        bodies.extend(lits.iter().filter_map(|f| match f {
+            Expr::FnLit { body_cfg, .. } => Some(&**body_cfg),
+            _ => None,
+        }));
+        for i in 0..bodies.len() {
+            bodies.extend(nested_bodies(bodies[i]).into_iter().map(|(_, b)| b));
+        }
+        let mut lets: HashMap<&'a str, Vec<&'a Expr>> = HashMap::new();
+        // Each receiver, with the write into it below the receiver: a
+        // mutating call writes any member, with a value nothing says.
+        let mut writes: Vec<(&'a Expr, MemberWrite<'a>)> = Vec::new();
+        fn calls<'a>(e: &'a Expr, f: &mut impl FnMut(&'a Expr)) {
+            if matches!(e, Expr::FnLit { .. }) {
+                return; // a body of its own, walked as one
+            }
+            f(e);
+            e.for_each_child(&mut |c| calls(c, f));
+        }
+        for body in &bodies {
+            for stmt in body.blocks.values().flat_map(|b| &b.stmts) {
+                match stmt {
+                    Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. } => {
+                        lets.entry(var.as_str()).or_default().push(rhs);
+                    }
+                    Stmt::MemberWrite { obj, key, rhs, .. } => {
+                        let (path, value) = (vec![member_key(key)], Some(rhs));
+                        writes.push((obj, MemberWrite { path, value }));
+                    }
+                    Stmt::ExprStmt(..) => {}
+                }
+            }
+            body.for_each_expr(&mut |e| {
+                calls(e, &mut |e| {
+                    if let Some(recv) = mutation_receiver(e) {
+                        let path = vec![None];
+                        writes.push((recv, MemberWrite { path, value: None }));
+                    }
+                    if let Expr::Call { fn_, args } = e
+                        && let Expr::Var(f) = fn_.peel_ts()
+                        && let Some(updater) = args.first()
+                    {
+                        hold(updater.peel_ts(), &mut setters.targets(f));
+                    }
+                });
+            });
+        }
+        let mut out = MemberWrites::default();
+        for (recv, write) in writes {
+            for (label, mut path) in out.roots(recv, &lets, &held, &mut Vec::new()) {
+                path.extend(write.path.iter().cloned());
+                let value = write.value;
+                out.by_slot
+                    .entry(label)
+                    .or_default()
+                    .push(MemberWrite { path, value });
+            }
+        }
+        out
+    }
+
+    /// The slots `e` may read the object of, each with the member path below
+    /// the slot.
+    fn roots(
+        &mut self,
+        e: &'a Expr,
+        lets: &HashMap<&'a str, Vec<&'a Expr>>,
+        held: &HashMap<&'a str, Vec<HookLabel>>,
+        stack: &mut Vec<&'a str>,
+    ) -> Vec<Root> {
+        let below = |mut roots: Vec<Root>, seg: Option<String>| {
+            for (_, path) in &mut roots {
+                path.push(seg.clone());
+            }
+            roots
+        };
+        match e.peel_ts() {
+            Expr::StateVal(l) => vec![(*l, Vec::new())],
+            Expr::FieldAccess { obj, field } => {
+                below(self.roots(obj, lets, held, stack), Some(field.clone()))
+            }
+            Expr::IndexAccess { arr, idx } => {
+                below(self.roots(arr, lets, held, stack), index_name(idx))
+            }
+            Expr::Var(v) => {
+                if stack.contains(&v.as_str()) || stack.len() >= crate::ir::bindings::MAX_ALIAS_HOPS
+                {
+                    self.deep = true;
+                    return Vec::new();
+                }
+                let mut out: Vec<_> = held
+                    .get(v.as_str())
+                    .into_iter()
+                    .flatten()
+                    .map(|l| (*l, Vec::new()))
+                    .collect();
+                stack.push(v.as_str());
+                for rhs in lets.get(v.as_str()).into_iter().flatten() {
+                    out.extend(self.roots(rhs, lets, held, stack));
+                }
+                stack.pop();
+                out
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// What the member at `segs` of slot `label`'s object may hold besides
+    /// what a setter put there: the expression each member write stores at
+    /// it — read off the literal a write to a shorter path stores — or
+    /// `None` when some write stores there what no expression says.
+    fn at(&self, label: HookLabel, segs: &[String]) -> Option<Vec<&'a Expr>> {
+        if self.deep {
+            return None;
+        }
+        let mut out = Vec::new();
+        for w in self.by_slot.get(&label).into_iter().flatten() {
+            let reaches = w.path.len() <= segs.len()
+                && w.path
+                    .iter()
+                    .zip(segs)
+                    .all(|(p, s)| p.as_ref().is_none_or(|p| p == s));
+            if reaches {
+                out.push(written_at(w.value?, &segs[w.path.len()..])?);
+            }
+        }
+        Some(out)
+    }
+}
+
+/// The member a key names, when a constant names it.
+fn member_key(key: &MemberKey) -> Option<String> {
+    match key {
+        MemberKey::Field(f) => Some(f.clone()),
+        MemberKey::Index(i) => index_name(i),
+    }
+}
+
+/// The member an index names, when it is a constant.
+fn index_name(idx: &Expr) -> Option<String> {
+    match idx.peel_ts() {
+        Expr::Lit(Prim::String(s)) => Some(s.clone()),
+        Expr::Lit(Prim::Int(n)) => Some(n.to_string()),
+        _ => None,
+    }
 }
 
 /// The blocks that run on every pass `call_block` runs on: itself and the
@@ -879,32 +1249,98 @@ struct Rewrite<'a> {
     /// when the write sits in another body, whose names mean something else
     /// at the guard.
     scope: Option<&'a CFG>,
+    /// Does a part of `expr` denote the same value on every run of the loop?
+    /// The relational arm's "both sides are one value next render" is a fact
+    /// about the render after the write only: a written `t` another write
+    /// moves makes `s !== t` true again (#209).
+    held: &'a dyn Fn(&Expr) -> bool,
+}
+
+/// The body a site's guards sit in, when the env they are narrowed from is
+/// not that body's own.
+struct Shadow<'a> {
+    /// What the body binds ([`let_bindings`]).
+    lets: &'a Bindings<'a>,
+    /// What a function nested in it binds ([`nested_binders`]): such a
+    /// closure may reassign a body name between its binding and the guard.
+    nested: HashSet<Var>,
+}
+
+/// What a guard's names read: the render's must table, under the bindings of
+/// the site's body.
+struct Names<'a> {
+    slots: &'a HashMap<Var, SlotPath>,
+    body: Option<&'a Shadow<'a>>,
+}
+
+impl Names<'_> {
+    /// The slot and member path `e` reads on every path at the guard: a name
+    /// the site's body binds once, never in a closure, reads what its
+    /// right-hand side reads (`const { n } = s`, #244); any other name the
+    /// body binds reads nothing certain; a name it does not bind is the
+    /// render's.
+    fn path(&self, e: &Expr) -> Option<SlotPath> {
+        self.go(e, crate::ir::bindings::MAX_ALIAS_HOPS)
+    }
+
+    fn go(&self, e: &Expr, depth: usize) -> Option<SlotPath> {
+        if depth == 0 {
+            return None;
+        }
+        match e.peel_ts() {
+            Expr::Var(v) => match self
+                .body
+                .and_then(|b| b.lets.get(v.as_str()).map(|r| (b, r)))
+            {
+                Some((b, Some(rhs))) if !b.nested.contains(v) => self.go(rhs, depth - 1),
+                Some(_) => None,
+                None => self.slots.get(v).cloned(),
+            },
+            Expr::FieldAccess { obj, field } => {
+                let (l, mut path) = self.go(obj, depth - 1)?;
+                path.push(field.clone());
+                Some((l, path))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// True when `guards`, the conjuncts of one site, are all dead once every
 /// `rewrite` sits in its slot, starting from `env`.
 ///
-/// `shadowed` names what the site's body binds when `env` is not that
-/// body's env — the render exit env under an effect body. Those names read
-/// ⊤: the render may bind the same name to something else (a lowered
-/// short-circuit temp `__t0` most of all), and narrowing that value would
-/// pronounce a guard dead on a name it does not test (#162).
+/// `shadowed` is the site's body when `env` is not that body's env — the
+/// render exit env under an effect body. The names it binds read ⊤: the
+/// render may bind the same name to something else (a lowered short-circuit
+/// temp `__t0` most of all), and narrowing that value would pronounce a
+/// guard dead on a name it does not test (#162).
 fn dead_once_written(
     guards: &[(&Expr, bool)],
-    shadowed: Option<&HashMap<&str, Option<&Expr>>>,
-    state_vals: &HashMap<Var, HookLabel>,
+    shadowed: Option<&Shadow<'_>>,
+    slots: &HashMap<Var, SlotPath>,
+    members: &MemberWrites<'_>,
     rewrites: &[Rewrite<'_>],
     env: &AbstractEnv<StateValue>,
     eval: &mut dyn FnMut(&Expr) -> StateValue,
 ) -> bool {
     let mut env = env.clone();
-    for name in shadowed.into_iter().flat_map(HashMap::keys) {
+    for name in shadowed.into_iter().flat_map(|s| s.lets.keys()) {
         env.extend((*name).to_string(), StateValue::top());
     }
-    let slots_of = |label: HookLabel| -> HashSet<&Var> {
-        state_vals
+    let names = Names {
+        slots,
+        body: shadowed,
+    };
+    // The render names that read the whole slot at the guard: a name the
+    // site's body binds is that binding, not the render's read.
+    let slots_of = |label: HookLabel| -> Vec<&Var> {
+        slots
             .iter()
-            .filter(|(_, l)| **l == label)
+            .filter(|(v, (l, path))| {
+                *l == label
+                    && path.is_empty()
+                    && !shadowed.is_some_and(|s| s.lets.contains_key(v.as_str()))
+            })
             .map(|(v, _)| v)
             .collect()
     };
@@ -916,24 +1352,36 @@ fn dead_once_written(
 
     for &(cond, taken) in guards {
         for rewrite in rewrites {
-            let slots = slots_of(rewrite.label);
+            // The member path `e` reads off this rewrite's slot.
+            let path = |e: &Expr| {
+                names
+                    .path(e)
+                    .filter(|(l, _)| *l == rewrite.label)
+                    .map(|(_, path)| path)
+            };
+            // What else lands at a member of the slot: the member writes
+            // into its object, wherever they sit (#252).
+            let others = |segs: &[String]| members.at(rewrite.label, segs);
             // Relational arm: the guard compares the slot against an
             // expression the write puts *into* the slot, so the two sides
-            // are the same value on the next render whatever that value is.
-            // An interval domain cannot say that — `x < y` after `x := y`
-            // needs the two to be related, not bounded — but the spellings
-            // can.
+            // are the same value on the next render whatever that value is
+            // — and on every later one only while that expression holds,
+            // and no member write moves the path it reads. An interval
+            // domain cannot say that — `x < y` after `x := y` needs the two
+            // to be related, not bounded — but the spellings can.
+            let unmoved =
+                |e: &Expr| path(e).filter(|segs| others(segs).is_some_and(|o| o.is_empty()));
             if let (Some(arg), Some(scope)) = (rewrite.expr, rewrite.scope)
-                && write_settles_comparison(cond, taken, &slots, arg, scope, eval)
+                && write_settles_comparison(cond, taken, &unmoved, arg, scope, rewrite.held, eval)
             {
                 return true;
             }
             // Member arm: the guard tests a *member* of the slot, so the
             // value written at that member answers it — the whole-slot
             // lookup below cannot, since the slot is one abstract value
-            // (#90).
+            // (#90, #244) — joined with what the member writes store there.
             if let Some(arg) = rewrite.expr
-                && write_settles_member_truth(cond, taken, &slots, arg, eval)
+                && write_settles_member(cond, taken, &path, arg, &others, eval)
             {
                 return true;
             }
@@ -960,12 +1408,15 @@ fn dead_once_written(
 ///
 /// Verbatim is checked with [`call_free_key`]: a call may not return the same
 /// thing twice, so a claim that two spellings are one value cannot cross one.
+/// And the stored expression must hold still (`held`): the guard is dead on
+/// every later render only while the slot and it stay one value (#209).
 fn write_settles_comparison(
     cond: &Expr,
     taken: bool,
-    slots: &HashSet<&Var>,
+    slot_path: &dyn Fn(&Expr) -> Option<Vec<String>>,
     written_expr: &Expr,
     cfg: &CFG,
+    held: &dyn Fn(&Expr) -> bool,
     eval: &mut dyn FnMut(&Expr) -> StateValue,
 ) -> bool {
     use crate::ir::expr::BinOp::*;
@@ -986,7 +1437,7 @@ fn write_settles_comparison(
         return false; // the guard survives its own write; nothing proved
     }
     [(lhs, rhs), (rhs, lhs)].iter().any(|(side, other)| {
-        let Some(segs) = slot_path(side, slots) else {
+        let Some(segs) = slot_path(side) else {
             return false;
         };
         let Some(at) = written_at(written_expr, &segs) else {
@@ -996,7 +1447,7 @@ fn write_settles_comparison(
         // `const x = {}; if (s !== x) setS(x)` holds again after every write
         // (#156). The claim below is about two spellings being one value
         // across runs, so neither side may be one.
-        if fresh_spelling(at, cfg, eval) || fresh_spelling(other, cfg, eval) {
+        if fresh_spelling(at, cfg, eval) || fresh_spelling(other, cfg, eval) || !held(at) {
             return false;
         }
         let keys = value_keys(at, cfg);
@@ -1050,60 +1501,106 @@ fn value_keys(e: &Expr, cfg: &CFG) -> Vec<String> {
     out
 }
 
-/// The field chain `e` reads off a variable aliasing the written slot, or
-/// `None` when `e` is not rooted there.
-fn slot_path(e: &Expr, slots: &HashSet<&Var>) -> Option<Vec<String>> {
-    match e.peel_ts() {
-        Expr::Var(v) if slots.contains(v) => Some(Vec::new()),
-        Expr::FieldAccess { obj, field } => {
-            let mut segs = slot_path(obj, slots)?;
-            segs.push(field.clone());
-            Some(segs)
-        }
-        _ => None,
-    }
-}
-
-/// Does the value written at a *member* of the slot contradict a guard that
-/// reads that member?
+/// Does the value written at a path of the slot contradict a guard that reads
+/// that path?
 ///
 /// `if (!id && sheet.leadId) setSheet({ leadId: null, open: false })` reaches
 /// the write only while `sheet.leadId` is truthy, and leaves `null` there — so
-/// the guard cannot hold again. The whole-slot narrowing cannot see that: the
-/// slot is one abstract value, and `{ leadId: null, … }` is a truthy
-/// reference.
+/// the guard cannot hold again; `if (s.n === 0) setS({ n: 1 })` leaves `1`
+/// where the guard wants `0` (#244). The whole-slot narrowing cannot see a
+/// member: the slot is one abstract value, and `{ leadId: null, … }` is a
+/// truthy reference. So the guard is narrowed on a fresh name standing for
+/// the member, bound to the written literal: the engine's own narrowing,
+/// read on the member instead of the slot.
 ///
-/// Only a literal is read, so the answer never depends on which environment a
-/// body-local name would be looked up in.
-fn write_settles_member_truth(
+/// Only a literal or an allocation is read, on either side, so the answer
+/// never depends on which environment a body-local name would be looked up
+/// in; a member the literal does not write, or writes after a spread, proves
+/// nothing. The same question kills a ref's lazy init (`if (!ref.current)
+/// ref.current = {}`, #228), the path read off the ref's `current`.
+///
+/// The object stays mutable once it sits in the slot: `others` answers what
+/// the member writes into it store at a path (#252). The member holds the
+/// join of the literal's and theirs, each a literal too, or the proof fails
+/// closed.
+pub(crate) fn write_settles_member<'m>(
     cond: &Expr,
     taken: bool,
-    slots: &HashSet<&Var>,
+    slot_path: &dyn Fn(&Expr) -> Option<Vec<String>>,
     written_expr: &Expr,
+    others: &dyn Fn(&[String]) -> Option<Vec<&'m Expr>>,
     eval: &mut dyn FnMut(&Expr) -> StateValue,
 ) -> bool {
-    let (read, truthy) = match cond.peel_ts() {
+    use crate::ir::expr::BinOp::*;
+    const MEMBER: &str = "__written_member";
+    let member = || Box::new(Expr::Var(MEMBER.to_string()));
+    // The operand the guard tests, and the guard rebuilt with the member in
+    // its place, in the shape the narrowing reads (the name on the left).
+    let (read, rebuilt) = match cond.peel_ts() {
         Expr::UnaryOp {
             op: UnaryOp::Not,
             arg,
-        } => (arg.peel_ts(), !taken),
-        e => (e, taken),
+        } => (
+            arg.as_ref(),
+            Expr::UnaryOp {
+                op: UnaryOp::Not,
+                arg: member(),
+            },
+        ),
+        Expr::BinOp { op, lhs, rhs } => {
+            let flipped = match op {
+                Eq => Eq,
+                Neq => Neq,
+                Lt => Gt,
+                Gt => Lt,
+                Leq => Geq,
+                Geq => Leq,
+                _ => return false,
+            };
+            let (read, lit, op) = match (lhs.peel_ts(), rhs.peel_ts()) {
+                (read, lit @ Expr::Lit(_)) => (read, lit, op.clone()),
+                (lit @ Expr::Lit(_), read) => (read, lit, flipped),
+                _ => return false,
+            };
+            (
+                read,
+                Expr::BinOp {
+                    op,
+                    lhs: member(),
+                    rhs: Box::new(lit.clone()),
+                },
+            )
+        }
+        read => (read, Expr::Var(MEMBER.to_string())),
     };
-    let Some(segs) = slot_path(read, slots).filter(|s| !s.is_empty()) else {
+    let Some(segs) = slot_path(read) else {
         return false;
     };
     let Some(at) = written_at(written_expr, &segs) else {
         return false;
     };
-    if !matches!(at, Expr::Lit(_)) {
+    // A function literal is not among them: written whole, it is an updater,
+    // and what it stores is its return.
+    let stored = |e: &Expr| {
+        matches!(
+            e.peel_ts(),
+            Expr::Lit(_) | Expr::ObjectLit { .. } | Expr::ArrayLit { .. } | Expr::New { .. }
+        )
+    };
+    let Some(others) = others(&segs) else {
+        return false;
+    };
+    if !stored(at) || !others.iter().all(|e| stored(e)) {
         return false;
     }
-    let val = eval(at);
-    if truthy {
-        val.narrow_truthy().is_bottom_value()
-    } else {
-        val.narrow_falsy().is_bottom_value()
-    }
+    let value = others
+        .iter()
+        .fold(eval(at), |v, e| v.join(&eval(e.peel_ts())));
+    let mut env = AbstractEnv::default();
+    env.extend(MEMBER.to_string(), value);
+    narrow_env_for_branch(&env, &rebuilt, taken)
+        .lookup(MEMBER)
+        .is_bottom_value()
 }
 
 /// The sub-expression the written value places at `segments`: the argument

@@ -44,6 +44,14 @@ pub trait ImportResolver: Send + Sync {
     /// Returns `None` for package imports (non-relative specifiers) or
     /// unresolvable paths.
     fn resolve(&self, from: &Path, specifier: &str) -> Option<PathBuf>;
+
+    /// Whether the file `resolve` answers stands in for a package's compiled
+    /// entry (build output the checkout does not hold, #48): its code is the
+    /// source's, its module directives are the build's, which the source does
+    /// not show (a bundler `"use client"` banner).
+    fn is_compiled_entry(&self, _from: &Path, _specifier: &str) -> bool {
+        false
+    }
 }
 
 pub struct DefaultFileDiscoverer {
@@ -115,6 +123,13 @@ impl ImportResolver for ChainResolver {
     fn resolve(&self, from: &Path, specifier: &str) -> Option<PathBuf> {
         self.0.iter().find_map(|r| r.resolve(from, specifier))
     }
+
+    fn is_compiled_entry(&self, from: &Path, specifier: &str) -> bool {
+        self.0
+            .iter()
+            .find(|r| r.resolve(from, specifier).is_some())
+            .is_some_and(|r| r.is_compiled_entry(from, specifier))
+    }
 }
 
 /// Per-file resolution: route by the *importing* file's location.
@@ -126,7 +141,8 @@ impl ImportResolver for ChainResolver {
 ///
 /// The scope whose root is the **longest** prefix of the importing file wins,
 /// so a nested package overrides its parent; a file under no scope goes to
-/// `fallback`. Same longest-prefix discipline as tsconfig `paths`.
+/// `fallback`. Same longest-prefix discipline as tsconfig `paths`. Roots and
+/// importing files are compared normalized, so `./app` scopes `app/x.ts`.
 pub struct ScopedResolver {
     scopes: Vec<(PathBuf, Box<dyn ImportResolver>)>,
     fallback: Box<dyn ImportResolver>,
@@ -142,20 +158,29 @@ impl ScopedResolver {
 
     /// Route imports written in files under `root` through `resolver`.
     pub fn scope(mut self, root: impl Into<PathBuf>, resolver: Box<dyn ImportResolver>) -> Self {
-        self.scopes.push((root.into(), resolver));
+        self.scopes.push((normalize(&root.into()), resolver));
         self
+    }
+
+    /// The resolver governing imports written in `from`.
+    fn scope_of(&self, from: &Path) -> &dyn ImportResolver {
+        let file = normalize(from);
+        self.scopes
+            .iter()
+            .filter(|(root, _)| file.starts_with(root))
+            .max_by_key(|(root, _)| root.components().count())
+            .map(|(_, r)| r.as_ref())
+            .unwrap_or(self.fallback.as_ref())
     }
 }
 
 impl ImportResolver for ScopedResolver {
     fn resolve(&self, from: &Path, specifier: &str) -> Option<PathBuf> {
-        self.scopes
-            .iter()
-            .filter(|(root, _)| from.starts_with(root))
-            .max_by_key(|(root, _)| root.components().count())
-            .map(|(_, r)| r.as_ref())
-            .unwrap_or(self.fallback.as_ref())
-            .resolve(from, specifier)
+        self.scope_of(from).resolve(from, specifier)
+    }
+
+    fn is_compiled_entry(&self, from: &Path, specifier: &str) -> bool {
+        self.scope_of(from).is_compiled_entry(from, specifier)
     }
 }
 
@@ -444,7 +469,8 @@ pub fn analyze_lowered(
     config.function_registry =
         FunctionRegistry::from_functions_and_imports(lowered.utilities, lowered.utility_imports);
     let registry = ComponentRegistry::from_components(lowered.components);
-    let hook_registry = HookRegistry::from_hooks(lowered.hooks);
+    let hook_registry = HookRegistry::from_hooks(lowered.hooks)
+        .with_re_exports(lowered.module_table.re_export_graph());
     let mut result = analyze_program(registry, hook_registry, strategy, &config);
     result.file_table = lowered.file_table;
     result.module_table = lowered.module_table;
@@ -580,17 +606,26 @@ fn walk(
     configured: &[String],
     ignores: &mut GitignoreStack,
     out: &mut Vec<PathBuf>,
+    is_marker: &dyn Fn(&str) -> bool,
+    marked: &mut Vec<PathBuf>,
 ) {
     let pushed = ignores.push_for(fs, dir);
+    let mut dir_marked = false;
     for path in fs.read_dir(dir) {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if fs.is_dir(&path) {
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if skip_dir(name, &path, configured, ignores) {
                 continue;
             }
-            walk(fs, &path, configured, ignores, out);
-        } else if fs.is_file(&path) && is_source_file(&path) {
-            out.push(path);
+            walk(fs, &path, configured, ignores, out, is_marker, marked);
+        } else if fs.is_file(&path) {
+            if !dir_marked && is_marker(name) {
+                dir_marked = true;
+                marked.push(dir.to_path_buf());
+            }
+            if is_source_file(&path) {
+                out.push(path);
+            }
         }
     }
     if pushed {
@@ -598,14 +633,23 @@ fn walk(
     }
 }
 
-impl FileDiscoverer for DefaultFileDiscoverer {
-    fn discover(&self, root: &Path) -> Vec<PathBuf> {
+impl DefaultFileDiscoverer {
+    /// [`FileDiscoverer::discover`], also returning every walked directory
+    /// holding a file whose bare name satisfies `is_marker`, collected in the
+    /// same pass: a caller that needs the tree's project roots does not walk
+    /// it twice.
+    pub fn discover_marked(
+        &self,
+        root: &Path,
+        is_marker: &dyn Fn(&str) -> bool,
+    ) -> (Vec<PathBuf>, Vec<PathBuf>) {
         let mut files = Vec::new();
+        let mut marked = Vec::new();
         if self.fs.is_file(root) {
             if is_source_file(root) {
                 files.push(root.to_path_buf());
             }
-            return files;
+            return (files, marked);
         }
         // The `.gitignore`s above `root` govern it too — `reactant check
         // src/features` is still inside the repository that wrote them.
@@ -616,9 +660,18 @@ impl FileDiscoverer for DefaultFileDiscoverer {
             &self.exclude_dirs,
             &mut ignores,
             &mut files,
+            is_marker,
+            &mut marked,
         );
         files.sort();
-        files
+        marked.sort();
+        (files, marked)
+    }
+}
+
+impl FileDiscoverer for DefaultFileDiscoverer {
+    fn discover(&self, root: &Path) -> Vec<PathBuf> {
+        self.discover_marked(root, &|_| false).0
     }
 }
 
@@ -647,32 +700,52 @@ pub(crate) fn normalize(path: &Path) -> PathBuf {
     out
 }
 
+/// The source file a module path names, the way TypeScript's bundler
+/// resolution reads it: a JavaScript extension swapped for TypeScript
+/// (`./x.js` written for `./x.ts`), else the path itself when it is a source
+/// file (never a `.d.ts`), else `<path>.<ext>`, else `<path>/index.<ext>`.
+///
+/// The one probe every resolver goes through. Only a JavaScript extension is
+/// ever replaced: any other dot is part of the name, so `./Modal.context`
+/// names `Modal.context.ts` and never `Modal.tsx` — swapping it bound the
+/// wrong module, and analysed the wrong body.
+pub(crate) fn probe_module(fs: &dyn FileSystem, path: &Path) -> Option<PathBuf> {
+    let base = normalize(path);
+    let is_source = |p: &PathBuf| {
+        p.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| SOURCE_EXTENSIONS.contains(&e))
+            && !p.to_string_lossy().ends_with(".d.ts")
+    };
+    let javascript = base
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| matches!(e, "js" | "jsx" | "mjs" | "cjs"));
+    let swapped = ["ts", "tsx"]
+        .iter()
+        .filter(|_| javascript)
+        .map(|ext| base.with_extension(ext));
+    let appended = SOURCE_EXTENSIONS.iter().map(|ext| {
+        let mut p = base.clone().into_os_string();
+        p.push(format!(".{ext}"));
+        PathBuf::from(p)
+    });
+    let index = SOURCE_EXTENSIONS
+        .iter()
+        .map(|ext| base.join(format!("index.{ext}")));
+    swapped
+        .chain(std::iter::once(base.clone()))
+        .chain(appended)
+        .chain(index)
+        .find(|candidate| is_source(candidate) && fs.is_file(candidate))
+}
+
 impl ImportResolver for DefaultImportResolver {
     fn resolve(&self, from: &Path, specifier: &str) -> Option<PathBuf> {
         if !specifier.starts_with('.') {
             return None;
         }
-
-        let parent = from.parent()?;
-        let base = parent.join(specifier);
-
-        // Try <base>.<ext> for each source extension.
-        for ext in SOURCE_EXTENSIONS {
-            let candidate = base.with_extension(ext);
-            if self.fs.is_file(&candidate) {
-                return Some(normalize(&candidate));
-            }
-        }
-
-        // Try <base>/index.<ext>.
-        for ext in SOURCE_EXTENSIONS {
-            let candidate = base.join(format!("index.{ext}"));
-            if self.fs.is_file(&candidate) {
-                return Some(normalize(&candidate));
-            }
-        }
-
-        None
+        probe_module(self.fs.as_ref(), &from.parent()?.join(specifier))
     }
 }
 
@@ -847,6 +920,38 @@ mod tests {
 
         let resolved = DefaultImportResolver::default().resolve(&from, "./utils");
         assert_eq!(resolved, Some(ts));
+    }
+
+    /// A dot inside a module name is part of the name: `./Modal.context`
+    /// is `Modal.context.ts`, and never the `Modal.tsx` beside it.
+    #[test]
+    fn resolve_keeps_a_dotted_name_whole() {
+        let tmp = Tmp::new("resolve-dotted");
+        let from = tmp.write("a/b.tsx", "");
+        tmp.write("a/Modal.tsx", "");
+        let context = tmp.write("a/Modal.context.ts", "");
+        let r = DefaultImportResolver::default();
+        assert_eq!(r.resolve(&from, "./Modal.context"), Some(context));
+        assert_eq!(
+            r.resolve(&from, "./Modal.styles"),
+            None,
+            "no `Modal.styles.*`: unresolved, not `Modal.tsx`"
+        );
+        let dir = tmp.write("a/Store.state/index.ts", "");
+        assert_eq!(r.resolve(&from, "./Store.state"), Some(dir));
+    }
+
+    /// `./utils.js` written for `./utils.ts` (TypeScript's ESM convention)
+    /// is the only extension ever replaced.
+    #[test]
+    fn resolve_maps_a_javascript_extension_to_typescript() {
+        let tmp = Tmp::new("resolve-js-ext");
+        let from = tmp.write("a/b.tsx", "");
+        let ts = tmp.write("a/utils.ts", "");
+        tmp.write("a/utils.js", "");
+        let r = DefaultImportResolver::default();
+        assert_eq!(r.resolve(&from, "./utils.js"), Some(ts.clone()));
+        assert_eq!(r.resolve(&from, "./utils.ts"), Some(ts));
     }
 
     #[test]

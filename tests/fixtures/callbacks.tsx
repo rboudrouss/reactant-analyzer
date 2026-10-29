@@ -97,14 +97,15 @@ function FetchUserOk() {
   return <div>{user ? "loaded" : "loading"}</div>;
 }
 
-// ── Unknown helper callback is conservatively skipped (no false positive) ─────
+// ── Unknown helper callback escapes (a possible loop) ─────────────────────────
 // A custom helper that takes a closure is not recognised as in-cycle, so its
-// setter is not descended — avoids flagging custom subscription wrappers.
+// setter is not descended at the call; the closure escapes into the helper and
+// runs with the handlers (#254). The helper may call it at once: a Warning.
 
-function CustomHelperOk() {
+function CustomHelperMayLoop() {
   const [v, setV] = useState(0);
   useEffect(() => {
-    myHelper(() => setV(v + 1)); // ✓ no infinite-loop (unknown callee → skipped)
+    myHelper(() => setV(v + 1)); // ⚠ infinite-loop Warning (the helper may run it now)
   });
   return <div>{v}</div>;
 }

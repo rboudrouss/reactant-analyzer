@@ -59,6 +59,60 @@ impl Default for Config {
     }
 }
 
+/// What the bodies of the whole program do, read once before any component
+/// is analysed: facts a component's own bodies cannot settle, and the
+/// results they would be joined over do not exist yet.
+pub struct ProgramFacts {
+    /// Some body fires event listeners itself (`dispatchEvent`), so no
+    /// listener is event-only (#219).
+    pub dispatches: bool,
+    /// The names some body writes outside itself
+    /// ([`written_names`](crate::engine::render_deps::written_names)): a
+    /// module binding among them is a cell that moves with no slot (#224).
+    pub written: HashSet<Var>,
+}
+
+impl ProgramFacts {
+    /// Every component, custom hook and utility of the program, as lowered.
+    pub(crate) fn of(
+        components: &ComponentRegistry,
+        hooks: &HookRegistry,
+        utilities: &FunctionRegistry,
+    ) -> Self {
+        use crate::engine::render_deps::written_in;
+        let mut facts = Self::of_utilities(utilities);
+        facts.dispatches =
+            crate::engine::registrations::program_dispatches_events(components, hooks, utilities);
+        for c in components.all_components() {
+            facts.written.extend(written_in(
+                std::slice::from_ref(&c.param),
+                &c.render_cfg,
+                &c.hooks,
+            ));
+        }
+        for h in hooks.all_keys().iter().filter_map(|k| hooks.get(k)) {
+            facts
+                .written
+                .extend(written_in(&h.params, &h.body_cfg, &h.hooks));
+        }
+        facts
+    }
+
+    /// A lone component's program: the utilities it may call. Its own bodies
+    /// are read where it is analysed, after its hooks are inlined.
+    fn of_utilities(utilities: &FunctionRegistry) -> Self {
+        ProgramFacts {
+            dispatches: utilities
+                .all_functions()
+                .any(|f| crate::engine::registrations::dispatches_events(&f.body_cfg)),
+            written: utilities
+                .all_functions()
+                .flat_map(|f| crate::engine::render_deps::written_roots(&f.params, &f.body_cfg))
+                .collect(),
+        }
+    }
+}
+
 /// `AnalyzeChildFn` callback called from `eval_comp_app` to inline a child component.
 /// Provided to `InterCtx` at creation time to break the circular dep between
 /// `domains::transfer` and `engine::fixpoint`.
@@ -77,6 +131,7 @@ pub fn analyze_component_inter(
         initial_env,
         initial_heap,
         Some(inter),
+        inter.program,
     )
 }
 
@@ -114,6 +169,8 @@ pub fn analyze_component_as<T: Transfer<Domain = StateValue>>(
         AbstractEnv::bottom(),
         Heap::new(),
         None,
+        // The program is this component and the utilities it may call.
+        &ProgramFacts::of_utilities(&config.function_registry),
     )
 }
 
@@ -127,6 +184,7 @@ pub fn analyze_component_as<T: Transfer<Domain = StateValue>>(
 ///   5. Handler passes (in-cycle).
 ///   6. Convergence check.
 ///   7. Widen after `config.widen_threshold` iterations.
+#[allow(clippy::too_many_arguments)]
 fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     comp: ComponentIR,
     comp_id: ComponentId,
@@ -135,6 +193,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     initial_env: AbstractEnv<StateValue>,
     initial_heap: Heap,
     inter: Option<&InterCtx<'_>>,
+    program: &ProgramFacts,
 ) -> AnalysisResult<StateValue> {
     let ComponentIR {
         file: comp_file,
@@ -195,7 +254,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     // a write site is caller-authored or wrapper-mediated.
     let mut inline_regions = crate::engine::setters::InlineRegions::default();
     // The identity supplies every splice in this component draws from.
-    let mut splice_salt = SpliceIds::for_component(&render_cfg, &hooks);
+    let mut splice_salt = SpliceIds::for_component(&render_cfg, &hooks, comp_id);
 
     // Utility-function inlining. Runs before `expand_custom_hooks` so utility
     // bodies containing hook calls become visible to the hook expansion pass.
@@ -315,10 +374,38 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     // body is an effect's, whose returned cleanup React calls too (#171);
     // what the fixpoint knows beyond the body's syntax (callback bodies,
     // reducers) and how loops widen are the same for all of them.
+    // A listener may run synchronously wherever the program dispatches
+    // events (#219): this component's own bodies, inlined hooks and utilities
+    // included, or any other body of the program. Every pass then runs a
+    // registered listener where it is registered (#250).
+    let dispatches = program.dispatches
+        || crate::engine::registrations::body_dispatches_events(&render_cfg, &hooks);
+    // The hooks expansion left: their arguments escape at their call (#254).
+    let hook_args: HashMap<HookLabel, Vec<Expr>> = hooks
+        .iter()
+        .filter_map(|h| match h {
+            HookEntry::Custom { label, args, .. } => Some((*label, args.clone())),
+            _ => None,
+        })
+        .collect();
     let query = FixpointCtx {
         callbacks: &callback_bodies,
         reducers: &reducers,
+        dispatches,
+        hook_args: &hook_args,
     };
+    // A `useCallback` value is a function the heap does not place — its body
+    // lives in the hook entry — so where it goes is not followed: its body
+    // may run wherever an escaped closure may (#254).
+    let escaped_bodies: Vec<(&[Var], &CFG)> = hooks
+        .iter()
+        .filter_map(|h| match h {
+            HookEntry::Callback {
+                params, body_cfg, ..
+            } => Some((params.as_slice(), body_cfg)),
+            _ => None,
+        })
+        .collect();
     let widening = crate::domains::Widening {
         after: config.widen_threshold,
         thresholds: &thresholds,
@@ -349,7 +436,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                     if let Terminator::Return(ret) = &block.term
                         && let Some(env) = envs.get(bid)
                     {
-                        let _ = exec_fn_value(transfer, ret, env, &mut ac, 0);
+                        let _ = exec_fn_value(transfer, ret, &[], env, &mut ac, 0);
                     }
                 }
             }
@@ -433,7 +520,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         // second pass so each recompute reads a consistent snapshot — the
         // fixpoint converges any memo-to-memo dependency across iterations.
         env_exit = exit_env(&render_cfg, &block_states);
-        let memo_updates: Vec<(HookLabel, StateValue)> = {
+        let memo_updates: Vec<(HookLabel, crate::domains::EnvVal<StateValue>)> = {
             let mut memo_ctx = AnalysisCtx {
                 component: comp_id,
                 state: &mut state_store,
@@ -447,15 +534,21 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             hooks
                 .iter()
                 .filter_map(|hook| match hook {
-                    HookEntry::Memo { label, deps, .. }
-                    | HookEntry::Callback { label, deps, .. } => Some((
+                    HookEntry::Memo { label, .. } | HookEntry::Callback { label, .. } => Some((
                         *label,
-                        transfer.recompute_memo(comp_id, deps, &env_exit, &mut memo_ctx),
+                        transfer.recompute_memo(
+                            comp_id,
+                            hook,
+                            &render_cfg,
+                            &env_exit,
+                            &mut memo_ctx,
+                        ),
                     )),
                     _ => None,
                 })
                 .collect()
         };
+        let memo_before = memo_store.clone();
         for (label, val) in memo_updates {
             memo_store.set(label, val);
         }
@@ -509,6 +602,26 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 state_from_handlers = state_from_handlers.join(&h_state);
             }
         }
+        // The functions code the analysis does not see may call — handed to
+        // a callee or a hook it does not run, to React through an element,
+        // stored where the heap does not follow — run as handlers do, from
+        // the render's exit env (#254). Every pass above has run, so every
+        // closure this iteration let escape runs in it.
+        {
+            let mut out = state_store.clone();
+            let mut ac = AnalysisCtx {
+                component: comp_id,
+                state: &mut out,
+                memo: &memo_store,
+                start: Some(&state_store),
+                heap: &mut heap,
+                query: &query,
+                inter,
+                widening,
+            };
+            crate::domains::interp::run_escaped(transfer, &escaped_bodies, &env_exit, &mut ac);
+            state_from_handlers = state_from_handlers.join(&out);
+        }
 
         // ── Convergence check ─────────────────────────────────────────────────
         let new_state_incycle = state_from_render.join(&state_from_effects);
@@ -520,7 +633,10 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             .join(&state_from_handlers)
             .join(&external_updates);
 
-        if new_state.leq(&state) {
+        // The memo store is part of the carrier: this pass's render read the
+        // memos the previous iteration computed, so it saw the stores only
+        // once they stop moving.
+        if new_state.leq(&state) && memo_store == memo_before {
             break;
         }
 
@@ -609,12 +725,15 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     let effect_info = collect_effect_info(&hooks);
     let handler_info = collect_handler_info(&hooks);
     // A write through a parent's setter prop is a row too, owner-qualified
-    // (ADR-042 §2) — the same resolution `setter-in-render` reads.
-    let foreign: HashMap<Var, crate::engine::setters::SetterProp> =
-        crate::engine::setters::collect_component_setter_vars(&render_cfg, &block_states, &heap)
-            .into_iter()
-            .filter(|(_, prop)| prop.component != comp_id)
-            .collect();
+    // (ADR-042 §2) — the same resolution `setter-in-render` reads — and so is
+    // one through a name or member the converged values bind to an own setter.
+    let render_params = std::slice::from_ref(&comp_param);
+    let converged_setters = crate::engine::setters::collect_component_setter_vars(
+        &render_cfg,
+        render_params,
+        &block_states,
+        &heap,
+    );
     // The envs each row's argument is evaluated in: the converged stores, and
     // the per-block envs of the region the row sits in.
     let site_envs = crate::engine::written::SiteEnvs {
@@ -630,12 +749,14 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     };
     let slot_writers = crate::engine::setters::collect_slot_writers(
         &render_cfg,
+        render_params,
         &hooks,
         &inline_regions,
         &hook_provenance,
-        &foreign,
+        &converged_setters,
         &site_envs,
         &reducers,
+        dispatches,
     );
     // The seed relation rides the same slice: it folds `slot_writers` rows and
     // the effects' declared deps, so it must come after both (#106, ADR-031).
@@ -650,31 +771,11 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     // The registration relation rides the same slice (#111, ADR-034): one
     // scan of the effect bodies, read by `stale-closure`, `missing-cleanup`
     // and the Tier-A `registrations` anchor alike.
-    let registrations = crate::engine::registrations::collect_registrations(&render_cfg, &hooks);
-    // The effect-trigger relation (ADR-042 §3): a dep evaluated in the render
-    // exit env, the one every hook body starts from.
-    let effect_triggers = {
-        let mut scratch = heap.clone();
-        crate::engine::triggers::collect_effect_triggers(
-            comp_id,
-            &render_cfg,
-            &hooks,
-            &memo_store,
-            |e| {
-                crate::engine::eval::eval_in_stores(
-                    e,
-                    &env_exit,
-                    comp_id,
-                    &final_state,
-                    &memo_store,
-                    &mut scratch,
-                )
-            },
-        )
-    };
+    let registrations =
+        crate::engine::registrations::collect_registrations(&render_cfg, &hooks, dispatches);
     let hooks_clone = hooks.clone();
 
-    AnalysisResult {
+    let mut result = AnalysisResult {
         component: comp_id,
         file: comp_file,
         param: comp_param,
@@ -698,10 +799,43 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         slot_writers,
         slot_seeds,
         registrations,
-        effect_triggers,
+        effect_triggers: Vec::new(),
+        effect_reruns: HashMap::new(),
+        effect_props: Default::default(),
         iterations: iteration,
         heap,
-    }
+    };
+    // The effect-trigger relation (ADR-042 §3): a dep evaluated in the render
+    // exit env, the one every hook body starts from, and what it is computed
+    // from where the effect is called. A module name some body of the
+    // program writes, this one's inlined bodies included, is a cell (#224).
+    let mut written = crate::engine::render_deps::written_names(&result);
+    written.extend(program.written.iter().cloned());
+    let sources = crate::engine::render_deps::render_deps(&result, &written).effect_deps;
+    let relation = {
+        let mut scratch = result.heap.clone();
+        crate::engine::triggers::collect_effect_triggers(
+            comp_id,
+            &result.render_cfg,
+            &result.hooks,
+            &result.memo_store,
+            &sources,
+            |e| {
+                crate::engine::eval::eval_in_stores(
+                    e,
+                    &env_exit,
+                    comp_id,
+                    &result.state_store,
+                    &result.memo_store,
+                    &mut scratch,
+                )
+            },
+        )
+    };
+    result.effect_triggers = relation.rows;
+    result.effect_reruns = relation.reruns;
+    result.effect_props = relation.props;
+    result
 }
 
 // ── Program-level analysis ────────────────────────────────────────────────────
@@ -724,9 +858,33 @@ pub fn analyze_program(
     let stats = RefCell::new(AnalysisStats::default());
     let results: RefCell<HashMap<ComponentId, AnalysisResult<crate::domains::StateValue>>> =
         RefCell::new(HashMap::new());
+    let inputs: RefCell<HashMap<ComponentId, crate::domains::ChildInput>> =
+        RefCell::new(HashMap::new());
+    let site_inputs: RefCell<HashMap<crate::domains::SiteKey, crate::domains::ChildInput>> =
+        RefCell::new(HashMap::new());
 
     let roots = strategy.detect(&registry);
     let mut analysed: std::collections::HashSet<ComponentId> = std::collections::HashSet::new();
+    let program = ProgramFacts::of(&registry, &hook_registry, &config.function_registry);
+
+    let inter_for = |component: ComponentId, call_stack: Vec<ComponentId>| InterCtx {
+        registry: &registry,
+        cache: &cache,
+        shared_state: &shared_state,
+        reducers: &reducers,
+        call_graph: &call_graph,
+        stats: &stats,
+        results: &results,
+        inputs: &inputs,
+        site_inputs: &site_inputs,
+        probe: false,
+        call_stack: RefCell::new(call_stack),
+        component,
+        config,
+        analyze_child: analyze_component_inter as AnalyzeChildFn,
+        hook_registry: Some(&hook_registry),
+        program: &program,
+    };
 
     // Phase 1: analyze roots top-down (children inlined via eval_comp_app).
     for &root in &roots {
@@ -734,20 +892,7 @@ pub fn analyze_program(
             continue;
         };
         if let Some(root_ir) = registry.ir_for(&root_key) {
-            let inter = InterCtx {
-                registry: &registry,
-                cache: &cache,
-                shared_state: &shared_state,
-                reducers: &reducers,
-                call_graph: &call_graph,
-                stats: &stats,
-                results: &results,
-                call_stack: RefCell::new(vec![]),
-                component: root,
-                config,
-                analyze_child: analyze_component_inter as AnalyzeChildFn,
-                hook_registry: Some(&hook_registry),
-            };
+            let inter = inter_for(root, vec![]);
             let result = analyze_component_impl(
                 root_ir,
                 root,
@@ -756,10 +901,43 @@ pub fn analyze_program(
                 AbstractEnv::bottom(),
                 Heap::new(),
                 Some(&inter),
+                &program,
             );
             stats.borrow_mut().components_analyzed += 1;
             results.borrow_mut().insert(root, result);
             analysed.insert(root);
+        }
+    }
+
+    // Per-site facts (#175). A child's result is its analysis under the join
+    // of every element's input, and the join loses what holds through one
+    // element alone (a dep that is a new reference at every render when one
+    // parent renders it). Each element whose input is below the join
+    // re-analyses its child under that input once, as a probe that changes
+    // nothing phase 1 stored, and its call-graph row keeps the facts.
+    let mut sites: Vec<_> = site_inputs.take().into_iter().collect();
+    sites.sort_by_key(|((child, caller, span), _)| (*child, *caller, span.map(|s| s.pos_key())));
+    for ((child, caller, span), input) in sites {
+        let alone = inputs
+            .borrow()
+            .get(&child)
+            .is_none_or(|joined| input.covers(&joined.props, &joined.heap));
+        let Some(ir) = registry.ir_of(child) else {
+            continue;
+        };
+        if alone {
+            continue;
+        }
+        let probe = InterCtx {
+            probe: true,
+            ..inter_for(child, vec![caller])
+        };
+        let result = probe.analyze_under(ir, input);
+        let facts = crate::engine::SiteFacts {
+            fresh_deps: crate::engine::fresh_deps(&result),
+        };
+        if let Some(row) = call_graph.borrow_mut().site_mut(caller, child, span) {
+            row.own = Some(facts);
         }
     }
 
@@ -796,6 +974,7 @@ pub fn analyze_program(
                 AbstractEnv::bottom(),
                 Heap::new(),
                 None,
+                &program,
             );
             stats.borrow_mut().components_analyzed += 1;
             results.borrow_mut().insert(id, result);
@@ -845,14 +1024,16 @@ pub fn analyze_program(
 /// (#134).
 pub(crate) struct SpliceIds {
     salt: u32,
-    next_alloc: usize,
+    next_alloc: u64,
 }
 
 impl SpliceIds {
-    fn for_component(render_cfg: &CFG, hooks: &[HookEntry]) -> Self {
+    /// Grafts land above the component's own sites, inside its range
+    /// ([`ComponentId::site_base`]) even when it allocates nothing itself.
+    fn for_component(render_cfg: &CFG, hooks: &[HookEntry], component: ComponentId) -> Self {
         SpliceIds {
             salt: 0,
-            next_alloc: alloc_span(render_cfg, hooks),
+            next_alloc: alloc_span(render_cfg, hooks).max(component.site_base()),
         }
     }
 
@@ -866,7 +1047,7 @@ impl SpliceIds {
 
     /// The salt and allocation-id offset for one graft `span` ids wide,
     /// advancing both supplies past it.
-    fn take(&mut self, span: usize) -> (u32, usize) {
+    fn take(&mut self, span: u64) -> (u32, u64) {
         let salt = self.salt;
         self.salt += 1;
         let ids = self.next_alloc;
@@ -878,7 +1059,7 @@ impl SpliceIds {
 /// The allocation-id width of a body together with the hook table grafted
 /// alongside it — they are numbered from one file counter, so they share a
 /// range and must be shifted by one offset.
-fn alloc_span(cfg: &CFG, hooks: &[HookEntry]) -> usize {
+fn alloc_span(cfg: &CFG, hooks: &[HookEntry]) -> u64 {
     std::iter::once(crate::ir::alloc_id_span(cfg))
         .chain(
             hooks
@@ -890,11 +1071,37 @@ fn alloc_span(cfg: &CFG, hooks: &[HookEntry]) -> usize {
         .unwrap_or(0)
 }
 
-/// Guard strategy: a local `expanding` set tracks every hook name whose entries
-/// have been inserted into `hooks` in this call.  Once a name is in the set, any
-/// further `Custom` entry with that name is skipped (cut to ⊤).  This is correct
-/// for self-recursive hooks and sound for the rare case of a hook called twice in
-/// the same component (second call stays opaque FN, not FP).
+/// The recursion guard both splices share (custom hooks, utilities): the
+/// names whose inlining produced a call, outermost first (empty for the
+/// component's own code). A call is cut to ⊤ only when its callee is in its
+/// own ancestry — exactly self- or mutual recursion. A name inlined
+/// *elsewhere* is no reason to cut: a guard remembering every name ever
+/// inlined left a sibling second call opaque, and every write through it
+/// invisible (#185, #232). Each inlining strictly lengthens the chain with a
+/// name not already in it, so chains are bounded by the number of names.
+#[derive(Clone, Default)]
+struct Ancestry(std::rc::Rc<Vec<String>>);
+
+impl Ancestry {
+    /// A call of `callee` here would re-enter an enclosing inlining.
+    fn recurses(&self, callee: &str) -> bool {
+        self.0.iter().any(|n| n == callee)
+    }
+
+    /// The ancestry of the code an inlining of `callee` from here produces.
+    fn enter(&self, callee: &str) -> Ancestry {
+        Ancestry(std::rc::Rc::new(
+            self.0
+                .iter()
+                .cloned()
+                .chain(std::iter::once(callee.to_string()))
+                .collect(),
+        ))
+    }
+}
+
+/// Guard strategy: every entry carries its [`Ancestry`]. A `Custom` entry is
+/// skipped (cut to ⊤) only when its ancestry recurses on its name.
 fn expand_custom_hooks(
     hooks: &mut Vec<HookEntry>,
     hook_provenance: &mut Vec<crate::ir::hooks::HookProvenance>,
@@ -909,7 +1116,8 @@ fn expand_custom_hooks(
         return;
     };
 
-    let mut expanding: HashSet<String> = HashSet::new();
+    // Ancestry by entry label; an entry with no row is the component's own.
+    let mut ancestry: HashMap<HookLabel, Ancestry> = HashMap::new();
 
     let mut i = 0;
     while i < hooks.len() {
@@ -933,22 +1141,17 @@ fn expand_custom_hooks(
         };
         let custom_label = hooks[i].label();
 
-        // Recursion guard: skip if we already started expanding this hook.
-        if expanding.contains(&name) {
+        // Recursion guard: skip a call of a hook this entry is already inside.
+        let chain = ancestry.get(&custom_label).cloned().unwrap_or_default();
+        if chain.recurses(&name) {
             i += 1;
             continue;
         }
 
-        // Prefer the resolved-file key; fall back to name-only when the import
-        // wasn't resolved OR the resolved file doesn't define the hook under
-        // that name (a one-level re-export: `./a` resolves but `useX` lives in
-        // `./b`). Same first-match caveat as the rest of `get_by_name`.
-        let hook_ir_opt = match &resolved_file {
-            Some(file) => reg
-                .get(&(file.clone(), name.clone()))
-                .or_else(|| reg.get_by_name(&name)),
-            None => reg.get_by_name(&name),
-        };
+        // The call's own import settles the body, through re-exports; only
+        // an unimported name falls back to the name (ADR-013, #226).
+        let hook_ir_opt =
+            reg.resolve_call(&name, import_source.as_deref(), resolved_file.as_deref());
         let Some(hook_ir) = hook_ir_opt else {
             // Not in HookRegistry check SummaryRegistry as fallback.
             // Known library hooks (TanStack, React Router, etc.) are removed from the
@@ -1034,9 +1237,33 @@ fn expand_custom_hooks(
             &caller_bound,
         );
 
+        // A deps argument the hook binds to one of its parameters is the
+        // call's argument there, or the parameter's default when the call
+        // omits it (#230). Read in the hook's own names: a default is one of
+        // them and takes the rename, an argument is the caller's and is put
+        // in after it.
+        use crate::ir::hooks::DepsArg;
+        let elsewhere =
+            crate::engine::setters::must_alias_scopes(&hook_ir.body_cfg, &hook_ir.hooks);
         let remapped: Vec<HookEntry> = remap_hooks(hook_ir.hooks.clone(), off)
             .into_iter()
-            .map(|h| {
+            .map(|mut h| {
+                let param = match h.deps_mut() {
+                    Some(DepsArg::Opaque(e)) => crate::ir::bindings::must_param(
+                        e,
+                        &hook_ir.body_cfg,
+                        &elsewhere,
+                        &hook_ir.params,
+                    ),
+                    _ => None,
+                };
+                let arg = param.and_then(|i| call_args.get(i).cloned());
+                let default = param
+                    .filter(|_| arg.is_none())
+                    .and_then(|i| hook_ir.param_defaults.get(i).cloned().flatten());
+                if let (Some(d), Some(deps)) = (default, h.deps_mut()) {
+                    *deps = DepsArg::from_expr(crate::ir::remap_expr(d, off));
+                }
                 let h = match h {
                     HookEntry::State {
                         label,
@@ -1051,7 +1278,11 @@ fn expand_custom_hooks(
                     },
                     other => other,
                 };
-                crate::ir::rename_hook_entry(h, &rename)
+                let mut h = crate::ir::rename_hook_entry(h, &rename);
+                if let (Some(arg), Some(deps)) = (arg, h.deps_mut()) {
+                    *deps = DepsArg::from_expr(arg);
+                }
+                h
             })
             .collect();
 
@@ -1060,7 +1291,9 @@ fn expand_custom_hooks(
         // multi-block-body FN (only the entry block used to survive) and the
         // destructuring rebind (the return is now actually bound).
         let body = remap_cfg(hook_ir.body_cfg.clone(), off);
-        if let Some((block_id, stmt_idx, bound_var)) = find_hook_marker(render_cfg, custom_label) {
+        let marker = find_hook_marker(render_cfg, custom_label);
+        let bound_temp = marker.as_ref().and_then(|(_, _, v)| v.clone());
+        if let Some((block_id, stmt_idx, bound_var)) = marker {
             let range = crate::ir::splice_callee_into_cfg(
                 render_cfg,
                 block_id,
@@ -1129,6 +1362,7 @@ fn expand_custom_hooks(
             name: name.clone(),
             from: hook_ir.file.clone(),
             kind: crate::engine::InlineKind::Hook,
+            bound: bound_temp,
         });
 
         // Provenance rows (ADR-023 step 1): the hook's own rows join the
@@ -1144,8 +1378,12 @@ fn expand_custom_hooks(
             }
         }));
 
-        // Mark before inserting so re-encountered Custom entries for this hook are guarded.
-        expanding.insert(name.clone());
+        // The inlined entries sit one hook deeper: their ancestry is this
+        // call's plus this hook, so a call of `name` among them is recursion.
+        let inner = chain.enter(&name);
+        for h in &remapped {
+            ancestry.insert(h.label(), inner.clone());
+        }
 
         // Replace the Custom entry with the hook's remapped sub-entries.
         hooks.remove(i);
@@ -1431,6 +1669,7 @@ fn collect_effect_info(hooks: &[HookEntry]) -> HashMap<HookLabel, EffectInfo> {
                 params,
                 deps,
                 span,
+                ..
             } => {
                 let (mut free_paths, mut deps_pinned) =
                     free_paths_and_pinned(body_cfg, &deps.covering());
@@ -1535,12 +1774,7 @@ fn expand_utility_calls(
         salt,
         truncated: false,
     };
-    inline_in_cfg(
-        render_cfg,
-        &mut ctx,
-        &mut regions.render,
-        &mut HashSet::new(),
-    );
+    inline_in_cfg(render_cfg, &mut ctx, &mut regions.render);
     for hook in hooks.iter_mut() {
         match hook {
             HookEntry::Effect {
@@ -1556,7 +1790,7 @@ fn expand_utility_calls(
                 label, body_cfg, ..
             } => {
                 let body_regions = regions.bodies.entry(*label).or_default();
-                inline_in_cfg(body_cfg, &mut ctx, body_regions, &mut HashSet::new());
+                inline_in_cfg(body_cfg, &mut ctx, body_regions);
             }
             _ => {}
         }
@@ -1564,10 +1798,10 @@ fn expand_utility_calls(
     ctx.truncated
 }
 
-/// Splice utility calls in `cfg`. Each utility name is inlined at most once
-/// per CFG: this is the recursion guard (self-recursive utilities, and
-/// `A → B → A` chains, terminate after a single round-trip; subsequent calls
-/// remain `Call` → opaque `Top`).
+/// Splice utility calls in `cfg`. The recursion guard is each block's
+/// [`Ancestry`]: a call is left `Call` → opaque `Top` only inside an inlining
+/// of its own callee (self-recursion, `A → B → A`), so two sibling calls of
+/// one utility are both inlined (#232).
 ///
 /// `max_depth` caps the total number of splices into one CFG so a single
 /// inlining never explodes the IR even with deep utility chains.
@@ -1575,11 +1809,26 @@ fn inline_in_cfg(
     cfg: &mut CFG,
     ctx: &mut InlineCtx<'_>,
     regions: &mut Vec<crate::engine::setters::InlineRegion>,
-    expanding: &mut HashSet<String>,
 ) {
+    // Ancestry by block range: a splice's blocks sit one utility deeper than
+    // its call; its join block (the caller's post-call statements, just past
+    // the range) keeps the call's own. Ranges are disjoint, each splice
+    // allocating strictly above.
+    let mut scopes: Vec<(std::ops::Range<BlockId>, Ancestry)> = Vec::new();
+    // A splice that bailed (a headless body) would bail again: never retried.
+    let mut unsplicable: HashSet<String> = HashSet::new();
     let mut budget = ctx.max_depth;
     loop {
-        let target = find_inlining_target(cfg, ctx.registry, ctx.caller_file, regions, expanding);
+        let ancestry = |bid: BlockId| {
+            scopes
+                .iter()
+                .find(|(r, _)| r.contains(&bid))
+                .map(|(_, a)| a.clone())
+                .unwrap_or_default()
+        };
+        let target = find_inlining_target(cfg, ctx.registry, ctx.caller_file, regions, |bid, n| {
+            unsplicable.contains(n) || ancestry(bid).recurses(n)
+        });
         if budget == 0 {
             // Exhausting the budget leaves the remaining calls opaque (⊤) —
             // sound, but a truncation, and one that measurably happens (20 CFGs
@@ -1592,9 +1841,7 @@ fn inline_in_cfg(
         let Some((block_id, stmt_idx, name)) = target else {
             break;
         };
-        // Mark before splicing so a self-recursive call inside the spliced
-        // body is skipped on the next scan.
-        expanding.insert(name.clone());
+        let chain = ancestry(block_id);
         // Provenance (ADR-019 origins, ADR-027 §4 regions): recorded as an
         // explicit pair with the splice, only when it actually happened —
         // the old push-before-splice let an early-returning splice desync
@@ -1604,6 +1851,10 @@ fn inline_in_cfg(
             .find(|r| r.start <= block_id && block_id < r.end)
             .map(|r| r.from.clone())
             .unwrap_or_else(|| ctx.caller_file.to_path_buf());
+        let bound = match &cfg.blocks[&block_id].stmts[stmt_idx] {
+            Stmt::Let { var, .. } => Some(var.clone()),
+            _ => None,
+        };
         if let Some((range, exported, from)) =
             splice_one_call(cfg, block_id, stmt_idx, ctx.registry, &res_file, ctx.salt)
         {
@@ -1611,10 +1862,13 @@ fn inline_in_cfg(
                 name: name.clone(),
                 from: from.clone(),
                 kind: crate::engine::InlineKind::Utility,
+                bound,
             });
             let parent = regions
                 .iter()
                 .position(|r| r.start <= block_id && block_id < r.end);
+            scopes.push((range.end..range.end + 1, chain.clone()));
+            scopes.push((range.clone(), chain.enter(&name)));
             regions.push(crate::engine::setters::InlineRegion {
                 start: range.start,
                 end: range.end,
@@ -1622,17 +1876,21 @@ fn inline_in_cfg(
                 from,
                 parent,
             });
+        } else {
+            unsplicable.insert(name);
         }
         budget -= 1;
     }
 }
 
+/// The first call to a resolvable utility in `cfg` that `skip(block, name)`
+/// does not cut.
 fn find_inlining_target(
     cfg: &CFG,
     registry: &FunctionRegistry,
     caller_file: &std::path::Path,
     regions: &[crate::engine::setters::InlineRegion],
-    expanding: &HashSet<String>,
+    skip: impl Fn(BlockId, &str) -> bool,
 ) -> Option<(BlockId, usize, String)> {
     for (&bid, block) in &cfg.blocks {
         // A statement inside a spliced region came from the wrapper's file:
@@ -1646,7 +1904,7 @@ fn find_inlining_target(
             .unwrap_or(caller_file);
         for (idx, stmt) in block.stmts.iter().enumerate() {
             if let Some(name) = utility_call_target(stmt) {
-                if expanding.contains(&name) {
+                if skip(bid, &name) {
                     continue;
                 }
                 if registry.resolve(res_file, &name).is_some() {
@@ -1766,10 +2024,6 @@ mod tests {
         },
     };
     use std::sync::Arc;
-
-    fn trivial_cfg() -> CFG {
-        crate::test_support::single_block_cfg(vec![])
-    }
 
     fn component(hooks: Vec<HookEntry>, render_stmts: Vec<Stmt>) -> ComponentIR {
         ComponentIR {
@@ -1909,7 +2163,8 @@ mod tests {
             StateValue::number(Interval {
                 lo: 0.0,
                 hi: 42.0,
-                is_int: true
+                is_int: true,
+                may_neg_zero: false
             })
         );
         assert!(result.widen_trace.is_empty());
@@ -2008,10 +2263,18 @@ mod tests {
 
     #[test]
     fn memo_store_recomputed_from_deps() {
-        // useMemo(() => x, [x]) where x = Number([1,1]) (stable point) → memo[0] = Reference(Stable)
+        // useMemo(() => [], [x]) where x = Number([1,1]) (stable point) → memo[0] = Reference(Stable)
         let hooks = vec![HookEntry::Memo {
             label: 0,
-            body_cfg: trivial_cfg(),
+            body_cfg: crate::test_support::single_block_cfg_term(
+                vec![],
+                Terminator::Return(Expr::ArrayLit {
+                    id: ExprId(0),
+                    elems: vec![],
+                    arity: crate::ir::hooks::Arity::Exact(0),
+                    spread_at: vec![],
+                }),
+            ),
             deps: DepsArg::List(DepsList::exact(vec![Expr::Var("x".to_string())])),
             span: None,
         }];
@@ -2029,7 +2292,8 @@ mod tests {
         ];
         let comp = component(hooks, render_stmts);
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-        // dep x = Number([1,1]).to_stability() = Stable → Reference(Stable)
+        // dep x = Number([1,1]).to_stability() = Stable → the body's array,
+        // Reference(Stable)
         assert_eq!(
             result.memo_store.get(0),
             StateValue::reference(Stability::Stable)
@@ -2516,7 +2780,8 @@ mod tests {
             StateValue::number(Interval {
                 lo: 0.0,
                 hi: 99.0,
-                is_int: true
+                is_int: true,
+                may_neg_zero: false
             }),
             "handler's setN(99) must be joined into state_store"
         );

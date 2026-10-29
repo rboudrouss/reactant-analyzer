@@ -48,7 +48,8 @@ pub enum Timing {
     Deferred,
     /// An external event. The DOM has no synchronous dispatch from
     /// `addEventListener`, so the callback provably does not run during the
-    /// registering call.
+    /// registering call — and, while no body of the program calls
+    /// `dispatchEvent`, during no React phase ([`Timing::in_program`]).
     Handler,
     /// The registrar may invoke the callback synchronously — an RxJS
     /// `BehaviorSubject` emits to a new subscriber on the spot — so nothing
@@ -312,6 +313,91 @@ pub fn match_registrar(fn_: &Expr) -> Option<(&'static Registrar, String)> {
     Some((reg, display))
 }
 
+// ── Synchronous dispatch (#219) ───────────────────────────────────────────────
+
+impl Timing {
+    /// A registrar's timing, given whether the program dispatches events
+    /// itself.
+    ///
+    /// `Handler` rests on "the DOM has no synchronous dispatch from
+    /// `addEventListener`", and `dispatchEvent` is one: it runs the target's
+    /// listeners before it returns, in the dispatching body's phase. Which
+    /// listener a dispatch reaches is a question of event names and targets
+    /// the IR does not resolve, so a program with any visible dispatch keeps
+    /// every listener at ⊤ (fail-closed, as #161's `navigates` does for
+    /// navigation-held values).
+    pub fn in_program(self, dispatches: bool) -> Timing {
+        match self {
+            Timing::Handler if dispatches => Timing::Unknown,
+            t => t,
+        }
+    }
+}
+
+/// Does `cfg`, nested functions included, fire event listeners itself: call
+/// `dispatchEvent`, or `emit` on a receiver?
+pub(crate) fn dispatches_events(cfg: &CFG) -> bool {
+    let mut found = false;
+    cfg.for_each_expr(&mut |e| found = found || expr_dispatches_events(e));
+    found
+}
+
+fn expr_dispatches_events(e: &Expr) -> bool {
+    match e {
+        Expr::Call { fn_, .. } | Expr::New { fn_, .. }
+            if match fn_.peel_ts() {
+                Expr::Var(name) => name == "dispatchEvent",
+                Expr::FieldAccess { field, .. } => field == "dispatchEvent" || field == "emit",
+                _ => false,
+            } =>
+        {
+            true
+        }
+        Expr::FnLit { body_cfg, .. } => dispatches_events(body_cfg),
+        other => {
+            let mut found = false;
+            other.for_each_child(&mut |c| found = found || expr_dispatches_events(c));
+            found
+        }
+    }
+}
+
+/// [`dispatches_events`] over one component or hook body and every hook it
+/// calls, the expressions its entries keep included.
+pub(crate) fn body_dispatches_events(cfg: &CFG, hooks: &[HookEntry]) -> bool {
+    dispatches_events(cfg)
+        || hooks.iter().any(|hook| {
+            hook.body_cfg().is_some_and(dispatches_events)
+                || match hook {
+                    HookEntry::State { init, .. } | HookEntry::Ref { init, .. } => {
+                        expr_dispatches_events(init)
+                    }
+                    HookEntry::Custom { args, .. } => args.iter().any(expr_dispatches_events),
+                    _ => false,
+                }
+        })
+}
+
+/// Does any body of the program — component, custom hook or utility — fire
+/// event listeners itself?
+pub(crate) fn program_dispatches_events(
+    components: &crate::engine::ComponentRegistry,
+    hooks: &crate::engine::HookRegistry,
+    utilities: &crate::engine::FunctionRegistry,
+) -> bool {
+    components
+        .all_components()
+        .any(|c| body_dispatches_events(&c.render_cfg, &c.hooks))
+        || hooks
+            .all_keys()
+            .iter()
+            .filter_map(|k| hooks.get(k))
+            .any(|h| body_dispatches_events(&h.body_cfg, &h.hooks))
+        || utilities
+            .all_functions()
+            .any(|f| dispatches_events(&f.body_cfg))
+}
+
 // ── The relation ──────────────────────────────────────────────────────────────
 
 /// Collect every registration in the component's effect bodies, each row
@@ -319,7 +405,14 @@ pub fn match_registrar(fn_: &Expr) -> Option<(&'static Registrar, String)> {
 ///
 /// Depth 2 is what both former native scans used: a registration one helper
 /// call or one callback deep still counts, nothing deeper does.
-pub fn collect_registrations(render_cfg: &CFG, hooks: &[HookEntry]) -> Vec<Registration> {
+///
+/// `dispatches`: some body of the program fires listeners itself
+/// ([`Timing::in_program`]).
+pub fn collect_registrations(
+    render_cfg: &CFG,
+    hooks: &[HookEntry],
+    dispatches: bool,
+) -> Vec<Registration> {
     let render_fns = crate::engine::setters::collect_fn_bindings(render_cfg);
     let mut out = Vec::new();
 
@@ -339,6 +432,7 @@ pub fn collect_registrations(render_cfg: &CFG, hooks: &[HookEntry]) -> Vec<Regis
         let cleanups = cleanup_bodies(body_cfg);
         for row in &mut rows {
             row.pairing = pair(row, &cleanups, &fns);
+            row.timing = row.timing.in_program(dispatches);
         }
         out.append(&mut rows);
     }

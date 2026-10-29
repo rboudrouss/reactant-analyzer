@@ -20,17 +20,18 @@ use std::collections::HashMap;
 use crate::{
     domains::{
         AbstractDomain, AnalysisCtx, Stability, StateValue, StateValueTransfer, Transfer,
-        interp::{entry_env_of, exit_env_of},
-        stores::{AbstractEnv, Heap, MemoStore, StateStore},
+        interp::{bind_params, callback_args, entry_env_of, exit_env_of, run_cfg},
+        stores::{AbstractEnv, EnvVal, Heap, MemoStore, StateStore},
     },
     engine::{
         Reducer,
-        setters::{Updater, WriterRegion},
+        setters::{Updater, WriterPhase, WriterRegion},
     },
     ir::{
         ComponentId,
         cfg::{CFG, Terminator},
         expr::Expr,
+        hooks::HookEntry,
         types::{BlockId, HookLabel, Var},
     },
 };
@@ -69,6 +70,22 @@ pub struct Written {
     pub value: StateValue,
     /// The argument as written, `None` for a bare `setX()`.
     pub expr: Option<Expr>,
+    /// The write stores a value the slot held at some render: its own read,
+    /// current or stale (`setX(x)` in a cleanup, a timer, a handler), or an
+    /// updater's identity `p => p`. A slot every write of which does so
+    /// never leaves its initial value ([`keeps_initial`], #223).
+    pub own_read: bool,
+}
+
+/// Does a slot never leave its initial value? True when every write of it,
+/// `rows` being all of them program-wide, stores a value it held
+/// (`Written::own_read`): by induction on the writes, that value is the
+/// initial one, so none of them changes the slot (`Object.is`, React bails
+/// out). `escapes` is whether the setter reaches code no row describes (a
+/// prop, an opaque call): then not every write is a row, and nothing is
+/// claimed.
+pub fn keeps_initial<'a>(mut rows: impl Iterator<Item = &'a Written>, escapes: bool) -> bool {
+    !escapes && rows.all(|w| w.own_read)
 }
 
 /// Classify argument 0 of a write. `value_of` evaluates a value expression
@@ -77,49 +94,54 @@ pub struct Written {
 /// scope). A bound updater the walk proved a function literal is read the
 /// same way; a bound name it could not prove stays on the value path, where
 /// a function value reads as an opaque reference. `own_slot` is the written
-/// slot when it is the writer's own (`None` for another component's), and
-/// `states` the render bindings of state reads (aliases resolved): together
-/// they say whether the write stores the slot's own content.
+/// slot when it is the writer's own (`None` for another component's),
+/// `must_read` the slot an expression reads on every path
+/// ([`must_slot_read`](crate::ir::bindings::must_slot_read)), and `phase` when
+/// the write runs: together they say whether the write stores the slot's own
+/// content.
 pub fn classify(
     arg: Option<&Expr>,
     updater: &Updater,
     own_slot: Option<HookLabel>,
-    states: &HashMap<Var, HookLabel>,
+    phase: WriterPhase,
+    must_read: impl Fn(&Expr) -> Option<HookLabel>,
     value_of: impl FnOnce(&Expr) -> StateValue,
 ) -> Written {
-    let identity = own_slot.is_some_and(|slot| stores_own_content(arg, slot, states));
+    // The slot's own read, in whatever render's closure the write runs.
+    let own_read = own_slot.is_some_and(|slot| stores_own_content(arg, slot, &must_read));
+    let identity = own_read && reads_committed_state(phase);
     // A bare `setX()` stores `undefined`, one value known in advance.
     let Some(arg) = arg else {
         return Written {
             change: Change::Once,
             value: StateValue::undefined(),
             expr: None,
+            own_read: false,
         };
     };
     let arg = arg.peel_ts();
     let expr = Some(arg.clone());
+    let returned = |change: Change, value: StateValue| Written {
+        own_read: change == Change::Never,
+        change,
+        value,
+        expr: expr.clone(),
+    };
     match (arg, updater) {
         (
             Expr::FnLit {
                 params, body_cfg, ..
             },
             _,
-        ) => Written {
-            change: returns_change(body_cfg, params),
-            value: returns_value(body_cfg),
-            expr,
-        },
-        (_, Updater::Functional(body)) => Written {
-            change: returns_change(body, &[]),
-            value: returns_value(body),
-            expr,
-        },
+        ) => returned(returns_change(body_cfg, params), returns_value(body_cfg)),
+        (_, Updater::Functional(body)) => returned(returns_change(body, &[]), returns_value(body)),
         (other, Updater::Unknown) => {
             let value = value_of(other);
             Written {
                 change: value_change(&value, identity),
                 value,
                 expr,
+                own_read,
             }
         }
     }
@@ -131,16 +153,33 @@ pub fn classify(
 /// either: no proof may compare the slot against it.
 pub fn dispatched(reducer: &Reducer) -> Written {
     match reducer {
-        Reducer::Body { params, body } => Written {
-            change: returns_change(body, params),
-            value: returns_value(body),
-            expr: None,
-        },
+        Reducer::Body { params, body } => {
+            let change = returns_change(body, params);
+            Written {
+                change,
+                value: returns_value(body),
+                expr: None,
+                own_read: change == Change::Never,
+            }
+        }
         Reducer::Opaque => Written {
             change: Change::May,
             value: StateValue::top(),
             expr: None,
+            own_read: false,
         },
+    }
+}
+
+/// What a write through a closure that captured the setter stores: whatever
+/// the closure passes it, which the call's argument is not. Any value, so
+/// it may change the slot at every call.
+pub fn carried() -> Written {
+    Written {
+        change: Change::May,
+        value: StateValue::top(),
+        expr: None,
+        own_read: false,
     }
 }
 
@@ -196,18 +235,33 @@ fn returns_change(body: &CFG, params: &[Var]) -> Change {
 }
 
 /// Does argument 0 store the slot's own content: the slot's state read, or a
-/// name bound to it (`states`, aliases resolved)? React bails out on it.
-/// Only the read itself counts — a field of it, a memo over it, a copy
+/// name bound to it on every path? React bails out on it. A must fact, so a
+/// must-alias: a name *some* binding ties to the slot — one arm of a lowered
+/// `c ? {…} : s`, a `let d = s` reassigned on a path — may store another value
+/// (#210). Only the read itself counts — a field of it, a memo over it, a copy
 /// carried through another slot are values derived from the slot.
 fn stores_own_content(
     arg: Option<&Expr>,
     slot: HookLabel,
-    states: &HashMap<Var, HookLabel>,
+    must_read: impl Fn(&Expr) -> Option<HookLabel>,
 ) -> bool {
-    match arg.map(Expr::peel_ts) {
-        Some(Expr::StateVal(l)) => *l == slot,
-        Some(Expr::Var(v)) => states.get(v) == Some(&slot),
-        _ => false,
+    arg.is_some_and(|e| must_read(e) == Some(slot))
+}
+
+/// Does a closure running in `phase` read the state the slot holds when it
+/// writes? A render reads its own state, and an effect or a memo body runs
+/// in the batch of the render that built it. A cleanup, a deferred
+/// continuation, a handler or a callback is the closure of an older render:
+/// `setX(x)` there stores the `x` of that render, which another write may
+/// have moved since (#205). ⊤ (`Unknown`) may be any of them.
+fn reads_committed_state(phase: WriterPhase) -> bool {
+    match phase {
+        WriterPhase::Render | WriterPhase::Effect | WriterPhase::Memo => true,
+        WriterPhase::Callback
+        | WriterPhase::Handler
+        | WriterPhase::Deferred
+        | WriterPhase::Cleanup
+        | WriterPhase::Unknown => false,
     }
 }
 
@@ -306,6 +360,171 @@ impl SiteEnvs<'_> {
         }
         env
     }
+
+    /// Every body of the component the fixpoint keeps no per-block envs for
+    /// — a memo or a callback body, and every function literal nested in any
+    /// body — with the envs a run of it settles on, and the heap those runs
+    /// leave: what a name such a body binds holds, `get()`'s temp in a
+    /// `forEach` callback included (#246).
+    ///
+    /// Each literal runs, as the interpreter runs a closure, from the env it
+    /// is reached from: the env at its statement — what [`Self::eval`]
+    /// replays for a write — joined with its body's exit env, where a closure
+    /// called later finds what it captured (#215); its parameters are ⊤, and
+    /// a memo or callback body runs from the render exit env, as the fixpoint
+    /// runs it. The runs are made here, once per component over the converged
+    /// stores, rather than each time the setter walk enters a closure or by
+    /// hoisting the callee call out of the closure in lowering: one table
+    /// then serves every way a closure is reached — a sync callback, a
+    /// continuation, a listener, a call by name or through a memo, from any
+    /// region — and every name it binds, a `const s = get()` as much as a
+    /// temp, while when a write runs and where it is placed stay the walk's.
+    pub(crate) fn closure_envs<'c>(
+        &self,
+        render: &'c CFG,
+        hooks: &'c [HookEntry],
+    ) -> (Vec<ClosureEnv<'c>>, Heap) {
+        let mut state = self.state.clone();
+        let mut heap = self.heap.clone();
+        let mut out = Vec::new();
+        {
+            let mut ac = AnalysisCtx::null(self.component, &mut state, self.memo, &mut heap);
+            reach_literals(
+                &mut ac,
+                render,
+                self.render_entry,
+                self.render_exits,
+                &mut out,
+            );
+            for hook in hooks {
+                match hook {
+                    HookEntry::Effect {
+                        label, body_cfg, ..
+                    } => {
+                        if let Some(exits) = self.effect_exits.get(label) {
+                            reach_literals(&mut ac, body_cfg, self.exit, exits, &mut out);
+                        }
+                    }
+                    HookEntry::Handler {
+                        label, body_cfg, ..
+                    } => {
+                        if let Some(exits) = self.handler_exits.get(label) {
+                            reach_literals(&mut ac, body_cfg, self.exit, exits, &mut out);
+                        }
+                    }
+                    HookEntry::Memo { body_cfg, .. } => {
+                        run_literal(&mut ac, body_cfg, &[], &[], self.exit.clone(), &mut out);
+                    }
+                    HookEntry::Callback {
+                        body_cfg, params, ..
+                    } => {
+                        run_literal(&mut ac, body_cfg, params, &[], self.exit.clone(), &mut out);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        (out, heap)
+    }
+}
+
+/// A body the fixpoint keeps no per-block envs for, with the exit env of
+/// every block a run of it reached ([`SiteEnvs::closure_envs`]).
+pub(crate) struct ClosureEnv<'c> {
+    pub body: &'c CFG,
+    pub params: &'c [Var],
+    pub exits: HashMap<BlockId, AbstractEnv<StateValue>>,
+}
+
+/// Run every function literal written in `body` (not those nested in another
+/// literal: its own run reaches them) from the env it is reached from, given
+/// the body's entry env and per-block exit envs. A block no run reached holds
+/// no literal that runs.
+fn reach_literals<'c>(
+    ac: &mut AnalysisCtx<'_, StateValue>,
+    body: &'c CFG,
+    entry: &AbstractEnv<StateValue>,
+    exits: &HashMap<BlockId, AbstractEnv<StateValue>>,
+    out: &mut Vec<ClosureEnv<'c>>,
+) {
+    // Each literal with the call and position it is an argument at, if any:
+    // an in-cycle callee passes it arguments (#253).
+    type Literal<'c> = (&'c [Var], &'c CFG, Option<(&'c Expr, usize)>);
+    fn literals<'c>(e: &'c Expr, at: Option<(&'c Expr, usize)>, out: &mut Vec<Literal<'c>>) {
+        match e {
+            Expr::FnLit {
+                params, body_cfg, ..
+            } => out.push((params, body_cfg, at)),
+            Expr::Call { fn_, args } => {
+                literals(fn_, None, out);
+                for (i, a) in args.iter().enumerate() {
+                    literals(a, Some((&**fn_, i)), out);
+                }
+            }
+            _ => e.for_each_child(&mut |c| literals(c, None, out)),
+        }
+    }
+    let after = exit_env_of(body, exits);
+    let reached = |env: &AbstractEnv<StateValue>| match &after {
+        Some(after) => env.join(after),
+        None => env.clone(),
+    };
+    for (&bid, block) in &body.blocks {
+        if !exits.contains_key(&bid) {
+            continue;
+        }
+        // The literals of each statement, the terminator's last.
+        let mut at: Vec<Vec<Literal<'c>>> = block
+            .stmts
+            .iter()
+            .map(|s| {
+                let mut lits = Vec::new();
+                s.for_each_expr(&mut |e| literals(e, None, &mut lits));
+                lits
+            })
+            .collect();
+        let mut term = Vec::new();
+        if let Terminator::Return(e) | Terminator::Branch { cond: e, .. } = &block.term {
+            literals(e, None, &mut term);
+        }
+        at.push(term);
+        let Some(last) = at.iter().rposition(|lits| !lits.is_empty()) else {
+            continue;
+        };
+        let mut env = entry_env_of(body, bid, entry, exits);
+        for (i, lits) in at.iter().enumerate().take(last + 1) {
+            for &(params, lit, call) in lits {
+                let env = reached(&env);
+                let args = call.map_or_else(Vec::new, |(callee, index)| {
+                    callback_args(&StateValueTransfer, callee, index, &env, ac)
+                });
+                run_literal(ac, lit, params, &args, env, out);
+            }
+            if let Some(stmt) = block.stmts.get(i).filter(|_| i < last) {
+                StateValueTransfer.exec_stmt(stmt, &mut env, ac);
+            }
+        }
+    }
+}
+
+/// Run one body from `env`, its parameters bound to `args` and ⊤ past them,
+/// then the literals it holds.
+fn run_literal<'c>(
+    ac: &mut AnalysisCtx<'_, StateValue>,
+    body: &'c CFG,
+    params: &'c [Var],
+    args: &[EnvVal<StateValue>],
+    mut env: AbstractEnv<StateValue>,
+    out: &mut Vec<ClosureEnv<'c>>,
+) {
+    bind_params(&mut env, params, args);
+    let exits = run_cfg(&StateValueTransfer, body, env.clone(), ac, 0).exits;
+    reach_literals(ac, body, &env, &exits, out);
+    out.push(ClosureEnv {
+        body,
+        params,
+        exits,
+    });
 }
 
 #[cfg(test)]
@@ -331,14 +550,22 @@ mod tests {
     /// The slot the tests write, the writer's own.
     const T: Option<HookLabel> = Some(0);
 
-    /// `x` reads slot 0, `y` reads slot 1.
-    fn states() -> HashMap<Var, HookLabel> {
-        HashMap::from([("x".to_string(), 0), ("y".to_string(), 1)])
+    /// The tests' writes run synchronously in an effect body.
+    const FX: WriterPhase = WriterPhase::Effect;
+
+    /// `x` reads slot 0 on every path, `y` slot 1.
+    fn states(e: &Expr) -> Option<HookLabel> {
+        match e.peel_ts() {
+            Expr::StateVal(l) => Some(*l),
+            Expr::Var(v) if v == "x" => Some(0),
+            Expr::Var(v) if v == "y" => Some(1),
+            _ => None,
+        }
     }
 
     #[test]
     fn no_argument_stores_undefined_once() {
-        let w = classify(None, &Updater::Unknown, T, &states(), opaque);
+        let w = classify(None, &Updater::Unknown, T, FX, states, opaque);
         assert_eq!(w.change, Change::Once);
         assert_eq!(w.value, StateValue::undefined());
         assert!(w.expr.is_none());
@@ -353,7 +580,7 @@ mod tests {
             },
             "p",
         );
-        let w = classify(Some(&e), &Updater::Unknown, T, &states(), opaque);
+        let w = classify(Some(&e), &Updater::Unknown, T, FX, states, opaque);
         assert_eq!(w.change, Change::Must);
         assert_eq!(w.value.reference, Stability::PerRender);
     }
@@ -369,7 +596,7 @@ mod tests {
             },
             "p",
         );
-        let w = classify(Some(&e), &Updater::Unknown, T, &states(), opaque);
+        let w = classify(Some(&e), &Updater::Unknown, T, FX, states, opaque);
         assert_eq!(w.change, Change::Must);
         assert_eq!(w.value.reference, Stability::PerRender);
     }
@@ -378,12 +605,12 @@ mod tests {
     fn the_identity_updater_never_changes_the_slot_a_literal_reset_once() {
         let id = updater(Expr::Var("p".into()), "p");
         assert_eq!(
-            classify(Some(&id), &Updater::Unknown, T, &states(), opaque).change,
+            classify(Some(&id), &Updater::Unknown, T, FX, states, opaque).change,
             Change::Never
         );
         let reset = updater(Expr::Lit(Prim::Int(0)), "p");
         assert_eq!(
-            classify(Some(&reset), &Updater::Unknown, T, &states(), opaque).change,
+            classify(Some(&reset), &Updater::Unknown, T, FX, states, opaque).change,
             Change::Once
         );
     }
@@ -400,7 +627,7 @@ mod tests {
             "p",
         );
         assert_eq!(
-            classify(Some(&not), &Updater::Unknown, T, &states(), opaque).change,
+            classify(Some(&not), &Updater::Unknown, T, FX, states, opaque).change,
             Change::May
         );
         let inc = updater(
@@ -412,7 +639,7 @@ mod tests {
             "p",
         );
         assert_eq!(
-            classify(Some(&inc), &Updater::Unknown, T, &states(), opaque).change,
+            classify(Some(&inc), &Updater::Unknown, T, FX, states, opaque).change,
             Change::May
         );
     }
@@ -423,12 +650,12 @@ mod tests {
     #[test]
     fn an_updater_stores_what_it_returns() {
         let reset = updater(Expr::Lit(Prim::Null), "p");
-        let w = classify(Some(&reset), &Updater::Unknown, T, &states(), opaque);
+        let w = classify(Some(&reset), &Updater::Unknown, T, FX, states, opaque);
         assert!(w.value.null);
         assert_eq!(w.value.reference, Stability::Bottom);
         let id = updater(Expr::Var("p".into()), "p");
         assert!(
-            classify(Some(&id), &Updater::Unknown, T, &states(), opaque)
+            classify(Some(&id), &Updater::Unknown, T, FX, states, opaque)
                 .value
                 .is_top_value()
         );
@@ -437,7 +664,7 @@ mod tests {
     #[test]
     fn a_value_argument_changes_the_slot_unless_it_is_one_known_value() {
         let arg = Expr::Var("next".into());
-        let change = |v: StateValue| classify(Some(&arg), &Updater::Unknown, T, &states(), |_| v);
+        let change = |v: StateValue| classify(Some(&arg), &Updater::Unknown, T, FX, states, |_| v);
         assert_eq!(
             change(StateValue::reference(Stability::PerRender)).change,
             Change::Must
@@ -468,7 +695,8 @@ mod tests {
             change(StateValue::number(Interval {
                 lo: 0.0,
                 hi: 10.0,
-                is_int: true
+                is_int: true,
+                may_neg_zero: false
             }))
             .change,
             Change::May
@@ -491,20 +719,48 @@ mod tests {
             v
         };
         let x = Expr::Var("x".into());
-        let own = classify(Some(&x), &Updater::Unknown, T, &states(), |_| read());
+        let own = classify(Some(&x), &Updater::Unknown, T, FX, states, |_| read());
         assert_eq!(own.change, Change::Never);
         let direct = classify(
             Some(&Expr::StateVal(0)),
             &Updater::Unknown,
             T,
-            &states(),
+            FX,
+            states,
             |_| read(),
         );
         assert_eq!(direct.change, Change::Never);
-        let copy = classify(Some(&x), &Updater::Unknown, Some(1), &states(), |_| read());
+        let copy = classify(Some(&x), &Updater::Unknown, Some(1), FX, states, |_| read());
         assert_eq!(copy.change, Change::May);
-        let foreign = classify(Some(&x), &Updater::Unknown, None, &states(), |_| read());
+        let foreign = classify(Some(&x), &Updater::Unknown, None, FX, states, |_| read());
         assert_eq!(foreign.change, Change::May);
+    }
+
+    /// A cleanup, a deferred continuation, a handler or a callback is the
+    /// closure of an older render: the read it writes back is that render's,
+    /// not the slot's content (#205). The identity updater reads the queue,
+    /// whatever closure runs it, and stays `Never`.
+    #[test]
+    fn the_own_read_is_the_slots_content_only_in_a_closure_of_the_current_render() {
+        let read = || StateValue::reference(Stability::versioned_by(crate::test_support::C, 0));
+        let x = Expr::Var("x".into());
+        let id = updater(Expr::Var("p".into()), "p");
+        for phase in [WriterPhase::Render, WriterPhase::Effect, WriterPhase::Memo] {
+            let w = classify(Some(&x), &Updater::Unknown, T, phase, states, |_| read());
+            assert_eq!(w.change, Change::Never, "{phase:?}");
+        }
+        for phase in [
+            WriterPhase::Cleanup,
+            WriterPhase::Deferred,
+            WriterPhase::Handler,
+            WriterPhase::Callback,
+            WriterPhase::Unknown,
+        ] {
+            let w = classify(Some(&x), &Updater::Unknown, T, phase, states, |_| read());
+            assert_eq!(w.change, Change::May, "{phase:?}");
+            let w = classify(Some(&id), &Updater::Unknown, T, phase, states, opaque);
+            assert_eq!(w.change, Change::Never, "updater in {phase:?}");
+        }
     }
 
     /// A memo over the slot, or a field of it, is a value derived from the
@@ -522,7 +778,7 @@ mod tests {
                 field: "inner".into(),
             },
         ] {
-            let w = classify(Some(&arg), &Updater::Unknown, T, &states(), |_| derived());
+            let w = classify(Some(&arg), &Updater::Unknown, T, FX, states, |_| derived());
             assert_eq!(w.change, Change::May, "{arg:?}");
         }
     }

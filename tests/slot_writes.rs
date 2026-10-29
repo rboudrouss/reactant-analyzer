@@ -343,3 +343,235 @@ export function Named({ id }: { id: number }) {
         assert_eq!(slot.join(&seven), slot, "{c}: 7 is not in {slot:?}");
     }
 }
+
+/// A name two paths bind to two setters writes one of them (#202): the join
+/// keeps both, so each slot gets the write — a weak one, which no row may
+/// place as a certain write of either.
+#[test]
+fn a_branch_chosen_setter_writes_both_slots() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function IfElse({ c }: { c?: boolean }) {
+  const [a, setA] = useState(0);
+  const [b, setB] = useState(0);
+  let s;
+  if (c) { s = setA; } else { s = setB; }
+  useEffect(() => { s(b + 1); }, [b]);
+  return <div>{a}{b}</div>;
+}
+export function Ternary({ c }: { c?: boolean }) {
+  const [a, setA] = useState(0);
+  const [b, setB] = useState(0);
+  const s = c ? setA : setB;
+  useEffect(() => { s(b + 1); }, [b]);
+  return <div>{a}{b}</div>;
+}
+"#;
+    let result = analyze(src);
+    for c in ["IfElse", "Ternary"] {
+        let comp = &result.components[&result.component_named(c).unwrap()];
+        for slot in [0, 1] {
+            let rows: Vec<_> = comp
+                .slot_writers
+                .iter()
+                .filter(|w| w.slot == slot && w.setter == "s")
+                .collect();
+            assert!(!rows.is_empty(), "{c}: no row writes slot {slot}");
+            assert!(rows.iter().all(|w| w.block.is_none()), "{c}: {rows:?}");
+        }
+        assert!(comp.diverges(1).is_some(), "{c}: `b` is written under [b]");
+        let sev = loops(&result, c);
+        assert!(
+            sev.contains(&Severity::Warning) && !sev.contains(&Severity::Error),
+            "{c}: {sev:?}"
+        );
+    }
+}
+
+/// A value that may be a setter or something else writes the setter when
+/// called (#233): `t[1]` is `setV` or `v` depending on the branch, and a
+/// call of a number throws, so the call may write `v` — never surely.
+#[test]
+fn a_value_that_may_be_a_setter_writes_it() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function Flip({ c }: { c?: boolean }) {
+  const [v, setV] = useState(0);
+  const t = c ? [setV, v] : [v, setV];
+  const b = t[1];
+  useEffect(() => { b((n: number) => n + 1); });
+  return <div>{v}</div>;
+}
+"#;
+    let result = analyze(src);
+    let comp = &result.components[&result.component_named("Flip").unwrap()];
+    let rows: Vec<_> = comp
+        .slot_writers
+        .iter()
+        .filter(|w| w.slot == 0 && w.setter == "b")
+        .collect();
+    assert!(!rows.is_empty(), "no row writes `v`");
+    assert!(rows.iter().all(|w| w.block.is_none()), "{rows:?}");
+    let sev = loops(&result, "Flip");
+    assert!(
+        sev.contains(&Severity::Warning) && !sev.contains(&Severity::Error),
+        "{sev:?}"
+    );
+}
+
+// ── #254: a function the passes never run escapes, and runs ─────────────────
+
+/// Does the converged slot `label` of `component` hold the number `n`?
+fn holds(result: &ProgramAnalysisResult, component: &str, label: usize, n: f64) -> bool {
+    let id = result.component_named(component).unwrap();
+    let slot = result.components[&id].state_store.get(label);
+    let point = StateValue::number(Interval::point(n));
+    slot.join(&point) == slot
+}
+
+/// A closure handed to code the analysis does not see may be called there:
+/// its write lands in the store, wherever the closure was handed over. Each
+/// component writes `k = 1` only from such a closure.
+#[test]
+fn an_escaped_closure_writes_its_slot() {
+    let src = r#"
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { runNow, useRun, useTable } from 'ext';
+export function Callee() {
+  const [k, setK] = useState(0);
+  useEffect(() => { runNow(() => setK(1)); }, []);
+  return <div>{k}</div>;
+}
+export function HookArg() {
+  const [k, setK] = useState(0);
+  useRun(() => setK(1));
+  return <div>{k}</div>;
+}
+export function HookArgMember() {
+  const [k, setK] = useState(0);
+  const options = { label: "row", onRow: () => setK(1) };
+  useTable(options);
+  return <div>{k}</div>;
+}
+export function CellHandler() {
+  const [k, setK] = useState(0);
+  useTable({ columns: [{ cell: (row: number) => <button onClick={() => setK(row)} /> }] });
+  return <div>{k}</div>;
+}
+export function RefMember() {
+  const [k, setK] = useState(0);
+  const latest = useRef(() => {});
+  latest.current = () => setK(1);
+  return <div>{k}</div>;
+}
+export function Returned() {
+  const [k, setK] = useState(0);
+  useEffect(() => { runNow(() => () => setK(1)); }, []);
+  return <div>{k}</div>;
+}
+export function Constructed() {
+  const [k, setK] = useState(0);
+  useEffect(() => {
+    const o = new IntersectionObserver(() => setK(1));
+    return () => o.disconnect();
+  }, []);
+  return <div>{k}</div>;
+}
+export function Captured() {
+  const [k, setK] = useState(0);
+  useEffect(() => {
+    const write = () => setK(1);
+    runNow(() => write());
+  }, []);
+  return <div>{k}</div>;
+}
+export function Memoized() {
+  const [k, setK] = useState(0);
+  const onRow = useCallback(() => setK(1), []);
+  useEffect(() => { runNow({ onRow }); }, []);
+  return <div>{k}</div>;
+}
+export function PastTheBudget() {
+  const [k, setK] = useState(0);
+  useEffect(() => {
+    Promise.resolve().then(() => {
+      setTimeout(() => {
+        queueMicrotask(() => {
+          requestAnimationFrame(() => setK(1));
+        });
+      });
+    });
+  }, []);
+  return <div>{k}</div>;
+}
+"#;
+    let result = analyze(src);
+    for c in [
+        "Callee",
+        "HookArg",
+        "HookArgMember",
+        "RefMember",
+        "Returned",
+        "Constructed",
+        "Captured",
+        "Memoized",
+        "PastTheBudget",
+    ] {
+        assert!(holds(&result, c, 0, 1.0), "{c}: the escaped write is lost");
+    }
+    // The cell's parameter is the row it renders: ⊤.
+    let id = result.component_named("CellHandler").unwrap();
+    assert_eq!(result.components[&id].state_store.get(0), StateValue::top());
+}
+
+/// #253: a closure reached through an array's entries or through a local
+/// function's parameter runs where the effect runs it — an effect write, not
+/// an escaped one — and so it drives the slot's widening.
+#[test]
+fn a_closure_passed_through_an_array_or_a_parameter_is_an_effect_write() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function Named() {
+  const [n, setN] = useState(0);
+  const fs = [() => setN(n + 1)];
+  useEffect(() => { fs.forEach((f) => f()); });
+  return <div>{n}</div>;
+}
+export function Param() {
+  const [n, setN] = useState(0);
+  const f = (g: () => void) => g();
+  useEffect(() => { f(() => setN(n + 1)); });
+  return <div>{n}</div>;
+}
+"#;
+    let result = analyze(src);
+    for c in ["Named", "Param"] {
+        let comp = &result.components[&result.component_named(c).unwrap()];
+        assert!(
+            !comp.effect_setter_writes.get(0).is_bottom(),
+            "{c}: no effect write"
+        );
+        assert!(comp.widen_trace.contains_key(&0), "{c}: `n` did not widen");
+    }
+}
+
+/// What an escaped closure writes is what the slot gets, nothing more: a
+/// write of the value the slot holds leaves it exact.
+#[test]
+fn an_escaped_constant_write_keeps_the_slot_exact() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+import { runNow } from 'ext';
+export function App() {
+  const [k, setK] = useState(0);
+  useEffect(() => { runNow(() => setK(0)); }, []);
+  return <div>{k}</div>;
+}
+"#;
+    let result = analyze(src);
+    let id = result.component_named("App").unwrap();
+    assert_eq!(
+        result.components[&id].state_store.get(0),
+        StateValue::number(Interval::point(0.0))
+    );
+}

@@ -114,3 +114,104 @@ fn a_setter_a_closure_only_carries_cannot_be_certified() {
          dominance cannot upgrade a may to a must:\n{out}"
     );
 }
+
+#[test]
+fn a_settling_render_write_is_not_verified_as_no_setter_call() {
+    let stdout = reactant(PHASE, &["--info"]).stdout;
+    let out = String::from_utf8_lossy(&stdout);
+    let section: Vec<&str> = out
+        .lines()
+        .skip_while(|l| !l.trim_start().starts_with("SettlingGuard"))
+        .skip(1)
+        .take_while(|l| l.starts_with("    "))
+        .collect();
+    assert!(
+        !section
+            .iter()
+            .any(|l| l.contains("setter-in-render")
+                && l.contains("no setter is called during render")),
+        "`if (s) setS(null)` calls a setter during render; the rule drops it \
+         because it settles, and may claim only that:\n{out}"
+    );
+    assert!(
+        section.iter().any(|l| l.contains("verified")
+            && l.contains("setter-in-render")
+            && l.contains("fails to settle")),
+        "the rule did check the component, and says what it proved:\n{out}"
+    );
+}
+
+#[test]
+fn a_memo_body_write_is_a_render_write_certain_only_when_the_memo_runs_every_render() {
+    // #249: a memo body runs during render, each time the memo recomputes.
+    let out = report(PHASE);
+    let line = line_for(&out, "MemoNoDeps");
+    assert!(
+        line.contains("error") && line.contains("setter-in-render") && line.contains("useMemo"),
+        "no deps array: the body and its unconditional write run at every render:\n{out}"
+    );
+    for component in ["MemoSlotDep", "MemoGuarded"] {
+        let line = line_for(&out, component);
+        assert!(
+            line.contains("warn") && line.contains("setter-in-render"),
+            "{component}: a re-run on a dep `n + 1` may not move, or a guarded write, \
+             is a possible loop, never a certain one:\n{out}"
+        );
+    }
+    for component in ["MemoMountOnly", "CallbackBody"] {
+        assert!(
+            !out.contains(component),
+            "{component}: an empty list runs the body once per mount, and a \
+             callback body does not run during render:\n{out}"
+        );
+    }
+}
+
+const NAMES: &str = "tests/fixtures/setter_names";
+
+/// The `setter `…`` a component's `setter-in-render` row names.
+fn named_setter(component: &str) -> String {
+    let out = report(NAMES);
+    let line = line_for(&out, component);
+    let after = line
+        .split_once("setter `")
+        .unwrap_or_else(|| panic!("no setter named for {component}:\n{out}"))
+        .1;
+    after.split('`').next().unwrap_or("").to_string()
+}
+
+#[test]
+fn a_setter_read_off_an_index_is_named_as_the_source_indexes_it() {
+    assert_eq!(named_setter("IndexAccess"), "t[1]");
+}
+
+#[test]
+fn a_setter_read_off_a_hook_value_keeps_its_member_path() {
+    assert_eq!(named_setter("MemberOfHook"), "c.set");
+}
+
+#[test]
+fn a_setter_returned_by_a_call_is_named_by_that_call() {
+    assert_eq!(named_setter("CallOfHook"), "useCounter(…).set");
+    assert_eq!(named_setter("CallOfUtility"), "pick(…)");
+    assert_eq!(named_setter("CallOfLocalFn"), "getSetter(…)");
+}
+
+#[test]
+fn the_trace_names_the_setter_as_the_message_does_and_json_keeps_the_variable() {
+    let trace = String::from_utf8_lossy(&reactant(NAMES, &["--trace"]).stdout).into_owned();
+    assert!(
+        trace.contains("`getSetter(…)` is a state setter"),
+        "the witness step names the callee by its call:\n{trace}"
+    );
+    let json = String::from_utf8_lossy(&reactant(NAMES, &["--format", "json"]).stdout).into_owned();
+    assert!(
+        json.contains("\"callee\":\"__call_") || json.contains("\"callee\": \"__call_"),
+        "the machine-readable `callee` is the variable, unchanged:\n{json}"
+    );
+}
+
+#[test]
+fn a_call_returned_by_a_call_is_named_through_both() {
+    assert_eq!(named_setter("CallOfCall"), "getGetter(…)(…)");
+}

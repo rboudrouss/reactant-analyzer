@@ -14,7 +14,7 @@ use crate::{
         types::{BlockId, ExprId},
     },
     lowering::JsxOrigins,
-    lowering::expr_lower::{assign_target_ident, empty_cfg, lower_expr},
+    lowering::expr_lower::{assign_target_ident, empty_cfg, lower_expr, property_name},
 };
 
 // ── Allocation-site ids ───────────────────────────────────────────────────────
@@ -30,9 +30,12 @@ use crate::{
 ///
 /// Cloning shares the counter, which is how it reaches a nested body without
 /// changing what a builder owns. One counter per file; the splice gives an
-/// inlined callee its own range (see [`crate::ir::Offsets`]).
+/// inlined callee its own range (see [`crate::ir::Offsets`]), and the
+/// component registry each component its own
+/// ([`crate::ir::ComponentId::site_base`]): a child's heap holds its parents'
+/// sites too (#243).
 #[derive(Debug, Clone, Default)]
-pub struct ExprIds(Rc<Cell<usize>>);
+pub struct ExprIds(Rc<Cell<u64>>);
 
 impl ExprIds {
     fn next(&self) -> ExprId {
@@ -774,7 +777,13 @@ fn lower_iter_loop(
 fn lower_switch(sw: &SwitchStatement, builder: &mut BlockBuilder) {
     let exit_block = builder.new_block();
     let disc = lower_expr(&sw.discriminant, builder);
-    builder.push_stmt(Stmt::ExprStmt(disc, None));
+    // Evaluated once, then compared against each case's test.
+    let disc_var = builder.fresh_temp();
+    builder.push_stmt(Stmt::Let {
+        var: disc_var.clone(),
+        rhs: disc,
+        span: None,
+    });
 
     if sw.cases.is_empty() {
         let b = builder.seal_with(Terminator::Jump(exit_block));
@@ -783,12 +792,13 @@ fn lower_switch(sw: &SwitchStatement, builder: &mut BlockBuilder) {
         return;
     }
 
-    // One block per case, fronted by a chain of opaque dispatches: dispatch `i`
-    // either enters case `i` or moves on to dispatch `i + 1`, and the last one
-    // falls to the exit. Which case matches is not a truthiness test on the
-    // discriminant, so every dispatch is opaque, and no case has to match — the
-    // exit is reachable without entering any of them (a `default` clause is
-    // over-approximated as optional).
+    // One block per case, fronted by a chain of dispatches: dispatch `i`
+    // tests `disc == test_i`, either enters case `i` or moves on to dispatch
+    // `i + 1`, and the last one falls to the exit. The test is what the case
+    // depends on: an element rendered under `switch (step.type)` has its mount
+    // condition read `step`. A `default` clause has no test, so its dispatch
+    // is opaque (`true`, which narrows nothing and is taken both ways): it is
+    // over-approximated as optional.
     //
     // Chaining the consequents into one straight line instead was an
     // under-approximation twice over: entering `case 2` without running `case 1`
@@ -803,8 +813,16 @@ fn lower_switch(sw: &SwitchStatement, builder: &mut BlockBuilder) {
 
     for (i, &case_block) in case_blocks.iter().enumerate() {
         let skip_to = later_dispatch.get(i).copied().unwrap_or(exit_block);
+        let cond = match &sw.cases[i].test {
+            Some(test) => Expr::BinOp {
+                op: crate::ir::expr::BinOp::Eq,
+                lhs: Box::new(Expr::Var(disc_var.clone())),
+                rhs: Box::new(lower_expr(test, builder)),
+            },
+            None => Expr::Lit(Prim::Bool(true)),
+        };
         let d = builder.seal_with(Terminator::Branch {
-            cond: Expr::Lit(Prim::Bool(true)),
+            cond,
             then_: case_block,
             else_: skip_to,
             span: None,
@@ -900,27 +918,19 @@ fn lower_binding_pattern(
                 span,
             });
             for prop in &obj.properties {
-                let field = match &prop.key {
-                    PropertyKey::StaticIdentifier(k) => Some(k.name.to_string()),
-                    PropertyKey::StringLiteral(s) => Some(s.value.to_string()),
-                    // `const { [k]: v } = o`: the key expression runs and `v`
-                    // is bound — to an unknown value, not to nothing. Skipping
-                    // the property took the read of `k` with it.
-                    other => {
-                        if let Some(e) = other.as_expression() {
-                            let key_span = builder.span_at(e.span().start).or(span);
-                            let key = lower_expr(e, builder);
-                            builder.push_stmt(Stmt::ExprStmt(key, key_span));
-                        }
-                        None
-                    }
-                };
-                let field_rhs = match field {
-                    Some(field) => Expr::FieldAccess {
-                        obj: Box::new(Expr::Var(temp.clone())),
-                        field,
+                let obj = Box::new(Expr::Var(temp.clone()));
+                let field_rhs = match property_name(&prop.key) {
+                    Some(field) => Expr::FieldAccess { obj, field },
+                    // `const { [k]: v } = o` binds `v` to `o[k]`: the key
+                    // expression runs, and the member it names is read
+                    // when its value names one (#76).
+                    None => match prop.key.as_expression() {
+                        Some(e) => Expr::IndexAccess {
+                            arr: obj,
+                            idx: Box::new(lower_expr(e, builder)),
+                        },
+                        None => Expr::SummaryVal(crate::ir::expr::SummaryValue::Top),
                     },
-                    None => Expr::SummaryVal(crate::ir::expr::SummaryValue::Top),
                 };
                 let prop_span = builder.span_at(prop.span.start).or(span);
                 lower_binding_pattern(&prop.value, field_rhs, prop_span, builder);
@@ -935,13 +945,12 @@ fn lower_binding_pattern(
                 lower_binding_pattern(&rest.argument, Expr::Var(temp.clone()), rest_span, builder);
             }
         }
+        // `{ cb = () => setX(1) }`: the default runs when the source is
+        // `undefined`, so its reads and writes stay visible; the binding
+        // keeps the source (#256).
         BindingPattern::AssignmentPattern(ap) => {
-            // The default value is not modeled (the binding keeps `rhs`), but
-            // it *is* evaluated when the source is undefined — emit it so its
-            // reads and side effects survive (`{ cb = () => setX(1) }`).
             let default_span = builder.span_at(ap.right.span().start).or(span);
-            let default = lower_expr(&ap.right, builder);
-            builder.push_stmt(Stmt::ExprStmt(default, default_span));
+            lower_default(&rhs, &ap.right, builder);
             lower_binding_pattern(&ap.left, rhs, span.or(default_span), builder);
         }
     }
@@ -955,18 +964,75 @@ pub(super) fn inject_param_preamble(
 ) -> Vec<String> {
     let mut names = Vec::new();
     for (i, p) in params.items.iter().enumerate() {
-        match &p.pattern {
-            BindingPattern::BindingIdentifier(id) => {
-                names.push(id.name.to_string());
-            }
-            other => {
-                let temp = format!("__p{}", i);
-                names.push(temp.clone());
-                lower_binding_pattern(other, Expr::Var(temp), None, builder);
-            }
+        let name = match &p.pattern {
+            BindingPattern::BindingIdentifier(id) => id.name.to_string(),
+            _ => format!("__p{}", i),
+        };
+        names.push(name.clone());
+        if let Some(init) = p.initializer.as_deref() {
+            lower_default(&Expr::Var(name.clone()), init, builder);
+        }
+        if !matches!(p.pattern, BindingPattern::BindingIdentifier(_)) {
+            lower_binding_pattern(&p.pattern, Expr::Var(name), None, builder);
         }
     }
     names
+}
+
+/// `source = init` evaluates `init` when `source` is `undefined`: lowered
+/// under that test, so its reads and its writes stay where they run — a
+/// setter call, a reassignment of an earlier parameter. One lowering for a
+/// parameter's default (#251) and a destructuring default (`const { f = g }
+/// = o`, #76), `source` then the member the pattern reads (a name, or a
+/// member or index of a destructuring temp: no call, read twice for free).
+///
+/// The value is not modeled: the binding keeps the source. A parameter's
+/// omitted argument is bound where the call is inlined (`param_defaults`,
+/// #230); a destructuring default's value waits on a solver that drops the
+/// side of the test no value takes (#256, #255).
+pub(super) fn lower_default(source: &Expr, init: &Expression, builder: &mut BlockBuilder) {
+    let span = builder.span_at(init.span().start);
+    let then_ = builder.new_block();
+    let join = builder.new_block();
+    let test = builder.seal_with(Terminator::Branch {
+        cond: Expr::BinOp {
+            op: crate::ir::expr::BinOp::Eq,
+            lhs: Box::new(source.clone()),
+            rhs: Box::new(Expr::Lit(Prim::Unit)),
+        },
+        then_,
+        else_: join,
+        span,
+    });
+    builder.add_edge(test, then_, EdgeKind::IfTrue);
+    builder.add_edge(test, join, EdgeKind::IfFalse);
+    builder.start_block(then_);
+    let value = lower_expr(init, builder);
+    builder.push_stmt(Stmt::ExprStmt(value, span));
+    if !builder.is_terminated() {
+        let end = builder.seal_with(Terminator::Jump(join));
+        builder.add_edge(end, join, EdgeKind::Unconditional);
+    }
+    builder.start_block(join);
+}
+
+/// The default of each formal parameter written `name = default`, aligned
+/// with the names [`inject_param_preamble`] returns: what an omitted argument
+/// stands for (#230). Lowered on its own, so `None` when lowering it emits a
+/// statement or a block (a call's temp, a short-circuit): the default is then
+/// no single expression. `None` too for a parameter with no default.
+pub(super) fn param_defaults(params: &FormalParameters, ctx: &LowerCtx) -> Vec<Option<Expr>> {
+    params
+        .items
+        .iter()
+        .map(|p| {
+            let init = p.initializer.as_deref()?;
+            let mut builder = BlockBuilder::new(ctx);
+            builder.start_block(0);
+            let default = lower_expr(init, &mut builder);
+            (builder.current_stmts.is_empty() && builder.blocks.is_empty()).then_some(default)
+        })
+        .collect()
 }
 
 /// Build a function body CFG with param destructuring preamble.
@@ -1195,6 +1261,43 @@ mod tests {
             1,
             "the no-case-matched edge is the only way here, and it must exist: {:?}",
             cfg.edges
+        );
+    }
+
+    /// Which case runs depends on the discriminant: each case's dispatch tests
+    /// it, so whatever reads the branch conditions (a mount guard) sees it. A
+    /// `default` has no test and stays opaque.
+    #[test]
+    fn a_switch_dispatch_tests_the_discriminant() {
+        let cfg = cfg_of("switch (s.type) { case \"a\": f(); break; default: g(); }");
+        let conds: Vec<&Expr> = cfg
+            .blocks
+            .values()
+            .filter_map(|b| match &b.term {
+                Terminator::Branch { cond, .. } => Some(cond),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(conds.len(), 2, "{conds:?}");
+        let disc = cfg
+            .blocks
+            .values()
+            .flat_map(|b| &b.stmts)
+            .find_map(|s| match s {
+                Stmt::Let {
+                    var,
+                    rhs: Expr::FieldAccess { field, .. },
+                    ..
+                } if field == "type" => Some(var.clone()),
+                _ => None,
+            })
+            .expect("the discriminant is bound once");
+        assert!(conds.iter().any(|c| matches!(c,
+            Expr::BinOp { lhs, .. } if matches!(lhs.as_ref(), Expr::Var(v) if *v == disc))));
+        assert!(
+            conds
+                .iter()
+                .any(|c| matches!(c, Expr::Lit(Prim::Bool(true))))
         );
     }
 

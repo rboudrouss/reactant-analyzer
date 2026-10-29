@@ -193,6 +193,7 @@ mod tests {
                 lo: 0.0,
                 hi: f64::INFINITY,
                 is_int: true,
+                may_neg_zero: false,
             })
         );
     }
@@ -210,7 +211,8 @@ mod tests {
             StateValue::number(Interval {
                 lo: 0.0,
                 hi: 5.0,
-                is_int: true
+                is_int: true,
+                may_neg_zero: false
             })
         );
         let exit_i = exit_envs[&3].lookup("i");
@@ -437,7 +439,7 @@ mod tests {
                 },
             },
         );
-        let arm = |id: BlockId, r: &str, n: &str, alloc: usize| BasicBlock {
+        let arm = |id: BlockId, r: &str, n: &str, alloc: u64| BasicBlock {
             id,
             stmts: vec![
                 Stmt::Let {
@@ -522,7 +524,8 @@ mod tests {
             Interval {
                 lo: 1.0,
                 hi: 2.0,
-                is_int: true
+                is_int: true,
+                may_neg_zero: false
             }
         );
         assert_eq!(
@@ -715,6 +718,7 @@ mod tests {
                 lo: 0.0,
                 hi: f64::INFINITY,
                 is_int: true,
+                may_neg_zero: false,
             }),
         );
 
@@ -853,7 +857,8 @@ mod tests {
             StateValue::number(Interval {
                 lo: 5.0,
                 hi: 6.0,
-                is_int: true
+                is_int: true,
+                may_neg_zero: false
             }),
             "functional updater in Return terminator must fire"
         );

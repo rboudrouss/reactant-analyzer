@@ -7,13 +7,15 @@ use crate::{
     ir::{
         SourceRange,
         cfg::CFG,
-        hooks::{Arity, HookEntry},
+        hooks::HookEntry,
         types::{BlockId, HookLabel, Var},
     },
 };
 
 use crate::engine::setters::SetterCallPhase;
-use crate::engine::{Change, ChurnEdge, ChurnGraph, EdgeStrength, WriterRegion};
+use crate::engine::{
+    Always, Change, ChurnEdge, ChurnGraph, EdgeStrength, EveryRender, Rerun, WriterRegion,
+};
 use crate::ir::ComponentId;
 use crate::rules::api::query::must_effect_cycle;
 use crate::rules::helpers::cycles::{NodeNames, cycle_path, node_display};
@@ -61,14 +63,14 @@ impl Rule for InfiniteLoop {
         // (`const s1 = setX`, `s2 = s1`) resolved across the render and every
         // hook body — a setter called in an effect through an alias must still
         // be attributed to its state slot (else a real loop goes unflagged).
-        let local_setter_labels: HashMap<Var, HookLabel> = all_setter_labels(comp_result);
+        let local_setter_labels = all_setter_labels(comp_result);
         let state_names = state_val_labels(&comp_result.render_cfg);
 
         // ComponentSetter props, excluding self-references.
-        let cs_vars: HashMap<Var, crate::engine::setters::SetterProp> =
+        let cs_vars: HashMap<Var, Vec<crate::engine::setters::SetterProp>> =
             crate::rules::cross_component_setters(comp_result, component);
 
-        let mut all_setter_vars: HashSet<Var> = local_setter_labels.keys().cloned().collect();
+        let mut all_setter_vars: HashSet<Var> = local_setter_labels.names().cloned().collect();
         all_setter_vars.extend(cs_vars.keys().cloned());
 
         if all_setter_vars.is_empty() {
@@ -94,8 +96,8 @@ impl Rule for InfiniteLoop {
             };
 
             // Mount-only: fires once, no loop. Only an array the engine knows
-            // is empty says so.
-            if matches!(deps.list(), Some(d) if d.arity == Arity::Exact(0)) {
+            // is empty says so (the re-run class).
+            if comp_result.rerun(*eff_label) == Some(Rerun::MountOnly) {
                 continue;
             }
             // A deps array gates the effect for good only when EVERY dep is
@@ -125,100 +127,113 @@ impl Rule for InfiniteLoop {
                 if call.class == SetterCallPhase::Handler {
                     continue;
                 }
-                if let Some(&state_label) = local_setter_labels.get(&call.var) {
+                let local: Vec<HookLabel> = local_setter_labels.targets(&call.var).collect();
+                if !local.is_empty() {
                     // ── Intra ─────────────────────────────────────────────────
-                    if comp_result.diverges(state_label).is_none() {
-                        continue; // the cycle bounded the slot
-                    }
-
-                    let deps_note = if deps.is_declared() {
-                        " (its deps do not provably gate it, so the effect can re-run every render)"
-                    } else {
-                        ""
-                    };
-                    let mut diag = Diagnostic::warn(
-                        "infinite-loop",
-                        format!(
-                            "this effect keeps pushing state {}{} to new values \
-                             on every run. Potential infinite render loop",
-                            state_slot_name(state_label, &state_names),
-                            deps_note
-                        ),
-                    )
-                    .with_label(state_label);
-
-                    if let Some(r) = comp_result.effect_info.get(eff_label).and_then(|i| i.span) {
-                        diag = diag.with_range(r);
-                    }
-
-                    let setter_vars_for_label: HashSet<Var> = local_setter_labels
-                        .iter()
-                        .filter(|&(_, l)| *l == state_label)
-                        .map(|(v, _)| v.clone())
-                        .collect();
-                    for h in &comp_result.hooks {
-                        if let HookEntry::Handler {
-                            label: h_label,
-                            event,
-                            body_cfg: h_cfg,
-                            ..
-                        } = h
-                            && !collect_setter_calls(h_cfg, &setter_vars_for_label, 1).is_empty()
-                        {
-                            let h_span = comp_result.handler_info.get(h_label).and_then(|i| i.span);
-                            diag = diag.with_step(
-                                crate::rules::Step::Handler {
-                                    event: event.clone(),
-                                    slot: state_label,
-                                },
-                                Some(*h_label),
-                                h_span,
-                                &|l| state_slot_name(l, &state_names),
-                            );
+                    // A name bound to several setters may write each (#202).
+                    for state_label in local {
+                        if comp_result.diverges(state_label).is_none() {
+                            continue; // the cycle bounded the slot
                         }
+
+                        let deps_note = if deps.is_declared() {
+                            " (its deps do not provably gate it, so the effect can re-run every render)"
+                        } else {
+                            ""
+                        };
+                        let mut diag = Diagnostic::warn(
+                            "infinite-loop",
+                            format!(
+                                "this effect keeps pushing state {}{} to new values \
+                             on every run. Potential infinite render loop",
+                                state_slot_name(state_label, &state_names),
+                                deps_note
+                            ),
+                        )
+                        .with_label(state_label);
+
+                        if let Some(r) = comp_result.effect_info.get(eff_label).and_then(|i| i.span)
+                        {
+                            diag = diag.with_range(r);
+                        }
+
+                        let setter_vars_for_label = local_setter_labels.aliases_of(state_label);
+                        for h in &comp_result.hooks {
+                            if let HookEntry::Handler {
+                                label: h_label,
+                                event,
+                                body_cfg: h_cfg,
+                                ..
+                            } = h
+                                && !collect_setter_calls(h_cfg, &setter_vars_for_label, 1)
+                                    .is_empty()
+                            {
+                                let h_span =
+                                    comp_result.handler_info.get(h_label).and_then(|i| i.span);
+                                diag = diag.with_step(
+                                    crate::rules::Step::Handler {
+                                        event: event.clone(),
+                                        slot: state_label,
+                                    },
+                                    Some(*h_label),
+                                    h_span,
+                                    &ctx.names(&|l| state_slot_name(l, &state_names)),
+                                );
+                            }
+                        }
+
+                        // Fixpoint evidence (ADR-019): which effects were writing
+                        // the slot when it widened, and at which iteration.
+                        diag = diag.with_notes(crate::rules::api::witness::slot_history(
+                            comp_result,
+                            state_label,
+                            &ctx.names(&|l| state_slot_name(l, &state_names)),
+                        ));
+
+                        reported_effects.insert(*eff_label);
+                        diags.push(diag);
                     }
-
-                    // Fixpoint evidence (ADR-019): which effects were writing
-                    // the slot when it widened, and at which iteration.
-                    diag = diag.with_notes(crate::rules::api::witness::slot_history(
-                        comp_result,
-                        state_label,
-                        &|l| state_slot_name(l, &state_names),
-                    ));
-
-                    reported_effects.insert(*eff_label);
-                    diags.push(diag);
-                } else if let Some(prop) = cs_vars.get(&call.var) {
+                } else if let Some(props) = cs_vars.get(&call.var) {
                     // ── Cross-component ────────────────────────────────────────
-                    let (parent_comp, parent_label) = (prop.component, prop.label);
-                    let shared_write = result.shared_state.get(parent_comp, parent_label);
-                    if shared_write.is_bottom_value() {
-                        continue; // setter not reached in semantic analysis
-                    }
-                    if !shared_write.is_unbounded() {
-                        continue; // write is bounded → no divergence
-                    }
+                    // A prop several call sites bind to several parents'
+                    // setters: one finding per parent a slot of which diverges.
+                    let mut named: HashSet<ComponentId> = HashSet::new();
+                    for prop in props {
+                        let (parent_comp, parent_label) = (prop.component, prop.label);
+                        if named.contains(&parent_comp) {
+                            continue;
+                        }
+                        let shared_write = result.shared_state.get(parent_comp, parent_label);
+                        if shared_write.is_bottom_value() {
+                            continue; // setter not reached in semantic analysis
+                        }
+                        if !shared_write.is_unbounded() {
+                            continue; // write is bounded → no divergence
+                        }
 
-                    let deps_note = if deps.is_declared() {
-                        " (its deps do not provably gate it, so the effect can re-run every render)"
-                    } else {
-                        ""
-                    };
-                    let msg = format!(
-                        "this effect calls `{}`, a state setter of parent `{}`{}. \
+                        let deps_note = if deps.is_declared() {
+                            " (its deps do not provably gate it, so the effect can re-run every render)"
+                        } else {
+                            ""
+                        };
+                        let msg = format!(
+                            "this effect calls `{}`, a state setter of parent `{}`{}. \
                          Parent re-renders → child re-renders → effect fires again: infinite loop",
-                        call.var,
-                        result.display_name(parent_comp),
-                        deps_note
-                    );
-                    let mut diag = Diagnostic::warn("cross-component-infinite-loop", msg)
-                        .with_label(*eff_label);
+                            call.var,
+                            result.display_name(parent_comp),
+                            deps_note
+                        );
+                        let mut diag = Diagnostic::warn("cross-component-infinite-loop", msg)
+                            .with_label(*eff_label);
 
-                    if let Some(r) = comp_result.effect_info.get(eff_label).and_then(|i| i.span) {
-                        diag = diag.with_range(r);
+                        if let Some(r) = comp_result.effect_info.get(eff_label).and_then(|i| i.span)
+                        {
+                            diag = diag.with_range(r);
+                        }
+                        named.insert(parent_comp);
+                        reported_effects.insert(*eff_label);
+                        diags.push(diag);
                     }
-                    reported_effects.insert(*eff_label);
-                    diags.push(diag);
                 }
             }
         }
@@ -228,10 +243,11 @@ impl Rule for InfiniteLoop {
         // builds it once for the run (issue #86).
         let graph = ctx.cache().churn();
         let (cycle_diags, covered) =
-            check_multi_effect_cycles(graph, result, component, &reported_effects);
+            check_multi_effect_cycles(ctx, graph, result, component, &reported_effects);
         diags.extend(cycle_diags);
         // Self-churn arm last: its Info branch skips writes a cycle covers.
         diags.extend(check_object_churn(
+            ctx,
             graph,
             result,
             component,
@@ -250,6 +266,7 @@ impl Rule for InfiniteLoop {
 /// the `(effect label, local state label)` writes covered by a reported
 /// cycle so the self-churn Info arm doesn't duplicate them.
 fn check_multi_effect_cycles(
+    ctx: &RuleCtx,
     graph: &ChurnGraph,
     result: &ProgramAnalysisResult,
     component: ComponentId,
@@ -315,12 +332,18 @@ fn check_multi_effect_cycles(
                             && w.written.change == Change::Must
                     })
             };
+            // Why a length-1 cycle re-runs its own effect after every render.
+            let always = e
+                .always
+                .as_ref()
+                .filter(|_| cyc.len() == 1)
+                .map(|a| always_clause(a, result, e.component, e.effect_label));
             let msg = if !certain && !cyc.iter().all(|e| allocates(e)) {
-                if cyc.len() == 1 && e.no_deps {
+                if let Some((why, reruns)) = &always {
                     format!(
-                        "this effect has no dependency array and may change state \
-                         {to_name}, so it re-runs after every render and no write of \
-                         it is proven to settle: possible infinite render loop"
+                        "this effect {why} and may change state {to_name}, so it \
+                         {reruns} after every render and no write of it is proven to \
+                         settle: possible infinite render loop"
                     )
                 } else if cyc.len() == 1 {
                     format!(
@@ -334,17 +357,17 @@ fn check_multi_effect_cycles(
                          no step is proven to settle: possible infinite render loop"
                     )
                 }
-            } else if cyc.len() == 1 && e.no_deps && certain {
+            } else if let (Some((why, _)), true) = (&always, certain) {
                 format!(
-                    "this effect has no dependency array and stores a fresh \
-                     reference into state {to_name}, so it re-runs after every \
-                     render and re-triggers itself: infinite render loop"
+                    "this effect {why} and stores a fresh reference into state \
+                     {to_name}, so it re-runs after every render and re-triggers \
+                     itself: infinite render loop"
                 )
-            } else if cyc.len() == 1 && e.no_deps {
+            } else if let Some((why, reruns)) = &always {
                 format!(
-                    "this effect has no dependency array and may store a fresh \
-                     reference into state {to_name}, so it re-runs after every \
-                     render and can re-trigger itself: possible infinite render loop"
+                    "this effect {why} and may store a fresh reference into state \
+                     {to_name}, so it {reruns} after every render and can \
+                     re-trigger itself: possible infinite render loop"
                 )
             } else if cyc.len() == 1 && certain {
                 format!(
@@ -397,7 +420,7 @@ fn check_multi_effect_cycles(
                     Some(e.effect_label),
                     Some(r),
                     // Qualified display (may name a parent component's slot).
-                    &|_| to_name.clone(),
+                    &ctx.names(&|_| to_name.clone()),
                 );
             }
             // Point at the cycle's other steps living in this component.
@@ -414,13 +437,62 @@ fn check_multi_effect_cycles(
                     },
                     Some(other.effect_label),
                     other.write_span,
-                    &crate::rules::api::witness::fallback_name,
+                    &ctx.names(&crate::rules::api::witness::fallback_name),
                 );
             }
             diags.push(diag);
         }
     }
     (diags, covered)
+}
+
+/// Why effect `label` re-runs after every render, as a clause of the
+/// message, and whether it surely does (`re-runs`) or only may (`may re-run`)
+/// — `surely` as the engine computed it on the edge — naming the parents
+/// whose elements alone make it so (#237).
+fn always_clause(
+    always: &EveryRender,
+    program: &ProgramAnalysisResult,
+    component: ComponentId,
+    label: HookLabel,
+) -> (String, &'static str) {
+    let comp = &program.components[&component];
+    let (why, surely) = (always.why, always.surely);
+    let dep = |i: usize| {
+        comp.hooks
+            .iter()
+            .find_map(|h| match h {
+                HookEntry::Effect { label: l, deps, .. } if *l == label => deps
+                    .list()
+                    .and_then(|d| d.as_slice().get(i))
+                    .map(|e| e.describe()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "a dep".to_string())
+    };
+    let clause = match why {
+        Always::NoDeps => "has no dependency array".to_string(),
+        Always::FreshDep(i) if surely => {
+            format!("depends on `{}`, a new reference every render,", dep(i))
+        }
+        // Fresh under these parents' elements alone.
+        Always::FreshDep(i) if !always.through.is_empty() => format!(
+            "depends on `{}`, a new reference whenever {} renders it,",
+            dep(i),
+            crate::rules::parent_elements(program, &always.through)
+        ),
+        // Fresh while the props hold: a prop the parent allocates.
+        Always::FreshDep(i) => format!(
+            "depends on `{}`, a new reference whenever its parent re-renders,",
+            dep(i)
+        ),
+        Always::OpaqueDeps => "is gated by a deps argument the analysis cannot read".to_string(),
+        Always::MutableDep(i) => format!(
+            "depends on `{}`, which may differ at any render without a state change,",
+            dep(i)
+        ),
+    };
+    (clause, if surely { "re-runs" } else { "may re-run" })
 }
 
 // ── Object-churn arm (ADR-017) ────────────────────────────────────────────────
@@ -437,6 +509,7 @@ fn check_multi_effect_cycles(
 //            state — cross-effect cycles are not analyzed (FN-flavor limit)
 
 fn check_object_churn(
+    ctx: &RuleCtx,
     graph: &ChurnGraph,
     result: &ProgramAnalysisResult,
     component: ComponentId,
@@ -459,7 +532,7 @@ fn check_object_churn(
             continue;
         };
         if deps.list().is_none() {
-            continue; // no dependency array: the graph arm's self-edge
+            continue; // no readable dependency array: the graph arm's self-edge
         }
 
         // This arm's partition of the relation (ADR-020 item 2, ADR-042 §4):
@@ -467,11 +540,12 @@ fn check_object_churn(
         // this component's own slots. A `self_slot` edge is the loop; every
         // other one feeds the Info branch. The change leg, the convergence kill and
         // the field-sensitive re-trigger test (#90) were applied by the engine
-        // when it built the edge.
+        // when it built the edge. An edge an every-render re-run carries is
+        // the graph arm's, like the self-edge of an effect with no array.
         let edges = graph.edges.iter().filter(|e| {
             e.component == component
                 && e.effect_label == *eff_label
-                && !e.no_deps
+                && e.always.is_none()
                 && e.from.0 == component
                 && e.to.0 == component
         });
@@ -615,7 +689,7 @@ fn check_object_churn(
                     },
                     Some(*eff_label),
                     Some(r),
-                    &|l| state_slot_name(l, &state_vals),
+                    &ctx.names(&|l| state_slot_name(l, &state_vals)),
                 );
             }
             diags.push(diag);
@@ -1192,8 +1266,11 @@ mod tests {
     }
 
     #[test]
-    fn unknown_callee_setter_does_not_loop() {
-        // useEffect(() => { myHelper(() => setN(n + 1)) }) unknown callee not descended
+    fn unknown_callee_setter_may_loop() {
+        // useEffect(() => { myHelper(() => setN(n + 1)) }): the closure
+        // escapes into the unknown callee and runs with the handlers (#254).
+        // Its write moves `n` but is no in-cycle growth; `myHelper` may call
+        // it at once, so the loop is possible: a Warning.
         let call = Expr::Call {
             fn_: Box::new(Expr::Var("myHelper".to_string())),
             args: vec![incrementing_setter_cb("setN")],
@@ -1208,10 +1285,10 @@ mod tests {
             },
         );
         assert!(!result.widen_trace.contains_key(&0));
+        let diags = InfiniteLoop.check(&RuleCtx::new(&prog("C", &result), crate::test_support::C));
         assert!(
-            InfiniteLoop
-                .check(&RuleCtx::new(&prog("C", &result), crate::test_support::C))
-                .is_empty()
+            !diags.is_empty() && diags.iter().all(|d| d.severity() == Severity::Warning),
+            "{diags:?}"
         );
     }
 

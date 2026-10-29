@@ -1672,6 +1672,88 @@ function A({ options }) {
 }
 
 #[test]
+fn adjust_during_render_on_a_one_arm_alias_warns() {
+    // `d` is the slot on one arm only and `null` on the arm that runs: the
+    // write never kills the guard (#231).
+    let src = r#"
+function A() {
+  const [s, setS] = useState(null);
+  const [c] = useState(false);
+  const d = c ? s : null;
+  if (d === null) setS({ n: 1 });
+  return <div/>;
+}
+"#;
+    let diags = diagnostics_sev(src);
+    assert!(
+        diags.iter().any(|(r, _, _)| r == "setter-in-render"),
+        "a guard on a one-arm alias is not settled by the write: {diags:?}"
+    );
+}
+
+#[test]
+fn adjust_during_render_on_a_closure_rebound_alias_warns() {
+    // `d` is the slot until a closure the render runs rebinds it (#231).
+    let src = r#"
+function A() {
+  const [s, setS] = useState(null);
+  let d = s;
+  [1].forEach(() => { d = null; });
+  if (d === null) setS({ n: 1 });
+  return <div/>;
+}
+"#;
+    let diags = diagnostics_sev(src);
+    assert!(
+        diags.iter().any(|(r, _, _)| r == "setter-in-render"),
+        "a guard on a name a closure rebinds is not settled by the write: {diags:?}"
+    );
+}
+
+#[test]
+fn a_setter_name_a_sync_closure_rebinds_is_no_certain_write() {
+    // The `forEach` callback runs during render and rebinds `set` to the
+    // no-op: `set(1)` writes nothing (#235).
+    let src = r#"
+function A() {
+  const [v, setV] = useState(0);
+  const noop = (_) => {};
+  let set = setV;
+  [1].forEach(() => { set = noop; });
+  set(1);
+  return <div>{v}</div>;
+}
+"#;
+    let diags = diagnostics_sev(src);
+    assert!(
+        diags
+            .iter()
+            .filter(|(r, _, _)| r == "setter-in-render")
+            .all(|(_, s, _)| *s != Severity::Error),
+        "a setter name a closure rebinds is at most a Warning: {diags:?}"
+    );
+}
+
+#[test]
+fn a_setter_alias_bound_once_stays_an_error() {
+    let src = r#"
+function A() {
+  const [v, setV] = useState(0);
+  const set = setV;
+  set(1);
+  return <div>{v}</div>;
+}
+"#;
+    let diags = diagnostics_sev(src);
+    assert!(
+        diags
+            .iter()
+            .any(|(r, s, _)| r == "setter-in-render" && *s == Severity::Error),
+        "a setter alias bound once is a certain write: {diags:?}"
+    );
+}
+
+#[test]
 fn unconditional_render_setter_still_error() {
     let src = r#"
 function A() {

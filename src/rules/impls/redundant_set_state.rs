@@ -82,6 +82,7 @@ impl Rule for RedundantSetState {
         };
         let state_names = crate::rules::state_val_labels(&result.render_cfg);
         let name_of = |l: HookLabel| crate::rules::state_slot_name(l, &state_names);
+        let names = ctx.names(&name_of);
 
         // ── Render body ───────────────────────────────────────────────────────
         for (&block_id, block) in &result.render_cfg.blocks {
@@ -97,7 +98,7 @@ impl Rule for RedundantSetState {
                 &result.memo_store,
                 &mut scratch,
                 &contested,
-                &name_of,
+                &names,
                 &mut diags,
                 &HashSet::new(),
             );
@@ -122,7 +123,7 @@ impl Rule for RedundantSetState {
                     &result.memo_store,
                     &mut scratch,
                     &contested,
-                    &name_of,
+                    &names,
                     &mut diags,
                 );
                 if let Some(r) = result.effect_info.get(eff_label).and_then(|i| i.span) {
@@ -150,7 +151,7 @@ fn check_cfg_for_redundant_sets(
     memo: &MemoStore<StateValue>,
     heap: &mut crate::domains::Heap,
     contested: &HashSet<HookLabel>,
-    name_of: &dyn Fn(HookLabel) -> String,
+    names: &crate::rules::api::witness::Names,
     diags: &mut Vec<Diagnostic>,
 ) {
     let skip_labels = collect_transition_setters(component, cfg, env, state, memo, heap);
@@ -163,7 +164,7 @@ fn check_cfg_for_redundant_sets(
             memo,
             heap,
             contested,
-            name_of,
+            names,
             diags,
             &skip_labels,
         );
@@ -203,19 +204,21 @@ fn collect_setter_vals_in_expr(
     match expr {
         Expr::Call { fn_, args } => {
             if let Expr::Var(name) = fn_.as_ref()
-                && let Some(label) = env.setter_label(name)
+                && let Some(labels) = env.setter_labels(name)
             {
                 let arg_val = args
                     .first()
                     .map(|a| crate::rules::eval_in_stores(a, env, component, state, memo, heap))
                     .unwrap_or(StateValue::top());
-                match tracker.entry(label) {
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        e.insert((arg_val, false));
-                    }
-                    std::collections::hash_map::Entry::Occupied(mut e) => {
-                        if e.get().0 != arg_val {
-                            e.get_mut().1 = true;
+                for &label in labels {
+                    match tracker.entry(label) {
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            e.insert((arg_val.clone(), false));
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            if e.get().0 != arg_val {
+                                e.get_mut().1 = true;
+                            }
                         }
                     }
                 }
@@ -247,7 +250,7 @@ fn check_setter_calls(
     memo: &MemoStore<StateValue>,
     heap: &mut crate::domains::Heap,
     contested: &HashSet<HookLabel>,
-    name_of: &dyn Fn(HookLabel) -> String,
+    names: &crate::rules::api::witness::Names,
     diags: &mut Vec<Diagnostic>,
     skip_labels: &HashSet<HookLabel>,
 ) {
@@ -276,7 +279,7 @@ fn check_setter_calls(
                         format!(
                             "state {} is set to a stable value it already holds, so the update is \
                              redundant",
-                            name_of(label)
+                            names.slot(label)
                         ),
                     )
                     .with_label(label)
@@ -289,7 +292,7 @@ fn check_setter_calls(
                         },
                         Some(label),
                         *call_span,
-                        name_of,
+                        names,
                     ),
                 );
             }

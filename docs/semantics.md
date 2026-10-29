@@ -121,7 +121,8 @@ handles least by construction:
 - **A package with no source.** A write may go through `runNow(cb)` (calls `cb`
   at once) or `defer(cb)` (calls it in a microtask), imported from `ext`. The
   runner provides `ext`; for the analyzer it is an npm package it cannot read,
-  ADR-009's `Unknown` callee.
+  ADR-009's `Unknown` callee. The cases also use its hook `useRun(x)`, which
+  calls `x`, or each function member of `x`, after every commit.
 
 `oracle/src/shrink.mjs` reduces a failing program: it drops any element of any
 list, nulls an optional field, replaces a node by a descendant of the same

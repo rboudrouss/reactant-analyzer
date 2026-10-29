@@ -59,9 +59,16 @@ pub enum MountCoupling {
     /// Every call site renders the consumer under a state guard, and every
     /// scope that writes the feeding slot writes that guard's slot too: the
     /// prop moves in the same commit that mounts or unmounts the consumer, so
-    /// no mounted instance need ever observe the change. Not a proof of
-    /// stillness — it only costs the Error tier its certainty.
+    /// no mounted instance need ever observe the change. A guard on the
+    /// feeding slot itself (`switch (step.type)` over a tagged union) counts:
+    /// each write of the feeder may change the shape the guard tests. Not a
+    /// proof of stillness — it only costs the Error tier its certainty.
     WriterCoupled,
+    /// Some analysed call site hands the consumer seeding props no feeder
+    /// reaches (a story rendering it with constants): an instance mounted
+    /// there never sees them move, so the freeze is not certain wherever the
+    /// component runs. It costs the Error tier its certainty.
+    Unfed,
     /// Nothing proven — a mounted instance may observe the change.
     Free,
 }
@@ -114,8 +121,8 @@ impl MountIndex {
     }
 
     /// Classify `consumer`'s mount lifetime against the props its `useState`
-    /// initializer reads (`seed_props`) and the slot feeding them (`feeder`,
-    /// when one is proven).
+    /// initializer reads (`seed_props`) and the slots proven to feed them
+    /// (`feeders`, empty when none is).
     ///
     /// Every call site must agree: one element that keeps the consumer mounted
     /// across the change is enough for the freeze to be observable, and a
@@ -124,7 +131,7 @@ impl MountIndex {
         &self,
         consumer: ComponentId,
         seed_props: &[Symbol],
-        feeder: Option<(ComponentId, HookLabel)>,
+        feeders: &[(ComponentId, HookLabel)],
         program: &ProgramAnalysisResult,
     ) -> MountCoupling {
         let sites = match self.sites.get(&consumer) {
@@ -137,9 +144,22 @@ impl MountIndex {
         if sites.iter().all(|s| s.reseeds(seed_props)) {
             return MountCoupling::Reseeds;
         }
-        let coupled = feeder.is_some_and(|(owner, slot)| {
-            sites.iter().all(|s| s.writer_coupled(owner, slot, program))
-        });
+        if !feeders.is_empty()
+            && program
+                .call_graph
+                .sites_of(consumer)
+                .any(|(_, row)| !carries(row, seed_props, feeders))
+        {
+            return MountCoupling::Unfed;
+        }
+        // A site in one feeder's owner is coupled through that feeder: the
+        // others reach the consumer through their own owners' sites.
+        let coupled = !feeders.is_empty()
+            && sites.iter().all(|s| {
+                feeders
+                    .iter()
+                    .any(|(owner, slot)| s.writer_coupled(*owner, *slot, program))
+            });
         if coupled {
             MountCoupling::WriterCoupled
         } else {
@@ -183,12 +203,35 @@ impl MountSite {
         program: &ProgramAnalysisResult,
     ) -> bool {
         // Guard slots are the *caller's*: a feeder owned elsewhere is written
-        // where this mount condition is not, so nothing couples.
+        // where this mount condition is not, so nothing couples. A guard on
+        // the feeder itself is written by every write of it.
         self.caller == owner
-            && self.guard_slots.iter().any(|guard_slot| {
-                *guard_slot != slot && writes_move_together(program, owner, slot, *guard_slot)
-            })
+            && self
+                .guard_slots
+                .iter()
+                .any(|guard_slot| writes_move_together(program, owner, slot, *guard_slot))
     }
+}
+
+/// May one of `feeders` reach the consumer through this analysed element?
+/// Read off the abstract value each seeding prop has there: a reference
+/// versioned by a feeder, or one whose versions are not bounded. A prop the
+/// element does not pass is `undefined`, unless a spread may pass it.
+fn carries(
+    row: &crate::engine::CallSite,
+    seed_props: &[Symbol],
+    feeders: &[(ComponentId, HookLabel)],
+) -> bool {
+    use crate::domains::Stability;
+    let spreads = row.props.keys().any(|k| k.starts_with("..."));
+    seed_props.iter().any(|name| match row.props.get(name) {
+        Some(val) => match &val.reference {
+            Stability::Versioned(labels) => feeders.iter().any(|f| labels.contains(f)),
+            Stability::VersionedTop | Stability::Unknown => true,
+            _ => false,
+        },
+        None => spreads,
+    })
 }
 
 /// `true` when every function scope of `owner` that writes `slot` also writes
@@ -205,14 +248,9 @@ fn writes_move_together(
         return false;
     };
     let labels = all_setter_labels(comp);
-    let setters_of = |wanted: HookLabel| -> HashSet<Var> {
-        labels
-            .iter()
-            .filter(|(_, l)| **l == wanted)
-            .map(|(v, _)| v.clone())
-            .collect()
-    };
-    let (feeder_setters, guard_setters) = (setters_of(slot), setters_of(guard_slot));
+    // A scope that may write the feeder must surely write the guard.
+    let (feeder_setters, guard_setters) =
+        (labels.aliases_of(slot), labels.sure_aliases_of(guard_slot));
     if feeder_setters.is_empty() || guard_setters.is_empty() {
         return false;
     }

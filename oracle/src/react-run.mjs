@@ -31,11 +31,20 @@ export const IN_LOOP = 10;
 /**
  * A package the analyzer cannot see into (ADR-009's `Unknown` callee): a bare
  * specifier that resolves nowhere on disk. `runNow` calls its callback at once,
- * `defer` in a microtask, like `Promise.then`; neither is a timer.
+ * `defer` in a microtask, like `Promise.then`; neither is a timer. `format` is
+ * a function of its argument, which the analyzer cannot know (#224).
+ * `useRun(x)` is a hook from that package: after every commit it calls `x`,
+ * or each function member of `x` (#254).
  */
 const EXT = {
   runNow: (cb) => cb(),
   defer: (cb) => void Promise.resolve().then(cb),
+  format: (x) => `<${x}>`,
+  useRun: (x) =>
+    React.useEffect(() => {
+      const fns = typeof x === "function" ? [x] : Object.values(x ?? {});
+      for (const f of fns) if (typeof f === "function") f();
+    }),
 };
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>");

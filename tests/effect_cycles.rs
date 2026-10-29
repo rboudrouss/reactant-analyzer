@@ -243,6 +243,83 @@ function Child({ value, onUpdate }) {
     );
 }
 
+#[test]
+fn a_closure_reads_a_variable_assigned_after_it_was_created() {
+    // #215: a closure captures `x`, not its value `0` at creation. The
+    // effect calls it after `x = 1`, so it writes `n + 1`, every render.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function App() {
+  const [n, setN] = useState(0);
+  let x = 0;
+  const bump = () => setN(n + x);
+  x = 1;
+  useEffect(() => { bump(); });
+  return <div>{n}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "App");
+    assert!(
+        diags
+            .iter()
+            .any(|(r, s, _)| r == "infinite-loop" && *s != Severity::Info),
+        "{diags:?}"
+    );
+}
+
+#[test]
+fn a_closure_prop_over_a_moving_slot_is_rerun_at_each_value() {
+    // Every render passes `() => setN(n + 1)`: the same reference, but a
+    // closure over a new `n`. The child cache keyed on the props' values
+    // alone answered the first `n`'s analysis for every later one, so the
+    // write never grew past `1` and the loop was missed.
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Child({ tick }) {
+  useEffect(() => { tick(); });
+  return null;
+}
+export function App() {
+  const [n, setN] = useState(0);
+  const cb = () => setN(n + 1);
+  return <Child tick={cb} />;
+}
+"#;
+    let diags = infinite_loop_diags(src, "Child");
+    assert!(
+        diags
+            .iter()
+            .any(|(r, _, m)| r == "cross-component-infinite-loop" && m.contains("`tick`")),
+        "{diags:?}"
+    );
+}
+
+#[test]
+fn a_callback_inside_an_object_prop_is_run_by_the_child() {
+    // #216: `api.tick()` resolves through the object literal the parent
+    // passed, two heap levels deep, and its write into the parent's slot is
+    // a row of the child's effect.
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Child({ api }) {
+  useEffect(() => { api.h.tick(); });
+  return null;
+}
+export function App() {
+  const [n, setN] = useState(0);
+  const cb = () => setN(n + 1);
+  return <Child api={{ h: { tick: cb } }} />;
+}
+"#;
+    let diags = infinite_loop_diags(src, "Child");
+    assert!(
+        diags
+            .iter()
+            .any(|(r, _, m)| r == "cross-component-infinite-loop" && m.contains("`api.h.tick`")),
+        "{diags:?}"
+    );
+}
+
 // ── convergent / acyclic patterns → silent ───────────────────────────────────
 
 #[test]
@@ -842,6 +919,32 @@ export function C({ enabled }: { enabled: boolean }) {
 }
 
 #[test]
+fn a_shadowed_name_read_as_top_leaves_the_other_conjunct_to_settle() {
+    // The body's `flag` reads ⊤, not the render's `true`, but `!on` dies once
+    // `true` is written: the write fires once (oracle case
+    // `guard-on-body-shadowed-render-name-settles`).
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C({ enabled }: { enabled: boolean }) {
+  const [on, setOn] = useState(false);
+  const flag = true;
+  useEffect(() => {
+    const flag = enabled;
+    if (flag && !on) setOn(true);
+  }, [on]);
+  return <div>{flag && on ? 'y' : 'n'}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags
+            .iter()
+            .all(|(rule, sev, _)| rule != "infinite-loop" || *sev == Severity::Info),
+        "`!on` settles whatever the body's `flag` is: {diags:?}"
+    );
+}
+
+#[test]
 fn opposite_facts_on_one_prop_across_two_bodies_prove_convergence() {
     // The same shape over one prop: the first effect fires only while `flag`
     // is truthy, the second only while it is falsy, and a prop holds still
@@ -868,16 +971,19 @@ export function C({ flag }: { flag: boolean }) {
 
 #[test]
 fn a_render_phase_write_revives_an_effect_guard() {
-    // The render body writes `null` behind `cond`, the effect refills behind
-    // `!s`: with `cond` true the pair loops (`{…}` → null → `{…}`). The site
-    // list used to be built from effect rows alone, so the render write
-    // revived nothing and the effect edge was killed.
+    // The render body writes `null` behind `cond`, the effect (no deps array,
+    // so it runs at every commit) refills behind `!s`: with `cond` true the
+    // pair loops (`{…}` → null → `{…}`, oracle case
+    // `render-write-revives-effect-guard-on-a-prop`). The site list used to
+    // be built from effect rows alone, so the render write revived nothing
+    // and the effect edge was killed. (With `[s]` deps React converges: the
+    // reset lands before the commit, which sees `null` twice.)
     let src = r#"
 import { useState, useEffect } from 'react';
 export function C({ cond }: { cond: boolean }) {
   const [s, setS] = useState(null);
   if (cond && s) setS(null);
-  useEffect(() => { if (!s) setS({ fresh: true }); }, [s]);
+  useEffect(() => { if (!s) setS({ fresh: true }); });
   return <div>{s ? 'y' : 'n'}</div>;
 }
 "#;
@@ -887,6 +993,30 @@ export function C({ cond }: { cond: boolean }) {
             .iter()
             .any(|(rule, sev, _)| rule == "infinite-loop" && *sev == Severity::Warning),
         "the render write revives the guard: {diags:?}"
+    );
+}
+
+#[test]
+fn a_render_phase_write_that_keeps_the_effect_guard_dead_settles() {
+    // The render write is a site, but it stores `2`: the effect's
+    // `s === null` dies under both writes, so the effect fires once, and the
+    // render guard then dies under the one write left (oracle case
+    // `render-write-keeps-effect-guard-dead`).
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [s, setS] = useState<number | null>(null);
+  if (s === 1) setS(2);
+  useEffect(() => { if (s === null) setS(1); });
+  return <div>{s}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags
+            .iter()
+            .all(|(rule, sev, _)| rule != "infinite-loop" || *sev == Severity::Info),
+        "no write revives the effect guard: {diags:?}"
     );
 }
 
@@ -941,6 +1071,35 @@ export function Parent({ ready }: { ready: boolean }) {
             .iter()
             .all(|(rule, sev, _)| rule != "infinite-loop" || *sev == Severity::Info),
         "a child mounted behind a held guard stays mounted: {diags:?}"
+    );
+}
+
+#[test]
+fn a_mount_effect_of_a_child_kept_through_an_intermediate_fires_once() {
+    // `Mid` mounts `Child` on every path and is itself mounted on every path:
+    // `stays` holds up the tree (#213), so the foreign `[]` row is not a site
+    // and the refill settles (oracle case `kept-child-mount-effect-fires-once`).
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Child({ onReady }: { onReady: (v: boolean) => void }) {
+  useEffect(() => { onReady(false); }, []);
+  return null;
+}
+function Mid({ onReady }: { onReady: (v: boolean) => void }) {
+  return <Child onReady={onReady} />;
+}
+export function App() {
+  const [s, setS] = useState(true);
+  useEffect(() => { if (!s) setS(true); }, [s]);
+  return <Mid onReady={setS} />;
+}
+"#;
+    let diags = infinite_loop_diags(src, "App");
+    assert!(
+        diags
+            .iter()
+            .all(|(rule, sev, _)| rule != "infinite-loop" || *sev == Severity::Info),
+        "a child every ancestor keeps mounted fires its `[]` effect once: {diags:?}"
     );
 }
 
@@ -1350,6 +1509,205 @@ export function App() {
 }
 
 #[test]
+fn a_child_its_grandparent_may_unmount_proves_no_loop() {
+    // #213: `Mid` renders `Child` on every path, but `App` hides `Mid` in its
+    // mount batch, and `Child` goes with it. Staying mounted is transitive.
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Child() {
+  const [s, setS] = useState<number[]>([]);
+  useEffect(() => { setS([...s, 1]); }, [s]);
+  return <div />;
+}
+function Mid() { return <Child />; }
+export function App() {
+  const [shown, setShown] = useState(true);
+  useEffect(() => { setShown(false); }, []);
+  return <div>{shown && <Mid />}</div>;
+}
+"#;
+    let sevs = loop_severities(src, "Child");
+    assert!(
+        !sevs.is_empty() && !sevs.contains(&Severity::Error),
+        "the grandparent may unmount the child with its parent: {sevs:?}"
+    );
+}
+
+#[test]
+fn a_prop_an_automatic_write_moves_holds_for_no_proof() {
+    // #206: the no-deps effect has no trigger row, but `bump` writes `App`'s
+    // slot, which is `p`: the two writes contradict each other on a prop that
+    // moves, and React loops through both components.
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Child({ p, bump }: { p: boolean; bump: () => void }) {
+  const [s, setS] = useState(false);
+  useEffect(() => {
+    if (p && !s) setS(true);
+    if (!p && s) setS(false);
+  });
+  useEffect(() => { bump(); }, [s]);
+  return <div>{String(s)}</div>;
+}
+export function App() {
+  const [n, setN] = useState(false);
+  return <Child p={n} bump={() => setN(!n)} />;
+}
+"#;
+    let diags = infinite_loop_diags(src, "Child");
+    assert!(
+        diags
+            .iter()
+            .any(|(rule, sev, _)| rule.ends_with("infinite-loop") && *sev != Severity::Info),
+        "the prop moves with the slot `bump` writes: {diags:?}"
+    );
+}
+
+#[test]
+fn a_prop_only_a_handler_moves_holds_across_the_loop() {
+    // The same two writes, with `App`'s slot written by a click only: no
+    // automatic write moves the prop, and the writes contradict on it.
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Child({ p }: { p: boolean }) {
+  const [s, setS] = useState(false);
+  useEffect(() => {
+    if (p && !s) setS(true);
+    if (!p && s) setS(false);
+  });
+  return <div>{String(s)}</div>;
+}
+export function App() {
+  const [n, setN] = useState(false);
+  return <div><button onClick={() => setN(!n)} /><Child p={n} /></div>;
+}
+"#;
+    let sevs = loop_severities(src, "Child");
+    assert!(sevs.is_empty(), "the prop holds across the loop: {sevs:?}");
+}
+
+/// The cycles of the program graph carried by an effect of `component`.
+fn cycles_carried_by(src: &str, component: &str) -> usize {
+    let result = parse_and_analyze(src);
+    let id = result.component_named(component).unwrap();
+    let graph = reactant::engine::ChurnGraph::build(&result);
+    graph
+        .cycles
+        .iter()
+        .filter(|c| c.edge_idx.iter().any(|&i| graph.edges[i].component == id))
+        .count()
+}
+
+#[test]
+fn a_fresh_prop_forwarded_by_a_middle_component_closes_a_cycle() {
+    // #207: `v` is new at every render of `App`, forwarded by `Mid`; `Leaf`
+    // carries no label of `App`'s slot, but its props move whenever `App`'s
+    // slot does, and its effect writes that slot.
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Leaf({ v, bump }: { v: object; bump: () => void }) {
+  useEffect(() => { bump(); }, [v]);
+  return null;
+}
+function Mid({ v, bump }: { v: object; bump: () => void }) {
+  return <Leaf v={v} bump={bump} />;
+}
+export function App() {
+  const [n, setN] = useState(0);
+  return <Mid v={{}} bump={() => setN(n + 1)} />;
+}
+"#;
+    assert!(
+        cycles_carried_by(src, "Leaf") > 0,
+        "App's slot → Leaf's props → App's slot"
+    );
+}
+
+#[test]
+fn a_child_of_a_rekeyed_parent_fires_its_mount_effect_every_round() {
+    // #207: `Mid` is re-keyed by `App`'s slot at every write, and `Child` is
+    // remounted with it: its `[]` effect fires at every mount.
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Child({ onMount }: { onMount: () => void }) {
+  useEffect(() => { onMount(); }, []);
+  return null;
+}
+function Mid({ onMount }: { onMount: () => void }) {
+  return <Child onMount={onMount} />;
+}
+export function App() {
+  const [k, setK] = useState(false);
+  return <Mid key={String(k)} onMount={() => setK(!k)} />;
+}
+"#;
+    assert!(
+        cycles_carried_by(src, "Child") > 0,
+        "a remounted child's mount effect is a mount edge"
+    );
+}
+
+#[test]
+fn a_primitive_prop_dep_is_moved_by_the_props_node() {
+    // `p` is a number computed from `App`'s slot: no reference label, no
+    // trigger row, but the props move it.
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Child({ p, bump }: { p: number; bump: () => void }) {
+  useEffect(() => { bump(); }, [p]);
+  return null;
+}
+export function App() {
+  const [n, setN] = useState(0);
+  return <Child p={n % 2} bump={() => setN(n + 1)} />;
+}
+"#;
+    assert!(cycles_carried_by(src, "Child") > 0);
+}
+
+#[test]
+fn a_prop_copied_into_child_state_closes_no_cycle() {
+    // The props move with `App`'s slot, and `Child` copies one into its own
+    // state: an edge into `Child`'s slot, none back into `App`'s.
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Child({ p }: { p: number }) {
+  const [local, setLocal] = useState(0);
+  useEffect(() => { setLocal(p); }, [p]);
+  return <div>{local}</div>;
+}
+export function App() {
+  const [n, setN] = useState(0);
+  useEffect(() => { setN(1); }, []);
+  return <Child p={n} />;
+}
+"#;
+    assert_eq!(cycles_carried_by(src, "Child"), 0);
+    assert!(loop_severities(src, "Child").is_empty());
+}
+
+#[test]
+fn a_child_every_ancestor_keeps_mounted_keeps_the_error() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Child() {
+  const [s, setS] = useState<number[]>([]);
+  useEffect(() => { setS([...s, 1]); }, [s]);
+  return <div />;
+}
+function Mid() { return <Child />; }
+export function App() {
+  return <div><Mid /></div>;
+}
+"#;
+    let sevs = loop_severities(src, "Child");
+    assert!(
+        sevs.contains(&Severity::Error),
+        "an unconditional chain of parents keeps the child mounted: {sevs:?}"
+    );
+}
+
+#[test]
 fn a_prop_or_a_memo_over_it_is_not_fresh_at_the_childs_own_renders() {
     // Fuzz seed 1, program 1706: `p` is new at each render of `App` only.
     let src = r#"
@@ -1398,6 +1756,188 @@ export function C() {
     );
 }
 
+// ── The re-run class (#189, #201, #203, #212) ────────────────────────────────
+
+#[test]
+fn an_unreadable_deps_argument_is_a_possible_loop_never_a_certain_one() {
+    // #212: the list is empty, the effect runs once and React settles. The
+    // engine cannot read it, so the effect only may re-run after every render.
+    let src = r#"
+import { useState, useEffect } from 'react';
+const DEPS: unknown[] = [];
+export function C() {
+  const [s, setS] = useState({});
+  useEffect(() => { setS({}); }, DEPS);
+  return <div />;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags.iter().all(|(_, s, _)| *s != Severity::Error),
+        "an unreadable list proves no re-run: {diags:?}"
+    );
+    assert!(
+        diags.iter().any(|(r, s, m)| r == "infinite-loop"
+            && *s == Severity::Warning
+            && m.contains("deps argument the analysis cannot read")
+            && !m.contains("no dependency array")),
+        "it may still re-run after every render: {diags:?}"
+    );
+}
+
+#[test]
+fn a_fresh_dep_and_a_fresh_write_are_the_no_deps_error() {
+    // #189: `opts` is a new object at every render, so the effect runs after
+    // every commit, as surely as with no deps array, and every run stores a
+    // new reference.
+    for deps in ["", ", [opts]", ", [s, opts]"] {
+        let src = format!(
+            r#"
+import {{ useState, useEffect }} from 'react';
+export function C() {{
+  const [s, setS] = useState<any>(0);
+  const opts = {{ v: 0 }};
+  useEffect(() => {{ setS([]); }}{deps});
+  return <div>{{String(s)}}</div>;
+}}
+"#
+        );
+        let sevs = loop_severities(&src, "C");
+        assert!(sevs.contains(&Severity::Error), "deps `{deps}`: {sevs:?}");
+    }
+}
+
+#[test]
+fn a_fresh_dep_and_a_conditional_fresh_write_are_a_warning() {
+    // The re-run is certain, the write is not on all paths.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C({ flag }) {
+  const [s, setS] = useState({});
+  const opts = { v: 0 };
+  useEffect(() => { if (flag) setS({}); }, [opts]);
+  return <div />;
+}
+"#;
+    let sevs = loop_severities(src, "C");
+    assert!(sevs.contains(&Severity::Warning), "{sevs:?}");
+    assert!(!sevs.contains(&Severity::Error), "{sevs:?}");
+}
+
+#[test]
+fn a_fresh_prop_dep_is_no_certain_rerun() {
+    // The parent allocates `opts`, but the child re-renders alone on its own
+    // write with the same props: the dep holds, the effect runs once. The
+    // value domain reads the prop as fresh (#199), so the re-run is possible.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function Parent() {
+  return <C opts={{ a: 1 }} />;
+}
+function C({ opts }: { opts: object }) {
+  const [s, setS] = useState({});
+  useEffect(() => { setS({}); }, [opts]);
+  return <div />;
+}
+"#;
+    let sevs = loop_severities(src, "C");
+    assert!(!sevs.contains(&Severity::Error), "{sevs:?}");
+}
+
+#[test]
+fn a_fresh_prop_dep_is_worded_as_new_at_the_parent_s_renders() {
+    // #229: the engine's certainty, not the reason's, picks the verb.
+    for (params, decl, clause, verb) in [
+        (
+            "{ data }: { data: object }",
+            "",
+            "a new reference whenever its parent re-renders",
+            "so it may re-run after every render",
+        ),
+        (
+            "",
+            "const data = {};",
+            "a new reference every render",
+            "so it re-runs after every render",
+        ),
+    ] {
+        let src = format!(
+            r#"
+import {{ useState, useEffect }} from 'react';
+export function Parent() {{
+  return <C data={{{{}}}} />;
+}}
+function C({params}) {{
+  {decl}
+  const [n, setN] = useState(false);
+  useEffect(() => {{ setN(!n); }}, [data]);
+  return <div>{{String(n)}}</div>;
+}}
+"#
+        );
+        let diags = infinite_loop_diags(&src, "C");
+        assert!(
+            diags
+                .iter()
+                .any(|(_, _, m)| m.contains(clause) && m.contains(verb)),
+            "`{decl}`: {diags:?}"
+        );
+    }
+}
+
+#[test]
+fn a_fresh_dep_bound_on_two_paths_is_a_possible_loop() {
+    // `o` is a new object on either path, so React re-runs the effect after
+    // every commit; a name bound twice is not certified fresh at the call, so
+    // the loop is a Warning rather than silence.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C({ c }) {
+  const [s, setS] = useState<any>(0);
+  let o;
+  if (c) { o = { a: 1 }; } else { o = { b: 1 }; }
+  useEffect(() => { setS([]); }, [o]);
+  return <div>{String(s)}</div>;
+}
+"#;
+    let sevs = loop_severities(src, "C");
+    assert!(sevs.contains(&Severity::Warning), "{sevs:?}");
+    assert!(!sevs.contains(&Severity::Error), "{sevs:?}");
+}
+
+#[test]
+fn a_ref_contents_dep_the_effect_reassigns_is_a_possible_loop() {
+    // #201: the effect stores a new object in `ref.current` and flips `t`:
+    // the dep differs after every commit.
+    let src = r#"
+import { useState, useEffect, useRef } from 'react';
+export function C() {
+  const ref = useRef<object>({});
+  const [t, setT] = useState(false);
+  useEffect(() => { ref.current = {}; setT(!t); }, [ref.current]);
+  return <div>{String(t)}</div>;
+}
+"#;
+    let sevs = loop_severities(src, "C");
+    assert!(sevs.contains(&Severity::Warning), "{sevs:?}");
+    assert!(!sevs.contains(&Severity::Error), "{sevs:?}");
+}
+
+#[test]
+fn a_primitive_dep_computed_from_the_written_slot_is_a_possible_loop() {
+    // #203: `!on` moves with `on`, which the effect flips at every run.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [on, setOn] = useState(false);
+  useEffect(() => { setOn(!on); }, [!on]);
+  return <div>{String(on)}</div>;
+}
+"#;
+    let sevs = loop_severities(src, "C");
+    assert!(sevs.contains(&Severity::Warning), "{sevs:?}");
+}
+
 #[test]
 fn every_write_fresh_keeps_the_error() {
     // Two fresh writes: whichever runs last, the slot changes.
@@ -1415,4 +1955,636 @@ export function C() {
         sevs.contains(&Severity::Error),
         "every write stores a new reference: {sevs:?}"
     );
+}
+
+// ── `Change::Never` / `Once` are must facts (#205, #208, #210) ───────────────
+
+#[test]
+fn a_cleanup_writing_back_its_own_read_alternates_with_a_mount_write() {
+    // The cleanup of render `j` stores `x_j` over the mount write's 1: 0, 1,
+    // 0… React loops (#205).
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [x, setX] = useState(0);
+  useEffect(() => { setX(1); }, []);
+  useEffect(() => { return () => { setX(x); }; }, [x]);
+  return <div>{x}</div>;
+}
+"#;
+    assert!(!loop_severities(src, "C").is_empty());
+}
+
+#[test]
+fn a_slot_every_write_of_which_stores_its_own_read_keeps_its_initial_value() {
+    // A sync, a deferred and a cleanup write of `x`'s own read: each stores
+    // a value the slot held, so it only ever holds its first object (#223).
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [x, setX] = useState({ v: 0 });
+  useEffect(() => {
+    setX(x);
+    Promise.resolve().then(() => setX(x));
+    return () => { setX(x); };
+  });
+  return <div>{x.v}</div>;
+}
+"#;
+    let sevs = loop_severities(src, "C");
+    assert!(sevs.is_empty(), "{sevs:?}");
+}
+
+#[test]
+fn a_slot_with_one_write_of_something_else_leaves_its_initial_value() {
+    // A third write stores a new object, a handler writes a constant, the
+    // setter reaches a callee no row describes: the stale reads are no longer
+    // the initial value (#223, #205).
+    for extra in [
+        "useEffect(() => { setX({ v: 1 }); }, []);",
+        "const h = <button onClick={() => setX({ v: 1 })} />;",
+        "useEffect(() => { register(setX); }, []);",
+    ] {
+        let src = format!(
+            r#"
+import {{ useState, useEffect }} from 'react';
+import {{ register }} from 'ext';
+export function C() {{
+  const [x, setX] = useState({{ v: 0 }});
+  {extra}
+  useEffect(() => {{
+    Promise.resolve().then(() => setX(x));
+    return () => {{ setX(x); }};
+  }}, [x]);
+  return <div>{{x.v}}</div>;
+}}
+"#
+        );
+        assert!(!loop_severities(&src, "C").is_empty(), "{extra}");
+    }
+}
+
+#[test]
+fn a_name_bound_to_the_read_on_one_path_is_not_an_identity_write() {
+    // `d` is `s` only when the guard fails; it never does (#210).
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [s, setS] = useState({ n: 0 });
+  let d = s;
+  if (s.n === 0) d = { n: 0 };
+  useEffect(() => { setS(d); }, [s]);
+  return <div />;
+}
+"#;
+    assert!(!loop_severities(src, "C").is_empty());
+}
+
+#[test]
+fn zero_and_negative_zero_alternate() {
+    // `Object.is(0, -0)` is false: each write moves the slot off the other's
+    // value, and React loops (#208).
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [s, setS] = useState(1);
+  useEffect(() => { if (Object.is(s, 0)) setS(-0); else setS(0); }, [s]);
+  return <div>{s}</div>;
+}
+"#;
+    assert!(!loop_severities(src, "C").is_empty());
+}
+
+// ── The convergence kills check their premises (#204, #209, #218, #222) ─────
+
+#[test]
+fn a_call_that_allocates_is_no_function_of_its_inputs() {
+    // `F.make(a)` returns a new object on every re-run, whatever `b` did:
+    // the change of `b` is an edge into `y` (#218).
+    let src = r#"
+import { useState, useEffect } from 'react';
+const F = { make: (v: number) => ({ v }) };
+export function C() {
+  const [a] = useState(0);
+  const [b, setB] = useState(false);
+  const [y, setY] = useState<any>(null);
+  useEffect(() => { setY(F.make(a)); }, [a, b]);
+  useEffect(() => { setB(!b); }, [y]);
+  return <div />;
+}
+"#;
+    assert!(!loop_severities(src, "C").is_empty());
+}
+
+#[test]
+fn a_relational_guard_settles_only_while_the_written_expression_holds() {
+    // `s === t` after the write, until the second effect moves `t` (#209).
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [s, setS] = useState(false);
+  const [t, setT] = useState(false);
+  useEffect(() => { if (s !== t) setS(t); }, [s, t]);
+  useEffect(() => { setT(!s); }, [s]);
+  return <div />;
+}
+"#;
+    assert!(!loop_severities(src, "C").is_empty());
+}
+
+#[test]
+fn a_read_that_is_not_a_dep_carries_its_own_edge() {
+    // `a` moves without re-running the first effect, and the re-run `b`
+    // causes stores the new `a` (#204).
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [a, setA] = useState(false);
+  const [b, setB] = useState(false);
+  const [y, setY] = useState<boolean | null>(null);
+  useEffect(() => { setY(a); }, [b]);
+  useEffect(() => { setA(!a); setB(!b); }, [y]);
+  return <div />;
+}
+"#;
+    assert!(!loop_severities(src, "C").is_empty());
+}
+
+#[test]
+fn a_dep_rooted_at_a_one_arm_alias_is_no_member_of_the_slot() {
+    // On the arm that runs, `d.name` is `data.slug`, which the spread
+    // update overwrites (#222).
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [data, setData] = useState({ name: "", slug: "" });
+  const d = data.slug.length >= 0 ? { name: data.slug } : data;
+  useEffect(() => {
+    setData((prev) => ({ ...prev, slug: prev.slug + "x" }));
+  }, [d.name]);
+  return <div />;
+}
+"#;
+    assert!(!loop_severities(src, "C").is_empty());
+}
+
+#[test]
+fn a_guard_on_a_one_arm_alias_is_not_settled_by_the_write() {
+    // `d` is `null` while `c` is false: the guard never dies (#222).
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [s, setS] = useState<any>(null);
+  const [c] = useState(false);
+  const d = c ? s : null;
+  useEffect(() => { if (d === null) setS({ n: 1 }); }, [s]);
+  return <div />;
+}
+"#;
+    assert!(!loop_severities(src, "C").is_empty());
+}
+
+#[test]
+fn a_guard_on_a_name_the_body_rebinds_is_not_settled_by_the_write() {
+    // The guard reads the body's `s`, not the slot (#222).
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [s, setS] = useState<any>(null);
+  useEffect(() => { let s = null; if (s === null) setS({ n: 1 }); }, [s]);
+  return <div />;
+}
+"#;
+    assert!(!loop_severities(src, "C").is_empty());
+}
+
+#[test]
+fn a_write_of_a_one_arm_alias_reads_every_arm() {
+    // `d` is `t` while `c` is false: the write reads `t`, not only `s`
+    // (#222, through #204's read edges).
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [c] = useState(false);
+  const [s] = useState(false);
+  const [t, setT] = useState(false);
+  const [b, setB] = useState(false);
+  const [y, setY] = useState<boolean | null>(null);
+  const d = c ? s : t;
+  useEffect(() => { setY(d); }, [b, s]);
+  useEffect(() => { setT(!t); setB(!b); }, [y]);
+  return <div />;
+}
+"#;
+    assert!(!loop_severities(src, "C").is_empty());
+}
+
+// ── A re-run that holds through one call site (#237) ──────────────────────────
+
+const ONE_FRESH_SITE: &str = r#"
+import { useState, useEffect } from 'react';
+const CONST = { a: 1 };
+function Child({ opts }: { opts: object }) {
+  const [n, setN] = useState({});
+  useEffect(() => { setN({ ...n }); }, [opts]);
+  return <div />;
+}
+export function Fresh() {
+  return <Child opts={{ a: 2 }} />;
+}
+"#;
+
+#[test]
+fn a_dep_fresh_through_one_call_site_reruns_the_effect_there() {
+    // A second element hands `opts` a constant: the join of the two is not
+    // a new reference every render, but through `<Fresh>` it is, and the
+    // effect re-runs there as it does when `<Fresh>` alone renders it. The
+    // finding names that parent, at Warning: the other one does not.
+    let joined =
+        format!("{ONE_FRESH_SITE}export function Still() {{ return <Child opts={{CONST}} />; }}\n");
+    for src in [ONE_FRESH_SITE, joined.as_str()] {
+        let d = infinite_loop_diags(src, "Child");
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].1, Severity::Warning, "{d:?}");
+    }
+    let d = infinite_loop_diags(&joined, "Child");
+    assert!(d[0].2.contains("whenever `<Fresh>` renders it"), "{d:?}");
+    assert!(!d[0].2.contains("Still"), "{d:?}");
+}
+
+#[test]
+fn a_dep_stable_at_every_call_site_reruns_nothing() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+const A = { a: 1 };
+const B = { b: 1 };
+function Child({ opts }: { opts: object }) {
+  const [n, setN] = useState({});
+  useEffect(() => { setN({ ...n }); }, [opts]);
+  return <div />;
+}
+export function P() { return <Child opts={A} />; }
+export function Q() { return <Child opts={B} />; }
+"#;
+    assert!(infinite_loop_diags(src, "Child").is_empty());
+}
+
+#[test]
+fn a_call_returned_setter_in_a_closure_nested_in_an_effect_loops() {
+    // #246: `get()(x)` in a `forEach` callback, a `.then` continuation, a
+    // closure under a memo or a callback the effect runs: the temp lives in
+    // a body with no per-block envs, read off a run of it. A possible loop
+    // (the callback may run 0 times, the continuation later), never an
+    // Error; and none when `get()` may be a no-op or the closure never runs.
+    let comp = |decl: &str, effect: &str| {
+        format!(
+            r#"
+            import {{ useState, useEffect, useMemo, useCallback }} from "react";
+            function App({{ c }}) {{
+              const [v, setV] = useState(0);
+              const get = () => setV;
+              const maybe = () => (c ? setV : (x) => {{}});
+              {decl}
+              useEffect(() => {{ {effect} }});
+              return <div>{{v}}</div>;
+            }}
+            "#
+        )
+    };
+    for (decl, effect) in [
+        ("", "[1].forEach(() => get()(v + 1));"),
+        ("", "Promise.resolve().then(() => get()(v + 1));"),
+        ("", "[1].forEach(() => { const s = get(); s(v + 1); });"),
+        (
+            "const run = useMemo(() => () => get()(v + 1), [v]);",
+            "run();",
+        ),
+        (
+            "const bump = useCallback(() => { [1].forEach(() => get()(v + 1)); }, [v]);",
+            "bump();",
+        ),
+        ("", "[1].forEach(() => maybe()(v + 1));"),
+    ] {
+        let diags = infinite_loop_diags(&comp(decl, effect), "App");
+        assert!(
+            diags
+                .iter()
+                .any(|(r, s, _)| r == "infinite-loop" && *s == Severity::Warning),
+            "{decl} {effect}: {diags:?}"
+        );
+        assert!(
+            diags.iter().all(|(_, s, _)| *s != Severity::Error),
+            "{decl} {effect}: {diags:?}"
+        );
+    }
+    let never = infinite_loop_diags(&comp("", "const later = () => get()(v + 1);"), "App");
+    assert!(never.is_empty(), "{never:?}");
+}
+
+#[test]
+fn a_guard_on_a_member_of_the_slot_dies_under_the_written_literal() {
+    // `{ n: 1 }` leaves `1` where the guard wants `0` (#244): through a
+    // member read, a render destructuring and a body destructuring.
+    for (decl, effect) in [
+        ("", "if (s.n === 0) setS({ n: 1 });"),
+        ("const { n } = s;", "if (n === 0) setS({ n: 1 });"),
+        ("", "const { n } = s; if (0 === n) setS({ n: 1 });"),
+        ("", "if (s.n < 1) setS({ n: 1 });"),
+        // An allocation at the member is truthy and not nullish (#228).
+        ("", "if (!s.m) setS({ n: 1, m: new Map() });"),
+        ("", "if (s.m == null) setS({ n: 1, m: [] });"),
+    ] {
+        let src = format!(
+            r#"
+import {{ useState, useEffect }} from 'react';
+export function C() {{
+  const [s, setS] = useState({{ n: 0 }});
+  {decl}
+  useEffect(() => {{ {effect} }}, [s]);
+  return <div />;
+}}
+"#
+        );
+        let sevs = loop_severities(&src, "C");
+        assert!(sevs.is_empty(), "{decl} {effect}: {sevs:?}");
+    }
+}
+
+#[test]
+fn a_guard_on_a_member_of_the_slot_lives_when_the_write_does_not_kill_it() {
+    // The member written back, a member the literal does not write, a value
+    // that is no literal, another site writing the member back, and a body
+    // name a closure may reassign: no proof (#244).
+    for (decl, effect) in [
+        ("const { n } = s;", "if (n === 0) setS({ n: 0 });"),
+        ("", "if (s.n === 0) setS({ m: 1 });"),
+        ("", "if (s.n === 0) setS({ ...s, n: s.n });"),
+        (
+            "",
+            "if (s.n === 0) setS({ n: 1 }); if (s.n === 1) setS({ n: 0 });",
+        ),
+        (
+            "",
+            "let { n } = s; [1].forEach(() => { n = 0; }); if (n === 0) setS({ n: 1 });",
+        ),
+    ] {
+        let src = format!(
+            r#"
+import {{ useState, useEffect }} from 'react';
+export function C() {{
+  const [s, setS] = useState<any>({{ n: 0 }});
+  {decl}
+  useEffect(() => {{ {effect} }}, [s]);
+  return <div />;
+}}
+"#
+        );
+        let sevs = loop_severities(&src, "C");
+        assert!(!sevs.is_empty(), "{decl} {effect}");
+    }
+}
+
+/// A component whose second effect is killed by the member arm, beside a
+/// body `other` that may write into the slot's object in place.
+fn member_mutation_src(other: &str, guarded: &str) -> String {
+    format!(
+        r#"
+import {{ useState, useEffect }} from 'react';
+export function C({{ id }}: {{ id: string }}) {{
+  const [s, setS] = useState<any>({{ ok: false, id: "", n: 0 }});
+  useEffect(() => {{ {other} }});
+  useEffect(() => {{ {guarded} }}, [s]);
+  return <div />;
+}}
+"#
+    )
+}
+
+#[test]
+fn a_member_write_into_the_slot_object_revives_a_member_guard() {
+    // The guard is dead under the setter's literal, but another body writes
+    // the member back in place: through the slot, an alias, a computed
+    // constant key, a `delete`, a mutating call, a functional updater's
+    // parameter, and for the relational arm as well (#252).
+    let kill = "if (!s.ok) setS({ ok: true });";
+    for (other, guarded) in [
+        ("s.ok = false;", kill),
+        ("const t = s; t.ok = false;", kill),
+        ("s['ok'] = false;", kill),
+        ("delete s.ok;", kill),
+        ("Object.assign(s, { ok: false });", kill),
+        ("setS((p: any) => { p.ok = false; return p; });", kill),
+        ("s.ok = id;", kill),
+        ("s.id = 'x';", "if (s.id !== id) setS({ id, ok: true });"),
+        (
+            "let n: any = s; while (n.next) n = n.next; n.ok = false;",
+            "if (!s.next.ok) setS({ next: { ok: true } });",
+        ),
+    ] {
+        let sevs = loop_severities(&member_mutation_src(other, guarded), "C");
+        assert!(!sevs.is_empty(), "{other} {guarded}");
+        assert!(!sevs.contains(&Severity::Error), "{other}: {sevs:?}");
+    }
+}
+
+#[test]
+fn a_member_write_that_keeps_the_guard_dead_is_no_reviver() {
+    // The write stores the killing value, or moves another member (#252).
+    for other in ["s.ok = true;", "s.n = 1;", "s.n++;"] {
+        let src = member_mutation_src(other, "if (!s.ok) setS({ ok: true, n: 0 });");
+        let sevs = loop_severities(&src, "C");
+        assert!(sevs.is_empty(), "{other}: {sevs:?}");
+    }
+}
+
+#[test]
+fn a_parameter_default_that_writes_state_is_a_write() {
+    // `go()` omits `v`, so its default runs and stores a new object into the
+    // slot the effect's deps read.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [s, setS] = useState({});
+  useEffect(() => {
+    const go = (v = setS({})) => v;
+    go();
+  }, [s]);
+  return <div />;
+}
+"#;
+    assert!(!loop_severities(src, "C").is_empty());
+}
+
+/// A component whose no-deps effect calls `call`, after `decl`.
+fn member_callee_src(decl: &str, call: &str) -> String {
+    format!(
+        r#"
+import {{ useState, useEffect }} from 'react';
+export function C({{ extra, k }}: {{ extra: any; k: string }}) {{
+  const [n, setN] = useState(0);
+  {decl}
+  useEffect(() => {{ {call} }});
+  return <div />;
+}}
+"#
+    )
+}
+
+#[test]
+fn a_member_copied_by_a_spread_or_stored_under_a_computed_key_is_called() {
+    // The closure reaches the call through a spread of a known object, over a
+    // member written before it, through a computed key no literal spells, a
+    // computed key the destructuring reads (#76). An unknown spread keeps
+    // the member written before it possible, as does a computed key that may
+    // name it: a warning, never a certainty. (A destructuring default's
+    // value is not stored yet, #256.)
+    for (decl, call) in [
+        (
+            "const b = { inc: INC }; const api = { ...b, x: 1 };",
+            "api.inc();",
+        ),
+        (
+            "const api = { inc: () => {}, ...{ inc: INC } };",
+            "api.inc();",
+        ),
+        (
+            "const key = 'inc'; const api = { [key]: INC };",
+            "api.inc();",
+        ),
+        ("const api = { [1]: INC };", "api[1]();"),
+        (
+            "const key = 'inc'; const { [key]: f } = { inc: INC };",
+            "f();",
+        ),
+        ("const api = { inc: INC, ...extra };", "api.inc();"),
+        ("const api = { inc: () => {}, [k]: INC };", "api.inc();"),
+    ] {
+        let decl = decl.replace("INC", "() => setN(n + 1)");
+        let sevs = loop_severities(&member_callee_src(&decl, call), "C");
+        assert!(!sevs.is_empty(), "{decl} {call}");
+        assert!(!sevs.contains(&Severity::Error), "{decl}: {sevs:?}");
+    }
+}
+
+#[test]
+fn a_member_a_spread_of_a_known_object_overrides_is_gone() {
+    // The spread writes `inc` over the closure: the call runs the no-op (#76).
+    let decl = "const api = { inc: () => setN(n + 1), ...{ inc: () => {} } };";
+    let sevs = loop_severities(&member_callee_src(decl, "api.inc();"), "C");
+    assert!(sevs.is_empty(), "{sevs:?}");
+}
+
+// ── #254: a write in a closure the passes never run moves its slot ──────────
+
+/// `runNow` and `useRun` are code the analysis does not see; the closure
+/// handed to each writes `k = 1`, so `setN(n + k)` grows `n` on every render.
+/// The write's timing is unknown, so the slot only *may* be 1: a Warning.
+/// While the write was lost, `k` stayed 0 and `setN(n + k)` read as a no-op.
+#[test]
+fn a_write_in_an_escaped_closure_feeds_the_loop() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+import { runNow, useRun } from 'ext';
+export function Callee() {
+  const [k, setK] = useState(0);
+  const [n, setN] = useState(0);
+  useEffect(() => { runNow(() => setK(1)); }, []);
+  useEffect(() => { setN(n + k); });
+  return <div>{n}</div>;
+}
+export function HookArg() {
+  const [k, setK] = useState(0);
+  const [n, setN] = useState(0);
+  useRun({ onRow: () => setK(1) });
+  useEffect(() => { setN(n + k); });
+  return <div>{n}</div>;
+}
+"#;
+    for c in ["Callee", "HookArg"] {
+        let diags = infinite_loop_diags(src, c);
+        assert!(
+            diags.iter().any(|(_, s, _)| *s == Severity::Warning)
+                && !diags.iter().any(|(_, s, _)| *s == Severity::Error),
+            "{c}: {diags:?}"
+        );
+    }
+}
+
+/// The negative: the escaped closure writes the value the slot holds, so
+/// `setN(n + k)` stays the bail-out `setN(n)`.
+#[test]
+fn an_escaped_closure_writing_the_held_value_feeds_nothing() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+import { runNow } from 'ext';
+export function App() {
+  const [k, setK] = useState(0);
+  const [n, setN] = useState(0);
+  useEffect(() => { runNow(() => setK(0)); }, []);
+  useEffect(() => { setN(n + k); });
+  return <div>{n}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "App");
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
+// ── #253: a closure reached through a local array or a local higher-order fn ─
+
+/// The closure runs in the effect, every run: through the array's entries an
+/// array method passes its callback, or through the parameter a local
+/// function is called with. Neither call is surely of that one closure, so
+/// the loop is a Warning; so is its conditional twin.
+#[test]
+fn a_closure_run_through_an_array_or_a_parameter_feeds_the_loop() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function Named() {
+  const [n, setN] = useState(0);
+  const fs = [() => setN(n + 1)];
+  useEffect(() => { fs.forEach((f) => f()); });
+  return <div>{n}</div>;
+}
+export function Literal() {
+  const [n, setN] = useState(0);
+  useEffect(() => { [() => setN(n + 1)].forEach((f) => f()); });
+  return <div>{n}</div>;
+}
+export function Param() {
+  const [n, setN] = useState(0);
+  const f = (g: () => void) => g();
+  useEffect(() => { f(() => setN(n + 1)); });
+  return <div>{n}</div>;
+}
+export function Guarded({ on }: { on: boolean }) {
+  const [n, setN] = useState(0);
+  const fs = [() => setN(n + 1)];
+  useEffect(() => { if (on) fs.forEach((f) => f()); });
+  return <div>{n}</div>;
+}
+"#;
+    for c in ["Named", "Literal", "Param", "Guarded"] {
+        let diags = infinite_loop_diags(src, c);
+        assert!(
+            diags.iter().any(|(_, s, _)| *s == Severity::Warning)
+                && !diags.iter().any(|(_, s, _)| *s == Severity::Error),
+            "{c}: {diags:?}"
+        );
+    }
+}
+
+/// The negative: the closures the array holds write a constant.
+#[test]
+fn an_array_of_settling_closures_feeds_nothing() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function App() {
+  const [n, setN] = useState(0);
+  const fs = [() => setN(0)];
+  useEffect(() => { fs.forEach((f) => f()); });
+  return <div>{n}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "App");
+    assert!(diags.is_empty(), "{diags:?}");
 }

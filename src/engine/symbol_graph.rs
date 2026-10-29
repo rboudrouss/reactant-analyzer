@@ -345,6 +345,7 @@ mod tests {
             file: PathBuf::from(file),
             name: name.to_string(),
             params: vec![],
+            param_defaults: vec![],
             body_cfg: cfg_calling(callees),
             hooks: vec![],
             hook_provenance: vec![],

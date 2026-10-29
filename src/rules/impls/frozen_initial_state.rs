@@ -33,11 +33,13 @@ use crate::rules::{
 ///   actually be written in its owner, no effect keyed on the prop (and no
 ///   render-time write) syncs the local slot, the local setter never escapes
 ///   this component (nothing else could sync it), and the move is *observable*
-///   — no call site ties the mount condition to the feeder's own writers.
+///   — no call site ties the mount condition to the feeder's own writers, and
+///   every analysed call site passes the feeder.
 /// - **Warning**: the freeze is real but the prop's motion is not proven
 ///   (props ⊤ in intra-only analysis, `VersionedTop`, per-render or unknown
 ///   values), or the proof chain has a hole (setter escapes, feeding slot's
-///   owner unavailable, mount writer-coupled).
+///   owner unavailable, mount writer-coupled, a call site the feeder does not
+///   reach).
 /// - **Info**: intent is declared — every seeding prop is *named* for
 ///   seed-once (`initial*` / `default*`) with unproven motion, the local slot
 ///   is never written at all (`const [{ snap }] = useState(...)`: a deliberate
@@ -179,9 +181,10 @@ impl Rule for FrozenInitialState {
                 Some(names) => ctx.cache().mounts().coupling(
                     component,
                     names,
-                    proven
+                    &proven
                         .as_ref()
-                        .map(|(_, p)| (p.evidence().owner, p.evidence().slot)),
+                        .map(|(_, p)| p.evidence().qualified())
+                        .unwrap_or_default(),
                     result,
                 ),
                 None => MountCoupling::Free,
@@ -198,8 +201,11 @@ impl Rule for FrozenInitialState {
                     // `escaped`: something outside this component holds the
                     // setter — an unseen sync path may exist. `WriterCoupled`:
                     // the mount condition moves with the feeder, so no mounted
-                    // instance need ever observe the change.
-                    let severity = if escaped || mount == MountCoupling::WriterCoupled {
+                    // instance need ever observe the change. `Unfed`: some
+                    // instance is mounted where no feeder reaches it.
+                    let severity = if escaped
+                        || matches!(mount, MountCoupling::WriterCoupled | MountCoupling::Unfed)
+                    {
                         Severity::Warning
                     } else {
                         Severity::Error
@@ -211,9 +217,9 @@ impl Rule for FrozenInitialState {
                              {display} and changes. `useState` reads its initializer on the \
                              first render only and nothing here re-syncs it, so {slot_name} \
                              stays frozen at the first `{path}` value",
-                            display = feeder.display
+                            display = feeder.display()
                         ),
-                        Some((feeder.slot, feeder.display.clone(), feeder.write_span)),
+                        Some(feeder.slots.clone()),
                     )
                 }
                 (None, Some(path)) => (
@@ -288,31 +294,32 @@ impl Rule for FrozenInitialState {
             }
             // Witness (ADR-019): the prop read at the seed site, the
             // init-once semantics, and — when proven — the write that moves
-            // the feeding slot in its owner.
+            // each feeding slot in its owner.
             d = d.with_step(
                 Step::Read {
                     what: primary_path.clone(),
                 },
                 Some(*label),
                 *span,
-                &name_of,
+                &ctx.names(&name_of),
             );
             d = d.with_step(
                 Step::InitOnce { slot: *label },
                 Some(*label),
                 *span,
-                &name_of,
+                &ctx.names(&name_of),
             );
-            if let Some((owner_slot, display, write_span)) = proven_evidence {
-                let owner_name = move |_: HookLabel| display.clone();
+            for feeder in proven_evidence.into_iter().flatten() {
+                let (slot, write_span) = (feeder.slot, feeder.write_span);
+                let owner_name = move |_: HookLabel| feeder.display.clone();
                 d = d.with_step(
                     Step::Write {
-                        slot: owner_slot,
+                        slot,
                         value: ValueClass::Unknown,
                     },
                     None,
                     write_span,
-                    &owner_name,
+                    &ctx.names(&owner_name),
                 );
             }
             diags.push(d);

@@ -1,11 +1,68 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
+
+use imbl::{OrdMap, ordmap::DiffItem};
 
 use crate::{
     domains::AbstractDomain,
     ir::types::{ExprId, HookLabel, Var},
 };
 
-use super::{leq_pointwise, map_get_or};
+use super::leq_pointwise;
+
+/// The allocation sites a value may point to.
+///
+/// `open`: the value may also be one no site places — a path bound it to a
+/// prop or a call's result, or it was read off a site that lacks the member —
+/// so the sites are what it may be, not all it may be, and a member read off
+/// it or a call of it may be anything as well (#240). A plain value is the
+/// open entry with no site.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Sites {
+    pub ids: HashSet<ExprId>,
+    pub open: bool,
+}
+
+impl Sites {
+    /// Exactly these sites.
+    pub fn closed(ids: impl IntoIterator<Item = ExprId>) -> Self {
+        Sites {
+            ids: ids.into_iter().collect(),
+            open: false,
+        }
+    }
+
+    /// Either: every site of both, open if either is.
+    pub fn join(&self, other: &Self) -> Self {
+        Sites {
+            ids: self.ids.union(&other.ids).copied().collect(),
+            open: self.open || other.open,
+        }
+    }
+
+    /// The join with a value no site places.
+    pub fn opened(self) -> Self {
+        Sites { open: true, ..self }
+    }
+
+    /// The join of two optional site sets: `None` is a plain value, the
+    /// open entry with no site.
+    pub fn join_opt(a: Option<&Sites>, b: Option<&Sites>) -> Option<Sites> {
+        match (a, b) {
+            (None, None) => None,
+            (Some(a), Some(b)) => Some(a.join(b)),
+            (Some(s), None) | (None, Some(s)) => Some(s.clone().opened()),
+        }
+    }
+
+    /// `a ⊑ b` over optional site sets, `None` the open entry with no site.
+    fn leq_opt(a: Option<&Sites>, b: Option<&Sites>) -> bool {
+        match (a, b) {
+            (None, b) => b.is_none_or(|b| b.open),
+            (Some(a), None) => a.ids.is_empty() && a.open,
+            (Some(a), Some(b)) => a.ids.is_subset(&b.ids) && (!a.open || b.open),
+        }
+    }
+}
 
 /// An entry in the abstract environment.
 ///
@@ -21,12 +78,20 @@ pub enum EnvVal<D> {
     /// made a function or object prop read as "unknown" in the child instead
     /// of the per-render reference the parent had already proved it to be.
     Loc {
-        ids: HashSet<ExprId>,
+        sites: Sites,
         val: D,
     },
 }
 
 impl<D: AbstractDomain> EnvVal<D> {
+    /// `val` pointing to `sites`, a plain value without any.
+    pub fn located(sites: Option<Sites>, val: D) -> Self {
+        match sites {
+            Some(sites) => EnvVal::Loc { sites, val },
+            None => EnvVal::Val(val),
+        }
+    }
+
     /// The domain value, whichever variant carries it.
     pub fn as_val(&self) -> D {
         match self {
@@ -34,59 +99,130 @@ impl<D: AbstractDomain> EnvVal<D> {
         }
     }
 
-    /// A `Loc`'s allocation sites, or `None` for a plain value.
+    /// A `Loc`'s allocation sites, or `None` for a plain value: what it may
+    /// point to, open or not.
     pub fn locs(&self) -> Option<&HashSet<ExprId>> {
+        self.sites().map(|s| &s.ids)
+    }
+
+    /// A `Loc`'s sites with whether they are all it may be.
+    pub fn sites(&self) -> Option<&Sites> {
         match self {
-            EnvVal::Loc { ids, .. } => Some(ids),
+            EnvVal::Loc { sites, .. } => Some(sites),
             EnvVal::Val(_) => None,
         }
     }
+
+    /// Either entry: the join of the values and the union of the sites, open
+    /// where one side places nothing — the reading [`AbstractEnv::join`]
+    /// gives a name, its values and its locations joined apart.
+    pub fn join(&self, other: &Self) -> Self {
+        let val = self.as_val().join(&other.as_val());
+        EnvVal::located(Sites::join_opt(self.sites(), other.sites()), val)
+    }
+
+    /// `self ⊑ other`: a value below, and sites among the other's.
+    pub fn leq(&self, other: &Self) -> bool {
+        let (a, b) = (self.as_val(), other.as_val());
+        a.join(&b) == b && Sites::leq_opt(self.sites(), other.sites())
+    }
 }
+
+/// A persistent map: O(1) clone, and a copy shares every node it does not
+/// change with the map it was copied from (ADR-045). Ordered, so iteration
+/// is deterministic.
+type Map<K, V> = OrdMap<K, V>;
 
 /// Per-variable abstract environment.
 ///
 /// `lookup` returns `D::top()` for unbound vars. `setter_bindings` is a
 /// React-specific side-channel for setState. `locs` tracks heap allocation-site
 /// `ExprId`s for FnLit/ObjectLit/ArrayLit vars; independent from `stabs`.
+///
+/// Every map is persistent (ADR-045): the solvers keep one env per block, and
+/// a block's env shares everything its statements did not rebind with the
+/// env it started from, instead of holding its own copy of every name in
+/// scope. Joins, `leq` and equality walk only the entries that differ.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AbstractEnv<D: AbstractDomain> {
-    stabs: HashMap<Var, D>,
-    locs: HashMap<Var, HashSet<ExprId>>,
-    setter_bindings: HashMap<Var, HookLabel>,
+    stabs: Map<Var, D>,
+    locs: Map<Var, Sites>,
+    /// The setters a name may be: one per path that bound it, unioned at a
+    /// join (#202).
+    setter_bindings: Map<Var, Labels>,
     /// Side-channel for `useCallback` bindings: the body lives in the hook
     /// entry (`QueryContext::callback_body`), not the heap, so calls through
-    /// the variable can still be executed for side effects.
-    callback_bindings: HashMap<Var, HookLabel>,
+    /// the variable can still be executed for side effects. Unioned at a
+    /// join, as the setters are.
+    callback_bindings: Map<Var, Labels>,
     /// The names that are, at this point, the value a state slot was read
     /// as in this render: `a = StateVal(l)` and its renames. A primitive
     /// slot's value carries no label (ADR-017, #203), so this is the only
     /// record a condition on it leaves (#197). A certificate, so it fails
     /// closed: any other binding of the name drops it, and a join keeps it
     /// only where both sides agree.
-    slot_bindings: HashMap<Var, HookLabel>,
+    slot_bindings: Map<Var, HookLabel>,
 }
 
 impl<D: AbstractDomain> Default for AbstractEnv<D> {
     fn default() -> Self {
         AbstractEnv {
-            stabs: HashMap::new(),
-            locs: HashMap::new(),
-            setter_bindings: HashMap::new(),
-            callback_bindings: HashMap::new(),
-            slot_bindings: HashMap::new(),
+            stabs: Map::new(),
+            locs: Map::new(),
+            setter_bindings: Map::new(),
+            callback_bindings: Map::new(),
+            slot_bindings: Map::new(),
         }
     }
 }
 
 /// The slot certificates both sides agree on.
-fn agreed_slots(
-    a: &HashMap<Var, HookLabel>,
-    b: &HashMap<Var, HookLabel>,
-) -> HashMap<Var, HookLabel> {
-    a.iter()
-        .filter(|(k, l)| b.get(*k) == Some(*l))
-        .map(|(k, l)| (k.clone(), *l))
-        .collect()
+fn agreed_slots(a: &Map<Var, HookLabel>, b: &Map<Var, HookLabel>) -> Map<Var, HookLabel> {
+    let mut out = a.clone();
+    for item in a.diff(b) {
+        match item {
+            DiffItem::Update { old: (k, _), .. } | DiffItem::Remove(k, _) => {
+                out.remove(k);
+            }
+            DiffItem::Add(..) => {}
+        }
+    }
+    out
+}
+
+/// The hooks a name may be bound to.
+pub type Labels = BTreeSet<HookLabel>;
+
+/// Every binding of either side, a name both bind holding the union.
+fn union_labels(a: &Map<Var, Labels>, b: &Map<Var, Labels>) -> Map<Var, Labels> {
+    let mut out = a.clone();
+    for item in a.diff(b) {
+        match item {
+            DiffItem::Add(k, v) => {
+                out.insert(k.clone(), v.clone());
+            }
+            DiffItem::Update {
+                old: (k, x),
+                new: (_, y),
+            } => {
+                out.insert(k.clone(), x.union(y).copied().collect());
+            }
+            DiffItem::Remove(..) => {}
+        }
+    }
+    out
+}
+
+/// `a ⊑ b` over label bindings: every name `a` binds, `b` binds to a superset.
+fn labels_leq(a: &Map<Var, Labels>, b: &Map<Var, Labels>) -> bool {
+    a.diff(b).all(|item| match item {
+        DiffItem::Update {
+            old: (_, x),
+            new: (_, y),
+        } => x.is_subset(y),
+        DiffItem::Remove(_, x) => x.is_empty(),
+        DiffItem::Add(..) => true,
+    })
 }
 
 impl<D: AbstractDomain> AbstractEnv<D> {
@@ -102,9 +238,9 @@ impl<D: AbstractDomain> AbstractEnv<D> {
     /// Returns heap location set for `var` if it was bound to an allocating expr.
     /// Returns `None` when the variable has no Loc (external/imported function).
     pub fn lookup_env_val(&self, var: &str) -> Option<EnvVal<D>> {
-        if let Some(ids) = self.locs.get(var) {
+        if let Some(sites) = self.locs.get(var) {
             return Some(EnvVal::Loc {
-                ids: ids.clone(),
+                sites: sites.clone(),
                 val: self.lookup(var),
             });
         }
@@ -120,14 +256,17 @@ impl<D: AbstractDomain> AbstractEnv<D> {
     /// drops the slot certificate, which the new binding must earn again.
     pub fn extend(&mut self, var: Var, val: D) {
         self.slot_bindings.remove(&var);
-        self.stabs.insert(var, val);
+        self.refine(var, val);
     }
 
     /// Replace the value of a variable without rebinding it — a narrowing
     /// on a branch, a selection taint — so what is known of the name's
     /// origin stays.
     pub fn refine(&mut self, var: Var, val: D) {
-        self.stabs.insert(var, val);
+        // An equal value leaves the map as it is, shared with its source.
+        if self.stabs.get(&var) != Some(&val) {
+            self.stabs.insert(var, val);
+        }
     }
 
     /// Record that `var` is the value slot `label` was read as.
@@ -140,73 +279,107 @@ impl<D: AbstractDomain> AbstractEnv<D> {
         self.slot_bindings.get(var).copied()
     }
 
-    /// Record that `var` is bound to an allocation site. Independent of `extend`.
-    pub fn extend_loc(&mut self, var: Var, id: ExprId) {
-        self.locs.entry(var).or_default().insert(id);
+    /// Record the allocation sites `var` is now bound to, none for a value
+    /// no site places: a binding replaces the sites of the one before, which
+    /// no longer is what the name holds. Independent of `extend`.
+    pub fn bind_locs(&mut self, var: Var, sites: Option<Sites>) {
+        match sites {
+            Some(sites) if self.locs.get(&var) != Some(&sites) => {
+                self.locs.insert(var, sites);
+            }
+            Some(_) => {}
+            None => {
+                self.locs.remove(&var);
+            }
+        }
     }
 
-    /// Record that `var` is a state-setter for hook `label`.
+    /// Record that `var` is the state-setter for hook `label`, and nothing
+    /// else.
     pub fn bind_setter(&mut self, var: Var, label: HookLabel) {
-        self.setter_bindings.insert(var, label);
+        self.setter_bindings.insert(var, Labels::from([label]));
     }
 
-    /// Returns the hook label if `var` is a known state-setter, else `None`.
+    /// Record that `var` is one of the state-setters `labels`.
+    pub fn bind_setters(&mut self, var: Var, labels: Labels) {
+        self.setter_bindings.insert(var, labels);
+    }
+
+    /// The hooks `var` may be the state-setter of; none for a non-setter.
+    pub fn setter_labels(&self, var: &str) -> Option<&Labels> {
+        self.setter_bindings.get(var)
+    }
+
+    /// The hook `var` is the state-setter of, when it is one setter.
     pub fn setter_label(&self, var: &str) -> Option<HookLabel> {
-        self.setter_bindings.get(var).copied()
+        self.setter_labels(var)
+            .filter(|s| s.len() == 1)
+            .and_then(|s| s.first().copied())
     }
 
     /// Record that `var` is bound to a `useCallback` hook `label`.
     pub fn bind_callback(&mut self, var: Var, label: HookLabel) {
-        self.callback_bindings.insert(var, label);
+        self.callback_bindings.insert(var, Labels::from([label]));
     }
 
-    /// Returns the hook label if `var` is a known `useCallback` binding.
-    pub fn callback_label(&self, var: &str) -> Option<HookLabel> {
-        self.callback_bindings.get(var).copied()
+    /// Record that `var` is one of the `useCallback` hooks `labels`.
+    pub fn bind_callbacks(&mut self, var: Var, labels: Labels) {
+        self.callback_bindings.insert(var, labels);
     }
 
-    fn join_stabs(a: &HashMap<Var, D>, b: &HashMap<Var, D>) -> HashMap<Var, D> {
-        let mut out = HashMap::new();
-        for (k, v) in a {
-            let w = map_get_or(b, k, D::top);
-            out.insert(k.clone(), v.join(&w));
-        }
-        for k in b.keys() {
-            if !a.contains_key(k) {
-                out.insert(k.clone(), D::top());
+    /// The `useCallback` hooks `var` may be bound to; none for another name.
+    pub fn callback_labels(&self, var: &str) -> Option<&Labels> {
+        self.callback_bindings.get(var)
+    }
+
+    /// Pointwise join over the entries that differ: a name both sides bind
+    /// to the same value keeps it (the join is idempotent), and a name only
+    /// one side binds joins with `D::top()`.
+    fn join_stabs(a: &Map<Var, D>, b: &Map<Var, D>) -> Map<Var, D> {
+        let mut out = a.clone();
+        for item in a.diff(b) {
+            match item {
+                DiffItem::Update {
+                    old: (k, v),
+                    new: (_, w),
+                } => {
+                    out.insert(k.clone(), v.join(w));
+                }
+                DiffItem::Remove(k, v) => {
+                    out.insert(k.clone(), v.join(&D::top()));
+                }
+                DiffItem::Add(k, _) => {
+                    out.insert(k.clone(), D::top());
+                }
             }
         }
         out
     }
 
-    fn join_locs(
-        a: &HashMap<Var, HashSet<ExprId>>,
-        b: &HashMap<Var, HashSet<ExprId>>,
-    ) -> HashMap<Var, HashSet<ExprId>> {
+    /// Pointwise join of the sites, [`Sites::join_opt`]: a name one side
+    /// binds to no site (or not at all) keeps the other's, open (#240).
+    fn join_locs(a: &Map<Var, Sites>, b: &Map<Var, Sites>) -> Map<Var, Sites> {
         let mut out = a.clone();
-        for (k, ids) in b {
-            out.entry(k.clone()).or_default().extend(ids);
+        for item in a.diff(b) {
+            let (k, joined) = match item {
+                DiffItem::Update {
+                    old: (k, x),
+                    new: (_, y),
+                } => (k, x.join(y)),
+                DiffItem::Add(k, s) | DiffItem::Remove(k, s) => (k, s.clone().opened()),
+            };
+            out.insert(k.clone(), joined);
         }
         out
     }
 
     /// Pointwise join. Variables present in only one side → `D::top()`.
     pub fn join(&self, other: &Self) -> Self {
-        let stabs = Self::join_stabs(&self.stabs, &other.stabs);
-        let locs = Self::join_locs(&self.locs, &other.locs);
-        let mut setter_bindings = self.setter_bindings.clone();
-        for (k, &v) in &other.setter_bindings {
-            setter_bindings.entry(k.clone()).or_insert(v);
-        }
-        let mut callback_bindings = self.callback_bindings.clone();
-        for (k, &v) in &other.callback_bindings {
-            callback_bindings.entry(k.clone()).or_insert(v);
-        }
         AbstractEnv {
-            stabs,
-            locs,
-            setter_bindings,
-            callback_bindings,
+            stabs: Self::join_stabs(&self.stabs, &other.stabs),
+            locs: Self::join_locs(&self.locs, &other.locs),
+            setter_bindings: union_labels(&self.setter_bindings, &other.setter_bindings),
+            callback_bindings: union_labels(&self.callback_bindings, &other.callback_bindings),
             slot_bindings: agreed_slots(&self.slot_bindings, &other.slot_bindings),
         }
     }
@@ -219,30 +392,27 @@ impl<D: AbstractDomain> AbstractEnv<D> {
     }
 
     fn widen_with(&self, other: &Self, thresholds: &[f64]) -> Self {
-        let mut stabs = HashMap::new();
+        // Every name is widened, an unchanged one too: widening is not
+        // required to be idempotent the way a join is. Only the entries it
+        // changes are written, so the rest stays shared.
+        let mut stabs = self.stabs.clone();
         for (k, v) in &self.stabs {
-            let w = map_get_or(&other.stabs, k, D::top);
-            stabs.insert(k.clone(), v.widen_to(&w, thresholds));
+            let w = other.stabs.get(k).cloned().unwrap_or_else(D::top);
+            let widened = v.widen_to(&w, thresholds);
+            if widened != *v {
+                stabs.insert(k.clone(), widened);
+            }
         }
-        for k in other.stabs.keys() {
-            if !self.stabs.contains_key(k) {
+        for item in self.stabs.diff(&other.stabs) {
+            if let DiffItem::Add(k, _) = item {
                 stabs.insert(k.clone(), D::top());
             }
         }
-        let locs = Self::join_locs(&self.locs, &other.locs);
-        let mut setter_bindings = self.setter_bindings.clone();
-        for (k, &v) in &other.setter_bindings {
-            setter_bindings.entry(k.clone()).or_insert(v);
-        }
-        let mut callback_bindings = self.callback_bindings.clone();
-        for (k, &v) in &other.callback_bindings {
-            callback_bindings.entry(k.clone()).or_insert(v);
-        }
         AbstractEnv {
             stabs,
-            locs,
-            setter_bindings,
-            callback_bindings,
+            locs: Self::join_locs(&self.locs, &other.locs),
+            setter_bindings: union_labels(&self.setter_bindings, &other.setter_bindings),
+            callback_bindings: union_labels(&self.callback_bindings, &other.callback_bindings),
             slot_bindings: agreed_slots(&self.slot_bindings, &other.slot_bindings),
         }
     }
@@ -252,30 +422,40 @@ impl<D: AbstractDomain> AbstractEnv<D> {
         Self::default()
     }
 
-    /// `self ⊑ other` in the lattice order.
+    /// `self ⊑ other` in the lattice order, over the entries that differ
+    /// (an entry is below itself).
     pub fn leq(&self, other: &Self) -> bool {
-        for (k, a) in &self.stabs {
-            let b = map_get_or(&other.stabs, k, D::bottom);
-            if !leq_pointwise(a, &b) {
+        for item in self.stabs.diff(&other.stabs) {
+            let below = match item {
+                DiffItem::Update {
+                    old: (_, a),
+                    new: (_, b),
+                } => leq_pointwise(a, b),
+                DiffItem::Remove(_, a) => leq_pointwise(a, &D::bottom()),
+                DiffItem::Add(..) => true,
+            };
+            if !below {
                 return false;
             }
         }
-        // Locs: self ⊑ other means every loc in self is also in other.
-        for (k, ids_self) in &self.locs {
-            match other.locs.get(k) {
-                Some(ids_other) => {
-                    if !ids_self.is_subset(ids_other) {
-                        return false;
-                    }
-                }
-                None => {
-                    if !ids_self.is_empty() {
-                        return false;
-                    }
-                }
+        // Locs: self ⊑ other means every loc in self is also in other, and
+        // other is open where self is — a name bound to no site is open, one
+        // not bound at all is ⊥.
+        for item in self.locs.diff(&other.locs) {
+            let below = match item {
+                DiffItem::Update {
+                    old: (_, a),
+                    new: (_, b),
+                } => Sites::leq_opt(Some(a), Some(b)),
+                DiffItem::Remove(_, a) => Sites::leq_opt(Some(a), None),
+                DiffItem::Add(k, b) => !self.stabs.contains_key(k) || Sites::leq_opt(None, Some(b)),
+            };
+            if !below {
+                return false;
             }
         }
-        true
+        labels_leq(&self.setter_bindings, &other.setter_bindings)
+            && labels_leq(&self.callback_bindings, &other.callback_bindings)
     }
 }
 
@@ -372,6 +552,20 @@ mod tests {
     }
 
     #[test]
+    fn a_join_of_two_setters_bound_to_one_name_keeps_both() {
+        let mut a = Env::new();
+        a.bind_setter("s".to_string(), 0);
+        let mut b = Env::new();
+        b.bind_setter("s".to_string(), 1);
+        let both = Labels::from([0, 1]);
+        assert_eq!(a.join(&b).setter_labels("s"), Some(&both));
+        assert_eq!(b.join(&a).setter_labels("s"), Some(&both), "commutative");
+        assert_eq!(a.widen_to(&b, &[]).setter_labels("s"), Some(&both));
+        assert_eq!(a.join(&b).setter_label("s"), None, "no one setter");
+        assert!(a.leq(&a.join(&b)) && !a.join(&b).leq(&a));
+    }
+
+    #[test]
     fn leq_self_is_true() {
         let mut env = Env::new();
         env.extend("x".to_string(), Stability::Stable);
@@ -392,50 +586,69 @@ mod tests {
         assert!(!a.leq(&Env::bottom()));
     }
 
+    fn bind(env: &mut Env, var: &str, ids: &[u64]) {
+        let sites = Sites::closed(ids.iter().map(|i| ExprId(*i)));
+        env.bind_locs(var.to_string(), Some(sites));
+    }
+
     #[test]
-    fn extend_loc_stores_location() {
+    fn bind_locs_stores_location() {
         let mut env = Env::new();
-        env.extend_loc("cb".to_string(), ExprId(1));
+        bind(&mut env, "cb", &[1]);
         match env.lookup_env_val("cb") {
-            Some(EnvVal::Loc { ids, .. }) => assert!(ids.contains(&ExprId(1))),
+            Some(EnvVal::Loc { sites, .. }) => assert_eq!(sites, Sites::closed([ExprId(1)])),
             _ => panic!("expected Loc"),
         }
     }
 
     #[test]
-    fn extend_loc_unions_multiple_ids() {
+    fn a_rebinding_replaces_the_sites() {
         let mut env = Env::new();
-        env.extend_loc("cb".to_string(), ExprId(1));
-        env.extend_loc("cb".to_string(), ExprId(2));
-        match env.lookup_env_val("cb") {
-            Some(EnvVal::Loc { ids, .. }) => {
-                assert!(ids.contains(&ExprId(1)));
-                assert!(ids.contains(&ExprId(2)));
-            }
-            _ => panic!("expected Loc"),
-        }
+        bind(&mut env, "cb", &[1]);
+        bind(&mut env, "cb", &[2]);
+        assert_eq!(
+            env.lookup_env_val("cb").unwrap().locs(),
+            Some(&HashSet::from([ExprId(2)]))
+        );
+        env.bind_locs("cb".to_string(), None);
+        assert!(env.lookup_env_val("cb").is_none(), "a value no site places");
     }
 
     #[test]
     fn join_locs_unions_sets() {
         let mut a = Env::new();
-        a.extend_loc("cb".to_string(), ExprId(1));
+        bind(&mut a, "cb", &[1]);
         let mut b = Env::new();
-        b.extend_loc("cb".to_string(), ExprId(2));
+        bind(&mut b, "cb", &[2]);
         let joined = a.join(&b);
         match joined.lookup_env_val("cb") {
-            Some(EnvVal::Loc { ids, .. }) => {
-                assert!(ids.contains(&ExprId(1)));
-                assert!(ids.contains(&ExprId(2)));
+            Some(EnvVal::Loc { sites, .. }) => {
+                assert_eq!(sites, Sites::closed([ExprId(1), ExprId(2)]));
             }
             _ => panic!("expected Loc after join"),
+        }
+    }
+
+    /// #240: a name one path binds to no site keeps the other path's sites,
+    /// open: they are what it may be, not all it may be.
+    #[test]
+    fn a_join_with_a_value_no_site_places_is_open() {
+        let mut a = Env::new();
+        bind(&mut a, "t", &[1]);
+        let mut b = Env::new();
+        b.extend("t".to_string(), Stability::Unknown);
+        for joined in [a.join(&b), b.join(&a)] {
+            let sites = joined.lookup_env_val("t").unwrap().sites().cloned();
+            assert_eq!(sites, Some(Sites::closed([ExprId(1)]).opened()));
+            assert!(a.leq(&joined) && b.leq(&joined));
+            assert!(!joined.leq(&a), "open is above closed");
         }
     }
 
     #[test]
     fn loc_lookup_returns_top_val() {
         let mut env = Env::new();
-        env.extend_loc("cb".to_string(), ExprId(1));
+        bind(&mut env, "cb", &[1]);
         assert_eq!(env.lookup("cb"), Stability::Unknown); // top
     }
 }

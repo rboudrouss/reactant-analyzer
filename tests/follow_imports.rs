@@ -38,16 +38,18 @@ export function Panel() {
 }
 "#;
 
-/// A component defined in the imported file, holding a finding of its own.
+/// A component defined in the imported file, holding a finding of its own —
+/// of a rule `Panel` cannot trigger (`Panel` itself loops: its effect re-runs
+/// on the fresh `bag` and bumps the hook's slot every time).
 const HOOK_WITH_COMPONENT: &str = r#"
-import { useState, useEffect } from "react";
+import { useState } from "react";
 export function useThing() {
   const [n, setN] = useState(0);
   return { n, setN, bag: { n } };
 }
 export function Widget() {
   const [m, setM] = useState(0);
-  useEffect(() => { setM(m + 1); });
+  setM(m + 1);
   return <div>{m}</div>;
 }
 "#;
@@ -206,7 +208,7 @@ fn findings_in_followed_files_are_counted_not_shown() {
         .write("src/features/Panel.tsx", CALLER);
     let r = run(&[&tmp.path().join("src/features")], &["--follow-imports"]);
     assert!(
-        !r.rules().contains(&"infinite-loop".into()),
+        !r.rules().contains(&"setter-in-render".into()),
         "Widget's finding leaked into the report: {:?}",
         r.rules()
     );
@@ -236,7 +238,7 @@ fn naming_the_path_reports_the_withheld_finding() {
         &[],
     );
     assert!(
-        r.rules().contains(&"infinite-loop".into()),
+        r.rules().contains(&"setter-in-render".into()),
         "{:?}",
         r.rules()
     );

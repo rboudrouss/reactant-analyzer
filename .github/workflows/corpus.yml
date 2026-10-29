@@ -70,8 +70,23 @@ jobs:
       # fails. Whether the *number* is acceptable is the next step's job.
       # Every rule is on, the off-by-default ones included: the corpus measures
       # the engine, and those rules exercise it as much as any other.
+      # One process per repo: each repo is its own project (its own aliases
+      # and import scopes), and the whole tree in one process does not fit
+      # the runner's memory once those imports resolve.
       - name: Run the analyzer over the corpus
-        run: ./target/release/reactant --format json --fail-on never --config tests/fixtures/all-rules.json test-repo > corpus-run.json
+        run: |
+          mkdir -p corpus-runs
+          failed=0
+          for repo in test-repo/*/; do
+            name=$(basename "$repo")
+            if /usr/bin/time -f "$name: %e s, %M KB peak" ./target/release/reactant --format json --fail-on never --config tests/fixtures/all-rules.json "$repo" > "corpus-runs/$name.json"; then
+              :
+            else
+              echo "$name: FAILED (exit $?)"; rm -f "corpus-runs/$name.json"; failed=1
+            fi
+          done
+          ./scripts/corpus-merge.py corpus-run.json corpus-runs/*.json
+          exit $failed
 
       - name: Compare against the committed baseline
         run: ./scripts/corpus-baseline.py corpus-run.json
@@ -84,5 +99,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: corpus-run
-          path: corpus-run.json
+          path: |
+            corpus-run.json
+            corpus-runs/
           retention-days: 30

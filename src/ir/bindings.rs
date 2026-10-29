@@ -24,7 +24,7 @@ use crate::ir::{
     cfg::CFG,
     expr::{Expr, object_member},
     stmt::Stmt,
-    types::{HookLabel, Var},
+    types::{BlockId, HookLabel, Var},
 };
 
 /// Every `let`/assignment right-hand side in `cfg`, by name — the bindings a
@@ -109,9 +109,16 @@ pub fn fn_binding_in<'c>(var: &str, cfg: &'c CFG) -> Option<(&'c [Var], &'c CFG)
 /// right-hand side, and bounded because a certain binding chain is finite
 /// anyway.
 pub fn binding_of<'c>(var: &str, cfg: &'c CFG) -> Option<&'c Expr> {
+    binding_site_of(var, cfg).map(|(_, rhs)| rhs)
+}
+
+/// [`binding_of`], with the block of `cfg` the value is bound in — where the
+/// chase ended, not where `var` itself is bound. A closure is authored where
+/// its literal sits, whatever names it is later read through.
+pub fn binding_site_of<'c>(var: &str, cfg: &'c CFG) -> Option<(BlockId, &'c Expr)> {
     let mut cur = sole_binding_in(var, cfg)?;
     for _ in 0..MAX_ALIAS_HOPS {
-        let Expr::Var(next) = cur else { break };
+        let Expr::Var(next) = cur.1 else { break };
         let Some(deeper) = sole_binding_in(next, cfg) else {
             break;
         };
@@ -120,18 +127,229 @@ pub fn binding_of<'c>(var: &str, cfg: &'c CFG) -> Option<&'c Expr> {
     Some(cur)
 }
 
+/// The state slot `expr` reads on every path: `StateVal(l)` itself, or a name
+/// whose sole binding in `scope`, through renames that are sole bindings too,
+/// is `StateVal(l)`. A must-alias, where `resolve_setter_aliases` keeps every
+/// name *some* binding ties to a slot (#210). `elsewhere` lists every other
+/// body a read of the name may sit in or be reached from, each with its
+/// parameters (nested ones included: see [`nested_bodies`]): a binder of a
+/// chain name in one of them (a reassignment, a same-named local or
+/// parameter) refuses the certificate, since the name a read there sees may
+/// be another value.
+pub fn must_slot_read(expr: &Expr, scope: &CFG, elsewhere: &[(&[Var], &CFG)]) -> Option<HookLabel> {
+    match must_binding(expr, scope, elsewhere)? {
+        Expr::StateVal(l) => Some(*l),
+        _ => None,
+    }
+}
+
+/// The parameter of `params` that `expr` denotes on every path: itself, or
+/// a name whose chain of sole bindings in `scope` ends at it — the `deps` of
+/// a `deps = []` parameter, which lowers to `let deps = __p1` (#230). No
+/// body binds a chain name again: not `scope` (the parameter itself
+/// included), not `elsewhere`, under the certificate [`must_slot_read`]
+/// states.
+pub fn must_param(
+    expr: &Expr,
+    scope: &CFG,
+    elsewhere: &[(&[Var], &CFG)],
+    params: &[Var],
+) -> Option<usize> {
+    let mut cur = expr.peel_ts();
+    for _ in 0..MAX_ALIAS_HOPS + 2 {
+        let Expr::Var(v) = cur else {
+            return None;
+        };
+        if elsewhere
+            .iter()
+            .any(|(ps, body)| ps.contains(v) || binds(v, body))
+        {
+            return None;
+        }
+        if let Some(i) = params.iter().position(|p| p == v) {
+            return (!binds(v, scope)).then_some(i);
+        }
+        cur = sole_binding_in(v, scope)?.1;
+    }
+    None
+}
+
+/// [`must_slot_read`] through member reads: the slot `expr` reads on every
+/// path and the fields it reads off it — `s.n`, or the `n` of a `const { n }
+/// = s` (#244). An empty path is the slot itself.
+pub fn must_slot_path(
+    expr: &Expr,
+    scope: &CFG,
+    elsewhere: &[(&[Var], &CFG)],
+) -> Option<(HookLabel, Vec<String>)> {
+    fn go(
+        expr: &Expr,
+        scope: &CFG,
+        elsewhere: &[(&[Var], &CFG)],
+        depth: usize,
+    ) -> Option<(HookLabel, Vec<String>)> {
+        match must_binding(expr, scope, elsewhere)? {
+            Expr::StateVal(l) => Some((*l, Vec::new())),
+            Expr::FieldAccess { obj, field } if depth > 0 => {
+                let (l, mut path) = go(obj, scope, elsewhere, depth - 1)?;
+                path.push(field.clone());
+                Some((l, path))
+            }
+            _ => None,
+        }
+    }
+    go(expr, scope, elsewhere, MAX_ALIAS_HOPS)
+}
+
+/// The value `expr` denotes on every path: itself when it is no name, or
+/// the end of the chain of sole bindings in `scope` a name starts, under the
+/// certificate [`must_slot_read`] states — no binder of a chain name in any
+/// body of `elsewhere`. What a name is *certainly* bound to, whatever it is
+/// (a slot's read, a setter: #235).
+pub fn must_binding<'e>(
+    expr: &'e Expr,
+    scope: &'e CFG,
+    elsewhere: &[(&[Var], &CFG)],
+) -> Option<&'e Expr> {
+    let mut cur = expr.peel_ts();
+    // The name's own binding, then the hops `binding_of` follows.
+    for _ in 0..MAX_ALIAS_HOPS + 2 {
+        match cur {
+            Expr::Var(v) => {
+                if elsewhere
+                    .iter()
+                    .any(|(params, body)| params.contains(v) || binds(v, body))
+                {
+                    return None;
+                }
+                cur = sole_binding_in(v, scope)?.1;
+            }
+            other => return Some(other),
+        }
+    }
+    None
+}
+
+/// [`must_binding`] through members: `api.inc` is the member `inc` of the
+/// object literal `api` is certainly bound to (the readable one, after every
+/// spread), `t[1]` the element of an exact array literal — when nothing can
+/// have replaced it since: no body, `scope` or `elsewhere`, uses the root
+/// other than to read a member (no member write rooted at it, no mutating
+/// method, no alias, no argument).
+pub fn must_member_binding<'e>(
+    expr: &'e Expr,
+    scope: &'e CFG,
+    elsewhere: &[(&[Var], &CFG)],
+) -> Option<&'e Expr> {
+    let (obj, key) = match expr.peel_ts() {
+        Expr::FieldAccess { obj, field } => (obj, field.clone()),
+        Expr::IndexAccess { arr, idx } => match idx.peel_ts() {
+            Expr::Lit(crate::ir::Prim::Int(i)) if *i >= 0 => (arr, i.to_string()),
+            _ => return None,
+        },
+        _ => return must_binding(expr, scope, elsewhere),
+    };
+    let root = root_var(obj)?;
+    if std::iter::once(scope)
+        .chain(elsewhere.iter().map(|(_, body)| *body))
+        .any(|body| used_whole(root, body))
+    {
+        return None;
+    }
+    let member = match must_member_binding(obj, scope, elsewhere)? {
+        Expr::ObjectLit { fields, .. } => object_member(fields, &key)?,
+        Expr::ArrayLit {
+            elems,
+            arity,
+            spread_at,
+            ..
+        } if spread_at.is_empty() && arity.exact() == Some(elems.len()) => {
+            elems.get(key.parse::<usize>().ok()?)?
+        }
+        _ => return None,
+    };
+    must_member_binding(member, scope, elsewhere)
+}
+
+/// The variable a member chain is rooted at: `api` for `api.a[0]`.
+fn root_var(expr: &Expr) -> Option<&Var> {
+    match expr.peel_ts() {
+        Expr::Var(v) => Some(v),
+        Expr::FieldAccess { obj, .. } => root_var(obj),
+        Expr::IndexAccess { arr, .. } => root_var(arr),
+        _ => None,
+    }
+}
+
+/// Does `cfg`, closures included, use `root` otherwise than as the receiver
+/// of a member read — the uses through which a member may be replaced?
+fn used_whole(root: &str, cfg: &CFG) -> bool {
+    fn expr(root: &str, e: &Expr) -> bool {
+        if crate::ir::expr::mutation_receiver(e)
+            .and_then(root_var)
+            .is_some_and(|r| r == root)
+        {
+            return true;
+        }
+        match e.peel_ts() {
+            Expr::Var(v) => v == root,
+            Expr::FieldAccess { obj, .. } if matches!(obj.peel_ts(), Expr::Var(v) if v == root) => {
+                false
+            }
+            Expr::IndexAccess { arr, idx } if matches!(arr.peel_ts(), Expr::Var(v) if v == root) => {
+                expr(root, idx)
+            }
+            Expr::FnLit {
+                params, body_cfg, ..
+            } => !params.iter().any(|p| p == root) && used_whole(root, body_cfg),
+            other => {
+                let mut found = false;
+                other.for_each_child(&mut |c| found = found || expr(root, c));
+                found
+            }
+        }
+    }
+    cfg.blocks.values().any(|block| {
+        let written = block.stmts.iter().any(|s| {
+            matches!(s, Stmt::MemberWrite { obj, .. } if root_var(obj).is_some_and(|r| r == root))
+        });
+        let mut found = written;
+        block.for_each_expr(&mut |e| found = found || expr(root, e));
+        found
+    })
+}
+
+/// Every function body nested under `cfg`, at any depth, with its parameters.
+pub fn nested_bodies(cfg: &CFG) -> Vec<(&[Var], &CFG)> {
+    fn walk<'c>(e: &'c Expr, out: &mut Vec<(&'c [Var], &'c CFG)>) {
+        if let Expr::FnLit {
+            params, body_cfg, ..
+        } = e
+        {
+            out.push((params, body_cfg));
+            body_cfg.for_each_expr(&mut |c| walk(c, out));
+            return;
+        }
+        e.for_each_child(&mut |c| walk(c, out));
+    }
+    let mut out = Vec::new();
+    cfg.for_each_expr(&mut |e| walk(e, &mut out));
+    out
+}
+
 /// Alias hops a chase will follow. A real chain is one or two (`{ bump }`, a
 /// destructuring preamble); the bound only stops a cycle, and stopping leaves
 /// the name itself — which no caller mistakes for a value.
-const MAX_ALIAS_HOPS: usize = 8;
+pub const MAX_ALIAS_HOPS: usize = 8;
 
-/// The single right-hand side `var` is bound to in `cfg`, `None` when it is
-/// bound zero times or more than once. Conditional or repeated re-binding is
-/// not "some value we haven't found" — it is a name whose captured environment
-/// is no longer syntactically certain, so the readers above fail closed.
-fn sole_binding_in<'c>(var: &str, cfg: &'c CFG) -> Option<&'c Expr> {
-    let mut found: Option<&Expr> = None;
-    for block in cfg.blocks.values() {
+/// The single right-hand side `var` is bound to in `cfg`, and its block;
+/// `None` when it is bound zero times or more than once. Conditional or
+/// repeated re-binding is not "some value we haven't found" — it is a name
+/// whose captured environment is no longer syntactically certain, so the
+/// readers above fail closed.
+fn sole_binding_in<'c>(var: &str, cfg: &'c CFG) -> Option<(BlockId, &'c Expr)> {
+    let mut found: Option<(BlockId, &Expr)> = None;
+    for (&bid, block) in &cfg.blocks {
         for stmt in &block.stmts {
             let (Stmt::Let { var: v, rhs, .. } | Stmt::Assign { var: v, rhs, .. }) = stmt else {
                 continue;
@@ -142,7 +360,7 @@ fn sole_binding_in<'c>(var: &str, cfg: &'c CFG) -> Option<&'c Expr> {
             if found.is_some() {
                 return None;
             }
-            found = Some(rhs.peel_ts());
+            found = Some((bid, rhs.peel_ts()));
         }
     }
     found

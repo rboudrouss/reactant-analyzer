@@ -23,6 +23,7 @@ pub fn compute_dominators(cfg: &CFG) -> HashMap<BlockId, HashSet<BlockId>> {
     }
 
     let rpo = cfg.rpo();
+    let pred_map = cfg.predecessor_map();
 
     let mut changed = true;
     while changed {
@@ -31,7 +32,7 @@ pub fn compute_dominators(cfg: &CFG) -> HashMap<BlockId, HashSet<BlockId>> {
             if b == cfg.entry {
                 continue;
             }
-            let preds = cfg.predecessors(b);
+            let preds = pred_map.get(&b).map(Vec::as_slice).unwrap_or(&[]);
             if preds.is_empty() {
                 continue;
             }
@@ -77,15 +78,16 @@ pub fn on_all_paths(cfg: &CFG, blocks: &HashSet<BlockId>) -> bool {
         return true;
     }
     // BFS avoiding `blocks`; reaching an exit block means a path escapes.
+    let succ_map = cfg.successor_map();
     let mut visited: HashSet<BlockId> = HashSet::new();
     let mut queue = vec![cfg.entry];
     visited.insert(cfg.entry);
     while let Some(bid) = queue.pop() {
-        let succs = cfg.successors(bid);
+        let succs = succ_map.get(&bid).map(Vec::as_slice).unwrap_or(&[]);
         if succs.is_empty() {
             return false; // exit reached without hitting a block of the set
         }
-        for succ in succs {
+        for &succ in succs {
             if !blocks.contains(&succ) && visited.insert(succ) {
                 queue.push(succ);
             }
@@ -111,7 +113,7 @@ pub(crate) fn controlling_branches(cfg: &CFG) -> HashMap<BlockId, Vec<BlockId>> 
 /// an early `return`) controls everything after it but selects nothing: no
 /// render compares the continuation's values with the exiting arm's.
 pub(crate) fn selecting_branches(cfg: &CFG) -> HashMap<BlockId, Vec<BlockId>> {
-    branches_over(cfg, |cfg, rt, re| {
+    branches_over(cfg, |adj, rt, re| {
         let merge: HashSet<BlockId> = rt.intersection(re).copied().collect();
         if merge.is_empty() {
             return HashSet::new();
@@ -120,7 +122,7 @@ pub(crate) fn selecting_branches(cfg: &CFG) -> HashMap<BlockId, Vec<BlockId>> {
         let mut reaches_merge: HashSet<BlockId> = merge.clone();
         let mut stack: Vec<BlockId> = merge.iter().copied().collect();
         while let Some(b) = stack.pop() {
-            for p in cfg.predecessors(b) {
+            for &p in adj.pred.get(&b).into_iter().flatten() {
                 if reaches_merge.insert(p) {
                     stack.push(p);
                 }
@@ -161,12 +163,18 @@ pub(crate) fn returning_branches(cfg: &CFG) -> HashMap<BlockId, Vec<BlockId>> {
     })
 }
 
+/// A CFG's edges indexed both ways, built once per relation.
+struct Adjacency {
+    succ: HashMap<BlockId, Vec<BlockId>>,
+    pred: HashMap<BlockId, Vec<BlockId>>,
+}
+
 /// For each branch, the blocks `pick` chooses from the blocks its two sides
 /// reach (`rt` from the `then` side, `re` from the `else` side), inverted
 /// into "block → branches".
 fn branches_over(
     cfg: &CFG,
-    pick: impl Fn(&CFG, &HashSet<BlockId>, &HashSet<BlockId>) -> HashSet<BlockId>,
+    pick: impl Fn(&Adjacency, &HashSet<BlockId>, &HashSet<BlockId>) -> HashSet<BlockId>,
 ) -> HashMap<BlockId, Vec<BlockId>> {
     let branches: Vec<(BlockId, BlockId, BlockId)> = cfg
         .blocks
@@ -180,12 +188,16 @@ fn branches_over(
     if branches.is_empty() {
         return out;
     }
+    let adj = Adjacency {
+        succ: cfg.successor_map(),
+        pred: cfg.predecessor_map(),
+    };
     // Forward reachability from each branch side, once per side.
     let reach = |from: BlockId| -> HashSet<BlockId> {
         let mut seen = HashSet::from([from]);
         let mut stack = vec![from];
         while let Some(b) = stack.pop() {
-            for s in cfg.successors(b) {
+            for &s in adj.succ.get(&b).into_iter().flatten() {
                 if seen.insert(s) {
                     stack.push(s);
                 }
@@ -196,7 +208,7 @@ fn branches_over(
     for (br, t, e) in branches {
         let rt = reach(t);
         let re = reach(e);
-        for b in pick(cfg, &rt, &re) {
+        for b in pick(&adj, &rt, &re) {
             out.entry(b).or_default().push(br);
         }
     }

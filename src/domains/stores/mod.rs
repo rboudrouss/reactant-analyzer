@@ -4,8 +4,8 @@ pub mod memo_store;
 pub mod shared_state_store;
 pub mod state_store;
 
-pub use abstract_env::{AbstractEnv, EnvVal};
-pub use heap::{Heap, HeapValue, resolve_locs};
+pub use abstract_env::{AbstractEnv, EnvVal, Sites};
+pub use heap::{Heap, HeapValue, Members, member_key, resolve_locs};
 pub use memo_store::MemoStore;
 pub use shared_state_store::SharedStateStore;
 pub use state_store::StateStore;

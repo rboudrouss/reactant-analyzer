@@ -161,6 +161,31 @@ fn an_unrelated_effect_does_not_silence_a_stale_capture() {
     );
 }
 
+/// An array literal is a heap object of its elements (#216), so `t[0]` reads
+/// `0` — until a call that moves elements in place (`t.unshift(1)`) or a
+/// write under an index that may be any (`t[k] = 1`): the member may then be
+/// `1`, and `setN(t[0])` is not a write of what `n` holds.
+#[test]
+fn an_array_mutated_in_place_does_not_keep_its_members() {
+    for mutation in ["t.unshift(1);", "t[k] = 1;"] {
+        let fired = diagnostics(&format!(
+            r#"
+            function C({{ k }}) {{
+              const [n, setN] = useState(0);
+              const t = [0];
+              {mutation}
+              useEffect(() => {{ setN(t[0]); }}, []);
+              return <div>{{n}}</div>;
+            }}
+            "#
+        ));
+        assert!(
+            !fired.iter().any(|r| r == "redundant-set-state"),
+            "`t[0]` may be `1` after `{mutation}`: {fired:?}"
+        );
+    }
+}
+
 // ── The splice half ───────────────────────────────────────────────────────────
 
 /// A custom hook is lowered on its own counter, so its allocation sites start

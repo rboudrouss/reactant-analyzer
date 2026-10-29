@@ -3,9 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::resolver::{
-    DefaultImportResolver, FileSystem, ImportResolver, SOURCE_EXTENSIONS, normalize,
-};
+use crate::resolver::{DefaultImportResolver, FileSystem, ImportResolver, probe_module};
 
 use super::tsconfig::TsconfigPaths;
 
@@ -52,26 +50,9 @@ impl TsconfigPathsResolver {
         }
     }
 
-    /// Probe a substituted target path for an existing source file:
-    /// `<base>/<target>` as-is, then `.<ext>`, then `/index.<ext>`.
+    /// The source file a substituted target names under `baseUrl`.
     fn probe(&self, target: &str) -> Option<PathBuf> {
-        let base = normalize(&self.base_url.join(target));
-        if self.fs.is_file(&base) {
-            return Some(base);
-        }
-        for ext in SOURCE_EXTENSIONS {
-            let candidate = base.with_extension(ext);
-            if self.fs.is_file(&candidate) {
-                return Some(candidate);
-            }
-        }
-        for ext in SOURCE_EXTENSIONS {
-            let candidate = base.join(format!("index.{ext}"));
-            if self.fs.is_file(&candidate) {
-                return Some(candidate);
-            }
-        }
-        None
+        probe_module(self.fs.as_ref(), &self.base_url.join(target))
     }
 }
 
@@ -224,6 +205,18 @@ mod tests {
         let r = resolver(&tmp, vec![("config", vec!["./src/config"])]);
         assert_eq!(r.resolve(&from, "config"), Some(cfg));
         assert_eq!(r.resolve(&from, "config/extra"), None);
+    }
+
+    /// The alias probe keeps a dotted name whole, like the relative one.
+    #[test]
+    fn a_dotted_alias_target_is_not_its_stem() {
+        let tmp = Tmp::new("dotted");
+        tmp.write("src/Modal.tsx", "");
+        let from = tmp.write("src/App.tsx", "");
+        let r = resolver(&tmp, vec![("@/*", vec!["./src/*"])]);
+        assert_eq!(r.resolve(&from, "@/Modal.context"), None);
+        let context = tmp.write("src/Modal.context.ts", "");
+        assert_eq!(r.resolve(&from, "@/Modal.context"), Some(context));
     }
 
     #[test]
