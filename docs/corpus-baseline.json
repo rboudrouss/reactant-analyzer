@@ -1,16 +1,16 @@
 {
   "total": 2273,
-  "digest": "1610abc46f47d3d316b37ed14ddfeb5a02cae73562997f66a854507e2c35193f",
+  "digest": "b33b3480babd48b6f82abd3f62fb80acb3fa62dd5e7ec2f853043cb8b71ddc3d",
   "by_rule": {
     "always-unstable-deps": 601,
     "conditional-hook": 10,
     "cross-component-infinite-loop": 39,
     "cross-setter-in-render": 14,
     "frozen-initial-state": 70,
-    "infinite-loop": 177,
+    "infinite-loop": 175,
     "lazy-init": 223,
     "missing-cleanup": 3,
-    "missing-deps": 463,
+    "missing-deps": 465,
     "redundant-set-state": 6,
     "setter-in-render": 30,
     "stale-closure": 1,
@@ -23,7 +23,7 @@
   "by_repo": {
     "ai-chatbot": 16,
     "bulletproof-react": 3,
-    "chakra-ui": 31,
+    "chakra-ui": 30,
     "commerce": 5,
     "dub": 683,
     "excalidraw": 39,
@@ -33,7 +33,7 @@
     "novel": 6,
     "precedent": 1,
     "shadcn-admin": 20,
-    "twenty": 920,
+    "twenty": 921,
     "zustand": 4
   },
   "corpus": "00e5fa79fa000c85"
