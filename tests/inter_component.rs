@@ -402,7 +402,12 @@ fn field_access_resolves_abstract_object_in_heap() {
         "onClick".to_string(),
         EnvVal::Val(StateValue::component_setter(parent, 0)),
     );
-    heap.insert(ExprId(1), reactant::domains::stores::HeapValue::Obj(fields));
+    heap.insert(
+        ExprId(1),
+        reactant::domains::stores::HeapValue::Obj(reactant::domains::stores::Members::exactly(
+            fields,
+        )),
+    );
 
     // Build env: props → loc ExprId(1)
     let mut env = AbstractEnv::bottom();
@@ -437,7 +442,12 @@ fn field_access_unknown_field_returns_top() {
         "onClick".to_string(),
         EnvVal::Val(StateValue::reference(Stability::Stable)),
     );
-    heap.insert(ExprId(1), reactant::domains::stores::HeapValue::Obj(fields));
+    heap.insert(
+        ExprId(1),
+        reactant::domains::stores::HeapValue::Obj(reactant::domains::stores::Members::exactly(
+            fields,
+        )),
+    );
 
     let mut env = AbstractEnv::bottom();
     env.bind_locs("props".to_string(), Some(Sites::closed([ExprId(1)])));

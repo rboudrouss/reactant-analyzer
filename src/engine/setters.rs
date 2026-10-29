@@ -498,8 +498,17 @@ impl<'a> ConvergedFns<'a> {
         }
     }
 
+    /// The closures a call through `path` may run: those at the path, or,
+    /// when its object names no such member, those its members no constant
+    /// names may hold (#76).
     fn bodies(&self, path: &str) -> Option<&[Arc<CFG>]> {
-        self.fns.get(path).map(Vec::as_slice)
+        let any = path
+            .rsplit_once('.')
+            .map(|(obj, _)| format!("{obj}.{ANY_MEMBER}"));
+        self.fns
+            .get(path)
+            .or_else(|| self.fns.get(any.as_deref()?))
+            .map(Vec::as_slice)
     }
 
     /// A call of `fn_` surely runs `body`: the table has no other closure
@@ -557,6 +566,11 @@ fn add_converged_fns(
         }
     });
 }
+
+/// The last segment of the member path that stands for every member an
+/// object holds under no constant name (`api.*`). No identifier is `*`, so
+/// no callee path ends with it.
+const ANY_MEMBER: &str = "*";
 
 /// The variable a member path is rooted at: `api` for `api.inc`.
 fn path_root(path: &str) -> &str {
@@ -617,7 +631,7 @@ fn for_each_converged_path(
                     .ids
                     .iter()
                     .filter_map(|id| match heap.get(*id) {
-                        Some(HeapValue::Obj(fields)) => Some(fields.keys()),
+                        Some(HeapValue::Obj(obj)) => Some(obj.named.keys()),
                         _ => None,
                     })
                     .flatten()
@@ -629,6 +643,17 @@ fn for_each_converged_path(
                         stack.push((path.clone(), EnvVal::Val(StateValue::top())));
                     }
                     stack.extend(entries.into_iter().rev().map(|e| (path.clone(), e.clone())));
+                }
+                // What a member no constant names may hold, under the path
+                // a call through any other member falls back to (#76).
+                let mut ids: Vec<_> = fresh.ids.iter().copied().collect();
+                ids.sort();
+                for id in ids {
+                    if let Some(HeapValue::Obj(obj)) = heap.get(id)
+                        && let Some(others) = &obj.others
+                    {
+                        stack.push((format!("{name}.{ANY_MEMBER}"), others.clone()));
+                    }
                 }
             }
         }

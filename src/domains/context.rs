@@ -3,13 +3,15 @@ use std::cell::RefCell;
 use crate::{
     domains::{
         AbstractDomain, StateValue,
-        stores::{AbstractEnv, EnvVal, Heap, HeapValue, MemoStore, SharedStateStore, StateStore},
+        stores::{
+            AbstractEnv, EnvVal, Heap, HeapValue, Members, MemoStore, SharedStateStore, StateStore,
+        },
     },
     engine::{
         AnalysisResult, AnalysisStats, ComponentCache, ComponentCallGraph, ComponentRegistry,
         HookRegistry, ProgramReducers, Reducer, Reducers, fixpoint::Config,
     },
-    ir::{ComponentId, component::ComponentIR},
+    ir::{ComponentId, component::ComponentIR, expr::is_synthetic_key},
 };
 
 // ── AnalyzeChildFn ─────────────────────────────────────────────────────────────
@@ -144,7 +146,14 @@ impl<'a> InterCtx<'a> {
     pub fn analyze_under(&self, ir: &ComponentIR, input: ChildInput) -> AnalysisResult<StateValue> {
         let mut env = AbstractEnv::bottom();
         let mut heap = input.heap;
-        heap.insert(input.props_id, HeapValue::Obj(input.props));
+        // A spread prop (`{...rest}`, kept under its synthetic key) may pass
+        // any member.
+        let spread = input.props.keys().any(|k| is_synthetic_key(k));
+        let props = match spread {
+            true => Members::at_least(input.props),
+            false => Members::exactly(input.props),
+        };
+        heap.insert(input.props_id, HeapValue::Obj(props));
         env.bind_locs(
             ir.param.clone(),
             Some(crate::domains::stores::Sites::closed([input.props_id])),

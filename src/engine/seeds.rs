@@ -491,6 +491,33 @@ mod chase_tests {
     }
 
     #[test]
+    fn a_member_a_computed_key_may_have_overwritten_is_not_resolved() {
+        // `{ seed, [k]: other }`: `k` may be `"seed"` (#76).
+        let cfg = single_block_cfg(vec![
+            let_("__obj", Expr::Var("__p0".to_string())),
+            let_("seed", field("__obj", "seed")),
+            let_(
+                "opts",
+                Expr::ObjectLit {
+                    id: ExprId(0),
+                    fields: vec![
+                        ("seed".to_string(), Expr::Var("seed".to_string())),
+                        (
+                            format!("{}0", crate::ir::expr::COMPUTED_KEY_PREFIX),
+                            Expr::Var("other".to_string()),
+                        ),
+                    ],
+                },
+            ),
+        ]);
+        let got = chase(&cfg, path("opts", &["seed"]));
+        assert!(
+            got.iter().all(|(_, exact)| !exact),
+            "a member behind a computed key cannot be claimed exact: {got:?}"
+        );
+    }
+
+    #[test]
     fn sibling_branches_of_a_widened_chase_all_survive() {
         // Half 2. `const key = seed + other` cannot be selected through, so the
         // chase widens to both reads. Both go through the SAME `__obj` root:

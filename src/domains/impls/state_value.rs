@@ -483,6 +483,27 @@ impl StateValue {
         self.num.is_one_value() && self.num.lo.is_finite()
     }
 
+    /// The one member the value names used as a key (`o[k]`, `{ [k]: v }`):
+    /// a single string constant, or a single non-negative integer, which
+    /// names the member its decimal spelling does (#76). `None` when it may
+    /// name several, or a member no constant spells.
+    pub fn as_member_key(&self) -> Option<String> {
+        if self.is_bottom_value() || !self.is_single_value() {
+            return None;
+        }
+        match &self.str {
+            StrConst::Set(s) => s.iter().next().cloned(),
+            _ if self.num_is_one_value()
+                && self.num.lo >= 0.0
+                && self.num.lo.fract() == 0.0
+                && self.num.lo <= f64::from(u32::MAX) =>
+            {
+                Some(format!("{}", self.num.lo as u64))
+            }
+            _ => None,
+        }
+    }
+
     /// True if `self` and `other` are provably the same concrete value,
     /// `Object.is`-equal: one and the same single value. A reference never
     /// qualifies — stability says a reference does not change, not which one

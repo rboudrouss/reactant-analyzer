@@ -14,7 +14,7 @@ use crate::{
         types::{BlockId, ExprId},
     },
     lowering::JsxOrigins,
-    lowering::expr_lower::{assign_target_ident, empty_cfg, lower_expr},
+    lowering::expr_lower::{assign_target_ident, empty_cfg, lower_expr, property_name},
 };
 
 // ── Allocation-site ids ───────────────────────────────────────────────────────
@@ -918,27 +918,19 @@ fn lower_binding_pattern(
                 span,
             });
             for prop in &obj.properties {
-                let field = match &prop.key {
-                    PropertyKey::StaticIdentifier(k) => Some(k.name.to_string()),
-                    PropertyKey::StringLiteral(s) => Some(s.value.to_string()),
-                    // `const { [k]: v } = o`: the key expression runs and `v`
-                    // is bound — to an unknown value, not to nothing. Skipping
-                    // the property took the read of `k` with it.
-                    other => {
-                        if let Some(e) = other.as_expression() {
-                            let key_span = builder.span_at(e.span().start).or(span);
-                            let key = lower_expr(e, builder);
-                            builder.push_stmt(Stmt::ExprStmt(key, key_span));
-                        }
-                        None
-                    }
-                };
-                let field_rhs = match field {
-                    Some(field) => Expr::FieldAccess {
-                        obj: Box::new(Expr::Var(temp.clone())),
-                        field,
+                let obj = Box::new(Expr::Var(temp.clone()));
+                let field_rhs = match property_name(&prop.key) {
+                    Some(field) => Expr::FieldAccess { obj, field },
+                    // `const { [k]: v } = o` binds `v` to `o[k]`: the key
+                    // expression runs, and the member it names is read
+                    // when its value names one (#76).
+                    None => match prop.key.as_expression() {
+                        Some(e) => Expr::IndexAccess {
+                            arr: obj,
+                            idx: Box::new(lower_expr(e, builder)),
+                        },
+                        None => Expr::SummaryVal(crate::ir::expr::SummaryValue::Top),
                     },
-                    None => Expr::SummaryVal(crate::ir::expr::SummaryValue::Top),
                 };
                 let prop_span = builder.span_at(prop.span.start).or(span);
                 lower_binding_pattern(&prop.value, field_rhs, prop_span, builder);
@@ -953,13 +945,12 @@ fn lower_binding_pattern(
                 lower_binding_pattern(&rest.argument, Expr::Var(temp.clone()), rest_span, builder);
             }
         }
+        // `{ cb = () => setX(1) }`: the default runs when the source is
+        // `undefined`, so its reads and writes stay visible; the binding
+        // keeps the source (#256).
         BindingPattern::AssignmentPattern(ap) => {
-            // The default value is not modeled (the binding keeps `rhs`), but
-            // it *is* evaluated when the source is undefined — emit it so its
-            // reads and side effects survive (`{ cb = () => setX(1) }`).
             let default_span = builder.span_at(ap.right.span().start).or(span);
-            let default = lower_expr(&ap.right, builder);
-            builder.push_stmt(Stmt::ExprStmt(default, default_span));
+            lower_default(&rhs, &ap.right, builder);
             lower_binding_pattern(&ap.left, rhs, span.or(default_span), builder);
         }
     }
@@ -979,7 +970,7 @@ pub(super) fn inject_param_preamble(
         };
         names.push(name.clone());
         if let Some(init) = p.initializer.as_deref() {
-            lower_param_default(&name, init, builder);
+            lower_default(&Expr::Var(name.clone()), init, builder);
         }
         if !matches!(p.pattern, BindingPattern::BindingIdentifier(_)) {
             lower_binding_pattern(&p.pattern, Expr::Var(name), None, builder);
@@ -988,19 +979,25 @@ pub(super) fn inject_param_preamble(
     names
 }
 
-/// `name = init` evaluates `init` when the argument is `undefined`: lowered
-/// under that test, so its reads and its writes stay in the body — a setter
-/// call, a reassignment of an earlier parameter. Dropping it was a write the
-/// body makes and no walk saw. As for a destructuring default, the value is
-/// not modeled: the name keeps the argument.
-fn lower_param_default(name: &str, init: &Expression, builder: &mut BlockBuilder) {
+/// `source = init` evaluates `init` when `source` is `undefined`: lowered
+/// under that test, so its reads and its writes stay where they run — a
+/// setter call, a reassignment of an earlier parameter. One lowering for a
+/// parameter's default (#251) and a destructuring default (`const { f = g }
+/// = o`, #76), `source` then the member the pattern reads (a name, or a
+/// member or index of a destructuring temp: no call, read twice for free).
+///
+/// The value is not modeled: the binding keeps the source. A parameter's
+/// omitted argument is bound where the call is inlined (`param_defaults`,
+/// #230); a destructuring default's value waits on a solver that drops the
+/// side of the test no value takes (#256, #255).
+pub(super) fn lower_default(source: &Expr, init: &Expression, builder: &mut BlockBuilder) {
     let span = builder.span_at(init.span().start);
     let then_ = builder.new_block();
     let join = builder.new_block();
     let test = builder.seal_with(Terminator::Branch {
         cond: Expr::BinOp {
             op: crate::ir::expr::BinOp::Eq,
-            lhs: Box::new(Expr::Var(name.to_string())),
+            lhs: Box::new(source.clone()),
             rhs: Box::new(Expr::Lit(Prim::Unit)),
         },
         then_,

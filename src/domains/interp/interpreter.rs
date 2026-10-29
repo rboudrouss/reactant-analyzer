@@ -5,7 +5,7 @@ use crate::{
     domains::{
         AbstractDomain, AnalysisCtx, Stability, Transfer,
         impls::StateValue,
-        stores::{AbstractEnv, EnvVal, HeapValue, Sites, resolve_locs},
+        stores::{AbstractEnv, EnvVal, Heap, HeapValue, Members, Sites, member_key, resolve_locs},
     },
     engine::{
         Reducer,
@@ -14,7 +14,9 @@ use crate::{
     ir::{
         bindings::binding_of,
         cfg::{CFG, EdgeKind, Terminator},
-        expr::{Expr, MarkerVal, SummaryValue},
+        expr::{
+            ACCESSOR_KEY_PREFIX, Expr, MarkerVal, SPREAD_KEY_PREFIX, SummaryValue, is_synthetic_key,
+        },
         stmt::{MemberKey, Stmt},
         types::{BlockId, Symbol},
     },
@@ -375,30 +377,24 @@ fn exec_stmt_core<T: Transfer>(
                 return;
             };
             let new_val = EnvVal::located(rhs_sites, sv);
-            // The member the write names: a field, or a constant index. Any
-            // other key may be any member — the write joins into each.
+            // The member the write names: a field, or a constant key. Any
+            // other key may be any member — the write joins into each, and
+            // may add one.
             let member = match key {
                 MemberKey::Field(field) => Some(field.clone()),
-                MemberKey::Index(idx) => match idx.peel_ts() {
-                    Expr::Lit(crate::ir::expr::Prim::Int(i)) if *i >= 0 => Some(i.to_string()),
-                    _ => None,
-                },
+                MemberKey::Index(idx) => member_key(idx, env),
             };
             for id in resolve_locs(obj, env, ctx.heap)
                 .map(|s| s.ids)
                 .unwrap_or_default()
             {
-                if let Some(HeapValue::Obj(fields)) = ctx.heap.get_mut(id) {
+                if let Some(HeapValue::Obj(obj)) = ctx.heap.get_mut(id) {
                     match &member {
                         Some(m) => {
-                            let joined = join_member(fields.get(m), &new_val);
-                            fields.insert(m.clone(), joined);
+                            let joined = join_member(obj.named.get(m), &new_val);
+                            obj.named.insert(m.clone(), joined);
                         }
-                        None => {
-                            for slot in fields.values_mut() {
-                                *slot = join_member(Some(slot), &new_val);
-                            }
-                        }
+                        None => obj.write_any(&new_val),
                     }
                 }
             }
@@ -441,16 +437,24 @@ fn havoc_members<T: Transfer>(
         all = join_member(Some(&all), &EnvVal::located(sites, val));
     }
     for id in &ids {
-        if let Some(HeapValue::Obj(fields)) = ctx.heap.get(*id) {
-            for member in fields.values() {
+        if let Some(HeapValue::Obj(obj)) = ctx.heap.get(*id) {
+            for member in obj.values() {
                 all = join_member(Some(&all), member);
             }
         }
     }
+    // A position past the end may be filled as well, and `Object.assign`
+    // copies its sources' members over the named ones: the object holds
+    // members no entry says (#76).
+    let assign = args.first().is_some_and(|a| std::ptr::eq(a, receiver));
     for id in ids {
-        if let Some(HeapValue::Obj(fields)) = ctx.heap.get_mut(id) {
-            for member in fields.values_mut() {
+        if let Some(HeapValue::Obj(obj)) = ctx.heap.get_mut(id) {
+            for member in obj.named.values_mut() {
                 *member = all.clone();
+            }
+            obj.open = true;
+            if assign {
+                obj.write_unknown();
             }
         }
     }
@@ -502,7 +506,9 @@ fn bind_rhs<T: Transfer>(
                 (k.clone(), EnvVal::Val(val))
             })
             .collect();
-        ctx.heap.insert(*id, HeapValue::Obj(fields));
+        // The contract names some members; the object holds others.
+        ctx.heap
+            .insert(*id, HeapValue::Obj(Members::at_least(fields)));
         env.bind_locs(var.to_string(), Some(Sites::closed([*id])));
     }
     if let Expr::Var(src) = rhs {
@@ -543,7 +549,7 @@ pub(crate) fn alloc_literal<T: Transfer>(
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
 ) -> Option<Sites> {
-    let (id, fields): (_, Vec<(Symbol, &Expr)>) = match expr.peel_ts() {
+    let (id, members) = match expr.peel_ts() {
         Expr::FnLit {
             id,
             params,
@@ -552,43 +558,113 @@ pub(crate) fn alloc_literal<T: Transfer>(
             ctx.heap.alloc_fn(*id, params, body_cfg, env, ctx.component);
             return Some(Sites::closed([*id]));
         }
-        // Members written before a spread are dropped: `{ a, ...rest }` may
-        // overwrite `a` with something this map cannot see, and an absent
-        // member falls back to the container's own value.
-        Expr::ObjectLit { id, fields } => (
-            *id,
-            crate::ir::expr::members_after_last_spread(fields)
-                .iter()
-                .map(|(k, v)| (k.clone(), v))
-                .collect(),
-        ),
+        Expr::ObjectLit { id, fields } => {
+            let mut members = Members::default();
+            for (key, value) in fields {
+                if key.starts_with(SPREAD_KEY_PREFIX) {
+                    let source = alloc_literal(transfer, value, env, ctx);
+                    spread_into(&mut members, source.as_ref(), ctx.heap);
+                } else if key.starts_with(ACCESSOR_KEY_PREFIX) {
+                    // A getter's member is what its body returns, under a
+                    // name the key does not keep.
+                    members.write_unknown();
+                } else if is_synthetic_key(key) {
+                    // A computed key no constant names: any member may be it.
+                    members.write_any(&member_entry(transfer, value, env, ctx));
+                } else {
+                    let entry = member_entry(transfer, value, env, ctx);
+                    members.named.insert(key.clone(), entry);
+                }
+            }
+            (*id, members)
+        }
+        // An entry before the first spread sits at its index when no
+        // elision moved it; past a spread, every position may hold any entry
+        // of the source, which the heap does not place.
         Expr::ArrayLit {
             id,
             elems,
             arity,
             spread_at,
         } => {
-            let exact = spread_at.is_empty() && arity.exact() == Some(elems.len());
-            let elems = elems.iter().filter(|_| exact);
-            (
-                *id,
-                elems.enumerate().map(|(i, v)| (i.to_string(), v)).collect(),
-            )
+            let placed = elems.len() - spread_at.len() == arity.at_least();
+            let prefix = spread_at.iter().min().copied().unwrap_or(elems.len());
+            let mut named = HashMap::new();
+            if placed {
+                for (i, value) in elems.iter().take(prefix).enumerate() {
+                    named.insert(i.to_string(), member_entry(transfer, value, env, ctx));
+                }
+            }
+            let members = match placed && arity.exact().is_some() {
+                true => Members::exactly(named),
+                false => Members::at_least(named),
+            };
+            (*id, members)
         }
         Expr::MemoVal(label) => return ctx.memo.sites(*label).cloned(),
         other => return resolve_locs(other, env, ctx.heap),
     };
-    let mut members = HashMap::new();
-    for (key, value) in fields {
-        let sites = alloc_literal(transfer, value, env, ctx);
-        let val = transfer
-            .eval_expr(value, env, ctx)
-            .as_state_value()
-            .unwrap_or_else(StateValue::top);
-        members.insert(key, EnvVal::located(sites, val));
-    }
     ctx.heap.insert(id, HeapValue::Obj(members));
     Some(Sites::closed([id]))
+}
+
+/// What a literal's entry holds: its allocation sites and its value.
+fn member_entry<T: Transfer>(
+    transfer: &T,
+    value: &Expr,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+) -> EnvVal<StateValue> {
+    let sites = alloc_literal(transfer, value, env, ctx);
+    let val = transfer
+        .eval_expr(value, env, ctx)
+        .as_state_value()
+        .unwrap_or_else(StateValue::top);
+    EnvVal::located(sites, val)
+}
+
+/// `{ …, ...source }`: the source's own members land in the object in order,
+/// each overriding the one before it (#76). A source the heap places is
+/// copied — a member one of its objects lacks may keep what it held, and a
+/// member no constant names in it may land anywhere. Anything else may
+/// bring any member with any value: every member written before may be
+/// overwritten, and the object holds members no entry says.
+fn spread_into(members: &mut Members, source: Option<&Sites>, heap: &Heap) {
+    let objs: Option<Vec<&Members>> = match source {
+        Some(s) if !s.open && !s.ids.is_empty() => s
+            .ids
+            .iter()
+            .map(|id| match heap.get(*id) {
+                Some(HeapValue::Obj(obj)) => Some(obj),
+                _ => None,
+            })
+            .collect(),
+        _ => None,
+    };
+    let Some(objs) = objs else {
+        members.write_unknown();
+        return;
+    };
+    let copied = objs
+        .iter()
+        .skip(1)
+        .fold(objs[0].clone(), |acc, obj| acc.join(obj));
+    if copied.open {
+        members.write_unknown();
+    }
+    if let Some(others) = &copied.others {
+        members.write_any(others);
+    }
+    for (m, ev) in copied.named {
+        // A member some object lacks was joined with `undefined`, its value
+        // there; the spread then leaves the member before it in place.
+        let lacks = objs.iter().any(|o| !o.named.contains_key(&m));
+        let entry = match members.named.get(&m) {
+            Some(before) if lacks => before.join(&ev),
+            _ => ev,
+        };
+        members.named.insert(m, entry);
+    }
 }
 
 /// The one transfer for "write a state slot": a call `f(arg)` whose callee is

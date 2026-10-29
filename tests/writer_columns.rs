@@ -180,6 +180,8 @@ fn a_sync_callback_write_is_placed_at_the_call_only_when_the_receiver_surely_run
         ("(xs ?? []).forEach(() => setV(v + 1));", false),
         ("xs.some(() => setV(v + 1));", false),
         ("[...xs].forEach(() => setV(v + 1));", false),
+        ("[1, ...xs].forEach(() => setV(v + 1));", false),
+        ("[...xs, 1].forEach(() => setV(v + 1));", false),
         ("[, 1].forEach(() => setV(v + 1));", false),
         ("[1].sort(() => { setV(v + 1); return 0; });", false),
         ("[1].reduce((a) => { setV(v + 1); return a; });", false),

@@ -33,7 +33,122 @@ pub enum HeapValue {
         captured_slots: HashMap<Symbol, HookLabel>,
     },
     /// An abstract object: fields may be plain values or heap locations (for FnLit props).
-    Obj(HashMap<Symbol, EnvVal<StateValue>>),
+    Obj(Members),
+}
+
+/// The members of an abstract object (#76).
+///
+/// `named` maps each member a constant names to what it may hold. `others` is
+/// what a member no constant names was written with (`{ [k]: v }`), `None`
+/// when nothing was. `open`: the object may also hold members nothing here
+/// says, with any value — copied from a spread whose source the heap does not
+/// place, or left out of a library object's contract. An object neither open
+/// nor holding `others` has no own member beyond `named`, which is what lets
+/// a later spread of it leave the members written before the spread in place.
+#[derive(Debug, Clone, Default)]
+pub struct Members {
+    pub named: HashMap<Symbol, EnvVal<StateValue>>,
+    pub others: Option<EnvVal<StateValue>>,
+    pub open: bool,
+}
+
+impl Members {
+    /// Exactly these members, and no other.
+    pub fn exactly(named: HashMap<Symbol, EnvVal<StateValue>>) -> Self {
+        Members {
+            named,
+            ..Members::default()
+        }
+    }
+
+    /// These members, and others nothing here says.
+    pub fn at_least(named: HashMap<Symbol, EnvVal<StateValue>>) -> Self {
+        Members {
+            named,
+            open: true,
+            ..Members::default()
+        }
+    }
+
+    /// A write of `value` under a key that may be any member: it may land on
+    /// every member, or add one.
+    pub fn write_any(&mut self, value: &EnvVal<StateValue>) {
+        for slot in self.named.values_mut() {
+            *slot = slot.join(value);
+        }
+        self.others = Some(
+            self.others
+                .as_ref()
+                .map_or_else(|| value.clone(), |o| o.join(value)),
+        );
+    }
+
+    /// Writes of any value under keys nothing says: every member may now
+    /// hold anything, and the object may hold members nothing says.
+    pub fn write_unknown(&mut self) {
+        let top = EnvVal::Val(StateValue::top());
+        for slot in self.named.values_mut() {
+            *slot = slot.join(&top);
+        }
+        self.open = true;
+    }
+
+    /// Every value an entry says a member may hold.
+    pub fn values(&self) -> impl Iterator<Item = &EnvVal<StateValue>> {
+        self.named.values().chain(&self.others)
+    }
+
+    /// What a member `named` lacks may hold: `undefined`, one of `others`, or
+    /// anything when the object is open.
+    fn lacking(&self) -> EnvVal<StateValue> {
+        let absent = EnvVal::Val(StateValue::undefined());
+        let known = self
+            .others
+            .as_ref()
+            .map_or(absent.clone(), |o| o.join(&absent));
+        match self.open {
+            true => known.join(&EnvVal::Val(StateValue::top())),
+            false => known,
+        }
+    }
+
+    /// Either object: a member one of them lacks holds there `undefined`, one
+    /// of that object's `others`, or anything when that object is open.
+    pub fn join(&self, other: &Self) -> Self {
+        let (mine_lacking, theirs_lacking) = (self.lacking(), other.lacking());
+        let mut named = self.named.clone();
+        for (m, ev) in &other.named {
+            let mine = self.named.get(m).unwrap_or(&mine_lacking);
+            named.insert(m.clone(), mine.join(ev));
+        }
+        for (m, ev) in named.iter_mut() {
+            if !other.named.contains_key(m) {
+                *ev = ev.join(&theirs_lacking);
+            }
+        }
+        let others = match (&self.others, &other.others) {
+            (Some(a), Some(b)) => Some(a.join(b)),
+            (a, b) => a.clone().or_else(|| b.clone()),
+        };
+        Members {
+            named,
+            others,
+            open: self.open || other.open,
+        }
+    }
+
+    /// `self ⊑ other`, member by member.
+    pub fn leq(&self, other: &Self) -> bool {
+        self.named
+            .iter()
+            .all(|(m, ev)| other.named.get(m).is_some_and(|o| ev.leq(o)))
+            && match (&self.others, &other.others) {
+                (None, _) => true,
+                (Some(a), Some(b)) => a.leq(b),
+                (Some(_), None) => false,
+            }
+            && (!self.open || other.open)
+    }
 }
 
 /// Abstract heap: maps allocation-site `ExprId`s to `HeapValue`s.
@@ -91,7 +206,8 @@ impl Heap {
     /// What `member` of a value pointing to `sites` may be: the entry of each
     /// site that records it, in site order, and whether it may also be what
     /// no entry says — the sites are open, or one of them is not an object
-    /// recording the member (#240).
+    /// recording the member (#240). An object that does not name the member
+    /// may still hold it among its `others` (#76).
     pub fn members(&self, sites: &Sites, member: &str) -> (Vec<&EnvVal<StateValue>>, bool) {
         let mut ids: Vec<_> = sites.ids.iter().copied().collect();
         ids.sort();
@@ -99,8 +215,15 @@ impl Heap {
         let mut entries = Vec::new();
         for id in ids {
             match self.get(id) {
-                Some(HeapValue::Obj(fields)) if fields.contains_key(member) => {
-                    entries.push(&fields[member]);
+                Some(HeapValue::Obj(obj)) if obj.named.contains_key(member) => {
+                    entries.push(&obj.named[member]);
+                }
+                Some(HeapValue::Obj(Members {
+                    others: Some(others),
+                    ..
+                })) => {
+                    entries.push(others);
+                    open = true;
                 }
                 _ => open = true,
             }
@@ -122,8 +245,8 @@ impl Heap {
             let Some(hv) = self.get(id) else {
                 continue;
             };
-            if let HeapValue::Obj(fields) = hv {
-                stack.extend(fields.values().filter_map(EnvVal::locs).flatten().copied());
+            if let HeapValue::Obj(obj) = hv {
+                stack.extend(obj.values().filter_map(EnvVal::locs).flatten().copied());
             }
             out.insert(id, hv.clone());
         }
@@ -187,12 +310,7 @@ impl Heap {
                 }
                 Some(HeapValue::Obj(mine)) => {
                     if let HeapValue::Obj(theirs) = val {
-                        let mut members = mine.clone();
-                        for (m, ev) in theirs {
-                            let joined = members.get(m).map_or_else(|| ev.clone(), |e| e.join(ev));
-                            members.insert(m.clone(), joined);
-                        }
-                        result.insert(*id, HeapValue::Obj(members));
+                        result.insert(*id, HeapValue::Obj(mine.join(theirs)));
                     }
                 }
             }
@@ -216,9 +334,7 @@ impl Heap {
                     v.join(&w) == w
                 })
             }
-            (HeapValue::Obj(a), Some(HeapValue::Obj(b))) => a
-                .iter()
-                .all(|(m, ev)| b.get(m).is_some_and(|other| ev.leq(other))),
+            (HeapValue::Obj(a), Some(HeapValue::Obj(b))) => a.leq(b),
             _ => false,
         })
     }
@@ -242,12 +358,9 @@ pub fn resolve_locs<D: AbstractDomain>(
         Expr::Var(v) => return env.lookup_env_val(v).and_then(|ev| ev.sites().cloned()),
         Expr::TSAnnotated(inner) => return resolve_locs(inner, env, heap),
         Expr::FieldAccess { obj, field } => (obj, field.clone()),
-        // A constant index is a member read (`t[1]`), as `eval_index_access`
-        // reads it.
-        Expr::IndexAccess { arr, idx } => match idx.peel_ts() {
-            Expr::Lit(crate::ir::expr::Prim::Int(i)) if *i >= 0 => (arr, i.to_string()),
-            _ => return None,
-        },
+        // A constant index is a member read (`t[1]`, `o["k"]`, `o[k]` with
+        // `k` one string), as `eval_index_access` reads it.
+        Expr::IndexAccess { arr, idx } => (arr, member_key(idx, env)?),
         _ => return None,
     };
     let (entries, open) = heap.members(&resolve_locs(obj, env, heap)?, &member);
@@ -264,6 +377,20 @@ pub fn resolve_locs<D: AbstractDomain>(
     (!sites.ids.is_empty()).then_some(sites)
 }
 
+/// The one member a key expression names, when it names one: a literal
+/// string or non-negative integer, or a value that is one of them
+/// ([`StateValue::as_member_key`]). The single reading of a computed key —
+/// an index read, an index write, a computed member of a literal (#76).
+pub fn member_key<D: AbstractDomain>(key: &Expr, env: &AbstractEnv<D>) -> Option<Symbol> {
+    use crate::ir::expr::Prim;
+    match key.peel_ts() {
+        Expr::Lit(Prim::Int(i)) if *i >= 0 => Some(i.to_string()),
+        Expr::Lit(Prim::String(s)) => Some(s.clone()),
+        Expr::Var(v) => env.lookup(v).as_state_value()?.as_member_key(),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,8 +402,40 @@ mod tests {
             "step".to_string(),
             EnvVal::Val(StateValue::number(Interval::point(step))),
         )]);
-        h.insert(ExprId(7), HeapValue::Obj(members));
+        h.insert(ExprId(7), HeapValue::Obj(Members::exactly(members)));
         h
+    }
+
+    #[test]
+    fn a_member_one_object_lacks_may_be_undefined_or_one_of_its_others() {
+        // #76: `{ a: 1 }` joined with `{ [k]: 2 }` — `a` may be 1, or 2 under
+        // `k`, or absent.
+        let one = |v: f64| EnvVal::Val(StateValue::number(Interval::point(v)));
+        let a = Members::exactly(HashMap::from([("a".to_string(), one(1.0))]));
+        let mut b = Members::default();
+        b.write_any(&one(2.0));
+        let j = a.join(&b);
+        let got = &j.named["a"];
+        assert!(one(1.0).leq(got) && one(2.0).leq(got));
+        assert!(got.as_val().undef, "absent from the other object: {got:?}");
+        assert!(a.leq(&j) && b.leq(&j));
+        assert!(!j.leq(&a), "the join holds others `a` does not");
+    }
+
+    #[test]
+    fn a_read_of_a_member_no_constant_names_is_one_of_the_others() {
+        let mut h = obj(0.0);
+        let sites = Sites::closed([ExprId(7)]);
+        assert!(h.members(&sites, "other").0.is_empty());
+        if let Some(HeapValue::Obj(o)) = h.get_mut(ExprId(7)) {
+            o.write_any(&EnvVal::Val(StateValue::number(Interval::point(1.0))));
+        }
+        let (entries, open) = h.members(&sites, "other");
+        assert_eq!(entries.len(), 1);
+        assert!(open, "the member may also be absent");
+        // Written under a key that may be `step` as well.
+        let step = &h.members(&sites, "step").0[0].as_val();
+        assert_eq!(step.num, Interval::point(0.0).hull(&Interval::point(1.0)));
     }
 
     #[test]

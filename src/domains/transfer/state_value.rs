@@ -7,7 +7,7 @@ use crate::{
         AbstractDomain, AnalysisCtx, Transfer,
         impls::{BoolVal, Interval, SetterVal, Stability, StateValue, StrConst},
         interp::{alloc_literal, exec_stmt_with_callbacks, returned_sites, run_cfg},
-        stores::{AbstractEnv, EnvVal, Heap, HeapValue, Sites, resolve_locs},
+        stores::{AbstractEnv, EnvVal, Heap, HeapValue, Sites, member_key, resolve_locs},
     },
     engine::component_registry::ChildLookup,
     ir::{
@@ -426,8 +426,8 @@ fn collect_escaping_setters(
                     }) => {
                         setter_calls_in_cfg(body_cfg, env, Some(captured), heap, own, out, walked);
                     }
-                    Some(HeapValue::Obj(obj_fields)) => {
-                        for ev in obj_fields.values() {
+                    Some(HeapValue::Obj(obj)) => {
+                        for ev in obj.values() {
                             out.extend(ev.as_val().setters());
                         }
                     }
@@ -726,11 +726,21 @@ fn props_cache_key(
                     .iter()
                     .map(|(v, val)| (format!("@{}:{v}", id.0), val.clone())),
             ),
-            HeapValue::Obj(fields) => key.extend(
-                fields
-                    .iter()
-                    .map(|(m, ev)| (format!("@{}.{m}", id.0), ev.as_val())),
-            ),
+            HeapValue::Obj(obj) => {
+                key.extend(
+                    obj.named
+                        .iter()
+                        .map(|(m, ev)| (format!("@{}.{m}", id.0), ev.as_val())),
+                );
+                key.extend(
+                    obj.others
+                        .iter()
+                        .map(|ev| (format!("@{}.*", id.0), ev.as_val())),
+                );
+                if obj.open {
+                    key.insert(format!("@{}.?", id.0), StateValue::top());
+                }
+            }
         }
     }
     key
@@ -780,17 +790,18 @@ fn eval_field_access(
 /// per-member map a named member already uses (#37). Before this, every indexed
 /// read was ⊤, which is why jotai's setter looked unstable.
 ///
-/// A non-constant index stays ⊤: which element `xs[i]` denotes is #76's
-/// question, not this one. A negative index is not a member either.
+/// A key that is one string names that member too (`o["k"]`, `o[k]` with `k`
+/// one constant, #76). Any other index stays ⊤: which element `xs[i]`
+/// denotes is not a member read. A negative index is not a member either.
 fn eval_index_access(
     arr: &Expr,
     idx: &Expr,
     env: &AbstractEnv<StateValue>,
     ctx: &mut AnalysisCtx<StateValue>,
 ) -> StateValue {
-    match idx.peel_ts() {
-        Expr::Lit(Prim::Int(i)) if *i >= 0 => eval_field_access(arr, &i.to_string(), env, ctx),
-        _ => StateValue::top(),
+    match member_key(idx, env) {
+        Some(m) => eval_field_access(arr, &m, env, ctx),
+        None => StateValue::top(),
     }
 }
 

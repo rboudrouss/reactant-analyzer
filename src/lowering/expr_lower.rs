@@ -6,13 +6,16 @@ use std::sync::Arc;
 
 use crate::ir::{
     cfg::{BasicBlock, CFG, EdgeKind, Terminator},
-    expr::{BinOp as IrBinOp, Expr, Prim, SPREAD_KEY_PREFIX, SummaryValue, UnaryOp as IrUnaryOp},
+    expr::{
+        ACCESSOR_KEY_PREFIX, BinOp as IrBinOp, COMPUTED_KEY_PREFIX, Expr, Prim, SPREAD_KEY_PREFIX,
+        SummaryValue, UnaryOp as IrUnaryOp,
+    },
     hooks::Arity,
     stmt::{MemberKey, Stmt},
 };
 
 use super::cfg_builder::{
-    BlockBuilder, build_expr_fn_body_cfg, build_fn_body_cfg, build_stmts_cfg,
+    BlockBuilder, build_expr_fn_body_cfg, build_fn_body_cfg, build_stmts_cfg, lower_default,
 };
 
 /// An opaque value of unknown kind (⊤). Used for expressions the analysis does
@@ -41,6 +44,27 @@ fn lower_for_effect(expr: &Expression, builder: &mut BlockBuilder) {
 /// so the value stays fully visible to them. Same device as the JSX spread key.
 fn synthetic_key(builder: &mut BlockBuilder, prefix: &str) -> String {
     format!("{prefix}{}", builder.next_expr_id().0)
+}
+
+/// The member a property key names when the source spells it: a name, a
+/// string, a non-negative integer (`{ 0: a }`, `{ [1]: b }`), or a template
+/// with no substitution (#76). `None` for a key only a run can compute.
+pub(super) fn property_name(key: &PropertyKey) -> Option<String> {
+    match key {
+        PropertyKey::StaticIdentifier(k) => Some(k.name.to_string()),
+        PropertyKey::StringLiteral(s) => Some(s.value.to_string()),
+        PropertyKey::NumericLiteral(n)
+            if n.value >= 0.0 && n.value.fract() == 0.0 && n.value <= f64::from(u32::MAX) =>
+        {
+            Some(format!("{}", n.value as u64))
+        }
+        PropertyKey::TemplateLiteral(t) if t.expressions.is_empty() => t
+            .quasis
+            .first()
+            .and_then(|q| q.value.cooked.as_ref())
+            .map(|c| c.to_string()),
+        _ => None,
+    }
 }
 
 /// Lower a class into an `ObjectLit` holding its member bodies under synthetic
@@ -102,7 +126,7 @@ pub(super) fn lower_class(class: &Class, builder: &mut BlockBuilder) -> Expr {
                 computed_key(&a.key, builder);
                 if let Some(value) = &a.value {
                     let lowered = lower_expr(value, builder);
-                    fields.push((synthetic_key(builder, "[accessor]"), lowered));
+                    fields.push((synthetic_key(builder, ACCESSOR_KEY_PREFIX), lowered));
                 }
             }
             // `static { … }` runs at definition time. Kept as a zero-arg body
@@ -355,25 +379,26 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
             for prop in &obj.properties {
                 match prop {
                     ObjectPropertyKind::ObjectProperty(p) => {
-                        let key = match &p.key {
+                        let named = property_name(&p.key);
+                        let key = match named {
                             // A getter/setter runs code on every read: `o.x`
                             // is whatever the body returns, not the function
                             // literal sitting in the property. Kept under a
                             // synthetic key, like a spread — the body stays
                             // visible, the name resolves to nothing.
                             _ if p.kind != PropertyKind::Init => {
-                                synthetic_key(builder, "[accessor]")
+                                synthetic_key(builder, ACCESSOR_KEY_PREFIX)
                             }
-                            PropertyKey::StaticIdentifier(ident) => ident.name.to_string(),
-                            PropertyKey::StringLiteral(s) => s.value.to_string(),
+                            Some(name) => name,
                             // Computed key (`{ [k]: v }`): the key expression
                             // runs, and `v` is still in the object — under a
-                            // synthetic name, since the real one is unknown.
-                            other => {
-                                if let Some(e) = other.as_expression() {
+                            // synthetic name, since the real one is unknown:
+                            // it may be any member (#76).
+                            None => {
+                                if let Some(e) = p.key.as_expression() {
                                     lower_for_effect(e, builder);
                                 }
-                                synthetic_key(builder, "[computed]")
+                                synthetic_key(builder, COMPUTED_KEY_PREFIX)
                             }
                         };
                         let value = lower_expr(&p.value, builder);
@@ -1111,44 +1136,37 @@ fn lower_assignment_target(
             });
             for prop in &obj.properties {
                 match prop {
+                    // `({ a = fallback } = o)`: `a` holds `o.a`; the
+                    // fallback runs when that is `undefined` (its value is
+                    // not stored, #256).
                     AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(p) => {
-                        // `({ a = fallback } = o)`: the default is not modeled,
-                        // but it is still evaluated — keep its reads visible.
                         let p_span = builder.span_at(p.span.start);
-                        if let Some(init) = &p.init {
-                            let d = lower_expr(init, builder);
-                            builder.push_stmt(Stmt::ExprStmt(d, p_span));
-                        }
+                        let name = p.binding.name.to_string();
                         builder.push_stmt(Stmt::Assign {
-                            var: p.binding.name.to_string(),
+                            var: name.clone(),
                             rhs: Expr::FieldAccess {
                                 obj: Box::new(Expr::Var(temp.clone())),
-                                field: p.binding.name.to_string(),
+                                field: name.clone(),
                             },
                             span: p_span,
                         });
+                        if let Some(init) = &p.init {
+                            lower_default(&Expr::Var(name.clone()), init, builder);
+                        }
                     }
                     AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
-                        let field = match &p.name {
-                            PropertyKey::StaticIdentifier(k) => Some(k.name.to_string()),
-                            PropertyKey::StringLiteral(k) => Some(k.value.to_string()),
-                            // Computed key: the key expression still runs, and
-                            // the target still gets written — with an unknown
-                            // value, never with its stale one.
-                            other => {
-                                if let Some(e) = other.as_expression() {
-                                    let k = lower_expr(e, builder);
-                                    builder.push_stmt(Stmt::ExprStmt(k, None));
-                                }
-                                None
-                            }
-                        };
-                        let prop_rhs = match field {
-                            Some(field) => Expr::FieldAccess {
-                                obj: Box::new(Expr::Var(temp.clone())),
-                                field,
+                        let obj = Box::new(Expr::Var(temp.clone()));
+                        let prop_rhs = match property_name(&p.name) {
+                            Some(field) => Expr::FieldAccess { obj, field },
+                            // Computed key: the target gets `o[k]`, the
+                            // member `k` names when its value names one.
+                            None => match p.name.as_expression() {
+                                Some(e) => Expr::IndexAccess {
+                                    arr: obj,
+                                    idx: Box::new(lower_expr(e, builder)),
+                                },
+                                None => opaque(),
                             },
-                            None => opaque(),
                         };
                         lower_assignment_maybe_default(&p.binding, prop_rhs, builder);
                     }
@@ -1174,8 +1192,8 @@ fn lower_assignment_target(
 }
 
 /// An array element or object property target, which may carry a default
-/// (`[a = 1] = xs`). The default expression is not modeled but is still
-/// evaluated, so it is emitted for its reads and side effects.
+/// (`[a = 1] = xs`): the default runs when the source is `undefined`, and
+/// the target gets the source (#256).
 fn lower_assignment_maybe_default(
     target: &AssignmentTargetMaybeDefault,
     rhs: Expr,
@@ -1183,8 +1201,7 @@ fn lower_assignment_maybe_default(
 ) {
     match target {
         AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(d) => {
-            let default = lower_expr(&d.init, builder);
-            builder.push_stmt(Stmt::ExprStmt(default, None));
+            lower_default(&rhs, &d.init, builder);
             lower_assignment_target(&d.binding, rhs, None, builder);
         }
         other => match other.as_assignment_target() {

@@ -2414,3 +2414,62 @@ export function C() {
 "#;
     assert!(!loop_severities(src, "C").is_empty());
 }
+
+/// A component whose no-deps effect calls `call`, after `decl`.
+fn member_callee_src(decl: &str, call: &str) -> String {
+    format!(
+        r#"
+import {{ useState, useEffect }} from 'react';
+export function C({{ extra, k }}: {{ extra: any; k: string }}) {{
+  const [n, setN] = useState(0);
+  {decl}
+  useEffect(() => {{ {call} }});
+  return <div />;
+}}
+"#
+    )
+}
+
+#[test]
+fn a_member_copied_by_a_spread_or_stored_under_a_computed_key_is_called() {
+    // The closure reaches the call through a spread of a known object, over a
+    // member written before it, through a computed key no literal spells, a
+    // computed key the destructuring reads (#76). An unknown spread keeps
+    // the member written before it possible, as does a computed key that may
+    // name it: a warning, never a certainty. (A destructuring default's
+    // value is not stored yet, #256.)
+    for (decl, call) in [
+        (
+            "const b = { inc: INC }; const api = { ...b, x: 1 };",
+            "api.inc();",
+        ),
+        (
+            "const api = { inc: () => {}, ...{ inc: INC } };",
+            "api.inc();",
+        ),
+        (
+            "const key = 'inc'; const api = { [key]: INC };",
+            "api.inc();",
+        ),
+        ("const api = { [1]: INC };", "api[1]();"),
+        (
+            "const key = 'inc'; const { [key]: f } = { inc: INC };",
+            "f();",
+        ),
+        ("const api = { inc: INC, ...extra };", "api.inc();"),
+        ("const api = { inc: () => {}, [k]: INC };", "api.inc();"),
+    ] {
+        let decl = decl.replace("INC", "() => setN(n + 1)");
+        let sevs = loop_severities(&member_callee_src(&decl, call), "C");
+        assert!(!sevs.is_empty(), "{decl} {call}");
+        assert!(!sevs.contains(&Severity::Error), "{decl}: {sevs:?}");
+    }
+}
+
+#[test]
+fn a_member_a_spread_of_a_known_object_overrides_is_gone() {
+    // The spread writes `inc` over the closure: the call runs the no-op (#76).
+    let decl = "const api = { inc: () => setN(n + 1), ...{ inc: () => {} } };";
+    let sevs = loop_severities(&member_callee_src(decl, "api.inc();"), "C");
+    assert!(sevs.is_empty(), "{sevs:?}");
+}

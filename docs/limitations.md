@@ -91,8 +91,8 @@ that writes it (see *Cross-file limits*).
   written as a statement. A setter joined with a value the analysis cannot see into (`c ?
   wrap(setV) : setV`, `wrap` unknown) is still a possible write of it
   [#238](https://github.com/rboudrouss/reactant-analyzer/issues/238); a call of a value nothing
-  names a setter in writes nothing (#19). Still missed: an array with a spread or an object member a spread may
-  overwrite.
+  names a setter in writes nothing (#19). Still missed: an array entry past a spread, and a setter
+  stored under a computed key no literal spells (a closure stored there is walked).
 - `useContext` is unmodelled, so a context value reads ⊤. This is the single largest source of
   analysis limits, 363 sites across the eight corpora [#28](https://github.com/rboudrouss/reactant-analyzer/issues/28).
 - Seven React hooks are unmodelled and emit an Info rather than a summary: `useActionState`,
@@ -141,8 +141,18 @@ that writes it (see *Cross-file limits*).
   negative exponent, and a `+`, `-` or `*` that may meet `∞ − ∞` or `0 × ∞` on operands widened
   to an infinite bound [#217](https://github.com/rboudrouss/reactant-analyzer/issues/217). `in` and `instanceof` are known to be booleans and nothing more
   [#73](https://github.com/rboudrouss/reactant-analyzer/issues/73).
-- A spread or computed key is kept for its reads but not modeled, so `{ ...opts }.foo` does not
-  resolve and a setter forwarded through `f(...handlers)` is not seen [#76](https://github.com/rboudrouss/reactant-analyzer/issues/76).
+- An object spread copies what the heap knows of its source: `{ ...opts }.foo` is `opts.foo`, and
+  a spread of a value the heap does not place may overwrite every member before it, which stay
+  possible. A computed key resolves when a literal spells it (`{ [1]: a }`, `o["k"]`) or, in a
+  read or a destructuring, when its value is one string (`const { [k]: v } = o`); in an object
+  literal it may be any member. Not modeled: an array entry past a spread (its index is ⊤), a
+  spread argument `f(...args)`, kept for its reads, so a setter forwarded through
+  `f(...handlers)` is not seen, and a parameter's default as the parameter's value outside a
+  spliced hook [#76](https://github.com/rboudrouss/reactant-analyzer/issues/76).
+- A destructuring default (`const { f = g } = o`) runs when the member is `undefined`, so its
+  reads and writes are seen, but its value is not stored: `f` reads as `o.f`, and a closure the
+  default supplies is not called through `f`
+  [#256](https://github.com/rboudrouss/reactant-analyzer/issues/256).
 - **Mount-coupled seeds.** `frozen-initial-state` drops to Info, hidden without `--info`, when every
   call site renders the consumer under a `key` built from the seeding prop, or under a guard built
   from it (`{msg && <Toast msg={msg}/>}`). Neither shape is a proof: a `msg` moving between two
