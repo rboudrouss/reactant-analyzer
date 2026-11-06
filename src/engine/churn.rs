@@ -1304,11 +1304,77 @@ fn cycles_in(edges: &[ChurnEdge], subset: &[usize]) -> Vec<Vec<usize>> {
             continue;
         }
         let start = *scc.iter().min().unwrap();
-        if let Some(cycle) = find_cycle_from(start, &adj, &scc_set, edges, &node_id) {
-            out.push(cycle);
+        let mut found: Vec<Vec<usize>> = find_cycle_from(start, &adj, &scc_set, edges, &node_id)
+            .into_iter()
+            .collect();
+        // Every edge inside the component lies on a cycle — its head reaches
+        // its tail — so every effect carrying one is on a loop: one the first
+        // cycle misses gets its own, the edge and the way back (#263).
+        let mut carried: HashSet<(ComponentId, HookLabel)> = found
+            .iter()
+            .flatten()
+            .map(|&e| (edges[e].component, edges[e].effect_label))
+            .collect();
+        let mut inner: Vec<usize> = scc
+            .iter()
+            .flat_map(|&n| adj[n].iter().copied())
+            .filter(|&e| scc_set.contains(&node_id[&edges[e].to]))
+            .collect();
+        inner.sort_unstable();
+        for e in inner {
+            if !carried.insert((edges[e].component, edges[e].effect_label)) {
+                continue;
+            }
+            let (from, to) = (node_id[&edges[e].from], node_id[&edges[e].to]);
+            if let Some(back) = path_within(to, from, &adj, &scc_set, edges, &node_id) {
+                let cycle: Vec<usize> = std::iter::once(e).chain(back).collect();
+                carried.extend(
+                    cycle
+                        .iter()
+                        .map(|&i| (edges[i].component, edges[i].effect_label)),
+                );
+                found.push(cycle);
+            }
         }
+        out.extend(found);
     }
     out
+}
+
+/// The edges of a shortest path from node `from` to node `to` inside `scc`,
+/// empty when they are the same node.
+fn path_within(
+    from: usize,
+    to: usize,
+    adj: &[Vec<usize>],
+    scc: &HashSet<usize>,
+    edges: &[ChurnEdge],
+    node_id: &HashMap<&QualifiedSlot, usize>,
+) -> Option<Vec<usize>> {
+    let mut via: HashMap<usize, usize> = HashMap::new(); // node → edge into it
+    let mut queue = std::collections::VecDeque::from([from]);
+    let mut seen = HashSet::from([from]);
+    while let Some(n) = queue.pop_front() {
+        if n == to {
+            let mut path = Vec::new();
+            let mut at = n;
+            while at != from {
+                let e = via[&at];
+                path.push(e);
+                at = node_id[&edges[e].from];
+            }
+            path.reverse();
+            return Some(path);
+        }
+        for &e in &adj[n] {
+            let w = node_id[&edges[e].to];
+            if scc.contains(&w) && seen.insert(w) {
+                via.insert(w, e);
+                queue.push_back(w);
+            }
+        }
+    }
+    None
 }
 
 /// Tarjan strongly-connected components (recursive; graphs are tiny).

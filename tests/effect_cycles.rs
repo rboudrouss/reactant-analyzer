@@ -185,7 +185,8 @@ fn multi_writer_revival_is_warning() {
     // e1's guarded write to `b` would converge alone, but e3 also writes `b`
     // (reviving the guard on the next automatic round) → the convergence
     // kill must NOT apply → the a→b→a cycle is real → Warning (conditional
-    // write, so no must proof).
+    // write, so no must proof). e3's own edge `a → b` lies on the cycle too:
+    // it reports one (#263).
     let src = r#"
 import { useState, useEffect } from 'react';
 export function C() {
@@ -204,7 +205,7 @@ export function C() {
             r == "infinite-loop" && *s == Severity::Warning && m.contains("state-update cycle")
         })
         .count();
-    assert_eq!(warnings, 2, "may-cycle → Warning per effect: {diags:?}");
+    assert_eq!(warnings, 3, "may-cycle → Warning per effect: {diags:?}");
 }
 
 #[test]
@@ -2764,6 +2765,41 @@ export function App() {
     let diags = infinite_loop_diags(src, "App");
     assert!(
         diags.iter().any(|(_, s, _)| *s == Severity::Warning),
+        "{diags:?}"
+    );
+}
+
+/// C1's no-deps effect re-triggers itself through a closure an unknown
+/// callee runs. C1 also renders C0, whose cleanup writes App's slot, so the
+/// self-edge shares one strongly connected component with the cycle through
+/// C0's effect: each effect carrying an edge inside it is on a loop, and
+/// reports one (#263).
+#[test]
+fn every_effect_with_an_edge_in_a_cyclic_component_reports_a_cycle() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+import { runNow } from 'ext';
+export function C0({ on1 }) {
+  useEffect(() => {
+    return () => { on1(0); };
+  });
+  return <div />;
+}
+export function C1() {
+  const [s0, setS0] = useState(2);
+  useEffect(() => {
+    runNow(() => setS0((prev) => prev + 2));
+  });
+  return <div>{0 && <C0 />}</div>;
+}
+export function App() {
+  const [s0, setS0] = useState(2);
+  return <div><C0 on1={setS0} /><C1 /></div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C1");
+    assert!(
+        !diags.is_empty() && diags.iter().all(|(_, s, _)| *s == Severity::Warning),
         "{diags:?}"
     );
 }
