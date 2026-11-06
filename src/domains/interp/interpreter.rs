@@ -632,7 +632,7 @@ pub(crate) fn alloc_literal<T: Transfer>(
         Expr::MemoVal(label) => return ctx.memo.sites(*label).cloned(),
         other => return resolve_locs(other, env, ctx.heap),
     };
-    ctx.heap.insert(id, HeapValue::Obj(members));
+    ctx.heap.alloc_obj(id, members);
     Some(Sites::closed([id]))
 }
 

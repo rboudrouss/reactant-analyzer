@@ -1,6 +1,6 @@
 // oracle: react=loop
-// oracle: known=fn #258
-// The value form of the escaped closure's member write.
+// #258, the value form of the escaped closure's member write: `o` is opened
+// where the closure escapes.
 import { useEffect, useState } from "react";
 import { runNow } from "ext";
 

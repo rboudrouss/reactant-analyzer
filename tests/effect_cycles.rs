@@ -2665,3 +2665,61 @@ export function App() {
     let diags = infinite_loop_diags(src, "App");
     assert!(diags.is_empty(), "{diags:?}");
 }
+
+/// `o.step` is 1 after a call the analysis does not see: a closure handed to
+/// it writes the member, which the allocation site keeps for the next pass,
+/// or the object itself is handed to it and is opened where it escapes
+/// (#258).
+#[test]
+fn an_object_handed_to_unseen_code_may_hold_anything_after() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+import { runNow, fill } from 'ext';
+export function Closure() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    const o = { step: 0 };
+    runNow(() => { o.step = 1; });
+    setN(n + o.step);
+  });
+  return <div>{n}</div>;
+}
+export function Argument() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    const o = { step: 0 };
+    fill(o);
+    setN(n + o.step);
+  });
+  return <div>{n}</div>;
+}
+"#;
+    for c in ["Closure", "Argument"] {
+        let diags = infinite_loop_diags(src, c);
+        assert!(
+            diags.iter().any(|(_, s, _)| *s == Severity::Warning)
+                && !diags.iter().any(|(_, s, _)| *s == Severity::Error),
+            "{c}: {diags:?}"
+        );
+    }
+}
+
+/// The negative: an object nothing unseen reaches keeps its members.
+#[test]
+fn an_object_kept_local_keeps_its_members() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+import { runNow } from 'ext';
+export function App() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    const o = { step: 0 };
+    runNow(() => {});
+    setN(n + o.step);
+  });
+  return <div>{n}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "App");
+    assert!(diags.is_empty(), "{diags:?}");
+}

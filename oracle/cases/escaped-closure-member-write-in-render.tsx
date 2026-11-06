@@ -1,8 +1,7 @@
 // oracle: react=loop
-// oracle: known=fn #258
-// The render hands the closure out and the effect reads the member. The
-// escaped closure's write lands after every pass of the round, and the
-// fixpoint stops on the state alone, so no pass reads it.
+// #258: the render hands the closure out and the effect reads the member.
+// The escaped closure's write landed after every pass of the round, and the
+// fixpoint stopped on the state alone, so no pass read it.
 import { useEffect, useState } from "react";
 import { runNow } from "ext";
 

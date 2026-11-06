@@ -205,9 +205,35 @@ impl Heap {
         self.cells.insert(id, val);
     }
 
-    /// Code the analysis does not see now holds `sites`.
+    /// An object literal evaluated at site `id`. The site stands for every
+    /// object it allocates, in every pass: it keeps what was written into
+    /// the ones before — by a closure that ran after the read, or by code
+    /// the analysis does not see (#258).
+    pub fn alloc_obj(&mut self, id: ExprId, members: Members) {
+        let members = match self.cells.get(&id) {
+            Some(HeapValue::Obj(before)) => before.join(&members),
+            _ => members,
+        };
+        self.cells.insert(id, HeapValue::Obj(members));
+    }
+
+    /// Code the analysis does not see now holds `sites`. It may write any
+    /// member of every object it reaches through members, from here on
+    /// (#258): each is opened. A closure it reaches runs with the handlers
+    /// ([`Heap::escaped_fns`]), its own writes landing where they do.
     pub fn escape(&mut self, sites: &Sites) {
         self.escaped.extend(sites.ids.iter().copied());
+        let mut stack: Vec<ExprId> = sites.ids.iter().copied().collect();
+        let mut seen = BTreeSet::new();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if let Some(HeapValue::Obj(obj)) = self.cells.get_mut(&id) {
+                stack.extend(obj.values().filter_map(EnvVal::locs).flatten().copied());
+                obj.write_unknown();
+            }
+        }
     }
 
     /// The closures an escaped site reaches, through the members of the
