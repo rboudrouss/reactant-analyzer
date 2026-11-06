@@ -1089,7 +1089,7 @@ mod tests {
                     },
                     None,
                 )],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                term: Terminator::Return(Expr::Lit(Prim::Unit), None),
             },
         );
         let eff_cfg = CFG {
@@ -1399,7 +1399,7 @@ mod tests {
             BasicBlock {
                 id: 3,
                 stmts: vec![],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                term: Terminator::Return(Expr::Lit(Prim::Unit), None),
             },
         );
         let cb = Expr::FnLit {
@@ -1482,7 +1482,7 @@ mod tests {
             BasicBlock {
                 id: 0,
                 stmts: all_stmts,
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                term: Terminator::Return(Expr::Lit(Prim::Unit), None),
             },
         );
         let eff_cfg = CFG {

@@ -145,7 +145,7 @@ pub(crate) fn returning_branches(cfg: &CFG) -> HashMap<BlockId, Vec<BlockId>> {
     let returns: HashSet<BlockId> = cfg
         .blocks
         .values()
-        .filter(|b| matches!(b.term, Terminator::Return(_)))
+        .filter(|b| matches!(b.term, Terminator::Return(..)))
         .map(|b| b.id)
         .collect();
     branches_over(cfg, |_, rt, re| {
@@ -268,7 +268,7 @@ mod tests {
             BasicBlock {
                 id: 2,
                 stmts: vec![],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                term: Terminator::Return(Expr::Lit(Prim::Unit), None),
             },
         );
         CFG {
@@ -326,7 +326,7 @@ mod tests {
             BasicBlock {
                 id: 3,
                 stmts: vec![],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                term: Terminator::Return(Expr::Lit(Prim::Unit), None),
             },
         );
         CFG {

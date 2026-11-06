@@ -38,7 +38,7 @@ fn empty_cfg() -> CFG {
         BasicBlock {
             id: 0,
             stmts: vec![],
-            term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            term: Terminator::Return(Expr::Lit(Prim::Unit), None),
         },
     );
     CFG {
@@ -74,12 +74,15 @@ fn heuristic_detects_parent_not_child_as_root() {
             BasicBlock {
                 id: 0,
                 stmts: vec![],
-                term: Terminator::Return(Expr::CompApp {
-                    name: "Child".to_string(),
-                    props: Box::new(Expr::Lit(Prim::Null)),
-                    span: None,
-                    origin: None,
-                }),
+                term: Terminator::Return(
+                    Expr::CompApp {
+                        name: "Child".to_string(),
+                        props: Box::new(Expr::Lit(Prim::Null)),
+                        span: None,
+                        origin: None,
+                    },
+                    None,
+                ),
             },
         );
         ComponentIR {
@@ -134,12 +137,15 @@ fn analyze_program_populates_call_graph_for_parent_child() {
             BasicBlock {
                 id: 0,
                 stmts: vec![],
-                term: Terminator::Return(Expr::CompApp {
-                    name: "Child".to_string(),
-                    props: Box::new(Expr::Lit(Prim::Null)),
-                    span: None,
-                    origin: None,
-                }),
+                term: Terminator::Return(
+                    Expr::CompApp {
+                        name: "Child".to_string(),
+                        props: Box::new(Expr::Lit(Prim::Null)),
+                        span: None,
+                        origin: None,
+                    },
+                    None,
+                ),
             },
         );
         ComponentIR {
@@ -201,7 +207,7 @@ fn setter_prop_propagates_to_shared_state() {
                         },
                         None,
                     )],
-                    term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                    term: Terminator::Return(Expr::Lit(Prim::Unit), None),
                 },
             );
             CFG {
@@ -225,7 +231,7 @@ fn setter_prop_propagates_to_shared_state() {
                         },
                         span: None,
                     }],
-                    term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                    term: Terminator::Return(Expr::Lit(Prim::Unit), None),
                 },
             );
             CFG {
@@ -271,18 +277,21 @@ fn setter_prop_propagates_to_shared_state() {
                             span: None,
                         },
                     ],
-                    term: Terminator::Return(Expr::CompApp {
-                        name: "Child".to_string(),
-                        props: Box::new(Expr::ObjectLit {
-                            id: ExprId(100),
-                            fields: vec![(
-                                "onChange".to_string(),
-                                Expr::Var("setCount".to_string()),
-                            )],
-                        }),
-                        span: None,
-                        origin: None,
-                    }),
+                    term: Terminator::Return(
+                        Expr::CompApp {
+                            name: "Child".to_string(),
+                            props: Box::new(Expr::ObjectLit {
+                                id: ExprId(100),
+                                fields: vec![(
+                                    "onChange".to_string(),
+                                    Expr::Var("setCount".to_string()),
+                                )],
+                            }),
+                            span: None,
+                            origin: None,
+                        },
+                        None,
+                    ),
                 },
             );
             CFG {
@@ -339,12 +348,15 @@ fn recursive_component_does_not_crash() {
             BasicBlock {
                 id: 0,
                 stmts: vec![],
-                term: Terminator::Return(Expr::CompApp {
-                    name: "TreeNode".to_string(),
-                    props: Box::new(Expr::Lit(Prim::Null)),
-                    span: None,
-                    origin: None,
-                }),
+                term: Terminator::Return(
+                    Expr::CompApp {
+                        name: "TreeNode".to_string(),
+                        props: Box::new(Expr::Lit(Prim::Null)),
+                        span: None,
+                        origin: None,
+                    },
+                    None,
+                ),
             },
         );
         ComponentIR {
@@ -837,7 +849,7 @@ fn prop_drilling_direct_ir() {
                         },
                         None,
                     )],
-                    term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                    term: Terminator::Return(Expr::Lit(Prim::Unit), None),
                 },
             );
             CFG {
@@ -870,21 +882,24 @@ fn prop_drilling_direct_ir() {
             BasicBlock {
                 id: 0,
                 stmts: vec![],
-                term: Terminator::Return(Expr::CompApp {
-                    name: "Leaf".to_string(),
-                    props: Box::new(Expr::ObjectLit {
-                        id: ExprId(200),
-                        fields: vec![(
-                            "action".to_string(),
-                            Expr::FieldAccess {
-                                obj: Box::new(Expr::Var("props".to_string())),
-                                field: "action".to_string(),
-                            },
-                        )],
-                    }),
-                    span: None,
-                    origin: None,
-                }),
+                term: Terminator::Return(
+                    Expr::CompApp {
+                        name: "Leaf".to_string(),
+                        props: Box::new(Expr::ObjectLit {
+                            id: ExprId(200),
+                            fields: vec![(
+                                "action".to_string(),
+                                Expr::FieldAccess {
+                                    obj: Box::new(Expr::Var("props".to_string())),
+                                    field: "action".to_string(),
+                                },
+                            )],
+                        }),
+                        span: None,
+                        origin: None,
+                    },
+                    None,
+                ),
             },
         );
         ComponentIR {
@@ -921,15 +936,18 @@ fn prop_drilling_direct_ir() {
                         span: None,
                     },
                 ],
-                term: Terminator::Return(Expr::CompApp {
-                    name: "Middle".to_string(),
-                    props: Box::new(Expr::ObjectLit {
-                        id: ExprId(201),
-                        fields: vec![("action".to_string(), Expr::Var("setV".to_string()))],
-                    }),
-                    span: None,
-                    origin: None,
-                }),
+                term: Terminator::Return(
+                    Expr::CompApp {
+                        name: "Middle".to_string(),
+                        props: Box::new(Expr::ObjectLit {
+                            id: ExprId(201),
+                            fields: vec![("action".to_string(), Expr::Var("setV".to_string()))],
+                        }),
+                        span: None,
+                        origin: None,
+                    },
+                    None,
+                ),
             },
         );
         ComponentIR {

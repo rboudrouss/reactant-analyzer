@@ -192,7 +192,7 @@ fn returns_value(body: &CFG) -> StateValue {
     body.blocks
         .values()
         .filter_map(|b| match &b.term {
-            Terminator::Return(e) => Some(StateValue::from_init(e.peel_ts())),
+            Terminator::Return(e, _) => Some(StateValue::from_init(e.peel_ts())),
             _ => None,
         })
         .reduce(|acc, v| acc.join(&v))
@@ -209,7 +209,7 @@ fn returns_change(body: &CFG, params: &[Var]) -> Change {
         .blocks
         .values()
         .filter_map(|b| match &b.term {
-            Terminator::Return(e) => Some(e.peel_ts()),
+            Terminator::Return(e, _) => Some(e.peel_ts()),
             _ => None,
         })
         .collect();
@@ -494,7 +494,7 @@ fn reach_literals<'c>(
             })
             .collect();
         let mut term = Vec::new();
-        if let Terminator::Return(e) | Terminator::Branch { cond: e, .. } = &block.term {
+        if let Terminator::Return(e, _) | Terminator::Branch { cond: e, .. } = &block.term {
             literals(e, None, &mut term);
         }
         at.push(term);
@@ -549,7 +549,10 @@ mod tests {
         Expr::FnLit {
             id: ExprId::fresh(),
             params: vec![param.to_string()],
-            body_cfg: std::sync::Arc::new(single_block_cfg_term(vec![], Terminator::Return(ret))),
+            body_cfg: std::sync::Arc::new(single_block_cfg_term(
+                vec![],
+                Terminator::Return(ret, None),
+            )),
         }
     }
 

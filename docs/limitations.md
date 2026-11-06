@@ -37,11 +37,7 @@ their issue.
 
 These drop or falsify information the analysis then relies on.
 
-| Shape in your code | Effect | Issue |
-|---|---|---|
-| A hook reached only through a `return` | Reported, but with no line or column, since `Terminator::Return` carries no span | [#140](https://github.com/rboudrouss/reactant-analyzer/issues/140) |
-
-It costs a position, never a finding.
+None known.
 
 **How to tell in general.** A run that read everything it was pointed at ends
 with `✓ … no issues found.`. A run that did not never prints that line, and lists
@@ -453,8 +449,9 @@ about which findings exist is affected [#129](https://github.com/rboudrouss/reac
 the source did not write: an `await` hoist, a ternary arm's temp, a spliced
 parameter binding, a callee `return` rewritten into an assignment. Each such
 statement binds a real source expression and takes its position. What the source
-cannot name, a callee `return` to which the IR gives no span, takes the call
-site's position, because that is where an inlined statement executes. A finding
+cannot name, a callee `return` rewritten into a binding, takes the call
+site's position, because that is where an inlined statement executes. A hook
+extracted from a `return` takes the position of that `return`. A finding
 with no position of its own takes the first one its witness chain names
 [#131](https://github.com/rboudrouss/reactant-analyzer/issues/131).
 

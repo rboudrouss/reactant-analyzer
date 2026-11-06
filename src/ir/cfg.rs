@@ -18,7 +18,7 @@ impl BasicBlock {
             stmt.for_each_expr(f);
         }
         match &self.term {
-            Terminator::Return(e) | Terminator::Branch { cond: e, .. } => f(e),
+            Terminator::Return(e, _) | Terminator::Branch { cond: e, .. } => f(e),
             Terminator::Jump(_) | Terminator::Unreachable => {}
         }
     }
@@ -29,7 +29,7 @@ impl BasicBlock {
             stmt.for_each_expr_mut(f);
         }
         match &mut self.term {
-            Terminator::Return(e) | Terminator::Branch { cond: e, .. } => f(e),
+            Terminator::Return(e, _) | Terminator::Branch { cond: e, .. } => f(e),
             Terminator::Jump(_) | Terminator::Unreachable => {}
         }
     }
@@ -46,13 +46,11 @@ pub enum Terminator {
         /// synthetic branches and manual-IR tests).
         span: Option<crate::ir::SourceRange>,
     },
-    /// Unlike [`Terminator::Branch`], this carries no span: nothing needed the
-    /// position of a `return` until a hook could be extracted from one (#4),
-    /// and adding it now is a 40-site IR change tracked separately. The cost is
-    /// that a hook reached only through a return yields findings with no line
-    /// number — visible but unlocated, which is still strictly better than the
-    /// silence it replaced.
-    Return(Expr),
+    /// The returned value, and where the `return` is in the source (`None` for
+    /// the implicit fall-through return, synthetic returns and manual-IR
+    /// tests). A hook reached only through a return (`return useMemo(…)`, #4)
+    /// takes this position as its call site.
+    Return(Expr, Option<crate::ir::SourceRange>),
     Unreachable,
 }
 
@@ -117,7 +115,7 @@ impl CFG {
                 stmt.for_each_expr(f);
             }
             match &block.term {
-                Terminator::Return(e) | Terminator::Branch { cond: e, .. } => f(e),
+                Terminator::Return(e, _) | Terminator::Branch { cond: e, .. } => f(e),
                 Terminator::Jump(_) | Terminator::Unreachable => {}
             }
         }
@@ -286,7 +284,7 @@ impl CFG {
             let targets: Vec<BlockId> = match &block.term {
                 Terminator::Jump(t) => vec![*t],
                 Terminator::Branch { then_, else_, .. } => vec![*then_, *else_],
-                Terminator::Return(_) | Terminator::Unreachable => vec![],
+                Terminator::Return(..) | Terminator::Unreachable => vec![],
             };
             for t in targets {
                 if !self.blocks.contains_key(&t) {

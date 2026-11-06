@@ -301,9 +301,10 @@ pub fn extract_hooks(
         // staged like a statement's, after the block's statements.
         let block = cfg.blocks.get_mut(&id).unwrap();
         match &mut block.term {
-            Terminator::Return(e) => {
+            Terminator::Return(e, span) => {
+                let span = *span;
                 let staged =
-                    ex.stage_hooks(std::mem::replace(e, Expr::Lit(Prim::Unit)), None, &mut new);
+                    ex.stage_hooks(std::mem::replace(e, Expr::Lit(Prim::Unit)), span, &mut new);
                 *e = staged;
             }
             Terminator::Branch { cond, span, .. } => {
@@ -1077,7 +1078,7 @@ fn hook_body_cfg(arg: Option<Expr>) -> CFG {
         BasicBlock {
             id: 0,
             stmts: vec![],
-            term: Terminator::Return(ret),
+            term: Terminator::Return(ret, None),
         },
     );
     CFG {
@@ -1236,7 +1237,7 @@ mod tests {
         assert!(
             matches!(
                 &body.blocks[&body.entry].term,
-                Terminator::Return(Expr::Call { fn_, .. })
+                Terminator::Return(Expr::Call { fn_, .. }, _)
                     if matches!(fn_.as_ref(), Expr::Var(v) if v == "handler")
             ),
             "the body must call and return the callback it was handed: {:?}",

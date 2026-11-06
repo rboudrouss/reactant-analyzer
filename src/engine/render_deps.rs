@@ -885,7 +885,7 @@ impl<'a> Analyzer<'a> {
                 self.transfer(stmt, &mut env, &p);
             }
             match &block.term {
-                Terminator::Return(e) => {
+                Terminator::Return(e, _) => {
                     self.collect(e, &env, &ctx);
                     if root {
                         let mut used = self.eval(e, &env).deps;

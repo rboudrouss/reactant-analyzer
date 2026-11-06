@@ -202,7 +202,7 @@ pub(crate) fn run_cfg<T: Transfer>(
                 // take EXPR's value as the return (ADR-020 item 7). The
                 // body's exit is a merge too: a return the other side of a
                 // branch answers with its own takes the branch's condition.
-                Terminator::Return(expr) => {
+                Terminator::Return(expr, _) => {
                     let returned = exec_callbacks_depth(transfer, expr, &env, ctx, depth);
                     let mut val = returned
                         .map_or_else(|| transfer.eval_expr(expr, &env, ctx), |ev| ev.as_val());
@@ -1222,7 +1222,7 @@ pub(crate) fn returned_sites<T: Transfer>(
     // `None` until a return is reached.
     let mut out: Option<Option<Sites>> = None;
     for (b, block) in &body.blocks {
-        let (Terminator::Return(expr), Some(exit)) = (&block.term, exits.get(b)) else {
+        let (Terminator::Return(expr, _), Some(exit)) = (&block.term, exits.get(b)) else {
             continue;
         };
         let sites = alloc_literal(transfer, expr, exit, ctx);

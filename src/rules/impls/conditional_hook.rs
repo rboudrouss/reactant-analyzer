@@ -92,7 +92,7 @@ mod tests {
             BasicBlock {
                 id: 1,
                 stmts: vec![],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                term: Terminator::Return(Expr::Lit(Prim::Unit), None),
             },
         );
         CFG {
@@ -142,7 +142,7 @@ mod tests {
             BasicBlock {
                 id: 3,
                 stmts: vec![],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                term: Terminator::Return(Expr::Lit(Prim::Unit), None),
             },
         );
         CFG {
@@ -242,7 +242,7 @@ mod tests {
             BasicBlock {
                 id: 1,
                 stmts: vec![],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                term: Terminator::Return(Expr::Lit(Prim::Unit), None),
             },
         );
         blocks.insert(
@@ -279,7 +279,7 @@ mod tests {
             BasicBlock {
                 id: 5,
                 stmts: vec![],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                term: Terminator::Return(Expr::Lit(Prim::Unit), None),
             },
         );
         let edges = vec![
@@ -456,7 +456,7 @@ mod tests {
                     rhs: Expr::StateVal(0),
                     span: None,
                 }],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                term: Terminator::Return(Expr::Lit(Prim::Unit), None),
             },
         );
         let comp = ComponentIR {
@@ -535,7 +535,7 @@ mod tests {
             BasicBlock {
                 id: 3,
                 stmts: vec![],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                term: Terminator::Return(Expr::Lit(Prim::Unit), None),
             },
         );
         let comp = ComponentIR {

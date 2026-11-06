@@ -433,7 +433,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             let envs = analyze_cfg(transfer, cfg, entry, &mut ac);
             if effect {
                 for (bid, block) in &cfg.blocks {
-                    if let Terminator::Return(ret) = &block.term
+                    if let Terminator::Return(ret, _) = &block.term
                         && let Some(env) = envs.get(bid)
                     {
                         let _ = exec_fn_value(transfer, ret, &[], env, &mut ac, 0);
@@ -2272,12 +2272,15 @@ mod tests {
             label: 0,
             body_cfg: crate::test_support::single_block_cfg_term(
                 vec![],
-                Terminator::Return(Expr::ArrayLit {
-                    id: ExprId(0),
-                    elems: vec![],
-                    arity: crate::ir::hooks::Arity::Exact(0),
-                    spread_at: vec![],
-                }),
+                Terminator::Return(
+                    Expr::ArrayLit {
+                        id: ExprId(0),
+                        elems: vec![],
+                        arity: crate::ir::hooks::Arity::Exact(0),
+                        spread_at: vec![],
+                    },
+                    None,
+                ),
             ),
             deps: DepsArg::List(DepsList::exact(vec![Expr::Var("x".to_string())])),
             span: None,
@@ -2350,7 +2353,7 @@ mod tests {
             BasicBlock {
                 id: 1,
                 stmts: vec![],
-                term: Terminator::Return(Expr::Var("x".to_string())),
+                term: Terminator::Return(Expr::Var("x".to_string()), None),
             },
         );
         let comp = ComponentIR {
@@ -2625,7 +2628,7 @@ mod tests {
             BasicBlock {
                 id: 3,
                 stmts: vec![],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                term: Terminator::Return(Expr::Lit(Prim::Unit), None),
             },
         );
         CFG {
@@ -2846,7 +2849,7 @@ mod tests {
             BasicBlock {
                 id: 2,
                 stmts: vec![],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                term: Terminator::Return(Expr::Lit(Prim::Unit), None),
             },
         );
         let eff_cfg = CFG {
@@ -3004,7 +3007,7 @@ mod tests {
             BasicBlock {
                 id: 2,
                 stmts: vec![],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                term: Terminator::Return(Expr::Lit(Prim::Unit), None),
             },
         );
         let eff_cfg = CFG {

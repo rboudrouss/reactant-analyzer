@@ -231,7 +231,7 @@ impl BlockBuilder {
                     // `stability_verdict` on them read an exit env missing a
                     // real path (a false negative). `Unreachable` now means only
                     // what it says — a `throw`, a stray `break`.
-                    term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                    term: Terminator::Return(Expr::Lit(Prim::Unit), None),
                 },
             );
         }
@@ -296,7 +296,7 @@ fn lower_stmt(stmt: &Statement, builder: &mut BlockBuilder) {
                 .as_ref()
                 .map(|e| lower_expr(e, builder))
                 .unwrap_or(Expr::Lit(Prim::Unit));
-            builder.seal_with(Terminator::Return(expr));
+            builder.seal_with(Terminator::Return(expr, builder.span_at(ret.span.start)));
         }
         Statement::IfStatement(if_) => {
             lower_if(&if_.test, &if_.consequent, if_.alternate.as_ref(), builder);
@@ -1079,7 +1079,7 @@ pub fn build_expr_fn_body_cfg(
     if let Some(Statement::ExpressionStatement(es)) = body.statements.first() {
         let expr = lower_expr(&es.expression, &mut builder);
         if !builder.is_terminated() {
-            builder.seal_with(Terminator::Return(expr));
+            builder.seal_with(Terminator::Return(expr, builder.span_at(es.span.start)));
         }
     }
     (param_names, builder.into_cfg(0))
@@ -1445,7 +1445,7 @@ mod tests {
         assert!(
             matches!(
                 cfg.blocks.get(&cfg.entry).map(|b| &b.term),
-                Some(Terminator::Return(Expr::Lit(Prim::Unit)))
+                Some(Terminator::Return(Expr::Lit(Prim::Unit), _))
             ),
             "got {:?}",
             cfg.blocks.get(&cfg.entry).map(|b| &b.term)

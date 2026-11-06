@@ -458,7 +458,7 @@ fn cleanup_bodies(body: &CFG) -> Cleanups<'_> {
     let mut bodies = Vec::new();
     let mut opaque = false;
     for block in body.blocks.values() {
-        let Terminator::Return(expr) = &block.term else {
+        let Terminator::Return(expr, _) = &block.term else {
             continue;
         };
         match expr.peel_ts() {
@@ -705,7 +705,7 @@ fn scan_cfg(
             scan_expr(expr, span, block_id, fns, depth, effect, handle, out);
         }
         match &block.term {
-            Terminator::Return(e) | Terminator::Branch { cond: e, .. } => {
+            Terminator::Return(e, _) | Terminator::Branch { cond: e, .. } => {
                 scan_expr(e, None, block_id, fns, depth, effect, None, out);
             }
             _ => {}

@@ -566,7 +566,7 @@ pub fn must_setter_on_all_paths(
                 call_sites.push((*bid, var, arg.clone(), *span));
             }
         }
-        if let Terminator::Return(expr) = &block.term
+        if let Terminator::Return(expr, _) = &block.term
             && let Some((var, arg)) = try_extract_setter_call(expr, setter_vars)
         {
             call_sites.push((*bid, var, arg.clone(), None));
@@ -631,7 +631,7 @@ pub fn must_setter_on_all_paths(
     let exit_blocks: Vec<_> = cfg
         .blocks
         .values()
-        .filter(|b| matches!(b.term, Terminator::Return(_) | Terminator::Unreachable))
+        .filter(|b| matches!(b.term, Terminator::Return(..) | Terminator::Unreachable))
         .collect();
     if exit_blocks.is_empty() {
         return MustResult::None;
@@ -685,7 +685,7 @@ impl ExitDominance {
         let exits = cfg
             .blocks
             .values()
-            .filter(|b| matches!(b.term, Terminator::Return(_)))
+            .filter(|b| matches!(b.term, Terminator::Return(..)))
             .map(|b| b.id)
             .filter(|id| reachable.contains(id))
             .collect();
@@ -1019,7 +1019,7 @@ pub fn must_stale_capture(
             }
         }
         // A concise arrow body (`() => setN(n + 1)`) returns the call.
-        if let Terminator::Return(expr) = &block.term
+        if let Terminator::Return(expr, _) = &block.term
             && try_extract_setter_call(expr, slot_setters).is_some()
         {
             write_blocks.insert(*bid);
@@ -1199,7 +1199,7 @@ pub enum CleanupVerdict {
 pub fn cleanup_verdict(body: &CFG) -> CleanupVerdict {
     let mut verdict = CleanupVerdict::Absent;
     for block in body.blocks.values() {
-        let Terminator::Return(expr) = &block.term else {
+        let Terminator::Return(expr, _) = &block.term else {
             continue;
         };
         match classify_returned(expr, body) {
@@ -1262,7 +1262,7 @@ mod tests {
             BasicBlock {
                 id: 2,
                 stmts: vec![set_call(20)],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                term: Terminator::Return(Expr::Lit(Prim::Unit), None),
             },
         );
         blocks.insert(

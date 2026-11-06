@@ -1519,7 +1519,7 @@ mod tests {
         };
         let body_entry = body.blocks.get(&body.entry).expect("body entry block");
         assert!(
-            matches!(body_entry.term, Terminator::Return(Expr::BinOp { .. })),
+            matches!(body_entry.term, Terminator::Return(Expr::BinOp { .. }, _)),
             "concise arrow body must Return its expression, got {:?}",
             body_entry.term
         );
@@ -1757,7 +1757,7 @@ mod tests {
         ] {
             let cfg = build(source);
             let body = cfg.blocks.get(&0).expect("expected entry block");
-            let Terminator::Return(Expr::BinOp { op, .. }) = &body.term else {
+            let Terminator::Return(Expr::BinOp { op, .. }, _) = &body.term else {
                 panic!("expected a BinOp return for {source}, got {:?}", body.term);
             };
             assert_eq!(
@@ -1781,7 +1781,7 @@ mod tests {
         ] {
             let cfg = build(source);
             let body = cfg.blocks.get(&0).expect("expected entry block");
-            let Terminator::Return(Expr::UnaryOp { op, .. }) = &body.term else {
+            let Terminator::Return(Expr::UnaryOp { op, .. }, _) = &body.term else {
                 panic!(
                     "expected a UnaryOp return for {source}, got {:?}",
                     body.term
@@ -1801,7 +1801,7 @@ mod tests {
         let cfg = build("function f(n) { return void g(n); }");
         let body = cfg.blocks.get(&0).expect("expected entry block");
         assert!(
-            matches!(body.term, Terminator::Return(Expr::Lit(Prim::Unit))),
+            matches!(body.term, Terminator::Return(Expr::Lit(Prim::Unit), _)),
             "void must evaluate to undefined, got {:?}",
             body.term
         );

@@ -2504,7 +2504,7 @@ impl<'a> SetterWalk<'a> {
                 // The terminator runs after every statement of the block.
                 let at = block_id.map(|b| (b, block.stmts.len()));
                 match &block.term {
-                    Terminator::Return(expr) => {
+                    Terminator::Return(expr, _) => {
                         // An effect body's returned function is its cleanup
                         // (ADR-027 §2) — descend it as such, whether inline
                         // or bound to a variable. Without this the cleanup's
@@ -3208,7 +3208,7 @@ pub fn setter_escapes(render_cfg: &CFG, hooks: &[HookEntry], aliases: &HashSet<V
                 }
                 Stmt::ExprStmt(e, _) => in_expr(e, aliases),
             }) || match &block.term {
-                Terminator::Return(e) | Terminator::Branch { cond: e, .. } => in_expr(e, aliases),
+                Terminator::Return(e, _) | Terminator::Branch { cond: e, .. } => in_expr(e, aliases),
                 _ => false,
             }
         })

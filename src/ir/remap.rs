@@ -202,7 +202,7 @@ fn remap_stmt(stmt: Stmt, off: Offsets) -> Stmt {
 
 fn remap_terminator(term: Terminator, off: Offsets) -> Terminator {
     match term {
-        Terminator::Return(e) => Terminator::Return(remap_expr(e, off)),
+        Terminator::Return(e, span) => Terminator::Return(remap_expr(e, off), span),
         Terminator::Branch {
             cond,
             then_,
@@ -405,7 +405,7 @@ mod tests {
                 rhs: Expr::StateVal(0),
                 span: None,
             }],
-            Terminator::Return(Expr::StateSetter(1)),
+            Terminator::Return(Expr::StateSetter(1), None),
         );
         let remapped = remap_cfg(cfg, Offsets::labels(10));
         let block = &remapped.blocks[&0];
@@ -418,7 +418,7 @@ mod tests {
         ));
         assert!(matches!(
             &block.term,
-            Terminator::Return(Expr::StateSetter(11))
+            Terminator::Return(Expr::StateSetter(11), None)
         ));
     }
 
@@ -435,7 +435,7 @@ mod tests {
                 label: 1,
                 body_cfg: single_block_cfg(
                     vec![Stmt::ExprStmt(Expr::StateSetter(0), None)],
-                    Terminator::Return(Expr::Lit(Prim::Unit)),
+                    Terminator::Return(Expr::Lit(Prim::Unit), None),
                 ),
                 deps: DepsArg::Absent,
                 span: None,

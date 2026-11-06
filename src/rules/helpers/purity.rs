@@ -90,7 +90,7 @@ impl<'a> Chase<'a> {
                 }
             }
             match &block.term {
-                Terminator::Return(e) | Terminator::Branch { cond: e, .. } if self.expr(e) => {
+                Terminator::Return(e, _) | Terminator::Branch { cond: e, .. } if self.expr(e) => {
                     return true;
                 }
                 _ => {}

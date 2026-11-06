@@ -1198,7 +1198,7 @@ mod tests {
     }
 
     fn single_block_cfg(stmts: Vec<Stmt>, ret: Expr) -> CFG {
-        crate::test_support::single_block_cfg_term(stmts, Terminator::Return(ret))
+        crate::test_support::single_block_cfg_term(stmts, Terminator::Return(ret, None))
     }
 
     // ── eval_expr ─────────────────────────────────────────────────────────────
@@ -1724,7 +1724,7 @@ mod tests {
             BasicBlock {
                 id: 2,
                 stmts: vec![],
-                term: Terminator::Return(Expr::Var("r2".to_string())),
+                term: Terminator::Return(Expr::Var("r2".to_string()), None),
             },
         );
         let cfg = CFG {
@@ -1753,7 +1753,7 @@ mod tests {
     fn a_return_the_other_side_answers_with_its_own_takes_the_condition() {
         // The body's exit is where the two returns meet: `Stable ⊔ Stable`
         // under a choice `a` makes is `Versioned({a})` (#197).
-        let (cfg, env) = two_returns_body(Terminator::Return(Expr::Var("r1".to_string())));
+        let (cfg, env) = two_returns_body(Terminator::Return(Expr::Var("r1".to_string()), None));
         let mut state = StateStore::bottom();
         state.update(0, StateValue::boolean(BoolVal::Top));
         let memo = MemoStore::new();
@@ -1814,7 +1814,7 @@ mod tests {
             BasicBlock {
                 id: 1,
                 stmts: vec![],
-                term: Terminator::Return(Expr::Var("c".to_string())),
+                term: Terminator::Return(Expr::Var("c".to_string()), None),
             },
         );
         blocks.insert(
@@ -1822,7 +1822,7 @@ mod tests {
             BasicBlock {
                 id: 2,
                 stmts: vec![],
-                term: Terminator::Return(Expr::Lit(Prim::Int(0))),
+                term: Terminator::Return(Expr::Lit(Prim::Int(0)), None),
             },
         );
         let body_cfg = CFG {
@@ -1947,7 +1947,7 @@ mod tests {
             BasicBlock {
                 id: 3,
                 stmts: vec![],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                term: Terminator::Return(Expr::Lit(Prim::Unit), None),
             },
         );
         CFG {
@@ -2103,7 +2103,7 @@ mod tests {
             BasicBlock {
                 id: 1,
                 stmts: vec![setter_call("s", Expr::Lit(Prim::Int(7)))],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                term: Terminator::Return(Expr::Lit(Prim::Unit), None),
             },
         );
         blocks.insert(
@@ -2111,7 +2111,7 @@ mod tests {
             BasicBlock {
                 id: 2,
                 stmts: vec![],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                term: Terminator::Return(Expr::Lit(Prim::Unit), None),
             },
         );
         let body_cfg = CFG {
@@ -2201,7 +2201,7 @@ mod tests {
             BasicBlock {
                 id: 4,
                 stmts: vec![],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                term: Terminator::Return(Expr::Lit(Prim::Unit), None),
             },
         );
         let body_cfg = CFG {
@@ -2274,11 +2274,14 @@ mod tests {
 
         // Reuse the while shape but give block 3 (exit) a real `c + 1` return.
         let mut body_cfg = while_loop_body(vec![setter_call("setOther", Expr::Lit(Prim::Int(1)))]);
-        body_cfg.blocks.get_mut(&3).unwrap().term = Terminator::Return(Expr::BinOp {
-            op: BinOp::Add,
-            lhs: Box::new(Expr::Var("c".to_string())),
-            rhs: Box::new(Expr::Lit(Prim::Int(1))),
-        });
+        body_cfg.blocks.get_mut(&3).unwrap().term = Terminator::Return(
+            Expr::BinOp {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Var("c".to_string())),
+                rhs: Box::new(Expr::Lit(Prim::Int(1))),
+            },
+            None,
+        );
 
         let mut heap = Heap::new();
         StateValueTransfer.exec_stmt(

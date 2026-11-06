@@ -155,7 +155,7 @@ pub fn splice_callee_into_cfg(
     let mut return_blocks: Vec<BlockId> = Vec::new();
     for (new_id, block) in callee_blocks.iter_mut() {
         block.id = *new_id;
-        if let (Some(fw), Terminator::Return(ret)) = (&forwarding, &mut block.term) {
+        if let (Some(fw), Terminator::Return(ret, _)) = (&forwarding, &mut block.term) {
             block.stmts.extend(fw.hoist(ret, call_span));
         }
         block.term = match std::mem::replace(&mut block.term, Terminator::Unreachable) {
@@ -171,7 +171,7 @@ pub fn splice_callee_into_cfg(
                 else_: else_ + block_offset,
                 span,
             },
-            Terminator::Return(ret) => {
+            Terminator::Return(ret, _) => {
                 if let Some(var) = bound_var {
                     // A `Let`, like the call statement it replaces: the
                     // variable is bound here, and an `Assign` without a `Let`
@@ -180,8 +180,8 @@ pub fn splice_callee_into_cfg(
                     block.stmts.push(Stmt::Let {
                         var: var.clone(),
                         rhs: ret,
-                        // `Terminator::Return` carries no span of its own, so
-                        // the call site is the only position available here.
+                        // The binding runs at the call site, not at the
+                        // callee's `return`.
                         span: call_span,
                     });
                 } else {
@@ -335,7 +335,7 @@ impl ReturnForwarding {
         }
         let mut keys: Option<ForwardedKeys> = None;
         for block in callee.values() {
-            let Terminator::Return(ret) = &block.term else {
+            let Terminator::Return(ret, _) = &block.term else {
                 continue;
             };
             let here = match ret.peel_ts() {
@@ -593,7 +593,7 @@ fn rename_vars_stmt(stmt: Stmt, ren: &HashMap<Var, Var>) -> Stmt {
 
 fn rename_vars_term(term: Terminator, ren: &HashMap<Var, Var>) -> Terminator {
     match term {
-        Terminator::Return(e) => Terminator::Return(rename_vars_expr(e, ren)),
+        Terminator::Return(e, span) => Terminator::Return(rename_vars_expr(e, ren), span),
         Terminator::Branch {
             cond,
             then_,
@@ -978,7 +978,7 @@ fn subst_vars_cfg(cfg: CFG, subst: &HashMap<Var, Expr>) -> CFG {
                 })
                 .collect();
             let term = match block.term {
-                Terminator::Return(e) => Terminator::Return(subst_vars_expr(e, subst)),
+                Terminator::Return(e, span) => Terminator::Return(subst_vars_expr(e, subst), span),
                 Terminator::Branch {
                     cond,
                     then_,
@@ -1035,7 +1035,7 @@ mod tests {
     /// the call at index 0).
     fn caller(stmts: Vec<Stmt>) -> CFG {
         let mut blocks = std::collections::BTreeMap::new();
-        let (id, b) = one_block(0, stmts, Terminator::Return(Expr::Lit(Prim::Unit)));
+        let (id, b) = one_block(0, stmts, Terminator::Return(Expr::Lit(Prim::Unit), None));
         blocks.insert(id, b);
         CFG {
             entry: 0,
@@ -1092,7 +1092,7 @@ mod tests {
     #[test]
     fn a_missing_call_site_block_leaves_the_caller_untouched() {
         let mut cblocks = std::collections::BTreeMap::new();
-        let (id, b) = one_block(0, vec![], Terminator::Return(Expr::Lit(Prim::Unit)));
+        let (id, b) = one_block(0, vec![], Terminator::Return(Expr::Lit(Prim::Unit), None));
         cblocks.insert(id, b);
         let callee = CFG {
             entry: 0,
@@ -1125,7 +1125,7 @@ mod tests {
         let (id, b) = one_block(
             0,
             vec![let_("a", Expr::Lit(Prim::Int(1)))],
-            Terminator::Return(Expr::Var("a".into())),
+            Terminator::Return(Expr::Var("a".into()), None),
         );
         cblocks.insert(id, b);
         let callee = CFG {
@@ -1174,7 +1174,7 @@ mod tests {
         let (id, b) = one_block(
             0,
             vec![let_("x", Expr::Lit(Prim::Int(9)))],
-            Terminator::Return(Expr::Var("x".into())),
+            Terminator::Return(Expr::Var("x".into()), None),
         );
         cblocks.insert(id, b);
         let callee = CFG {
@@ -1199,7 +1199,7 @@ mod tests {
         let (i1, b1) = one_block(
             1,
             vec![let_("b", Expr::Lit(Prim::Int(2)))],
-            Terminator::Return(Expr::Var("b".into())),
+            Terminator::Return(Expr::Var("b".into()), None),
         );
         cblocks.insert(i0, b0);
         cblocks.insert(i1, b1);
@@ -1250,7 +1250,7 @@ mod tests {
     fn params_bind_args_under_fresh_names() {
         // callee(p): return p; spliced with arg `Lit(5)` → `let p#2 = 5`.
         let mut cblocks = std::collections::BTreeMap::new();
-        let (id, b) = one_block(0, vec![], Terminator::Return(Expr::Var("p".into())));
+        let (id, b) = one_block(0, vec![], Terminator::Return(Expr::Var("p".into()), None));
         cblocks.insert(id, b);
         let callee = CFG {
             entry: 0,
@@ -1351,7 +1351,7 @@ mod tests {
         ];
         let mut edges = vec![];
         if let [only] = rets.as_slice() {
-            let (id, b) = one_block(0, prelude, Terminator::Return(only.clone()));
+            let (id, b) = one_block(0, prelude, Terminator::Return(only.clone(), None));
             cblocks.insert(id, b);
         } else {
             let (id, b) = one_block(
@@ -1366,7 +1366,7 @@ mod tests {
             );
             cblocks.insert(id, b);
             for (i, ret) in rets.into_iter().enumerate() {
-                let (id, b) = one_block(i + 1, vec![], Terminator::Return(ret));
+                let (id, b) = one_block(i + 1, vec![], Terminator::Return(ret, None));
                 cblocks.insert(id, b);
                 edges.push(Edge {
                     from: 0,
@@ -1601,7 +1601,7 @@ mod tests {
         let mut ren = HashMap::new();
         ren.insert("p".to_string(), "p#0".to_string());
         let mut inner_blocks = std::collections::BTreeMap::new();
-        let (id, b) = one_block(0, vec![], Terminator::Return(Expr::Var("p".into())));
+        let (id, b) = one_block(0, vec![], Terminator::Return(Expr::Var("p".into()), None));
         inner_blocks.insert(id, b);
         let lambda = Expr::FnLit {
             id: ExprId(0),
@@ -1618,7 +1618,7 @@ mod tests {
         };
         let ret = &body_cfg.blocks[&0].term;
         assert!(
-            matches!(ret, Terminator::Return(Expr::Var(v)) if v == "p"),
+            matches!(ret, Terminator::Return(Expr::Var(v), _) if v == "p"),
             "shadowed closure param `p` must NOT be renamed: {ret:?}"
         );
     }

@@ -443,7 +443,7 @@ mod tests {
     use std::sync::Arc;
 
     fn single_return_cfg(expr: Expr) -> CFG {
-        crate::test_support::single_block_cfg_term(vec![], Terminator::Return(expr))
+        crate::test_support::single_block_cfg_term(vec![], Terminator::Return(expr, None))
     }
 
     fn lambda(params: &[&str], body: Expr) -> Expr {

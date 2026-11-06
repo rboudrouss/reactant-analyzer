@@ -773,7 +773,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                         return None;
                     };
                     let mut returns = body_cfg.blocks.values().filter_map(|b| match &b.term {
-                        Terminator::Return(r) => Some(r),
+                        Terminator::Return(r, _) => Some(r),
                         _ => None,
                     });
                     let (Some(r), None) = (returns.next(), returns.next()) else {
@@ -1531,7 +1531,7 @@ fn updater_overwrites(written_expr: Option<&Expr>) -> Option<HashSet<Symbol>> {
     let mut out = HashSet::new();
     let mut returns = 0usize;
     for block in body_cfg.blocks.values() {
-        let crate::ir::cfg::Terminator::Return(e) = &block.term else {
+        let crate::ir::cfg::Terminator::Return(e, _) = &block.term else {
             continue;
         };
         returns += 1;

@@ -150,7 +150,7 @@ mod tests {
             BasicBlock {
                 id: 3,
                 stmts: vec![],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                term: Terminator::Return(Expr::Lit(Prim::Unit), None),
             },
         );
         CFG {
@@ -300,7 +300,7 @@ mod tests {
             BasicBlock {
                 id: 1,
                 stmts: vec![],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                term: Terminator::Return(Expr::Lit(Prim::Unit), None),
             },
         );
         let cfg = CFG {
@@ -372,7 +372,7 @@ mod tests {
             BasicBlock {
                 id: 3,
                 stmts: vec![],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                term: Terminator::Return(Expr::Lit(Prim::Unit), None),
             },
         );
         let cfg = CFG {
@@ -470,7 +470,7 @@ mod tests {
             BasicBlock {
                 id: 3,
                 stmts: vec![],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                term: Terminator::Return(Expr::Lit(Prim::Unit), None),
             },
         );
         let cfg = CFG {
@@ -566,7 +566,7 @@ mod tests {
             BasicBlock {
                 id: 1,
                 stmts: vec![],
-                term: Terminator::Return(Expr::Lit(Prim::Null)),
+                term: Terminator::Return(Expr::Lit(Prim::Null), None),
             },
         );
         blocks.insert(
@@ -578,7 +578,7 @@ mod tests {
                     rhs: Expr::Var("r1".to_string()),
                     span: None,
                 }],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                term: Terminator::Return(Expr::Lit(Prim::Unit), None),
             },
         );
         let cfg = CFG {
@@ -613,7 +613,7 @@ mod tests {
         use crate::ir::types::ExprId;
         let body = crate::test_support::single_block_cfg_term(
             vec![],
-            Terminator::Return(Expr::Var("r1".to_string())),
+            Terminator::Return(Expr::Var("r1".to_string()), None),
         );
         let cfg = single_block_cfg(vec![
             Stmt::Let {
@@ -683,7 +683,7 @@ mod tests {
             BasicBlock {
                 id: 1,
                 stmts: vec![],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                term: Terminator::Return(Expr::Lit(Prim::Unit), None),
             },
         );
         blocks.insert(
@@ -691,7 +691,7 @@ mod tests {
             BasicBlock {
                 id: 2,
                 stmts: vec![],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                term: Terminator::Return(Expr::Lit(Prim::Unit), None),
             },
         );
         let cfg = CFG {
@@ -793,7 +793,7 @@ mod tests {
     /// both sides: the lowering puts `true` where a condition is unknown.
     #[test]
     fn a_side_no_value_takes_runs_nothing_a_literal_test_keeps_both() {
-        let ret = || Terminator::Return(Expr::Lit(Prim::Unit));
+        let ret = || Terminator::Return(Expr::Lit(Prim::Unit), None);
         let program = |cond: Expr| {
             cfg_of(
                 vec![
@@ -868,7 +868,7 @@ mod tests {
                     }],
                     Terminator::Jump(1),
                 ),
-                (5, vec![], Terminator::Return(Expr::Lit(Prim::Unit))),
+                (5, vec![], Terminator::Return(Expr::Lit(Prim::Unit), None)),
             ],
             &[(4, 1)],
         );
@@ -886,10 +886,13 @@ mod tests {
             BasicBlock {
                 id: 0,
                 stmts: vec![],
-                term: Terminator::Return(Expr::Call {
-                    fn_: Box::new(Expr::Var("setN".to_string())),
-                    args: vec![Expr::Lit(Prim::Int(99))],
-                }),
+                term: Terminator::Return(
+                    Expr::Call {
+                        fn_: Box::new(Expr::Var("setN".to_string())),
+                        args: vec![Expr::Lit(Prim::Int(99))],
+                    },
+                    None,
+                ),
             },
         );
         let cfg = CFG {
@@ -923,7 +926,7 @@ mod tests {
                     rhs: Expr::StateSetter(0),
                     span: None,
                 }],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                term: Terminator::Return(Expr::Lit(Prim::Unit), None),
             },
         );
         let cfg = CFG {
@@ -953,11 +956,14 @@ mod tests {
             BasicBlock {
                 id: 0,
                 stmts: vec![],
-                term: Terminator::Return(Expr::BinOp {
-                    op: crate::ir::expr::BinOp::Add,
-                    lhs: Box::new(Expr::StateVal(0)),
-                    rhs: Box::new(Expr::Lit(Prim::Int(1))),
-                }),
+                term: Terminator::Return(
+                    Expr::BinOp {
+                        op: crate::ir::expr::BinOp::Add,
+                        lhs: Box::new(Expr::StateVal(0)),
+                        rhs: Box::new(Expr::Lit(Prim::Int(1))),
+                    },
+                    None,
+                ),
             },
         );
         let updater_cfg = Arc::new(CFG {
@@ -972,14 +978,17 @@ mod tests {
             BasicBlock {
                 id: 0,
                 stmts: vec![],
-                term: Terminator::Return(Expr::Call {
-                    fn_: Box::new(Expr::Var("setN".to_string())),
-                    args: vec![Expr::FnLit {
-                        id: ExprId(0),
-                        params: vec!["c".to_string()],
-                        body_cfg: updater_cfg,
-                    }],
-                }),
+                term: Terminator::Return(
+                    Expr::Call {
+                        fn_: Box::new(Expr::Var("setN".to_string())),
+                        args: vec![Expr::FnLit {
+                            id: ExprId(0),
+                            params: vec!["c".to_string()],
+                            body_cfg: updater_cfg,
+                        }],
+                    },
+                    None,
+                ),
             },
         );
         let cfg = CFG {

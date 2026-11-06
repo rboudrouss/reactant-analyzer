@@ -26,7 +26,7 @@ use crate::{
 /// One-block render CFG terminated by `return unit` — the canonical trivial
 /// body used by most rule/engine tests (entry 0, block id 0, no edges).
 pub(crate) fn single_block_cfg(stmts: Vec<Stmt>) -> CFG {
-    single_block_cfg_term(stmts, Terminator::Return(Expr::Lit(Prim::Unit)))
+    single_block_cfg_term(stmts, Terminator::Return(Expr::Lit(Prim::Unit), None))
 }
 
 /// One-block CFG with a caller-chosen terminator (entry 0, block id 0, no edges).

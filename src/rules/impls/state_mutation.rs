@@ -214,7 +214,7 @@ impl<'a> Collector<'a> {
                 }
             }
             match &block.term {
-                Terminator::Return(e) | Terminator::Branch { cond: e, .. } => {
+                Terminator::Return(e, _) | Terminator::Branch { cond: e, .. } => {
                     self.walk_expr(e, scopes, None, container);
                 }
                 _ => {}
@@ -316,7 +316,7 @@ impl<'a> Collector<'a> {
         // (possibly through a local alias — chase with the body's bindings).
         scopes.push(Scope::from_cfg(body_cfg));
         for block in body_cfg.blocks.values() {
-            if let Terminator::Return(e) = &block.term
+            if let Terminator::Return(e, _) = &block.term
                 && self.chase(e, scopes, &mut HashSet::new()) == MutRoot::State(label)
             {
                 self.ident_sets.push((

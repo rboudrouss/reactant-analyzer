@@ -429,7 +429,7 @@ fn ref_may_move(
                         return true;
                     }
                 }
-                if let Terminator::Return(e) | Terminator::Branch { cond: e, .. } = &b.term
+                if let Terminator::Return(e, _) | Terminator::Branch { cond: e, .. } = &b.term
                     && self.expr(e)
                 {
                     return true;

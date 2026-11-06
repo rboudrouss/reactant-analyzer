@@ -41,7 +41,7 @@ pub(crate) fn outgoing<D: AbstractDomain>(
                 })
                 .collect(),
             Terminator::Jump(succ) => vec![(*succ, env_out.clone())],
-            Terminator::Return(_) | Terminator::Unreachable => vec![],
+            Terminator::Return(..) | Terminator::Unreachable => vec![],
         }
     } else {
         cfg.successors(b)
@@ -94,7 +94,7 @@ pub(crate) fn exit_env_of<D: AbstractDomain>(
 ) -> Option<AbstractEnv<D>> {
     cfg.blocks
         .values()
-        .filter(|b| matches!(b.term, Terminator::Return(_)))
+        .filter(|b| matches!(b.term, Terminator::Return(..)))
         .filter_map(|b| exits.get(&b.id))
         .cloned()
         .reduce(|acc, env| acc.join(&env))

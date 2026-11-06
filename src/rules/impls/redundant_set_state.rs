@@ -339,7 +339,7 @@ mod tests {
                 BasicBlock {
                     id,
                     stmts,
-                    term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                    term: Terminator::Return(Expr::Lit(Prim::Unit), None),
                 },
             );
         }
