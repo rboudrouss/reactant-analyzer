@@ -1155,3 +1155,47 @@ fn many_member_seeds_are_named_by_the_handle_they_share() {
         msgs[0]
     );
 }
+
+// ── A destructured prop with a default (#256) ─────────────────────────────────
+
+#[test]
+fn a_state_seeded_from_a_defaulted_destructured_prop_is_a_seed() {
+    // `{ defaultTheme = "system" }` binds the name from a temp that holds the
+    // prop joined with its default: the state is still seeded from the prop.
+    let d = diags_for(
+        r#"
+        import { useState } from "react";
+        function ThemeProvider({ defaultTheme = "system" }) {
+          const [theme, setTheme] = useState(defaultTheme);
+          return <button onClick={() => setTheme("dark")}>{theme}</button>;
+        }
+        "#,
+        "ThemeProvider",
+    );
+    assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
+    assert!(
+        d[0].message.contains("`defaultTheme`"),
+        "message: {}",
+        d[0].message
+    );
+}
+
+#[test]
+fn a_defaulted_prop_fed_by_a_moving_parent_state_still_errors() {
+    let d = diags_for(
+        r#"
+        import { useState } from "react";
+        function Parent() {
+          const [user, setUser] = useState({ name: "a" });
+          return <Child user={user} onRename={() => setUser({ name: "b" })} />;
+        }
+        function Child({ user = { name: "z" } }) {
+          const [local, setLocal] = useState(user);
+          return <button onClick={() => setLocal({ name: "c" })}>{local.name}</button>;
+        }
+        "#,
+        "Child",
+    );
+    assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
+    assert_eq!(d[0].severity(), Severity::Error, "{d:?}");
+}

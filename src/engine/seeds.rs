@@ -272,9 +272,29 @@ fn normalize_to_prop(
     let Some(rhss) = bindings.get(path.root.as_str()) else {
         return vec![];
     };
+    // A multi-write binding is uncertain and not chased, except a default
+    // temp, which is the join of its writes: the name is seeded from each.
+    if crate::ir::names::is_default_temp(&path.root) {
+        let chased = rhss
+            .iter()
+            .flat_map(|rhs| chase_write(rhs, path, param, bindings, &seen))
+            .collect();
+        return dedup_norm(chased);
+    }
     let [single] = rhss.as_slice() else {
         return vec![];
     };
+    chase_write(single, path, param, bindings, &seen)
+}
+
+/// [`normalize_to_prop`] through one right-hand side `single` of `path`'s root.
+fn chase_write(
+    single: &Expr,
+    path: &AccessPath,
+    param: &Var,
+    bindings: &HashMap<&str, Vec<&Expr>>,
+    seen: &HashSet<Var>,
+) -> Vec<NormPath> {
     // A member chain: splice this path's segments onto it and keep going.
     if let Some(base) = as_member_chain(single) {
         let combined = AccessPath {
@@ -285,7 +305,7 @@ fn normalize_to_prop(
                 .chain(path.segments.iter().cloned())
                 .collect(),
         };
-        return normalize_to_prop(&combined, param, bindings, &seen);
+        return normalize_to_prop(&combined, param, bindings, seen);
     }
     // An object literal the path selects a readable member of: `{ a: x }.a`
     // *is* `x`, so the selector is consumed and the chase stays exact.
@@ -301,7 +321,7 @@ fn normalize_to_prop(
                 .chain(path.segments[1..].iter().cloned())
                 .collect(),
         };
-        return normalize_to_prop(&combined, param, bindings, &seen);
+        return normalize_to_prop(&combined, param, bindings, seen);
     }
     // Nothing to select through: widen to every path the RHS reads, dropping
     // the outer segments. Inexact by construction.
@@ -312,7 +332,7 @@ fn normalize_to_prop(
     let mut out = Vec::new();
     for p in sub {
         out.extend(
-            normalize_to_prop(&p, param, bindings, &seen)
+            normalize_to_prop(&p, param, bindings, seen)
                 .into_iter()
                 .map(|n| NormPath {
                     path: n.path,

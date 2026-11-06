@@ -69,6 +69,14 @@ fn is_call_temp(var: &str) -> bool {
     var.starts_with("__call_") || var.starts_with("__hook_")
 }
 
+/// The temp a destructuring default binds, `__dflt_N` (#256): written once
+/// with the member the pattern reads, then again with the default when that
+/// member is `undefined`. Its value is the join of its writes, so every write
+/// is a source of the name it stands for.
+pub fn is_default_temp(var: &str) -> bool {
+    var.starts_with("__dflt_")
+}
+
 /// Bound on temps read through temps (`get()()()`): lowering never makes a
 /// cycle, the bound only keeps a malformed IR from looping.
 const MAX_TEMP_DEPTH: usize = 8;
