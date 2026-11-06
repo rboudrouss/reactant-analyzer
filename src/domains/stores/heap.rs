@@ -52,11 +52,17 @@ pub enum HeapValue {
 /// place, or left out of a library object's contract. An object neither open
 /// nor holding `others` has no own member beyond `named`, which is what lets
 /// a later spread of it leave the members written before the spread in place.
+///
+/// `unseen`: code the analysis does not see holds this object (#258), so any
+/// member may now hold anything. Unlike `open`, a fact about this object
+/// only: the next object the site allocates is not yet held
+/// ([`Heap::alloc_obj`]), and reads before its own escape see its members.
 #[derive(Debug, Clone, Default)]
 pub struct Members {
     pub named: HashMap<Symbol, EnvVal<StateValue>>,
     pub others: Option<EnvVal<StateValue>>,
     pub open: bool,
+    pub unseen: bool,
 }
 
 impl Members {
@@ -105,6 +111,26 @@ impl Members {
         self.named.values().chain(&self.others)
     }
 
+    /// Join into this object the writes `written` records: a member before
+    /// its write holds what this object says, or what it lacks.
+    pub fn overlay(&mut self, written: &Members) {
+        let lacking = self.lacking();
+        for (m, ev) in &written.named {
+            let before = self.named.get(m).unwrap_or(&lacking);
+            let joined = before.join(ev);
+            self.named.insert(m.clone(), joined);
+        }
+        if let Some(others) = &written.others {
+            self.write_any(others);
+        }
+        self.open |= written.open;
+    }
+
+    /// The object may hold a member, or a value, no entry says.
+    pub fn is_open(&self) -> bool {
+        self.open || self.unseen
+    }
+
     /// What a member `named` lacks may hold: `undefined`, one of `others`, or
     /// anything when the object is open.
     fn lacking(&self) -> EnvVal<StateValue> {
@@ -113,7 +139,7 @@ impl Members {
             .others
             .as_ref()
             .map_or(absent.clone(), |o| o.join(&absent));
-        match self.open {
+        match self.is_open() {
             true => known.join(&EnvVal::Val(StateValue::top())),
             false => known,
         }
@@ -154,6 +180,7 @@ impl Members {
             named,
             others,
             open: self.open || other.open,
+            unseen: self.unseen || other.unseen,
         }
     }
 
@@ -168,6 +195,7 @@ impl Members {
                 (Some(_), None) => false,
             }
             && (!self.open || other.open)
+            && (!self.unseen || other.unseen)
     }
 }
 
@@ -186,11 +214,18 @@ impl Members {
 /// body that binds it shares, and any of those bodies may run between two
 /// of another's statements, so each statement starts from the join
 /// ([`Heap::share_assigned`]). Kept across passes, like the cells.
+///
+/// `written` is, per object site, every write made into one of its objects
+/// after the literal built it ([`Heap::write_after`]): a closure that ran
+/// after the read, a later effect. The next object the site allocates
+/// starts from it as well ([`Heap::alloc_obj`]), so a write the order of a
+/// pass put after the read is seen by the read of the next pass (#258).
 #[derive(Debug, Clone, Default)]
 pub struct Heap {
     cells: HashMap<ExprId, HeapValue>,
     escaped: BTreeSet<ExprId>,
     assigned: AbstractEnv<StateValue>,
+    written: HashMap<ExprId, Members>,
 }
 
 impl Heap {
@@ -218,22 +253,32 @@ impl Heap {
         self.cells.insert(id, val);
     }
 
-    /// An object literal evaluated at site `id`. The site stands for every
-    /// object it allocates, in every pass: it keeps what was written into
-    /// the ones before — by a closure that ran after the read, or by code
-    /// the analysis does not see (#258).
-    pub fn alloc_obj(&mut self, id: ExprId, members: Members) {
-        let members = match self.cells.get(&id) {
-            Some(HeapValue::Obj(before)) => before.join(&members),
-            _ => members,
-        };
+    /// An object literal evaluated at site `id`: what the literal puts
+    /// there, and every write made into an object of the site after its
+    /// literal (#258). Neither the values the literal held in an earlier
+    /// pass nor what unseen code may have done to an earlier object is
+    /// kept: the new object is not held by it yet.
+    pub fn alloc_obj(&mut self, id: ExprId, mut members: Members) {
+        if let Some(written) = self.written.get(&id) {
+            members.overlay(written);
+        }
         self.cells.insert(id, HeapValue::Obj(members));
+    }
+
+    /// Apply `write` to the object at site `id`, and keep it for the
+    /// objects the site allocates next.
+    pub fn write_after(&mut self, id: ExprId, write: impl Fn(&mut Members)) {
+        if let Some(HeapValue::Obj(obj)) = self.cells.get_mut(&id) {
+            write(obj);
+            write(self.written.entry(id).or_default());
+        }
     }
 
     /// Code the analysis does not see now holds `sites`. It may write any
     /// member of every object it reaches through members, from here on
-    /// (#258): each is opened. A closure it reaches runs with the handlers
-    /// ([`Heap::escaped_fns`]), its own writes landing where they do.
+    /// (#258): each is marked `unseen`. A closure it reaches runs with the
+    /// handlers ([`Heap::escaped_fns`]), its own writes landing where they
+    /// do.
     pub fn escape(&mut self, sites: &Sites) {
         self.escaped.extend(sites.ids.iter().copied());
         let mut stack: Vec<ExprId> = sites.ids.iter().copied().collect();
@@ -244,7 +289,7 @@ impl Heap {
             }
             if let Some(HeapValue::Obj(obj)) = self.cells.get_mut(&id) {
                 stack.extend(obj.values().filter_map(EnvVal::locs).flatten().copied());
-                obj.write_unknown();
+                obj.unseen = true;
             }
         }
     }
@@ -325,6 +370,7 @@ impl Heap {
             match self.get(id) {
                 Some(HeapValue::Obj(obj)) if obj.named.contains_key(member) => {
                     entries.push(&obj.named[member]);
+                    open |= obj.unseen;
                 }
                 Some(HeapValue::Obj(Members {
                     others: Some(others),
@@ -467,10 +513,20 @@ impl Heap {
                 false => assigned.join_binding_from(var, &other.assigned),
             };
         }
+        let mut written = self.written.clone();
+        for (id, theirs) in &other.written {
+            let merged = match (written.get(id), widen) {
+                (None, _) => theirs.clone(),
+                (Some(mine), true) => mine.widen(&mine.join(theirs)),
+                (Some(mine), false) => mine.join(theirs),
+            };
+            written.insert(*id, merged);
+        }
         Heap {
             cells: result,
             escaped: self.escaped.union(&other.escaped).copied().collect(),
             assigned,
+            written,
         }
     }
 
@@ -506,6 +562,10 @@ impl Heap {
                     (HeapValue::Obj(a), Some(HeapValue::Obj(b))) => a.leq(b),
                     _ => false,
                 })
+            && self
+                .written
+                .iter()
+                .all(|(id, w)| other.written.get(id).is_some_and(|o| w.leq(o)))
             && {
                 let mut theirs = other.assigned.clone();
                 self.assigned

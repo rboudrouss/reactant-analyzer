@@ -737,7 +737,7 @@ fn props_cache_key(
                         .iter()
                         .map(|ev| (format!("@{}.*", id.0), ev.as_val())),
                 );
-                if obj.open {
+                if obj.is_open() {
                     key.insert(format!("@{}.?", id.0), StateValue::top());
                 }
             }

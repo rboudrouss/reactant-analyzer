@@ -418,15 +418,13 @@ fn exec_stmt_core<T: Transfer>(
                 MemberKey::Index(idx) => member_key(idx, env),
             };
             for id in placed.map(|s| s.ids).unwrap_or_default() {
-                if let Some(HeapValue::Obj(obj)) = ctx.heap.get_mut(id) {
-                    match &member {
-                        Some(m) => {
-                            let joined = join_member(obj.named.get(m), &new_val);
-                            obj.named.insert(m.clone(), joined);
-                        }
-                        None => obj.write_any(&new_val),
+                ctx.heap.write_after(id, |obj| match &member {
+                    Some(m) => {
+                        let joined = join_member(obj.named.get(m), &new_val);
+                        obj.named.insert(m.clone(), joined);
                     }
-                }
+                    None => obj.write_any(&new_val),
+                });
             }
         }
         // Expression statements never reach the binding core — `exec_full_stmt`
@@ -477,16 +475,14 @@ fn havoc_members<T: Transfer>(
     // copies its sources' members over the named ones: the object holds
     // members no entry says (#76).
     let assign = args.first().is_some_and(|a| std::ptr::eq(a, receiver));
+    if assign {
+        all = join_member(Some(&all), &EnvVal::Val(StateValue::top()));
+    }
     for id in ids {
-        if let Some(HeapValue::Obj(obj)) = ctx.heap.get_mut(id) {
-            for member in obj.named.values_mut() {
-                *member = all.clone();
-            }
+        ctx.heap.write_after(id, |obj| {
+            obj.write_any(&all);
             obj.open = true;
-            if assign {
-                obj.write_unknown();
-            }
-        }
+        });
     }
 }
 
@@ -665,7 +661,8 @@ fn spread_into(members: &mut Members, source: Option<&Sites>, heap: &Heap) {
             .ids
             .iter()
             .map(|id| match heap.get(*id) {
-                Some(HeapValue::Obj(obj)) => Some(obj),
+                // An object unseen code holds may hold anything (#258).
+                Some(HeapValue::Obj(obj)) if !obj.unseen => Some(obj),
                 _ => None,
             })
             .collect(),
@@ -1039,7 +1036,7 @@ pub(crate) fn callback_args<T: Transfer>(
             let mut entry: Option<EnvVal<StateValue>> = sites.open.then(|| top.clone());
             for id in ids {
                 let members: Vec<EnvVal<StateValue>> = match ctx.heap.get(id) {
-                    Some(HeapValue::Obj(o)) if o.open => {
+                    Some(HeapValue::Obj(o)) if o.is_open() => {
                         o.values().cloned().chain([top.clone()]).collect()
                     }
                     Some(HeapValue::Obj(o)) => o.values().cloned().collect(),

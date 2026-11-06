@@ -501,3 +501,49 @@ fn a_prop_stable_at_every_call_site_stays_silent() {
     );
     assert!(d.is_empty(), "{d:?}");
 }
+
+#[test]
+fn a_member_read_before_the_object_escapes_keeps_its_freshness() {
+    // `opts` reaches a callee the analysis does not see after `items` was
+    // read off it; the object the next render allocates is not held yet, so
+    // `items` is the fresh literal (#258, dub `useTable`'s `columns`).
+    let d = program_diags(
+        r#"
+        import { useMemo } from "react";
+        import { format } from "ext";
+        export function App() {
+          const opts = { items: [1, 2] };
+          const { items } = opts;
+          const total = useMemo(() => items.length, [items]);
+          format(opts);
+          return <div>{total}</div>;
+        }
+        "#,
+        "App",
+    );
+    assert_eq!(d.len(), 1, "{d:?}");
+}
+
+#[test]
+fn a_member_keeps_the_value_its_literal_puts_there_in_this_pass() {
+    // `props.columns` is the memo, fresh every render. An object site keeps
+    // the writes made into its objects after their literal (#258), not the
+    // value an earlier pass's literal put there — the memo before the
+    // fixpoint had computed it (dub `useTable`'s `columns`).
+    let d = program_diags(
+        r#"
+        import { useMemo, useState } from "react";
+        export function App() {
+          const [w] = useState("w");
+          const ws = { w };
+          const columns = useMemo(() => [1, 2].filter((c) => c > 0), [ws]);
+          const props = { columns };
+          const { columns: cols } = props;
+          const normalized = useMemo(() => cols.map((c) => c), [cols]);
+          return <div>{normalized.length}</div>;
+        }
+        "#,
+        "App",
+    );
+    assert_eq!(d.len(), 2, "{d:?}");
+}
