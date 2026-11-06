@@ -62,7 +62,11 @@ that writes it (see *Cross-file limits*).
   its writes reach the state store as possible writes, never as writes of the body that handed it
   over. So a loop it closes in an effect is claimed only through the slot values it moves, as a
   Warning, and its writes can mask the in-cycle growth a widening claim reads, as a handler's do
-  [#19](https://github.com/rboudrouss/reactant-analyzer/issues/19). A closure reached through a
+  [#19](https://github.com/rboudrouss/reactant-analyzer/issues/19). The writer relation reads one
+  the render hands to such a callee or hook — a literal, or a name bound to one or to a
+  `useCallback` value — as a possible render write
+  [#262](https://github.com/rboudrouss/reactant-analyzer/issues/262); one held by an object the
+  render hands over (`useTable({ onClick: () => setN(1) })`) is not read there. A closure reached through a
   local function's parameter (`const f = (g) => g(); f(() => setN(1))`) or an array method's
   callback parameter (`fs.forEach((f) => f())`, the parameter being the array's entries) runs
   where it is called [#253](https://github.com/rboudrouss/reactant-analyzer/issues/253), a possible

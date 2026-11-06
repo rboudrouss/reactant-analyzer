@@ -137,13 +137,19 @@ fn setter_calls(
     extra_fn_bindings: &HashMap<Var, Arc<CFG>>,
     converged: Option<&ConvergedFns<'_>>,
 ) -> Vec<SetterCall> {
-    let converged = converged.map(|c| c.seen_from(cfg, None));
     let mut fn_bindings = collect_fn_bindings(cfg);
-    for (k, v) in extra_fn_bindings {
+    let callback_fns = converged
+        .filter(|c| std::ptr::eq(cfg, c.render))
+        .map(ConvergedFns::callback_fns);
+    for (k, v) in extra_fn_bindings
+        .iter()
+        .chain(callback_fns.iter().flatten())
+    {
         fn_bindings
             .entry(k.clone())
             .or_insert_with(|| Arc::clone(v));
     }
+    let converged = converged.map(|c| c.seen_from(cfg, None));
     let mut found = Found::default();
     let empty = HashSet::new();
     let wrappers = wrapper_callees(cfg);
@@ -221,9 +227,9 @@ pub(crate) struct WriteSite {
 /// handler body is extracted out of the render CFG, so a `set(inc)` whose
 /// `inc` was defined in render is invisible to a walk of the body alone. A
 /// name the walked body binds itself drops out of the set, fail-closed, the
-/// same device as `shadowed`. `converged` are the closures the converged
-/// values put behind a name or member path ([`ConvergedFns`]), as seen from
-/// `cfg` ([`ConvergedFns::seen_from`]).
+/// same device as `shadowed`; the render binds them. `converged` are the
+/// closures the converged values put behind a name or member path
+/// ([`ConvergedFns`]), as seen from `cfg` ([`ConvergedFns::seen_from`]).
 ///
 /// `dispatches`: some body of the program fires event listeners itself
 /// ([`SetterWalk::dispatches`]).
@@ -243,8 +249,12 @@ pub(crate) fn collect_write_sites(
     let wrappers = wrapper_callees(cfg);
     let mut fn_bindings = collect_fn_bindings(cfg);
     let mut certified = certified_fn_names(cfg, &fn_bindings);
+    // The render binds the names `outer_fns` are about: a `useCallback` value
+    // the render hands out is its body there too (#262).
     let mut local_binders: HashSet<Var> = HashSet::new();
-    collect_binders(cfg, &mut local_binders);
+    if !std::ptr::eq(cfg, converged.render) {
+        collect_binders(cfg, &mut local_binders);
+    }
     for (v, body) in outer_fns {
         if local_binders.contains(v) {
             continue;
@@ -413,6 +423,7 @@ pub(crate) struct ConvergedFns<'a> {
     scopes: Vec<(&'a [Var], &'a CFG)>,
     heap: &'a Heap,
     component: ComponentId,
+    hooks: &'a [HookEntry],
 }
 
 impl<'a> ConvergedFns<'a> {
@@ -431,6 +442,7 @@ impl<'a> ConvergedFns<'a> {
             scopes: must_alias_scopes(render, hooks),
             heap,
             component,
+            hooks,
         }
     }
 
@@ -495,7 +507,27 @@ impl<'a> ConvergedFns<'a> {
             scopes: self.scopes.clone(),
             heap: self.heap,
             component: self.component,
+            hooks: self.hooks,
         }
+    }
+    /// The arguments of the hook at `label` when the expansion left it: the
+    /// fixpoint hands them, at the hook's marker, to code it does not see
+    /// (#254), as a call of an unknown callee hands its own (#262).
+    fn left_args(&self, label: HookLabel) -> &'a [Expr] {
+        self.hooks
+            .iter()
+            .find_map(|h| match h {
+                HookEntry::Custom { label: l, args, .. } if *l == label => Some(args.as_slice()),
+                _ => None,
+            })
+            .unwrap_or(&[])
+    }
+    /// The names bound once to a `useCallback` value, with its body: a call
+    /// or an argument through one runs that body, as the writer relation
+    /// reads it ([`callback_bound_vars`], #262).
+    fn callback_fns(&self) -> HashMap<Var, Arc<CFG>> {
+        let bodies: Vec<&CFG> = self.hooks.iter().filter_map(HookEntry::body_cfg).collect();
+        callback_bound_vars(self.render, &bodies, &callback_bodies(self.hooks))
     }
 
     /// The closures a call through `path` may run: those at the path, or,
@@ -1418,6 +1450,19 @@ impl InlineRegions {
     }
 }
 
+/// The body of every `useCallback` of the component, by label.
+fn callback_bodies(hooks: &[HookEntry]) -> HashMap<HookLabel, Arc<CFG>> {
+    hooks
+        .iter()
+        .filter_map(|h| match h {
+            HookEntry::Callback {
+                label, body_cfg, ..
+            } => Some((*label, Arc::new(body_cfg.clone()))),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Names bound exactly once, anywhere below, to the result of a `useCallback`
 /// — mapped to that callback's body.
 ///
@@ -1661,15 +1706,7 @@ pub(crate) fn collect_slot_writers(
     // every body below — the same certificate a consumer needs before it may
     // treat a name as the function it was bound to (ADR-023 §3, #103).
     let hook_bodies: Vec<&CFG> = hooks.iter().filter_map(|h| h.body_cfg()).collect();
-    let callback_bodies: HashMap<HookLabel, Arc<CFG>> = hooks
-        .iter()
-        .filter_map(|h| match h {
-            HookEntry::Callback {
-                label, body_cfg, ..
-            } => Some((*label, Arc::new(body_cfg.clone()))),
-            _ => None,
-        })
-        .collect();
+    let callback_bodies = callback_bodies(hooks);
     let mut outer_fns: HashMap<Var, Arc<CFG>> = collect_fn_bindings(render_cfg)
         .into_iter()
         .filter(|(v, _)| {
@@ -2744,31 +2781,20 @@ impl<'a> SetterWalk<'a> {
                 // rows run at this call, and are placed here only when the
                 // receiver surely runs it, as an IIFE is (#248).
                 let placed = at.filter(|_| i == 0 && runs_at_least_once(fn_, args));
-                match arg {
-                    // Inline FnLit arg descend body, costs one depth level.
-                    Expr::FnLit { body_cfg, .. } if depth > 0 => {
-                        let mut inner = Found::default();
-                        self.cfg(body_cfg, depth - 1, &mut inner, class, prov, stmt_span);
-                        found.absorb(inner, body_cfg, class, placed, prov);
-                    }
-                    // B5: variable arg name resolution, no depth cost — so this is
-                    // the arm that can cycle (`const tick = t => raf(tick)`); the
-                    // `walking` stack is what terminates it.
-                    Expr::Var(name) if self.fn_bindings.contains_key(name) => {
-                        let body = &self.fn_bindings[name];
-                        let mut inner = Found::default();
-                        self.path.push(name.clone());
-                        self.cfg(body, depth, &mut inner, class, prov, stmt_span);
-                        self.path.pop();
-                        found.absorb(inner, body, class, placed, prov);
-                    }
-                    // A path the converged values point at closures of this
-                    // component (`setTimeout(api.inc)`, #239): each runs in
-                    // the argument's class, at this call only when it is a
-                    // callback the receiver surely runs.
-                    _ => self.converged_bodies(arg, class, placed, depth, found, prov, stmt_span),
-                }
+                self.callback_arg(arg, class, placed, depth, found, prov, stmt_span);
                 self.repeating = outer_repeating;
+            }
+        }
+        // A hook the expansion left receives its arguments at its marker, as
+        // an unknown callee does: the fixpoint escapes them there (#254), and
+        // a closure among them may run at any time (#262). What evaluating
+        // one runs is a render statement ahead of the marker already (#193).
+        if let Expr::HookMarker(label, _) = expr
+            && let Some(args) = self.converged.map(|c| c.left_args(*label))
+        {
+            for arg in args {
+                let class = WalkClass::Unknown;
+                self.callback_arg(arg, class, None, depth, found, prov, stmt_span);
             }
         }
         // A JSX prop React or the child may invoke runs as a listener, the
@@ -2784,6 +2810,46 @@ impl<'a> SetterWalk<'a> {
                     self.converged_bodies(val, class, None, depth, found, prov, stmt_span);
                 }
             }
+        }
+    }
+
+    /// Walk the function a call hands its callee as `arg`, in `class`;
+    /// `placed` is where its rows run in this CFG, when the callee surely
+    /// runs it there.
+    #[allow(clippy::too_many_arguments)]
+    fn callback_arg(
+        &mut self,
+        arg: &'a Expr,
+        class: WalkClass,
+        placed: Option<(BlockId, usize)>,
+        depth: usize,
+        found: &mut Found,
+        prov: Option<BlockId>,
+        stmt_span: Option<SourceRange>,
+    ) {
+        match arg {
+            // Inline FnLit arg descend body, costs one depth level.
+            Expr::FnLit { body_cfg, .. } if depth > 0 => {
+                let mut inner = Found::default();
+                self.cfg(body_cfg, depth - 1, &mut inner, class, prov, stmt_span);
+                found.absorb(inner, body_cfg, class, placed, prov);
+            }
+            // B5: variable arg name resolution, no depth cost — so this is
+            // the arm that can cycle (`const tick = t => raf(tick)`); the
+            // `walking` stack is what terminates it.
+            Expr::Var(name) if self.fn_bindings.contains_key(name) => {
+                let body = &self.fn_bindings[name];
+                let mut inner = Found::default();
+                self.path.push(name.clone());
+                self.cfg(body, depth, &mut inner, class, prov, stmt_span);
+                self.path.pop();
+                found.absorb(inner, body, class, placed, prov);
+            }
+            // A path the converged values point at closures of this
+            // component (`setTimeout(api.inc)`, #239): each runs in the
+            // argument's class, at this call only when it is a callback the
+            // receiver surely runs.
+            _ => self.converged_bodies(arg, class, placed, depth, found, prov, stmt_span),
         }
     }
 

@@ -4,7 +4,7 @@
 use reactant::domains::StateValue;
 use reactant::engine::{
     AnalysisResult, ComponentRegistry, Config, HookRegistry, ProgramAnalysisResult, RootStrategy,
-    WriterPhase, analyze_program,
+    WriterPhase, WriterRegion, analyze_program,
 };
 use reactant::rules::{Rule, RuleCtx, SetterInRender, Severity};
 
@@ -165,4 +165,78 @@ fn an_effect_or_memo_body_stays_out_of_the_render_pass() {
     let r = parse_and_analyze(SRC);
     assert!(!render_write(comp(&r, "EffectBody")));
     assert!(setter_in_render(&r, "EffectBody").is_empty());
+}
+
+const HANDED_OUT: &str = r#"
+import { useState, useCallback } from "react";
+import { useExternal, runIt } from "some-lib";
+
+export function LeftHookClosure() {
+  const [a, setA] = useState(0);
+  useExternal(() => {
+    setA(a + 1);
+  });
+  return <p>{a}</p>;
+}
+
+export function LeftHookCallback() {
+  const [a, setA] = useState(0);
+  const bump = useCallback(() => {
+    setA(a + 1);
+  }, [a]);
+  useExternal(bump);
+  return <p>{a}</p>;
+}
+
+export function UnknownCalleeCallback() {
+  const [a, setA] = useState(0);
+  const bump = useCallback(() => {
+    setA(a + 1);
+  }, [a]);
+  runIt(bump);
+  return <p>{a}</p>;
+}
+
+export function LeftHookNoClosure() {
+  const [a, setA] = useState(0);
+  const bump = () => setA(a + 1);
+  useExternal(a);
+  return <p onClick={bump}>{a}</p>;
+}
+"#;
+
+/// Does the writer relation hold a write through `setA` of unknown timing
+/// in the render region?
+fn unknown_render_write(c: &AnalysisResult<StateValue>) -> bool {
+    c.slot_writers.iter().any(|w| {
+        w.region == WriterRegion::Render
+            && w.phase == WriterPhase::Unknown
+            && reactant::ir::source_name(&w.setter) == "setA"
+    })
+}
+
+#[test]
+fn a_closure_handed_to_a_left_hook_or_an_unknown_callee_may_write_in_render() {
+    // #262: the fixpoint escapes a left hook's arguments at its marker and
+    // runs them with the handlers (#254); the walks the rules read entered
+    // neither them nor a `useCallback` value an unknown callee receives.
+    let r = parse_and_analyze(HANDED_OUT);
+    for name in [
+        "LeftHookClosure",
+        "LeftHookCallback",
+        "UnknownCalleeCallback",
+    ] {
+        assert!(
+            unknown_render_write(comp(&r, name)),
+            "{name}: code the analysis does not see may run the closure at any time: {:?}",
+            comp(&r, name).slot_writers
+        );
+        assert_eq!(
+            setter_in_render(&r, name),
+            vec![Severity::Warning],
+            "{name}: a possible render write, never a certain one"
+        );
+    }
+    assert!(!unknown_render_write(comp(&r, "LeftHookNoClosure")));
+    assert!(setter_in_render(&r, "LeftHookNoClosure").is_empty());
 }
