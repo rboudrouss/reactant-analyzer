@@ -498,6 +498,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
 
     loop {
         let mut state_store = state.clone();
+        let heap_before = heap.clone();
 
         // ── Render pass ───────────────────────────────────────────────────────
         // Use initial_env as entry: child analyses start with props bound.
@@ -635,8 +636,10 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
 
         // The memo store is part of the carrier: this pass's render read the
         // memos the previous iteration computed, so it saw the stores only
-        // once they stop moving.
-        if new_state.leq(&state) && memo_store == memo_before {
+        // once they stop moving. So is the heap: a member or a shared name
+        // written by a body that ran after the reads — an escaped closure,
+        // a later effect — is read by the next iteration (#258).
+        if new_state.leq(&state) && memo_store == memo_before && heap.leq(&heap_before) {
             break;
         }
 
@@ -668,6 +671,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                     });
             }
             state = state.widen_to(&new_state, &thresholds);
+            heap = heap_before.widen(&heap);
         } else {
             state = new_state;
         }

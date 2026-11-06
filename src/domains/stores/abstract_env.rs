@@ -121,6 +121,12 @@ impl<D: AbstractDomain> EnvVal<D> {
         EnvVal::located(Sites::join_opt(self.sites(), other.sites()), val)
     }
 
+    /// [`EnvVal::join`] with the values widened, `self` the earlier one.
+    pub fn widen(&self, other: &Self) -> Self {
+        let val = self.as_val().widen(&other.as_val());
+        EnvVal::located(Sites::join_opt(self.sites(), other.sites()), val)
+    }
+
     /// `self ⊑ other`: a value below, and sites among the other's.
     pub fn leq(&self, other: &Self) -> bool {
         let (a, b) = (self.as_val(), other.as_val());
@@ -279,6 +285,25 @@ impl<D: AbstractDomain> AbstractEnv<D> {
         var: &str,
         from: &AbstractEnv<E>,
     ) -> bool {
+        self.merge_binding_from(var, from, false)
+    }
+
+    /// [`AbstractEnv::join_binding_from`] with the value widened, `self`
+    /// the earlier binding.
+    pub fn widen_binding_from<E: AbstractDomain>(
+        &mut self,
+        var: &str,
+        from: &AbstractEnv<E>,
+    ) -> bool {
+        self.merge_binding_from(var, from, true)
+    }
+
+    fn merge_binding_from<E: AbstractDomain>(
+        &mut self,
+        var: &str,
+        from: &AbstractEnv<E>,
+        widen: bool,
+    ) -> bool {
         let Some(theirs) = from.stabs.get(var) else {
             return false;
         };
@@ -289,7 +314,10 @@ impl<D: AbstractDomain> AbstractEnv<D> {
         let (val, sites) = match self.stabs.get(var) {
             None => (theirs, their_sites.cloned()),
             Some(mine) => (
-                mine.join(&theirs),
+                match widen {
+                    true => mine.widen(&mine.join(&theirs)),
+                    false => mine.join(&theirs),
+                },
                 Sites::join_opt(self.locs.get(var), their_sites),
             ),
         };

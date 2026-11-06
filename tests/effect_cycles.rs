@@ -2723,3 +2723,33 @@ export function App() {
     let diags = infinite_loop_diags(src, "App");
     assert!(diags.is_empty(), "{diags:?}");
 }
+
+/// A handler, an effect and an escaped closure each add one to a member or a
+/// shared name. The heap and the shared names are part of the fixpoint
+/// carrier (#258); widened, the fixpoint still ends, and the slot the
+/// effect writes the member into loops through it.
+#[test]
+fn a_counter_in_the_heap_or_a_shared_name_still_converges() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+import { runNow } from 'ext';
+export function App() {
+  const [n, setN] = useState(0);
+  const box = { n: 0 };
+  let count = 0;
+  useEffect(() => {
+    runNow(() => { count = count + 1; });
+    setN(box.n + count);
+  });
+  return <button onClick={() => { box.n = box.n + 1; }}>{n}</button>;
+}
+"#;
+    let result = parse_and_analyze(src);
+    let app = &result.components[&result.component_named("App").unwrap()];
+    assert!(app.iterations < 100, "{} iterations", app.iterations);
+    let diags = infinite_loop_diags(src, "App");
+    assert!(
+        diags.iter().any(|(_, s, _)| *s == Severity::Warning),
+        "{diags:?}"
+    );
+}

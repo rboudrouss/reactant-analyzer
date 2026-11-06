@@ -122,19 +122,32 @@ impl Members {
     /// Either object: a member one of them lacks holds there `undefined`, one
     /// of that object's `others`, or anything when that object is open.
     pub fn join(&self, other: &Self) -> Self {
+        self.merge(other, EnvVal::join)
+    }
+
+    /// [`Members::join`] with the values widened, `self` the earlier one.
+    pub fn widen(&self, other: &Self) -> Self {
+        self.merge(other, EnvVal::widen)
+    }
+
+    fn merge(
+        &self,
+        other: &Self,
+        merge: impl Fn(&EnvVal<StateValue>, &EnvVal<StateValue>) -> EnvVal<StateValue>,
+    ) -> Self {
         let (mine_lacking, theirs_lacking) = (self.lacking(), other.lacking());
         let mut named = self.named.clone();
         for (m, ev) in &other.named {
             let mine = self.named.get(m).unwrap_or(&mine_lacking);
-            named.insert(m.clone(), mine.join(ev));
+            named.insert(m.clone(), merge(mine, ev));
         }
         for (m, ev) in named.iter_mut() {
             if !other.named.contains_key(m) {
-                *ev = ev.join(&theirs_lacking);
+                *ev = merge(ev, &theirs_lacking);
             }
         }
         let others = match (&self.others, &other.others) {
-            (Some(a), Some(b)) => Some(a.join(b)),
+            (Some(a), Some(b)) => Some(merge(a, b)),
             (a, b) => a.clone().or_else(|| b.clone()),
         };
         Members {
@@ -368,6 +381,17 @@ impl Heap {
     /// envs (two call sites of a child, #175) is either object. A site that
     /// escaped in either heap has escaped.
     pub fn join(&self, other: &Self) -> Self {
+        self.merge(other, false)
+    }
+
+    /// [`Heap::join`] with every value widened, `self` the earlier heap: the
+    /// members of an object, a closure's captures and the shared names grow
+    /// to a bound the fixpoint reaches (#258).
+    pub fn widen(&self, other: &Self) -> Self {
+        self.merge(other, true)
+    }
+
+    fn merge(&self, other: &Self, widen: bool) -> Self {
         let mut result = self.cells.clone();
         for (id, val) in &other.cells {
             match result.get(id) {
@@ -392,7 +416,11 @@ impl Heap {
                         let mut joined_cap = cap_self.clone();
                         for (k, v) in cap_other {
                             let cur = map_get_or(&joined_cap, k, StateValue::bottom);
-                            joined_cap.insert(k.clone(), cur.join(v));
+                            let next = match widen {
+                                true => cur.widen(&cur.join(v)),
+                                false => cur.join(v),
+                            };
+                            joined_cap.insert(k.clone(), next);
                         }
                         let joined_locs = locs_self
                             .keys()
@@ -423,26 +451,27 @@ impl Heap {
                 }
                 Some(HeapValue::Obj(mine)) => {
                     if let HeapValue::Obj(theirs) = val {
-                        result.insert(*id, HeapValue::Obj(mine.join(theirs)));
+                        let merged = match widen {
+                            true => mine.widen(&mine.join(theirs)),
+                            false => mine.join(theirs),
+                        };
+                        result.insert(*id, HeapValue::Obj(merged));
                     }
                 }
             }
         }
         let mut assigned = self.assigned.clone();
         for var in other.assigned.names() {
-            assigned.join_binding_from(var, &other.assigned);
+            match widen {
+                true => assigned.widen_binding_from(var, &other.assigned),
+                false => assigned.join_binding_from(var, &other.assigned),
+            };
         }
         Heap {
             cells: result,
             escaped: self.escaped.union(&other.escaped).copied().collect(),
             assigned,
         }
-    }
-
-    /// Widening: same as join (heap entries are structurally fixed at
-    /// allocation sites; they can only grow, not oscillate).
-    pub fn widen(&self, other: &Self) -> Self {
-        self.join(other)
     }
 
     /// `self ⊑ other`: every entry of `self` is in `other`, a closure's
