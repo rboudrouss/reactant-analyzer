@@ -166,15 +166,39 @@ impl Members {
 /// member written into an object it does not place, what such a closure
 /// returns. That code may call every closure they reach, at any time —
 /// [`Heap::escaped_fns`].
+///
+/// `assigned` is every value a body stored in a name it does not declare —
+/// a closure's assignment to a variable of the scope it was created in, an
+/// effect's to one of the render (#258). Such a name is one variable every
+/// body that binds it shares, and any of those bodies may run between two
+/// of another's statements, so each statement starts from the join
+/// ([`Heap::share_assigned`]). Kept across passes, like the cells.
 #[derive(Debug, Clone, Default)]
 pub struct Heap {
     cells: HashMap<ExprId, HeapValue>,
     escaped: BTreeSet<ExprId>,
+    assigned: AbstractEnv<StateValue>,
 }
 
 impl Heap {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A body that does not declare `var` assigned it what `env` binds it
+    /// to (#258).
+    pub fn record_assign<D: AbstractDomain>(&mut self, var: &str, env: &AbstractEnv<D>) {
+        self.assigned.join_binding_from(var, env);
+    }
+
+    /// Join into every name `env` binds what the bodies that assign it
+    /// without declaring it stored there (#258).
+    pub fn share_assigned<D: AbstractDomain>(&self, env: &mut AbstractEnv<D>) {
+        for var in self.assigned.names() {
+            if env.contains(var) {
+                env.join_binding_from(var, &self.assigned);
+            }
+        }
     }
 
     pub fn insert(&mut self, id: ExprId, val: HeapValue) {
@@ -378,9 +402,14 @@ impl Heap {
                 }
             }
         }
+        let mut assigned = self.assigned.clone();
+        for var in other.assigned.names() {
+            assigned.join_binding_from(var, &other.assigned);
+        }
         Heap {
             cells: result,
             escaped: self.escaped.union(&other.escaped).copied().collect(),
+            assigned,
         }
     }
 
@@ -422,6 +451,12 @@ impl Heap {
                     (HeapValue::Obj(a), Some(HeapValue::Obj(b))) => a.leq(b),
                     _ => false,
                 })
+            && {
+                let mut theirs = other.assigned.clone();
+                self.assigned
+                    .names()
+                    .all(|var| !theirs.join_binding_from(var, &self.assigned))
+            }
     }
 }
 

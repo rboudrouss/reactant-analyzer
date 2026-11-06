@@ -88,17 +88,26 @@ impl fmt::Display for AccessPath {
     }
 }
 
-/// Compute free variables of a CFG: variables read anywhere minus variables locally defined.
+/// Compute free variables of a CFG: variables read or assigned anywhere minus
+/// variables locally declared.
 pub fn compute_free_vars(cfg: &CFG) -> HashSet<Var> {
     let mut used: HashSet<Var> = HashSet::new();
     cfg.for_each_expr(&mut |e| collect_used_vars(e, &mut used));
 
-    // Locally-defined roots (`let`/assignment targets) are bound, not free.
+    // A `let` binds a name; an assignment to a name the body does not
+    // declare writes the enclosing scope's variable, which the body
+    // captures (#258).
     let mut defined: HashSet<Var> = HashSet::new();
     for block in cfg.blocks.values() {
         for stmt in &block.stmts {
-            if let Stmt::Let { var, .. } | Stmt::Assign { var, .. } = stmt {
-                defined.insert(var.clone());
+            match stmt {
+                Stmt::Let { var, .. } => {
+                    defined.insert(var.clone());
+                }
+                Stmt::Assign { var, .. } => {
+                    used.insert(var.clone());
+                }
+                _ => {}
             }
         }
     }
@@ -626,5 +635,32 @@ mod tests {
             crate::ir::stmt::Stmt::ExprStmt(lambda(&["open"], Expr::Var("open".to_string())), None),
         ]);
         assert!(compute_free_vars(&cfg).contains("open"));
+    }
+
+    #[test]
+    fn an_assigned_name_is_captured_a_declared_one_is_not() {
+        // `ready = true; let own = 1; own = 2;` : the body writes the
+        // enclosing `ready` and declares `own` (#258).
+        use crate::ir::{expr::Prim, stmt::Stmt};
+        let cfg = crate::test_support::single_block_cfg(vec![
+            Stmt::Assign {
+                var: "ready".to_string(),
+                rhs: Expr::Lit(Prim::Bool(true)),
+                span: None,
+            },
+            Stmt::Let {
+                var: "own".to_string(),
+                rhs: Expr::Lit(Prim::Int(1)),
+                span: None,
+            },
+            Stmt::Assign {
+                var: "own".to_string(),
+                rhs: Expr::Lit(Prim::Int(2)),
+                span: None,
+            },
+        ]);
+        let free = compute_free_vars(&cfg);
+        assert!(free.contains("ready"), "{free:?}");
+        assert!(!free.contains("own"), "{free:?}");
     }
 }

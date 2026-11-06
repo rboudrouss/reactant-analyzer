@@ -1,6 +1,6 @@
 // oracle: react=loop
 // #258: a synchronous callback assigns the effect's `ready`; the assignment
-// does not reach the effect after `forEach` returns.
+// did not reach the effect after `forEach` returned.
 import { useEffect, useState } from "react";
 
 export function App() {

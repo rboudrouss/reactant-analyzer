@@ -2588,3 +2588,80 @@ export function App() {
     let diags = infinite_loop_diags(src, "App");
     assert!(diags.is_empty(), "{diags:?}");
 }
+
+// ── #258: a name a nested body assigns is shared by every body that binds it ─
+
+/// `step` is 1 once a closure has assigned it: called by name, run by a sync
+/// array method, handed to a callee the analysis does not see, or an effect
+/// assigning the render's variable before the next effect reads it. Every
+/// form loops in React; `setN(n + step)` was read as the bail-out `setN(n)`.
+#[test]
+fn a_name_a_closure_assigns_feeds_the_loop() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+import { runNow } from 'ext';
+export function Called() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    let step = 0;
+    const arm = () => { step = 1; };
+    arm();
+    setN(n + step);
+  });
+  return <div>{n}</div>;
+}
+export function SyncCallback() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    let step = 0;
+    [1].forEach(() => { step = 1; });
+    setN(n + step);
+  });
+  return <div>{n}</div>;
+}
+export function Escaped() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    let step = 0;
+    runNow(() => { step = 1; });
+    setN(n + step);
+  });
+  return <div>{n}</div>;
+}
+export function OtherEffect() {
+  const [n, setN] = useState(0);
+  let step = 0;
+  useEffect(() => { step = 1; });
+  useEffect(() => { setN(n + step); });
+  return <div>{n}</div>;
+}
+"#;
+    for c in ["Called", "SyncCallback", "Escaped", "OtherEffect"] {
+        let diags = infinite_loop_diags(src, c);
+        assert!(
+            diags.iter().any(|(_, s, _)| *s == Severity::Warning)
+                && !diags.iter().any(|(_, s, _)| *s == Severity::Error),
+            "{c}: {diags:?}"
+        );
+    }
+}
+
+/// The negative: the closure assigns the value the name already holds.
+#[test]
+fn a_closure_assigning_the_held_value_feeds_nothing() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function App() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    let step = 0;
+    const arm = () => { step = 0; };
+    arm();
+    setN(n + step);
+  });
+  return <div>{n}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "App");
+    assert!(diags.is_empty(), "{diags:?}");
+}

@@ -1,6 +1,6 @@
 // oracle: react=loop
-// oracle: known=fn #258
-// The value form: the second effect reads the `step` the first one assigned.
+// #258, the value form: the second effect reads the `step` the first one
+// assigned.
 import { useEffect, useState } from "react";
 
 export function App() {

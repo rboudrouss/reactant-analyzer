@@ -1,6 +1,6 @@
 // oracle: react=loop
-// oracle: known=fn #258
-// The value form of the escaped closure's assignment.
+// #258, the value form of the escaped closure's assignment: `step` may be 1
+// once the closure has run.
 import { useEffect, useState } from "react";
 import { runNow } from "ext";
 

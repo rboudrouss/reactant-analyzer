@@ -1,6 +1,5 @@
 // oracle: react=loop
-// oracle: known=fn #258
-// The value form of the synchronous callback's assignment.
+// #258, the value form of the synchronous callback's assignment.
 import { useEffect, useState } from "react";
 
 export function App() {

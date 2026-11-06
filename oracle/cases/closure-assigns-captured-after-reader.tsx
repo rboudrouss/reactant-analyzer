@@ -1,7 +1,8 @@
 // oracle: react=converges
 // #258, the precision side: the effect that assigns `step` runs after the
 // one that reads it, and the next render binds a fresh `step = 0`. The
-// reader always sees 0, `setN(n)` bails out.
+// reader always sees 0, `setN(n)` bails out. The analyzer keeps one `step`
+// for every render and does not order the effects, so it claims (fp).
 import { useEffect, useState } from "react";
 
 export function App() {

@@ -33,6 +33,7 @@ pub const MAX_INLINE_DEPTH: usize = 3;
 ///
 /// `Transfer::exec_stmt` implementations call this to get the full traversal
 /// machinery (`.then`, timers, sync HOFs, B5/B6 var-callback resolution) for free.
+/// The next statement starts from the shared names' join, as in [`run_cfg`].
 pub(crate) fn exec_stmt_with_callbacks<T: Transfer>(
     transfer: &T,
     stmt: &Stmt,
@@ -40,6 +41,7 @@ pub(crate) fn exec_stmt_with_callbacks<T: Transfer>(
     ctx: &mut AnalysisCtx<T::Domain>,
 ) {
     exec_full_stmt(transfer, stmt, env, ctx, 0);
+    ctx.heap.share_assigned(env);
 }
 
 /// Execute a FnLit body CFG and return its abstract return value.
@@ -157,11 +159,24 @@ pub(crate) fn run_cfg<T: Transfer>(
     entries.insert(cfg.entry, entry_env);
     pending.insert((rank(cfg.entry), cfg.entry));
 
+    // A name the body assigns without declaring it belongs to an enclosing
+    // scope, shared with every body that binds it (#258).
+    let declared: HashSet<&Symbol> = cfg
+        .blocks
+        .values()
+        .flat_map(|block| &block.stmts)
+        .filter_map(|s| match s {
+            Stmt::Let { var, .. } => Some(var),
+            _ => None,
+        })
+        .collect();
+
     while let Some((_, b)) = pending.pop_first() {
         let mut env = entries[&b].clone();
         // The change bound of the conditions this block's writes run under.
         let pc = bound_under(selecting.get(&b), &cond_bounds);
         if let Some(block) = cfg.blocks.get(&b) {
+            ctx.heap.share_assigned(&mut env);
             for stmt in &block.stmts {
                 exec_full_stmt(transfer, stmt, &mut env, ctx, depth);
                 if under_condition(&pc)
@@ -171,6 +186,12 @@ pub(crate) fn run_cfg<T: Transfer>(
                     let selected = env.lookup(var).select_under(&pc);
                     env.refine(var.clone(), selected);
                 }
+                if let Stmt::Assign { var, .. } = stmt
+                    && !declared.contains(var)
+                {
+                    ctx.heap.record_assign(var, &env);
+                }
+                ctx.heap.share_assigned(&mut env);
             }
             match &block.term {
                 // A concise arrow body (`() => EXPR`) lowers EXPR to this
@@ -193,6 +214,7 @@ pub(crate) fn run_cfg<T: Transfer>(
                 // bound is what the blocks it selects run under.
                 Terminator::Branch { cond, .. } => {
                     exec_expr_effects(transfer, cond, &mut env, ctx, depth);
+                    ctx.heap.share_assigned(&mut env);
                     let bound = condition_bound(transfer, cond, cfg, &env, ctx);
                     if cond_bounds.get(&b) != Some(&bound) {
                         cond_bounds.insert(b, bound);

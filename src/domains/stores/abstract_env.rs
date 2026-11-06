@@ -269,6 +269,62 @@ impl<D: AbstractDomain> AbstractEnv<D> {
         }
     }
 
+    /// Join into `var` what `from` binds it to — its value, its sites, the
+    /// setters and the callbacks it may be — taking that binding whole when
+    /// `self` has none (#258). A name whose value grows is no longer a
+    /// slot's read value. False when `from` does not bind `var` or `self`
+    /// already holds all of it.
+    pub fn join_binding_from<E: AbstractDomain>(
+        &mut self,
+        var: &str,
+        from: &AbstractEnv<E>,
+    ) -> bool {
+        let Some(theirs) = from.stabs.get(var) else {
+            return false;
+        };
+        let theirs = theirs
+            .as_state_value()
+            .map_or_else(D::top, D::from_state_value);
+        let their_sites = from.locs.get(var);
+        let (val, sites) = match self.stabs.get(var) {
+            None => (theirs, their_sites.cloned()),
+            Some(mine) => (
+                mine.join(&theirs),
+                Sites::join_opt(self.locs.get(var), their_sites),
+            ),
+        };
+        let mut changed = false;
+        if self.stabs.get(var) != Some(&val) {
+            self.stabs.insert(var.to_string(), val);
+            self.slot_bindings.remove(var);
+            changed = true;
+        }
+        if self.locs.get(var) != sites.as_ref() {
+            self.bind_locs(var.to_string(), sites);
+            changed = true;
+        }
+        for (mine, theirs) in [
+            (&mut self.setter_bindings, &from.setter_bindings),
+            (&mut self.callback_bindings, &from.callback_bindings),
+        ] {
+            if let Some(labels) = theirs.get(var) {
+                let current = mine.get(var);
+                if current.is_none_or(|c| !labels.is_subset(c)) {
+                    let union = current
+                        .map_or_else(|| labels.clone(), |c| c.union(labels).copied().collect());
+                    mine.insert(var.to_string(), union);
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    /// The names this env binds a value to.
+    pub fn names(&self) -> impl Iterator<Item = &Var> {
+        self.stabs.keys()
+    }
+
     /// Record that `var` is the value slot `label` was read as.
     pub fn bind_slot(&mut self, var: Var, label: HookLabel) {
         self.slot_bindings.insert(var, label);
