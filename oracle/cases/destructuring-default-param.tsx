@@ -1,7 +1,6 @@
 // oracle: react=loop
-// oracle: known=fn #256
-// A destructured parameter's default is the member when the argument does
-// not hold it; its value is not stored yet.
+// #256: a destructured parameter's member is its default when the argument
+// does not hold it.
 import { useEffect, useState } from "react";
 
 export function App() {

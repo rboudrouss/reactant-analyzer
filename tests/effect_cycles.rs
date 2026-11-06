@@ -2436,9 +2436,14 @@ fn a_member_copied_by_a_spread_or_stored_under_a_computed_key_is_called() {
     // member written before it, through a computed key no literal spells, a
     // computed key the destructuring reads (#76). An unknown spread keeps
     // the member written before it possible, as does a computed key that may
-    // name it: a warning, never a certainty. (A destructuring default's
-    // value is not stored yet, #256.)
+    // name it: a warning, never a certainty. So does a destructuring default
+    // the member leaves `undefined` (#256).
     for (decl, call) in [
+        ("const { inc = INC } = extra;", "inc();"),
+        (
+            "const { inc = INC } = {} as { inc?: () => void };",
+            "inc();",
+        ),
         (
             "const b = { inc: INC }; const api = { ...b, x: 1 };",
             "api.inc();",
@@ -2464,6 +2469,15 @@ fn a_member_copied_by_a_spread_or_stored_under_a_computed_key_is_called() {
         assert!(!sevs.is_empty(), "{decl} {call}");
         assert!(!sevs.contains(&Severity::Error), "{decl}: {sevs:?}");
     }
+}
+
+/// The negative: the member is defined, so the default never runs and no
+/// value of the test takes its side (#256, #255).
+#[test]
+fn a_destructuring_default_the_member_overrides_is_not_called() {
+    let decl = "const { inc = () => setN(n + 1) } = { inc: () => {} };";
+    let sevs = loop_severities(&member_callee_src(decl, "inc();"), "C");
+    assert!(sevs.is_empty(), "{sevs:?}");
 }
 
 #[test]

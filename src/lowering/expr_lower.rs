@@ -1136,9 +1136,8 @@ fn lower_assignment_target(
             });
             for prop in &obj.properties {
                 match prop {
-                    // `({ a = fallback } = o)`: `a` holds `o.a`; the
-                    // fallback runs when that is `undefined` (its value is
-                    // not stored, #256).
+                    // `({ a = fallback } = o)`: `a` holds `o.a`, replaced
+                    // by the fallback when that is `undefined` (#256).
                     AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(p) => {
                         let p_span = builder.span_at(p.span.start);
                         let name = p.binding.name.to_string();
@@ -1151,7 +1150,7 @@ fn lower_assignment_target(
                             span: p_span,
                         });
                         if let Some(init) = &p.init {
-                            lower_default(&Expr::Var(name.clone()), init, builder);
+                            lower_default(&name, init, true, builder);
                         }
                     }
                     AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
@@ -1192,8 +1191,8 @@ fn lower_assignment_target(
 }
 
 /// An array element or object property target, which may carry a default
-/// (`[a = 1] = xs`): the default runs when the source is `undefined`, and
-/// the target gets the source (#256).
+/// (`[a = 1] = xs`): the source is read into a temp, which the default
+/// replaces when it is `undefined`, and the target gets the temp (#256).
 fn lower_assignment_maybe_default(
     target: &AssignmentTargetMaybeDefault,
     rhs: Expr,
@@ -1201,8 +1200,14 @@ fn lower_assignment_maybe_default(
 ) {
     match target {
         AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(d) => {
-            lower_default(&rhs, &d.init, builder);
-            lower_assignment_target(&d.binding, rhs, None, builder);
+            let temp = format!("__dflt_{}", d.span.start);
+            builder.push_stmt(Stmt::Let {
+                var: temp.clone(),
+                rhs,
+                span: None,
+            });
+            lower_default(&temp, &d.init, true, builder);
+            lower_assignment_target(&d.binding, Expr::Var(temp), None, builder);
         }
         other => match other.as_assignment_target() {
             Some(t) => lower_assignment_target(t, rhs, None, builder),

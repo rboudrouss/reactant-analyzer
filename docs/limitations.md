@@ -165,10 +165,6 @@ that writes it (see *Cross-file limits*).
   Because the call keeps no trace of the spread, the arguments after it may sit at other
   positions: a local function's parameters are bound to its arguments (#253), and the arguments
   still run with the handlers.
-- A destructuring default (`const { f = g } = o`) runs when the member is `undefined`, so its
-  reads and writes are seen, but its value is not stored: `f` reads as `o.f`, and a closure the
-  default supplies is not called through `f`
-  [#256](https://github.com/rboudrouss/reactant-analyzer/issues/256).
 - **Mount-coupled seeds.** `frozen-initial-state` drops to Info, hidden without `--info`, when every
   call site renders the consumer under a `key` built from the seeding prop, or under a guard built
   from it (`{msg && <Toast msg={msg}/>}`). Neither shape is a proof: a `msg` moving between two

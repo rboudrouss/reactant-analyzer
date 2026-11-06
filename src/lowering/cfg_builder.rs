@@ -945,13 +945,19 @@ fn lower_binding_pattern(
                 lower_binding_pattern(&rest.argument, Expr::Var(temp.clone()), rest_span, builder);
             }
         }
-        // `{ cb = () => setX(1) }`: the default runs when the source is
-        // `undefined`, so its reads and writes stay visible; the binding
-        // keeps the source (#256).
+        // `{ cb = () => setX(1) }`: the source is read into a temp, which
+        // the default replaces when it is `undefined` (#256); the pattern
+        // binds the temp.
         BindingPattern::AssignmentPattern(ap) => {
             let default_span = builder.span_at(ap.right.span().start).or(span);
-            lower_default(&rhs, &ap.right, builder);
-            lower_binding_pattern(&ap.left, rhs, span.or(default_span), builder);
+            let temp = format!("__dflt_{}", ap.span.start);
+            builder.push_stmt(Stmt::Let {
+                var: temp.clone(),
+                rhs,
+                span,
+            });
+            lower_default(&temp, &ap.right, true, builder);
+            lower_binding_pattern(&ap.left, Expr::Var(temp), span.or(default_span), builder);
         }
     }
 }
@@ -970,7 +976,7 @@ pub(super) fn inject_param_preamble(
         };
         names.push(name.clone());
         if let Some(init) = p.initializer.as_deref() {
-            lower_default(&Expr::Var(name.clone()), init, builder);
+            lower_default(&name, init, false, builder);
         }
         if !matches!(p.pattern, BindingPattern::BindingIdentifier(_)) {
             lower_binding_pattern(&p.pattern, Expr::Var(name), None, builder);
@@ -979,25 +985,31 @@ pub(super) fn inject_param_preamble(
     names
 }
 
-/// `source = init` evaluates `init` when `source` is `undefined`: lowered
-/// under that test, so its reads and its writes stay where they run — a
-/// setter call, a reassignment of an earlier parameter. One lowering for a
-/// parameter's default (#251) and a destructuring default (`const { f = g }
-/// = o`, #76), `source` then the member the pattern reads (a name, or a
-/// member or index of a destructuring temp: no call, read twice for free).
+/// `source = init` evaluates `init` when the name `source` is `undefined`:
+/// lowered under that test, so its reads and its writes stay where they run
+/// — a setter call, a reassignment of an earlier parameter. One lowering for
+/// a parameter's default (#251) and a destructuring default (`const { f = g }
+/// = o`, #76), `source` then a temp holding the member the pattern reads.
 ///
-/// The value is not modeled: the binding keeps the source. A parameter's
+/// `store`: the default's value is assigned to `source`, which then is the
+/// member or the default (#256); the solver drops the side of the test no
+/// value of `source` takes (#255). A parameter's default is not stored: its
 /// omitted argument is bound where the call is inlined (`param_defaults`,
-/// #230); a destructuring default's value waits on a solver that drops the
-/// side of the test no value takes (#256, #255).
-pub(super) fn lower_default(source: &Expr, init: &Expression, builder: &mut BlockBuilder) {
+/// #230), and a parameter assigned in its body is no longer one a deps
+/// argument can name.
+pub(super) fn lower_default(
+    source: &str,
+    init: &Expression,
+    store: bool,
+    builder: &mut BlockBuilder,
+) {
     let span = builder.span_at(init.span().start);
     let then_ = builder.new_block();
     let join = builder.new_block();
     let test = builder.seal_with(Terminator::Branch {
         cond: Expr::BinOp {
             op: crate::ir::expr::BinOp::Eq,
-            lhs: Box::new(source.clone()),
+            lhs: Box::new(Expr::Var(source.to_string())),
             rhs: Box::new(Expr::Lit(Prim::Unit)),
         },
         then_,
@@ -1008,7 +1020,14 @@ pub(super) fn lower_default(source: &Expr, init: &Expression, builder: &mut Bloc
     builder.add_edge(test, join, EdgeKind::IfFalse);
     builder.start_block(then_);
     let value = lower_expr(init, builder);
-    builder.push_stmt(Stmt::ExprStmt(value, span));
+    builder.push_stmt(match store {
+        true => Stmt::Assign {
+            var: source.to_string(),
+            rhs: value,
+            span,
+        },
+        false => Stmt::ExprStmt(value, span),
+    });
     if !builder.is_terminated() {
         let end = builder.seal_with(Terminator::Jump(join));
         builder.add_edge(end, join, EdgeKind::Unconditional);

@@ -1,8 +1,6 @@
 // oracle: react=loop
-// oracle: known=fn #256
-// `o.f` is undefined, so `f` is the default. The default runs under that
-// test, but its value is not stored: `f` reads as `o.f` and the call runs
-// nothing.
+// #256: `o.f` is undefined, so `f` is the default. Its value was not
+// stored: `f` read as `o.f` and the call ran nothing.
 import { useEffect, useState } from "react";
 
 export function App() {
