@@ -349,6 +349,7 @@ mod tests {
             body_cfg: cfg_calling(callees),
             hooks: vec![],
             hook_provenance: vec![],
+            alias_of: None,
         }
     }
 

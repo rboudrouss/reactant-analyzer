@@ -1282,3 +1282,74 @@ fn a_deps_parameter_the_caller_moves_still_reruns_the_effect() {
     let (class, _) = deps_param_case("deps = [], x = (deps = [b])", "useGated(() => setB({}));");
     assert_eq!(class, Some(Rerun::Always(Always::OpaqueDeps)));
 }
+
+/// `App`'s findings of `rule` when it calls the hook alias `alias` binds.
+fn alias_case(alias: &str, call: &str, rule: &str) -> Vec<reactant::rules::Severity> {
+    let src = format!(
+        r#"
+        import {{ useEffect, useLayoutEffect, useMemo, useState }} from "react";
+        const useIso = {alias};
+        function App() {{
+            const [a, setA] = useState(0);
+            {call}
+            return <div>{{a}}</div>;
+        }}
+        "#
+    );
+    let result = parse_and_analyze(&src);
+    diags_for(&result, "App")
+        .into_iter()
+        .filter(|d| d.rule.as_ref() == rule && d.severity() != reactant::rules::Severity::Info)
+        .map(|d| d.severity())
+        .collect()
+}
+
+#[test]
+fn a_hook_alias_choosing_among_effect_hooks_is_that_effect() {
+    // mantine's `useIsomorphicEffect`: both arms lower to one `Effect`, so a
+    // call through the alias is that effect, deps and all.
+    let iso = "typeof document !== 'undefined' ? useLayoutEffect : useEffect";
+    let once = "useIso(() => { setA(1); }, []);";
+    assert!(alias_case(iso, once, "setter-in-render").is_empty());
+    assert!(alias_case(iso, once, "infinite-loop").is_empty());
+    let every = "useIso(() => { setA(a + 1); });";
+    assert!(alias_case(iso, every, "setter-in-render").is_empty());
+    assert!(!alias_case(iso, every, "infinite-loop").is_empty());
+    assert!(alias_case("useEffect", once, "setter-in-render").is_empty());
+}
+
+#[test]
+fn a_hook_alias_whose_arms_lower_apart_is_not_read() {
+    // `useMemo` runs its argument during render, `useEffect` after commit:
+    // the closure stays one a hook the analysis does not see receives.
+    let mixed = "Math.random() > 0.5 ? useMemo : useEffect";
+    assert_eq!(
+        alias_case(mixed, "useIso(() => { setA(1); }, []);", "setter-in-render"),
+        vec![reactant::rules::Severity::Warning]
+    );
+}
+
+#[test]
+fn a_hook_alias_called_without_deps_reruns_every_render() {
+    use reactant::engine::Rerun;
+    let src = r#"
+        import { useEffect, useLayoutEffect, useState } from "react";
+        const useIso = typeof window === "undefined" ? useEffect : useLayoutEffect;
+        function App() {
+            const [a, setA] = useState(0);
+            useIso(() => { setA(1); });
+            return <div>{a}</div>;
+        }
+    "#;
+    let result = parse_and_analyze(src);
+    let comp = &result.components[&result.component_named("App").unwrap()];
+    let effect = comp
+        .hooks
+        .iter()
+        .find_map(|h| match h {
+            reactant::ir::HookEntry::Effect { label, .. } => Some(*label),
+            _ => None,
+        })
+        .expect("the alias is inlined");
+    assert!(matches!(comp.rerun(effect), Some(Rerun::Always(_))));
+}

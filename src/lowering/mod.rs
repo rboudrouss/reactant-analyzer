@@ -391,14 +391,14 @@ pub fn lower_custom_hooks_with_resolver(
     let origins = build_hook_origins(program, file, resolver);
     let react_ns = build_react_ns(program);
     let candidates = detect_custom_hooks(program);
-    let local_hooks: HashSet<String> = candidates.iter().map(|c| c.name.clone()).collect();
+    let (local_hooks, aliases) = local_hooks(program, &origins, &react_ns, file);
     let imports = hook_extractor::ImportCtx {
         origins: &origins,
         react_ns: &react_ns,
         local_hooks: &local_hooks,
         current_file: Some(file),
     };
-    candidates
+    let mut out: Vec<HookIR> = candidates
         .into_iter()
         .map(|candidate| {
             let (params, mut body_cfg) = candidate.build_cfg(&ctx);
@@ -415,9 +415,74 @@ pub fn lower_custom_hooks_with_resolver(
                 body_cfg,
                 hooks,
                 hook_provenance,
+                alias_of: None,
             }
         })
-        .collect()
+        .collect();
+    out.extend(aliases.into_iter().map(|(alias, hook)| HookIR {
+        file: file.to_path_buf(),
+        name: alias.name,
+        params: vec![],
+        param_defaults: vec![],
+        body_cfg: crate::ir::cfg::CFG {
+            entry: 0,
+            blocks: std::collections::BTreeMap::from([(
+                0,
+                crate::ir::cfg::BasicBlock {
+                    id: 0,
+                    stmts: vec![],
+                    term: crate::ir::cfg::Terminator::Return(
+                        crate::ir::expr::Expr::Lit(crate::ir::expr::Prim::Unit),
+                        None,
+                    ),
+                },
+            )]),
+            edges: vec![],
+        },
+        hooks: vec![],
+        hook_provenance: vec![],
+        alias_of: Some(hook),
+    }));
+    out
+}
+
+/// The hook names `program` defines: its `use*` functions, and the
+/// [`HookAlias`](hook_detector::HookAlias)es whose every arm is one of React's
+/// effect hooks, which the IR lowers alike, returned with their first arm.
+/// Any other alias is not a definition the analysis reads: a call through it
+/// stays a hook it does not see.
+fn local_hooks(
+    program: &Program,
+    origins: &HashMap<String, import_resolution::HookOrigin>,
+    react_ns: &HashSet<String>,
+    file: &Path,
+) -> (HashSet<String>, Vec<(hook_detector::HookAlias, String)>) {
+    let mut names: HashSet<String> = detect_custom_hooks(program)
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
+    let imports = hook_extractor::ImportCtx {
+        origins,
+        react_ns,
+        local_hooks: &names,
+        current_file: Some(file),
+    };
+    let aliases: Vec<(hook_detector::HookAlias, String)> =
+        hook_detector::detect_hook_aliases(program)
+            .into_iter()
+            .filter_map(|alias| {
+                let hooks: Option<Vec<String>> =
+                    alias.arms.iter().map(|a| imports.react_hook(a)).collect();
+                let hooks = hooks?;
+                let first = hooks.first()?.clone();
+                hooks
+                    .iter()
+                    .all(|h| hook_extractor::is_effect_hook(h))
+                    .then_some((alias, first))
+            })
+            .collect();
+    names.extend(aliases.iter().map(|(a, _)| a.name.clone()));
+    (names, aliases)
 }
 
 /// Stage 3 entry point: lower all React components in `program` to `ComponentIR`.
@@ -457,10 +522,7 @@ pub fn lower_program_with_resolver(
     let origins = build_hook_origins(program, file, resolver);
     let react_ns = build_react_ns(program);
     let module_consts = Arc::new(collect_module_consts(program, &react_ns, file));
-    let local_hooks: HashSet<String> = detect_custom_hooks(program)
-        .iter()
-        .map(|c| c.name.clone())
-        .collect();
+    let (local_hooks, _) = local_hooks(program, &origins, &react_ns, file);
     let imports = hook_extractor::ImportCtx {
         origins: &origins,
         react_ns: &react_ns,

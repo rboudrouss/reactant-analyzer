@@ -469,7 +469,11 @@ is not built from `src/<subpath>` (`twenty-sdk/front-component` comes from
 [#48](https://github.com/rboudrouss/reactant-analyzer/issues/48); re-export
 chains beyond one level for components, contexts and utilities [#49](https://github.com/rboudrouss/reactant-analyzer/issues/49)
 (a custom hook's import follows the chain to its end); a third-party hook re-exported under a
-local alias [#50](https://github.com/rboudrouss/reactant-analyzer/issues/50). `node_modules` is never lowered, and the
+local alias [#50](https://github.com/rboudrouss/reactant-analyzer/issues/50). A module `const` binding a
+hook name to React hooks (`const useIsoEffect = isBrowser ? useLayoutEffect : useEffect`) is read as
+that hook only when every arm is one of React's effect hooks, which the IR lowers alike; any other
+alias, a no-op arm included (`isBrowser ? useLayoutEffect : () => {}`), is a hook the analysis does
+not see. `node_modules` is never lowered, and the
 `SummaryRegistry` is the supported extension point [#51](https://github.com/rboudrouss/reactant-analyzer/issues/51).
 
 Utility inlining is statement position only [#52](https://github.com/rboudrouss/reactant-analyzer/issues/52), runs once per

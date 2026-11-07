@@ -26,4 +26,9 @@ pub struct HookIR {
     /// labels remapped, marked `inlined` — into each consumer that expands
     /// this hook.
     pub hook_provenance: Vec<HookProvenance>,
+    /// `Some(hook)`: the name is a module binding to React's effect hooks,
+    /// `hook` among them (`const useIsoEffect = isBrowser ? useLayoutEffect :
+    /// useEffect`), which the IR lowers alike. A call is that hook's own
+    /// call, with no body of its own.
+    pub alias_of: Option<Symbol>,
 }

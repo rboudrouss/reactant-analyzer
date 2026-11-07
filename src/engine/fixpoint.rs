@@ -1209,6 +1209,22 @@ fn expand_custom_hooks(
             continue;
         };
 
+        // An alias of React's effect hooks is that hook: the call's own entry,
+        // its arguments the caller's, at the caller's label and position.
+        if let Some(hook) = &hook_ir.alias_of {
+            let span = hooks[i].span();
+            if let Some(entry) = crate::lowering::hook_extractor::react_hook_entry(
+                hook,
+                custom_label,
+                call_args,
+                span,
+            ) {
+                hooks[i] = entry;
+            }
+            i += 1;
+            continue;
+        }
+
         // Offset = first available label after all current entries.
         let offset: HookLabel = hooks.iter().map(|h| h.label() + 1).max().unwrap_or(0);
 

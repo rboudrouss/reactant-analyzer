@@ -800,6 +800,14 @@ impl ImportCtx<'static> {
 }
 
 impl ImportCtx<'_> {
+    /// The React hook `name` is, by the hook's own name: what a hook alias's
+    /// arms must be ([`super::hook_detector::HookAlias`]).
+    pub(crate) fn react_hook(&self, name: &str) -> Option<String> {
+        self.classify_callee(&Expr::Var(name.to_string()))
+            .filter(|c| c.is_react)
+            .map(|c| c.origin_name)
+    }
+
     /// Resolve a callee to a hook identity, or `None` for a plain call.
     ///
     /// - bare `name(...)`: a local `use*` definition shadows everything
@@ -880,6 +888,31 @@ impl ImportCtx<'_> {
 
 // ── HookEntry construction ────────────────────────────────────────────────────
 
+/// React's effect hooks: the IR lowers each to the same `HookEntry::Effect`.
+const EFFECT_HOOKS: &[&str] = &["useEffect", "useLayoutEffect", "useInsertionEffect"];
+
+/// `name` is one of React's effect hooks.
+pub(crate) fn is_effect_hook(name: &str) -> bool {
+    EFFECT_HOOKS.contains(&name)
+}
+
+/// The entry React's hook `name` called with `args` lowers to — what a call
+/// through an alias of it is ([`crate::ir::HookIR::alias_of`]).
+pub fn react_hook_entry(
+    name: &str,
+    label: HookLabel,
+    args: Vec<Expr>,
+    span: Option<SourceRange>,
+) -> Option<HookEntry> {
+    let call = ResolvedHookCall {
+        origin_name: name.to_string(),
+        is_react: true,
+        specifier: Some("react".to_string()),
+        resolved_file: None,
+    };
+    make_hook_entry(&call, label, args, span)
+}
+
 fn make_hook_entry(
     call: &ResolvedHookCall,
     label: HookLabel,
@@ -915,7 +948,7 @@ fn make_hook_entry(
                 span,
             })
         }
-        "useEffect" => {
+        _ if EFFECT_HOOKS.contains(&name) => {
             let body_cfg = hook_body_cfg(it.next());
             let deps = it.next().map_or(DepsArg::Absent, DepsArg::from_expr);
             Some(HookEntry::Effect {
@@ -969,16 +1002,6 @@ fn make_hook_entry(
                 label,
                 init,
                 reducer,
-                span,
-            })
-        }
-        "useLayoutEffect" | "useInsertionEffect" => {
-            let body_cfg = hook_body_cfg(it.next());
-            let deps = it.next().map_or(DepsArg::Absent, DepsArg::from_expr);
-            Some(HookEntry::Effect {
-                label,
-                body_cfg,
-                deps,
                 span,
             })
         }
