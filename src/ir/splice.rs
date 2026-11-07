@@ -812,7 +812,7 @@ pub fn rename_hook_entry(entry: HookEntry, ren: &HashMap<Var, Var>) -> HookEntry
             name,
             args: args.into_iter().map(|e| rename_vars_expr(e, ren)).collect(),
             deps: deps.map_exprs(|e| rename_vars_expr(e, ren)),
-            binding,
+            binding: binding.map(|b| rename_one(ren, &b)),
             import_source,
             resolved_file,
             span,
