@@ -114,6 +114,97 @@ export function ClickOutside() {
 }
 "#;
 
+const OPTIONS: &str = r#"
+import { useState } from "react";
+import { useAction as useSafeAction } from "next-safe-action/hooks";
+import { useReactTable } from "@tanstack/react-table";
+import { useMutation } from "@tanstack/react-query";
+import useSWR from "swr";
+import { useDropzone } from "react-dropzone";
+
+export function ActionResponse() {
+  const [a, setA] = useState(0);
+  const { execute } = useSafeAction(save, {
+    onSuccess: () => setA(1),
+    onError: () => setA(2),
+  });
+  return <p onClick={() => execute()}>{a}</p>;
+}
+
+export function ActionStart() {
+  const [a, setA] = useState(0);
+  const { execute } = useSafeAction(save, { onExecute: () => setA(1) });
+  return <p onClick={() => execute()}>{a}</p>;
+}
+
+export function ActionOptionsByName() {
+  const [a, setA] = useState(0);
+  const opts = { onSuccess: () => setA(1) };
+  const { execute } = useSafeAction(save, opts);
+  return <p onClick={() => execute()}>{a}</p>;
+}
+
+export function TableChangedInRender() {
+  const [a, setA] = useState(0);
+  const table = useReactTable({ data: [], columns: [], onPaginationChange: (p) => setA(1) });
+  table.setPageIndex(0);
+  return <p>{a}</p>;
+}
+
+export function Mutation() {
+  const [a, setA] = useState(0);
+  const m = useMutation({ mutationFn: send, onSuccess: () => setA(1), onMutate: () => setA(2) });
+  return <p onClick={() => m.mutate()}>{a}</p>;
+}
+
+export function Swr() {
+  const [a, setA] = useState(0);
+  const { data } = useSWR("/k", fetcher, { onSuccess: () => setA(1) });
+  return <p>{a}{data}</p>;
+}
+
+export function Dropzone() {
+  const [a, setA] = useState(0);
+  const { getRootProps } = useDropzone({ onDrop: () => setA(1) });
+  return <div {...getRootProps()}>{a}</div>;
+}
+"#;
+
+#[test]
+fn an_options_member_the_table_names_runs_at_its_time() {
+    let r = parse_and_analyze(OPTIONS);
+    for name in ["ActionResponse", "Swr"] {
+        assert!(setter_in_render(&r, name).is_empty(), "{name}");
+        assert_eq!(
+            phases(comp(&r, name)),
+            vec![WriterPhase::Deferred],
+            "{name}"
+        );
+    }
+    assert!(setter_in_render(&r, "Dropzone").is_empty());
+    assert_eq!(phases(comp(&r, "Dropzone")), vec![WriterPhase::Handler]);
+}
+
+#[test]
+fn an_options_member_the_table_does_not_name_keeps_unknown_timing() {
+    // `onExecute` and `onMutate` run when the request starts; an options
+    // object handed by name is not read member by member; a table's
+    // `on…Change` runs in any call of a table API, a render's included.
+    let r = parse_and_analyze(OPTIONS);
+    for name in [
+        "ActionStart",
+        "ActionOptionsByName",
+        "TableChangedInRender",
+        "Mutation",
+    ] {
+        assert_eq!(
+            setter_in_render(&r, name),
+            vec![Severity::Warning],
+            "{name}"
+        );
+    }
+}
+
 #[test]
 fn a_debounced_callback_runs_from_a_timer() {
     let r = parse_and_analyze(SRC);

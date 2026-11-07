@@ -17,6 +17,26 @@
 //!   may be flushed there.
 //! - `usehooks-ts`'s `useOnClickOutside(ref, handler, …)` runs `handler` from
 //!   a document listener and nowhere else: a listener.
+//!
+//! An options object is timed member by member (`ArgTiming::Members`): a
+//! member the entry names runs at its time, any other member of the literal
+//! keeps the `Unknown` timing, and so does an options argument that is not
+//! an object literal.
+//!
+//! - The response callbacks — `next-safe-action`'s `useAction(action, {
+//!   onSuccess, onError, onSettled })`, `swr`'s `useSWR` / `useSWRMutation`
+//!   options and `@tanstack/react-query`'s `useMutation({ … })` — run once
+//!   the request they follow has answered: deferred. `onExecute` and
+//!   `onMutate`, which run when the request starts, are not in the table.
+//! - `react-dropzone`'s `useDropzone({ onDrop, … })` drag and drop callbacks
+//!   run from the drop zone's DOM listeners, and `onFileDialogCancel` from a
+//!   window focus listener: listeners. `onFileDialogOpen` runs in a call of
+//!   the result's `open`, which may be made during a render: not in the
+//!   table.
+//! - `@tanstack/react-table`'s `on…Change` options are not in the table: they
+//!   run in a call of the table API that changes their state, and the table
+//!   is handed to the components that render it, any of which may call one
+//!   during its render.
 
 use std::collections::HashMap;
 
@@ -34,7 +54,39 @@ pub(crate) enum ArgTiming {
     Deferred,
     /// From an event listener.
     Listener,
+    /// An options object whose named members run at their own time.
+    Members(&'static [(&'static str, ArgTiming)]),
 }
+
+impl ArgTiming {
+    /// The timing of member `name` of an options object timed `self`.
+    pub(crate) fn member(self, name: &str) -> Option<ArgTiming> {
+        match self {
+            ArgTiming::Members(ms) => ms.iter().find(|(m, _)| *m == name).map(|(_, t)| *t),
+            _ => None,
+        }
+    }
+}
+
+use ArgTiming::{Deferred, Listener, Members};
+
+/// The response callbacks of a request hook's options.
+const RESPONSE: ArgTiming = Members(&[
+    ("onSuccess", Deferred),
+    ("onError", Deferred),
+    ("onSettled", Deferred),
+]);
+
+/// `useDropzone`'s DOM-event callbacks.
+const DROPZONE: ArgTiming = Members(&[
+    ("onDrop", Listener),
+    ("onDropAccepted", Listener),
+    ("onDropRejected", Listener),
+    ("onDragEnter", Listener),
+    ("onDragLeave", Listener),
+    ("onDragOver", Listener),
+    ("onFileDialogCancel", Listener),
+]);
 
 /// The timing of every argument of every hook of `hooks` the expansion left,
 /// by label: `None` for an argument the table does not time.
@@ -71,6 +123,10 @@ pub(crate) fn left_hook_args(
                     timed(0, ArgTiming::Deferred)
                 }
                 ("usehooks-ts", "useOnClickOutside") => timed(1, ArgTiming::Listener),
+                ("next-safe-action/hooks" | "next-safe-action", "useAction") => timed(1, RESPONSE),
+                ("swr", "useSWR") | ("swr/mutation", "useSWRMutation") => timed(2, RESPONSE),
+                ("@tanstack/react-query", "useMutation") => timed(0, RESPONSE),
+                ("react-dropzone", "useDropzone") => timed(0, DROPZONE),
                 _ => return None,
             };
             Some((*label, row))

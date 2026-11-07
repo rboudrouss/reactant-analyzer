@@ -66,11 +66,17 @@ that writes it (see *Cross-file limits*).
   `useEffectEvent` is the exception: its argument — a literal, or a name bound to one or to a
   `useCallback` value — runs where a name bound once to the function it hands back is called, as a
   `useCallback` value does; the value itself stays opaque, so a call through it React would reject
-  during render is still read as running the argument. Two package hooks have a timing of their
+  during render is still read as running the argument. A few package hooks have a timing of their
   own (`engine::timing`): `use-debounce`'s `useDebouncedCallback(fn, wait)` runs `fn` deferred
   when it gets no options and its result is only called, cancelled or listed in deps (a `flush`, a
   `leading` option or a result handed elsewhere keep it of unknown timing), and `usehooks-ts`'s
-  `useOnClickOutside` runs its handler as a listener. A closure reached through a
+  `useOnClickOutside` runs its handler as a listener. Options literals are timed by member: the
+  response callbacks (`onSuccess`, `onError`, `onSettled`) of `next-safe-action`'s `useAction`,
+  `swr`'s `useSWR` and `@tanstack/react-query`'s `useMutation` are deferred, and
+  `react-dropzone`'s drag and drop callbacks are listeners. `@tanstack/react-table`'s `on…Change`
+  run in any call of a table API, during a render included, and keep the unknown timing, as does
+  any other member and an options object handed by name. A
+  closure reached through a
   local function's parameter (`const f = (g) => g(); f(() => setN(1))`) or an array method's
   callback parameter (`fs.forEach((f) => f())`, the parameter being the array's entries) runs
   where it is called [#253](https://github.com/rboudrouss/reactant-analyzer/issues/253), a possible

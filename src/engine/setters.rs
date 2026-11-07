@@ -2926,11 +2926,19 @@ impl<'a> SetterWalk<'a> {
             && let Some(c) = self.converged
         {
             for (i, arg) in c.left_args(*label).iter().enumerate() {
-                let class = match c.arg_timing(*label, i) {
-                    Some(ArgTiming::Deferred) => WalkClass::Deferred,
-                    Some(ArgTiming::Listener) => self.listener_class(),
-                    None => WalkClass::Unknown,
-                };
+                let timing = c.arg_timing(*label, i);
+                // An options literal: each member at the time the table
+                // gives it, ⊤ for the rest.
+                if let Some(t @ ArgTiming::Members(_)) = timing
+                    && let Expr::ObjectLit { fields, .. } = arg.peel_ts()
+                {
+                    for (name, val) in fields {
+                        let class = self.timing_class(t.member(name));
+                        self.callback_arg(val, class, None, depth, found, prov, stmt_span);
+                    }
+                    continue;
+                }
+                let class = self.timing_class(timing);
                 self.callback_arg(arg, class, None, depth, found, prov, stmt_span);
             }
         }
@@ -3051,6 +3059,17 @@ impl<'a> SetterWalk<'a> {
     /// A listener's class: `Handler`, or ⊤ in a program that dispatches
     /// events itself, where it may run synchronously in the dispatching body
     /// ([`Timing::in_program`](crate::engine::registrations::Timing::in_program), #219).
+    /// The class a package hook's argument timed `timing` runs in
+    /// ([`crate::engine::timing`]); ⊤ for an untimed one, and for an options
+    /// object handed whole.
+    fn timing_class(&self, timing: Option<ArgTiming>) -> WalkClass {
+        match timing {
+            Some(ArgTiming::Deferred) => WalkClass::Deferred,
+            Some(ArgTiming::Listener) => self.listener_class(),
+            Some(ArgTiming::Members(_)) | None => WalkClass::Unknown,
+        }
+    }
+
     fn listener_class(&self) -> WalkClass {
         if self.dispatches {
             WalkClass::Unknown
