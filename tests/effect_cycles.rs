@@ -2803,3 +2803,32 @@ export function App() {
         "{diags:?}"
     );
 }
+
+/// The write sits three callbacks deep — a closure an unknown callee runs,
+/// `forEach`'s callback, the array entry its parameter is bound to (#253).
+/// The fixpoint inlines that deep, so the writer relation must too (#266);
+/// the constant twin stores the value already there and stays silent.
+#[test]
+fn a_write_three_callbacks_deep_closes_the_effect_loop() {
+    let src = |write: &str| {
+        format!(
+            r#"
+import {{ useState, useEffect }} from 'react';
+import {{ runNow }} from 'ext';
+export function App() {{
+  const [n, setN] = useState(0);
+  useEffect(() => {{
+    runNow(() => [() => setN({write})].forEach((f) => f()));
+  }}, [n]);
+  return <div>{{n}}</div>;
+}}
+"#
+        )
+    };
+    let grows = infinite_loop_diags(&src("n + 1"), "App");
+    assert!(
+        !grows.is_empty() && grows.iter().all(|(_, s, _)| *s == Severity::Warning),
+        "{grows:?}"
+    );
+    assert!(infinite_loop_diags(&src("1"), "App").is_empty());
+}

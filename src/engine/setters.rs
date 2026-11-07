@@ -1879,10 +1879,12 @@ pub(crate) fn collect_slot_writers(
             add_converged(&mut targets, &own);
         }
         let setter_vars: HashSet<Var> = targets.keys().cloned().collect();
+        // The relation descends as deep as the fixpoint inlines: a write the
+        // store holds through three nested callbacks is a row too (#266).
         let mut sites = collect_write_sites(
             cfg,
             &setter_vars,
-            2,
+            crate::domains::interp::MAX_INLINE_DEPTH,
             effect_body,
             dispatches,
             &shadowed,
