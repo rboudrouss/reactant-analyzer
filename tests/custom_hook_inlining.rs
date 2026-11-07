@@ -1353,3 +1353,58 @@ fn a_hook_alias_called_without_deps_reruns_every_render() {
         .expect("the alias is inlined");
     assert!(matches!(comp.rerun(effect), Some(Rerun::Always(_))));
 }
+
+#[test]
+fn a_component_no_root_reaches_still_expands_its_custom_hooks() {
+    // `Other` is analysed after the roots, on its own (phase 2): its hook is
+    // its body there too, and so is a library hook's summary.
+    use oxc_allocator::Allocator;
+    use oxc_parser::{ParseOptions, Parser};
+    use oxc_span::SourceType;
+    let src = r#"
+        import { useEffect, useState } from "react";
+        import { useRouter } from "next/navigation";
+        function useTick() {
+            const [n, setN] = useState(0);
+            useEffect(() => { setN(n + 1); });
+            return n;
+        }
+        function App() {
+            return <div />;
+        }
+        function Other() {
+            const router = useRouter();
+            const n = useTick();
+            return <div onClick={() => router.push("/")}>{n}</div>;
+        }
+    "#;
+    let alloc = Allocator::default();
+    let ret = Parser::new(&alloc, src, SourceType::tsx())
+        .with_options(ParseOptions::default())
+        .parse();
+    let path = std::path::Path::new("test.tsx");
+    let components = lower_program(&ret.program, src, path, &mut Default::default());
+    let hooks = lower_custom_hooks(&ret.program, src, path, &mut Default::default());
+    let config = Config {
+        summary_registry: reactant::registry::SummaryRegistry::new_with_common(),
+        ..Config::default()
+    };
+    let result = analyze_program(
+        ComponentRegistry::from_components(components),
+        HookRegistry::from_hooks(hooks),
+        RootStrategy::Explicit(vec!["App".to_string()]),
+        &config,
+    );
+    let diags = diags_for(&result, "Other");
+    assert!(
+        diags.iter().any(|d| d.rule.as_ref() == "infinite-loop"
+            && d.severity() != reactant::rules::Severity::Info),
+        "{diags:#?}"
+    );
+    assert!(
+        !diags
+            .iter()
+            .any(|d| d.message.contains("was not found in the registry")),
+        "{diags:#?}"
+    );
+}

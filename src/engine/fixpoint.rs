@@ -132,6 +132,7 @@ pub fn analyze_component_inter(
         initial_heap,
         Some(inter),
         inter.program,
+        inter.hook_registry,
     )
 }
 
@@ -171,6 +172,7 @@ pub fn analyze_component_as<T: Transfer<Domain = StateValue>>(
         None,
         // The program is this component and the utilities it may call.
         &ProgramFacts::of_utilities(&config.function_registry),
+        None,
     )
 }
 
@@ -194,6 +196,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     initial_heap: Heap,
     inter: Option<&InterCtx<'_>>,
     program: &ProgramFacts,
+    hook_registry: Option<&HookRegistry>,
 ) -> AnalysisResult<StateValue> {
     let ComponentIR {
         file: comp_file,
@@ -281,7 +284,8 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         &mut hooks,
         &mut hook_provenance,
         &mut render_cfg,
-        inter,
+        config,
+        hook_registry,
         &mut inline_origins,
         &mut inline_regions,
         &mut splice_salt,
@@ -932,6 +936,7 @@ pub fn analyze_program(
                 Heap::new(),
                 Some(&inter),
                 &program,
+                Some(&hook_registry),
             );
             stats.borrow_mut().components_analyzed += 1;
             results.borrow_mut().insert(root, result);
@@ -995,7 +1000,8 @@ pub fn analyze_program(
             }
             // Phase 2 is intra-only, but the component still has to record its
             // own identity — a `Versioned` label it mints here is compared
-            // against phase-1 results.
+            // against phase-1 results — and its custom hooks are its body as
+            // they are a reached component's.
             let result = analyze_component_impl(
                 ir,
                 id,
@@ -1005,6 +1011,7 @@ pub fn analyze_program(
                 Heap::new(),
                 None,
                 &program,
+                Some(&hook_registry),
             );
             stats.borrow_mut().components_analyzed += 1;
             results.borrow_mut().insert(id, result);
@@ -1132,17 +1139,18 @@ impl Ancestry {
 
 /// Guard strategy: every entry carries its [`Ancestry`]. A `Custom` entry is
 /// skipped (cut to ⊤) only when its ancestry recurses on its name.
+#[allow(clippy::too_many_arguments)]
 fn expand_custom_hooks(
     hooks: &mut Vec<HookEntry>,
     hook_provenance: &mut Vec<crate::ir::hooks::HookProvenance>,
     render_cfg: &mut CFG,
-    inter: Option<&InterCtx<'_>>,
+    config: &Config,
+    hook_registry: Option<&HookRegistry>,
     origins: &mut Vec<crate::engine::InlineOrigin>,
     regions: &mut crate::engine::setters::InlineRegions,
     salt: &mut SpliceIds,
 ) {
-    let Some(inter) = inter else { return };
-    let Some(reg) = inter.hook_registry else {
+    let Some(reg) = hook_registry else {
         return;
     };
 
@@ -1188,11 +1196,7 @@ fn expand_custom_hooks(
             // hooks vec so they don't generate opaque Custom diagnostics.
             // Call summarize() to get the abstract return value and patch the
             // render_cfg binding so the fixpoint sees the right abstraction.
-            if let Some(summary) = inter
-                .config
-                .summary_registry
-                .get(&name, import_source.as_deref())
-            {
+            if let Some(summary) = config.summary_registry.get(&name, import_source.as_deref()) {
                 // A per-member contract needs an allocation site of its own —
                 // one per call, so two `useForm()`s are two objects. Drawn
                 // from the component's splice cursor, the same supply a graft
