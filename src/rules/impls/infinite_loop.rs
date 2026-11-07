@@ -146,7 +146,7 @@ impl Rule for InfiniteLoop {
                             format!(
                                 "this effect keeps pushing state {}{} to new values \
                              on every run. Potential infinite render loop",
-                                state_slot_name(state_label, &state_names),
+                                state_slot_name(state_label, ctx.source_names(), &state_names),
                                 deps_note
                             ),
                         )
@@ -176,7 +176,9 @@ impl Rule for InfiniteLoop {
                                     },
                                     Some(*h_label),
                                     h_span,
-                                    &ctx.names(&|l| state_slot_name(l, &state_names)),
+                                    &ctx.names(&|l| {
+                                        state_slot_name(l, ctx.source_names(), &state_names)
+                                    }),
                                 );
                             }
                         }
@@ -186,7 +188,7 @@ impl Rule for InfiniteLoop {
                         diag = diag.with_notes(crate::rules::api::witness::slot_history(
                             comp_result,
                             state_label,
-                            &ctx.names(&|l| state_slot_name(l, &state_names)),
+                            &ctx.names(&|l| state_slot_name(l, ctx.source_names(), &state_names)),
                         ));
 
                         reported_effects.insert(*eff_label);
@@ -633,7 +635,7 @@ fn check_object_churn(
                         "this effect recreates object state {state} it depends on. \
                          Every run stores a fresh reference (`Object.is` always fails) \
                          and re-triggers itself: infinite render loop",
-                        state = state_slot_name(state_label, &state_vals)
+                        state = state_slot_name(state_label, ctx.source_names(), &state_vals)
                     ),
                 ),
                 (Severity::Info, _) if allocates => Diagnostic::info(
@@ -642,7 +644,7 @@ fn check_object_churn(
                         "this effect depends on object state but freshly recreates \
                          state {state} outside its deps. No update cycle was found, \
                          but deps may be too imprecise to rule one out",
-                        state = state_slot_name(state_label, &state_vals)
+                        state = state_slot_name(state_label, ctx.source_names(), &state_vals)
                     ),
                 ),
                 (Severity::Info, _) => Diagnostic::info(
@@ -651,7 +653,7 @@ fn check_object_churn(
                         "this effect depends on state and may change state {state} \
                          outside its deps. No update cycle was found, but deps may be \
                          too imprecise to rule one out",
-                        state = state_slot_name(state_label, &state_vals)
+                        state = state_slot_name(state_label, ctx.source_names(), &state_vals)
                     ),
                 ),
                 _ if allocates => Diagnostic::warn(
@@ -659,7 +661,7 @@ fn check_object_churn(
                     format!(
                         "this effect may store a fresh reference into state \
                          {state} which its deps react to: possible infinite render loop",
-                        state = state_slot_name(state_label, &state_vals)
+                        state = state_slot_name(state_label, ctx.source_names(), &state_vals)
                     ),
                 ),
                 _ => Diagnostic::warn(
@@ -668,7 +670,7 @@ fn check_object_churn(
                         "this effect may change state {state} which its deps react to, \
                          and no write of it is proven to settle: possible infinite \
                          render loop",
-                        state = state_slot_name(state_label, &state_vals)
+                        state = state_slot_name(state_label, ctx.source_names(), &state_vals)
                     ),
                 ),
             }
@@ -688,7 +690,7 @@ fn check_object_churn(
                     },
                     Some(*eff_label),
                     Some(r),
-                    &ctx.names(&|l| state_slot_name(l, &state_vals)),
+                    &ctx.names(&|l| state_slot_name(l, ctx.source_names(), &state_vals)),
                 );
             }
             diags.push(diag);

@@ -81,7 +81,8 @@ impl Rule for RedundantSetState {
                 .collect()
         };
         let state_names = crate::rules::state_val_labels(&result.render_cfg);
-        let name_of = |l: HookLabel| crate::rules::state_slot_name(l, &state_names);
+        let name_of =
+            |l: HookLabel| crate::rules::state_slot_name(l, ctx.source_names(), &state_names);
         let names = ctx.names(&name_of);
 
         // ── Render body ───────────────────────────────────────────────────────

@@ -92,7 +92,7 @@ impl Rule for FrozenInitialState {
         let setter_labels = all_setter_labels(comp);
         let state_labels = state_val_labels(render_cfg);
         let locally_written = may_written_slots(render_cfg, &comp.hooks, &setter_labels);
-        let name_of = |l: HookLabel| state_slot_name(l, &state_labels);
+        let name_of = |l: HookLabel| state_slot_name(l, ctx.source_names(), &state_labels);
 
         let mut diags = Vec::new();
 

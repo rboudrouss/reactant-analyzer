@@ -158,14 +158,14 @@ impl Rule for UnnecessaryRerender {
                                 "mount-only effect flips state {} from `false` to `true`. \
                              The SSR mount-flag idiom costs one extra rerender on every \
                              mount; prefer `useSyncExternalStore` for client detection",
-                                state_slot_name(state_label, &state_names)
+                                state_slot_name(state_label, ctx.source_names(), &state_names)
                             )
                         } else {
                             format!(
                                 "mount-only effect sets state {} to a constant \
                              different from its initial value, which costs one extra rerender on mount; \
                              consider initialising directly with the target value",
-                                state_slot_name(state_label, &state_names)
+                                state_slot_name(state_label, ctx.source_names(), &state_names)
                             )
                         };
                         let mut d = Diagnostic::warn("unnecessary-rerender", message)
@@ -182,7 +182,7 @@ impl Rule for UnnecessaryRerender {
                             },
                             Some(*eff_label),
                             eff_span,
-                            &ctx.names(&|l| state_slot_name(l, &state_names)),
+                            &ctx.names(&|l| state_slot_name(l, ctx.source_names(), &state_names)),
                         );
                         diags.push(d);
                     }

@@ -407,7 +407,7 @@ impl Rule for StateMutation {
             collector.walk_cfg(body_cfg, &mut scopes, 1 + i);
         }
 
-        let name_of = |l: HookLabel| state_slot_name(l, &state_val_label);
+        let name_of = |l: HookLabel| state_slot_name(l, ctx.source_names(), &state_val_label);
         let mut diags = Vec::new();
 
         // ── Arm A: state mutated + setter called with the same reference ──

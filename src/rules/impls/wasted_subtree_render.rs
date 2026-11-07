@@ -188,8 +188,10 @@ impl Rule for WastedSubtreeRender {
             if wasted.is_empty() || (total < min_wasted && !list) {
                 continue;
             }
-            let slot_names: Vec<String> =
-                labels.iter().map(|l| state_slot_name(*l, &names)).collect();
+            let slot_names: Vec<String> = labels
+                .iter()
+                .map(|l| state_slot_name(*l, ctx.source_names(), &names))
+                .collect();
             let slot = join_names(&slot_names);
             let noun = if labels.len() == 1 { "state" } else { "states" };
             let event = continuous
@@ -251,7 +253,7 @@ impl Rule for WastedSubtreeRender {
                     },
                     None,
                     w.span,
-                    &ctx.names(&|l| state_slot_name(l, &names)),
+                    &ctx.names(&|l| state_slot_name(l, ctx.source_names(), &names)),
                 );
             }
             diags.push(d);

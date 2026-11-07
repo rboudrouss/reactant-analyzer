@@ -103,13 +103,20 @@ pub(crate) fn hook_kind_word(kind: HookKind) -> &'static str {
 /// meaningless next to source.
 ///
 /// One slot can have several source names — `const c = count` aliases it, and
-/// alias resolution records both. The smallest name wins: `find` over a
-/// `HashMap` would pick a seed-dependent one, so the same slot could be called
-/// `count` in one run and `c` in the next.
+/// alias resolution records both. The name the `useState` destructuring
+/// declares wins ([`SourceNames::declared_slot`](crate::ir::SourceNames),
+/// #278): `const isDragging = active || dismissing` is a name the slot's
+/// read may flow into, not the slot. Without one, the smallest alias wins:
+/// `find` over a `HashMap` would pick a seed-dependent one, so the same slot
+/// could be called `count` in one run and `c` in the next.
 pub(crate) fn state_slot_name(
     label: HookLabel,
+    names: &crate::ir::SourceNames,
     state_val_labels: &HashMap<Var, HookLabel>,
 ) -> String {
+    if let Some(v) = names.declared_slot(label) {
+        return format!("`{v}`");
+    }
     state_val_labels
         .iter()
         .filter(|(v, l)| **l == label && !v.starts_with("__"))
@@ -117,6 +124,21 @@ pub(crate) fn state_slot_name(
         .min()
         .map(|v| format!("`{}`", crate::ir::source_name(v)))
         .unwrap_or_else(|| format!("state #{label}"))
+}
+
+/// The [`SourceNames`](crate::ir::SourceNames) of a component's render, as
+/// [`RuleCtx::source_names`](crate::rules::RuleCtx::source_names) builds
+/// them: for a message about another component's slots.
+pub(crate) fn source_names_of(
+    comp: &crate::engine::AnalysisResult<crate::domains::StateValue>,
+) -> crate::ir::SourceNames {
+    crate::ir::SourceNames::of(
+        &comp.render_cfg,
+        &comp.hook_provenance,
+        comp.inline_origins
+            .iter()
+            .filter_map(|o| Some((o.bound.as_ref()?, o.name.as_str()))),
+    )
 }
 
 /// `true` when `component` called at least one hook of `kind`. The applicability
@@ -264,7 +286,7 @@ mod tests {
                 m.insert("count".into(), 3);
                 m.insert("c".into(), 3);
                 m.insert("__state_0".into(), 3);
-                state_slot_name(3, &m)
+                state_slot_name(3, &crate::ir::SourceNames::default(), &m)
             })
             .collect();
         assert!(
@@ -277,6 +299,30 @@ mod tests {
     fn slot_name_falls_back_when_only_temps_bind_it() {
         let mut m: HashMap<Var, HookLabel> = HashMap::new();
         m.insert("__obj_1".into(), 7);
-        assert_eq!(state_slot_name(7, &m), "state #7");
+        assert_eq!(
+            state_slot_name(7, &crate::ir::SourceNames::default(), &m),
+            "state #7"
+        );
+    }
+
+    /// #278: the name the `useState` destructuring declares, not the
+    /// smallest name the slot's read flows into.
+    #[test]
+    fn slot_name_is_the_declared_one() {
+        use crate::ir::{expr::Expr, stmt::Stmt};
+        let let_ = |var: &str, rhs: Expr| Stmt::Let {
+            var: var.into(),
+            rhs,
+            span: None,
+        };
+        let cfg = crate::test_support::single_block_cfg(vec![
+            let_("scrollDismissActive", Expr::StateVal(3)),
+            let_("isDragging", Expr::Var("scrollDismissActive".into())),
+        ]);
+        let names = crate::ir::SourceNames::of(&cfg, &[], []);
+        let mut m: HashMap<Var, HookLabel> = HashMap::new();
+        m.insert("scrollDismissActive".into(), 3);
+        m.insert("isDragging".into(), 3);
+        assert_eq!(state_slot_name(3, &names, &m), "`scrollDismissActive`");
     }
 }

@@ -236,7 +236,7 @@ impl Rule for StaleClosure {
                 _ => None,
             })
             .collect();
-        let name_of = |l: HookLabel| state_slot_name(l, &state_vals_render);
+        let name_of = |l: HookLabel| state_slot_name(l, ctx.source_names(), &state_vals_render);
 
         let mut diags = Vec::new();
 

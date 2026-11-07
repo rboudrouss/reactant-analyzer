@@ -138,8 +138,9 @@ impl Rule for DerivedState {
             }
             // Witness (ADR-019): the mirrored source is read, then its
             // function is written to the derived slot.
-            let name_of =
-                |l: crate::ir::types::HookLabel| crate::rules::state_slot_name(l, &state_val_label);
+            let name_of = |l: crate::ir::types::HookLabel| {
+                crate::rules::state_slot_name(l, ctx.source_names(), &state_val_label)
+            };
             d = d.with_step(
                 crate::rules::Step::Read {
                     what: dep_var.clone(),

@@ -13,8 +13,13 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use crate::ir::{
-    bindings::nested_bodies, cfg::CFG, expr::Expr, hooks::HookProvenance, splice::SPLICE_MARK,
-    stmt::Stmt, types::Var,
+    bindings::nested_bodies,
+    cfg::CFG,
+    expr::Expr,
+    hooks::HookProvenance,
+    splice::SPLICE_MARK,
+    stmt::Stmt,
+    types::{HookLabel, Var},
 };
 
 /// Separates the segments of a member path (`api.setV`, `t.1`).
@@ -60,6 +65,11 @@ fn push_path(out: &mut String, path: &str) {
 #[derive(Debug, Default)]
 pub struct SourceNames {
     callees: HashMap<Var, Expr>,
+    /// The name the render's `useState` destructuring declares for each slot
+    /// (`const [n, setN]`): a `Let` of the slot's read the component itself
+    /// writes, not an inlined hook, the smallest such name if there are
+    /// several (#278).
+    slots: HashMap<HookLabel, Var>,
 }
 
 /// Lowering names the value of a callee that is itself a call `__call_N`
@@ -97,6 +107,21 @@ impl SourceNames {
                 callees.insert(var.clone(), Expr::Var(callee.to_string()));
             }
         }
+        let mut slots: HashMap<HookLabel, Var> = HashMap::new();
+        for stmt in cfg.blocks.values().flat_map(|b| &b.stmts) {
+            // A slot an inlined hook declares (`storedValue#3`) is named by
+            // what the component calls it, the alias table's business.
+            if let Stmt::Let { var, rhs, .. } = stmt
+                && let Expr::StateVal(label) = rhs.peel_ts()
+                && !var.starts_with("__")
+                && !var.contains(SPLICE_MARK)
+            {
+                let best = slots.entry(*label).or_insert_with(|| var.clone());
+                if var < best {
+                    *best = var.clone();
+                }
+            }
+        }
         let bodies = std::iter::once(cfg).chain(nested_bodies(cfg).into_iter().map(|(_, b)| b));
         for body in bodies {
             for block in body.blocks.values() {
@@ -121,7 +146,13 @@ impl SourceNames {
                 }
             }
         }
-        SourceNames { callees }
+        SourceNames { callees, slots }
+    }
+
+    /// The name the `useState` destructuring declares for slot `label`, as
+    /// the source wrote it (#278).
+    pub fn declared_slot(&self, label: HookLabel) -> Option<Cow<'_, str>> {
+        self.slots.get(&label).map(|v| source_name(v))
     }
 
     /// [`source_name`], with a call temp at the root read as the call it binds:

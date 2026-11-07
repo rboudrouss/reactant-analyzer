@@ -19,8 +19,13 @@ use crate::{
 
 /// Slot display names per component, resolved lazily. Building the alias table
 /// for a component is not free, and a cycle names the same slots repeatedly.
-pub(in crate::rules) type NodeNames =
-    HashMap<ComponentId, HashMap<crate::ir::types::Var, HookLabel>>;
+pub(in crate::rules) type NodeNames = HashMap<
+    ComponentId,
+    (
+        crate::ir::SourceNames,
+        HashMap<crate::ir::types::Var, HookLabel>,
+    ),
+>;
 
 /// Display name of a qualified slot: `` `count` `` locally,
 /// `` `count` of `Parent` `` for another component's slot.
@@ -30,19 +35,22 @@ pub(in crate::rules) fn node_display(
     result: &ProgramAnalysisResult,
     names: &mut NodeNames,
 ) -> String {
-    let map = names.entry(node.0).or_insert_with(|| {
+    let (declared, map) = names.entry(node.0).or_insert_with(|| {
         result
             .components
             .get(&node.0)
             .map(|r| {
-                super::setters::resolve_setter_aliases(
-                    &r.render_cfg,
-                    &super::setters::state_val_labels(&r.render_cfg),
+                (
+                    super::source_names_of(r),
+                    super::setters::resolve_setter_aliases(
+                        &r.render_cfg,
+                        &super::setters::state_val_labels(&r.render_cfg),
+                    ),
                 )
             })
             .unwrap_or_default()
     });
-    let base = crate::rules::state_slot_name(node.1, map);
+    let base = crate::rules::state_slot_name(node.1, declared, map);
     if node.0 == component {
         base
     } else {
