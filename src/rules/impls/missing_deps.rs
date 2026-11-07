@@ -105,7 +105,12 @@ impl Rule for MissingDeps {
             }
 
             for path in reported {
-                let val = env_exit.lookup(&path.root);
+                // The value the message speaks of is the one read: a member's
+                // own, not its container's (#274).
+                let val = match path.segments.len() {
+                    0 => env_exit.lookup(&path.root),
+                    n => result.evaluator().at(&env_exit, &path.prefix_expr(n)),
+                };
                 {
                     let mut d = Diagnostic::warn(
                         "missing-deps",
