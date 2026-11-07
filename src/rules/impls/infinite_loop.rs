@@ -115,7 +115,7 @@ impl Rule for InfiniteLoop {
             }
 
             let calls =
-                collect_setter_calls_with_extra(body_cfg, &all_setter_vars, 1, &render_fn_bindings);
+                collect_setter_calls_with_extra(body_cfg, &all_setter_vars, &render_fn_bindings);
 
             for call in &calls {
                 // A write only a registered event listener reaches does not
@@ -165,8 +165,7 @@ impl Rule for InfiniteLoop {
                                 body_cfg: h_cfg,
                                 ..
                             } = h
-                                && !collect_setter_calls(h_cfg, &setter_vars_for_label, 1)
-                                    .is_empty()
+                                && !collect_setter_calls(h_cfg, &setter_vars_for_label).is_empty()
                             {
                                 let h_span =
                                     comp_result.handler_info.get(h_label).and_then(|i| i.span);

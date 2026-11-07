@@ -93,24 +93,25 @@ impl From<WalkClass> for SetterCallPhase {
 
 /// Collect all setter variable names called in `cfg` together with their
 /// call-site span and block ID, descending into FnLit argument bodies and
-/// variable-bound FnLits up to `max_depth` levels.
-pub fn collect_setter_calls(
-    cfg: &CFG,
-    setter_vars: &HashSet<Var>,
-    max_depth: usize,
-) -> Vec<SetterCall> {
-    collect_setter_calls_with_extra(cfg, setter_vars, max_depth, &HashMap::new())
+/// variable-bound FnLits as deep as the fixpoint inlines ([`WALK_DEPTH`]).
+pub fn collect_setter_calls(cfg: &CFG, setter_vars: &HashSet<Var>) -> Vec<SetterCall> {
+    collect_setter_calls_with_extra(cfg, setter_vars, &HashMap::new())
 }
+
+/// How many nested function bodies every walk of this module descends: as
+/// many as the fixpoint inlines, so a write the store holds is a write some
+/// walk finds, whatever rule asks (#266, #267). Past it, both stop and the
+/// component reports the `analysis-limit`.
+pub const WALK_DEPTH: usize = crate::domains::interp::MAX_INLINE_DEPTH;
 
 /// Like `collect_setter_calls` but merges `extra_fn_bindings` so that variable
 /// callbacks defined outside `cfg` are resolved. `cfg`-local entries take precedence.
 pub fn collect_setter_calls_with_extra(
     cfg: &CFG,
     setter_vars: &HashSet<Var>,
-    max_depth: usize,
     extra_fn_bindings: &HashMap<Var, Arc<CFG>>,
 ) -> Vec<SetterCall> {
-    setter_calls(cfg, setter_vars, max_depth, extra_fn_bindings, None)
+    setter_calls(cfg, setter_vars, extra_fn_bindings, None)
 }
 
 /// `collect_setter_calls` that also runs the closures the converged values
@@ -119,22 +120,14 @@ pub fn collect_setter_calls_with_extra(
 pub(crate) fn collect_setter_calls_converged(
     cfg: &CFG,
     setter_vars: &HashSet<Var>,
-    max_depth: usize,
     converged: &ConvergedFns<'_>,
 ) -> Vec<SetterCall> {
-    setter_calls(
-        cfg,
-        setter_vars,
-        max_depth,
-        &HashMap::new(),
-        Some(converged),
-    )
+    setter_calls(cfg, setter_vars, &HashMap::new(), Some(converged))
 }
 
 fn setter_calls(
     cfg: &CFG,
     setter_vars: &HashSet<Var>,
-    max_depth: usize,
     extra_fn_bindings: &HashMap<Var, Arc<CFG>>,
     converged: Option<&ConvergedFns<'_>>,
 ) -> Vec<SetterCall> {
@@ -172,7 +165,7 @@ fn setter_calls(
         wrappers: &wrappers,
         path: Vec::new(),
     };
-    walk.cfg(cfg, max_depth, &mut found, WalkClass::Sync, None, None);
+    walk.cfg(cfg, WALK_DEPTH, &mut found, WalkClass::Sync, None, None);
     let mut found = found.setters;
     // Collapse to the historical one-row-per-var shape, preferring the sync
     // site: its block id serves dominance, where any other class records
@@ -238,7 +231,6 @@ pub(crate) struct WriteSite {
 pub(crate) fn collect_write_sites(
     cfg: &CFG,
     setter_vars: &HashSet<Var>,
-    max_depth: usize,
     effect_body: bool,
     dispatches: bool,
     shadowed: &HashSet<Var>,
@@ -285,7 +277,7 @@ pub(crate) fn collect_write_sites(
         wrappers: &wrappers,
         path: Vec::new(),
     };
-    walk.cfg(cfg, max_depth, &mut found, WalkClass::Sync, None, None);
+    walk.cfg(cfg, WALK_DEPTH, &mut found, WalkClass::Sync, None, None);
     found
         .setters
         .into_iter()
@@ -890,7 +882,7 @@ pub(crate) fn setter_reassigned_before_call(
 /// rather than guess from the shape of the binding.
 fn body_writes(body_cfg: &CFG, setter: &Symbol) -> bool {
     let vars: HashSet<Var> = std::iter::once(setter.clone()).collect();
-    collect_setter_calls(body_cfg, &vars, 2)
+    collect_setter_calls(body_cfg, &vars)
         .iter()
         .any(|c| c.class == SetterCallPhase::Sync)
 }
@@ -1879,12 +1871,9 @@ pub(crate) fn collect_slot_writers(
             add_converged(&mut targets, &own);
         }
         let setter_vars: HashSet<Var> = targets.keys().cloned().collect();
-        // The relation descends as deep as the fixpoint inlines: a write the
-        // store holds through three nested callbacks is a row too (#266).
         let mut sites = collect_write_sites(
             cfg,
             &setter_vars,
-            crate::domains::interp::MAX_INLINE_DEPTH,
             effect_body,
             dispatches,
             &shadowed,
@@ -3224,7 +3213,7 @@ pub fn collect_slot_reads(render_cfg: &CFG, hooks: &[HookEntry]) -> Vec<SlotRead
 /// descent are all the walk's, so the relation inherits them instead of
 /// re-deriving them. `region` is the lexical body — exact — and decides what
 /// a synchronous call's phase is called.
-pub fn collect_body_calls(cfg: &CFG, region: WriterRegion, max_depth: usize) -> Vec<BodyCall> {
+pub fn collect_body_calls(cfg: &CFG, region: WriterRegion) -> Vec<BodyCall> {
     let fn_bindings = collect_fn_bindings(cfg);
     let certified = certified_fn_names(cfg, &fn_bindings);
     let empty_vars = HashSet::new();
@@ -3247,7 +3236,7 @@ pub fn collect_body_calls(cfg: &CFG, region: WriterRegion, max_depth: usize) -> 
         wrappers: &NO_WRAPPERS,
         path: Vec::new(),
     };
-    walk.cfg(cfg, max_depth, &mut found, WalkClass::Sync, None, None);
+    walk.cfg(cfg, WALK_DEPTH, &mut found, WalkClass::Sync, None, None);
     let mut rows: Vec<BodyCall> = found
         .calls
         .into_iter()
@@ -3477,7 +3466,7 @@ mod tests {
         ]);
 
         let setters: HashSet<Var> = ["setN".to_string()].into_iter().collect();
-        let found = collect_setter_calls(&cfg, &setters, 2);
+        let found = collect_setter_calls(&cfg, &setters);
 
         assert_eq!(
             found.iter().map(|c| c.var.as_str()).collect::<Vec<_>>(),
@@ -3521,7 +3510,7 @@ mod tests {
         ]);
 
         let setters: HashSet<Var> = ["setN".to_string()].into_iter().collect();
-        let found = collect_setter_calls(&cfg, &setters, 2);
+        let found = collect_setter_calls(&cfg, &setters);
 
         assert_eq!(
             found.iter().map(|c| c.var.as_str()).collect::<Vec<_>>(),

@@ -208,14 +208,14 @@ impl<'a> EntityCtx<'a> {
     pub fn render_setters(&self, foreign: bool) -> Vec<SetterEntity> {
         if !foreign {
             return self.sorted_setters(
-                collect_setter_calls(&self.comp.render_cfg, &self.setter_vars, 2),
+                collect_setter_calls(&self.comp.render_cfg, &self.setter_vars),
                 &HashMap::new(),
             );
         }
         let cross = self.cross_setters();
         let mut vars = self.setter_vars.clone();
         vars.extend(cross.keys().cloned());
-        self.sorted_setters(collect_setter_calls(&self.comp.render_cfg, &vars, 2), cross)
+        self.sorted_setters(collect_setter_calls(&self.comp.render_cfg, &vars), cross)
     }
 
     /// `var → (owning component, slot)` for every `ComponentSetter`-valued
@@ -387,7 +387,7 @@ impl<'a> EntityCtx<'a> {
             return vec![];
         };
         self.sorted_setters(
-            collect_setter_calls(body, &self.setter_vars, 2),
+            collect_setter_calls(body, &self.setter_vars),
             &HashMap::new(),
         )
     }
@@ -413,7 +413,7 @@ impl<'a> EntityCtx<'a> {
                         };
                         Some((
                             info.label,
-                            crate::engine::collect_body_calls(body, region_of(&row), 2),
+                            crate::engine::collect_body_calls(body, region_of(&row)),
                         ))
                     })
                     .collect()
@@ -424,7 +424,7 @@ impl<'a> EntityCtx<'a> {
 
     /// `render_calls`: non-hook call sites in the render body (#126).
     pub fn render_call_rows(&self) -> Vec<crate::engine::BodyCall> {
-        crate::engine::collect_body_calls(&self.comp.render_cfg, WriterRegion::Render, 2)
+        crate::engine::collect_body_calls(&self.comp.render_cfg, WriterRegion::Render)
     }
 
     /// `deps`: declared deps-array entries, in declared order. An effect with

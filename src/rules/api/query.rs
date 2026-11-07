@@ -871,9 +871,7 @@ fn slot_write_evidence(
     let render_fns = crate::rules::collect_fn_bindings(&owner.render_cfg);
     let mut spans: Vec<SourceRange> = std::iter::once(&owner.render_cfg)
         .chain(owner.hooks.iter().filter_map(|h| h.body_cfg()))
-        .flat_map(|cfg| {
-            crate::rules::collect_setter_calls_with_extra(cfg, &setters, 2, &render_fns)
-        })
+        .flat_map(|cfg| crate::rules::collect_setter_calls_with_extra(cfg, &setters, &render_fns))
         .filter_map(|c| c.span)
         .collect();
     spans.sort_by_key(|r| r.pos_key());

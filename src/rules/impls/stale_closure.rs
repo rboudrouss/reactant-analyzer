@@ -335,7 +335,7 @@ impl Rule for StaleClosure {
                         None
                     } else {
                         let mut calls =
-                            collect_setter_calls_with_extra(cb_body, &slot_setters, 2, &fn_bodies);
+                            collect_setter_calls_with_extra(cb_body, &slot_setters, &fn_bodies);
                         calls.sort_by_key(|c| c.span.map_or((u32::MAX, u32::MAX), |r| r.pos_key()));
                         calls
                             .first()

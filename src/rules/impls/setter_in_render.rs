@@ -133,7 +133,6 @@ impl SetterInRender {
         crate::engine::setters::collect_setter_calls_converged(
             &comp_result.render_cfg,
             &all_setter_vars,
-            2,
             &converged,
         )
         .into_iter()

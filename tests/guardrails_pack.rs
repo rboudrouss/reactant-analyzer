@@ -355,3 +355,24 @@ fn banned_hook_fires_even_when_the_defining_file_is_analyzed() {
         "a provenance-anchored finding must carry the call-site range (ADR-027 §7)"
     );
 }
+
+#[test]
+fn self_retriggering_effect_sees_a_write_three_callbacks_deep() {
+    // #267: `body_setter_calls` descended two nested callbacks while the
+    // fixpoint inlines three; the write below had no row and the rule was
+    // silent on a loop.
+    let d = one(
+        r#"
+        import { useEffect, useState } from "react";
+        function C() {
+            const [n, setN] = useState(0);
+            useEffect(() => {
+                [1].forEach(() => [2].forEach(() => [3].forEach(() => setN(n + 1))));
+            }, [n]);
+            return <div>{n}</div>;
+        }
+        "#,
+        "guardrails/self-retriggering-effect",
+    );
+    assert!(d.message.contains("`n`"), "{}", d.message);
+}

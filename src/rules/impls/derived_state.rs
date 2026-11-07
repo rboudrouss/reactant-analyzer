@@ -53,11 +53,10 @@ impl Rule for DerivedState {
         let setter_vars: HashSet<Var> = setter_label.names().cloned().collect();
 
         // Setters called in render body are not derived-state candidates.
-        let render_setters: HashSet<Var> =
-            collect_setter_calls(&result.render_cfg, &setter_vars, 1)
-                .into_iter()
-                .map(|c| c.var)
-                .collect();
+        let render_setters: HashSet<Var> = collect_setter_calls(&result.render_cfg, &setter_vars)
+            .into_iter()
+            .map(|c| c.var)
+            .collect();
 
         let mut diags = Vec::new();
 

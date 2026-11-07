@@ -304,3 +304,38 @@ fn a_closure_inside_an_argument_object_or_array_may_write_in_render() {
     assert!(!unknown_render_write(comp(&r, "LeftHookObjectNoClosure")));
     assert!(setter_in_render(&r, "LeftHookObjectNoClosure").is_empty());
 }
+
+const DEEP: &str = r#"
+import { useState } from "react";
+
+export function ThreeDeep() {
+  const [a, setA] = useState(0);
+  [1].forEach(() => [2].forEach(() => [3].forEach(() => setA(a + 1))));
+  return <p>{a}</p>;
+}
+
+function Child({ onTick, n }) {
+  [1].forEach(() => [2].forEach(() => [3].forEach(() => onTick(n + 1))));
+  return <p />;
+}
+
+export function Parent() {
+  const [n, setN] = useState(0);
+  return <Child onTick={setN} n={n} />;
+}
+"#;
+
+#[test]
+fn a_render_write_three_callbacks_deep_is_found() {
+    // #267: the rule's own walk descended two nested callbacks while the
+    // fixpoint inlines three (`WALK_DEPTH`): the write had no call and the
+    // rule printed `verified` on a render loop.
+    let r = parse_and_analyze(DEEP);
+    assert_eq!(setter_in_render(&r, "ThreeDeep"), vec![Severity::Error]);
+    let id = r.component_named("Child").unwrap();
+    let cross = SetterInRender.check(&RuleCtx::new(&r, id));
+    assert!(
+        cross.iter().any(|d| d.rule == "cross-setter-in-render"),
+        "the parent's setter is called in render: {cross:?}"
+    );
+}

@@ -265,10 +265,10 @@ fn writes_move_together(
     }
     let mut found = false;
     for scope in scopes {
-        if collect_setter_calls_with_extra(scope, &feeder_setters, 2, &render_fns).is_empty() {
+        if collect_setter_calls_with_extra(scope, &feeder_setters, &render_fns).is_empty() {
             continue;
         }
-        if collect_setter_calls_with_extra(scope, &guard_setters, 2, &render_fns).is_empty() {
+        if collect_setter_calls_with_extra(scope, &guard_setters, &render_fns).is_empty() {
             return false;
         }
         found = true;

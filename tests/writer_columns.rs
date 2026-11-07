@@ -201,7 +201,7 @@ fn a_sync_callback_write_is_placed_at_the_call_only_when_the_receiver_surely_run
         let r = parse_and_analyze(&src);
         let c = comp(&r, "App");
         let setters: HashSet<String> = c.slot_writers.iter().map(|w| w.setter.clone()).collect();
-        let calls = reactant::rules::collect_setter_calls(&c.render_cfg, &setters, 2);
+        let calls = reactant::rules::collect_setter_calls(&c.render_cfg, &setters);
         assert_eq!(calls.len(), 1, "{call}: {calls:?}");
         match calls[0].block_id {
             Some(b) => {
