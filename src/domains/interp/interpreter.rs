@@ -396,11 +396,15 @@ fn exec_stmt_core<T: Transfer>(
         // join, never replace.
         Stmt::MemberWrite { obj, key, rhs, .. } => {
             let rhs_sites = alloc_literal(transfer, rhs, env, ctx);
-            // An object the heap does not place (`ref.current = cb`, a
-            // parameter's member) is one code the analysis does not see may
-            // read: what is written there escapes (#254).
+            // An object the heap does not place (a parameter's member, a
+            // call's result) is one code the analysis does not see may
+            // read: what is written there escapes (#254). So is a ref: it
+            // outlives the render, and a context value or a module binding
+            // may hand it where no row follows (#268).
             let placed = resolve_locs(obj, env, ctx.heap);
-            if placed.as_ref().is_none_or(|s| s.open)
+            if placed
+                .as_ref()
+                .is_none_or(|s| s.open || ctx.heap.persists(s))
                 && let Some(sites) = &rhs_sites
             {
                 ctx.heap.escape(sites);
@@ -418,13 +422,8 @@ fn exec_stmt_core<T: Transfer>(
                 MemberKey::Index(idx) => member_key(idx, env),
             };
             for id in placed.map(|s| s.ids).unwrap_or_default() {
-                ctx.heap.write_after(id, |obj| match &member {
-                    Some(m) => {
-                        let joined = join_member(obj.named.get(m), &new_val);
-                        obj.named.insert(m.clone(), joined);
-                    }
-                    None => obj.write_any(&new_val),
-                });
+                ctx.heap
+                    .write_after(id, |obj| obj.write(member.as_ref(), &new_val));
             }
         }
         // Expression statements never reach the binding core — `exec_full_stmt`
@@ -515,6 +514,20 @@ fn bind_rhs<T: Transfer>(
     // previous binding are not what it holds now (#240).
     let sites = alloc_literal(transfer, rhs, env, ctx);
     env.bind_locs(var.to_string(), sites);
+    // `useRef` returns the hook's one object (#268): the closures a body
+    // writes into `current` are what a call through it runs. It persists
+    // across renders, so a value read through it stays unknown.
+    if let Expr::HookMarker(label, MarkerVal::StableRef) = rhs {
+        let id = ctx.component.ref_site(*label);
+        if ctx.heap.get(id).is_none() {
+            let members = Members {
+                persists: true,
+                ..Members::default()
+            };
+            ctx.heap.insert(id, HeapValue::Obj(members));
+        }
+        env.bind_locs(var.to_string(), Some(Sites::closed([id])));
+    }
     // A library hook whose contract is per member (`useForm()` promises
     // `setValue` is the same function every render, and promises nothing about
     // `formState`) reads as the same per-member map an object literal gets.
@@ -950,6 +963,31 @@ fn escape_returned<D: AbstractDomain>(returned: Option<&EnvVal<D>>, ctx: &mut An
     if let Some(sites) = returned.and_then(EnvVal::sites) {
         ctx.heap.escape(sites);
     }
+}
+
+/// Join `useRef(init)`'s argument, evaluated in `env` (the render's), into
+/// `current` of the hook's object (#268): React evaluates it on every render
+/// and keeps the first, so every value it takes is one `current` may hold.
+pub(crate) fn seed_ref<T: Transfer>(
+    transfer: &T,
+    label: crate::ir::types::HookLabel,
+    init: &Expr,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+) {
+    let id = ctx.component.ref_site(label);
+    let sites = alloc_literal(transfer, init, env, ctx);
+    // What a ref holds escapes, as a write into `current` does.
+    if let Some(sites) = &sites {
+        ctx.heap.escape(sites);
+    }
+    let Some(val) = transfer.eval_expr(init, env, ctx).as_state_value() else {
+        return;
+    };
+    let val = EnvVal::located(sites, val);
+    let current = "current".to_string();
+    ctx.heap
+        .write_after(id, |obj| obj.write(Some(&current), &val));
 }
 
 /// Run, for their effects, the functions code the analysis does not see may

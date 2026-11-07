@@ -52,7 +52,7 @@ that writes it (see *Cross-file limits*).
 - Hooks and callees it cannot reach. A function handed to code the analysis does not see — an
   npm-package callee (`pkgFn(() => setN(1))`, `new IntersectionObserver(cb)`), a hook it does not
   inline (`useTable({ onClick })`), React through an element's `on*` or `ref`, an object the heap
-  does not place (`ref.current = cb`), what such a function returns, a callback past the inlining
+  does not place (`props.box.current = cb`), what such a function returns, a callback past the inlining
   depth, and every `useCallback` body, whose value the heap does not follow — runs with the
   handlers, at an unknown time [#254](https://github.com/rboudrouss/reactant-analyzer/issues/254):
   its writes reach the state store as possible writes, never as writes of the body that handed it

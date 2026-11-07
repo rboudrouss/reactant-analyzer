@@ -31,16 +31,14 @@ fn parse_and_analyze(src: &str) -> ProgramAnalysisResult {
         "parse errors: {:?}",
         ret.diagnostics
     );
-    let components = lower_program(
-        &ret.program,
-        src,
-        std::path::Path::new("test.tsx"),
-        &mut Default::default(),
-    );
+    let path = std::path::Path::new("test.tsx");
+    let components = lower_program(&ret.program, src, path, &mut Default::default());
+    let hooks =
+        reactant::lowering::lower_custom_hooks(&ret.program, src, path, &mut Default::default());
     let reg = ComponentRegistry::from_components(components);
     analyze_program(
         reg,
-        HookRegistry::new(),
+        HookRegistry::from_hooks(hooks),
         RootStrategy::Heuristic,
         &Config::default(),
     )
@@ -2831,4 +2829,64 @@ export function App() {{
         "{grows:?}"
     );
     assert!(infinite_loop_diags(&src("1"), "App").is_empty());
+}
+
+/// A closure kept in a ref — written into `current`, or only `useRef`'s
+/// argument, or through a local hook that hands the ref back — is what a
+/// call through `ref.current` runs: an effect calling it after every commit
+/// closes the loop (#268). Called only from a click handler, it does not.
+#[test]
+fn a_call_through_a_ref_runs_the_closures_the_ref_holds() {
+    let assigned = r#"
+import { useState, useEffect, useRef } from 'react';
+export function App() {
+  const [n, setN] = useState(0);
+  const cb = () => setN(n + 1);
+  const ref = useRef(cb);
+  ref.current = cb;
+  useEffect(() => { ref.current(); });
+  return <div>{n}</div>;
+}
+"#;
+    let init_only = r#"
+import { useState, useEffect, useRef } from 'react';
+export function App() {
+  const [n, setN] = useState(0);
+  const ref = useRef(() => setN((c) => c + 1));
+  useEffect(() => { ref.current(); });
+  return <div>{n}</div>;
+}
+"#;
+    let local_hook = r#"
+import { useState, useEffect, useRef } from 'react';
+function useLatest(value) {
+  const ref = useRef(value);
+  ref.current = value;
+  return ref;
+}
+export function App() {
+  const [n, setN] = useState(0);
+  const latest = useLatest(() => setN(n + 1));
+  useEffect(() => { latest.current(); });
+  return <div>{n}</div>;
+}
+"#;
+    for src in [assigned, init_only, local_hook] {
+        let diags = infinite_loop_diags(src, "App");
+        assert!(
+            !diags.is_empty() && diags.iter().all(|(_, s, _)| *s == Severity::Warning),
+            "{diags:?}"
+        );
+    }
+    let handler = r#"
+import { useState, useRef } from 'react';
+export function App() {
+  const [n, setN] = useState(0);
+  const cb = () => setN(n + 1);
+  const ref = useRef(cb);
+  ref.current = cb;
+  return <button onClick={() => ref.current()}>{n}</button>;
+}
+"#;
+    assert!(infinite_loop_diags(handler, "App").is_empty());
 }

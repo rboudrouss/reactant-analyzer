@@ -1,10 +1,8 @@
 // oracle: react=loop
-// oracle: known=fn #268
-// A closure kept in a ref and called from an effect with no deps runs after
-// every commit. The heap does not place `ref.current = cb`, so the closure
-// escapes and runs with the handlers (#254), and the effect's call of
-// `ref.current` writes nothing the churn graph reads: no claim. The same
-// holds through a local hook that keeps its callback in a ref.
+// #268: a closure kept in a ref and called from an effect with no deps runs
+// after every commit. `useRef` returns its hook's one object, so the closure
+// written into `current` is what the effect's `ref.current()` runs, with the
+// effect's timing: a write the churn graph reads.
 import { useEffect, useRef, useState } from "react";
 
 export function App() {

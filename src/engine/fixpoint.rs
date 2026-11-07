@@ -553,6 +553,31 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         for (label, val) in memo_updates {
             memo_store.set(label, val);
         }
+        // What each `useRef` received in this render is a value its object's
+        // `current` may hold (#268).
+        {
+            let mut ref_ctx = AnalysisCtx {
+                component: comp_id,
+                state: &mut state_store,
+                memo: &memo_store,
+                start: None,
+                heap: &mut heap,
+                query: &query,
+                inter,
+                widening,
+            };
+            for hook in &hooks {
+                if let HookEntry::Ref { label, init, .. } = hook {
+                    crate::domains::interp::seed_ref(
+                        transfer,
+                        *label,
+                        init,
+                        &env_exit,
+                        &mut ref_ctx,
+                    );
+                }
+            }
+        }
 
         // ── Effect passes ─────────────────────────────────────────────────────
         let mut state_from_effects = StateStore::bottom();

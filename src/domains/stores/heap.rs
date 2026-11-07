@@ -57,12 +57,18 @@ pub enum HeapValue {
 /// member may now hold anything. Unlike `open`, a fact about this object
 /// only: the next object the site allocates is not yet held
 /// ([`Heap::alloc_obj`]), and reads before its own escape see its members.
+///
+/// `persists`: the object outlives every render — `useRef`'s (#268). A
+/// member keeps the sites written there, so a call through it runs what was
+/// stored, and no value: a literal stored there was fresh in the render that
+/// built it, not in the one reading it, so a read through it is unknown.
 #[derive(Debug, Clone, Default)]
 pub struct Members {
     pub named: HashMap<Symbol, EnvVal<StateValue>>,
     pub others: Option<EnvVal<StateValue>>,
     pub open: bool,
     pub unseen: bool,
+    pub persists: bool,
 }
 
 impl Members {
@@ -80,6 +86,30 @@ impl Members {
             named,
             open: true,
             ..Members::default()
+        }
+    }
+
+    /// A weak write of `value` into `member`, or, `None`, under a key that
+    /// may be any member: the values join and the sites unite, as two
+    /// bindings of a name do at an env join. An object that persists keeps
+    /// the sites only.
+    pub fn write(&mut self, member: Option<&Symbol>, value: &EnvVal<StateValue>) {
+        let kept;
+        let value = if self.persists {
+            kept = EnvVal::located(value.sites().cloned(), StateValue::bottom());
+            &kept
+        } else {
+            value
+        };
+        match member {
+            Some(m) => {
+                let joined = self
+                    .named
+                    .get(m)
+                    .map_or_else(|| value.clone(), |old| old.join(value));
+                self.named.insert(m.clone(), joined);
+            }
+            None => self.write_any(value),
         }
     }
 
@@ -181,6 +211,7 @@ impl Members {
             others,
             open: self.open || other.open,
             unseen: self.unseen || other.unseen,
+            persists: self.persists || other.persists,
         }
     }
 
@@ -196,6 +227,7 @@ impl Members {
             }
             && (!self.open || other.open)
             && (!self.unseen || other.unseen)
+            && (!self.persists || other.persists)
     }
 }
 
@@ -247,6 +279,15 @@ impl Heap {
                 env.join_binding_from(var, &self.assigned);
             }
         }
+    }
+
+    /// Some object `sites` may denote outlives every render — a ref
+    /// ([`Members::persists`]).
+    pub fn persists(&self, sites: &Sites) -> bool {
+        sites
+            .ids
+            .iter()
+            .any(|id| matches!(self.cells.get(id), Some(HeapValue::Obj(o)) if o.persists))
     }
 
     pub fn insert(&mut self, id: ExprId, val: HeapValue) {
@@ -370,7 +411,7 @@ impl Heap {
             match self.get(id) {
                 Some(HeapValue::Obj(obj)) if obj.named.contains_key(member) => {
                     entries.push(&obj.named[member]);
-                    open |= obj.unseen;
+                    open |= obj.unseen || obj.persists;
                 }
                 Some(HeapValue::Obj(Members {
                     others: Some(others),

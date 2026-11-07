@@ -63,6 +63,15 @@ impl ComponentId {
         }
         (u64::from(self.0) + 1) << 32
     }
+
+    /// The site of the object `useRef` at hook `label` returns: one per hook
+    /// instance, the same on every render, as React keeps it (#268). Ref
+    /// sites count down from the top of the component's range, which lowered
+    /// sites, numbered up from its base, do not reach.
+    pub fn ref_site(self, label: super::types::HookLabel) -> super::types::ExprId {
+        let top = self.site_base() + u64::from(u32::MAX);
+        super::types::ExprId(top - label as u64)
+    }
 }
 
 /// Interning table `ComponentId ↔ (file, name)`, built once from the component
