@@ -4,29 +4,34 @@
 //! live and how import specifiers map to files. Detected: **Vite** (presence
 //! of `vite.config.*`) and **Next.js** (presence of `next.config.*`), both of
 //! which load `@/*`-style aliases from tsconfig `paths` (see [`tsconfig`]).
-//! Everything else is [`ProjectKind::Plain`].
+//! Everything else is [`ProjectKind::Plain`]. Monorepo workspace packages
+//! resolve to their source through [`workspace`].
 //!
 //! Out of scope (deliberately): evaluating `vite.config.*` / `next.config.*`
-//! for `resolve.alias` / `webpack` overrides (requires running JS),
-//! `jsconfig.json`, package.json `exports` maps.
+//! for `resolve.alias` / `webpack` overrides (requires running JS).
 
 pub mod nextjs;
 pub mod paths_resolver;
 pub mod tsconfig;
+pub mod workspace;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::resolver::{DefaultImportResolver, FileSystem, ImportResolver};
+use crate::resolver::{
+    ChainResolver, DefaultImportResolver, FileSystem, ImportResolver, ScopedResolver,
+};
 
 pub use nextjs::{USE_CLIENT, server_entry_kind, server_modules};
 pub use paths_resolver::TsconfigPathsResolver;
 pub use tsconfig::{TsconfigPaths, load_tsconfig_paths, strip_jsonc};
+pub use workspace::WorkspaceResolver;
 
 /// Build-tool convention detected at a project root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectKind {
-    /// No recognized build tool: walk the given path as-is, relative imports only.
+    /// No recognized build tool: walk the given path as-is; tsconfig `paths`
+    /// when a tsconfig declares them, relative imports otherwise.
     Plain,
     /// Vite project: sources under `src/`, tsconfig `paths` aliases.
     Vite,
@@ -132,6 +137,75 @@ fn locate_tsconfig_paths(config_root: &Path, fs: &dyn FileSystem) -> Option<Tsco
     .or(base_only)
 }
 
+/// The import resolver a run started at `dir` resolves with: the tsconfig
+/// `paths` found from `dir` upward, else relative resolution only.
+pub fn resolver_at(dir: &Path, fs: Arc<dyn FileSystem>) -> Box<dyn ImportResolver> {
+    paths_resolver(locate_tsconfig_paths(dir, fs.as_ref()), fs)
+}
+
+/// Resolution through `paths` when there are any, relative only otherwise.
+fn paths_resolver(
+    paths: Option<TsconfigPaths>,
+    fs: Arc<dyn FileSystem>,
+) -> Box<dyn ImportResolver> {
+    match paths {
+        Some(paths) => Box::new(TsconfigPathsResolver::new(paths, fs)),
+        None => Box::new(DefaultImportResolver::new(fs)),
+    }
+}
+
+/// Whether a file named `name` can make its directory a project root: a
+/// build-tool marker or a TypeScript config. Discovery collects the
+/// directories holding one ([`crate::resolver::DefaultFileDiscoverer::discover_marked`]).
+pub fn is_root_marker(name: &str) -> bool {
+    name == "tsconfig.json"
+        || name == "jsconfig.json"
+        || VITE_CONFIGS.contains(&name)
+        || NEXT_CONFIGS.contains(&name)
+}
+
+/// Route each file's imports through the innermost project root holding it.
+///
+/// One invocation can cover several projects (a monorepo's apps and
+/// packages, a directory of repositories), and each resolves its specifiers
+/// its own way: one resolver for the whole run maps `@/…` the way the first
+/// project does, or not at all. Each of `starts` (the directories a run was
+/// asked to walk) and each of `marked` that is a real root (a build-tool
+/// marker, or a tsconfig declaring `paths` or `baseUrl`) becomes a scope
+/// resolving as a run started there would ([`resolver_at`]); a file under
+/// none of them goes to `fallback`. A bare specifier the project's own
+/// statement (its tsconfig `paths`) leaves unresolved then goes to the
+/// workspace packages ([`WorkspaceResolver`]).
+pub fn scope_by_project(
+    fallback: Box<dyn ImportResolver>,
+    starts: &[PathBuf],
+    marked: &[PathBuf],
+    fs: Arc<dyn FileSystem>,
+) -> Box<dyn ImportResolver> {
+    let roots: Vec<&PathBuf> = starts
+        .iter()
+        .chain(marked.iter().filter(|dir| {
+            detect(dir, fs.as_ref()) != ProjectKind::Plain
+                || load_tsconfig_paths(dir, fs.as_ref()).is_some()
+        }))
+        .collect();
+    let projects = if roots.is_empty() {
+        fallback
+    } else {
+        Box::new(
+            roots
+                .into_iter()
+                .fold(ScopedResolver::new(fallback), |scoped, dir| {
+                    scoped.scope(dir.clone(), resolver_at(dir, fs.clone()))
+                }),
+        )
+    };
+    Box::new(ChainResolver::new(vec![
+        projects,
+        Box::new(WorkspaceResolver::new(fs)),
+    ]))
+}
+
 /// Narrow discovery to `<root>/src` when the Next.js router lives there.
 ///
 /// Next supports both layouts, and only one of them is ever populated: with
@@ -205,51 +279,38 @@ pub fn build_context(
     } else {
         root.to_path_buf()
     };
-    if kind == ProjectKind::Plain {
-        return ProjectContext {
-            kind,
-            discovery_root,
-            resolver: Box::new(DefaultImportResolver::new(fs)),
-            alias_warning: None,
-        };
-    }
-
+    // tsconfig `paths` are TypeScript's, not the build tool's: a Plain tree
+    // loads them too. Only the warning is the build tool's, since a Vite or
+    // Next project is the one whose missing aliases imply a blind spot.
+    let paths = locate_tsconfig_paths(&config_root, fs.as_ref());
     let config_name = match kind {
         ProjectKind::NextJs => "next.config",
         _ => "vite.config",
     };
-    match locate_tsconfig_paths(&config_root, fs.as_ref()) {
+    let alias_warning = match &paths {
+        _ if kind == ProjectKind::Plain => None,
         // A patternless entry means the config declared only `baseUrl`. That
         // resolves bare specifiers (`import "lib/api"`, the Next scaffold
         // without `paths`), so it is a real resolver — but no `@/*` alias
         // exists, and a project written against one would still be blind.
-        Some(paths) if paths.patterns.is_empty() => ProjectContext {
-            kind,
-            discovery_root,
-            resolver: Box::new(TsconfigPathsResolver::new(paths, fs)),
-            alias_warning: Some(format!(
-                "tsconfig declares `baseUrl` but no `paths`, so bare specifiers resolve \
-                 against it, but `@/...`-style aliases stay unresolved and their targets \
-                 are NOT analyzed (possible false negatives). Aliases declared only in \
-                 {config_name} are not read."
-            )),
-        },
-        Some(paths) => ProjectContext {
-            kind,
-            discovery_root,
-            resolver: Box::new(TsconfigPathsResolver::new(paths, fs)),
-            alias_warning: None,
-        },
-        None => ProjectContext {
-            kind,
-            discovery_root,
-            resolver: Box::new(DefaultImportResolver::new(fs)),
-            alias_warning: Some(format!(
-                "no tsconfig `paths` found, so aliased imports (e.g. `@/...`) stay \
-                 unresolved and their targets are NOT analyzed (possible false \
-                 negatives). Aliases declared only in {config_name} are not read."
-            )),
-        },
+        Some(paths) if paths.patterns.is_empty() => Some(format!(
+            "tsconfig declares `baseUrl` but no `paths`, so bare specifiers resolve \
+             against it, but `@/...`-style aliases stay unresolved and their targets \
+             are NOT analyzed (possible false negatives). Aliases declared only in \
+             {config_name} are not read."
+        )),
+        Some(_) => None,
+        None => Some(format!(
+            "no tsconfig `paths` found, so aliased imports (e.g. `@/...`) stay \
+             unresolved and their targets are NOT analyzed (possible false \
+             negatives). Aliases declared only in {config_name} are not read."
+        )),
+    };
+    ProjectContext {
+        kind,
+        discovery_root,
+        resolver: paths_resolver(paths, fs),
+        alias_warning,
     }
 }
 

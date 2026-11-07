@@ -27,6 +27,16 @@ Analyseur statique React (niveau 3, interprétation abstraite) en Rust.
   Warning (défaut possible, ou fait certain au coût incertain), Info (limite
   de l'analyse ou motif qui a l'air voulu, derrière `--info`).
 
+## Commits
+
+- **Atomiques** : un commit = un changement (une issue, un fix, une baseline).
+- **Conventional Commits** : `type(scope): sujet` ; le titre suffit dans la
+  majorité des cas.
+- **Body sobre** : seulement si vraiment nécessaire (ce que le titre ne peut
+  pas dire : une expectation de test changée et pourquoi, un chiffre mesuré),
+  le plus direct possible, sinon rien.
+- **Pas de trailer `Co-Authored-By` Claude.**
+
 ## Références
 
 - Décisions d'architecture : `docs/adr/`

@@ -136,7 +136,7 @@ impl Rule for StateLiftedTooHigh {
                     },
                     None,
                     hop.span,
-                    &|l| state_slot_name(l, &names),
+                    &ctx.names(&|l| state_slot_name(l, &names)),
                 );
             }
             diags.push(d);

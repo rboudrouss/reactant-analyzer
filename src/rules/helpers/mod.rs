@@ -67,6 +67,21 @@ pub(crate) fn join_names(names: &[String]) -> String {
     }
 }
 
+/// `` `<A>` or `<B>` ``: the elements of these parents, in a message that
+/// names where a per-call-site fact holds (#175, #237).
+pub(crate) fn parent_elements(
+    program: &ProgramAnalysisResult,
+    parents: &std::collections::BTreeSet<ComponentId>,
+) -> String {
+    let mut names: Vec<String> = parents
+        .iter()
+        .map(|&p| format!("`<{}>`", program.display_name(p)))
+        .collect();
+    names.sort();
+    names.dedup();
+    names.join(" or ")
+}
+
 pub(crate) fn hook_kind_word(kind: HookKind) -> &'static str {
     match kind {
         HookKind::State => "state",

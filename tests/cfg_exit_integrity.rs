@@ -75,7 +75,7 @@ fn inlining_a_falling_through_hook_keeps_the_caller_exit_reachable() {
         .render_cfg
         .blocks
         .values()
-        .filter(|b| matches!(b.term, Terminator::Return(_)))
+        .filter(|b| matches!(b.term, Terminator::Return(..)))
         .collect();
     assert!(!returns.is_empty(), "the component must have an exit");
 

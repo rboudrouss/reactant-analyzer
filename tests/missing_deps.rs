@@ -725,3 +725,74 @@ fn uncovered_members_beside_a_declared_one_are_named_individually() {
         "`settings.material` and `settings.lighting`, each its own finding"
     );
 }
+
+#[test]
+fn an_effect_event_is_never_a_missing_dep() {
+    // #273: what `useEffectEvent` hands back calls the latest render's
+    // function, and React forbids listing it: neither the name nor a closure
+    // that only captures it is a missing dep. A plain callback still is.
+    let event = missing_deps_hits(
+        r#"
+        import { useEffect, useEffectEvent } from "react";
+        function C({ onPin, y }) {
+            const onPinEvent = useEffectEvent(() => onPin());
+            const fire = () => onPinEvent();
+            useEffect(() => {
+                if (y > 10) { onPinEvent(); fire(); }
+            }, [y]);
+            return <div/>;
+        }
+        "#,
+    );
+    assert_eq!(event, 0, "an effect event is exempt");
+    let plain = missing_deps_hits(
+        r#"
+        import { useEffect } from "react";
+        function C({ onPin, y }) {
+            const onPinEvent = () => onPin();
+            useEffect(() => {
+                if (y > 10) onPinEvent();
+            }, [y]);
+            return <div/>;
+        }
+        "#,
+    );
+    assert_eq!(plain, 1, "a plain function capturing a prop is not");
+}
+
+#[test]
+fn a_member_read_is_described_by_the_members_value() {
+    // #274: `ws` is a new object every render, but `ws.programId` is what the
+    // callback reads, and nothing says that member is recreated.
+    let src = r#"
+        import { useCallback } from "react";
+        function C({ data }) {
+            const ws = { ...data, id: data.id };
+            const cb = useCallback(() => [ws.id, ws.programId], [ws.id]);
+            return <button onClick={cb}>x</button>;
+        }
+        "#;
+    let alloc = Allocator::default();
+    let ret = Parser::new(&alloc, src, SourceType::tsx())
+        .with_options(ParseOptions::default())
+        .parse();
+    let components = lower_program(
+        &ret.program,
+        src,
+        std::path::Path::new("test.tsx"),
+        &mut Default::default(),
+    );
+    let msgs: Vec<String> = components
+        .into_iter()
+        .flat_map(|comp| {
+            let name = comp.name.clone();
+            let result = analyze_component(comp, &StateValueTransfer, &Config::default());
+            let prog = make_prog(&name, result);
+            MissingDeps.check(&RuleCtx::new(&prog, prog.component_named(&name).unwrap()))
+        })
+        .map(|d| d.message)
+        .collect();
+    assert_eq!(msgs.len(), 1, "{msgs:?}");
+    assert!(msgs[0].contains("`ws.programId`"), "{msgs:?}");
+    assert!(!msgs[0].contains("recreated on every render"), "{msgs:?}");
+}

@@ -31,6 +31,57 @@ fn default<'a>(
     }
 }
 
+/// A top-level `const` binding a hook name to other hooks' names, directly or
+/// through a conditional: `const useIsoEffect = isBrowser ? useLayoutEffect :
+/// useEffect`. Which hooks the arms are is the caller's to decide.
+pub struct HookAlias {
+    pub name: String,
+    /// Every name the binding may hold, in source order.
+    pub arms: Vec<String>,
+}
+
+/// Every [`HookAlias`] of `program`.
+pub fn detect_hook_aliases(program: &Program) -> Vec<HookAlias> {
+    fn arms(e: &Expression, out: &mut Vec<String>) -> bool {
+        match e {
+            Expression::Identifier(id) => {
+                out.push(id.name.to_string());
+                true
+            }
+            Expression::ConditionalExpression(c) => {
+                arms(&c.consequent, out) && arms(&c.alternate, out)
+            }
+            Expression::ParenthesizedExpression(p) => arms(&p.expression, out),
+            Expression::TSAsExpression(a) => arms(&a.expression, out),
+            _ => false,
+        }
+    }
+    let decls = program.body.iter().filter_map(|stmt| match stmt {
+        Statement::VariableDeclaration(d) => Some(&**d),
+        Statement::ExportNamedDeclaration(exp) => match &exp.declaration {
+            Some(Declaration::VariableDeclaration(d)) => Some(&**d),
+            _ => None,
+        },
+        _ => None,
+    });
+    let mut out = Vec::new();
+    for decl in decls.filter(|d| d.kind == VariableDeclarationKind::Const) {
+        for vd in &decl.declarations {
+            let (BindingPattern::BindingIdentifier(id), Some(init)) = (&vd.id, &vd.init) else {
+                continue;
+            };
+            let mut names = Vec::new();
+            if is_custom_hook(&id.name) && arms(init, &mut names) {
+                out.push(HookAlias {
+                    name: id.name.to_string(),
+                    arms: names,
+                });
+            }
+        }
+    }
+    out
+}
+
 // ── Detection rules ────────────────────────────────────────────────────────────
 
 /// Returns `true` iff `name` is a user-defined custom hook.

@@ -92,7 +92,7 @@ impl<'a> Scope<'a> {
 
 struct Collector<'a> {
     state_val_label: &'a HashMap<Var, HookLabel>,
-    setter_label: &'a HashMap<Var, HookLabel>,
+    setter_label: &'a crate::engine::setters::SetterTargets,
     param: &'a str,
     /// Props whose declared TS type is a DOM interface — imperative DOM
     /// manipulation, not React-owned data.
@@ -214,7 +214,7 @@ impl<'a> Collector<'a> {
                 }
             }
             match &block.term {
-                Terminator::Return(e) | Terminator::Branch { cond: e, .. } => {
+                Terminator::Return(e, _) | Terminator::Branch { cond: e, .. } => {
                     self.walk_expr(e, scopes, None, container);
                 }
                 _ => {}
@@ -238,9 +238,10 @@ impl<'a> Collector<'a> {
                 if let Some(receiver) = mutation_receiver(expr) {
                     self.record_mutation(receiver, scopes, span, container);
                 }
-                // Setter call: is the argument the slot's own reference?
+                // Setter call: is the argument the slot's own reference? Only
+                // a name every call through which writes the slot says so.
                 if let Expr::Var(name) = fn_.as_ref()
-                    && let Some(&label) = self.setter_label.get(name.as_str())
+                    && let Some(label) = self.setter_label.sole(name.as_str())
                 {
                     {
                         {
@@ -315,7 +316,7 @@ impl<'a> Collector<'a> {
         // (possibly through a local alias — chase with the body's bindings).
         scopes.push(Scope::from_cfg(body_cfg));
         for block in body_cfg.blocks.values() {
-            if let Terminator::Return(e) = &block.term
+            if let Terminator::Return(e, _) = &block.term
                 && self.chase(e, scopes, &mut HashSet::new()) == MutRoot::State(label)
             {
                 self.ident_sets.push((
@@ -440,9 +441,9 @@ impl Rule for StateMutation {
             };
             let slot = name_of(label);
             let setter_name = setter_label
-                .iter()
-                .find(|(_, l)| **l == label)
-                .map(|(v, _)| v.clone())
+                .sure_aliases_of(label)
+                .into_iter()
+                .min()
                 .unwrap_or_else(|| "its setter".to_string());
             let site = mut_sites[0];
             let set_site = sets
@@ -469,7 +470,7 @@ impl Rule for StateMutation {
                 },
                 Some(label),
                 site.span,
-                &name_of,
+                &ctx.names(&name_of),
             );
             d = d.with_step(
                 Step::Write {
@@ -478,7 +479,7 @@ impl Rule for StateMutation {
                 },
                 Some(label),
                 set_site.span,
-                &name_of,
+                &ctx.names(&name_of),
             );
             diags.push(d);
         }
@@ -511,7 +512,7 @@ impl Rule for StateMutation {
                 },
                 None,
                 site.span,
-                &name_of,
+                &ctx.names(&name_of),
             );
             diags.push(d);
         }

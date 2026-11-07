@@ -199,6 +199,7 @@ impl Rule for LazyInit {
                 init,
                 &program.function_registry,
                 &result.file,
+                &ctx.names(&crate::rules::api::witness::fallback_name),
             ));
             diags.push(d);
         }
@@ -307,7 +308,7 @@ mod tests {
             BasicBlock {
                 id: 0,
                 stmts: vec![],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                term: Terminator::Return(Expr::Lit(Prim::Unit), None),
             },
         );
         ComponentIR {
@@ -454,7 +455,7 @@ mod tests {
             BasicBlock {
                 id: 0,
                 stmts,
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                term: Terminator::Return(Expr::Lit(Prim::Unit), None),
             },
         );
         ComponentIR {

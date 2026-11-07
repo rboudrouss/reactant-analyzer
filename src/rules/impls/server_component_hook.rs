@@ -8,16 +8,17 @@ use crate::project::nextjs::{USE_CLIENT, server_entry_kind, server_modules};
 use crate::rules::{Diagnostic, Rule, RuleCtx, SafeCheck};
 
 /// React's own hooks that only exist while rendering on the client. The
-/// engine models the first five as dedicated `HookEntry` kinds; the rest
-/// reach the IR as `Custom` rows with a `react` provenance.
+/// engine models `useState`, `useEffect` and `useRef` as dedicated
+/// `HookEntry` kinds; the rest reach the IR as `Custom` rows with a `react`
+/// provenance. React's server build (`ReactServer.js`) exports `useId`,
+/// `useDebugValue`, `useMemo`, `useCallback` and `use`, so none of them is
+/// here (#236).
 const REACT_CLIENT_HOOKS: &[&str] = &[
     "useContext",
-    "useId",
     "useTransition",
     "useDeferredValue",
     "useSyncExternalStore",
     "useImperativeHandle",
-    "useDebugValue",
     "useOptimistic",
     "useActionState",
     "useFormStatus",
@@ -77,9 +78,9 @@ fn client_only_hook(entry: &HookEntry, prov: Option<&HookProvenance>) -> Option<
         // `useLayoutEffect` as `Effect`).
         HookEntry::State { .. } => Some(named("useState")),
         HookEntry::Effect { .. } => Some(named("useEffect")),
-        HookEntry::Memo { .. } => Some(named("useMemo")),
-        HookEntry::Callback { .. } => Some(named("useCallback")),
         HookEntry::Ref { .. } => Some(named("useRef")),
+        // `useMemo` and `useCallback` are in React's server build.
+        HookEntry::Memo { .. } | HookEntry::Callback { .. } => None,
         // An opaque `useX` is not evidence on its own — plenty of `use`-named
         // helpers call no hook at all. Only the ones whose origin is a hook
         // documented as client-only count.
@@ -290,6 +291,57 @@ mod tests {
             ),
             None
         );
+    }
+
+    fn empty_cfg() -> crate::ir::CFG {
+        crate::ir::CFG {
+            entry: 0,
+            blocks: Default::default(),
+            edges: vec![],
+        }
+    }
+
+    #[test]
+    fn use_id_runs_on_the_server() {
+        // React's server build exports `useId` (#236).
+        let entry = custom("useId", Some("react"));
+        assert_eq!(
+            client_only_hook(&entry, Some(&prov("useId", true, Some("react")))),
+            None
+        );
+    }
+
+    #[test]
+    fn use_debug_value_runs_on_the_server() {
+        let entry = custom("useDebugValue", Some("react"));
+        assert_eq!(
+            client_only_hook(&entry, Some(&prov("useDebugValue", true, Some("react")))),
+            None
+        );
+    }
+
+    #[test]
+    fn use_memo_runs_on_the_server() {
+        let memo = HookEntry::Memo {
+            label: 0,
+            body_cfg: empty_cfg(),
+            deps: DepsArg::Absent,
+            span: None,
+        };
+        assert_eq!(client_only_hook(&memo, None), None);
+    }
+
+    #[test]
+    fn use_callback_runs_on_the_server() {
+        let callback = HookEntry::Callback {
+            label: 0,
+            body_cfg: empty_cfg(),
+            params: vec![],
+            literal: true,
+            deps: DepsArg::Absent,
+            span: None,
+        };
+        assert_eq!(client_only_hook(&callback, None), None);
     }
 
     #[test]

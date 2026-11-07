@@ -10,8 +10,6 @@
 //! zero author effort (§8). Custom rules have no `safe_check` in v1 (the
 //! trait default).
 
-use std::collections::HashSet;
-
 use crate::ir::SourceRange;
 use crate::ir::hooks::{Arity, HookEntry};
 use crate::ir::types::HookLabel;
@@ -804,12 +802,7 @@ impl TierARule {
                 // must-forwarding handles multi-site/branchy writes, which
                 // the deduplicated `SetterCall.block_id` could not.
                 let slot = setter.slot?;
-                let aliases: HashSet<_> = e
-                    .setter_labels
-                    .iter()
-                    .filter(|(_, l)| **l == slot)
-                    .map(|(v, _)| v.clone())
-                    .collect();
+                let aliases = e.setter_labels.sure_aliases_of(slot);
                 match must_setter_on_all_paths(body, &aliases, None) {
                     MustResult::All(c) => Some(Proof::Setter(c)),
                     _ => None,

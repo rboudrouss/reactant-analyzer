@@ -3,6 +3,19 @@
 - **Status**: Accepted (Part 1 implemented; Part 2 superseded — see Revision 2026-06-28)
 - **Date**: 2026-06-27
 
+## Revision (2026-11-06) — the heap and the shared names are in the carrier
+
+The outer fixpoint stops when the state store, the memo store **and the heap**
+stop growing (#258). The heap holds what a body wrote that another body reads in
+a later pass: a member an escaped closure or a later effect writes into an object
+literal's allocation site, which keeps it, and the record of the names a body
+assigns without declaring them, which every body joins before each statement.
+A write made after the reads of its round — the escaped closures run last — is
+therefore read by the next round instead of being lost when the state alone has
+settled. At the widening threshold the heap is widened like the state (members,
+closure captures and shared names with `widen`, no thresholds), so a counter kept
+in an object or a shared name (`o.n = o.n + 1` in a handler) ends the fixpoint.
+
 ## Revision (2026-06-28) — narrowing superseded by inner threshold widening
 
 Implementation of Part 1 revealed that classic narrowing (Part 2) is **largely

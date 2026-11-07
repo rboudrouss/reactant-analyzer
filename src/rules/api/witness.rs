@@ -8,13 +8,14 @@
 //! The enum is closed on purpose — there is no free-text variant. A rule that
 //! needs a new kind of justification extends the vocabulary here.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use crate::{
     domains::StateValue,
     engine::{AnalysisResult, FunctionRegistry},
     ir::{
-        SourceRange,
+        SourceNames, SourceRange,
         cfg::CFG,
         expr::Expr,
         stmt::Stmt,
@@ -150,18 +151,16 @@ impl Step {
         }
     }
 
-    /// Render the step's prose. `name` maps a state slot to its user-facing
-    /// name (callers pass a closure over their `state_slot_name` table; the
-    /// closure may also capture a cross-component display name). This is the
-    /// only place witness prose is produced.
-    pub fn render(&self, name: &dyn Fn(HookLabel) -> String) -> String {
+    /// Render the step's prose, naming slots and variables through `names`.
+    /// This is the only place witness prose is produced.
+    pub fn render(&self, names: &Names) -> String {
         match self {
             Step::Binding { var } => {
-                let var = crate::ir::source_name(var);
+                let var = names.var(var);
                 format!("the value flows through `{var}`, bound here")
             }
             Step::Resolve { name: n, target } => {
-                let n = crate::ir::source_name(n);
+                let n = names.var(n);
                 match target {
                     ResolveTarget::Import(path) => {
                         format!("`{n}` resolves to an import from {}", path.display())
@@ -176,7 +175,7 @@ impl Step {
                 }
             }
             Step::Call { callee, class } => {
-                let callee = crate::ir::source_name(callee);
+                let callee = names.var(callee);
                 match class {
                     EffectClass::Setter => {
                         format!("`{callee}` is a state setter, so calling it writes state")
@@ -193,31 +192,34 @@ impl Step {
             }
             Step::Write { slot, value } => match value {
                 ValueClass::Fresh => {
-                    format!("a fresh value is written to state {} here", name(*slot))
+                    format!(
+                        "a fresh value is written to state {} here",
+                        names.slot(*slot)
+                    )
                 }
                 ValueClass::SameAsCurrent => format!(
                     "the value written to state {} is the value it already holds",
-                    name(*slot)
+                    names.slot(*slot)
                 ),
-                ValueClass::Unknown => format!("state {} is written here", name(*slot)),
+                ValueClass::Unknown => format!("state {} is written here", names.slot(*slot)),
             },
-            Step::Read { what } => format!("`{}` is read here", crate::ir::source_name(what)),
+            Step::Read { what } => format!("`{}` is read here", names.var(what)),
             Step::Branch { desc } => format!("guarded by {desc}"),
             Step::Handler { event, slot } => format!(
                 "handler `on{}` also calls this setter and keeps growing state {}",
                 capitalize_first(event),
-                name(*slot)
+                names.slot(*slot)
             ),
             Step::CycleEdge { from: _, to } => {
                 format!("cycle continues: this effect freshly stores state {to}")
             }
             Step::Widen { slot, iteration } => format!(
                 "the abstract value of state {} kept growing and was widened at iteration {}",
-                name(*slot),
+                names.slot(*slot),
                 iteration
             ),
             Step::Mutate { target } => {
-                let target = crate::ir::source_name(target);
+                let target = names.var(target);
                 format!(
                     "`{target}` is mutated in place here, so its reference identity is unchanged"
                 )
@@ -225,12 +227,12 @@ impl Step {
             Step::Capture { what } => format!(
                 "`{}` is captured at registration time, so the callback keeps this value, \
                  not the latest one",
-                crate::ir::source_name(what)
+                names.var(what)
             ),
             Step::InitOnce { slot } => format!(
                 "state {} reads its initializer on the first render only, so later renders \
                  ignore it",
-                name(*slot)
+                names.slot(*slot)
             ),
             Step::Forward {
                 from,
@@ -248,8 +250,8 @@ impl Step {
                 let via = if props.is_empty() {
                     "through a spread".to_string()
                 } else {
-                    let names: Vec<String> = props.iter().map(|p| format!("`{p}`")).collect();
-                    format!("as {}", names.join(", "))
+                    let quoted: Vec<String> = props.iter().map(|p| format!("`{p}`")).collect();
+                    format!("as {}", quoted.join(", "))
                 };
                 format!("`{from}` passes it to `<{to}>` {via} without using it itself")
             }
@@ -277,6 +279,30 @@ pub fn fallback_name(label: HookLabel) -> String {
     format!("state #{label}")
 }
 
+/// How a step names what it mentions: a state slot by the rule's own table (a
+/// closure over its `state_slot_name` map, which may also capture a
+/// cross-component display name), a variable by the component's
+/// [`SourceNames`]. Built with [`RuleCtx::names`](super::query::RuleCtx::names),
+/// so no message reaches the user under a lowering spelling.
+pub struct Names<'a> {
+    slot: &'a dyn Fn(HookLabel) -> String,
+    vars: &'a SourceNames,
+}
+
+impl<'a> Names<'a> {
+    pub(crate) fn new(slot: &'a dyn Fn(HookLabel) -> String, vars: &'a SourceNames) -> Self {
+        Names { slot, vars }
+    }
+
+    pub fn slot(&self, label: HookLabel) -> String {
+        (self.slot)(label)
+    }
+
+    pub fn var<'b>(&'b self, var: &'b str) -> Cow<'b, str> {
+        self.vars.name(var)
+    }
+}
+
 /// `click` → `Click` (for `on{Event}` handler names).
 pub(crate) fn capitalize_first(s: &str) -> String {
     let mut chars = s.chars();
@@ -292,10 +318,10 @@ pub fn note(
     step: Step,
     hook_label: Option<HookLabel>,
     range: Option<SourceRange>,
-    name: &dyn Fn(HookLabel) -> String,
+    names: &Names,
 ) -> Note {
     Note {
-        message: step.render(name),
+        message: step.render(names),
         step,
         hook_label,
         range,
@@ -414,6 +440,7 @@ pub fn resolve_and_classify(
     registry: &FunctionRegistry,
     component_file: &Path,
     name: &str,
+    names: &Names,
 ) -> Vec<Note> {
     let resolved = registry.resolve(component_file, name);
     let Some(func) = resolved else {
@@ -424,7 +451,7 @@ pub fn resolve_and_classify(
             },
             None,
             None,
-            &fallback_name,
+            names,
         )];
     };
 
@@ -440,7 +467,7 @@ pub fn resolve_and_classify(
         },
         None,
         None,
-        &fallback_name,
+        names,
     )];
     if let Some((callee, span)) = find_effectful_call(&func.body_cfg) {
         notes.push(note(
@@ -450,7 +477,7 @@ pub fn resolve_and_classify(
             },
             None,
             span,
-            &fallback_name,
+            names,
         ));
     }
     notes
@@ -465,6 +492,7 @@ pub fn chase_value(
     expr: &Expr,
     registry: &FunctionRegistry,
     component_file: &Path,
+    names: &Names,
 ) -> Vec<Note> {
     let mut notes = Vec::new();
     let mut target = expr;
@@ -476,19 +504,19 @@ pub fn chase_value(
             && let [single] = rhss.as_slice()
         {
             let span = binding_span(cfg, v);
-            notes.push(note(
-                Step::Binding { var: v.clone() },
-                None,
-                span,
-                &fallback_name,
-            ));
+            notes.push(note(Step::Binding { var: v.clone() }, None, span, names));
             target = single;
         }
     }
 
     // First plain callee in the target expression → registry resolution.
     if let Some(callee_name) = first_callee_var(target) {
-        notes.extend(resolve_and_classify(registry, component_file, &callee_name));
+        notes.extend(resolve_and_classify(
+            registry,
+            component_file,
+            &callee_name,
+            names,
+        ));
     }
     notes
 }
@@ -529,7 +557,7 @@ fn first_callee_var(e: &Expr) -> Option<String> {
 pub fn slot_history(
     result: &AnalysisResult<StateValue>,
     slot: HookLabel,
-    name: &dyn Fn(HookLabel) -> String,
+    names: &Names,
 ) -> Vec<Note> {
     let Some(event) = result.widen_trace.get(&slot) else {
         return vec![];
@@ -544,7 +572,7 @@ pub fn slot_history(
             },
             Some(*writer),
             span,
-            name,
+            names,
         ));
     }
     notes.push(note(
@@ -554,7 +582,7 @@ pub fn slot_history(
         },
         None,
         None,
-        name,
+        names,
     ));
     notes
 }

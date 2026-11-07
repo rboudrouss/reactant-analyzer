@@ -174,9 +174,28 @@ there deliberately will not be (ADR-023 §4).
 A project's conventions do not stop applying when you point at one of its
 subdirectories: `reactant check src/features` is still a run inside that Vite
 project, and its `@/...` imports still resolve through the tsconfig at the root.
-Other path arguments are discovered as-is with the same resolver. Next.js is
+Other path arguments are discovered as-is. Imports resolve per project, not per
+run: every directory argument, and every directory under the walk holding a
+`vite.config.*`, a `next.config.*`, or a `tsconfig.json`/`jsconfig.json` that
+declares `paths` or `baseUrl`, resolves the imports of the files under it as a
+run started there would, the innermost one winning. A monorepo's apps, or a
+directory of repositories, therefore each keep their own aliases. Next.js is
 tested before Vite: a Next app may keep a `vite.config.*` for its test runner,
 and the router conventions are the ones that govern the sources.
+
+Monorepo workspace packages resolve to their source. The nearest ancestor of an
+importing file that declares workspace members (`pnpm-workspace.yaml`'s
+`packages:`, or `package.json`'s `workspaces`) has its member globs expanded,
+and `import … from "@acme/ui"` or `"@acme/ui/icons"` maps to that member's
+entry: `source`, else the `exports` entry for `.` / `./icons` (conditions in
+declaration order, `types` skipped), else `module` / `main`. An entry that is
+not TypeScript is taken to be compiled output (`dist/index.mjs`), and the
+package's `src/index` (`src/icons` for a subpath) stands for it when that
+file exists. The stand-in carries the entry's code, not its directives
+(a bundler may prepend `"use client"`), so the App Router server graph does
+not enter it. tsconfig `paths` still come first. A package outside the
+member globs, a subpath its `exports` map does not list, or a name two
+members share stays unresolved.
 
 Discovery still walks exactly the directories you named. The `<root>/src`
 narrowing below is a convenience for "analyse this project" and applies only
@@ -222,7 +241,10 @@ imports that then resolve outside what you named are reported as
 ### Plain (everything else)
 
 Recursive walk of the given directories for `.ts/.tsx/.js/.jsx`, excluding
-`*.test.*`, `*.spec.*` and `*.d.ts`. Relative imports only.
+`*.test.*`, `*.spec.*` and `*.d.ts`. Aliases come from tsconfig `paths`
+when a tsconfig declares them, searched upward as for Vite; without one,
+relative imports only. No build tool implies aliases here, so their absence
+does not warn.
 
 Which *directories* are skipped has one precedence order, three sources:
 
@@ -626,10 +648,10 @@ Summary: [docs/limitations.md](limitations.md). Open work, one entry per
 limit: the [issue tracker](https://github.com/rboudrouss/reactant-analyzer/issues).
 Most impactful:
 
-- Aliases outside tsconfig `paths` stay opaque (monorepo `@workspace/*`
-  without tsconfig entries, vite-config-only aliases). The imported symbol
-  is treated as external and its body is not analyzed, a possible false
-  negative. Write a custom `ImportResolver` for those.
+- Aliases outside tsconfig `paths` and the workspace packages stay opaque
+  (vite-config-only aliases, a package whose source is not at `src/<subpath>`).
+  The imported symbol is treated as external and its body is not analyzed, a
+  possible false negative. Write a custom `ImportResolver` for those.
 - An alias resolving *outside* the discovery root is never read at all, and
   the notice is `--info`-only: pass the target directory too.
 - Utility inlining is statement-level only; `if (util(x))` and `setX(util(y))`

@@ -18,7 +18,18 @@ impl BasicBlock {
             stmt.for_each_expr(f);
         }
         match &self.term {
-            Terminator::Return(e) | Terminator::Branch { cond: e, .. } => f(e),
+            Terminator::Return(e, _) | Terminator::Branch { cond: e, .. } => f(e),
+            Terminator::Jump(_) | Terminator::Unreachable => {}
+        }
+    }
+
+    /// [`Self::for_each_expr`], mutably — the same expressions.
+    pub fn for_each_expr_mut(&mut self, f: &mut impl FnMut(&mut Expr)) {
+        for stmt in &mut self.stmts {
+            stmt.for_each_expr_mut(f);
+        }
+        match &mut self.term {
+            Terminator::Return(e, _) | Terminator::Branch { cond: e, .. } => f(e),
             Terminator::Jump(_) | Terminator::Unreachable => {}
         }
     }
@@ -35,13 +46,11 @@ pub enum Terminator {
         /// synthetic branches and manual-IR tests).
         span: Option<crate::ir::SourceRange>,
     },
-    /// Unlike [`Terminator::Branch`], this carries no span: nothing needed the
-    /// position of a `return` until a hook could be extracted from one (#4),
-    /// and adding it now is a 40-site IR change tracked separately. The cost is
-    /// that a hook reached only through a return yields findings with no line
-    /// number — visible but unlocated, which is still strictly better than the
-    /// silence it replaced.
-    Return(Expr),
+    /// The returned value, and where the `return` is in the source (`None` for
+    /// the implicit fall-through return, synthetic returns and manual-IR
+    /// tests). A hook reached only through a return (`return useMemo(…)`, #4)
+    /// takes this position as its call site.
+    Return(Expr, Option<crate::ir::SourceRange>),
     Unreachable,
 }
 
@@ -106,7 +115,7 @@ impl CFG {
                 stmt.for_each_expr(f);
             }
             match &block.term {
-                Terminator::Return(e) | Terminator::Branch { cond: e, .. } => f(e),
+                Terminator::Return(e, _) | Terminator::Branch { cond: e, .. } => f(e),
                 Terminator::Jump(_) | Terminator::Unreachable => {}
             }
         }
@@ -133,12 +142,13 @@ impl CFG {
         if seeds.is_empty() {
             return out;
         }
+        let succs = self.successor_map();
         let mut queue: std::collections::VecDeque<BlockId> = seeds.into_iter().collect();
         while let Some(b) = queue.pop_front() {
             if !out.insert(b) {
                 continue;
             }
-            for succ in self.successors(b) {
+            for &succ in succs.get(&b).into_iter().flatten() {
                 if !out.contains(&succ) {
                     queue.push_back(succ);
                 }
@@ -155,15 +165,39 @@ impl CFG {
     /// the same set. Anything quantifying over program points — exits above
     /// all — must use this one.
     pub fn reachable_blocks(&self) -> std::collections::HashSet<BlockId> {
+        let succs = self.successor_map();
         let mut seen = std::collections::HashSet::new();
         let mut stack = vec![self.entry];
         while let Some(id) = stack.pop() {
             if !seen.insert(id) {
                 continue;
             }
-            stack.extend(self.successors(id));
+            stack.extend(succs.get(&id).into_iter().flatten().copied());
         }
         seen
+    }
+
+    /// Every block's successors, in edge order, built in one scan of
+    /// `edges`. [`Self::successors`] scans every edge per call, so a walk
+    /// asking it once per block is quadratic in the body's size: a walk over
+    /// the whole CFG reads this index instead.
+    pub fn successor_map(&self) -> std::collections::HashMap<BlockId, Vec<BlockId>> {
+        let mut out: std::collections::HashMap<BlockId, Vec<BlockId>> =
+            std::collections::HashMap::new();
+        for edge in &self.edges {
+            out.entry(edge.from).or_default().push(edge.to);
+        }
+        out
+    }
+
+    /// [`Self::successor_map`] for predecessors, in edge order.
+    pub fn predecessor_map(&self) -> std::collections::HashMap<BlockId, Vec<BlockId>> {
+        let mut out: std::collections::HashMap<BlockId, Vec<BlockId>> =
+            std::collections::HashMap::new();
+        for edge in &self.edges {
+            out.entry(edge.to).or_default().push(edge.from);
+        }
+        out
     }
 
     pub fn successors(&self, block_id: BlockId) -> Vec<BlockId> {
@@ -189,7 +223,15 @@ impl CFG {
     pub fn rpo(&self) -> Vec<BlockId> {
         let mut visited = std::collections::HashSet::from([self.entry]);
         let mut post = Vec::new();
-        let succs = |b: BlockId| self.successors(b).into_iter().rev().collect::<Vec<_>>();
+        let map = self.successor_map();
+        let succs = |b: BlockId| {
+            map.get(&b)
+                .into_iter()
+                .flatten()
+                .rev()
+                .copied()
+                .collect::<Vec<_>>()
+        };
         let mut stack = vec![(self.entry, succs(self.entry))];
         while let Some((bid, pending)) = stack.last_mut() {
             match pending.pop() {
@@ -242,7 +284,7 @@ impl CFG {
             let targets: Vec<BlockId> = match &block.term {
                 Terminator::Jump(t) => vec![*t],
                 Terminator::Branch { then_, else_, .. } => vec![*then_, *else_],
-                Terminator::Return(_) | Terminator::Unreachable => vec![],
+                Terminator::Return(..) | Terminator::Unreachable => vec![],
             };
             for t in targets {
                 if !self.blocks.contains_key(&t) {

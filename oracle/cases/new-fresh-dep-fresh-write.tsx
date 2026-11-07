@@ -1,9 +1,8 @@
 // oracle: react=loop
-// oracle: known=fn #189
 // Found by `oracle fuzz --seed 1` (program 233, shrunk). The dep is a fresh
 // object every render, so the effect runs after every commit, and it stores a
-// fresh array, so every run re-renders. `always-unstable-deps` sees the first
-// half; no rule puts the two together into a loop.
+// fresh array, so every run re-renders. The re-run class reads the fresh dep
+// as "re-runs after every render", like a missing deps array (#189).
 import { useEffect, useState } from "react";
 
 export function App() {

@@ -318,7 +318,7 @@ pub(crate) fn top_level_exprs(cfg: &CFG) -> Vec<(BlockId, Vec<&Expr>)> {
                 }
             }
             match &block.term {
-                Terminator::Return(e) | Terminator::Branch { cond: e, .. } => exprs.push(e),
+                Terminator::Return(e, _) | Terminator::Branch { cond: e, .. } => exprs.push(e),
                 Terminator::Jump(_) | Terminator::Unreachable => {}
             }
             (id, exprs)

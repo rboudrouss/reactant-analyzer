@@ -320,6 +320,7 @@ pub struct RuleCtx<'a> {
     component: ComponentId,
     comp: &'a AnalysisResult<StateValue>,
     config: RuleConfig,
+    source_names: std::sync::OnceLock<crate::ir::SourceNames>,
 }
 
 /// The ctx's [`ProgramCache`]: shared with every other component of the same
@@ -378,6 +379,7 @@ impl<'a> RuleCtx<'a> {
             component,
             comp,
             config,
+            source_names: std::sync::OnceLock::new(),
         }
     }
 
@@ -411,6 +413,29 @@ impl<'a> RuleCtx<'a> {
 
     pub fn config(&self) -> &RuleConfig {
         &self.config
+    }
+
+    /// How this component's variables are named in a message: the source
+    /// expression a lowering temp stands for, not its spelling. Built on first
+    /// use.
+    pub fn source_names(&self) -> &crate::ir::SourceNames {
+        self.source_names.get_or_init(|| {
+            crate::ir::SourceNames::of(
+                &self.comp.render_cfg,
+                &self.comp.hook_provenance,
+                self.comp
+                    .inline_origins
+                    .iter()
+                    .filter_map(|o| Some((o.bound.as_ref()?, o.name.as_str()))),
+            )
+        })
+    }
+
+    /// The one printer of a message's names: slots through `slot` (the rule's
+    /// own table, or [`witness::fallback_name`](super::witness::fallback_name)),
+    /// variables through [`RuleCtx::source_names`].
+    pub fn names<'b>(&'b self, slot: &'b dyn Fn(HookLabel) -> String) -> super::witness::Names<'b> {
+        super::witness::Names::new(slot, self.source_names())
     }
 }
 
@@ -489,7 +514,7 @@ impl<'a> RuleCtx<'a> {
                             .to_string(),
                     };
                     notes.push(Note {
-                        message: step.render(&super::witness::fallback_name),
+                        message: step.render(&self.names(&super::witness::fallback_name)),
                         step,
                         hook_label: None,
                         range: guard_span,
@@ -541,7 +566,7 @@ pub fn must_setter_on_all_paths(
                 call_sites.push((*bid, var, arg.clone(), *span));
             }
         }
-        if let Terminator::Return(expr) = &block.term
+        if let Terminator::Return(expr, _) = &block.term
             && let Some((var, arg)) = try_extract_setter_call(expr, setter_vars)
         {
             call_sites.push((*bid, var, arg.clone(), None));
@@ -571,6 +596,7 @@ pub fn must_setter_on_all_paths(
         // The scan above reads statements of `cfg` itself, never a nested
         // body, so every site it can find runs when `cfg` runs.
         class: crate::engine::setters::SetterCallPhase::Sync,
+        own: None,
     };
 
     // must_in[B] = ∧ must_out[preds]; must_out[B] = must_in[B] ∨ called_in[B].
@@ -606,7 +632,7 @@ pub fn must_setter_on_all_paths(
     let exit_blocks: Vec<_> = cfg
         .blocks
         .values()
-        .filter(|b| matches!(b.term, Terminator::Return(_) | Terminator::Unreachable))
+        .filter(|b| matches!(b.term, Terminator::Return(..) | Terminator::Unreachable))
         .collect();
     if exit_blocks.is_empty() {
         return MustResult::None;
@@ -660,7 +686,7 @@ impl ExitDominance {
         let exits = cfg
             .blocks
             .values()
-            .filter(|b| matches!(b.term, Terminator::Return(_)))
+            .filter(|b| matches!(b.term, Terminator::Return(..)))
             .map(|b| b.id)
             .filter(|id| reachable.contains(id))
             .collect();
@@ -773,11 +799,37 @@ pub fn must_direct_write(w: &crate::engine::SlotWriter) -> MustResult<DirectWrit
     }
 }
 
-/// A state slot in an analyzed owner that provably moves: its setter is
-/// referenced in the owner, with the first provable write site when one is
-/// syntactically visible. The evidence carried by [`Motion::Proven`].
+/// The state slots in analyzed owners that feed a seeding prop and provably
+/// move: the evidence carried by [`Motion::Proven`]. Never empty. A prop
+/// several call sites feed from several parents (#175) names every one of
+/// them, since a reader cannot tell which parent shows the freeze.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MovingFeeder {
+    pub slots: Vec<FeederSlot>,
+}
+
+impl MovingFeeder {
+    /// Every feeding slot, pre-qualified for display ("state `a` of `P` or
+    /// state `b` of `Q`").
+    pub fn display(&self) -> String {
+        self.slots
+            .iter()
+            .map(|s| s.display.as_str())
+            .collect::<Vec<_>>()
+            .join(" or ")
+    }
+
+    /// The qualified slots, for the mount questions asked about each.
+    pub fn qualified(&self) -> Vec<(ComponentId, HookLabel)> {
+        self.slots.iter().map(|s| (s.owner, s.slot)).collect()
+    }
+}
+
+/// One state slot in an analyzed owner that provably moves: its setter is
+/// referenced in the owner, with the first provable write site when one is
+/// syntactically visible.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FeederSlot {
     /// Component the slot belongs to — the half of the version label a rule
     /// needs to ask further questions about the slot (who writes it, when the
     /// consumer is mounted relative to those writes).
@@ -816,17 +868,11 @@ fn slot_write_evidence(
     if !may.contains(&slot) {
         return (false, None);
     }
-    let setters: HashSet<Var> = setter_labels
-        .iter()
-        .filter(|(_, l)| **l == slot)
-        .map(|(v, _)| v.clone())
-        .collect();
+    let setters: HashSet<Var> = setter_labels.aliases_of(slot);
     let render_fns = crate::rules::collect_fn_bindings(&owner.render_cfg);
     let mut spans: Vec<SourceRange> = std::iter::once(&owner.render_cfg)
         .chain(owner.hooks.iter().filter_map(|h| h.body_cfg()))
-        .flat_map(|cfg| {
-            crate::rules::collect_setter_calls_with_extra(cfg, &setters, 2, &render_fns)
-        })
+        .flat_map(|cfg| crate::rules::collect_setter_calls_with_extra(cfg, &setters, &render_fns))
         .filter_map(|c| c.span)
         .collect();
     spans.sort_by_key(|r| r.pos_key());
@@ -842,6 +888,7 @@ pub fn classify_motion(val: &StateValue, result: &ProgramAnalysisResult) -> Moti
     // `recompute_memo` does.
     if let Stability::Versioned(labels) = &val.reference {
         let mut unverifiable = false;
+        let mut slots: Vec<FeederSlot> = Vec::new();
         for (owner, slot) in labels {
             let Some(owner_result) = result.components.get(owner) else {
                 unverifiable = true;
@@ -855,21 +902,22 @@ pub fn classify_motion(val: &StateValue, result: &ProgramAnalysisResult) -> Moti
                     crate::rules::state_slot_name(*slot, &owner_states),
                     result.display_name(*owner)
                 );
-                return Motion::Proven(Certified::mint(
-                    MovingFeeder {
-                        owner: *owner,
-                        slot: *slot,
-                        display,
-                        write_span,
-                    },
-                    // The write that moves the feeding slot *is* the proof, and
-                    // this is where it was found. The consuming rule anchors
-                    // the finding at the seed site instead — a better place to
-                    // point a user — but the token now says where the proof
-                    // lives without anyone reading back into the evidence.
-                    Provenance::at(write_span, None),
-                ));
+                slots.push(FeederSlot {
+                    owner: *owner,
+                    slot: *slot,
+                    display,
+                    write_span,
+                });
             }
+        }
+        if let Some(first) = slots.first() {
+            // The write that moves a feeding slot *is* the proof, and this is
+            // where it was found. The consuming rule anchors the finding at
+            // the seed site instead — a better place to point a user — but
+            // the token says where the proof lives without anyone reading
+            // back into the evidence.
+            let at = Provenance::at(first.write_span, None);
+            return Motion::Proven(Certified::mint(MovingFeeder { slots }, at));
         }
         return if unverifiable {
             Motion::Unproven
@@ -970,7 +1018,7 @@ pub fn must_stale_capture(
             }
         }
         // A concise arrow body (`() => setN(n + 1)`) returns the call.
-        if let Terminator::Return(expr) = &block.term
+        if let Terminator::Return(expr, _) = &block.term
             && try_extract_setter_call(expr, slot_setters).is_some()
         {
             write_blocks.insert(*bid);
@@ -1150,7 +1198,7 @@ pub enum CleanupVerdict {
 pub fn cleanup_verdict(body: &CFG) -> CleanupVerdict {
     let mut verdict = CleanupVerdict::Absent;
     for block in body.blocks.values() {
-        let Terminator::Return(expr) = &block.term else {
+        let Terminator::Return(expr, _) = &block.term else {
             continue;
         };
         match classify_returned(expr, body) {
@@ -1213,7 +1261,7 @@ mod tests {
             BasicBlock {
                 id: 2,
                 stmts: vec![set_call(20)],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                term: Terminator::Return(Expr::Lit(Prim::Unit), None),
             },
         );
         blocks.insert(

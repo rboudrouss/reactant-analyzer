@@ -195,12 +195,15 @@ mod tests {
             BasicBlock {
                 id: 0,
                 stmts: vec![],
-                term: Terminator::Return(Expr::CompApp {
-                    name: child.to_string(),
-                    props: Box::new(Expr::Lit(Prim::Null)),
-                    span: None,
-                    origin: None,
-                }),
+                term: Terminator::Return(
+                    Expr::CompApp {
+                        name: child.to_string(),
+                        props: Box::new(Expr::Lit(Prim::Null)),
+                        span: None,
+                        origin: None,
+                    },
+                    None,
+                ),
             },
         );
         ComponentIR {

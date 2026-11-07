@@ -45,6 +45,10 @@ pub struct InlineOrigin {
     /// File the inlined body came from.
     pub from: std::path::PathBuf,
     pub kind: InlineKind,
+    /// The variable the call's value was bound to, which the splice rebinds
+    /// to the body's return: the only place the call survives for a lowering
+    /// temp (`__call_N`, `__hook_N`), whose message name is that call.
+    pub bound: Option<crate::ir::Var>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,7 +136,7 @@ impl EffectInfo {
     /// incomplete array, so a rule must check it with *nothing* covered rather
     /// than skip it.
     pub fn deps_are_opaque(&self) -> bool {
-        matches!(self.deps, DepsArg::Opaque)
+        matches!(self.deps, DepsArg::Opaque(_))
     }
 
     /// Every deps element the IR can see, in declared order; empty when there
@@ -192,6 +196,9 @@ pub struct AnalysisResult<D: AbstractDomain> {
     pub module_consts: std::sync::Arc<HashMap<Var, crate::ir::ModuleConstInit>>,
     pub state_store: StateStore<D>,
     pub memo_store: MemoStore<D>,
+    /// Abstract environment at the entry of the render CFG: props and module
+    /// constants bound.
+    pub render_entry: AbstractEnv<D>,
     /// Abstract environment at the *exit* of each render-CFG block.
     pub block_states: HashMap<BlockId, AbstractEnv<D>>,
     /// Abstract environment at the *exit* of each block, per effect body CFG.
@@ -255,11 +262,20 @@ pub struct AnalysisResult<D: AbstractDomain> {
     /// at convergence in the same slice as `slot_writers`. Empty for
     /// hand-built IR.
     pub registrations: Vec<crate::engine::registrations::Registration>,
-    /// The effect-trigger relation (ADR-042 §3): one row per (effect, dep
-    /// index, qualified slot) with the must-rerun bit `exact`. Computed at
+    /// The effect-trigger relation (ADR-042 §3): one row per (effect or memo,
+    /// dep index, qualified slot) with the must-rerun bit `exact` — a memo's
+    /// list gates its body as an effect's does (#249). Computed at
     /// convergence in the same slice as `slot_writers`. Empty for hand-built
     /// IR.
     pub effect_triggers: Vec<crate::engine::triggers::EffectTrigger>,
+    /// The re-run class of every effect and memo, computed with
+    /// `effect_triggers`: whether it runs once per mount, when a slot of its
+    /// rows moves, or after every render. Read it through
+    /// [`AnalysisResult::rerun`].
+    pub effect_reruns: HashMap<HookLabel, crate::engine::triggers::Rerun>,
+    /// The effects and memos a dep of which may move with the props, beside
+    /// the rows: the churn graph's props node is among their triggers (#207).
+    pub effect_props: std::collections::HashSet<HookLabel>,
     /// Number of outer fixpoint iterations before convergence.  Useful for
     /// --verbose output and for Info diagnostics about analysis depth.
     pub iterations: usize,
@@ -278,9 +294,40 @@ impl<D: AbstractDomain> AnalysisResult<D> {
         crate::domains::interp::exit_env_of(&self.render_cfg, &self.block_states)
             .unwrap_or_else(AbstractEnv::bottom)
     }
+
+    /// The re-run class of effect or memo `label` (`engine::triggers`), `None`
+    /// when it names neither. A result built without the relation (hand-built
+    /// IR) still answers what the deps argument's shape decides, and reads a
+    /// written list as `OnSlots`.
+    pub fn rerun(&self, label: HookLabel) -> Option<crate::engine::triggers::Rerun> {
+        use crate::engine::triggers::Rerun;
+        if let Some(r) = self.effect_reruns.get(&label) {
+            return Some(*r);
+        }
+        self.hooks.iter().find_map(|h| match h {
+            HookEntry::Effect { label: l, deps, .. } | HookEntry::Memo { label: l, deps, .. }
+                if *l == label =>
+            {
+                Some(Rerun::of_shape(deps).unwrap_or(Rerun::OnSlots))
+            }
+            _ => None,
+        })
+    }
 }
 
 impl AnalysisResult<StateValue> {
+    /// The names no deps array should list, whatever their value: what a
+    /// React `useEffectEvent` hands back (#273). A setter or a ref is exempt
+    /// by its value, which is stable; an effect event's is not, yet a stale
+    /// copy of it runs the latest render's function.
+    pub fn deps_exempt_names(&self) -> std::collections::HashSet<crate::ir::types::Var> {
+        crate::engine::setters::effect_event_names(
+            &self.render_cfg,
+            &self.hooks,
+            &self.hook_provenance,
+        )
+    }
+
     /// The value-divergence predicate: the render → effect cycle widened
     /// `slot`, and what the effects write into it is not bounded either
     /// (branch narrowing did not hold the growth; ⊥ = the write was not

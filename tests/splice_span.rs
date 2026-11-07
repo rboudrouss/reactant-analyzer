@@ -34,7 +34,7 @@ fn a_call_spliced_in_from_a_utilitys_return_reports_the_call_site() {
     );
     assert!(
         out.contains("(line 4:8)"),
-        "`const data = normalize(raw);` is App.tsx line 4 — the one position \
-         the splice knows, since `Terminator::Return` carries none:\n{out}"
+        "`const data = normalize(raw);` is App.tsx line 4 — the binding runs \
+         at the call site, not at the utility's `return`:\n{out}"
     );
 }

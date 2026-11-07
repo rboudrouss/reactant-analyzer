@@ -182,7 +182,7 @@ impl StateValue {
 
     pub fn component_setter(component: ComponentId, label: HookLabel) -> Self {
         StateValue {
-            setter: SetterVal::One(component, label),
+            setter: SetterVal::one(component, label),
             ..Self::bottom_value()
         }
     }
@@ -194,6 +194,7 @@ impl StateValue {
                 lo: f64::INFINITY,
                 hi: f64::NEG_INFINITY,
                 is_int: true,
+                may_neg_zero: false,
             },
             boolean: BoolVal::Bottom,
             str: StrConst::Bottom,
@@ -233,7 +234,7 @@ impl StateValue {
             && *reference == Stability::Unknown
             && *null
             && *undef
-            && *setter == SetterVal::Top
+            && !setter.is_closed()
             && *other
     }
 
@@ -278,12 +279,36 @@ impl StateValue {
         }
     }
 
+    /// Every setter the value may be: a call of it may write each of them. A
+    /// value two call sites bind to two setters names both (#175), and so does
+    /// one that may also be something else (`c ? [setV, v] : [v, setV]`, #233)
+    /// — a call of a non-function throws and a call of another function runs
+    /// elsewhere, so the setters are still what the call may write. That the
+    /// call surely writes one is [`Self::surely_setter`]. A setter joined with
+    /// a value the analysis cannot see into is still named (#238).
+    pub fn setters(&self) -> Vec<(ComponentId, HookLabel)> {
+        self.setter.candidates().collect()
+    }
+
+    /// The value can only be one of [`Self::setters`]: a call of it surely
+    /// writes one of them.
+    pub fn surely_setter(&self) -> bool {
+        self.populated_kinds().only(KindMask::SETTER) && self.setter.is_closed()
+    }
+
     /// True when the value is exactly a per-render-fresh reference (nothing
     /// else) — a *must* fact: a new reference every render, guaranteed.
     /// `Versioned` (changes only at setter events) deliberately returns false
     /// (ADR-017).
     pub fn is_unstable_reference_only(&self) -> bool {
         self.reference == Stability::PerRender && self.populated_kinds().only(KindMask::REF)
+    }
+
+    /// True when the value can only be a reference: `Object.is` then compares
+    /// identities, and the reference's change component is the whole story of
+    /// when the value differs. Anything else is compared by value.
+    pub fn is_reference_only(&self) -> bool {
+        !self.is_bottom_value() && self.populated_kinds().only(KindMask::REF)
     }
 
     /// Derive the best initial abstract value from a `useState(init)` expression.
@@ -324,7 +349,8 @@ impl StateValue {
         let mut acc = Stability::Bottom;
         let mut in_motion = false;
         if !self.num.is_bottom() {
-            if self.num.is_point() {
+            // A `0` that may be `-0` is two values under `Object.is` (#208).
+            if self.num.is_one_value() {
                 acc = acc.join(&Stability::Stable);
             } else {
                 in_motion = true;
@@ -402,12 +428,12 @@ impl StateValue {
     }
 
     /// The primitive kinds of this value that hold more than one concrete
-    /// value (a non-point interval, either boolean, several or any strings),
-    /// alone. A kind with one value, `null` and `undefined` included, is
-    /// dropped: two writes of it are `Object.is`-equal.
+    /// value (a non-point interval, a `0` that may be `-0`, either boolean,
+    /// several or any strings), alone. A kind with one value, `null` and
+    /// `undefined` included, is dropped: two writes of it are
+    /// `Object.is`-equal.
     pub fn varying_primitives(&self) -> StateValue {
-        let num_varies =
-            !self.num.is_bottom() && !(self.num.lo == self.num.hi && self.num.lo.is_finite());
+        let num_varies = !self.num.is_bottom() && !self.num_is_one_value();
         StateValue {
             num: if num_varies {
                 self.num
@@ -430,9 +456,8 @@ impl StateValue {
     /// True if the value is one concrete value, the same on every evaluation:
     /// one kind, and within it a point number, one boolean, one string
     /// constant, `null`, `undefined`, a stable reference or one setter. Two
-    /// writes of it are `Object.is`-equal (the interval domain does not tell
-    /// `-0` from `0`, the one point it conflates). ⊥ holds too: no value is
-    /// ever stored.
+    /// writes of it are `Object.is`-equal, so a `0` that may be `-0` does not
+    /// count (#208). ⊥ holds too: no value is ever stored.
     pub fn is_single_value(&self) -> bool {
         let kinds = self.populated_kinds();
         if kinds.is_empty() {
@@ -441,16 +466,41 @@ impl StateValue {
         if kinds.count() != 1 {
             return false;
         }
-        let num_point = self.num.lo == self.num.hi && self.num.lo.is_finite();
         let one_str = matches!(&self.str, StrConst::Set(s) if s.len() == 1);
         match kinds.0 {
-            KindMask::NUM => num_point,
+            KindMask::NUM => self.num_is_one_value(),
             KindMask::BOOL => matches!(self.boolean, BoolVal::True | BoolVal::False),
             KindMask::STR => one_str,
             KindMask::REF => self.reference == Stability::Stable,
             KindMask::NULL | KindMask::UNDEF => true,
             KindMask::SETTER => self.setter.as_one().is_some(),
             _ => false,
+        }
+    }
+
+    /// The number kind is one finite value under `Object.is`.
+    fn num_is_one_value(&self) -> bool {
+        self.num.is_one_value() && self.num.lo.is_finite()
+    }
+
+    /// The one member the value names used as a key (`o[k]`, `{ [k]: v }`):
+    /// a single string constant, or a single non-negative integer, which
+    /// names the member its decimal spelling does (#76). `None` when it may
+    /// name several, or a member no constant spells.
+    pub fn as_member_key(&self) -> Option<String> {
+        if self.is_bottom_value() || !self.is_single_value() {
+            return None;
+        }
+        match &self.str {
+            StrConst::Set(s) => s.iter().next().cloned(),
+            _ if self.num_is_one_value()
+                && self.num.lo >= 0.0
+                && self.num.lo.fract() == 0.0
+                && self.num.lo <= f64::from(u32::MAX) =>
+            {
+                Some(format!("{}", self.num.lo as u64))
+            }
+            _ => None,
         }
     }
 
@@ -548,7 +598,14 @@ impl fmt::Debug for StateValue {
         }
         match &self.setter {
             SetterVal::Bottom => {}
-            SetterVal::One(c, l) => parts.push(format!("setter(#{}#{l})", c.index())),
+            s @ (SetterVal::Some(_) | SetterVal::Open(_)) => parts.push(format!(
+                "setter({}{})",
+                s.candidates()
+                    .map(|(c, l)| format!("#{}#{l}", c.index()))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                if s.is_closed() { "" } else { ",…" }
+            )),
             SetterVal::Top => parts.push("setter".into()),
         }
         if self.other {
@@ -601,7 +658,7 @@ impl AbstractDomain for StateValue {
             reference: Stability::Unknown,
             null: true,
             undef: true,
-            setter: SetterVal::Top,
+            setter: SetterVal::unnamed(),
             other: true,
         }
     }
@@ -824,7 +881,8 @@ mod tests {
             StateValue::number(Interval {
                 lo: 0.0,
                 hi: 1.0,
-                is_int: true
+                is_int: true,
+                may_neg_zero: false
             })
         );
     }
@@ -885,7 +943,8 @@ mod tests {
             StateValue::number(Interval {
                 lo: 0.0,
                 hi: 5.0,
-                is_int: true
+                is_int: true,
+                may_neg_zero: false
             })
             .to_stability(),
             Stability::PerRender
@@ -920,7 +979,8 @@ mod tests {
             StateValue::number(Interval {
                 lo: 0.0,
                 hi: f64::INFINITY,
-                is_int: true
+                is_int: true,
+                may_neg_zero: false
             })
             .is_unbounded()
         );
@@ -978,6 +1038,7 @@ mod tests {
             lo: 0.0,
             hi: f64::INFINITY,
             is_int: true,
+            may_neg_zero: false,
         };
         let n = i.narrow_lt(10.0);
         assert_eq!(n.lo, 0.0);
@@ -990,6 +1051,7 @@ mod tests {
             lo: 0.0,
             hi: f64::INFINITY,
             is_int: true,
+            may_neg_zero: false,
         };
         let n = i.narrow_geq(10.0);
         assert_eq!(n.lo, 10.0);
@@ -1002,6 +1064,7 @@ mod tests {
             lo: 0.0,
             hi: 5.0,
             is_int: true,
+            may_neg_zero: false,
         };
         assert_eq!(i.narrow_eq(3.0), Interval::point(3.0));
     }
@@ -1012,6 +1075,7 @@ mod tests {
             lo: 0.0,
             hi: 5.0,
             is_int: true,
+            may_neg_zero: false,
         };
         assert!(i.narrow_eq(7.0).is_bottom());
     }
@@ -1022,6 +1086,7 @@ mod tests {
             lo: 0.0,
             hi: f64::INFINITY,
             is_int: true,
+            may_neg_zero: false,
         });
         let n = v.narrow_lt(10.0);
         assert_eq!(
@@ -1029,7 +1094,8 @@ mod tests {
             StateValue::number(Interval {
                 lo: 0.0,
                 hi: 9.0,
-                is_int: true
+                is_int: true,
+                may_neg_zero: false
             })
         );
     }
@@ -1041,6 +1107,7 @@ mod tests {
             lo: 0.0,
             hi: f64::INFINITY,
             is_int: true,
+            may_neg_zero: false,
         }));
         let n = v.narrow_lt(10.0);
         assert!(n.null);
@@ -1049,7 +1116,8 @@ mod tests {
             Interval {
                 lo: 0.0,
                 hi: 9.0,
-                is_int: true
+                is_int: true,
+                may_neg_zero: false
             }
         );
     }
@@ -1106,6 +1174,7 @@ mod tests {
             lo: 0.0,
             hi: 5.0,
             is_int: true,
+            may_neg_zero: false,
         })
         .join(&StateValue::boolean(BoolVal::Top));
         let tw = w.narrow_truthy();
@@ -1114,7 +1183,8 @@ mod tests {
             Interval {
                 lo: 0.0,
                 hi: 5.0,
-                is_int: true
+                is_int: true,
+                may_neg_zero: false
             },
             "can't split [0,5]"
         );
@@ -1129,6 +1199,7 @@ mod tests {
                 lo: 0.0,
                 hi: 5.0,
                 is_int: true,
+                may_neg_zero: false,
             }))
             .join(&StateValue::str_set(
                 ["a".to_string(), String::new()].into_iter().collect(),
@@ -1218,6 +1289,7 @@ mod tests {
             lo: 0.0,
             hi: 5.0,
             is_int: true,
+            may_neg_zero: false,
         });
         let b = num_point(1.0).join(&str_singleton("s"));
         assert!(a.partial_cmp(&b).is_none());
@@ -1257,14 +1329,14 @@ mod tests {
     }
 
     #[test]
-    fn component_setter_join_different_loses_identity_stays_stable() {
-        // Joining distinct setters keeps the setter slot at ⊤ — still Stable,
-        // identity lost.
+    fn component_setter_join_different_keeps_both_stays_stable() {
+        // Joining distinct setters keeps both candidates — still Stable, no
+        // longer one exact identity.
         for j in [
             cs("Foo", 0).join(&cs("Bar", 0)),
             cs("Foo", 0).join(&cs("Foo", 1)),
         ] {
-            assert_eq!(j.setter, SetterVal::Top);
+            assert_eq!(j.setters().len(), 2);
             assert!(j.as_setter().is_none());
             assert_eq!(j.to_stability(), Stability::Stable);
         }
@@ -1273,10 +1345,13 @@ mod tests {
     #[test]
     fn component_setter_join_with_ref_keeps_both_slots() {
         let j = cs("Foo", 0).join(&StateValue::reference(Stability::Stable));
-        assert_eq!(j.setter, SetterVal::One(crate::test_support::cid(0), 0));
+        assert_eq!(j.setter, SetterVal::one(crate::test_support::cid(0), 0));
         assert_eq!(j.reference, Stability::Stable);
-        // Mixed with a reference → no longer an exact setter.
+        // Mixed with a reference → no longer an exact setter, still one a
+        // call may write (#233).
         assert!(j.as_setter().is_none());
+        assert!(!j.surely_setter());
+        assert_eq!(j.setters(), vec![(crate::test_support::cid(0), 0)]);
         // Two populated kinds = two distinct possible values → not
         // definitely stable (cross-kind union rule).
         assert_eq!(j.to_stability(), Stability::Unknown);
@@ -1298,6 +1373,7 @@ mod tests {
             lo: 0.0,
             hi: f64::INFINITY,
             is_int: true,
+            may_neg_zero: false,
         }));
         assert_eq!(v.to_stability(), Stability::PerRender);
         // Top stays Unknown: opaque values never claim definite instability.
@@ -1306,7 +1382,12 @@ mod tests {
 
     #[test]
     fn component_setter_join_with_top_gives_top() {
-        assert!(cs("Foo", 0).join(&StateValue::top()).is_top_value());
+        let j = cs("Foo", 0).join(&StateValue::top());
+        assert!(j.is_top_value());
+        // ⊤ does not erase the setter it is joined with (#238): a call may
+        // write it, not surely.
+        assert_eq!(j.setters(), vec![(crate::test_support::named("Foo"), 0)]);
+        assert!(!j.surely_setter());
     }
 
     #[test]
