@@ -2996,6 +2996,29 @@ impl<'a> SetterWalk<'a> {
                 self.repeating = outer_repeating;
             }
         }
+        // A call that fires events (`ref.current.click()`, `dispatchEvent`)
+        // runs the component's JSX handlers of that event before it returns,
+        // or all of them when the name is not known: their writes are
+        // possible writes of this call, in its class (#277), as a registered
+        // listener's are in a dispatching program (#250). Never placed: the
+        // dispatch may reach none of them.
+        if let Expr::Call { fn_, args } | Expr::New { fn_, args, .. } = expr
+            && let Some(event) = crate::engine::registrations::dispatched_event(fn_, args)
+            && let Some(c) = self.converged
+            && depth > 0
+        {
+            for hook in c.hooks {
+                if let HookEntry::Handler {
+                    event: e, body_cfg, ..
+                } = hook
+                    && event.as_deref().is_none_or(|n| n == e)
+                {
+                    let mut inner = Found::default();
+                    self.cfg(body_cfg, depth - 1, &mut inner, mode, prov, stmt_span);
+                    found.absorb(inner, body_cfg, mode, None, prov);
+                }
+            }
+        }
         // A hook the expansion left receives its arguments at its marker, as
         // an unknown callee does: the fixpoint escapes them there (#254), and
         // a closure among them may run at any time (#262). What evaluating

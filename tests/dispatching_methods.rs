@@ -6,6 +6,10 @@ use reactant::lowering::lower_program;
 use reactant::rules::{RuleCtx, Severity, all_rules};
 
 fn loop_claims(src: &str) -> usize {
+    loop_severities(src).len()
+}
+
+fn loop_severities(src: &str) -> Vec<Severity> {
     use oxc_allocator::Allocator;
     use oxc_parser::{ParseOptions, Parser};
     use oxc_span::SourceType;
@@ -28,8 +32,9 @@ fn loop_claims(src: &str) -> usize {
         .iter()
         .filter(|rule| rule.name() == "infinite-loop")
         .flat_map(|rule| rule.check(&ctx))
-        .filter(|d| d.severity() != Severity::Info)
-        .count()
+        .map(|d| d.severity())
+        .filter(|s| *s != Severity::Info)
+        .collect()
 }
 
 fn with_trigger(trigger: &str) -> String {
@@ -60,6 +65,42 @@ fn an_element_method_that_fires_events_makes_a_listener_run_in_place() {
     ] {
         assert!(loop_claims(&with_trigger(trigger)) > 0, "{trigger}");
     }
+}
+
+fn jsx_case(trigger: &str, deps: &str, handler: &str) -> String {
+    format!(
+        r#"
+import {{ useEffect, useRef, useState }} from "react";
+export function App() {{
+  const [n, setN] = useState(0);
+  const ref = useRef(null);
+  useEffect(() => {{
+    {trigger}
+  }}{deps});
+  return <button ref={{ref}} onClick={{() => {handler}}}>{{n}}</button>;
+}}
+"#
+    )
+}
+
+#[test]
+fn a_dispatch_runs_the_components_jsx_handlers_of_that_event() {
+    // #277: `click()` in an effect with no deps runs `onClick`, whose write
+    // re-renders: a possible loop, never a certain one.
+    let src = jsx_case("ref.current.click();", "", "setN(n + 1)");
+    let claims = loop_severities(&src);
+    assert!(!claims.is_empty());
+    assert!(claims.iter().all(|s| *s == Severity::Warning), "{claims:?}");
+    // `focus()` fires no `click`; a mount-only effect firing a constant
+    // write settles.
+    assert_eq!(
+        loop_claims(&jsx_case("ref.current.focus();", "", "setN(n + 1)")),
+        0
+    );
+    assert_eq!(
+        loop_claims(&jsx_case("ref.current.click();", ", []", "setN(1)")),
+        0
+    );
 }
 
 #[test]

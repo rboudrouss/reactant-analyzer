@@ -339,10 +339,11 @@ carries an Error.
   program the fixpoint runs every listener where it is registered, as it runs a timer callback, so
   the slot a listener writes moves with its writes, a listener passed by name included
   [#250](https://github.com/rboudrouss/reactant-analyzer/issues/250). A dispatch
-  hidden in an opaque callee is not seen. A JSX handler (`onClick`) stays event-only even then,
-  though dispatching on a DOM node React manages would run it synchronously too: an effect that
-  calls `ref.current.click()` on the button whose `onClick` writes state loops unclaimed
-  (`oracle/cases/dispatch-reaches-jsx-handler.tsx`, a known false negative). The program's test
+  hidden in an opaque callee is not seen. A dispatching call runs the component's own JSX
+  handlers of the event it fires (`click()` its `onClick`s, a `dispatchEvent` of an event whose
+  name is not a literal all of them) where it is made, as possible writes of that body [#277](https://github.com/rboudrouss/reactant-analyzer/issues/277);
+  another component's handlers, reached by bubbling or through a ref handed down, stay
+  event-only. The program's test
   files are not read (`*.test.*`, `*.spec.*` are no source files to the walk), so a dispatch there
   makes nothing ⊤.
 - **`frozen-initial-state`** still fires on a child remounted by machinery it cannot see: a dialog

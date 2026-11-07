@@ -1,10 +1,8 @@
 // oracle: react=loop
-// oracle: known=fn
 // An effect dispatches `click` on the element whose JSX `onClick` writes the
 // state: the handler runs inside the effect, every run re-renders. The
-// handler is its own entry point, and a dispatch makes its writes of unknown
-// timing in the handler's region, never writes of the dispatching effect, so
-// the churn graph has no edge for the loop.
+// dispatching call runs the component's `click` handlers where it is made
+// (#277), so their write is a possible write of the effect.
 import { useEffect, useRef, useState } from "react";
 
 export function App() {

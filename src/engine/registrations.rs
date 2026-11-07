@@ -355,14 +355,43 @@ pub(crate) fn dispatches_events(cfg: &CFG) -> bool {
     found
 }
 
+/// The events a call with callee `fn_` and arguments `args` fires before it
+/// returns: `None` when it fires none, `Some(None)` when their name is not
+/// known (`dispatchEvent(ev)`, `emit`), `Some(Some(name))` for an element
+/// method's own event (`click()` → `click`, `requestSubmit()` → `submit`) or
+/// a `dispatchEvent(new Event("name"))`.
+pub(crate) fn dispatched_event(fn_: &Expr, args: &[Expr]) -> Option<Option<String>> {
+    let name = match fn_.peel_ts() {
+        Expr::Var(name) if name == "dispatchEvent" => name.as_str(),
+        Expr::FieldAccess { field, .. } if DISPATCHING_METHODS.contains(&field.as_str()) => {
+            field.as_str()
+        }
+        _ => return None,
+    };
+    Some(match name {
+        "click" | "focus" | "blur" => Some(name.to_string()),
+        "requestSubmit" => Some("submit".to_string()),
+        "dispatchEvent" => {
+            let Some(Expr::New { fn_, args, .. }) = args.first().map(Expr::peel_ts) else {
+                return Some(None);
+            };
+            match (fn_.peel_ts(), args.first().map(Expr::peel_ts)) {
+                (Expr::Var(c), Some(Expr::Lit(crate::ir::expr::Prim::String(n))))
+                    if c.ends_with("Event") =>
+                {
+                    Some(n.to_lowercase())
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    })
+}
+
 fn expr_dispatches_events(e: &Expr) -> bool {
     match e {
-        Expr::Call { fn_, .. } | Expr::New { fn_, .. }
-            if match fn_.peel_ts() {
-                Expr::Var(name) => name == "dispatchEvent",
-                Expr::FieldAccess { field, .. } => DISPATCHING_METHODS.contains(&field.as_str()),
-                _ => false,
-            } =>
+        Expr::Call { fn_, args } | Expr::New { fn_, args, .. }
+            if dispatched_event(fn_, args).is_some() =>
         {
             true
         }
