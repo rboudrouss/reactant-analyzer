@@ -1597,6 +1597,38 @@ fn effect_event_args<'a>(
         .collect()
 }
 
+/// The names bound once, in render and in no other body, to what a React
+/// `useEffectEvent` hands back (#273). That function calls the latest
+/// render's argument, so a stale copy of it is the current one, and React
+/// forbids listing it in a deps array: no deps reading asks for it.
+pub(crate) fn effect_event_names(
+    render: &CFG,
+    hooks: &[HookEntry],
+    provenance: &[HookProvenance],
+) -> HashSet<Var> {
+    let events = effect_event_args(hooks, provenance);
+    let mut elsewhere = HashSet::new();
+    for body in hooks.iter().filter_map(HookEntry::body_cfg) {
+        collect_binders(body, &mut elsewhere);
+    }
+    hooks
+        .iter()
+        .filter_map(|h| match h {
+            HookEntry::Custom {
+                label,
+                binding: Some(v),
+                ..
+            } if events.contains_key(label)
+                && !elsewhere.contains(v)
+                && crate::ir::bindings::binding_of(v, render).is_some() =>
+            {
+                Some(v.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// Names bound exactly once, anywhere below, to the result of a `useCallback`
 /// — mapped to that callback's body — or of a `useEffectEvent` whose
 /// argument is such a name or a function literal (`events`), mapped to the

@@ -44,6 +44,7 @@ impl Rule for MissingDeps {
         let (result, component) = (ctx.program(), ctx.component());
         let result = &result.components[&component];
         let env_exit = result.exit_env();
+        let exempt = result.deps_exempt_names();
         let mut diags = Vec::new();
 
         for (label, info) in &result.effect_info {
@@ -76,7 +77,7 @@ impl Rule for MissingDeps {
                     continue;
                 }
                 // Globals (fetch, console, …) are not in env_exit → skip.
-                if !env_exit.contains(&path.root) {
+                if !env_exit.contains(&path.root) || exempt.contains(&path.root) {
                     continue;
                 }
                 // What can go stale is the *member actually read*: a fresh
@@ -87,7 +88,13 @@ impl Rule for MissingDeps {
                 // this only ever removes findings (issue #88).
                 if !env_exit.lookup(&path.root).is_stable()
                     && !member_is_stable(path, &env_exit, result)
-                    && !closure_is_behaviorally_stable(path, result, &env_exit, &mut HashSet::new())
+                    && !closure_is_behaviorally_stable(
+                        path,
+                        result,
+                        &env_exit,
+                        &exempt,
+                        &mut HashSet::new(),
+                    )
                 {
                     reported.insert(if declared_roots.contains(&path.root) {
                         path.clone()
@@ -168,6 +175,7 @@ fn closure_is_behaviorally_stable(
     path: &AccessPath,
     result: &crate::engine::AnalysisResult<StateValue>,
     env_exit: &AbstractEnv<StateValue>,
+    exempt: &HashSet<Var>,
     seen: &mut HashSet<AccessPath>,
 ) -> bool {
     if !seen.insert(path.clone()) {
@@ -185,10 +193,10 @@ fn closure_is_behaviorally_stable(
         if !env_exit.contains(&cap.root) {
             continue;
         }
-        if env_exit.lookup(&cap.root).is_stable() {
+        if env_exit.lookup(&cap.root).is_stable() || exempt.contains(&cap.root) {
             continue;
         }
-        if !closure_is_behaviorally_stable(&cap, result, env_exit, seen) {
+        if !closure_is_behaviorally_stable(&cap, result, env_exit, exempt, seen) {
             return false;
         }
     }

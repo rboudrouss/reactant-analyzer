@@ -316,6 +316,18 @@ impl<D: AbstractDomain> AnalysisResult<D> {
 }
 
 impl AnalysisResult<StateValue> {
+    /// The names no deps array should list, whatever their value: what a
+    /// React `useEffectEvent` hands back (#273). A setter or a ref is exempt
+    /// by its value, which is stable; an effect event's is not, yet a stale
+    /// copy of it runs the latest render's function.
+    pub fn deps_exempt_names(&self) -> std::collections::HashSet<crate::ir::types::Var> {
+        crate::engine::setters::effect_event_names(
+            &self.render_cfg,
+            &self.hooks,
+            &self.hook_provenance,
+        )
+    }
+
     /// The value-divergence predicate: the render → effect cycle widened
     /// `slot`, and what the effects write into it is not bounded either
     /// (branch narrowing did not hold the growth; ⊥ = the write was not

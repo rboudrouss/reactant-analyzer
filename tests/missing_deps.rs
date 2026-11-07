@@ -725,3 +725,37 @@ fn uncovered_members_beside_a_declared_one_are_named_individually() {
         "`settings.material` and `settings.lighting`, each its own finding"
     );
 }
+
+#[test]
+fn an_effect_event_is_never_a_missing_dep() {
+    // #273: what `useEffectEvent` hands back calls the latest render's
+    // function, and React forbids listing it: neither the name nor a closure
+    // that only captures it is a missing dep. A plain callback still is.
+    let event = missing_deps_hits(
+        r#"
+        import { useEffect, useEffectEvent } from "react";
+        function C({ onPin, y }) {
+            const onPinEvent = useEffectEvent(() => onPin());
+            const fire = () => onPinEvent();
+            useEffect(() => {
+                if (y > 10) { onPinEvent(); fire(); }
+            }, [y]);
+            return <div/>;
+        }
+        "#,
+    );
+    assert_eq!(event, 0, "an effect event is exempt");
+    let plain = missing_deps_hits(
+        r#"
+        import { useEffect } from "react";
+        function C({ onPin, y }) {
+            const onPinEvent = () => onPin();
+            useEffect(() => {
+                if (y > 10) onPinEvent();
+            }, [y]);
+            return <div/>;
+        }
+        "#,
+    );
+    assert_eq!(plain, 1, "a plain function capturing a prop is not");
+}
