@@ -876,6 +876,68 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
 
 /// Analyze all components in `registry` together, propagating props and
 /// callbacks across component boundaries (top-down inlining).
+/// The props the element at `span` in `caller`'s render passes unchanged
+/// from `caller`'s own (#241): `(child prop, caller prop)` for each member
+/// written as a read of the caller's prop — `items={props.items}`, or a name
+/// whose sole binding is that read (`Parent({ items })`). A default, a
+/// spread or any other expression forwards nothing.
+fn forwarded_props(
+    caller: &ComponentIR,
+    span: Option<crate::ir::SourceRange>,
+) -> Vec<(crate::ir::types::Symbol, crate::ir::types::Symbol)> {
+    fn find<'a>(cfg: &'a CFG, span: crate::ir::SourceRange, out: &mut Option<&'a Expr>) {
+        fn walk<'a>(e: &'a Expr, span: crate::ir::SourceRange, out: &mut Option<&'a Expr>) {
+            match e {
+                Expr::CompApp { props, span: s, .. } if *s == Some(span) => *out = Some(props),
+                Expr::FnLit { body_cfg, .. } => find(body_cfg, span, out),
+                _ => e.for_each_child(&mut |c| walk(c, span, out)),
+            }
+        }
+        cfg.for_each_expr(&mut |e| walk(e, span, out));
+    }
+    let Some(span) = span else {
+        return Vec::new();
+    };
+    let mut props = None;
+    find(&caller.render_cfg, span, &mut props);
+    let Some(Expr::ObjectLit { fields, .. }) = props.map(Expr::peel_ts) else {
+        return Vec::new();
+    };
+    // A name is the props object when it is the parameter, or a chain of
+    // single renames of it (`const __obj = __p0`).
+    let is_props = |e: &Expr| {
+        let mut e = e.peel_ts();
+        for _ in 0..crate::ir::bindings::MAX_ALIAS_HOPS {
+            let Expr::Var(v) = e else {
+                return false;
+            };
+            if *v == caller.param {
+                return true;
+            }
+            match crate::ir::bindings::binding_of(v, &caller.render_cfg) {
+                Some(next) => e = next.peel_ts(),
+                None => return false,
+            }
+        }
+        false
+    };
+    let prop_of = |e: &Expr| match e.peel_ts() {
+        Expr::FieldAccess { obj, field } if is_props(obj) => Some(field.clone()),
+        _ => None,
+    };
+    fields
+        .iter()
+        .filter(|(k, _)| !crate::ir::expr::is_synthetic_key(k))
+        .filter_map(|(k, v)| {
+            let read = match v.peel_ts() {
+                Expr::Var(x) => crate::ir::bindings::binding_of(x, &caller.render_cfg)?,
+                other => other,
+            };
+            Some((k.clone(), prop_of(read)?))
+        })
+        .collect()
+}
+
 pub fn analyze_program(
     registry: ComponentRegistry,
     hook_registry: HookRegistry,
@@ -952,27 +1014,77 @@ pub fn analyze_program(
     // nothing phase 1 stored, and its call-graph row keeps the facts.
     let mut sites: Vec<_> = site_inputs.take().into_iter().collect();
     sites.sort_by_key(|((child, caller, span), _)| (*child, *caller, span.map(|s| s.pos_key())));
-    for ((child, caller, span), input) in sites {
-        let alone = inputs
+    let below_join = |child: ComponentId, input: &crate::domains::ChildInput| {
+        inputs
             .borrow()
             .get(&child)
-            .is_none_or(|joined| input.covers(&joined.props, &joined.heap));
-        let Some(ir) = registry.ir_of(child) else {
+            .is_some_and(|joined| !input.covers(&joined.props, &joined.heap))
+    };
+    for ((child, caller, span), input) in &sites {
+        let Some(ir) = registry.ir_of(*child) else {
             continue;
         };
-        if alone {
+        if !below_join(*child, input) {
             continue;
         }
         let probe = InterCtx {
             probe: true,
-            ..inter_for(child, vec![caller])
+            ..inter_for(*child, vec![*caller])
         };
-        let result = probe.analyze_under(ir, input);
+        let result = probe.analyze_under(ir, input.clone());
         let facts = crate::engine::SiteFacts {
             fresh_deps: crate::engine::fresh_deps(&result),
         };
-        if let Some(row) = call_graph.borrow_mut().site_mut(caller, child, span) {
+        if let Some(row) = call_graph.borrow_mut().site_mut(*caller, *child, *span) {
             row.own = Some(facts);
+        }
+    }
+    // One level up (#241): an element that forwards a prop of its caller
+    // unchanged (`<Child items={items} />` in `Parent({ items })`) hands the
+    // child, under each element rendering the caller, the value that element
+    // passes. The caller's own result is the join of its elements, so a
+    // grandparent's fresh prop is a may at the child; the child is probed
+    // under each such element's values instead, without re-analysing the
+    // caller, and the row names the grandparent.
+    for ((child, caller, span), input) in &sites {
+        let (Some(ir), Some(caller_ir)) = (registry.ir_of(*child), registry.ir_of(*caller)) else {
+            continue;
+        };
+        let forwarded = forwarded_props(caller_ir, *span);
+        if forwarded.is_empty() {
+            continue;
+        }
+        for ((parent, grand, _), outer) in &sites {
+            if parent != caller {
+                continue;
+            }
+            let mut derived = input.clone();
+            for (to, from) in &forwarded {
+                let passed = outer
+                    .props
+                    .get(from)
+                    .cloned()
+                    .unwrap_or(crate::domains::EnvVal::Val(StateValue::undefined()));
+                derived.props.insert(to.clone(), passed);
+            }
+            derived.heap = derived.heap.join(&outer.heap);
+            if !below_join(*child, &derived) {
+                continue;
+            }
+            let probe = InterCtx {
+                probe: true,
+                ..inter_for(*child, vec![*grand, *caller])
+            };
+            let result = probe.analyze_under(ir, derived);
+            let facts = crate::engine::SiteFacts {
+                fresh_deps: crate::engine::fresh_deps(&result),
+            };
+            if facts.fresh_deps.is_empty() {
+                continue;
+            }
+            if let Some(row) = call_graph.borrow_mut().site_mut(*caller, *child, *span) {
+                row.through.push((*grand, facts));
+            }
         }
     }
 

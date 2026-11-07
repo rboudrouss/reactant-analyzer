@@ -243,6 +243,13 @@ impl ComponentCallGraph {
             for &i in fresh.into_iter().flatten() {
                 out.entry(i).or_default().insert(caller);
             }
+            // A prop the caller forwards is fresh through the component
+            // rendering the caller's element that passes it so (#241).
+            for (grand, facts) in &site.through {
+                for &i in facts.fresh_deps.get(&hook).into_iter().flatten() {
+                    out.entry(i).or_default().insert(*grand);
+                }
+            }
         }
         out
     }
@@ -282,6 +289,11 @@ pub struct CallSite {
     /// is lost in that join. `None`: no other input reaches the callee, or
     /// this one was not re-analysed.
     pub own: Option<SiteFacts>,
+    /// What the callee does when this element renders it under one element
+    /// of the caller's own: the props the element forwards unchanged from
+    /// the caller's take the values that element passes (#241). Keyed by
+    /// the component rendering that element.
+    pub through: Vec<(ComponentId, SiteFacts)>,
 }
 
 /// The callee's facts under one call site's input alone (must, for that

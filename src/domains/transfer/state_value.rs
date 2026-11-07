@@ -883,6 +883,7 @@ fn record_call_site(
             props,
             location,
             own: None,
+            through: Vec::new(),
         },
     );
 }

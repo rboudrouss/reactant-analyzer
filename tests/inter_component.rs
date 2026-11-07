@@ -1402,3 +1402,47 @@ export function App() {{
     let never = src("cbRef.current = () => onTick(n + 1);", "");
     assert!(loop_messages(&never, "App").is_empty());
 }
+
+// ── #241: a prop forwarded by a parent ─────────────────────────────────────────
+
+/// `Parent` forwards `items` unchanged to `Child`. Its own result is the
+/// join of its two elements, so the child's memo is fresh at none of them
+/// there; through the grandparent element passing a new array, the child is
+/// probed under that element's value and the row names `App`.
+#[test]
+fn a_forwarded_prop_is_fresh_through_the_grandparents_element() {
+    use reactant::rules::{AlwaysUnstableDeps, Rule};
+    let src = |second: &str| {
+        format!(
+            r#"
+import {{ useMemo }} from "react";
+const STABLE = [1, 2];
+function Child({{ items }}) {{
+  const total = useMemo(() => items.length, [items]);
+  return <div>{{total}}</div>;
+}}
+function Parent({{ items }}) {{
+  return <Child items={{items}} />;
+}}
+export function App() {{
+  return <div><Parent items={{{second}}} /><Parent items={{STABLE}} /></div>;
+}}
+"#
+        )
+    };
+    let messages = |src: &str| {
+        let result = parse_and_analyze(src);
+        AlwaysUnstableDeps
+            .check(&RuleCtx::new(
+                &result,
+                result.component_named("Child").unwrap(),
+            ))
+            .into_iter()
+            .map(|d| d.message)
+            .collect::<Vec<_>>()
+    };
+    let fresh = messages(&src("[1, 2, 3]"));
+    assert_eq!(fresh.len(), 1, "{fresh:?}");
+    assert!(fresh[0].contains("`<App>`"), "{fresh:?}");
+    assert!(messages(&src("STABLE")).is_empty());
+}
