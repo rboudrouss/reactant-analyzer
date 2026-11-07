@@ -547,3 +547,44 @@ fn a_member_keeps_the_value_its_literal_puts_there_in_this_pass() {
     );
     assert_eq!(d.len(), 2, "{d:?}");
 }
+
+#[test]
+fn a_spread_in_deps_is_judged_by_its_elements() {
+    // #272: React compares the elements a spread supplies, never its source.
+    // A fresh array of the caller's deps (`Array.isArray(d) ? d : []`) is no
+    // fresh dep; an array the heap places, whose element is a new object at
+    // every render, is.
+    let opaque = hits(
+        r#"
+        import { useCallback } from "react";
+        function C({ d, store }) {
+            const deps = Array.isArray(d) ? d : [];
+            const cb = useCallback(() => store.get(), [...deps, store]);
+            return <div onClick={cb}/>;
+        }
+        "#,
+    );
+    assert_eq!(opaque, 0, "the source array is not compared");
+    let empty = hits(
+        r#"
+        import { useMemo } from "react";
+        function C() {
+            const deps = [];
+            const v = useMemo(() => 1, [...deps]);
+            return <div>{v}</div>;
+        }
+        "#,
+    );
+    assert_eq!(empty, 0, "a fresh empty array supplies no element");
+    let fresh = hits(
+        r#"
+        import { useMemo } from "react";
+        function C() {
+            const deps = [{ a: 1 }];
+            const v = useMemo(() => 1, [...deps]);
+            return <div>{v}</div>;
+        }
+        "#,
+    );
+    assert_eq!(fresh, 1, "its one element is a new object every render");
+}

@@ -493,6 +493,26 @@ pub fn dep_is_fresh(
         .is_unstable_reference_only()
 }
 
+/// Is a spread `[...src]` in a deps list a new reference at every render?
+/// React compares the elements it supplies, never `src` (#272): it is when
+/// every array the heap places `src` at holds an element that is one. A
+/// source the heap does not place, or that may hold elements no entry says,
+/// answers nothing.
+fn spread_is_fresh(src: &Expr, env: &AbstractEnv<StateValue>, heap: &Heap) -> bool {
+    let Some(sites) = crate::domains::stores::resolve_locs(src, env, heap) else {
+        return false;
+    };
+    !sites.open
+        && !sites.ids.is_empty()
+        && sites.ids.iter().all(|id| match heap.get(*id) {
+            Some(crate::domains::HeapValue::Obj(obj)) if !obj.is_open() => obj
+                .named
+                .values()
+                .any(|ev| ev.as_val().is_unstable_reference_only()),
+            _ => false,
+        })
+}
+
 /// Every effect, memo and callback of `result` with a written deps list
 /// that holds a dep [`dep_is_fresh`], and the indices of those deps.
 pub fn fresh_deps(result: &AnalysisResult<StateValue>) -> FreshDeps {
@@ -515,7 +535,10 @@ pub fn fresh_deps(result: &AnalysisResult<StateValue>) -> FreshDeps {
             .as_slice()
             .iter()
             .enumerate()
-            .filter(|(_, dep)| {
+            .filter(|(i, dep)| {
+                if list.spread_at.contains(i) {
+                    return spread_is_fresh(dep, &env, &heap);
+                }
                 dep_is_fresh(
                     result.component,
                     dep,
