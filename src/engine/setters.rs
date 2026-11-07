@@ -577,6 +577,36 @@ impl<'a> ConvergedFns<'a> {
             })
             .unwrap_or(&[])
     }
+    /// The argument, and its timing, a call through `fn_` runs at a time the
+    /// package-hook table gives, when `fn_` is a member of a package hook's
+    /// result: `form.register`, or `register` destructured off it. Both names
+    /// on the way must be certainly bound — once, in the render, and by no
+    /// other body ([`must_binding`](crate::ir::bindings::must_binding)).
+    fn result_member_timing(&self, fn_: &Expr) -> Option<(usize, ArgTiming)> {
+        use crate::ir::bindings::must_binding;
+        let member = match fn_.peel_ts() {
+            m @ Expr::FieldAccess { .. } => m,
+            v @ Expr::Var(_) => must_binding(v, self.render, &self.scopes)?,
+            _ => return None,
+        };
+        let Expr::FieldAccess { obj, field } = member.peel_ts() else {
+            return None;
+        };
+        let Expr::HookMarker(label, _) = must_binding(obj, self.render, &self.scopes)?.peel_ts()
+        else {
+            return None;
+        };
+        self.hooks.iter().find_map(|h| match h {
+            HookEntry::Custom {
+                label: l,
+                name,
+                import_source: Some(src),
+                ..
+            } if l == label => crate::engine::timing::result_member(src, name, field),
+            _ => None,
+        })
+    }
+
     /// The timing the package-hook table gives argument `i` of the left hook
     /// at `label`, `None` when it gives none.
     fn arg_timing(&self, label: HookLabel, i: usize) -> Option<ArgTiming> {
@@ -2905,8 +2935,15 @@ impl<'a> SetterWalk<'a> {
             if crate::engine::registrations::is_teardown(fn_) {
                 return;
             }
+            // A member of a package hook's result the timing table knows
+            // (`register(name, { onChange })`) runs that argument at its time.
+            let member = self.converged.and_then(|c| c.result_member_timing(fn_));
             for (i, arg) in args.iter().enumerate() {
                 if reified && i == 1 {
+                    continue;
+                }
+                if let Some((_, timing)) = member.filter(|(at, _)| *at == i) {
+                    self.timed_arg(arg, Some(timing), depth, found, prov, stmt_span);
                     continue;
                 }
                 let class = if listener && i == 1 {
@@ -2937,19 +2974,7 @@ impl<'a> SetterWalk<'a> {
         {
             for (i, arg) in c.left_args(*label).iter().enumerate() {
                 let timing = c.arg_timing(*label, i);
-                // An options literal: each member at the time the table
-                // gives it, ⊤ for the rest.
-                if let Some(t @ ArgTiming::Members(_)) = timing
-                    && let Expr::ObjectLit { fields, .. } = arg.peel_ts()
-                {
-                    for (name, val) in fields {
-                        let class = self.timing_class(t.member(name));
-                        self.callback_arg(val, class, None, depth, found, prov, stmt_span);
-                    }
-                    continue;
-                }
-                let class = self.timing_class(timing);
-                self.callback_arg(arg, class, None, depth, found, prov, stmt_span);
+                self.timed_arg(arg, timing, depth, found, prov, stmt_span);
             }
         }
         // A JSX prop React or the child may invoke runs as a listener, the
@@ -3069,6 +3094,31 @@ impl<'a> SetterWalk<'a> {
     /// A listener's class: `Handler`, or ⊤ in a program that dispatches
     /// events itself, where it may run synchronously in the dispatching body
     /// ([`Timing::in_program`](crate::engine::registrations::Timing::in_program), #219).
+    /// Walk an argument the timing table times `timing` (⊤ when `None`): an
+    /// options literal member by member, each at the time the table gives
+    /// it, ⊤ for the rest.
+    fn timed_arg(
+        &mut self,
+        arg: &'a Expr,
+        timing: Option<ArgTiming>,
+        depth: usize,
+        found: &mut Found,
+        prov: Option<BlockId>,
+        stmt_span: Option<SourceRange>,
+    ) {
+        if let Some(t @ ArgTiming::Members(_)) = timing
+            && let Expr::ObjectLit { fields, .. } = arg.peel_ts()
+        {
+            for (name, val) in fields {
+                let class = self.timing_class(t.member(name));
+                self.callback_arg(val, class, None, depth, found, prov, stmt_span);
+            }
+            return;
+        }
+        let class = self.timing_class(timing);
+        self.callback_arg(arg, class, None, depth, found, prov, stmt_span);
+    }
+
     /// The class a package hook's argument timed `timing` runs in
     /// ([`crate::engine::timing`]); ⊤ for an untimed one, and for an options
     /// object handed whole.

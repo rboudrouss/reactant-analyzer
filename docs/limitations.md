@@ -75,7 +75,11 @@ that writes it (see *Cross-file limits*).
   `swr`'s `useSWR` and `@tanstack/react-query`'s `useMutation` are deferred, and
   `react-dropzone`'s drag and drop callbacks are listeners. `@tanstack/react-table`'s `on…Change`
   run in any call of a table API, during a render included, and keep the unknown timing, as does
-  any other member and an options object handed by name. A
+  any other member and an options object handed by name. A callback handed to a member of such a
+  hook's result is timed the same way when the member is certainly that result's (`form.register`,
+  or `register` destructured once off it): `react-hook-form`'s `register(name, { onChange, onBlur
+  })` runs them as listeners, and `useMutation().mutate(vars, { onSuccess, … })` and
+  `useSWRMutation().trigger(arg, { … })` defer their response callbacks. A
   closure reached through a
   local function's parameter (`const f = (g) => g(); f(() => setN(1))`) or an array method's
   callback parameter (`fs.forEach((f) => f())`, the parameter being the array's entries) runs

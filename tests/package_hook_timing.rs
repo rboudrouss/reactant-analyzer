@@ -233,6 +233,80 @@ fn a_debounced_callback_that_may_run_synchronously_keeps_unknown_timing() {
     }
 }
 
+const MEMBERS: &str = r#"
+import { useState } from "react";
+import { useForm } from "react-hook-form";
+import { useMutation } from "@tanstack/react-query";
+import { useForm as useOtherForm } from "other-form";
+
+export function Registered() {
+  const [a, setA] = useState(0);
+  const { register } = useForm();
+  return <input {...register("x", { onChange: () => setA(1) })} />;
+}
+
+export function RegisteredThroughResult() {
+  const [a, setA] = useState(0);
+  const form = useForm();
+  return <input {...form.register("x", { onBlur: () => setA(1) })} />;
+}
+
+export function MutatedInRender() {
+  const [a, setA] = useState(0);
+  const m = useMutation({ mutationFn: send });
+  m.mutate(1, { onSuccess: () => setA(1) });
+  return <p>{a}</p>;
+}
+
+export function RegisteredValidate() {
+  const [a, setA] = useState(0);
+  const { register } = useForm();
+  return <input {...register("x", { validate: () => setA(1) })} />;
+}
+
+export function OtherRegister() {
+  const [a, setA] = useState(0);
+  const { register } = useOtherForm();
+  return <input {...register("x", { onChange: () => setA(1) })} />;
+}
+
+export function RegisterRebound() {
+  const [a, setA] = useState(0);
+  let { register } = useForm();
+  if (a) register = other;
+  return <input {...register("x", { onChange: () => setA(1) })} />;
+}
+"#;
+
+#[test]
+fn a_callback_handed_to_a_member_of_a_hook_result_runs_at_its_time() {
+    let r = parse_and_analyze(MEMBERS);
+    for name in ["Registered", "RegisteredThroughResult"] {
+        assert!(setter_in_render(&r, name).is_empty(), "{name}");
+        assert_eq!(phases(comp(&r, name)), vec![WriterPhase::Handler], "{name}");
+    }
+    assert!(setter_in_render(&r, "MutatedInRender").is_empty());
+    assert_eq!(
+        phases(comp(&r, "MutatedInRender")),
+        vec![WriterPhase::Deferred]
+    );
+}
+
+#[test]
+fn a_member_the_table_does_not_name_or_cannot_certify_keeps_unknown_timing() {
+    // `validate` runs when the library validates, which a `trigger()` may ask
+    // for at any time; another package's `register` proves nothing; a name
+    // bound twice is not certainly the member.
+    let r = parse_and_analyze(MEMBERS);
+    for name in ["RegisteredValidate", "OtherRegister", "RegisterRebound"] {
+        assert_eq!(
+            setter_in_render(&r, name),
+            vec![Severity::Warning],
+            "{name}"
+        );
+    }
+}
+
 #[test]
 fn a_click_outside_handler_is_a_listener() {
     let r = parse_and_analyze(SRC);

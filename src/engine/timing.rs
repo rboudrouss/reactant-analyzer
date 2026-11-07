@@ -88,6 +88,31 @@ const DROPZONE: ArgTiming = Members(&[
     ("onFileDialogCancel", Listener),
 ]);
 
+/// `register`'s field callbacks, which the field's own DOM listeners run.
+const REGISTER: ArgTiming = Members(&[("onChange", Listener), ("onBlur", Listener)]);
+
+/// The argument a call of member `member` of the result of `hook`, imported
+/// from `import_source`, runs at a time the table knows, with that time.
+///
+/// - `react-hook-form`'s `register(name, { onChange, onBlur })`: the field's
+///   change and blur listeners run them. `handleSubmit` is not here: the
+///   library summary names it a wrapper, and the walk reads it as one.
+/// - `@tanstack/react-query`'s `useMutation().mutate(vars, { onSuccess, … })`
+///   and `swr`'s `useSWRMutation().trigger(arg, { … })`: the response
+///   callbacks of that one call, deferred as the hook's own are.
+pub(crate) fn result_member(
+    import_source: &str,
+    hook: &str,
+    member: &str,
+) -> Option<(usize, ArgTiming)> {
+    match (import_source, hook, member) {
+        ("react-hook-form", "useForm" | "useFormContext", "register") => Some((1, REGISTER)),
+        ("@tanstack/react-query", "useMutation", "mutate" | "mutateAsync") => Some((1, RESPONSE)),
+        ("swr/mutation", "useSWRMutation", "trigger") => Some((1, RESPONSE)),
+        _ => None,
+    }
+}
+
 /// The timing of every argument of every hook of `hooks` the expansion left,
 /// by label: `None` for an argument the table does not time.
 pub(crate) fn left_hook_args(
