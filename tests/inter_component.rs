@@ -1362,3 +1362,43 @@ fn missing_deps_inter_specific_fp_suppression() {
         );
     }
 }
+
+// ── #270: a child's write into a prop ref ─────────────────────────────────────
+
+/// The parent hands its ref to a child, which stores a closure over the
+/// parent's setter in `current` (in render or in an effect); the parent's
+/// effect calls it after every commit. The objects a child's props reach are
+/// the parent's, so what the child wrote there is in the parent's heap, and
+/// the call is a write of the parent's slot. Never called, it writes nothing.
+#[test]
+fn a_childs_write_into_a_prop_ref_reaches_the_parents_ref() {
+    let src = |child_body: &str, parent_effect: &str| {
+        format!(
+            r#"
+import {{ useEffect, useRef, useState }} from "react";
+function Child({{ cbRef, n, onTick }}) {{
+  {child_body}
+  return <div>{{n}}</div>;
+}}
+export function App() {{
+  const [n, setN] = useState(0);
+  const ref = useRef(() => {{}});
+  {parent_effect}
+  return <Child cbRef={{ref}} n={{n}} onTick={{setN}} />;
+}}
+"#
+        )
+    };
+    let calls = "useEffect(() => { ref.current(); });";
+    for child in [
+        "cbRef.current = () => onTick(n + 1);",
+        "useEffect(() => { cbRef.current = () => onTick(n + 1); });",
+    ] {
+        assert!(
+            !loop_messages(&src(child, calls), "App").is_empty(),
+            "`{child}`: the parent's effect runs the child's closure"
+        );
+    }
+    let never = src("cbRef.current = () => onTick(n + 1);", "");
+    assert!(loop_messages(&never, "App").is_empty());
+}

@@ -336,6 +336,10 @@ pub(crate) struct SetterProp {
     /// Reached through a closure that captured the setter: calling the name
     /// runs the closure, whose argument is not the one the setter stores.
     pub closure: bool,
+    /// The component whose closure it is, when `closure`: a child's closure
+    /// a prop ref brings back (#270) names the child's bindings, so a walk
+    /// of this component cannot enter it.
+    pub closure_owner: Option<ComponentId>,
 }
 
 /// One slot a write through a name may land in ([`collect_slot_writers`]).
@@ -801,13 +805,17 @@ fn setter_of(ev: &EnvVal<StateValue>, heap: &Heap) -> Vec<SetterProp> {
             label,
             must_write: val.surely_setter(),
             closure: false,
+            closure_owner: None,
         })
         .collect();
     let mut ids: Vec<_> = ev.locs().into_iter().flatten().copied().collect();
     ids.sort();
     for id in ids {
         if let Some(HeapValue::Fn {
-            captured, body_cfg, ..
+            captured,
+            body_cfg,
+            owner,
+            ..
         }) = heap.get(id)
         {
             let mut caps: Vec<_> = captured.iter().collect();
@@ -821,6 +829,7 @@ fn setter_of(ev: &EnvVal<StateValue>, heap: &Heap) -> Vec<SetterProp> {
                     label: *label,
                     must_write: !open && body_writes(body_cfg, name),
                     closure: true,
+                    closure_owner: Some(*owner),
                 });
             }
         }
@@ -940,9 +949,10 @@ pub(crate) fn cross_component_setters(
 /// The setters a call through each name or member path of `comp` may write,
 /// read off the converged values: another component's setter, or this one's
 /// when the value is the setter itself — `t[1]`, `api.setV`, a member a
-/// nested or memoized destructuring reads (#216, #233). A closure over an own
-/// setter is not one: its body is walked instead. The writer relation and
-/// `setter-in-render` read the same table.
+/// nested or memoized destructuring reads (#216, #233). A closure of this
+/// component over an own setter is not one: its body is walked instead. A
+/// child's closure over it, which a prop ref brings back, is (#270). The
+/// writer relation and `setter-in-render` read the same table.
 pub(crate) fn converged_call_targets(
     converged: &HashMap<Var, Vec<SetterProp>>,
     component: ComponentId,
@@ -952,7 +962,7 @@ pub(crate) fn converged_call_targets(
         .filter_map(|(v, props)| {
             let targets: Vec<SetterProp> = props
                 .iter()
-                .filter(|p| p.component != component || !p.closure)
+                .filter(|p| p.component != component || p.closure_owner != Some(component))
                 .cloned()
                 .collect();
             (!targets.is_empty()).then(|| (v.clone(), targets))

@@ -646,9 +646,49 @@ fn eval_comp_app(
     let cache_key = props_cache_key(&abstract_props, &props_heap);
     record_call_site(inter, child, abstract_props, span);
     record_site_input(inter, child, span, &abstract_props_full, &props_heap);
+    let passed: Vec<ExprId> = props_heap.iter().map(|(id, _)| *id).collect();
+    run_child(
+        inter,
+        child,
+        &child_ir,
+        &cache_key,
+        abstract_props_full,
+        props_heap,
+    );
+    flow_back(inter, child, &passed, ctx);
+}
 
+/// What the child wrote into the objects its props reach — a closure stored
+/// in a prop ref's `current` (#270) — is in those objects here too: they are
+/// this component's, the child only received them. The child's analysis
+/// under the join of every call site's input is in `results`, analysed now
+/// or by an earlier site.
+fn flow_back(
+    inter: &crate::domains::InterCtx<'_>,
+    child: ComponentId,
+    passed: &[ExprId],
+    ctx: &mut AnalysisCtx<StateValue>,
+) {
+    let results = inter.results.borrow();
+    let Some(result) = results.get(&child) else {
+        return;
+    };
+    let back = result.heap.reachable(passed.iter().copied());
+    *ctx.heap = ctx.heap.join(&back);
+}
+
+/// Analyse `child` under this element's input, unless the cache or the
+/// stored join of every call site's input already covers it.
+fn run_child(
+    inter: &crate::domains::InterCtx<'_>,
+    child: ComponentId,
+    child_ir: &crate::ir::ComponentIR,
+    cache_key: &HashMap<Symbol, StateValue>,
+    abstract_props_full: HashMap<Symbol, EnvVal<StateValue>>,
+    props_heap: Heap,
+) {
     // Cache lookup (strict equality)
-    if inter.cache.borrow().contains(child, &cache_key) {
+    if inter.cache.borrow().contains(child, cache_key) {
         inter.stats.borrow_mut().cache_hits += 1;
         return;
     }
@@ -678,11 +718,11 @@ fn eval_comp_app(
         return;
     };
 
-    let child_result = inter.child(child).analyze_under(&child_ir, input);
+    let child_result = inter.child(child).analyze_under(child_ir, input);
 
     // Store result in the program-level results map and cache
     inter.results.borrow_mut().insert(child, child_result);
-    inter.cache.borrow_mut().insert(child, cache_key);
+    inter.cache.borrow_mut().insert(child, cache_key.clone());
 }
 
 /// Join one evaluation of an element into what it hands its child
