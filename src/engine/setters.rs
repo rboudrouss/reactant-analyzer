@@ -583,6 +583,22 @@ impl<'a> ConvergedFns<'a> {
             .map(Vec::as_slice)
     }
 
+    /// The closures held under the members of the object at `path`, at any
+    /// depth (`opts.onRun`, `opts.cbs.0`): what handing that object over
+    /// hands along with it (#264).
+    fn member_bodies(&self, path: &str) -> Vec<&Arc<CFG>> {
+        let prefix = format!("{path}.");
+        let mut paths: Vec<&Var> = self.fns.keys().filter(|p| p.starts_with(&prefix)).collect();
+        paths.sort();
+        let mut bodies: Vec<&Arc<CFG>> = Vec::new();
+        for b in paths.into_iter().flat_map(|p| &self.fns[p]) {
+            if !bodies.iter().any(|k| Arc::ptr_eq(k, b)) {
+                bodies.push(b);
+            }
+        }
+        bodies
+    }
+
     /// A call of `fn_` surely runs `body`: the table has no other closure
     /// for it, and the callee is certainly bound to that literal.
     fn certain(&self, fn_: &Expr, body: &Arc<CFG>) -> bool {
@@ -2928,11 +2944,69 @@ impl<'a> SetterWalk<'a> {
                 self.path.pop();
                 found.absorb(inner, body, class, placed, prov);
             }
+            // A function inside an argument object or array escapes with it
+            // (#254): the callee may call it at any time, or never (#264).
+            Expr::ObjectLit { fields, .. } => {
+                for (_, val) in fields {
+                    self.callback_arg(val, WalkClass::Unknown, None, depth, found, prov, stmt_span);
+                }
+            }
+            Expr::ArrayLit { elems, .. } => {
+                for elem in elems {
+                    self.callback_arg(
+                        elem,
+                        WalkClass::Unknown,
+                        None,
+                        depth,
+                        found,
+                        prov,
+                        stmt_span,
+                    );
+                }
+            }
             // A path the converged values point at closures of this
             // component (`setTimeout(api.inc)`, #239): each runs in the
             // argument's class, at this call only when it is a callback the
-            // receiver surely runs.
-            _ => self.converged_bodies(arg, class, placed, depth, found, prov, stmt_span),
+            // receiver surely runs. The closures the object at that path
+            // holds escape with it, as an argument literal's do.
+            _ => {
+                self.converged_bodies(arg, class, placed, depth, found, prov, stmt_span);
+                self.member_bodies(arg, depth, found, prov, stmt_span);
+            }
+        }
+    }
+
+    /// Walk the closures of this component held under the members of the
+    /// object the converged values put behind `arg`, a name or member path
+    /// handed to a callee (`useRun(opts)`, #264): it may call any of them, at
+    /// any time.
+    fn member_bodies(
+        &mut self,
+        arg: &Expr,
+        depth: usize,
+        found: &mut Found,
+        prov: Option<BlockId>,
+        stmt_span: Option<SourceRange>,
+    ) {
+        let Some(converged) = self.converged.filter(|_| depth > 0) else {
+            return;
+        };
+        let Some(name) = callee_path(arg).filter(|n| !self.fn_bindings.contains_key(n)) else {
+            return;
+        };
+        for body in converged.member_bodies(&name) {
+            let mut inner = Found::default();
+            self.path.push(name.clone());
+            self.cfg(
+                body,
+                depth - 1,
+                &mut inner,
+                WalkClass::Sync,
+                prov,
+                stmt_span,
+            );
+            self.path.pop();
+            found.absorb(inner, body, WalkClass::Unknown, None, prov);
         }
     }
 

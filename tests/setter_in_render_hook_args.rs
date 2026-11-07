@@ -240,3 +240,67 @@ fn a_closure_handed_to_a_left_hook_or_an_unknown_callee_may_write_in_render() {
     assert!(!unknown_render_write(comp(&r, "LeftHookNoClosure")));
     assert!(setter_in_render(&r, "LeftHookNoClosure").is_empty());
 }
+
+const MEMBERS: &str = r#"
+import { useState } from "react";
+import { useExternal, runIt } from "some-lib";
+
+export function LeftHookObject() {
+  const [a, setA] = useState(0);
+  useExternal({ label: "x", onRun: () => setA(a + 1) });
+  return <p>{a}</p>;
+}
+
+export function LeftHookArray() {
+  const [a, setA] = useState(0);
+  useExternal([() => setA(a + 1)]);
+  return <p>{a}</p>;
+}
+
+export function UnknownCalleeNested() {
+  const [a, setA] = useState(0);
+  runIt({ cbs: [() => setA(a + 1)] });
+  return <p>{a}</p>;
+}
+
+export function LeftHookNamedObject() {
+  const [a, setA] = useState(0);
+  const opts = { onRun: () => setA(a + 1) };
+  useExternal(opts);
+  return <p>{a}</p>;
+}
+
+export function LeftHookObjectNoClosure() {
+  const [a, setA] = useState(0);
+  const bump = () => setA(a + 1);
+  useExternal({ label: "x", count: a });
+  return <p onClick={bump}>{a}</p>;
+}
+"#;
+
+#[test]
+fn a_closure_inside_an_argument_object_or_array_may_write_in_render() {
+    // #264: the fixpoint escapes every closure an argument reaches (#254);
+    // the walk entered a function argument, not one held by an argument
+    // object or array, at one level or nested, literal or bound to a name.
+    let r = parse_and_analyze(MEMBERS);
+    for name in [
+        "LeftHookObject",
+        "LeftHookArray",
+        "UnknownCalleeNested",
+        "LeftHookNamedObject",
+    ] {
+        assert!(
+            unknown_render_write(comp(&r, name)),
+            "{name}: the callee may call a closure the argument holds at any time: {:?}",
+            comp(&r, name).slot_writers
+        );
+        assert_eq!(
+            setter_in_render(&r, name),
+            vec![Severity::Warning],
+            "{name}: a possible render write, never a certain one"
+        );
+    }
+    assert!(!unknown_render_write(comp(&r, "LeftHookObjectNoClosure")));
+    assert!(setter_in_render(&r, "LeftHookObjectNoClosure").is_empty());
+}

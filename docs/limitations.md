@@ -60,9 +60,9 @@ that writes it (see *Cross-file limits*).
   Warning, and its writes can mask the in-cycle growth a widening claim reads, as a handler's do
   [#19](https://github.com/rboudrouss/reactant-analyzer/issues/19). The writer relation reads one
   the render hands to such a callee or hook — a literal, or a name bound to one or to a
-  `useCallback` value — as a possible render write
-  [#262](https://github.com/rboudrouss/reactant-analyzer/issues/262); one held by an object the
-  render hands over (`useTable({ onClick: () => setN(1) })`) is not read there. React's
+  `useCallback` value, or one held by an object or array it hands over — as a possible render write
+  [#262](https://github.com/rboudrouss/reactant-analyzer/issues/262),
+  [#264](https://github.com/rboudrouss/reactant-analyzer/issues/264). React's
   `useEffectEvent` is the exception: its argument — a literal, or a name bound to one or to a
   `useCallback` value — runs where a name bound once to the function it hands back is called, as a
   `useCallback` value does; the value itself stays opaque, so a call through it React would reject
