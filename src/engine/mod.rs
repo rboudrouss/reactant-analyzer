@@ -19,6 +19,7 @@ pub mod root_detector;
 pub mod seeds;
 pub mod setters;
 pub mod symbol_graph;
+pub mod timing;
 pub mod triggers;
 pub mod written;
 

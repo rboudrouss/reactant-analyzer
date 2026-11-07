@@ -16,6 +16,7 @@ use crate::{
     engine::{
         AnalysisResult,
         dominance::on_all_paths,
+        timing::ArgTiming,
         written::{self, ClosureEnv, SiteEnvs, Written},
     },
     ir::{
@@ -429,6 +430,9 @@ pub(crate) struct ConvergedFns<'a> {
     /// The `useEffectEvent` hooks whose value is bound to a name
     /// `callback_fns` holds: their argument runs where that name is called.
     called_events: Arc<HashSet<HookLabel>>,
+    /// The timing the package-hook table gives a left hook's arguments
+    /// ([`crate::engine::timing`]).
+    arg_timings: Arc<HashMap<HookLabel, Vec<Option<ArgTiming>>>>,
 }
 
 impl<'a> ConvergedFns<'a> {
@@ -465,6 +469,7 @@ impl<'a> ConvergedFns<'a> {
             hooks,
             callback_fns: Arc::new(callback_fns),
             called_events: Arc::new(called_events),
+            arg_timings: Arc::new(crate::engine::timing::left_hook_args(render, hooks)),
         }
     }
 
@@ -532,6 +537,7 @@ impl<'a> ConvergedFns<'a> {
             hooks: self.hooks,
             callback_fns: Arc::clone(&self.callback_fns),
             called_events: Arc::clone(&self.called_events),
+            arg_timings: Arc::clone(&self.arg_timings),
         }
     }
     /// The arguments of the hook at `label` when the expansion left it: the
@@ -551,6 +557,11 @@ impl<'a> ConvergedFns<'a> {
                 _ => None,
             })
             .unwrap_or(&[])
+    }
+    /// The timing the package-hook table gives argument `i` of the left hook
+    /// at `label`, `None` when it gives none.
+    fn arg_timing(&self, label: HookLabel, i: usize) -> Option<ArgTiming> {
+        *self.arg_timings.get(&label)?.get(i)?
     }
     /// The names bound once to a `useCallback` or a `useEffectEvent` value,
     /// with the body it runs: a call or an argument through one runs that
@@ -2856,11 +2867,16 @@ impl<'a> SetterWalk<'a> {
         // an unknown callee does: the fixpoint escapes them there (#254), and
         // a closure among them may run at any time (#262). What evaluating
         // one runs is a render statement ahead of the marker already (#193).
+        // A package hook the timing table knows runs it at that time instead.
         if let Expr::HookMarker(label, _) = expr
-            && let Some(args) = self.converged.map(|c| c.left_args(*label))
+            && let Some(c) = self.converged
         {
-            for arg in args {
-                let class = WalkClass::Unknown;
+            for (i, arg) in c.left_args(*label).iter().enumerate() {
+                let class = match c.arg_timing(*label, i) {
+                    Some(ArgTiming::Deferred) => WalkClass::Deferred,
+                    Some(ArgTiming::Listener) => self.listener_class(),
+                    None => WalkClass::Unknown,
+                };
                 self.callback_arg(arg, class, None, depth, found, prov, stmt_span);
             }
         }
