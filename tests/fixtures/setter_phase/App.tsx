@@ -1,5 +1,6 @@
 import { useCallback, useMemo, useState } from "react";
 import { compose } from "./util";
+import { runNow } from "some-pkg";
 
 // #130 — a setter call that is not in statement position. The write is real
 // and the walk classifies it Sync: `wrap`'s argument is evaluated at the call
@@ -83,6 +84,23 @@ export function MemoMountOnly() {
     return n;
   }, []);
   return <div>{m}</div>;
+}
+
+// One setter, two sites: the settling render write clears, and the closure a
+// callee with no timing summary receives still may run during render.
+export function SettledAndEscaped() {
+  const [n, setN] = useState(0);
+  if (n !== 1) setN(1);
+  runNow(() => setN(n + 1));
+  return <div>{n}</div>;
+}
+
+// The same with a timer write as the first site.
+export function DeferredAndEscaped() {
+  const [n, setN] = useState(0);
+  setTimeout(() => setN(1), 0);
+  runNow(() => setN(n + 1));
+  return <div>{n}</div>;
 }
 
 // A `useCallback` body does not run during render.

@@ -111,18 +111,20 @@ pub fn collect_setter_calls_with_extra(
     setter_vars: &HashSet<Var>,
     extra_fn_bindings: &HashMap<Var, Arc<CFG>>,
 ) -> Vec<SetterCall> {
-    setter_calls(cfg, setter_vars, extra_fn_bindings, None)
+    setter_calls(cfg, setter_vars, extra_fn_bindings, None, true)
 }
 
 /// `collect_setter_calls` that also runs the closures the converged values
 /// put behind a called path (`api.inc()`, #233): a write in one is a write of
-/// the call — the same table the writer relation walks.
-pub(crate) fn collect_setter_calls_converged(
+/// the call — the same table the writer relation walks. One row per call
+/// site, in walk order: a setter written at two sites is two facts, and a
+/// consumer that clears one site has not cleared the other.
+pub(crate) fn collect_setter_sites_converged(
     cfg: &CFG,
     setter_vars: &HashSet<Var>,
     converged: &ConvergedFns<'_>,
 ) -> Vec<SetterCall> {
-    setter_calls(cfg, setter_vars, &HashMap::new(), Some(converged))
+    setter_calls(cfg, setter_vars, &HashMap::new(), Some(converged), false)
 }
 
 fn setter_calls(
@@ -130,6 +132,7 @@ fn setter_calls(
     setter_vars: &HashSet<Var>,
     extra_fn_bindings: &HashMap<Var, Arc<CFG>>,
     converged: Option<&ConvergedFns<'_>>,
+    collapse: bool,
 ) -> Vec<SetterCall> {
     let mut fn_bindings = collect_fn_bindings(cfg);
     let callback_fns = converged
@@ -167,10 +170,21 @@ fn setter_calls(
     };
     walk.cfg(cfg, WALK_DEPTH, &mut found, WalkClass::Sync, None, None);
     let mut found = found.setters;
+    if !collapse {
+        return found
+            .into_iter()
+            .map(|site| SetterCall {
+                var: site.var,
+                span: site.span,
+                block_id: site.at.map(|(b, _)| b),
+                class: site.class.into(),
+            })
+            .collect();
+    }
     // Collapse to the historical one-row-per-var shape, preferring the sync
     // site: its block id serves dominance, where any other class records
     // `None`. The walk itself no longer collapses, so this is the one place
-    // the old granularity still exists — and the only consumer that wants it.
+    // the old granularity still exists.
     found.sort_by_key(|s| s.class); // WalkClass derives Ord with Sync first
     let mut by_var: HashMap<Var, (Option<SourceRange>, Option<BlockId>, WalkClass)> =
         HashMap::new();

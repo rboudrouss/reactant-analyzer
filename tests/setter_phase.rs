@@ -90,6 +90,20 @@ fn a_write_a_known_registrar_deferred_is_not_a_render_write() {
 }
 
 #[test]
+fn every_site_of_a_setter_is_judged_not_only_the_first() {
+    // The rule kept one site per setter, the most synchronous: a site it
+    // cleared — a settling guard, a timer — hid one it must report.
+    let out = report(PHASE);
+    for name in ["SettledAndEscaped", "DeferredAndEscaped"] {
+        let line = line_for(&out, name);
+        assert!(
+            line.contains("warn") && line.contains("no timing summary"),
+            "{name}: `runNow(() => setN(n + 1))` may run during render:\n{out}"
+        );
+    }
+}
+
+#[test]
 fn a_components_own_setter_is_not_a_parents_when_its_name_was_salted() {
     let out = report(IDENTITY);
     assert!(

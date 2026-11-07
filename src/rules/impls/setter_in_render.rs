@@ -8,7 +8,7 @@ use crate::ir::{
 };
 
 use crate::engine::guards::converges_once_written;
-use crate::engine::setters::{SetterCallPhase, SetterTargets};
+use crate::engine::setters::{SetterCall, SetterCallPhase, SetterTargets};
 use crate::engine::triggers::{Always, Rerun};
 use crate::engine::{Change, SlotWriter, WriterPhase, WriterRegion, triggers_of};
 use crate::ir::hooks::HookEntry;
@@ -130,13 +130,7 @@ impl SetterInRender {
             &comp_result.heap,
             component,
         );
-        crate::engine::setters::collect_setter_calls_converged(
-            &comp_result.render_cfg,
-            &all_setter_vars,
-            &converged,
-        )
-        .into_iter()
-        .filter_map(|call| {
+        let judge = |call: SetterCall| -> Option<Diagnostic> {
             // The walk classified when this write runs, and this rule is
             // the question "during the render pass?". A `Handler` or
             // `Deferred` row is a *proof* of no — a user event or a known
@@ -340,8 +334,30 @@ impl SetterInRender {
                 &ctx.names(&crate::rules::api::witness::fallback_name),
             );
             Some(d)
-        })
-        .collect()
+        };
+        // Every site is judged: a setter whose render-pass site settles may
+        // also be handed to a callee that runs it at any time. A setter is
+        // one finding, its first site, the synchronous ones first, that
+        // nothing clears.
+        let mut sites = crate::engine::setters::collect_setter_sites_converged(
+            &comp_result.render_cfg,
+            &all_setter_vars,
+            &converged,
+        );
+        sites.sort_by_key(|s| s.class != SetterCallPhase::Sync);
+        let mut reported: HashSet<Var> = HashSet::new();
+        let mut out = Vec::new();
+        for site in sites {
+            if reported.contains(&site.var) {
+                continue;
+            }
+            let var = site.var.clone();
+            if let Some(d) = judge(site) {
+                reported.insert(var);
+                out.push(d);
+            }
+        }
+        out
     }
 
     /// The writes of a `useMemo` body (#249): it runs during render, each time
