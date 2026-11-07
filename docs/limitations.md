@@ -364,6 +364,11 @@ carries an Error.
   (`if (!prev || prev !== next)`), and **arithmetic** on the compared value
   (`setIndex(Math.max(0, plans.length - 1))` under `index >= plans.length`)
   [#91](https://github.com/rboudrouss/reactant-analyzer/issues/91), [precision-log](precision-log.md#2026-09-02-a-write-that-settles-its-own-guard).
+  The proof holds for a slot's sole render-pass write only — two settling writes of one slot can
+  revive each other's guard — and reads a guard inside a callback the render runs synchronously
+  (`[1].forEach(() => { if (n !== 1) setN(1); })`) in the env of the callback's run
+  [#269](https://github.com/rboudrouss/reactant-analyzer/issues/269); a callback handed to a
+  callee with no timing summary keeps its Warning.
 - **A library hook's per-member contract is a table, not an inference.** `useForm()`, `useRouter()`
   and SWR's `mutate` have their stable members listed by name. A member that is not listed reads ⊤, so
   a library that adds one, or a library with no entry at all, keeps firing. `formState`, `data` and

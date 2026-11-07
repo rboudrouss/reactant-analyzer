@@ -103,6 +103,43 @@ export function DeferredAndEscaped() {
   return <div>{n}</div>;
 }
 
+// #269: a guarded write in a callback the render runs synchronously settles
+// as a direct one does.
+export function SyncCallbackSettles() {
+  const [n, setN] = useState(0);
+  [1].forEach(() => {
+    if (n !== 1) setN(1);
+  });
+  return <div>{n}</div>;
+}
+
+// The two-level form.
+export function NestedSyncCallbackSettles() {
+  const [n, setN] = useState(0);
+  [1].forEach(() => [2].forEach(() => {
+    if (n !== 1) setN(1);
+  }));
+  return <div>{n}</div>;
+}
+
+// A guard the write does not kill.
+export function SyncCallbackGrows() {
+  const [n, setN] = useState(0);
+  [1].forEach(() => {
+    if (n < 100) setN(n + 1);
+  });
+  return <div>{n}</div>;
+}
+
+// A callee with no timing summary runs the callback when it likes.
+export function EscapedCallbackGuard() {
+  const [n, setN] = useState(0);
+  runNow(() => {
+    if (n !== 1) setN(1);
+  });
+  return <div>{n}</div>;
+}
+
 // A `useCallback` body does not run during render.
 export function CallbackBody() {
   const [n, setN] = useState(0);

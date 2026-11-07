@@ -109,6 +109,21 @@ fn every_site_of_a_setter_is_judged_not_only_the_first() {
 }
 
 #[test]
+fn a_guard_inside_a_sync_callback_the_render_runs_is_read_by_the_settling_proof() {
+    // #269: the guard is the callback's, read where the callback runs.
+    let out = report(PHASE);
+    for name in ["SyncCallbackSettles", "NestedSyncCallbackSettles"] {
+        assert!(!out.contains(name), "{name} settles:\n{out}");
+    }
+    assert!(line_for(&out, "SyncCallbackGrows").contains("setter-in-render"));
+    let line = line_for(&out, "EscapedCallbackGuard");
+    assert!(
+        line.contains("warn") && line.contains("no timing summary"),
+        "an escaped callback's guard may read a stale value:\n{out}"
+    );
+}
+
+#[test]
 fn a_components_own_setter_is_not_a_parents_when_its_name_was_salted() {
     let out = report(IDENTITY);
     assert!(

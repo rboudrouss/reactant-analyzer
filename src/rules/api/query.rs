@@ -596,6 +596,7 @@ pub fn must_setter_on_all_paths(
         // The scan above reads statements of `cfg` itself, never a nested
         // body, so every site it can find runs when `cfg` runs.
         class: crate::engine::setters::SetterCallPhase::Sync,
+        own: None,
     };
 
     // must_in[B] = ∧ must_out[preds]; must_out[B] = must_in[B] ∨ called_in[B].

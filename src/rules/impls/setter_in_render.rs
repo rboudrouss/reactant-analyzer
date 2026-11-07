@@ -10,6 +10,7 @@ use crate::ir::{
 use crate::engine::guards::converges_once_written;
 use crate::engine::setters::{SetterCall, SetterCallPhase, SetterTargets};
 use crate::engine::triggers::{Always, Rerun};
+use crate::engine::written::{ClosureEnv, SiteEnvs};
 use crate::engine::{Change, SlotWriter, WriterPhase, WriterRegion, triggers_of};
 use crate::ir::hooks::HookEntry;
 use crate::rules::helpers::eval_in_exit_env;
@@ -130,6 +131,10 @@ impl SetterInRender {
             &comp_result.heap,
             component,
         );
+        // The runs of the closures the render reaches (#246), made once and
+        // only when a site inside one needs them.
+        let exit = comp_result.exit_env();
+        let closures = std::cell::OnceCell::new();
         let judge = |call: SetterCall| -> Option<Diagnostic> {
             // The walk classified when this write runs, and this rule is
             // the question "during the render pass?". A `Handler` or
@@ -221,6 +226,32 @@ impl SetterInRender {
                     Some(arg),
                     &comp_result.exit_env(),
                     &mut |e| eval_in_exit_env(e, comp_result),
+                )
+            {
+                return None;
+            }
+            // A guarded write in a closure the render runs synchronously
+            // (`[1].forEach(() => { if (n !== 1) setN(1); })`) settles as a
+            // direct one does: its guards are the closure's own, read in the
+            // env of every run of it the closure runs make (#269). A write
+            // the walk could not prove synchronous keeps its row.
+            if proof.is_none()
+                && call.class == SetterCallPhase::Sync
+                && let Some((body, bid)) = call.own
+                && body != std::ptr::from_ref(&comp_result.render_cfg) as usize
+                && let Some(label) = local_setter_info.sole(&call.var)
+                && sole_render_writer(result, component, label)
+                && settles_in_closure(
+                    comp_result,
+                    closures.get_or_init(|| {
+                        SiteEnvs::of(comp_result, &exit)
+                            .closure_envs(&comp_result.render_cfg, &comp_result.hooks)
+                    }),
+                    (body, bid),
+                    &call.var,
+                    label,
+                    &state_vals,
+                    &members,
                 )
             {
                 return None;
@@ -495,6 +526,60 @@ fn unknown_phase_message(names: &crate::ir::SourceNames, var: &Var) -> String {
 }
 
 /// First argument of the top-level `setter(arg)` call in block `bid`, if any.
+/// The write of `setter` at `site` — a block of a closure body, by pointer
+/// identity — settles in every run of that closure: its guards there die once
+/// its value, read in the run's env, sits in slot `label`
+/// ([`converges_once_written`]). No run, no proof.
+#[allow(clippy::too_many_arguments)]
+fn settles_in_closure(
+    comp: &crate::engine::AnalysisResult<crate::domains::StateValue>,
+    (closures, heap): &(Vec<ClosureEnv<'_>>, crate::domains::stores::Heap),
+    (body, block): (usize, BlockId),
+    setter: &Var,
+    label: HookLabel,
+    slots: &HashMap<Var, crate::engine::guards::SlotPath>,
+    members: &crate::engine::guards::MemberWrites<'_>,
+) -> bool {
+    let runs: Vec<&ClosureEnv<'_>> = closures
+        .iter()
+        .filter(|c| std::ptr::from_ref(c.body) as usize == body)
+        .collect();
+    let Some(cfg) = runs.first().map(|c| c.body) else {
+        return false;
+    };
+    let Some(arg) = setter_call_arg(cfg, block, setter) else {
+        return false;
+    };
+    runs.iter().all(|c| {
+        let Some(exit) = crate::domains::interp::exit_env_of(c.body, &c.exits) else {
+            return false;
+        };
+        let mut heap = heap.clone();
+        let mut eval = |e: &Expr| {
+            crate::engine::eval::eval_in_stores(
+                e,
+                &exit,
+                comp.component,
+                &comp.state_store,
+                &comp.memo_store,
+                &mut heap,
+            )
+        };
+        let written = eval(arg);
+        converges_once_written(
+            cfg,
+            block,
+            slots,
+            members,
+            label,
+            &written,
+            Some(arg),
+            &exit,
+            &mut eval,
+        )
+    })
+}
+
 /// Slot `label` of `component` has exactly one write that may run in a
 /// render pass — of its own render or memo bodies, or of another component's
 /// (a prop) — in the writer relation.

@@ -44,6 +44,11 @@ pub struct SetterCall {
     /// can now tell an effect-body write from one only a keydown reaches
     /// (ADR-034 §4, #93). It used to be computed and thrown away.
     pub class: SetterCallPhase,
+    /// The body the call sits in (pointer identity) and its block there,
+    /// when that body runs it synchronously: the render CFG for a direct
+    /// call, a callback's for one the render runs (#269). `None` from the
+    /// collapsed walks.
+    pub(crate) own: Option<(usize, BlockId)>,
 }
 
 /// The externally-visible half of the walk's phase classification. A subset:
@@ -157,6 +162,7 @@ fn setter_calls(
         converged: converged.as_ref(),
         walking: HashSet::new(),
         root: cfg as *const CFG as usize,
+        body: cfg as *const CFG as usize,
         effect_body: false,
         dispatches: false,
         shadowed: &empty,
@@ -178,6 +184,7 @@ fn setter_calls(
                 span: site.span,
                 block_id: site.at.map(|(b, _)| b),
                 class: site.class.into(),
+                own: site.own,
             })
             .collect();
     }
@@ -200,6 +207,7 @@ fn setter_calls(
             span,
             block_id,
             class: class.into(),
+            own: None,
         })
         .collect()
 }
@@ -280,6 +288,7 @@ pub(crate) fn collect_write_sites(
         converged: Some(converged),
         walking: HashSet::new(),
         root: cfg as *const CFG as usize,
+        body: cfg as *const CFG as usize,
         effect_body,
         dispatches,
         shadowed,
@@ -2082,6 +2091,9 @@ struct SetterWalk<'a> {
     /// The walk's outermost CFG (pointer identity) — where effect cleanup
     /// returns and reified listeners are recognized.
     root: usize,
+    /// The CFG the walk is in (pointer identity), the root or a body it
+    /// descended into.
+    body: usize,
     /// The walked root is an effect body: its top-level `addEventListener`
     /// listeners were reified as Handler entries (`extract_subscriptions`),
     /// and its returned function is its cleanup.
@@ -2284,6 +2296,10 @@ struct FoundSite {
     /// site inside a nested body records a block of *that* body's CFG, and
     /// `BlockId` is per-CFG.
     at: Option<(BlockId, usize)>,
+    /// The body the call sits in (pointer identity) and its block there, for
+    /// a site its own body runs synchronously; unlike `at`, never moved to
+    /// the call that runs the body.
+    own: Option<(usize, BlockId)>,
     /// The top-level block the walk descended from — always a block of the
     /// walked root, which makes it the only id that means anything in the
     /// region's CFG. Region membership reads it (a nested callback defined
@@ -2559,6 +2575,22 @@ impl<'a> SetterWalk<'a> {
         prov: Option<BlockId>,
         witness: Option<SourceRange>,
     ) {
+        let outer = std::mem::replace(&mut self.body, cfg as *const CFG as usize);
+        self.cfg_body(cfg, depth, found, mode, prov, witness);
+        self.body = outer;
+    }
+
+    /// [`Self::cfg`], with `self.body` set to `cfg`.
+    #[allow(clippy::too_many_arguments)]
+    fn cfg_body(
+        &mut self,
+        cfg: &'a CFG,
+        depth: usize,
+        found: &mut Found,
+        mode: WalkClass,
+        prov: Option<BlockId>,
+        witness: Option<SourceRange>,
+    ) {
         let key = cfg as *const CFG as usize;
         if !self.walking.insert(key) {
             return;
@@ -2780,6 +2812,7 @@ impl<'a> SetterWalk<'a> {
                     class: mode,
                     span: stmt_span,
                     at,
+                    own: at.map(|(b, _)| (self.body, b)),
                     prov_block: prov,
                     repeats: self.repeating,
                     updater: self.updater_of(args),
@@ -3158,6 +3191,7 @@ pub fn collect_slot_reads(render_cfg: &CFG, hooks: &[HookEntry]) -> Vec<SlotRead
             converged: None,
             walking: HashSet::new(),
             root: cfg as *const CFG as usize,
+            body: cfg as *const CFG as usize,
             effect_body: matches!(region, WriterRegion::Effect(_)),
             dispatches: false,
             shadowed: &no_shadow,
@@ -3239,6 +3273,7 @@ pub fn collect_body_calls(cfg: &CFG, region: WriterRegion) -> Vec<BodyCall> {
         converged: None,
         walking: HashSet::new(),
         root: cfg as *const CFG as usize,
+        body: cfg as *const CFG as usize,
         effect_body: matches!(region, WriterRegion::Effect(_)),
         dispatches: false,
         shadowed: &empty_shadow,

@@ -787,6 +787,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         module_consts,
         state_store: final_state,
         memo_store,
+        render_entry: initial_env.clone(),
         block_states,
         effect_block_states,
         hook_calls,

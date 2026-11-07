@@ -314,6 +314,27 @@ pub struct SiteEnvs<'a> {
     pub handler_exits: &'a HashMap<HookLabel, HashMap<BlockId, AbstractEnv<StateValue>>>,
 }
 
+impl<'a> SiteEnvs<'a> {
+    /// The same bundle, read back off a converged component's result, for a
+    /// consumer that runs after the fixpoint; `exit` is its render exit env.
+    pub(crate) fn of(
+        comp: &'a crate::engine::AnalysisResult<StateValue>,
+        exit: &'a AbstractEnv<StateValue>,
+    ) -> Self {
+        SiteEnvs {
+            component: comp.component,
+            state: &comp.state_store,
+            memo: &comp.memo_store,
+            heap: &comp.heap,
+            render_entry: &comp.render_entry,
+            render_exits: &comp.block_states,
+            exit,
+            effect_exits: &comp.effect_block_states,
+            handler_exits: &comp.handler_block_states,
+        }
+    }
+}
+
 impl SiteEnvs<'_> {
     /// Evaluate `expr` where a write at `at` in `region`'s `cfg` runs: the
     /// block's entry env replayed through the statements before the call.

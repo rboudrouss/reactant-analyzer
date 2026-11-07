@@ -196,6 +196,9 @@ pub struct AnalysisResult<D: AbstractDomain> {
     pub module_consts: std::sync::Arc<HashMap<Var, crate::ir::ModuleConstInit>>,
     pub state_store: StateStore<D>,
     pub memo_store: MemoStore<D>,
+    /// Abstract environment at the entry of the render CFG: props and module
+    /// constants bound.
+    pub render_entry: AbstractEnv<D>,
     /// Abstract environment at the *exit* of each render-CFG block.
     pub block_states: HashMap<BlockId, AbstractEnv<D>>,
     /// Abstract environment at the *exit* of each block, per effect body CFG.
