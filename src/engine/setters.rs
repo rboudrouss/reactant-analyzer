@@ -23,7 +23,7 @@ use crate::{
         cfg::{CFG, Terminator},
         expr::Expr,
         free_vars::{call_free_key, collect_used_vars},
-        hooks::HookEntry,
+        hooks::{HookEntry, HookProvenance},
         stmt::Stmt,
         types::{BlockId, HookLabel, Symbol, Var},
     },
@@ -143,7 +143,7 @@ fn setter_calls(
         .map(ConvergedFns::callback_fns);
     for (k, v) in extra_fn_bindings
         .iter()
-        .chain(callback_fns.iter().flatten())
+        .chain(callback_fns.into_iter().flatten())
     {
         fn_bindings
             .entry(k.clone())
@@ -424,6 +424,11 @@ pub(crate) struct ConvergedFns<'a> {
     heap: &'a Heap,
     component: ComponentId,
     hooks: &'a [HookEntry],
+    /// [`callback_bound_vars`] of the render and the hook bodies.
+    callback_fns: Arc<HashMap<Var, Arc<CFG>>>,
+    /// The `useEffectEvent` hooks whose value is bound to a name
+    /// `callback_fns` holds: their argument runs where that name is called.
+    called_events: Arc<HashSet<HookLabel>>,
 }
 
 impl<'a> ConvergedFns<'a> {
@@ -431,10 +436,25 @@ impl<'a> ConvergedFns<'a> {
         render: &'a CFG,
         params: &[Var],
         hooks: &'a [HookEntry],
+        provenance: &[HookProvenance],
         block_states: &HashMap<BlockId, AbstractEnv<StateValue>>,
         heap: &'a Heap,
         component: ComponentId,
     ) -> Self {
+        let bodies: Vec<&CFG> = hooks.iter().filter_map(HookEntry::body_cfg).collect();
+        let events = effect_event_args(hooks, provenance);
+        let callback_fns = callback_bound_vars(render, &bodies, &callback_bodies(hooks), &events);
+        let called_events = hooks
+            .iter()
+            .filter_map(|h| match h {
+                HookEntry::Custom {
+                    label,
+                    binding: Some(v),
+                    ..
+                } if events.contains_key(label) && callback_fns.contains_key(v) => Some(*label),
+                _ => None,
+            })
+            .collect();
         ConvergedFns {
             fns: collect_converged_fns(render, params, block_states, heap, component),
             closures: HashMap::new(),
@@ -443,6 +463,8 @@ impl<'a> ConvergedFns<'a> {
             heap,
             component,
             hooks,
+            callback_fns: Arc::new(callback_fns),
+            called_events: Arc::new(called_events),
         }
     }
 
@@ -508,12 +530,20 @@ impl<'a> ConvergedFns<'a> {
             heap: self.heap,
             component: self.component,
             hooks: self.hooks,
+            callback_fns: Arc::clone(&self.callback_fns),
+            called_events: Arc::clone(&self.called_events),
         }
     }
     /// The arguments of the hook at `label` when the expansion left it: the
     /// fixpoint hands them, at the hook's marker, to code it does not see
-    /// (#254), as a call of an unknown callee hands its own (#262).
+    /// (#254), as a call of an unknown callee hands its own (#262). React
+    /// runs a `useEffectEvent`'s argument only through the function it hands
+    /// back: when a name certifiably holds that function, the argument runs
+    /// where the name is called, not at the marker.
     fn left_args(&self, label: HookLabel) -> &'a [Expr] {
+        if self.called_events.contains(&label) {
+            return &[];
+        }
         self.hooks
             .iter()
             .find_map(|h| match h {
@@ -522,12 +552,11 @@ impl<'a> ConvergedFns<'a> {
             })
             .unwrap_or(&[])
     }
-    /// The names bound once to a `useCallback` value, with its body: a call
-    /// or an argument through one runs that body, as the writer relation
-    /// reads it ([`callback_bound_vars`], #262).
-    fn callback_fns(&self) -> HashMap<Var, Arc<CFG>> {
-        let bodies: Vec<&CFG> = self.hooks.iter().filter_map(HookEntry::body_cfg).collect();
-        callback_bound_vars(self.render, &bodies, &callback_bodies(self.hooks))
+    /// The names bound once to a `useCallback` or a `useEffectEvent` value,
+    /// with the body it runs: a call or an argument through one runs that
+    /// body, as the writer relation reads it ([`callback_bound_vars`], #262).
+    fn callback_fns(&self) -> &HashMap<Var, Arc<CFG>> {
+        &self.callback_fns
     }
 
     /// The closures a call through `path` may run: those at the path, or,
@@ -1463,8 +1492,33 @@ fn callback_bodies(hooks: &[HookEntry]) -> HashMap<HookLabel, Arc<CFG>> {
         .collect()
 }
 
+/// The argument of every React `useEffectEvent` the expansion left, by label.
+/// React hands back a function that runs it, and runs it nowhere else: the
+/// returned function calls the latest render's argument, and throws when
+/// called during a render.
+fn effect_event_args<'a>(
+    hooks: &'a [HookEntry],
+    provenance: &[HookProvenance],
+) -> HashMap<HookLabel, &'a Expr> {
+    hooks
+        .iter()
+        .filter_map(|h| match h {
+            HookEntry::Custom { label, args, .. }
+                if provenance
+                    .iter()
+                    .any(|p| p.label == *label && p.react && p.origin_hook == "useEffectEvent") =>
+            {
+                args.first().map(|a| (*label, a))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// Names bound exactly once, anywhere below, to the result of a `useCallback`
-/// — mapped to that callback's body.
+/// — mapped to that callback's body — or of a `useEffectEvent` whose
+/// argument is such a name or a function literal (`events`), mapped to the
+/// body the argument is.
 ///
 /// The same single-binding bar the literal certificate uses: a name any body
 /// re-binds is not the memoized function by the time the write runs.
@@ -1472,6 +1526,7 @@ fn callback_bound_vars(
     render_cfg: &CFG,
     also: &[&CFG],
     callback_bodies: &HashMap<HookLabel, Arc<CFG>>,
+    events: &HashMap<HookLabel, &Expr>,
 ) -> HashMap<Var, Arc<CFG>> {
     fn scan<'a>(cfg: &'a CFG, out: &mut HashMap<&'a str, Vec<&'a Expr>>) {
         for block in cfg.blocks.values() {
@@ -1507,16 +1562,26 @@ fn callback_bound_vars(
         .keys()
         .filter_map(|&name| {
             let mut cur = sole(name)?;
+            let mut event = false;
             for _ in 0..crate::ir::bindings::MAX_ALIAS_HOPS {
-                let Expr::Var(next) = cur else { break };
-                cur = sole(next)?;
+                cur = match cur {
+                    Expr::Var(next) => sole(next)?,
+                    // An effect event is its argument, as a rename hop is.
+                    Expr::HookMarker(label, _) if events.contains_key(label) => {
+                        event = true;
+                        events[label].peel_ts()
+                    }
+                    _ => break,
+                };
             }
-            let Expr::CallbackVal(label) = cur else {
-                return None;
+            let body = match cur {
+                Expr::CallbackVal(label) => callback_bodies.get(label)?,
+                // A name bound to a literal is the literal certificate's;
+                // only an effect event's argument is read here.
+                Expr::FnLit { body_cfg, .. } if event => body_cfg,
+                _ => return None,
             };
-            callback_bodies
-                .get(label)
-                .map(|b| (name.to_string(), Arc::clone(b)))
+            Some((name.to_string(), Arc::clone(body)))
         })
         .collect()
 }
@@ -1713,25 +1778,27 @@ pub(crate) fn collect_slot_writers(
             crate::ir::bindings::certified_fn_binding(v, render_cfg, &hook_bodies).is_some()
         })
         .collect();
-    // `const inc = useCallback(…)` binds a `CallbackVal`, not an `FnLit`, so
-    // the literal certificate never sees it — and a memoized updater read as ⊤
-    // fired the non-functional rules on correct code.
-    outer_fns.extend(callback_bound_vars(
-        render_cfg,
-        &hook_bodies,
-        &callback_bodies,
-    ));
     // What no single binding certifies, the converged values may still point
     // at: a closure behind a member path (`api.inc()`) or a memo's member.
     let converged_fns = ConvergedFns::of(
         render_cfg,
         params,
         hooks,
+        hook_provenance,
         envs.render_exits,
         envs.heap,
         envs.component,
     )
     .with_closures(&closures, &closure_heap);
+    // `const inc = useCallback(…)` binds a `CallbackVal`, not an `FnLit`, so
+    // the literal certificate never sees it — and a memoized updater read as ⊤
+    // fired the non-functional rules on correct code.
+    outer_fns.extend(
+        converged_fns
+            .callback_fns()
+            .iter()
+            .map(|(v, b)| (v.clone(), Arc::clone(b))),
+    );
 
     // A write reached through a function name is authored where that function
     // is defined, and a name can carry a closure out of the region it was

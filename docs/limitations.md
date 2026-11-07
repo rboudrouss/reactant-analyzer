@@ -62,7 +62,11 @@ that writes it (see *Cross-file limits*).
   the render hands to such a callee or hook — a literal, or a name bound to one or to a
   `useCallback` value — as a possible render write
   [#262](https://github.com/rboudrouss/reactant-analyzer/issues/262); one held by an object the
-  render hands over (`useTable({ onClick: () => setN(1) })`) is not read there. A closure reached through a
+  render hands over (`useTable({ onClick: () => setN(1) })`) is not read there. React's
+  `useEffectEvent` is the exception: its argument — a literal, or a name bound to one or to a
+  `useCallback` value — runs where a name bound once to the function it hands back is called, as a
+  `useCallback` value does; the value itself stays opaque, so a call through it React would reject
+  during render is still read as running the argument. A closure reached through a
   local function's parameter (`const f = (g) => g(); f(() => setN(1))`) or an array method's
   callback parameter (`fs.forEach((f) => f())`, the parameter being the array's entries) runs
   where it is called [#253](https://github.com/rboudrouss/reactant-analyzer/issues/253), a possible

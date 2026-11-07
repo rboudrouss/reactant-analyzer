@@ -125,6 +125,7 @@ impl SetterInRender {
             &comp_result.render_cfg,
             std::slice::from_ref(&comp_result.param),
             &comp_result.hooks,
+            &comp_result.hook_provenance,
             &comp_result.block_states,
             &comp_result.heap,
             component,
