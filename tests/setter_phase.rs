@@ -94,13 +94,18 @@ fn every_site_of_a_setter_is_judged_not_only_the_first() {
     // The rule kept one site per setter, the most synchronous: a site it
     // cleared — a settling guard, a timer — hid one it must report.
     let out = report(PHASE);
-    for name in ["SettledAndEscaped", "DeferredAndEscaped"] {
-        let line = line_for(&out, name);
-        assert!(
-            line.contains("warn") && line.contains("no timing summary"),
-            "{name}: `runNow(() => setN(n + 1))` may run during render:\n{out}"
-        );
-    }
+    let line = line_for(&out, "DeferredAndEscaped");
+    assert!(
+        line.contains("warn") && line.contains("no timing summary"),
+        "`runNow(() => setN(n + 1))` may run during render:\n{out}"
+    );
+    // A second render-pass write of the slot also voids the first's
+    // settling proof: the next render reads whichever ran last.
+    let line = line_for(&out, "SettledAndEscaped");
+    assert!(
+        line.contains("warn") && line.contains("setter-in-render"),
+        "{out}"
+    );
 }
 
 #[test]

@@ -203,10 +203,13 @@ impl SetterInRender {
 
             // Sanctioned adjust-during-render idiom: conditional local call
             // whose guards die once the written value is in the slot —
-            // converges after one extra render, no diagnostic.
+            // converges after one extra render, no diagnostic. Only for the
+            // slot's sole render-pass write: with two, the next render reads
+            // whichever ran last.
             if proof.is_none()
                 && let Some(bid) = call.block_id
                 && let Some(label) = local_setter_info.sole(&call.var)
+                && sole_render_writer(result, component, label)
                 && let Some(arg) = setter_call_arg(&comp_result.render_cfg, bid, &call.var)
                 && converges_once_written(
                     &comp_result.render_cfg,
@@ -492,6 +495,39 @@ fn unknown_phase_message(names: &crate::ir::SourceNames, var: &Var) -> String {
 }
 
 /// First argument of the top-level `setter(arg)` call in block `bid`, if any.
+/// Slot `label` of `component` has exactly one write that may run in a
+/// render pass — of its own render or memo bodies, or of another component's
+/// (a prop) — in the writer relation.
+fn sole_render_writer(
+    result: &crate::engine::ProgramAnalysisResult,
+    component: crate::ir::ComponentId,
+    label: HookLabel,
+) -> bool {
+    let render_pass = |w: &&SlotWriter| {
+        w.slot == label
+            && matches!(w.region, WriterRegion::Render | WriterRegion::Memo(_))
+            && matches!(
+                w.phase,
+                WriterPhase::Render | WriterPhase::Memo | WriterPhase::Unknown
+            )
+    };
+    let own = result.components[&component]
+        .slot_writers
+        .iter()
+        .filter(|w| w.owner.is_none())
+        .filter(render_pass)
+        .count();
+    let others = result
+        .components
+        .iter()
+        .filter(|(c, _)| **c != component)
+        .flat_map(|(_, r)| &r.slot_writers)
+        .filter(|w| w.owner == Some(component))
+        .filter(render_pass)
+        .count();
+    own == 1 && others == 0
+}
+
 fn setter_call_arg<'a>(
     cfg: &'a crate::ir::cfg::CFG,
     bid: BlockId,
