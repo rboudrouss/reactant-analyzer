@@ -1004,12 +1004,13 @@ type Root = (HookLabel, Vec<Option<String>>);
 /// or a reducer's state parameter. Names are not scoped — a spelling is
 /// every binding of it in the component, a may reading. A receiver whose
 /// chase meets a name bound through itself (`n = n.next`), or runs past the
-/// alias depth, may sit at any depth of any slot, and leaves every member
-/// unknown (`deep`).
+/// alias depth, may sit at any depth of every slot the name's bindings reach
+/// at all, and leaves each member of those slots unknown (`deep`, #275);
+/// a slot no binding of it reaches keeps its members.
 #[derive(Default)]
 pub struct MemberWrites<'a> {
     by_slot: HashMap<HookLabel, Vec<MemberWrite<'a>>>,
-    deep: bool,
+    deep: HashSet<HookLabel>,
 }
 
 impl<'a> MemberWrites<'a> {
@@ -1134,7 +1135,7 @@ impl<'a> MemberWrites<'a> {
             Expr::Var(v) => {
                 if stack.contains(&v.as_str()) || stack.len() >= crate::ir::bindings::MAX_ALIAS_HOPS
                 {
-                    self.deep = true;
+                    reach(e, lets, held, &mut HashSet::new(), &mut self.deep);
                     return Vec::new();
                 }
                 let mut out: Vec<_> = held
@@ -1159,7 +1160,7 @@ impl<'a> MemberWrites<'a> {
     /// it — read off the literal a write to a shorter path stores — or
     /// `None` when some write stores there what no expression says.
     fn at(&self, label: HookLabel, segs: &[String]) -> Option<Vec<&'a Expr>> {
-        if self.deep {
+        if self.deep.contains(&label) {
             return None;
         }
         let mut out = Vec::new();
@@ -1174,6 +1175,35 @@ impl<'a> MemberWrites<'a> {
             }
         }
         Some(out)
+    }
+}
+
+/// Every slot `e` may read the object of, through the edges
+/// [`MemberWrites::roots`] follows, with no depth: the slots a receiver the
+/// chase cut short may sit at (#275). `seen` ends a name bound through itself.
+fn reach<'a>(
+    e: &'a Expr,
+    lets: &HashMap<&'a str, Vec<&'a Expr>>,
+    held: &HashMap<&'a str, Vec<HookLabel>>,
+    seen: &mut HashSet<&'a str>,
+    out: &mut HashSet<HookLabel>,
+) {
+    match e.peel_ts() {
+        Expr::StateVal(l) => {
+            out.insert(*l);
+        }
+        Expr::FieldAccess { obj, .. } => reach(obj, lets, held, seen, out),
+        Expr::IndexAccess { arr, .. } => reach(arr, lets, held, seen, out),
+        Expr::Var(v) => {
+            if !seen.insert(v.as_str()) {
+                return;
+            }
+            out.extend(held.get(v.as_str()).into_iter().flatten().copied());
+            for rhs in lets.get(v.as_str()).into_iter().flatten() {
+                reach(rhs, lets, held, seen, out);
+            }
+        }
+        _ => {}
     }
 }
 
