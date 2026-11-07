@@ -334,8 +334,21 @@ impl Timing {
     }
 }
 
+/// The DOM element methods that fire the element's listeners before they
+/// return: `click()` dispatches `click`, `focus()` / `blur()` the focus
+/// events, `requestSubmit()` `submit`.
+const DISPATCHING_METHODS: &[&str] = &[
+    "dispatchEvent",
+    "emit",
+    "click",
+    "focus",
+    "blur",
+    "requestSubmit",
+];
+
 /// Does `cfg`, nested functions included, fire event listeners itself: call
-/// `dispatchEvent`, or `emit` on a receiver?
+/// `dispatchEvent`, `emit` on a receiver, or a [`DISPATCHING_METHODS`]
+/// member?
 pub(crate) fn dispatches_events(cfg: &CFG) -> bool {
     let mut found = false;
     cfg.for_each_expr(&mut |e| found = found || expr_dispatches_events(e));
@@ -347,7 +360,7 @@ fn expr_dispatches_events(e: &Expr) -> bool {
         Expr::Call { fn_, .. } | Expr::New { fn_, .. }
             if match fn_.peel_ts() {
                 Expr::Var(name) => name == "dispatchEvent",
-                Expr::FieldAccess { field, .. } => field == "dispatchEvent" || field == "emit",
+                Expr::FieldAccess { field, .. } => DISPATCHING_METHODS.contains(&field.as_str()),
                 _ => false,
             } =>
         {

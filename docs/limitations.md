@@ -332,14 +332,19 @@ carries an Error.
   neither does a write back that is not on every path of the callback
   [#142](https://github.com/rboudrouss/reactant-analyzer/issues/142).
 - **One `dispatchEvent` anywhere makes every `addEventListener` listener ⊤.** A listener is
-  event-only (no churn edge) only while no body of the program calls `dispatchEvent` (or `emit`
-  on a receiver): a dispatch runs the listeners before it returns, and which listener it reaches
+  event-only (no churn edge) only while no body of the program calls `dispatchEvent`, `emit` on a
+  receiver, or an element method that fires events before it returns (`click()`, `focus()`,
+  `blur()`, `requestSubmit()`): a dispatch runs the listeners before it returns, and which listener it reaches
   is a question of event names and targets the analysis does not resolve (#219). In such a
   program the fixpoint runs every listener where it is registered, as it runs a timer callback, so
   the slot a listener writes moves with its writes, a listener passed by name included
   [#250](https://github.com/rboudrouss/reactant-analyzer/issues/250). A dispatch
   hidden in an opaque callee is not seen. A JSX handler (`onClick`) stays event-only even then,
-  though dispatching on a DOM node React manages would run it synchronously too.
+  though dispatching on a DOM node React manages would run it synchronously too: an effect that
+  calls `ref.current.click()` on the button whose `onClick` writes state loops unclaimed
+  (`oracle/cases/dispatch-reaches-jsx-handler.tsx`, a known false negative). The program's test
+  files are not read (`*.test.*`, `*.spec.*` are no source files to the walk), so a dispatch there
+  makes nothing ⊤.
 - **`frozen-initial-state`** still fires on a child remounted by machinery it cannot see: a dialog
   body unmounted by its library wrapper, a route that swaps the subtree [#136](https://github.com/rboudrouss/reactant-analyzer/issues/136).
 - **`missing-deps`** asks whether a capture can go *stale*, so a read through a handle that never
