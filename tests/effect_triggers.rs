@@ -30,11 +30,16 @@ fn parse_and_analyze(src: &str) -> ProgramAnalysisResult {
         std::path::Path::new("test.tsx"),
         &mut Default::default(),
     );
+    // The library summaries the CLI loads: a router hook's says its values
+    // move on navigation alone (#161, #294).
     analyze_program(
         ComponentRegistry::from_components(components),
         HookRegistry::new(),
         RootStrategy::Heuristic,
-        &Config::default(),
+        &Config {
+            summary_registry: reactant::registry::SummaryRegistry::new_with_common(),
+            ..Config::default()
+        },
     )
 }
 
@@ -780,9 +785,21 @@ fn a_dep_that_moves_with_no_slot_may_rerun_the_effect_every_render() {
             "s.split(\",\").map(format).join()",
             Rerun::Always(Always::MutableDep(0)),
         ),
-        // A hook's result is held by decision (#161), whatever its
-        // arguments are computed through.
-        ("const d = useThing(format(t));", "d", Rerun::OnSlots),
+        // The result of a hook the analysis cannot see into may be a new
+        // reference at every render (#294, which reverses #161's hold); a
+        // router hook's summary keeps it held (below).
+        (
+            "const d = useThing(format(t));",
+            "d",
+            Rerun::Always(Always::MutableDep(0)),
+        ),
+        (
+            "const d = useThing(t);",
+            "d",
+            Rerun::Always(Always::MutableDep(0)),
+        ),
+        // A router hook's summary says its values move on navigation alone.
+        ("const sp = useSearchParams();", "sp", Rerun::OnSlots),
         // A member of an object literal with spreads reads what may be put
         // there, not its siblings.
         (
@@ -836,4 +853,26 @@ fn a_dep_that_moves_with_no_slot_may_rerun_the_effect_every_render() {
             .unwrap();
         assert_eq!(c.rerun(last), Some(class), "`{decl}` `[{dep}]`");
     }
+}
+
+/// A context value the analysis cannot pin may be a new reference whenever
+/// the provider renders, which the component cannot see: a possible re-run
+/// at every render (#294), never held.
+#[test]
+fn a_context_value_may_rerun_the_effect_every_render() {
+    let src = r#"
+        import { useState, useEffect, useContext, createContext } from "react";
+        const Ctx = createContext(null);
+        export function C() {
+          const [t, setT] = useState(false);
+          const v = useContext(Ctx);
+          useEffect(() => { setT(!t); }, [v]);
+          return <div />;
+        }
+    "#;
+    let r = parse_and_analyze(src);
+    assert_eq!(
+        only_effect_class(comp(&r, "C")),
+        Rerun::Always(Always::MutableDep(0))
+    );
 }

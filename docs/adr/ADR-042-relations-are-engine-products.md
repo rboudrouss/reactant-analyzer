@@ -121,6 +121,14 @@ from `count`), this one answers identity (the dep *is* `count`), and the
 must-rerun claim needs identity. Both arms of `infinite-loop` read it;
 `missing-deps` and `always-unstable-deps` may migrate onto it later.
 
+**Amended (#294):** the result of a hook the analysis cannot see into, and a
+context value it cannot pin, are a may re-run at every render
+(`Always::MutableDep`), no longer held across the loop as #161 decided. The
+hold was an assumption, not a fact of the model: the oracle shows a package
+hook returning a fresh object per call loops an effect on it. A hook summary
+that pins the result (the router hooks' navigation-only values) still holds
+it.
+
 ### 4. `engine/churn.rs`: the graph is a fold over two relations
 
 Edges are built from `slot_writers` rows in `Effect(_)` regions and

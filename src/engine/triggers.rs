@@ -47,7 +47,7 @@ use crate::{
         ComponentId, QualifiedSlot,
         bindings::{binding_of, must_slot_read},
         cfg::{CFG, Terminator},
-        expr::{Expr, mutation_receiver},
+        expr::{Expr, MarkerVal, SummaryValue, mutation_receiver},
         hooks::{Arity, DepsArg, HookEntry},
         stmt::{MemberKey, Stmt},
         types::{BlockId, HookLabel, Var},
@@ -167,6 +167,7 @@ pub(crate) fn collect_effect_triggers(
         props: HashSet::new(),
     };
     let mut refs_move: HashMap<(HookLabel, bool), bool> = HashMap::new();
+    let held_hooks = held_hook_labels(render_cfg);
     for hook in hooks {
         // A memo's deps list gates its body exactly as an effect's does: React
         // compares both lists the same way, at the same render (#249).
@@ -241,8 +242,8 @@ pub(crate) fn collect_effect_triggers(
             // domain cannot bound — is compared by value, so it may move with
             // whatever it is computed from: the slots among its `render_deps`
             // sources (`!on`, `count * 2`, a ternary's condition: #203). A
-            // ref's contents moves with no slot at all. A hook's or a
-            // context's result is held across the loop (#161), and a prop
+            // ref's contents moves with no slot at all, and so may a hook's
+            // or a context's result the domain cannot pin (#294), and a prop
             // reaches here through the parent slots it is versioned by. A
             // reference's labels already follow every rename and join of
             // the name (a slot read is `Versioned`, a merge takes both arms),
@@ -269,17 +270,25 @@ pub(crate) fn collect_effect_triggers(
                         .or_insert_with(|| ref_may_move(l, &names, identity, render_cfg, hooks))
                 };
                 // A cell that moves with no slot: a ref's contents, a module
-                // binding some body writes (`cache.size`), or the result of a
+                // binding some body writes (`cache.size`), the result of a
                 // call not known pure the value does not pin (`Math.random()`,
-                // #224). A source a function value only captures is not read
-                // here: the function's identity, not the cell, is compared.
+                // #224), or what a hook or a context the analysis cannot see
+                // into hands back, which may be a new reference at every
+                // render (#294: holding it still was an assumption, and a
+                // hook returning a fresh object per call loops). A summary
+                // that pins the result keeps it: through the value
+                // (`by_identity`, `held`), or the router hooks' values that
+                // move on navigation alone (`held_hooks`). A source a function value
+                // only captures is not read here: the function's identity,
+                // not the cell, is compared.
                 if src.top
                     || (src.impure && call_may_differ(&val, |_| true, true))
                     || src.set.iter().any(|s| {
                         !src.captured.contains(s)
                             && match s {
                                 Source::Ref(l) => moving_ref(*l),
-                                Source::Module(_) => true,
+                                Source::Hook(l) => !held_hooks.contains(l),
+                                Source::Module(_) | Source::Context(_) => true,
                                 _ => false,
                             }
                     })
@@ -317,6 +326,21 @@ pub(crate) fn collect_effect_triggers(
         };
         out.reruns.insert(*label, class);
     }
+    out
+}
+
+/// The hooks whose summary says the result moves only on navigation, which
+/// the automatic loop cannot raise (`SummaryValue::Held`, the router hooks,
+/// #161): the one hook result a re-run class may read as held (#294).
+fn held_hook_labels(render_cfg: &CFG) -> HashSet<HookLabel> {
+    fn walk(e: &Expr, out: &mut HashSet<HookLabel>) {
+        if let Expr::HookMarker(l, MarkerVal::Summary(SummaryValue::Held)) = e {
+            out.insert(*l);
+        }
+        e.for_each_child(&mut |c| walk(c, out));
+    }
+    let mut out = HashSet::new();
+    render_cfg.for_each_expr(&mut |e| walk(e, &mut out));
     out
 }
 

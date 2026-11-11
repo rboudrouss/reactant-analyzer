@@ -236,12 +236,16 @@ that writes it (see *Cross-file limits*).
   call not known pure its value does not pin to one value: `[Math.random()]` and `[format(x)]`
   over an import may re-run the effect, a Warning on an effect that writes state, while
   `[JSON.stringify(filters)]` moves with `filters` alone
-  [#224](https://github.com/rboudrouss/reactant-analyzer/issues/224). A
-  callback that only names the ref or the binding in its body does not read it: its identity moves
-  with its deps list [#227](https://github.com/rboudrouss/reactant-analyzer/issues/227). A dep
-  that moves for another reason reads as held: a module binding written only behind a call the
-  analysis cannot see into, and, by decision, a hook's or a context's result, whatever the hook's
-  arguments are computed through [#161](https://github.com/rboudrouss/reactant-analyzer/issues/161).
+  [#224](https://github.com/rboudrouss/reactant-analyzer/issues/224). So may the result of a hook
+  the analysis cannot see into, and a context value it cannot pin to its provider: either may be a
+  new reference at every render (a package hook returning a fresh object per call loops), so
+  `[useThing()]` or `[useContext(Ctx)]` is a possible re-run at every render, a Warning. Only a
+  hook summary that pins the result keeps it held, the router hooks' navigation-only values
+  [#294](https://github.com/rboudrouss/reactant-analyzer/issues/294), which reverses the hold
+  [#161](https://github.com/rboudrouss/reactant-analyzer/issues/161) assumed. A callback that only
+  names the ref or the binding in its body does not read it: its identity moves with its deps list
+  [#227](https://github.com/rboudrouss/reactant-analyzer/issues/227). A dep that moves for another
+  reason reads as held: a module binding written only behind a call the analysis cannot see into.
 - **Which calls are functions of their inputs.** A call computes the same content from the same
   inputs when its callee is a builtin the engine names — `JSON.stringify`/`parse`, `String`,
   `Number`, `Object.keys`, `Array.isArray`, `Math.*` but `random`, and the methods of a receiver

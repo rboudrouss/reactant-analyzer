@@ -88,15 +88,16 @@ reference every render, `is_unstable_reference_only`, the fact
 that is not a written array, #212 — once a custom hook is inlined, a parameter
 is the call's argument or the parameter's default, #230) and `MutableDep(i)` (dep `i` reads a ref's
 contents a body can replace — `ref.current` itself only through a
-reassignment that is no lazy init, #228 — or a source the dependence
-analysis lost, #201;
+reassignment that is no lazy init, #228 — the result of a hook the analysis
+cannot see into or a context value it cannot pin, which may be a new
+reference at every render (#294; a router hook's summary keeps its values
+held), or a source the dependence analysis lost, #201;
 or it is a fresh reference not certified fresh at the call — a name bound on
 two paths — or a spread whose source is not a reference only slots move). The churn graph reads `Always` the way it
 reads no deps array, at strength `min(why, must(write))`; for `FreshDep` it
 also asks that the dep does not hold while props hold — a prop the parent
 allocates is the same when the component re-renders alone, the reading a
-fresh *write* gets too. A hook's or a context's result is held (#161), so it
-makes no effect `Always`. Where the class is not `Always`, the churn graph
+fresh *write* gets too. Where the class is not `Always`, the churn graph
 also reads a dep fresh under one call site's input alone (`fresh_through`,
 below) as a possible `FreshDep` re-run, naming the parents it holds through
 (#237).

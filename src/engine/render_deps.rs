@@ -984,9 +984,10 @@ impl<'a> Analyzer<'a> {
                         }
                         kind = purity::hook_result(import_source.as_deref(), name);
                     }
-                    // The result is held by decision (#161): an argument
-                    // computed through an unknown call moves it no more than
-                    // the hook's own state does.
+                    // The result moves through its own `Source::Hook` (#294);
+                    // an argument computed through an unknown call adds
+                    // nothing to that, and nothing to a function that only
+                    // captures the result (#161).
                     d.impure = false;
                     DVal::of_kind(d, kind)
                 }

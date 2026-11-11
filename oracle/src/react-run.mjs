@@ -40,6 +40,8 @@ const EXT = {
   runNow: (cb) => cb(),
   defer: (cb) => void Promise.resolve().then(cb),
   format: (x) => `<${x}>`,
+  // A package hook whose result is a new object at every call (#294).
+  useFresh: () => ({}),
   useRun: (x) =>
     React.useEffect(() => {
       const fns = typeof x === "function" ? [x] : Object.values(x ?? {});
