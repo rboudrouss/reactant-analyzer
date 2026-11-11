@@ -241,6 +241,47 @@ path and nothing else.
 review asked for, written down once. The docs-drift test keeps it in step
 with the pack typings.
 
+### 8. The churn graph is `infinite-loop`'s only self-loop reader (#265)
+
+The widening arm of `infinite-loop` — a Warning on every effect write of a
+slot the fixpoint widened and whose effect writes stayed unbounded
+(`AnalysisResult::diverges`) — is retired, with what only it read: the
+`effect_setter_writes` re-run of the effects from ⊥, `must_self_churn`, and
+the `handler` witness step. The churn graph claims a loop unless it proves
+the write settles, and its proofs need precise values; a widened slot makes
+them fail, so the arm only added claims the graph had no edge for. Measured
+with the arm off, on the oracle (every case and four fuzz seeds), and on
+hand-written programs for each ⊤ source a dep can read (a prop, a member or
+a call of one, `useContext`, an opaque hook, an unknown call, a custom
+hook's parameter, a rest prop, `children`; looping and settling variants):
+
+| run | fn | error-unsound | fp before → after |
+|---|---|---|---|
+| oracle cases (314) | 0 | 0 | 47 → 46 |
+| fuzz seed 1 ×1000 | 0 | 0 | 325 → 317 |
+| fuzz seed 7 ×1000 | 0 | 0 | 305 → 292 |
+| fuzz seed 3 ×1000 | 0 | 0 | 294 → 285 |
+| fuzz seed 11 ×1000 | 0 | 0 | 318 → 311 |
+| ⊤-dep probes (40, 20 looping) | 0 | 0 | 14 → 14 |
+
+Three of those probes were false negatives that only the arm's widened
+`n + 1` reached, the same shape with a fresh object write being missed
+already: a rest prop bound to the props object (#295), an opaque hook's and
+a context's result held across the loop (#294). Both were fixed in the
+trigger and lowering layers first. The arm also hid proven Errors: an effect
+it claimed on one slot was skipped by the cycle arm, whose Error rested on
+another (`reported_effects`); ten fuzz programs go Warning → Error, each a
+loop in React.
+
+**This supersedes ADR-021 §5's fixture for `infinite-loop`.** The fixture —
+a ⊤ prop dep and an unconditional self-write — pinned a gate quantifier, and
+the arm read it as a loop. React says otherwise: a child's own re-render
+keeps its props, so the effect runs once (the oracle converges in 2 renders,
+`oracle/cases/prop-dep-self-write-settles.tsx`); a prop dep loops only when
+the parent re-renders, which the churn graph reads through the props node
+and the cross-component arm through the setter prop. The gate tests now
+stand in front of that arm (`tests/effect_cycles.rs`).
+
 ## Soundness arguments
 
 - **Relocation is monotone except where §4 says otherwise.** Every fact the

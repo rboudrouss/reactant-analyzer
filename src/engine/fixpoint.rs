@@ -732,29 +732,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         env_exit = exit_env(&render_cfg, &block_states);
     }
 
-    // ── Post-convergence: pure setter writes ──────────────────────────────────
-    // Re-run effects from ⊥ so `effect_setter_writes` contains only what setters
-    // actually wrote. InfiniteLoop uses this to distinguish bounded growth (narrowing
-    // held: `[1,10]`) from true divergence (`[1,+∞)`).
     let final_state = state;
-    let bottom_state: StateStore<StateValue> = StateStore::bottom();
-    let mut effect_setter_writes: StateStore<StateValue> = StateStore::bottom();
-    for hook in &hooks {
-        if let HookEntry::Effect { body_cfg, .. } = hook {
-            let (_, pure_writes) = pass(
-                body_cfg,
-                env_exit.clone(),
-                &bottom_state,
-                &final_state,
-                &memo_store,
-                &mut heap,
-                false,
-                true,
-            );
-            effect_setter_writes = effect_setter_writes.join(&pure_writes);
-        }
-    }
-
     let hook_calls = collect_hook_calls(&hooks, &render_cfg);
     let effect_info = collect_effect_info(&hooks);
     let handler_info = collect_handler_info(&hooks);
@@ -827,7 +805,6 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         handler_info,
         widen_trace,
         inline_origins,
-        effect_setter_writes,
         custom_arg_returns,
         render_cfg,
         hooks: hooks_clone,

@@ -17,18 +17,21 @@ use crate::engine::{
     Always, Change, ChurnEdge, ChurnGraph, EdgeStrength, EveryRender, Rerun, WriterRegion,
 };
 use crate::ir::ComponentId;
-use crate::rules::api::query::{must_effect_cycle, must_self_churn};
+use crate::rules::api::query::must_effect_cycle;
 use crate::rules::helpers::cycles::{NodeNames, cycle_path, node_display};
 use crate::rules::{
     Certified, Diagnostic, MustResult, OnAllPaths, Rule, Severity, all_deps_provably_stable,
-    all_setter_labels, collect_fn_bindings, collect_setter_calls, collect_setter_calls_with_extra,
-    must_on_all_paths, resolve_setter_aliases, state_slot_name, state_val_labels,
+    all_setter_labels, collect_fn_bindings, collect_setter_calls_with_extra, must_on_all_paths,
+    resolve_setter_aliases, state_slot_name, state_val_labels,
 };
 
 /// Fires when an effect causes an infinite render loop.
 ///
-/// - `"infinite-loop"` local state widens in fixpoint.
-/// - `"cross-component-infinite-loop"` parent state widens via ComponentSetter prop.
+/// - `"infinite-loop"` an effect's write re-triggers it, alone or in a cycle
+///   of effects: the churn graph's arms, which claim a loop unless they prove
+///   the write settles (#265 retired the arm that read a widened slot).
+/// - `"cross-component-infinite-loop"` parent state widens via ComponentSetter
+///   prop, or a churn cycle crosses components.
 ///
 /// Effects with `deps: []` (mount-only) are excluded. Effects with all-unstable deps
 /// are treated as no-deps. If parent not in results, cross fires as Warning.
@@ -64,7 +67,6 @@ impl Rule for InfiniteLoop {
         // hook body — a setter called in an effect through an alias must still
         // be attributed to its state slot (else a real loop goes unflagged).
         let local_setter_labels = all_setter_labels(comp_result);
-        let state_names = state_val_labels(&comp_result.render_cfg);
 
         // ComponentSetter props, excluding self-references.
         let cs_vars: HashMap<Var, Vec<crate::engine::setters::SetterProp>> =
@@ -79,8 +81,8 @@ impl Rule for InfiniteLoop {
         let render_fn_bindings: HashMap<Var, Arc<CFG>> =
             collect_fn_bindings(&comp_result.render_cfg);
         let mut diags = Vec::new();
-        // Effects already reported by the fixpoint/cross arms — the churn
-        // cycle arm skips them (same outage class, one report per effect).
+        // Effects already reported by the cross arm — the churn cycle arm
+        // skips them (same outage class, one report per effect).
         let mut reported_effects: HashSet<HookLabel> = HashSet::new();
         // The graph is whole-program data: read it from the ctx cache, which
         // builds it once for the run (issue #86).
@@ -129,123 +131,54 @@ impl Rule for InfiniteLoop {
                 if call.class == SetterCallPhase::Handler {
                     continue;
                 }
-                let local: Vec<HookLabel> = local_setter_labels.targets(&call.var).collect();
-                if !local.is_empty() {
-                    // ── Intra ─────────────────────────────────────────────────
-                    // A name bound to several setters may write each (#202).
-                    for state_label in local {
-                        if comp_result.diverges(state_label).is_none() {
-                            continue; // the cycle bounded the slot
-                        }
-                        // A self-loop the churn graph proves is the arm's that
-                        // owns its edge, with the proof and its wording (#280):
-                        // this one only reads that the slot widened.
-                        if matches!(
-                            must_self_churn(&graph.edges, component, *eff_label, state_label),
-                            MustResult::All(_)
-                        ) {
-                            continue;
-                        }
-
-                        let deps_note = if deps.is_declared() {
-                            " (its deps do not provably gate it, so the effect can re-run every render)"
-                        } else {
-                            ""
-                        };
-                        let mut diag = Diagnostic::warn(
-                            "infinite-loop",
-                            format!(
-                                "this effect keeps pushing state {}{} to new values \
-                             on every run. Potential infinite render loop",
-                                state_slot_name(state_label, ctx.source_names(), &state_names),
-                                deps_note
-                            ),
-                        )
-                        .with_label(state_label);
-
-                        if let Some(r) = comp_result.effect_info.get(eff_label).and_then(|i| i.span)
-                        {
-                            diag = diag.with_range(r);
-                        }
-
-                        let setter_vars_for_label = local_setter_labels.aliases_of(state_label);
-                        for h in &comp_result.hooks {
-                            if let HookEntry::Handler {
-                                label: h_label,
-                                event,
-                                body_cfg: h_cfg,
-                                ..
-                            } = h
-                                && !collect_setter_calls(h_cfg, &setter_vars_for_label).is_empty()
-                            {
-                                let h_span =
-                                    comp_result.handler_info.get(h_label).and_then(|i| i.span);
-                                diag = diag.with_step(
-                                    crate::rules::Step::Handler {
-                                        event: event.clone(),
-                                        slot: state_label,
-                                    },
-                                    Some(*h_label),
-                                    h_span,
-                                    &ctx.names(&|l| {
-                                        state_slot_name(l, ctx.source_names(), &state_names)
-                                    }),
-                                );
-                            }
-                        }
-
-                        // Fixpoint evidence (ADR-019): which effects were writing
-                        // the slot when it widened, and at which iteration.
-                        diag = diag.with_notes(crate::rules::api::witness::slot_history(
-                            comp_result,
-                            state_label,
-                            &ctx.names(&|l| state_slot_name(l, ctx.source_names(), &state_names)),
-                        ));
-
-                        reported_effects.insert(*eff_label);
-                        diags.push(diag);
+                // A write of this component's own slot is the churn graph's,
+                // whose arms below claim a loop unless they prove it settles
+                // (#265): what remains here is a parent's setter, reached
+                // through a prop.
+                if local_setter_labels.targets(&call.var).next().is_some() {
+                    continue;
+                }
+                let Some(props) = cs_vars.get(&call.var) else {
+                    continue;
+                };
+                // ── Cross-component ────────────────────────────────────────────
+                // A prop several call sites bind to several parents'
+                // setters: one finding per parent a slot of which diverges.
+                let mut named: HashSet<ComponentId> = HashSet::new();
+                for prop in props {
+                    let (parent_comp, parent_label) = (prop.component, prop.label);
+                    if named.contains(&parent_comp) {
+                        continue;
                     }
-                } else if let Some(props) = cs_vars.get(&call.var) {
-                    // ── Cross-component ────────────────────────────────────────
-                    // A prop several call sites bind to several parents'
-                    // setters: one finding per parent a slot of which diverges.
-                    let mut named: HashSet<ComponentId> = HashSet::new();
-                    for prop in props {
-                        let (parent_comp, parent_label) = (prop.component, prop.label);
-                        if named.contains(&parent_comp) {
-                            continue;
-                        }
-                        let shared_write = result.shared_state.get(parent_comp, parent_label);
-                        if shared_write.is_bottom_value() {
-                            continue; // setter not reached in semantic analysis
-                        }
-                        if !shared_write.is_unbounded() {
-                            continue; // write is bounded → no divergence
-                        }
+                    let shared_write = result.shared_state.get(parent_comp, parent_label);
+                    if shared_write.is_bottom_value() {
+                        continue; // setter not reached in semantic analysis
+                    }
+                    if !shared_write.is_unbounded() {
+                        continue; // write is bounded → no divergence
+                    }
 
-                        let deps_note = if deps.is_declared() {
-                            " (its deps do not provably gate it, so the effect can re-run every render)"
-                        } else {
-                            ""
-                        };
-                        let msg = format!(
-                            "this effect calls `{}`, a state setter of parent `{}`{}. \
+                    let deps_note = if deps.is_declared() {
+                        " (its deps do not provably gate it, so the effect can re-run every render)"
+                    } else {
+                        ""
+                    };
+                    let msg = format!(
+                        "this effect calls `{}`, a state setter of parent `{}`{}. \
                          Parent re-renders → child re-renders → effect fires again: infinite loop",
-                            ctx.source_names().name(&call.var),
-                            result.display_name(parent_comp),
-                            deps_note
-                        );
-                        let mut diag = Diagnostic::warn("cross-component-infinite-loop", msg)
-                            .with_label(*eff_label);
+                        ctx.source_names().name(&call.var),
+                        result.display_name(parent_comp),
+                        deps_note
+                    );
+                    let mut diag = Diagnostic::warn("cross-component-infinite-loop", msg)
+                        .with_label(*eff_label);
 
-                        if let Some(r) = comp_result.effect_info.get(eff_label).and_then(|i| i.span)
-                        {
-                            diag = diag.with_range(r);
-                        }
-                        named.insert(parent_comp);
-                        reported_effects.insert(*eff_label);
-                        diags.push(diag);
+                    if let Some(r) = comp_result.effect_info.get(eff_label).and_then(|i| i.span) {
+                        diag = diag.with_range(r);
                     }
+                    named.insert(parent_comp);
+                    reported_effects.insert(*eff_label);
+                    diags.push(diag);
                 }
             }
         }
@@ -304,7 +237,7 @@ fn check_multi_effect_cycles(
                 covered.insert((e.effect_label, e.to.1));
             }
             if reported_effects.contains(&e.effect_label) {
-                continue; // fixpoint/cross arm already flagged this effect
+                continue; // the cross arm already flagged this effect
             }
             // One report per effect: a swap's two writes are two edges of one
             // cycle in one effect. Cycles come must-first, so the kept report
@@ -538,8 +471,8 @@ fn proven_self_loop(stepping: bool, state: &str, why: Option<&str>) -> String {
 // ── Object-churn arm (ADR-017) ────────────────────────────────────────────────
 //
 // `useEffect(() => setObj({...obj}), [obj])` never widens: the reference slot
-// converges (`join(PerRender, PerRender)`), so the fixpoint arm above is blind
-// to it. Certainty comes from *dep structure* instead: a dep that is the state
+// converges (`join(PerRender, PerRender)`), so no widened value says it loops.
+// Certainty comes from *dep structure* instead: a dep that is the state
 // slot itself must-changes when its setter stores a must-fresh reference.
 //
 // Stratification (Error = all-must, per the diagnostic doctrine):
@@ -670,8 +603,8 @@ fn check_object_churn(
 
         for (state_label, (sev, call_span, proof, allocates, stepping)) in best {
             // One report per effect, as in the cycle arm: an effect the
-            // fixpoint arm flagged keeps that report, unless this arm holds
-            // the stronger, proven verdict.
+            // cross arm flagged keeps that report, unless this arm holds the
+            // stronger, proven verdict.
             if reported_effects.contains(eff_label) && sev != Severity::Error {
                 continue;
             }
@@ -765,7 +698,6 @@ mod tests {
         },
         rules::Rule,
     };
-    use std::collections::HashSet;
 
     fn prog(name: &str, r: &AnalysisResult<StateValue>) -> ProgramAnalysisResult {
         crate::test_support::prog(name, r.clone())
@@ -775,26 +707,24 @@ mod tests {
         crate::test_support::single_block_cfg(vec![])
     }
 
-    fn make_result_with_widened(
-        widened: HashSet<usize>,
-        hooks: Vec<HookEntry>,
-        render_stmts: Vec<Stmt>,
-    ) -> AnalysisResult<StateValue> {
-        AnalysisResult {
-            widen_trace: widened
-                .into_iter()
-                .map(|l| (l, crate::engine::WidenEvent::default()))
-                .collect(),
-            hooks,
-            ..crate::test_support::analysis_result(crate::test_support::single_block_cfg(
-                render_stmts,
-            ))
+    /// `setN({})` as a statement.
+    fn fresh_object_write() -> Expr {
+        Expr::Call {
+            fn_: Box::new(Expr::Var("setN".to_string())),
+            args: vec![Expr::ObjectLit {
+                id: crate::ir::types::ExprId(0),
+                fields: vec![],
+            }],
         }
     }
 
+    fn loops_of(result: &AnalysisResult<StateValue>) -> Vec<Diagnostic> {
+        InfiniteLoop.check(&RuleCtx::new(&prog("C", result), result.component))
+    }
+
     #[test]
-    fn no_widened_labels_no_warning() {
-        let result = make_result_with_widened(HashSet::new(), vec![], vec![]);
+    fn no_effect_no_warning() {
+        let result = crate::test_support::analysis_result(trivial_cfg());
         assert!(
             InfiniteLoop
                 .check(&RuleCtx::new(&prog("C", &result), crate::test_support::C))
@@ -802,35 +732,19 @@ mod tests {
         );
     }
 
+    /// An effect with no deps array storing a fresh object at every run: the
+    /// churn graph's self-edge, proven (#265: it used to be the widening
+    /// arm's, on a hand-widened slot).
     #[test]
-    fn widened_with_unconditional_setter_warns() {
-        let eff_cfg = crate::test_support::single_block_cfg(vec![Stmt::ExprStmt(
-            Expr::Call {
-                fn_: Box::new(Expr::Var("setN".to_string())),
-                args: vec![Expr::ObjectLit {
-                    id: crate::ir::types::ExprId(0),
-                    fields: vec![],
-                }],
-            },
-            None,
-        )]);
-
-        let hooks = vec![HookEntry::Effect {
-            label: 1,
-            body_cfg: eff_cfg,
-            deps: DepsArg::Absent,
-            span: None,
-        }];
-        let render_stmts = vec![Stmt::Let {
-            var: "setN".to_string(),
-            rhs: Expr::StateSetter(0),
-            span: None,
-        }];
-
-        let result = make_result_with_widened(HashSet::from([0]), hooks, render_stmts);
-        let diags = InfiniteLoop.check(&RuleCtx::new(&prog("C", &result), crate::test_support::C));
-        assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].hook_label, Some(0));
+    fn an_unconditional_fresh_write_with_no_deps_is_a_proven_loop() {
+        let result = analyze_component(
+            component_with_effect_call("setN", fresh_object_write(), DepsArg::Absent),
+            &StateValueTransfer,
+            &Config::default(),
+        );
+        let diags = loops_of(&result);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].severity(), Severity::Error, "{diags:?}");
     }
 
     /// Issue #86: the churn graph is whole-program data. Checking N components
@@ -841,29 +755,10 @@ mod tests {
         use crate::engine::churn::BUILDS;
         use crate::rules::api::cache::ProgramCache;
 
-        let eff_cfg = crate::test_support::single_block_cfg(vec![Stmt::ExprStmt(
-            Expr::Call {
-                fn_: Box::new(Expr::Var("setN".to_string())),
-                args: vec![Expr::ObjectLit {
-                    id: crate::ir::types::ExprId(0),
-                    fields: vec![],
-                }],
-            },
-            None,
-        )]);
-        let one = make_result_with_widened(
-            HashSet::from([0]),
-            vec![HookEntry::Effect {
-                label: 1,
-                body_cfg: eff_cfg,
-                deps: DepsArg::Absent,
-                span: None,
-            }],
-            vec![Stmt::Let {
-                var: "setN".to_string(),
-                rhs: Expr::StateSetter(0),
-                span: None,
-            }],
+        let one = analyze_component(
+            component_with_effect_call("setN", fresh_object_write(), DepsArg::Absent),
+            &StateValueTransfer,
+            &Config::default(),
         );
 
         let ids = ["A", "B", "C"].map(crate::test_support::named);
@@ -889,63 +784,35 @@ mod tests {
     }
 
     #[test]
-    fn widened_but_setter_only_conditional_no_warning() {
-        // Effect body has no setter call in entry block → no warning
-        let eff_cfg = trivial_cfg(); // empty body
-        let hooks = vec![HookEntry::Effect {
-            label: 1,
-            body_cfg: eff_cfg,
-            deps: DepsArg::Absent,
-            span: None,
-        }];
-        let render_stmts = vec![Stmt::Let {
-            var: "setN".to_string(),
-            rhs: Expr::StateSetter(0),
-            span: None,
-        }];
-        let result = make_result_with_widened(HashSet::from([0]), hooks, render_stmts);
-        assert!(
-            InfiniteLoop
-                .check(&RuleCtx::new(&prog("C", &result), crate::test_support::C))
-                .is_empty()
+    fn an_effect_with_no_setter_call_no_warning() {
+        let result = analyze_component(
+            component_with_effect(trivial_cfg(), DepsArg::Absent),
+            &StateValueTransfer,
+            &Config::default(),
         );
+        assert!(loops_of(&result).is_empty());
     }
 
     #[test]
     fn empty_deps_array_never_warns() {
         // deps: Some([]) = mount-only, no cycle even if setter called
-        let eff_cfg = crate::test_support::single_block_cfg(vec![Stmt::ExprStmt(
-            Expr::Call {
-                fn_: Box::new(Expr::Var("setN".to_string())),
-                args: vec![Expr::ObjectLit {
-                    id: crate::ir::types::ExprId(0),
-                    fields: vec![],
-                }],
-            },
-            None,
-        )]);
-        let hooks = vec![HookEntry::Effect {
-            label: 1,
-            body_cfg: eff_cfg,
-            deps: DepsArg::List(DepsList::exact(vec![])),
-            span: None,
-        }];
-        let render_stmts = vec![Stmt::Let {
-            var: "setN".to_string(),
-            rhs: Expr::StateSetter(0),
-            span: None,
-        }];
-        let result = make_result_with_widened(HashSet::from([0]), hooks, render_stmts);
+        let result = analyze_component(
+            component_with_effect_call(
+                "setN",
+                fresh_object_write(),
+                DepsArg::List(DepsList::exact(vec![])),
+            ),
+            &StateValueTransfer,
+            &Config::default(),
+        );
         assert!(
-            InfiniteLoop
-                .check(&RuleCtx::new(&prog("C", &result), crate::test_support::C))
-                .is_empty(),
+            loops_of(&result).is_empty(),
             "deps:[] = one-shot, never infinite"
         );
     }
 
     #[test]
-    fn widened_different_state_no_warning() {
+    fn a_call_of_another_name_no_warning() {
         let eff_cfg = crate::test_support::single_block_cfg(vec![Stmt::ExprStmt(
             Expr::Call {
                 fn_: Box::new(Expr::Var("setOther".to_string())),
@@ -956,24 +823,12 @@ mod tests {
             },
             None,
         )]);
-
-        let hooks = vec![HookEntry::Effect {
-            label: 1,
-            body_cfg: eff_cfg,
-            deps: DepsArg::Absent,
-            span: None,
-        }];
-        let render_stmts = vec![Stmt::Let {
-            var: "setN".to_string(),
-            rhs: Expr::StateSetter(0),
-            span: None,
-        }];
-        let result = make_result_with_widened(HashSet::from([0]), hooks, render_stmts);
-        assert!(
-            InfiniteLoop
-                .check(&RuleCtx::new(&prog("C", &result), crate::test_support::C))
-                .is_empty()
+        let result = analyze_component(
+            component_with_effect(eff_cfg, DepsArg::Absent),
+            &StateValueTransfer,
+            &Config::default(),
         );
+        assert!(loops_of(&result).is_empty());
     }
 
     #[test]
@@ -1151,21 +1006,13 @@ mod tests {
             }],
         };
 
-        let hooks = vec![HookEntry::Effect {
-            label: 1,
-            body_cfg: eff_cfg,
-            deps: DepsArg::Absent,
-            span: None,
-        }];
-        let render_stmts = vec![Stmt::Let {
-            var: "setN".to_string(),
-            rhs: Expr::StateSetter(0),
-            span: None,
-        }];
-        let result = make_result_with_widened(HashSet::from([0]), hooks, render_stmts);
-        let diags = InfiniteLoop.check(&RuleCtx::new(&prog("C", &result), crate::test_support::C));
+        let result = analyze_component(
+            component_with_effect(eff_cfg, DepsArg::Absent),
+            &StateValueTransfer,
+            &Config::default(),
+        );
         assert!(
-            !diags.is_empty(),
+            !loops_of(&result).is_empty(),
             "setter in block 1 should be detected via BFS"
         );
     }
@@ -1186,6 +1033,16 @@ mod tests {
             },
             Stmt::ExprStmt(call_expr, None),
         ]);
+        component_with_setter_effect(setter_name, eff_cfg, deps)
+    }
+
+    /// Component `C` with state 0 (`n`, init 0, setter `setN`) and one
+    /// effect (label 1) running `eff_cfg`.
+    fn component_with_effect(eff_cfg: CFG, deps: DepsArg) -> ComponentIR {
+        component_with_setter_effect("setN", eff_cfg, deps)
+    }
+
+    fn component_with_setter_effect(setter_name: &str, eff_cfg: CFG, deps: DepsArg) -> ComponentIR {
         let hooks = vec![
             HookEntry::State {
                 label: 0,
@@ -1781,100 +1638,44 @@ mod tests {
         );
     }
 
-    fn setter_cfg(setter_var: &str) -> CFG {
-        crate::test_support::single_block_cfg(vec![Stmt::ExprStmt(
-            Expr::Call {
-                fn_: Box::new(Expr::Var(setter_var.to_string())),
-                args: vec![Expr::Lit(Prim::Int(1))],
-            },
-            None,
-        )])
+    /// `setN(n + 1)`.
+    fn growing_write() -> Expr {
+        Expr::Call {
+            fn_: Box::new(Expr::Var("setN".to_string())),
+            args: vec![Expr::BinOp {
+                op: crate::ir::expr::BinOp::Add,
+                lhs: Box::new(Expr::StateVal(0)),
+                rhs: Box::new(Expr::Lit(Prim::Int(1))),
+            }],
+        }
     }
 
+    /// A no-deps effect that grows its slot loops, and a click handler that
+    /// writes the slot too changes nothing: the churn graph claims the loop
+    /// either way. These were the widening arm's handler-note tests (#265),
+    /// run on a constant write a hand-widened slot made look like growth; the
+    /// note went with the arm.
     #[test]
-    fn handler_note_attached_when_handler_calls_setter() {
-        let hooks = vec![
-            HookEntry::Effect {
-                label: 1,
-                body_cfg: setter_cfg("setN"),
-                deps: DepsArg::Absent,
-                span: None,
-            },
-            HookEntry::Handler {
-                label: 2,
-                event: "click".to_string(),
-                body_cfg: setter_cfg("setN"),
-                span: None,
-                dom_event: true,
-            },
-        ];
-        let render_stmts = vec![
-            Stmt::Let {
-                var: "n".to_string(),
-                rhs: Expr::StateVal(0),
-                span: None,
-            },
-            Stmt::Let {
-                var: "setN".to_string(),
-                rhs: Expr::StateSetter(0),
-                span: None,
-            },
-        ];
-        let result = make_result_with_widened(HashSet::from([0]), hooks, render_stmts);
-        let diags = InfiniteLoop.check(&RuleCtx::new(&prog("C", &result), crate::test_support::C));
-
-        assert!(!diags.is_empty(), "should detect infinite loop");
-        let handler_notes: Vec<_> = diags[0]
-            .notes
-            .iter()
-            .filter(|n| matches!(n.step, crate::rules::Step::Handler { .. }))
-            .collect();
-        assert_eq!(handler_notes.len(), 1, "one Handler step for the handler");
-        assert_eq!(
-            handler_notes[0].hook_label,
-            Some(2),
-            "note → handler label 2"
-        );
-        // The fixpoint evidence closes the chain (ADR-019).
-        assert!(
-            diags[0]
-                .notes
-                .iter()
-                .any(|n| matches!(n.step, crate::rules::Step::Widen { slot: 0, .. })),
-            "widen step present"
-        );
-    }
-
-    #[test]
-    fn no_note_when_no_handler_calls_setter() {
-        let hooks = vec![HookEntry::Effect {
-            label: 1,
-            body_cfg: setter_cfg("setN"),
-            deps: DepsArg::Absent,
-            span: None,
-        }];
-        let render_stmts = vec![
-            Stmt::Let {
-                var: "n".to_string(),
-                rhs: Expr::StateVal(0),
-                span: None,
-            },
-            Stmt::Let {
-                var: "setN".to_string(),
-                rhs: Expr::StateSetter(0),
-                span: None,
-            },
-        ];
-        let result = make_result_with_widened(HashSet::from([0]), hooks, render_stmts);
-        let diags = InfiniteLoop.check(&RuleCtx::new(&prog("C", &result), crate::test_support::C));
-
-        assert!(!diags.is_empty(), "should detect infinite loop");
-        assert!(
-            !diags[0]
-                .notes
-                .iter()
-                .any(|n| matches!(n.step, crate::rules::Step::Handler { .. })),
-            "no Handler step when no handler calls the setter"
-        );
+    fn a_growing_no_deps_write_loops_with_or_without_a_handler_writing_it() {
+        for with_handler in [false, true] {
+            let mut comp = component_with_effect_call("setN", growing_write(), DepsArg::Absent);
+            if with_handler {
+                comp.hooks.push(HookEntry::Handler {
+                    label: 2,
+                    event: "click".to_string(),
+                    body_cfg: crate::test_support::single_block_cfg(vec![Stmt::ExprStmt(
+                        growing_write(),
+                        None,
+                    )]),
+                    span: None,
+                    dom_event: true,
+                });
+            }
+            let result = analyze_component(comp, &StateValueTransfer, &Config::default());
+            assert!(
+                !loops_of(&result).is_empty(),
+                "with a handler: {with_handler}"
+            );
+        }
     }
 }

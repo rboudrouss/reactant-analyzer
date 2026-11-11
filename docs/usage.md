@@ -369,13 +369,13 @@ path from an entry leaves that subtree unclassified.
       "notes": [
         {
           "message": "...",
-          "kind": "handler",
+          "kind": "write",
           "hook_label": 3,
-          "file": "src/users/page.tsx",
-          "line": 3,
-          "col": 2,
-          "event": "click",
-          "slot": 1
+          "file": "src/hooks/useData.ts",
+          "line": 12,
+          "col": 6,
+          "slot": 1,
+          "value_class": "fresh"
         }
       ]
     }
@@ -413,10 +413,12 @@ Semantics:
 - `component_file`: the component's defining file; what `file` meant in v1.
 - `notes`: the finding's witness chain (ADR-019), typed steps explaining
   why the rule fired. `kind` ∈ `binding | resolve | call | write | read |
-  branch | handler | cycle-edge | widen | mutate | capture | init-once`;
-  each kind adds its structured
+  branch | cycle-edge | widen | mutate | capture | init-once | forward |
+  rerender`; each kind adds its structured
   fields (`var`, `name`/`target`, `callee`/`effect_class`,
-  `slot`/`value_class`, `what`, `desc`, `event`, `from`/`to`, `iteration`).
+  `slot`/`value_class`, `what`, `desc`, `from`/`to`, `iteration`).
+  *(v3 drops `handler` and its `event` field: only `infinite-loop`'s
+  widening arm emitted it, retired by #265.)*
   `notes[].file` names the file the step's position points into; it may
   differ from the diagnostic's `file` when the step lives in a cross-file
   inlined hook/utility. `message` is the rendered prose (same text as
@@ -519,8 +521,8 @@ schemars output the validator compiles from.
 ```
   Counter  (3 hooks)  src/Counter.tsx  ✓      ← analyzed, no diagnostic
   Page  (2 hooks)  src/users/page.tsx         ← with diagnostics
-    warn   infinite-loop  [hook:1]  (line 7:2)  this effect keeps pushing ...
-       → handler `onClick` also calls setter ... [hook:3] (line 12:4)
+    warn   infinite-loop  [hook:1]  (line 7:2)  this effect may change state `n` which its deps react to ...
+       → state `n` is written here [hook:1] (line 8:4)
     warn   stale-closure  [hook:4]  (src/hooks/useData.ts:9:2)  ...
 ```
 

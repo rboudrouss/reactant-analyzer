@@ -410,9 +410,9 @@ export function C() {
 
 #[test]
 fn numeric_cycle_not_double_reported() {
-    // Numeric cycles diverge in the fixpoint — the intra arm reports them.
-    // Numeric writes are not reference-fresh, so the churn graph must add
-    // nothing (no duplicate per effect).
+    // A numeric cycle is the churn graph's: no step is proven to settle, so
+    // each of its effects reports it once, as the cycle (#265: the widening
+    // arm reported each effect instead, and the graph stood aside).
     let src = r#"
 import { useState, useEffect } from 'react';
 export function C() {
@@ -428,67 +428,79 @@ export function C() {
         .iter()
         .filter(|(r, _, _)| r == "infinite-loop")
         .collect();
-    assert_eq!(loops.len(), 2, "one intra-arm diag per effect: {diags:?}");
+    assert_eq!(loops.len(), 2, "one diag per effect: {diags:?}");
     assert!(
         loops
             .iter()
-            .all(|(_, _, m)| !m.contains("state-update cycle")),
-        "churn-graph arm must not fire on numeric cycles: {diags:?}"
+            .all(|(_, _, m)| m.contains("state-update cycle")),
+        "each effect reports the cycle: {diags:?}"
     );
 }
 
-// ── ADR-021 §5 regression: a ⊤ dep must not silence a self-write loop ─────────
+// ── ADR-021 §5 regression: a ⊤ dep must not gate an effect ────────────────────
+//
+// The gate (`all_deps_provably_stable`) now stands in front of the
+// cross-component arm only: #265 retired the widening arm these tests used to
+// read, whose claim on a self-write under a prop dep the child's own
+// re-render cannot make (it keeps its props; the oracle converges in 2
+// renders). A write of the parent's slot through a setter prop is the arm the
+// gate still decides.
+
+/// The gated effect: it pushes the parent's slot through its setter prop,
+/// under `deps`.
+fn cross_write_under(deps: &str) -> String {
+    format!(
+        r#"
+import {{ useState, useEffect }} from 'react';
+function C({{ data, setX }}: {{ data: unknown; setX: (f: (x: number) => number) => void }}) {{
+  const label = "fixed";
+  useEffect(() => {{
+    setX((x) => x + 1);
+  }}, [{deps}]);
+  return null;
+}}
+export function P({{ data }}: {{ data: unknown }}) {{
+  const [x, setX] = useState(0);
+  return <div>{{x}}<C data={{data}} setX={{setX}} /></div>;
+}}
+"#
+    )
+}
+
+fn cross_arm_fires(deps: &str) -> bool {
+    infinite_loop_diags(&cross_write_under(deps), "C")
+        .iter()
+        .any(|(rule, _, m)| {
+            rule == "cross-component-infinite-loop" && m.contains("a state setter of parent")
+        })
+}
 
 #[test]
 fn top_prop_dep_does_not_silence_self_write_loop() {
-    // `data` is a prop → ⊤ (Unknown). The effect writes `n` unboundedly on
-    // every run. The retired gate keyed on `is_unstable` (PerRender-only), so a
-    // ⊤ dep read as "not changing", the effect was skipped, and the loop was
-    // never reported — the shipped false negative. `may_change` (⊤ → true) no
-    // longer un-gates it. Reverting the gate to `is_unstable` fails this test.
-    let src = r#"
-import { useState, useEffect } from 'react';
-export function C({ data }: { data: unknown }) {
-  const [n, setN] = useState(0);
-  useEffect(() => {
-    setN(n + 1);
-  }, [data]);
-  return <div>{n}</div>;
-}
-"#;
-    let diags = infinite_loop_diags(src, "C");
+    // `data` is a prop → ⊤ (Unknown). The retired gate keyed on `is_unstable`
+    // (PerRender-only), so a ⊤ dep read as "not changing", the effect was
+    // skipped, and the write was never reported — the shipped false negative.
+    // `may_change` (⊤ → true) no longer un-gates it. Reverting the gate to
+    // `is_unstable` fails this test.
     assert!(
-        diags.iter().any(|(rule, _, _)| rule == "infinite-loop"),
-        "expected an infinite-loop diagnostic for the ⊤-dep self-write loop, got: {diags:?}"
+        cross_arm_fires("data"),
+        "{:?}",
+        infinite_loop_diags(&cross_write_under("data"), "C")
     );
+    // Control: a provably stable dep alone gates the effect.
+    assert!(!cross_arm_fires("label"));
 }
 
 #[test]
 fn stable_dep_alongside_top_dep_does_not_gate_self_write_loop() {
     // Quantifier sibling of the ⊤ FN above: React re-runs an effect when ANY
     // dep changed (OR semantics), so one provably-stable dep (`label`) among
-    // moving ones gates nothing — `data` (⊤) can still re-trigger the effect
-    // on every render. The first cut of the gate (`all_deps_may_change`)
-    // skipped as soon as ONE dep was provably stable, resurrecting the FN one
-    // stable dep away. The sound gate skips only when EVERY dep is provably
-    // stable. Reverting `all_deps_provably_stable` to the any-stable
-    // quantifier fails this test.
-    let src = r#"
-import { useState, useEffect } from 'react';
-export function C({ data }: { data: unknown }) {
-  const label = "fixed";
-  const [n, setN] = useState(0);
-  useEffect(() => {
-    setN(n + 1);
-  }, [label, data]);
-  return <div>{n}</div>;
-}
-"#;
-    let diags = infinite_loop_diags(src, "C");
-    assert!(
-        diags.iter().any(|(rule, _, _)| rule == "infinite-loop"),
-        "expected an infinite-loop diagnostic despite the stable dep, got: {diags:?}"
-    );
+    // moving ones gates nothing — `data` (⊤) can still re-trigger the effect.
+    // The first cut of the gate (`all_deps_may_change`) skipped as soon as ONE
+    // dep was provably stable, resurrecting the FN one stable dep away. The
+    // sound gate skips only when EVERY dep is provably stable. Reverting
+    // `all_deps_provably_stable` to the any-stable quantifier fails this test.
+    assert!(cross_arm_fires("label, data"));
 }
 
 /// `...rest` is a new object at every render, so an effect on `[rest]` re-runs

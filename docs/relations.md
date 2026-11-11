@@ -79,7 +79,7 @@ with a `Prop` source is moved by a parent no row names: the effect is in
 
 **The re-run class** — `effect_reruns`, read through `AnalysisResult::rerun`.
 One `Rerun` per effect, computed with the rows, and the first thing every
-reader asks (the churn graph, the fixpoint arm of `infinite-loop`): `MountOnly`
+reader asks (the churn graph, the cross-component arm of `infinite-loop`): `MountOnly`
 (a readable `[]`), `OnSlots` (re-runs when a slot of its rows moves, never in
 the loop without one), or `Always(why)` (re-runs after every render). `why` is
 certain for `NoDeps` (no deps argument) and `FreshDep(i)` (dep `i` is a new

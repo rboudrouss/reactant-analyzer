@@ -220,13 +220,6 @@ pub struct AnalysisResult<D: AbstractDomain> {
     /// Symbols (custom hooks, utilities) inlined into this component's CFGs
     /// during analysis, with their source file (ADR-019).
     pub inline_origins: Vec<InlineOrigin>,
-    /// Join of all values written to the state store by effects in the final fixpoint
-    /// iteration, starting from ⊥ (i.e. excludes the pre-existing state value).
-    ///
-    /// Used by `InfiniteLoop` to distinguish a setter that writes a bounded value
-    /// (branch narrowing held the growth) from one that truly diverges.
-    /// `Bottom` for a label = effect never called that setter in the semantic analysis.
-    pub effect_setter_writes: StateStore<D>,
     /// Joined abstract return value of each inline `FnLit` argument of an
     /// unexpanded custom hook, keyed by `(hook label, argument index)`
     /// (ADR-023 §3 amendment: computed during analysis, where the context
@@ -330,20 +323,5 @@ impl AnalysisResult<StateValue> {
             &self.hooks,
             &self.hook_provenance,
         )
-    }
-
-    /// The value-divergence predicate: the render → effect cycle widened
-    /// `slot`, and what the effects write into it is not bounded either
-    /// (branch narrowing did not hold the growth; ⊥ = the write was not
-    /// seen, so nothing bounds it). Returns the provenance of the widening.
-    ///
-    /// A slot that reaches ⊤ by a plain join never widens, since ⊤ has
-    /// nowhere left to grow. That case is the churn graph's: an unbounded
-    /// write reads as `Maybe` fresh there (`written::value_freshness`), and
-    /// the guard proofs that settle it live there.
-    pub fn diverges(&self, slot: HookLabel) -> Option<&WidenEvent> {
-        let event = self.widen_trace.get(&slot)?;
-        let writes = self.effect_setter_writes.get(slot);
-        (writes.is_bottom_value() || writes.is_unbounded()).then_some(event)
     }
 }

@@ -57,8 +57,7 @@ that writes it (see *Cross-file limits*).
   handlers, at an unknown time [#254](https://github.com/rboudrouss/reactant-analyzer/issues/254):
   its writes reach the state store as possible writes, never as writes of the body that handed it
   over. So a loop it closes in an effect is claimed only through the slot values it moves, as a
-  Warning, and its writes can mask the in-cycle growth a widening claim reads, as a handler's do
-  [#19](https://github.com/rboudrouss/reactant-analyzer/issues/19). The writer relation reads one
+  Warning [#19](https://github.com/rboudrouss/reactant-analyzer/issues/19). The writer relation reads one
   the render hands to such a callee or hook — a literal, or a name bound to one or to a
   `useCallback` value, or one held by an object or array it hands over — as a possible render write
   [#262](https://github.com/rboudrouss/reactant-analyzer/issues/262),

@@ -97,8 +97,6 @@ pub enum Step {
     Read { what: String },
     /// The site is guarded by this branch condition.
     Branch { desc: String },
-    /// Escapes into an event handler that re-triggers the cycle.
-    Handler { event: String, slot: HookLabel },
     /// Churn-graph edge: the cycle continues through this write.
     /// `from`/`to` are qualified display names (possibly cross-component).
     CycleEdge { from: String, to: String },
@@ -140,7 +138,6 @@ impl Step {
             Step::Write { .. } => "write",
             Step::Read { .. } => "read",
             Step::Branch { .. } => "branch",
-            Step::Handler { .. } => "handler",
             Step::CycleEdge { .. } => "cycle-edge",
             Step::Widen { .. } => "widen",
             Step::Mutate { .. } => "mutate",
@@ -205,11 +202,6 @@ impl Step {
             },
             Step::Read { what } => format!("`{}` is read here", names.var(what)),
             Step::Branch { desc } => format!("guarded by {desc}"),
-            Step::Handler { event, slot } => format!(
-                "handler `on{}` also calls this setter and keeps growing state {}",
-                capitalize_first(event),
-                names.slot(*slot)
-            ),
             Step::CycleEdge { from: _, to } => {
                 format!("cycle continues: this effect freshly stores state {to}")
             }
@@ -300,15 +292,6 @@ impl<'a> Names<'a> {
 
     pub fn var<'b>(&'b self, var: &'b str) -> Cow<'b, str> {
         self.vars.name(var)
-    }
-}
-
-/// `click` → `Click` (for `on{Event}` handler names).
-pub(crate) fn capitalize_first(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
     }
 }
 

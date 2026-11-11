@@ -165,12 +165,13 @@ export type NoteKind =
   | "write"
   | "read"
   | "branch"
-  | "handler"
   | "cycle-edge"
   | "widen"
   | "mutate"
   | "capture"
-  | "init-once";
+  | "init-once"
+  | "forward"
+  | "rerender";
 
 /** One typed witness step: `message` is the prose, the rest is its structure. */
 export interface Note {
@@ -190,7 +191,6 @@ export interface Note {
   value_class?: "fresh" | "same-as-current" | "unknown";
   what?: string;
   desc?: string;
-  event?: string;
   from?: string;
   to?: string;
   iteration?: number;

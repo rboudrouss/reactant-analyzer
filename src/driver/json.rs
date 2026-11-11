@@ -95,8 +95,8 @@ struct JsonDiagnostic<'a> {
 #[derive(Serialize)]
 struct JsonNote<'a> {
     message: &'a str,
-    /// binding | resolve | call | write | read | branch | handler |
-    /// cycle-edge | widen | mutate | capture | init-once
+    /// binding | resolve | call | write | read | branch | cycle-edge |
+    /// widen | mutate | capture | init-once | forward | rerender
     kind: &'static str,
     hook_label: Option<usize>,
     /// File the note's position points into — may differ from the
@@ -125,8 +125,6 @@ struct JsonNote<'a> {
     what: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     desc: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    event: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     from: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -173,7 +171,6 @@ fn to_json_note<'a>(
         value_class: None,
         what: None,
         desc: None,
-        event: None,
         from: None,
         to: None,
         iteration: None,
@@ -208,10 +205,6 @@ fn to_json_note<'a>(
         }
         Step::Read { what } => j.what = Some(what),
         Step::Branch { desc } => j.desc = Some(desc),
-        Step::Handler { event, slot } => {
-            j.event = Some(event);
-            j.slot = Some(*slot);
-        }
         Step::CycleEdge { from, to } => {
             j.from = Some(from);
             j.to = Some(to);

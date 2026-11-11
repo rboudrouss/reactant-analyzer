@@ -290,10 +290,9 @@ export function Direct() {
     assert_eq!(loops(&result, "AsyncIife"), direct);
 }
 
-/// An updater reads the slot's converged value, also in the pure-writes
-/// re-run from ⊥: given ⊥, `prev * 2` wrote ⊥, and a ⊥ write vanished in the
-/// join with any bounded write of the slot (`setS0(3)` here), which hid the
-/// growth (oracle fuzz seed 1, program 439).
+/// A bounded write of the slot (`setS0(3)` here) does not hide the growth of
+/// an updater beside it (oracle fuzz seed 1, program 439): the churn graph
+/// claims the loop, no write of it being proven to settle (#265).
 #[test]
 fn a_growing_updater_is_not_hidden_by_a_bounded_write() {
     let src = r#"
@@ -318,7 +317,7 @@ export function InCleanup() {
     let result = analyze(src);
     for c in ["InBody", "InCleanup"] {
         let id = result.component_named(c).unwrap();
-        assert!(result.components[&id].diverges(0).is_some(), "{c}");
+        assert!(result.components[&id].widen_trace.contains_key(&0), "{c}");
         assert_eq!(loops(&result, c), vec![Severity::Warning], "{c}");
     }
 }
@@ -387,7 +386,10 @@ export function Ternary({ c }: { c?: boolean }) {
             assert!(!rows.is_empty(), "{c}: no row writes slot {slot}");
             assert!(rows.iter().all(|w| w.block.is_none()), "{c}: {rows:?}");
         }
-        assert!(comp.diverges(1).is_some(), "{c}: `b` is written under [b]");
+        assert!(
+            comp.widen_trace.contains_key(&1),
+            "{c}: `b` is written under [b]"
+        );
         let sev = loops(&result, c);
         assert!(
             sev.contains(&Severity::Warning) && !sev.contains(&Severity::Error),
@@ -555,10 +557,7 @@ export function Param() {
     let result = analyze(src);
     for c in ["Named", "Param"] {
         let comp = &result.components[&result.component_named(c).unwrap()];
-        assert!(
-            !comp.effect_setter_writes.get(0).is_bottom(),
-            "{c}: no effect write"
-        );
+        // Only an effect write grows `n` past the widening threshold.
         assert!(comp.widen_trace.contains_key(&0), "{c}: `n` did not widen");
     }
 }
