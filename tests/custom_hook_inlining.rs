@@ -596,6 +596,35 @@ fn a_setter_called_off_a_named_hook_result_is_a_write() {
 }
 
 #[test]
+fn a_loop_through_a_setter_only_a_value_holds_is_reported() {
+    // #283: no name of `App` is bound to the setter, only the pair a state
+    // hook returns, kept whole or handed back by a hook. `infinite-loop`
+    // returned before its churn arms, whose rows write through it.
+    for src in [
+        r#"
+        function App() {
+            const t = useState(0);
+            useEffect(() => { t[1](t[0] + 1); });
+            return <div>{t[0]}</div>;
+        }
+        "#,
+        r#"
+        function useCounter() {
+            return useState(0);
+        }
+        function App() {
+            const [n, setN] = useCounter();
+            useEffect(() => { setN(n + 1); });
+            return <div>{n}</div>;
+        }
+        "#,
+    ] {
+        let found = rules_for(src, "App");
+        assert!(fires(&found, "infinite-loop"), "{src}: {found:?}");
+    }
+}
+
+#[test]
 fn an_object_setter_from_a_hook_loops_in_an_effect() {
     let found = rules_for(
         r#"

@@ -70,12 +70,11 @@ impl Rule for InfiniteLoop {
         let cs_vars: HashMap<Var, Vec<crate::engine::setters::SetterProp>> =
             crate::rules::cross_component_setters(comp_result, component);
 
+        // No early return when this is empty: the churn arms below read the
+        // graph, whose rows also write through setters only a value holds
+        // (`t[1]` of a `useState` result kept whole, #283).
         let mut all_setter_vars: HashSet<Var> = local_setter_labels.names().cloned().collect();
         all_setter_vars.extend(cs_vars.keys().cloned());
-
-        if all_setter_vars.is_empty() {
-            return vec![];
-        }
 
         let render_fn_bindings: HashMap<Var, Arc<CFG>> =
             collect_fn_bindings(&comp_result.render_cfg);
