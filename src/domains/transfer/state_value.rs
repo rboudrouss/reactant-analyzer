@@ -6,7 +6,10 @@ use crate::{
     domains::{
         AbstractDomain, AnalysisCtx, Transfer,
         impls::{BoolVal, Interval, SetterVal, Stability, StateValue, StrConst},
-        interp::{alloc_literal, exec_stmt_with_callbacks, returned_sites, run_cfg},
+        interp::{
+            alloc_literal, call_targets, closure_env, exec_stmt_with_callbacks, returned_sites,
+            run_cfg,
+        },
         stores::{AbstractEnv, EnvVal, Heap, HeapValue, Sites, member_key, resolve_locs},
     },
     engine::component_registry::ChildLookup,
@@ -367,7 +370,6 @@ fn havoc_setter_props(
     let Expr::ObjectLit { fields, .. } = props_expr else {
         return;
     };
-    let own = ctx.component;
     let mut setters: Vec<(ComponentId, crate::ir::types::HookLabel)> = Vec::new();
     for (_, v) in fields {
         // Bare setter prop (`<X onOpenChange={setOpen}/>`): the value
@@ -376,7 +378,7 @@ fn havoc_setter_props(
         setters.extend(eval_state_value(v, env, ctx).setters());
         // Everything a function value can smuggle a setter through: spread
         // objects, closures wrapping a setter call, heap-allocated FnLits.
-        collect_escaping_setters(v, env, ctx.heap, own, &mut setters, &mut HashSet::new());
+        collect_escaping_setters(v, env, ctx, &mut setters, &mut HashSet::new());
     }
     for (comp, label) in setters {
         ctx.write_slot(comp, label, StateValue::top());
@@ -394,22 +396,21 @@ fn havoc_setter_props(
 /// names (TODO.md B).
 ///
 /// The walk is bounded by *identity*, not by a depth budget: `walked` records
-/// the `(body, captured-environment)` pairs already visited, so every body is
-/// entered once and the chase always terminates. The old `depth > 4` cut-off
-/// was a budget doing a cycle guard's job — a setter smuggled through a fifth
-/// closure was silently missed, and the analysis then concluded the state was
-/// stable (a false negative, the forbidden direction).
+/// the `(body, env)` pairs already visited, so every body is entered once and
+/// the chase always terminates. The old `depth > 4` cut-off was a budget
+/// doing a cycle guard's job — a setter smuggled through a fifth closure was
+/// silently missed, and the analysis then concluded the state was stable (a
+/// false negative, the forbidden direction).
 fn collect_escaping_setters(
     v: &Expr,
     env: &AbstractEnv<StateValue>,
-    heap: &Heap,
-    own: ComponentId,
+    ctx: &mut AnalysisCtx<StateValue>,
     out: &mut Vec<(ComponentId, crate::ir::types::HookLabel)>,
-    walked: &mut HashSet<(usize, usize)>,
+    walked: &mut HashSet<(usize, Option<ExprId>)>,
 ) {
     match v {
         Expr::FnLit { body_cfg, .. } => {
-            setter_calls_in_cfg(body_cfg, env, None, heap, own, out, walked);
+            setter_calls_in_cfg(body_cfg, env, None, ctx, out, walked);
         }
         Expr::Var(name) => {
             let Some(EnvVal::Loc {
@@ -420,32 +421,30 @@ fn collect_escaping_setters(
                 return;
             };
             for id in ids.iter().copied().collect::<Vec<_>>() {
-                match heap.get(id) {
-                    Some(HeapValue::Fn {
-                        body_cfg, captured, ..
-                    }) => {
-                        setter_calls_in_cfg(body_cfg, env, Some(captured), heap, own, out, walked);
-                    }
-                    Some(HeapValue::Obj(obj)) => {
-                        for ev in obj.values() {
-                            out.extend(ev.as_val().setters());
-                        }
-                    }
-                    _ => {}
+                // A heap closure's calls resolve in the env its body runs in,
+                // its captured names bound as a call of it binds them.
+                let closure = ctx
+                    .heap
+                    .get(id)
+                    .and_then(|c| closure_env(c, env, ctx.component));
+                if let Some((_, body, scope)) = closure {
+                    setter_calls_in_cfg(&body, &scope, Some(id), ctx, out, walked);
+                } else if let Some(HeapValue::Obj(obj)) = ctx.heap.get(id) {
+                    out.extend(obj.values().flat_map(|ev| ev.as_val().setters()));
                 }
             }
         }
         Expr::TSAnnotated(inner) => {
-            collect_escaping_setters(inner, env, heap, own, out, walked);
+            collect_escaping_setters(inner, env, ctx, out, walked);
         }
         Expr::ObjectLit { fields, .. } => {
             for (_, f) in fields {
-                collect_escaping_setters(f, env, heap, own, out, walked);
+                collect_escaping_setters(f, env, ctx, out, walked);
             }
         }
         Expr::ArrayLit { elems, .. } => {
             for e in elems {
-                collect_escaping_setters(e, env, heap, own, out, walked);
+                collect_escaping_setters(e, env, ctx, out, walked);
             }
         }
         // Deliberately NOT the generic `for_each_child` recursion: only
@@ -455,99 +454,49 @@ fn collect_escaping_setters(
     }
 }
 
-/// Walk a function body for calls whose callee resolves to a setter.
-/// `captured` is the closure's creation-time environment (heap `Fn`);
-/// syntactic FnLits resolve through the live `env` instead.
+/// Walk a function body for calls whose callee resolves to a setter, each
+/// resolved as the interpreter resolves a call in a body ([`call_targets`]:
+/// a name's setter binding, else the setters the callee's value holds —
+/// `setN`, `t[1]`, `api.setV`, #286), in `scope`, the env the body runs in:
+/// the live env for a function literal, `closure`'s for a heap closure.
 ///
-/// The `(body, captured)` pair is the memo key, not the body alone: the same
-/// closure body reached under a different creation-time environment resolves
-/// its callees differently, so skipping it would lose a setter.
+/// The `(body, closure)` pair is the memo key, not the body alone: the same
+/// body reached through another closure runs in another env, so skipping it
+/// would lose a setter.
 fn setter_calls_in_cfg(
     cfg: &crate::ir::cfg::CFG,
-    env: &AbstractEnv<StateValue>,
-    captured: Option<&HashMap<Symbol, StateValue>>,
-    heap: &Heap,
-    own: ComponentId,
+    scope: &AbstractEnv<StateValue>,
+    closure: Option<ExprId>,
+    ctx: &mut AnalysisCtx<StateValue>,
     out: &mut Vec<(ComponentId, crate::ir::types::HookLabel)>,
-    walked: &mut HashSet<(usize, usize)>,
+    walked: &mut HashSet<(usize, Option<ExprId>)>,
 ) {
-    let key = (
-        cfg as *const _ as usize,
-        captured.map_or(0, |c| c as *const _ as usize),
-    );
-    if !walked.insert(key) {
+    if !walked.insert((cfg as *const _ as usize, closure)) {
         return;
     }
-    cfg.for_each_expr(&mut |e| setter_calls_in_expr(e, env, captured, heap, own, out, walked));
+    cfg.for_each_expr(&mut |e| setter_calls_in_expr(e, scope, closure, ctx, out, walked));
 }
 
 fn setter_calls_in_expr(
     e: &Expr,
-    env: &AbstractEnv<StateValue>,
-    captured: Option<&HashMap<Symbol, StateValue>>,
-    heap: &Heap,
-    own: ComponentId,
+    scope: &AbstractEnv<StateValue>,
+    closure: Option<ExprId>,
+    ctx: &mut AnalysisCtx<StateValue>,
     out: &mut Vec<(ComponentId, crate::ir::types::HookLabel)>,
-    walked: &mut HashSet<(usize, usize)>,
+    walked: &mut HashSet<(usize, Option<ExprId>)>,
 ) {
     match e {
         Expr::Call { fn_, .. } => {
-            out.extend(callee_setter(fn_, env, captured, heap, own));
-            e.for_each_child(&mut |c| {
-                setter_calls_in_expr(c, env, captured, heap, own, out, walked)
-            });
+            out.extend(call_targets(&StateValueTransfer, fn_, scope, ctx));
+            e.for_each_child(&mut |c| setter_calls_in_expr(c, scope, closure, ctx, out, walked));
         }
         Expr::FnLit { body_cfg, .. } => {
-            setter_calls_in_cfg(body_cfg, env, captured, heap, own, out, walked);
+            setter_calls_in_cfg(body_cfg, scope, closure, ctx, out, walked);
         }
         other => {
-            other.for_each_child(&mut |c| {
-                setter_calls_in_expr(c, env, captured, heap, own, out, walked)
-            });
+            other
+                .for_each_child(&mut |c| setter_calls_in_expr(c, scope, closure, ctx, out, walked));
         }
-    }
-}
-
-/// Resolve a call target to the setters it may be. Resolution order for
-/// variables: the closure's captured environment (creation-time values),
-/// then the live env.
-fn callee_setter(
-    fn_: &Expr,
-    env: &AbstractEnv<StateValue>,
-    captured: Option<&HashMap<Symbol, StateValue>>,
-    heap: &Heap,
-    own: ComponentId,
-) -> Vec<(ComponentId, crate::ir::types::HookLabel)> {
-    match fn_ {
-        // Direct state-binding reference: always the current component's.
-        Expr::StateSetter(l) => vec![(own, *l)],
-        Expr::Var(name) => {
-            if let Some(cap) = captured
-                && let Some(v) = cap.get(name.as_str())
-            {
-                let s = v.setters();
-                if !s.is_empty() {
-                    return s;
-                }
-            }
-            env.lookup(name).setters()
-        }
-        // `props.onDone(...)`: chase the object's heap fields.
-        Expr::FieldAccess { obj, field } => {
-            let Expr::Var(o) = obj.as_ref() else {
-                return Vec::new();
-            };
-            let Some(EnvVal::Loc { sites, .. }) = env.lookup_env_val(o) else {
-                return Vec::new();
-            };
-            let (entries, _) = heap.members(&sites, field);
-            entries
-                .into_iter()
-                .flat_map(|ev| ev.as_val().setters())
-                .collect()
-        }
-        Expr::TSAnnotated(inner) => callee_setter(inner, env, captured, heap, own),
-        _ => Vec::new(),
     }
 }
 
@@ -1617,8 +1566,8 @@ mod tests {
     /// comes from visiting each body once, so nesting costs nothing.
     #[test]
     fn a_deeply_nested_escaping_setter_is_still_found() {
-        let (env, _state, _memo) = empty();
-        let heap = Heap::new();
+        let (env, mut state, memo) = empty();
+        let mut heap = Heap::new();
 
         // `() => setN(1)`, wrapped in six levels of object literal.
         let call_setter = single_block_cfg(
@@ -1647,8 +1596,7 @@ mod tests {
         collect_escaping_setters(
             &value,
             &env,
-            &heap,
-            crate::test_support::C,
+            &mut AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap),
             &mut found,
             &mut HashSet::new(),
         );

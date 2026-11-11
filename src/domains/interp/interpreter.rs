@@ -728,22 +728,35 @@ fn exec_slot_write<T: Transfer>(
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
 ) {
+    for (owner, label) in call_targets(transfer, fn_, env, ctx) {
+        write_one_slot(transfer, owner, label, args, env, ctx, depth);
+    }
+}
+
+/// The slots a call through `fn_` may write, in `env`: those a name is bound
+/// to as a setter, else those the callee's value holds — whatever the callee
+/// is (`setN`, `t[1]`, `api.setV`, a parent's setter prop). The one lookup of
+/// a call's target, for the call itself ([`exec_slot_write`]) and for a call
+/// in a closure that escapes where the analysis cannot follow it (#286).
+///
+/// A name two paths bound to two setters (#202), or a value two call sites
+/// bound to two setters, writes one of them: each candidate is a target.
+pub(crate) fn call_targets<T: Transfer>(
+    transfer: &T,
+    fn_: &Expr,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+) -> Vec<(crate::ir::ComponentId, crate::ir::types::HookLabel)> {
     let bound = match fn_ {
         Expr::Var(name) => env.setter_labels(name),
         _ => None,
     };
-    // A name two paths bound to two setters (#202), or a value two call sites
-    // bound to two setters, writes one of them: each candidate gets the
-    // write, a join like every slot write.
-    let targets = match bound {
+    match bound {
         Some(labels) => labels.iter().map(|&l| (ctx.component, l)).collect(),
         None => transfer
             .eval_expr(fn_, env, ctx)
             .as_state_value()
             .map_or_else(Vec::new, |sv| sv.setters()),
-    };
-    for (owner, label) in targets {
-        write_one_slot(transfer, owner, label, args, env, ctx, depth);
     }
 }
 
@@ -1182,54 +1195,11 @@ fn exec_heap_fns<T: Transfer>(
     // `None` until a body is run, as in [`returned_sites`].
     let mut placed: Option<Option<Sites>> = None;
     for id in ids {
-        if let Some(HeapValue::Fn {
-            params,
-            body_cfg,
-            captured,
-            captured_locs,
-            owner,
-            captured_slots,
-        }) = ctx.heap.get(id)
+        if let Some((params, body_cfg, mut sub_env)) = ctx
+            .heap
+            .get(id)
+            .and_then(|closure| closure_env(closure, env, ctx.component))
         {
-            let params = params.clone();
-            let body_cfg = Arc::clone(body_cfg);
-            let captured = captured.clone();
-            let captured_locs = captured_locs.clone();
-            let captured_slots = captured_slots.clone();
-            // A closure captures variables (#215): called in the component
-            // that created it, a captured name is also what it holds at the
-            // call — the render's exit env, for a call in an effect or a
-            // handler, holds every assignment made after the creation.
-            let live: HashSet<Symbol> = if *owner == ctx.component {
-                captured
-                    .keys()
-                    .filter(|v| env.contains(v))
-                    .cloned()
-                    .collect()
-            } else {
-                HashSet::new()
-            };
-            let mut sub_env = env.clone();
-            for (var, val) in captured {
-                let mut val = T::Domain::from_state_value(val);
-                let mut sites = captured_locs.get(&var).cloned();
-                if live.contains(&var) {
-                    val = val.join(&env.lookup(&var));
-                    let at_call = env.lookup_env_val(&var);
-                    sites =
-                        Sites::join_opt(sites.as_ref(), at_call.as_ref().and_then(EnvVal::sites));
-                }
-                sub_env.bind_locs(var.clone(), sites);
-                sub_env.extend(var, val);
-            }
-            // The creation-time certificates, not the call site's: the
-            // body's `a` is the one it closed over — and, for a name the
-            // call also reads, only where both agree.
-            for (var, label) in captured_slots {
-                if !live.contains(&var) || env.slot_label(&var) == Some(label) {
-                    sub_env.bind_slot(var, label);
-                }
-            }
             bind_params(&mut sub_env, &params, args);
             let run = run_cfg(transfer, &body_cfg, sub_env, ctx, depth + 1);
             let sites = returned_sites(transfer, &body_cfg, &run.exits, ctx);
@@ -1245,6 +1215,59 @@ fn exec_heap_fns<T: Transfer>(
     returned
         .filter(|v| !v.is_bottom())
         .map(|v| EnvVal::located(placed.flatten(), v))
+}
+
+/// The parameters and body of `closure`, a heap `Fn`, and the env its body
+/// runs in when called from `env` in `component`, parameters not yet bound:
+/// `env` with each name the closure captured bound to what it captured — its
+/// value, its sites, its slot certificate. `None` when `closure` is no
+/// function.
+pub(crate) fn closure_env<D: AbstractDomain>(
+    closure: &HeapValue,
+    env: &AbstractEnv<D>,
+    component: crate::ir::ComponentId,
+) -> Option<(Vec<Symbol>, Arc<CFG>, AbstractEnv<D>)> {
+    let HeapValue::Fn {
+        params,
+        body_cfg,
+        captured,
+        captured_locs,
+        owner,
+        captured_slots,
+    } = closure
+    else {
+        return None;
+    };
+    // A closure captures variables (#215): called in the component that
+    // created it, a captured name is also what it holds at the call — the
+    // render's exit env, for a call in an effect or a handler, holds every
+    // assignment made after the creation.
+    let live: HashSet<&Symbol> = if *owner == component {
+        captured.keys().filter(|v| env.contains(v)).collect()
+    } else {
+        HashSet::new()
+    };
+    let mut sub_env = env.clone();
+    for (var, val) in captured {
+        let mut val = D::from_state_value(val.clone());
+        let mut sites = captured_locs.get(var).cloned();
+        if live.contains(var) {
+            val = val.join(&env.lookup(var));
+            let at_call = env.lookup_env_val(var);
+            sites = Sites::join_opt(sites.as_ref(), at_call.as_ref().and_then(EnvVal::sites));
+        }
+        sub_env.bind_locs(var.clone(), sites);
+        sub_env.extend(var.clone(), val);
+    }
+    // The creation-time certificates, not the call site's: the body's `a` is
+    // the one it closed over — and, for a name the call also reads, only
+    // where both agree.
+    for (var, &label) in captured_slots {
+        if !live.contains(var) || env.slot_label(var) == Some(label) {
+            sub_env.bind_slot(var.clone(), label);
+        }
+    }
+    Some((params.clone(), Arc::clone(body_cfg), sub_env))
 }
 
 /// The allocation sites a body run may return: the join over its reached

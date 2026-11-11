@@ -2555,6 +2555,32 @@ export function App() {
     assert!(diags.is_empty(), "{diags:?}");
 }
 
+// ── #286: a closure an unknown child holds calls a setter through a member ───
+
+/// `Primitive.Root` is no component the analysis knows, so the closure it
+/// receives may run at any time, and the setter it calls — the tuple's
+/// `t[1]` — may write `v` anything. While the escape resolved only names and
+/// `obj.field` callees, `v` stayed 0, `if (v > 0)` stayed false, and the loop
+/// read as `verified`. A possible write: a Warning.
+#[test]
+fn a_member_call_in_a_closure_an_unknown_child_holds_feeds_the_loop() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function App() {
+  const [v, setV] = useState(0);
+  const t = [v, setV];
+  useEffect(() => { if (v > 0) setV(v + 1); }, [v]);
+  return <Primitive.Root api={{ run: () => t[1](1) }} />;
+}
+"#;
+    let diags = infinite_loop_diags(src, "App");
+    assert!(
+        diags.iter().any(|(_, s, _)| *s == Severity::Warning)
+            && !diags.iter().any(|(_, s, _)| *s == Severity::Error),
+        "{diags:?}"
+    );
+}
+
 // ── #253: a closure reached through a local array or a local higher-order fn ─
 
 /// The closure runs in the effect, every run: through the array's entries an
