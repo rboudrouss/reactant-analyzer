@@ -45,6 +45,7 @@ reactant check src/ --ignore-rule derived-state  # all but this one
 | Flag | Effect |
 |------|--------|
 | `--format human\|json` | Output format. `json` prints exactly one JSON document on stdout (schema below); all warnings/verbose go to stderr. Default `human`. |
+| `--per-component` | One row per component a finding is reported through, in both formats. By default a finding inside a hook that several components inline is one row naming them (`` [reported through `<A>` and `<B>`] ``, a count past three), shown at the strongest level any of them reports it; see [Shared hooks](#a-finding-inside-a-shared-hook). |
 | `--fail-on error\|warning\|never` | Which findings make the exit code `1`. Default `warning` (errors *or* warnings fail). `Info` diagnostics never affect the exit code. |
 | `--project auto\|vite\|next\|plain` | Project-kind handling. `auto` (default) detects from marker files; `vite`/`next` force those conventions; `plain` disables detection. |
 | `--rule <name>` | Only report this diagnostic (repeatable), an off-by-default one included. An unknown name exits with code 2. |
@@ -345,11 +346,11 @@ live outside the abstract domain. That is why the finding is a `Warning`, and
 why it under-reports rather than over-reports: an unresolved specifier on the
 path from an entry leaves that subtree unclassified.
 
-## JSON schema (v2)
+## JSON schema (v3)
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "files_analyzed": 12,
   "parse_errors": [ { "file": "src/broken.tsx", "message": "...", "analyzed": true } ],
   "diagnostics": [
@@ -357,6 +358,7 @@ path from an entry leaves that subtree unclassified.
       "rule": "infinite-loop",
       "severity": "warning",
       "component": "Page@src/users/page.tsx",
+      "components": ["Page@src/users/page.tsx", "Settings"],
       "file": "src/hooks/useData.ts",
       "component_file": "src/users/page.tsx",
       "line": 10,
@@ -391,8 +393,17 @@ path from an entry leaves that subtree unclassified.
 
 Semantics:
 
+- One object per finding, not per component *(changed in v3)*: a finding
+  inside a hook several components inline is one object, grouped by `rule`,
+  `file`, `line`, `col` and `message` as the human report groups it (see
+  [A finding inside a shared hook](#a-finding-inside-a-shared-hook)).
+  `--per-component` restores v2's one object per component.
 - `component`: registry display name. The `@<file>` suffix appears only when
-  two files define the same component name.
+  two files define the same component name. Of `components`, the first whose
+  own finding has this `severity`, the strongest of the group; `line`, `col`,
+  `hook_label`, `var`, `component_file` and `notes` are that component's.
+- `components`: every component the finding is reported through, in report
+  order; only `component` under `--per-component` *(added in v3)*.
 - `file`: the file `line`/`col` point into, relative to the CWD when possible.
   A custom hook is inlined into each component that calls it (ADR-013), so a
   finding anchored inside one is reported in the *hook's* file, not the
@@ -414,8 +425,9 @@ Semantics:
   no source range.
 - `severity` ∈ `"error" | "warning" | "info"`. Info entries appear only with
   `--info`.
-- `summary.exit_code` mirrors the process exit code under the active
-  `--fail-on`.
+- `summary.errors`/`warnings`/`infos` count the objects in `diagnostics` by
+  `severity`. `summary.exit_code` mirrors the process exit code under the
+  active `--fail-on`, which reads the per-component findings.
 - stdout is exactly one JSON document; parse errors are both listed in
   `parse_errors` and kept off stdout.
 - `parse_errors[].analyzed` says what became of the file. `true`: the parser
@@ -518,6 +530,27 @@ component from there (ADR-013). Trace steps follow the same convention.
 
 On a component-name collision the name is disambiguated automatically
 (`Page@tests/fixtures/page_collision/users/page.tsx`).
+
+### A finding inside a shared hook
+
+A hook is inlined into every component that calls it (ADR-013), so a finding
+in its body is produced once per such component. It is reported once
+(#129, #271): one row per rule, position and message, printed under one of
+those components and naming the others,
+
+```
+    warn   missing-deps  [hook:2]  (src/hooks/useForm.ts:106:2)  `handler` is used ...  [reported through `<Login>` and `<Signup>`]
+```
+
+or counting them past three (`[reported through 87 components]`, listed on
+an `in:` line under `--trace`). The row takes the strongest level any of
+them reports, with that component's own witness: a hook whose loop is proven
+in one caller and only possible in another is an `error` row. Two findings
+that say different things on the same line stay two rows. The summary counts
+these rows and adds the per-component total as `, N component attribution(s)`
+when it differs; `--fail-on` reads the per-component findings, so grouping
+never changes the exit code. `--per-component` prints every component's own
+rows instead.
 
 ### The last line, and when it is withheld
 

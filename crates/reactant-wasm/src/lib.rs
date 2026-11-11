@@ -133,6 +133,8 @@ struct Options {
     #[serde(default)]
     format: Option<String>,
     #[serde(default)]
+    per_component: bool,
+    #[serde(default)]
     fail_on: Option<String>,
     #[serde(default)]
     project: Option<String>,
@@ -307,6 +309,7 @@ fn check_options(o: &Options, cfg: &config::ReactantConfig) -> Result<CheckOptio
             FormatConfig::Human => driver::ReportFormat::Human,
             FormatConfig::Json => driver::ReportFormat::Json,
         },
+        per_component: o.per_component,
         fail_on: match partial.fail_on.unwrap_or(FailOnConfig::Warning) {
             FailOnConfig::Error => driver::FailOn::Error,
             FailOnConfig::Warning => driver::FailOn::Warning,

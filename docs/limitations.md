@@ -471,12 +471,16 @@ finding 87 times. Across the corpus, 6,322 produced findings resolve to 1,170
 distinct source locations, and the effect is worst on the codebases that factor
 their hooks best.
 
-The human report groups by `(rule, file, line, col, message)`. It prints each
-location once with `[in 87 components]`, names the consumers under `--trace`,
-hides the components that add no new line, and counts locations in the summary
-with the row total as a `, N component attribution(s)` tail. **The JSON keeps one
-row per component** (schema v2), and `--fail-on` reads the row counts, so nothing
-about which findings exist is affected [#129](https://github.com/rboudrouss/reactant-analyzer/issues/129).
+Both reports group by `(rule, file, line, col, message)`. Each location is one
+row naming the components it is reported through (`` [reported through `<A>`
+and `<B>`] ``, `[reported through 87 components]` past three, listed under
+`--trace`), at the strongest level any of them reports it. The human report
+hides the components that add no new line and counts locations in the summary
+with the row total as a `, N component attribution(s)` tail; the JSON row lists
+them in `components` (schema v3). `--per-component` restores one row per
+component, and `--fail-on` reads the per-component findings, so nothing about
+which findings exist is affected [#129](https://github.com/rboudrouss/reactant-analyzer/issues/129),
+[#271](https://github.com/rboudrouss/reactant-analyzer/issues/271).
 
 **Every finding carries a position.** Lowering and the CFG splice mint statements
 the source did not write: an `await` hoist, a ternary arm's temp, a spliced

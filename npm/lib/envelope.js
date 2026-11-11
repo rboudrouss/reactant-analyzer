@@ -18,6 +18,7 @@ const BOOL_OPTIONS = [
   "verbose",
   "allRoots",
   "followImports",
+  "perComponent",
   "color",
 ];
 const LIST_OPTIONS = ["entry", "excludeDir", "rule", "ignoreRule"];

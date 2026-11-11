@@ -1,4 +1,4 @@
-//! JSON renderer (schema v2, documented in docs/usage.md).
+//! JSON renderer (schema v3, documented in docs/usage.md).
 //!
 //! The DTOs moved here from the binary verbatim, field for field — the wire
 //! schema, not the crate boundary, is the stability contract. The whole
@@ -12,6 +12,7 @@ use serde::Serialize;
 use crate::ir::FileTable;
 use crate::rules::{Diagnostic, Note, ResolveTarget, Severity, Step};
 
+use super::locations::LocationIndex;
 use super::report::CheckReport;
 
 #[derive(Serialize)]
@@ -64,7 +65,13 @@ struct JsonDiagnostic<'a> {
     rule: &'a str,
     severity: &'static str,
     /// Registry display name; collision-disambiguated (`Page@src/a/page.tsx`).
+    /// The component the row is reported as: of `components`, the first whose
+    /// own row has this `severity`.
     component: &'a str,
+    /// Every component the finding is reported through, in report order
+    /// (schema v3: one row per finding, not per component; `--per-component`
+    /// restores the v2 rows, each with only its own component here).
+    components: Vec<&'a str>,
     /// The file `line`/`col` point into — the anchor's own file, which for a
     /// finding inside a cross-file inlined hook is *not* `component_file`
     /// (schema v2; v1 reported the component's file here and so paired it with
@@ -229,6 +236,7 @@ fn to_json_note<'a>(
 fn to_json_diag<'a>(
     d: &'a Diagnostic,
     component: &'a str,
+    components: Vec<&'a str>,
     file: Option<&'a Path>,
     files: &FileTable,
     display: &dyn Fn(&Path) -> String,
@@ -238,6 +246,7 @@ fn to_json_diag<'a>(
         rule: &d.rule,
         severity: severity_str(d.severity()),
         component,
+        components,
         file: anchor_file.or_else(|| file.map(display)),
         component_file: file.map(display),
         line: d.range.map(|r| r.line),
@@ -253,19 +262,25 @@ fn to_json_diag<'a>(
     }
 }
 
-pub fn render(report: &CheckReport, display: &dyn Fn(&Path) -> String) -> String {
-    let diagnostics: Vec<JsonDiagnostic> = report
-        .components
-        .iter()
-        .flat_map(|c| {
-            c.diagnostics
+pub fn render(
+    report: &CheckReport,
+    locations: &LocationIndex,
+    display: &dyn Fn(&Path) -> String,
+) -> String {
+    let diagnostics: Vec<JsonDiagnostic> = locations
+        .rows(&report.components)
+        .map(|(d, ci, consumers)| {
+            let c = &report.components[ci];
+            let names = consumers
                 .iter()
-                .map(|d| to_json_diag(d, &c.name, c.file.as_deref(), &report.file_table, display))
+                .map(|&o| report.components[o].name.as_str())
+                .collect();
+            to_json_diag(d, &c.name, names, c.file.as_deref(), &report.file_table, display)
         })
         .collect();
 
     let doc = JsonReport {
-        version: 2,
+        version: 3,
         files_analyzed: report.files_analyzed,
         parse_errors: report
             .parse_errors
@@ -293,9 +308,9 @@ pub fn render(report: &CheckReport, display: &dyn Fn(&Path) -> String) -> String
             withheld_examples: &f.withheld_examples,
         }),
         summary: JsonSummary {
-            errors: report.errors,
-            warnings: report.warnings,
-            infos: report.infos,
+            errors: locations.errors,
+            warnings: locations.warnings,
+            infos: locations.infos,
             components_analyzed: report.components.len(),
             exit_code: report.exit_code,
         },

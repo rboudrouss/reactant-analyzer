@@ -73,6 +73,9 @@ pub struct CheckOptions {
     /// report still covers only the components defined in the named paths.
     pub follow_imports: bool,
     pub format: ReportFormat,
+    /// `--per-component`: one row per component a finding is reported
+    /// through, instead of one row per finding (#271).
+    pub per_component: bool,
     pub fail_on: FailOn,
     pub project: ProjectOverride,
     /// Resolved by the host (tty + NO_COLOR + --no-color); the driver never
@@ -515,6 +518,9 @@ pub fn run_check(
 }
 
 fn render(report: &CheckReport, opts: &CheckOptions, display: &dyn Fn(&Path) -> String) -> String {
+    // One grouping for both renderers (#271), so the two formats cannot
+    // disagree about which rows a finding is.
+    let locations = locations::LocationIndex::build(&report.components, opts.per_component);
     match opts.format {
         ReportFormat::Human => human::render(
             report,
@@ -522,9 +528,10 @@ fn render(report: &CheckReport, opts: &CheckOptions, display: &dyn Fn(&Path) -> 
             opts.show_clean,
             opts.info,
             opts.trace,
+            &locations,
             display,
         ),
-        ReportFormat::Json => json::render(report, display),
+        ReportFormat::Json => json::render(report, &locations, display),
     }
 }
 

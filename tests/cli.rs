@@ -44,7 +44,7 @@ fn check_vite_project_json() {
 
     let doc: serde_json::Value =
         serde_json::from_str(&stdout(&out)).expect("stdout must be valid JSON");
-    assert_eq!(doc["version"], 2);
+    assert_eq!(doc["version"], 3);
     assert_eq!(doc["files_analyzed"], 2);
     assert_eq!(doc["parse_errors"].as_array().unwrap().len(), 0);
 

@@ -66,6 +66,11 @@ pub struct CheckArgs {
     #[arg(long, value_enum)]
     pub format: Option<OutputFormat>,
 
+    /// One row per component a finding is reported through, instead of one
+    /// row per finding naming them (a hook inlined into many components)
+    #[arg(long)]
+    pub per_component: bool,
+
     /// Findings severity that makes the exit code non-zero (default: warning)
     #[arg(long, value_enum)]
     pub fail_on: Option<FailOn>,
@@ -175,6 +180,7 @@ pub fn run(mut args: CheckArgs) -> i32 {
             FormatConfig::Human => driver::ReportFormat::Human,
             FormatConfig::Json => driver::ReportFormat::Json,
         },
+        per_component: args.per_component,
         fail_on: match partial.fail_on.unwrap_or(FailOnConfig::Warning) {
             FailOnConfig::Error => driver::FailOn::Error,
             FailOnConfig::Warning => driver::FailOn::Warning,

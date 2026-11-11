@@ -55,7 +55,9 @@ function analyzeNow(source, { bin = reactantBinary() } = {}) {
   return new Promise((res, rej) => {
     execFile(
       bin,
-      ["check", "--format", "json", "--fail-on", "never", "--info", "--project", "plain", dir],
+      // `--per-component`: a claim is judged on the component it is made
+      // about, at that component's own level, not at its group's (#271).
+      ["check", "--format", "json", "--per-component", "--fail-on", "never", "--info", "--project", "plain", dir],
       { cwd: dir, maxBuffer: 64 << 20, timeout: 60_000 },
       (err, stdout, stderr) => {
         rmSync(dir, { recursive: true, force: true });

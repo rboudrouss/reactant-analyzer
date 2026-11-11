@@ -42,7 +42,7 @@ impl Severity {
     /// Lattice rank for the `⊓` clamp (ADR-022 §3): Error > Warning > Info.
     /// Distinct from the enum discriminant, whose order (Error < Warning <
     /// Info) the deterministic output sort depends on.
-    fn rank(self) -> u8 {
+    pub(crate) fn rank(self) -> u8 {
         match self {
             Severity::Error => 2,
             Severity::Warning => 1,
