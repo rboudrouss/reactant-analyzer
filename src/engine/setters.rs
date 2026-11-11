@@ -2000,6 +2000,32 @@ pub(crate) fn collect_slot_writers(
             }
         }
         let reach = Reachability::of(cfg);
+        // What a name a write passes surely holds where it runs (#280): its
+        // one binding in this body, run before the write and shadowed by no
+        // nested body; or, in a body that runs after the render, its
+        // must-alias binding there.
+        let dom = crate::engine::DominatorTree::new(cfg);
+        let nested = crate::ir::bindings::nested_bodies(cfg);
+        let after_render = matches!(region, WriterRegion::Effect(_) | WriterRegion::Handler(_));
+        let bound = |e: &Expr, at: Option<(BlockId, usize)>| -> Option<Expr> {
+            let Expr::Var(v) = e.peel_ts() else {
+                return None;
+            };
+            if crate::ir::bindings::binds(v, cfg) {
+                crate::ir::bindings::binding_before(v, cfg, &nested, at?, |a, b| {
+                    dom.dominates(a, b)
+                })
+                .cloned()
+            } else if after_render
+                && !nested
+                    .iter()
+                    .any(|(ps, b)| ps.contains(v) || crate::ir::bindings::binds(v, b))
+            {
+                crate::ir::bindings::must_binding(e, render_cfg, &elsewhere).cloned()
+            } else {
+                None
+            }
+        };
         for (site, target, sole) in sites.into_iter().flat_map(|s| {
             let ts = targets.get(&s.var).cloned().unwrap_or_default();
             let sole = matches!(ts.as_slice(), [t] if t.sure);
@@ -2051,6 +2077,7 @@ pub(crate) fn collect_slot_writers(
                     class_phase(site.class, region),
                     must_read,
                     |e| envs.eval(region, cfg, at, e),
+                    |e| bound(e, at),
                 ),
             };
             let via = {

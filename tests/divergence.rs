@@ -295,6 +295,12 @@ fn a_counter_is_an_error_like_an_object_churn() {
         // on the new value and it steps again (#280).
         "const [n, setN] = useState(0); useEffect(() => setN(n + 1), [n]); \
          return <button onClick={() => setN(0)}>{n}</button>;",
+        // The step through the name it is written into, in the effect or in
+        // the render (#280).
+        "const [n, setN] = useState(0); \
+         useEffect(() => { const next = n + 1; setN(next); }, [n]); return <p>{n}</p>;",
+        "const [n, setN] = useState(0); const next = n + 1; \
+         useEffect(() => setN(next), [n]); return <p>{n}</p>;",
     ] {
         assert_eq!(
             severities_of(body),
@@ -338,6 +344,12 @@ fn a_step_short_of_the_proof_is_no_error() {
         "const [n, setN] = useState(0); const r = useRef(null); \
          useEffect(() => { setN(n + 1); r.current?.click(); }, [n]); \
          return <button ref={r} onClick={() => setN(0)}>{n}</button>;",
+        // A name bound after the write, or to an operand moved since (#280).
+        "const [n, setN] = useState(0); \
+         useEffect(() => { setN(next); var next = n + 1; }, [n]); return <p>{n}</p>;",
+        "const [n, setN] = useState(0); \
+         useEffect(() => { let k = 0; const next = n + k; k = 1; setN(next); }, [n]); \
+         return <p>{n}</p>;",
         "const [n, setN] = useState(0); useEffect(() => setN(n + (on ? 1 : 0)), [n]); return <p>{n}</p>;",
         "const [n, setN] = useState(0); useEffect(() => setN(n + 0.5), [n]); return <p>{n}</p>;",
         "const [n, setN] = useState(0); useEffect(() => { setN(n + 1); setN(n + 2); }, [n]); \

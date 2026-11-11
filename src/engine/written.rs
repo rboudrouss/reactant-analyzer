@@ -107,7 +107,9 @@ pub fn keeps_initial<'a>(mut rows: impl Iterator<Item = &'a Written>, escapes: b
 /// `must_read` the slot an expression reads on every path
 /// ([`must_slot_read`](crate::ir::bindings::must_slot_read)), and `phase` when
 /// the write runs: together they say whether the write stores the slot's own
-/// content, or that content moved by a step.
+/// content, or that content moved by a step. `bound` is what a name the write
+/// passes surely holds where it runs, so a step written into a name or an
+/// updater bound to one is the write's step too (#280).
 pub fn classify(
     arg: Option<&Expr>,
     updater: &Updater,
@@ -115,6 +117,7 @@ pub fn classify(
     phase: WriterPhase,
     must_read: impl Fn(&Expr) -> Option<HookLabel>,
     value_of: impl Fn(&Expr) -> StateValue,
+    bound: impl Fn(&Expr) -> Option<Expr>,
 ) -> Written {
     // The slot's own read, in whatever render's closure the write runs.
     let own_read = own_slot.is_some_and(|slot| stores_own_content(arg, slot, &must_read));
@@ -149,16 +152,39 @@ pub fn classify(
             returns_value(body_cfg),
             returns_step(body_cfg, params),
         ),
-        (_, Updater::Functional(body)) => {
-            returned(returns_change(body, &[]), returns_value(body), None)
-        }
+        (other, Updater::Functional(body)) => returned(
+            returns_change(body, &[]),
+            returns_value(body),
+            match bound(other) {
+                Some(Expr::FnLit {
+                    params, body_cfg, ..
+                }) => returns_step(&body_cfg, &params),
+                _ => None,
+            },
+        ),
         (other, Updater::Unknown) => {
             let value = value_of(other);
-            // A closure of an older render reads that render's value (#205):
-            // its read moved by a step is no step from what the slot holds.
-            let step = own_slot
-                .filter(|_| reads_committed_state(phase))
-                .and_then(|slot| step_of(other, &|e| must_read(e) == Some(slot), &value_of));
+            let step = match bound(other) {
+                // A function argument is an updater, whatever the walk could
+                // certify from where it stood: React calls it.
+                Some(Expr::FnLit {
+                    params, body_cfg, ..
+                }) => returns_step(&body_cfg, &params),
+                // A closure of an older render reads that render's value
+                // (#205): its read moved by a step is no step from what the
+                // slot holds. A name steps as the expression it is bound to,
+                // its operands read as written: one reassigned since holds
+                // another value.
+                held => own_slot
+                    .filter(|_| reads_committed_state(phase))
+                    .and_then(|slot| {
+                        let is_read = |e: &Expr| must_read(e) == Some(slot);
+                        match held {
+                            Some(held) => step_of(&held, &is_read, &StateValue::from_init),
+                            None => step_of(other, &is_read, &value_of),
+                        }
+                    }),
+            };
             Written {
                 change: value_change(&value, identity),
                 value,
@@ -668,6 +694,18 @@ mod tests {
         panic!("a function literal is classified without an env")
     }
 
+    /// `classify` with no name the tests pass bound to anything known.
+    fn classify(
+        arg: Option<&Expr>,
+        updater: &Updater,
+        own_slot: Option<HookLabel>,
+        phase: WriterPhase,
+        must_read: impl Fn(&Expr) -> Option<HookLabel>,
+        value_of: impl Fn(&Expr) -> StateValue,
+    ) -> Written {
+        super::classify(arg, updater, own_slot, phase, must_read, value_of, |_| None)
+    }
+
     /// The slot the tests write, the writer's own.
     const T: Option<HookLabel> = Some(0);
 
@@ -839,6 +877,49 @@ mod tests {
         );
         assert_eq!(step(&updater(int(0), "p")), None);
         assert_eq!(step(&updater(bin(BinOp::Mul, p(), int(2)), "p")), None);
+    }
+
+    /// A name steps as what it is surely bound to: `const next = x + 1`, an
+    /// updater passed by name. An operand the binding reads from another
+    /// name is no step: it may have moved since (#280).
+    #[test]
+    fn a_name_carries_the_step_it_is_bound_to() {
+        let x = || Expr::Var("x".into());
+        let name = Expr::Var("next".into());
+        let step_through = |held: Expr| {
+            super::classify(
+                Some(&name),
+                &Updater::Unknown,
+                T,
+                FX,
+                states,
+                StateValue::from_init,
+                move |_| Some(held.clone()),
+            )
+            .step
+        };
+        assert_eq!(
+            step_through(bin(BinOp::Add, x(), int(1))),
+            Some(Interval::point(1.0))
+        );
+        assert_eq!(
+            step_through(bin(BinOp::Add, x(), Expr::Var("k".into()))),
+            None
+        );
+        let inc = updater(bin(BinOp::Add, Expr::Var("p".into()), int(1)), "p");
+        let Expr::FnLit { body_cfg, .. } = &inc else {
+            unreachable!()
+        };
+        let named = super::classify(
+            Some(&Expr::Var("inc".into())),
+            &Updater::Functional(std::sync::Arc::clone(body_cfg)),
+            T,
+            FX,
+            states,
+            opaque,
+            |_| Some(inc.clone()),
+        );
+        assert_eq!(named.step, Some(Interval::point(1.0)));
     }
 
     #[test]

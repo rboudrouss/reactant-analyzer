@@ -406,7 +406,7 @@ fn bound_below(var: &str, cfg: &CFG) -> bool {
 }
 
 /// Does this body bind or assign `var` at its own level?
-fn binds(var: &str, cfg: &CFG) -> bool {
+pub fn binds(var: &str, cfg: &CFG) -> bool {
     cfg.blocks.values().any(|b| {
         b.stmts.iter().any(|s| {
             matches!(
@@ -415,6 +415,46 @@ fn binds(var: &str, cfg: &CFG) -> bool {
             )
         })
     })
+}
+
+/// What `var` holds at the statement `at` of `scope`: its one binding there,
+/// run before `at` — in a block `dominates` puts first, or earlier in `at`'s
+/// own block — with no binder of the name in a body of `elsewhere`. A
+/// binding after `at` is refused: the lowering keeps no `var` hoisting, so
+/// the name may not hold it yet.
+pub fn binding_before<'c>(
+    var: &str,
+    scope: &'c CFG,
+    elsewhere: &[(&[Var], &CFG)],
+    at: (BlockId, usize),
+    dominates: impl Fn(BlockId, BlockId) -> bool,
+) -> Option<&'c Expr> {
+    if elsewhere
+        .iter()
+        .any(|(params, body)| params.iter().any(|p| p == var) || binds(var, body))
+    {
+        return None;
+    }
+    let mut found = None;
+    for (&bid, block) in &scope.blocks {
+        for (i, stmt) in block.stmts.iter().enumerate() {
+            if let Stmt::Let { var: v, rhs, .. } | Stmt::Assign { var: v, rhs, .. } = stmt
+                && v == var
+            {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some((bid, i, rhs.peel_ts()));
+            }
+        }
+    }
+    let (bid, i, rhs) = found?;
+    let before = if bid == at.0 {
+        i < at.1
+    } else {
+        dominates(bid, at.0)
+    };
+    before.then_some(rhs)
 }
 
 /// Call `f` for every function body one level down from `cfg`.
