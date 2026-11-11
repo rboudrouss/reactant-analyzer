@@ -46,6 +46,29 @@ fn synthetic_key(builder: &mut BlockBuilder, prefix: &str) -> String {
     format!("{prefix}{}", builder.next_expr_id().0)
 }
 
+/// The value a rest element binds: a new object or array at every
+/// evaluation, holding what the source holds (#295). `{ a, ...rest } = o` is
+/// `{ ...o }` with `a` dropped, and `[a, ...rest] = xs` is `[...xs]` with the
+/// first entries dropped; keeping them is the sound over-approximation (a
+/// superset of the members, each with its value), while binding the source
+/// itself claimed `rest` *is* `o`, the same reference at every render.
+pub(super) fn rest_copy(source: Expr, array: bool, builder: &mut BlockBuilder) -> Expr {
+    if array {
+        Expr::ArrayLit {
+            id: builder.next_expr_id(),
+            elems: vec![source],
+            arity: Arity::AtLeast(0),
+            spread_at: vec![0],
+        }
+    } else {
+        let key = synthetic_key(builder, SPREAD_KEY_PREFIX);
+        Expr::ObjectLit {
+            id: builder.next_expr_id(),
+            fields: vec![(key, source)],
+        }
+    }
+}
+
 /// The member a property key names when the source spells it: a name, a
 /// string, a non-negative integer (`{ 0: a }`, `{ [1]: b }`), or a template
 /// with no substitution (#76). `None` for a key only a run can compute.
@@ -1120,11 +1143,11 @@ fn lower_assignment_target(
                 };
                 lower_assignment_maybe_default(elem, elem_rhs, builder);
             }
-            // `[a, ...rest] = xs`: bind `rest` to the source itself — a sound
-            // over-approximation (its elements are a subset of the source's),
-            // matching what `lower_binding_pattern` does for object rest.
+            // `[a, ...rest] = xs`: `rest` is a new array of the remaining
+            // entries ([`rest_copy`]), as in `lower_binding_pattern`.
             if let Some(rest) = &arr.rest {
-                lower_assignment_target(&rest.target, Expr::Var(temp.clone()), None, builder);
+                let copy = rest_copy(Expr::Var(temp.clone()), true, builder);
+                lower_assignment_target(&rest.target, copy, None, builder);
             }
         }
         AssignmentTarget::ObjectAssignmentTarget(obj) => {
@@ -1172,7 +1195,8 @@ fn lower_assignment_target(
                 }
             }
             if let Some(rest) = &obj.rest {
-                lower_assignment_target(&rest.target, Expr::Var(temp.clone()), None, builder);
+                let copy = rest_copy(Expr::Var(temp.clone()), false, builder);
+                lower_assignment_target(&rest.target, copy, None, builder);
             }
         }
         // Member targets nested in a pattern (`[obj.f] = xs`).

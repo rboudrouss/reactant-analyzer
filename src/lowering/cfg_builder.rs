@@ -14,7 +14,7 @@ use crate::{
         types::{BlockId, ExprId},
     },
     lowering::JsxOrigins,
-    lowering::expr_lower::{assign_target_ident, empty_cfg, lower_expr, property_name},
+    lowering::expr_lower::{assign_target_ident, empty_cfg, lower_expr, property_name, rest_copy},
 };
 
 // ── Allocation-site ids ───────────────────────────────────────────────────────
@@ -902,12 +902,13 @@ fn lower_binding_pattern(
                 let elem_span = builder.span_at(elem.span().start).or(span);
                 lower_binding_pattern(elem, elem_rhs, elem_span, builder);
             }
-            // `const [a, ...rest] = xs`: bind `rest` to the source — the same
-            // sound over-approximation the object pattern uses for its rest.
-            // Leaving it unbound loses forwarded setters.
+            // `const [a, ...rest] = xs`: `rest` is a new array holding what
+            // `xs` holds ([`rest_copy`], #295). Leaving it unbound loses
+            // forwarded setters.
             if let Some(rest) = &arr.rest {
                 let rest_span = builder.span_at(rest.span.start).or(span);
-                lower_binding_pattern(&rest.argument, Expr::Var(temp.clone()), rest_span, builder);
+                let copy = rest_copy(Expr::Var(temp.clone()), true, builder);
+                lower_binding_pattern(&rest.argument, copy, rest_span, builder);
             }
         }
         BindingPattern::ObjectPattern(obj) => {
@@ -935,14 +936,15 @@ fn lower_binding_pattern(
                 let prop_span = builder.span_at(prop.span.start).or(span);
                 lower_binding_pattern(&prop.value, field_rhs, prop_span, builder);
             }
-            // Rest element `{ a, ...rest }`: bind `rest` to the source object
-            // itself — a sound over-approximation (rest has a subset of the
-            // fields, each with the same value). Dropping it unbinds `props`
-            // in wrapper components (`({...props}) => <X {...props}/>`) and
-            // loses forwarded setters (TODO.md F4).
+            // Rest element `{ a, ...rest }`: a new object spreading the
+            // source ([`rest_copy`], #295) — every field it may hold, with
+            // its value, and a reference of its own at every render. Dropping
+            // it unbinds `props` in wrapper components (`({...props}) => <X
+            // {...props}/>`) and loses forwarded setters (TODO.md F4).
             if let Some(rest) = &obj.rest {
                 let rest_span = builder.span_at(rest.span.start).or(span);
-                lower_binding_pattern(&rest.argument, Expr::Var(temp.clone()), rest_span, builder);
+                let copy = rest_copy(Expr::Var(temp.clone()), false, builder);
+                lower_binding_pattern(&rest.argument, copy, rest_span, builder);
             }
         }
         // `{ cb = () => setX(1) }`: the source is read into a temp, which
@@ -1138,6 +1140,45 @@ mod tests {
             bound.iter().any(|v| v == "rest"),
             "`rest` must be bound, got {bound:?}"
         );
+    }
+
+    /// A rest element is a new object or array spreading the source, not the
+    /// source itself: `rest` is a different reference at every evaluation
+    /// (#295).
+    #[test]
+    fn a_rest_element_binds_a_fresh_copy_of_its_source() {
+        for (body, array) in [
+            ("const { a, ...rest } = o;", false),
+            ("const [a, ...rest] = xs;", true),
+        ] {
+            let cfg = cfg_of(body);
+            let rhs = cfg.blocks[&cfg.entry]
+                .stmts
+                .iter()
+                .find_map(|s| match s {
+                    Stmt::Let { var, rhs, .. } if var == "rest" => Some(rhs.clone()),
+                    _ => None,
+                })
+                .expect("`rest` is bound");
+            match (rhs, array) {
+                (Expr::ObjectLit { fields, .. }, false) => {
+                    assert!(
+                        matches!(fields.as_slice(), [(k, Expr::Var(_))] if k.starts_with(crate::ir::expr::SPREAD_KEY_PREFIX)),
+                        "{fields:?}"
+                    );
+                }
+                (
+                    Expr::ArrayLit {
+                        elems, spread_at, ..
+                    },
+                    true,
+                ) => {
+                    assert!(matches!(elems.as_slice(), [Expr::Var(_)]), "{elems:?}");
+                    assert_eq!(spread_at, vec![0]);
+                }
+                (other, _) => panic!("{body}: `rest` bound to {other:?}"),
+            }
+        }
     }
 
     #[test]

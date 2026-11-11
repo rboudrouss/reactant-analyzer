@@ -491,6 +491,36 @@ export function C({ data }: { data: unknown }) {
     );
 }
 
+/// `...rest` is a new object at every render, so an effect on `[rest]` re-runs
+/// after each one, while `rest.x` still reads the prop it copies (#295: the
+/// rest was bound to the props object itself, held across the loop).
+#[test]
+fn a_rest_prop_is_a_new_object_at_every_render() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function Whole({ a, ...rest }) {
+  const [s, setS] = useState({});
+  useEffect(() => { setS({}); }, [rest]);
+  return <div>{a}</div>;
+}
+export function Member({ a, ...rest }) {
+  const [s, setS] = useState({});
+  useEffect(() => { setS({}); }, [rest.x]);
+  return <div>{a}</div>;
+}
+"#;
+    let whole = infinite_loop_diags(src, "Whole");
+    assert!(
+        whole.iter().any(|(rule, _, _)| rule == "infinite-loop"),
+        "an effect on `[rest]` re-runs at every render: {whole:?}"
+    );
+    let member = infinite_loop_diags(src, "Member");
+    assert!(
+        member.is_empty(),
+        "`rest.x` is the prop, held across the loop: {member:?}"
+    );
+}
+
 #[test]
 fn all_stable_deps_gate_self_write_effect() {
     // Complement guard: when EVERY dep is provably stable the effect re-runs
