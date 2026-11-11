@@ -340,11 +340,23 @@ fn rule_messages_name_a_spliced_local_without_its_salt() {
     "#;
     let result = parse_and_analyze(src);
     let expect = [
-        ("Mirror", "derived-state", "sets `setC` to a call-free expression of `b`"),
-        ("List", "state-mutation", "`setItems` is called with the same"),
+        (
+            "Mirror",
+            "derived-state",
+            "sets `setC` to a call-free expression of `b`",
+        ),
+        (
+            "List",
+            "state-mutation",
+            "`setItems` is called with the same",
+        ),
         ("Init", "side-effect-in-init", "calls `client.subscribe`"),
         ("Bus", "missing-cleanup", "calls `bus.addEventListener`"),
-        ("Child", "cross-component-infinite-loop", "calls `set`, a state setter"),
+        (
+            "Child",
+            "cross-component-infinite-loop",
+            "calls `set`, a state setter",
+        ),
     ];
     for (comp, rule, wording) in expect {
         let diags = diags_for(&result, comp);

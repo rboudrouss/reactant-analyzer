@@ -156,7 +156,9 @@ pub fn through(names: &[&str]) -> Option<String> {
     let quoted = |n: &&str| format!("`<{n}>`");
     match names {
         [] | [_] => None,
-        _ if names.len() > MAX_NAMED => Some(format!("reported through {} components", names.len())),
+        _ if names.len() > MAX_NAMED => {
+            Some(format!("reported through {} components", names.len()))
+        }
         [init @ .., last] => Some(format!(
             "reported through {} and {}",
             init.iter().map(quoted).collect::<Vec<_>>().join(", "),
@@ -212,7 +214,10 @@ mod tests {
             comp("A", vec![at(Diagnostic::warn("r", "m"), 3)]),
             comp("B", vec![at(Diagnostic::warn("r", "other"), 3)]),
             comp("C", vec![at(Diagnostic::warn("r", "m"), 4)]),
-            comp("D", vec![Diagnostic::warn("r", "m"), Diagnostic::warn("r", "m")]),
+            comp(
+                "D",
+                vec![Diagnostic::warn("r", "m"), Diagnostic::warn("r", "m")],
+            ),
         ];
         let idx = LocationIndex::build(&comps, false);
         assert_eq!(idx.rows(&comps).count(), 5);

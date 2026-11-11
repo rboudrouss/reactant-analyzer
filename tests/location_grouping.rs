@@ -82,7 +82,10 @@ fn per_component_restores_one_row_per_component() {
     let rows = loop_rows(&doc);
     let comps: Vec<_> = rows.iter().map(|d| d["component"].clone()).collect();
     assert_eq!(comps, ["Alpha", "Beta", "Gamma"]);
-    assert!(rows.iter().all(|d| d["components"] == serde_json::json!([d["component"]])));
+    assert!(
+        rows.iter()
+            .all(|d| d["components"] == serde_json::json!([d["component"]]))
+    );
     assert_eq!(doc["summary"]["errors"], 3);
 
     let out = human(&["--per-component"]);

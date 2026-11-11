@@ -275,7 +275,14 @@ pub fn render(
                 .iter()
                 .map(|&o| report.components[o].name.as_str())
                 .collect();
-            to_json_diag(d, &c.name, names, c.file.as_deref(), &report.file_table, display)
+            to_json_diag(
+                d,
+                &c.name,
+                names,
+                c.file.as_deref(),
+                &report.file_table,
+                display,
+            )
         })
         .collect();
 
