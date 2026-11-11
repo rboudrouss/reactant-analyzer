@@ -958,9 +958,10 @@ fn exec_callbacks_depth<T: Transfer>(
 
 /// Code the analysis does not see receives the value of `expr` (#254): a
 /// callee it does not run, a hook it does not inline, React for an element's
-/// handler, an object it does not place. Every closure the value reaches may
-/// be called there, at any time; [`run_escaped`] runs them.
-fn escape<T: Transfer>(
+/// handler, an object it does not place, a child component it cannot resolve
+/// (#289). Every closure the value reaches may be called there, at any time;
+/// [`run_escaped`] runs them.
+pub(crate) fn escape<T: Transfer>(
     transfer: &T,
     expr: &Expr,
     env: &AbstractEnv<T::Domain>,

@@ -2581,6 +2581,56 @@ export function App() {
     );
 }
 
+// ── #289: a closure an unknown child holds runs its whole body ──────────────
+
+/// `App` with `Primitive.Root`, which the analysis does not resolve, handed a
+/// closure that runs `body`, and an effect whose write needs `v` past `min`.
+fn unknown_child_holding(body: &str, min: u32) -> String {
+    format!(
+        r#"
+import {{ useState, useEffect }} from 'react';
+export function App() {{
+  const [v, setV] = useState(0);
+  const t = [v, setV];
+  const bump = () => setV(1);
+  useEffect(() => {{ if (v > {min}) setV(v + 1); }}, [v]);
+  return <Primitive.Root api={{{{ run: () => {{ {body} }} }}}} />;
+}}
+"#
+    )
+}
+
+/// The closure's write goes through a name its body binds, a destructuring
+/// of the tuple, or a render function it calls: the escape walk resolves the
+/// callees it reads without running the body, so none was a setter there and
+/// the loop read as `verified`. The closure now escapes and runs with the
+/// handlers. The child may never call it, so the loop is only possible: a
+/// Warning, never an Error.
+#[test]
+fn a_closure_an_unknown_child_holds_runs_its_body() {
+    for body in ["const s = setV; s(1);", "const [, s] = t; s(1);", "bump();"] {
+        let diags = infinite_loop_diags(&unknown_child_holding(body, 0), "App");
+        assert!(
+            diags.iter().any(|(_, s, _)| *s == Severity::Warning)
+                && !diags.iter().any(|(_, s, _)| *s == Severity::Error),
+            "{body}: {diags:?}"
+        );
+    }
+}
+
+/// The escape walk's mark stays the fallback: a setter it finds in the
+/// closure still writes its slot with any value, though a run of the body
+/// stores only 1 — so `v > 5` is still reachable, as before #289.
+#[test]
+fn the_escape_walk_still_marks_what_it_finds_with_any_value() {
+    let diags = infinite_loop_diags(&unknown_child_holding("t[1](1);", 5), "App");
+    assert!(
+        diags.iter().any(|(_, s, _)| *s == Severity::Warning)
+            && !diags.iter().any(|(_, s, _)| *s == Severity::Error),
+        "{diags:?}"
+    );
+}
+
 // ── #253: a closure reached through a local array or a local higher-order fn ─
 
 /// The closure runs in the effect, every run: through the array's entries an

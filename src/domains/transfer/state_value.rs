@@ -7,8 +7,8 @@ use crate::{
         AbstractDomain, AnalysisCtx, Transfer,
         impls::{BoolVal, Interval, SetterVal, Stability, StateValue, StrConst},
         interp::{
-            alloc_literal, call_targets, closure_env, exec_stmt_with_callbacks, returned_sites,
-            run_cfg,
+            alloc_literal, call_targets, closure_env, escape, exec_stmt_with_callbacks,
+            returned_sites, run_cfg,
         },
         stores::{AbstractEnv, EnvVal, Heap, HeapValue, Sites, member_key, resolve_locs},
     },
@@ -358,10 +358,16 @@ fn returns_fresh_reference(
     }
 }
 
-/// Join ⊤ into every state slot whose setter is passed as a prop to an
-/// unanalyzable child, through [`AnalysisCtx::write_slot`]: an own slot in
-/// `ctx.state`, a forwarded ancestor's in the `SharedStateStore` its fixpoint
-/// imports.
+/// Hand `props_expr` to a child the analysis cannot resolve, code it does
+/// not see. Every prop escapes (#289): each closure it reaches runs with the
+/// handlers once per round, from the render's exit env with every parameter
+/// ⊤ ([`run_escaped`](crate::domains::interp::run_escaped)), so a write its
+/// body makes through a name it binds, a destructuring or a nested call
+/// lands as any body's does. And every slot whose setter the escape walk
+/// finds in a prop is joined with ⊤, as before, through
+/// [`AnalysisCtx::write_slot`] — an own slot in `ctx.state`, a forwarded
+/// ancestor's in the `SharedStateStore` its fixpoint imports: the fallback
+/// wherever the run falls short, so no slot is written less than it was.
 fn havoc_setter_props(
     props_expr: &Expr,
     env: &AbstractEnv<StateValue>,
@@ -372,6 +378,7 @@ fn havoc_setter_props(
     };
     let mut setters: Vec<(ComponentId, crate::ir::types::HookLabel)> = Vec::new();
     for (_, v) in fields {
+        escape(&StateValueTransfer, v, env, ctx);
         // Bare setter prop (`<X onOpenChange={setOpen}/>`): the value
         // carries its owner (`StateSetter` always evals to a
         // `component_setter`, intra included).
