@@ -213,8 +213,13 @@ is emitted:
 effective severity = pin ⊓ the polarity of THIS finding's verdict
 ```
 
-- A certified verdict (a `must_*` guard that proved) honours the pin up to
-  Error.
+- A certified verdict honours the pin up to Error: a `must_*` guard proved,
+  and every other guard is an exact filter (`name`, `source`, `receiver`,
+  `prop`, `origin`, `in_deps`, `deps_declared`, `count` unless a spread leaves
+  the length open, `cycle`, `slot_ownership`, `provenance`). Any other guard
+  (a verdict such as `stability` or `writer_phases`, `in_deps` with `negate`,
+  a `must_*` kept uncertified by `"else": "keep"`) can pass on what may be
+  false, and the proof of one conjunct says nothing about it.
 - A "maybe" verdict caps at Warning whatever the pin says. The clamp is
   structural: the executor can only build an Error out of an engine proof, it
   cannot forge one.

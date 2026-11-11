@@ -473,6 +473,44 @@ fn else_drop_kills_unproven_findings() {
     );
 }
 
+/// #143: an Error proves every conjunct, not the one a `must_*` certified.
+/// `writer_phases` passes on the ⊤ phase of the `handleSubmit` row, a
+/// may-fact the direct-write proof says nothing about, so neither row is
+/// proven in full: both stay Warnings, as the native `setter-in-render`
+/// reports the ⊤ row.
+#[test]
+fn a_certified_must_does_not_prove_a_may_guard_beside_it() {
+    let pack = one_rule(
+        r#"{"id":"render-writer","docs":{"description":"d","why":"w","fix":"f"},
+            "severity":"error","anchor":{"relation":"hook_calls","kind":"state"},
+            "forEach":{"edge":"writers","as":"w"},
+            "guards":[{"kind":"writer_phases","of":"anchor","includes":["render"]},
+                      {"kind":"must_direct_write","of":"w","else":"drop"}],
+            "message":"state {anchor.name} is written during render"}"#,
+    );
+    let diags = run_pack(
+        &pack,
+        r#"
+        import { useState } from "react";
+        function C() {
+            const [n, setN] = useState(0);
+            return <form onSubmit={handleSubmit(() => setN(1))}>
+                <button onClick={() => setN(2)}>x</button></form>;
+        }
+    "#,
+        &Options::new(),
+    );
+    let fired: Vec<_> = diags
+        .iter()
+        .filter(|d| d.rule == "t/render-writer")
+        .collect();
+    assert_eq!(fired.len(), 2, "one finding per writer row: {diags:?}");
+    assert!(
+        fired.iter().all(|d| d.severity() == Severity::Warning),
+        "a may-typed conjunct caps the finding at Warning: {fired:?}"
+    );
+}
+
 // ── Executor: params, guards, determinism ─────────────────────────────────────
 
 const SIX_DEPS: &str = r#"
