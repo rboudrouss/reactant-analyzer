@@ -26,7 +26,7 @@ use crate::{
 /// One-block render CFG terminated by `return unit` — the canonical trivial
 /// body used by most rule/engine tests (entry 0, block id 0, no edges).
 pub(crate) fn single_block_cfg(stmts: Vec<Stmt>) -> CFG {
-    single_block_cfg_term(stmts, Terminator::Return(Expr::Lit(Prim::Unit)))
+    single_block_cfg_term(stmts, Terminator::Return(Expr::Lit(Prim::Unit), None))
 }
 
 /// One-block CFG with a caller-chosen terminator (entry 0, block id 0, no edges).
@@ -118,7 +118,9 @@ pub(crate) fn analysis_result(render_cfg: CFG) -> AnalysisResult<StateValue> {
         dom_props: Default::default(),
         module_consts: Default::default(),
         state_store: StateStore::bottom(),
+        state_init: StateStore::bottom(),
         memo_store: MemoStore::new(),
+        render_entry: crate::domains::AbstractEnv::bottom(),
         block_states: HashMap::new(),
         effect_block_states: HashMap::new(),
         hook_calls: vec![],
@@ -134,9 +136,10 @@ pub(crate) fn analysis_result(render_cfg: CFG) -> AnalysisResult<StateValue> {
         slot_seeds: vec![],
         registrations: vec![],
         effect_triggers: vec![],
+        effect_reruns: HashMap::new(),
+        effect_props: HashSet::new(),
         custom_arg_returns: HashMap::new(),
         iterations: 0,
-        effect_setter_writes: StateStore::bottom(),
         heap: Heap::new(),
     }
 }

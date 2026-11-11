@@ -27,6 +27,27 @@ Analyseur statique React (niveau 3, interprétation abstraite) en Rust.
   Warning (défaut possible, ou fait certain au coût incertain), Info (limite
   de l'analyse ou motif qui a l'air voulu, derrière `--info`).
 
+## Commits
+
+- **Atomiques** : un commit = un changement (une issue, un fix, une baseline).
+- **Conventional Commits** : `type(scope): sujet` ; le titre suffit dans la
+  majorité des cas.
+- **Body sobre** : seulement si vraiment nécessaire (ce que le titre ne peut
+  pas dire : une expectation de test changée et pourquoi, un chiffre mesuré),
+  le plus direct possible, sinon rien.
+- **Pas de trailer `Co-Authored-By` Claude.**
+
+## Changelog
+
+- Tout changement visible par un utilisateur (règle, niveau ou message d'un
+  diagnostic, option CLI, format de sortie, précision ou soundness mesurée,
+  performance) ajoute une ligne à la section `[Unreleased]` de `CHANGELOG.md`,
+  dans la même PR. Un refactor interne ou un test seul n'en demande pas.
+- Format Keep a Changelog (`Added` / `Changed` / `Removed` / `Fixed`), une
+  ligne par changement, du point de vue de l'utilisateur, avec le numéro
+  d'issue. Un changement incompatible est marqué **breaking**.
+- À la release, `[Unreleased]` devient la section de la version.
+
 ## Références
 
 - Décisions d'architecture : `docs/adr/`

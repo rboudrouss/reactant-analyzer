@@ -8,7 +8,7 @@ use std::path::Path;
 use crate::ir::{FileTable, SourceRange};
 use crate::rules::Severity;
 
-use super::locations::LocationIndex;
+use super::locations::{LocationIndex, MAX_NAMED, through};
 use super::palette::Palette;
 use super::report::{CheckReport, ComponentReport};
 
@@ -74,6 +74,7 @@ pub fn render(
     show_clean: bool,
     info: bool,
     trace: bool,
+    locations: &LocationIndex,
     display: &dyn Fn(&Path) -> String,
 ) -> String {
     let p = Palette::pick(color);
@@ -104,9 +105,8 @@ pub fn render(
     }
 
     // A finding's identity is its source location, not the component that
-    // inlined it (#129): each distinct location is printed once, under the
-    // first component that reaches it, and says how many share it.
-    let locations = LocationIndex::build(&report.components);
+    // inlined it (#129, #271): each distinct location is printed once, under
+    // the component whose row it is printed as, naming the others.
     let mut hidden_clean = 0usize;
     let mut hidden_repeat = 0usize;
 
@@ -136,9 +136,9 @@ pub fn render(
             continue;
         }
 
-        // Every finding here was already printed under an earlier component:
-        // the component is not clean, but it adds no line the reader has not
-        // read. The `--info` assurances are its own, so it stays when they
+        // Every finding here is printed under another component: the
+        // component is not clean, but it adds no line the reader does not
+        // get. The `--info` assurances are its own, so it stays when they
         // would otherwise be lost.
         if locations.all_repeats(ci)
             && !(info && (!comp.safe_checks.is_empty() || comp.suspended_safe_checks > 0))
@@ -168,7 +168,7 @@ pub fn render(
             let var_info = d
                 .var
                 .as_deref()
-                .map(|v| format!("  var:{v}"))
+                .map(|v| format!("  var:{}", crate::ir::source_name(v)))
                 .unwrap_or_default();
             let range_info = d
                 .range
@@ -179,11 +179,14 @@ pub fn render(
                 .unwrap_or_default();
             // The multiplicity is honest — a hook inlined into 87 components
             // genuinely produces the finding 87 times — so it is reported as
-            // a count rather than as 87 lines.
-            let shared = match consumers.len() {
-                1 => String::new(),
-                n => format!("  {}[in {} components]{}", p.dim, n, p.reset),
-            };
+            // the components it goes through rather than as 87 lines.
+            let names: Vec<&str> = consumers
+                .iter()
+                .map(|&c| report.components[c].name.as_str())
+                .collect();
+            let shared = through(&names)
+                .map(|t| format!("  {}[{t}]{}", p.dim, p.reset))
+                .unwrap_or_default();
             let _ = writeln!(
                 out,
                 "    {}{}{}  {}{}{}{}  {}{}",
@@ -197,11 +200,8 @@ pub fn render(
                 d.message,
                 shared
             );
-            if trace && consumers.len() > 1 {
-                let names: Vec<&str> = consumers
-                    .iter()
-                    .map(|&c| report.components[c].name.as_str())
-                    .collect();
+            // A counted row names its components under `--trace`.
+            if trace && names.len() > MAX_NAMED {
                 let _ = writeln!(out, "       {}in: {}{}", p.dim, names.join(", "), p.reset);
             }
             if trace {
@@ -248,8 +248,8 @@ pub fn render(
     if hidden_repeat > 0 {
         let _ = writeln!(
             out,
-            "{}   {} component(s) hidden. Every finding in them is a source line already \
-             reported above{}",
+            "{}   {} component(s) hidden. Every finding in them is a source line reported \
+             under another component{}",
             p.dim, hidden_repeat, p.reset
         );
     }

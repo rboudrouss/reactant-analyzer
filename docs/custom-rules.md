@@ -122,7 +122,7 @@ emit the finding.
 | Relation | What it selects |
 |----------|-----------------|
 | `hook_calls` | Every hook call in the component, including those reached through cross-file inlined custom hooks. Optional `"kind"` filter: `state`, `effect`, `memo`, `callback`, `ref`, `custom`, `handler`. |
-| `render_setter_calls` | Every setter call in the render body, resolved through aliases. |
+| `render_setter_calls` | Every setter call the render may run, one row per call site: the sites the native `setter-in-render` judges, resolved through aliases and the converged values (`t[1](x)`, `api.setV(x)`, a closure such a path holds). A call only an event handler or a deferred callback makes is no row (#281). |
 | `hook_origins` | Every provenance row: any hook call whose identity is resolved, **including** the ones inlining dissolved. This is the anchor for identity rules (banning a hook, mandating a wrapper): unlike `hook_calls` + `kind: "custom"`, it also sees the hooks the engine resolved. No `kind`, no edge; `name` = the hook's origin name, `source` = the raw import specifier. |
 | `context_providers` | Every `<Ctx.Provider value={…}>` element, or React 19 `<Ctx value={…}>` (#177), in the render body whose `Ctx` is a module-level `createContext` the engine proved (#71). Render-only by semantics: a provider built inside a `useMemo` keeps its identity. `name` = the context binding, `identity` = the value's identity verdict. No `kind`, no edge. |
 | `jsx_props` | Every prop of every element the render body builds, including inside a callback it runs synchronously, so `items.map(it => <Row/>)` is enumerated (#125). Optional `elements` filter: `component` (the default, resolved component applications, the only place a prop is compared with `Object.is` at a memo boundary), `host` (`<input ref={r} value={v}/>`), or `any`. Inside a list callback there is no analysed env, so `identity` answers `fresh-every-render` for an allocation written in place and `unknown` otherwise; an element built inside an event handler is never enumerated. `name` = the element (the tag, for a host element), `prop` = the prop name, `kind` = `component` or `host`, `identity` = the value's identity verdict. Which children memoize is unknown: name them with a `name` guard. No edge. |
@@ -195,7 +195,7 @@ the finding carries a proof and can reach Error.
 | Kind | Certifies that… |
 |------|-----------------|
 | `must_setter_on_all_paths` | the setter is called on every path through the body. |
-| `must_dominates_all_exits` | the entity dominates every exit. |
+| `must_dominates_all_exits` | the setter call writes on every render: its block dominates every exit, and its callee is the setter on every path (for a parent's setter prop, surely that one). |
 | `must_init_calls_setter` | the initialization calls the setter. |
 | `must_hook_is_conditional` | the hook call is conditional. |
 | `must_direct_write` | the targeted `writers` row is a direct write, outside any spliced region. This is the proof behind a policy rule like "state is only written through our wrapper" pinned at `error`. |
@@ -213,8 +213,13 @@ is emitted:
 effective severity = pin ⊓ the polarity of THIS finding's verdict
 ```
 
-- A certified verdict (a `must_*` guard that proved) honours the pin up to
-  Error.
+- A certified verdict honours the pin up to Error: a `must_*` guard proved,
+  and every other guard is an exact filter (`name`, `source`, `receiver`,
+  `prop`, `origin`, `in_deps`, `deps_declared`, `count` unless a spread leaves
+  the length open, `cycle`, `slot_ownership`, `provenance`). Any other guard
+  (a verdict such as `stability` or `writer_phases`, `in_deps` with `negate`,
+  a `must_*` kept uncertified by `"else": "keep"`) can pass on what may be
+  false, and the proof of one conjunct says nothing about it.
 - A "maybe" verdict caps at Warning whatever the pin says. The clamp is
   structural: the executor can only build an Error out of an engine proof, it
   cannot forge one.

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Backend of action.yml: runs the published CLI via npx, turns its JSON
-// output (docs/usage.md § JSON schema v2) into GitHub annotations, step
+// output (docs/usage.md § JSON schema) into GitHub annotations, step
 // outputs, and a job-summary line, then exits with the CLI's exit code.
 import { spawnSync } from "node:child_process";
 import { appendFileSync, writeFileSync } from "node:fs";
@@ -54,8 +54,11 @@ for (const d of report.diagnostics ?? []) {
     props.push(`line=${d.line}`);
     props.push(`col=${(d.col ?? 0) + 1}`); // JSON col is 0-indexed, annotations are 1-indexed
   }
+  // v3 rows name every component a finding is reported through; v2 one.
+  const through = d.components ?? [d.component];
+  const who = through.length > 1 ? `${d.component} and ${through.length - 1} more` : d.component;
   const msg = [
-    `[${d.component}] ${d.message}`,
+    `[${who}] ${d.message}`,
     ...(d.notes ?? []).map((n) => `→ ${n.message}`),
   ].join("\n");
   console.log(`::${level[d.severity] ?? "notice"} ${props.join(",")}::${escData(msg)}`);

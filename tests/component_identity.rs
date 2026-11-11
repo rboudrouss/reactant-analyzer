@@ -63,6 +63,7 @@ fn findings(tmp: &Tmp, info: bool) -> Vec<(String, String)> {
         exclude_dirs: vec![],
         follow_imports: false,
         format: ReportFormat::Json,
+        per_component: true,
         fail_on: reactant::driver::FailOn::Never,
         project: reactant::driver::ProjectOverride::Auto,
         color: false,

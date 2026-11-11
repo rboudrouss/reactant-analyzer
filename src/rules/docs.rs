@@ -172,12 +172,14 @@ pub const RULE_DOCS: &[RuleDoc] = &[
     ),
     doc(
         "infinite-loop",
-        "effect sets state that re-triggers the effect, and the state diverges",
-        "The render → effect → setState → render cycle never stabilizes: the \
-                      abstract value of the state slot required widening and the effect's \
-                      write stays unbounded, the structural signature of an infinite render \
-                      loop. Detected through the fixpoint (guards that bound the state, e.g. \
-                      `if (n < 5) setN(n+1)`, converge and are not flagged), including \
+        "effect sets state that re-triggers the effect, and no write is proven to settle",
+        "The render → effect → setState → render cycle may never stabilize: an \
+                      effect writes a slot that re-runs it, alone or through a cycle of \
+                      effects, and no write on the cycle is proven to settle (a guard \
+                      that bounds the state, e.g. `if (n < 5) setN(n+1)`, a write of the \
+                      value the slot holds, a step that stops). Error when every write is \
+                      proven to change its slot at every run (a new reference, or a step \
+                      from a bounded start) and the effect re-runs on it. Detected \
                       through `.then(...)` / `setTimeout(...)` callbacks and inlined \
                       cross-file custom hooks.",
         "useEffect(() => { setCount(count + 1); }, [count]);",

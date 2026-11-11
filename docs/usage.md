@@ -45,6 +45,7 @@ reactant check src/ --ignore-rule derived-state  # all but this one
 | Flag | Effect |
 |------|--------|
 | `--format human\|json` | Output format. `json` prints exactly one JSON document on stdout (schema below); all warnings/verbose go to stderr. Default `human`. |
+| `--per-component` | One row per component a finding is reported through, in both formats. By default a finding inside a hook that several components inline is one row naming them (`` [reported through `<A>` and `<B>`] ``, a count past three), shown at the strongest level any of them reports it; see [Shared hooks](#a-finding-inside-a-shared-hook). |
 | `--fail-on error\|warning\|never` | Which findings make the exit code `1`. Default `warning` (errors *or* warnings fail). `Info` diagnostics never affect the exit code. |
 | `--project auto\|vite\|next\|plain` | Project-kind handling. `auto` (default) detects from marker files; `vite`/`next` force those conventions; `plain` disables detection. |
 | `--rule <name>` | Only report this diagnostic (repeatable), an off-by-default one included. An unknown name exits with code 2. |
@@ -174,9 +175,28 @@ there deliberately will not be (ADR-023 §4).
 A project's conventions do not stop applying when you point at one of its
 subdirectories: `reactant check src/features` is still a run inside that Vite
 project, and its `@/...` imports still resolve through the tsconfig at the root.
-Other path arguments are discovered as-is with the same resolver. Next.js is
+Other path arguments are discovered as-is. Imports resolve per project, not per
+run: every directory argument, and every directory under the walk holding a
+`vite.config.*`, a `next.config.*`, or a `tsconfig.json`/`jsconfig.json` that
+declares `paths` or `baseUrl`, resolves the imports of the files under it as a
+run started there would, the innermost one winning. A monorepo's apps, or a
+directory of repositories, therefore each keep their own aliases. Next.js is
 tested before Vite: a Next app may keep a `vite.config.*` for its test runner,
 and the router conventions are the ones that govern the sources.
+
+Monorepo workspace packages resolve to their source. The nearest ancestor of an
+importing file that declares workspace members (`pnpm-workspace.yaml`'s
+`packages:`, or `package.json`'s `workspaces`) has its member globs expanded,
+and `import … from "@acme/ui"` or `"@acme/ui/icons"` maps to that member's
+entry: `source`, else the `exports` entry for `.` / `./icons` (conditions in
+declaration order, `types` skipped), else `module` / `main`. An entry that is
+not TypeScript is taken to be compiled output (`dist/index.mjs`), and the
+package's `src/index` (`src/icons` for a subpath) stands for it when that
+file exists. The stand-in carries the entry's code, not its directives
+(a bundler may prepend `"use client"`), so the App Router server graph does
+not enter it. tsconfig `paths` still come first. A package outside the
+member globs, a subpath its `exports` map does not list, or a name two
+members share stays unresolved.
 
 Discovery still walks exactly the directories you named. The `<root>/src`
 narrowing below is a convenience for "analyse this project" and applies only
@@ -222,7 +242,10 @@ imports that then resolve outside what you named are reported as
 ### Plain (everything else)
 
 Recursive walk of the given directories for `.ts/.tsx/.js/.jsx`, excluding
-`*.test.*`, `*.spec.*` and `*.d.ts`. Relative imports only.
+`*.test.*`, `*.spec.*` and `*.d.ts`. Aliases come from tsconfig `paths`
+when a tsconfig declares them, searched upward as for Vite; without one,
+relative imports only. No build tool implies aliases here, so their absence
+does not warn.
 
 Which *directories* are skipped has one precedence order, three sources:
 
@@ -323,11 +346,11 @@ live outside the abstract domain. That is why the finding is a `Warning`, and
 why it under-reports rather than over-reports: an unresolved specifier on the
 path from an entry leaves that subtree unclassified.
 
-## JSON schema (v2)
+## JSON schema (v3)
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "files_analyzed": 12,
   "parse_errors": [ { "file": "src/broken.tsx", "message": "...", "analyzed": true } ],
   "diagnostics": [
@@ -335,6 +358,7 @@ path from an entry leaves that subtree unclassified.
       "rule": "infinite-loop",
       "severity": "warning",
       "component": "Page@src/users/page.tsx",
+      "components": ["Page@src/users/page.tsx", "Settings"],
       "file": "src/hooks/useData.ts",
       "component_file": "src/users/page.tsx",
       "line": 10,
@@ -345,13 +369,13 @@ path from an entry leaves that subtree unclassified.
       "notes": [
         {
           "message": "...",
-          "kind": "handler",
+          "kind": "write",
           "hook_label": 3,
-          "file": "src/users/page.tsx",
-          "line": 3,
-          "col": 2,
-          "event": "click",
-          "slot": 1
+          "file": "src/hooks/useData.ts",
+          "line": 12,
+          "col": 6,
+          "slot": 1,
+          "value_class": "fresh"
         }
       ]
     }
@@ -369,8 +393,17 @@ path from an entry leaves that subtree unclassified.
 
 Semantics:
 
+- One object per finding, not per component *(changed in v3)*: a finding
+  inside a hook several components inline is one object, grouped by `rule`,
+  `file`, `line`, `col` and `message` as the human report groups it (see
+  [A finding inside a shared hook](#a-finding-inside-a-shared-hook)).
+  `--per-component` restores v2's one object per component.
 - `component`: registry display name. The `@<file>` suffix appears only when
-  two files define the same component name.
+  two files define the same component name. Of `components`, the first whose
+  own finding has this `severity`, the strongest of the group; `line`, `col`,
+  `hook_label`, `var`, `component_file` and `notes` are that component's.
+- `components`: every component the finding is reported through, in report
+  order; only `component` under `--per-component` *(added in v3)*.
 - `file`: the file `line`/`col` point into, relative to the CWD when possible.
   A custom hook is inlined into each component that calls it (ADR-013), so a
   finding anchored inside one is reported in the *hook's* file, not the
@@ -380,10 +413,12 @@ Semantics:
 - `component_file`: the component's defining file; what `file` meant in v1.
 - `notes`: the finding's witness chain (ADR-019), typed steps explaining
   why the rule fired. `kind` ∈ `binding | resolve | call | write | read |
-  branch | handler | cycle-edge | widen | mutate | capture | init-once`;
-  each kind adds its structured
+  branch | cycle-edge | widen | mutate | capture | init-once | forward |
+  rerender`; each kind adds its structured
   fields (`var`, `name`/`target`, `callee`/`effect_class`,
-  `slot`/`value_class`, `what`, `desc`, `event`, `from`/`to`, `iteration`).
+  `slot`/`value_class`, `what`, `desc`, `from`/`to`, `iteration`).
+  *(v3 drops `handler` and its `event` field: only `infinite-loop`'s
+  widening arm emitted it, retired by #265.)*
   `notes[].file` names the file the step's position points into; it may
   differ from the diagnostic's `file` when the step lives in a cross-file
   inlined hook/utility. `message` is the rendered prose (same text as
@@ -392,8 +427,9 @@ Semantics:
   no source range.
 - `severity` ∈ `"error" | "warning" | "info"`. Info entries appear only with
   `--info`.
-- `summary.exit_code` mirrors the process exit code under the active
-  `--fail-on`.
+- `summary.errors`/`warnings`/`infos` count the objects in `diagnostics` by
+  `severity`. `summary.exit_code` mirrors the process exit code under the
+  active `--fail-on`, which reads the per-component findings.
 - stdout is exactly one JSON document; parse errors are both listed in
   `parse_errors` and kept off stdout.
 - `parse_errors[].analyzed` says what became of the file. `true`: the parser
@@ -485,8 +521,8 @@ schemars output the validator compiles from.
 ```
   Counter  (3 hooks)  src/Counter.tsx  ✓      ← analyzed, no diagnostic
   Page  (2 hooks)  src/users/page.tsx         ← with diagnostics
-    warn   infinite-loop  [hook:1]  (line 7:2)  this effect keeps pushing ...
-       → handler `onClick` also calls setter ... [hook:3] (line 12:4)
+    warn   infinite-loop  [hook:1]  (line 7:2)  this effect may change state `n` which its deps react to ...
+       → state `n` is written here [hook:1] (line 8:4)
     warn   stale-closure  [hook:4]  (src/hooks/useData.ts:9:2)  ...
 ```
 
@@ -496,6 +532,27 @@ component from there (ADR-013). Trace steps follow the same convention.
 
 On a component-name collision the name is disambiguated automatically
 (`Page@tests/fixtures/page_collision/users/page.tsx`).
+
+### A finding inside a shared hook
+
+A hook is inlined into every component that calls it (ADR-013), so a finding
+in its body is produced once per such component. It is reported once
+(#129, #271): one row per rule, position and message, printed under one of
+those components and naming the others,
+
+```
+    warn   missing-deps  [hook:2]  (src/hooks/useForm.ts:106:2)  `handler` is used ...  [reported through `<Login>` and `<Signup>`]
+```
+
+or counting them past three (`[reported through 87 components]`, listed on
+an `in:` line under `--trace`). The row takes the strongest level any of
+them reports, with that component's own witness: a hook whose loop is proven
+in one caller and only possible in another is an `error` row. Two findings
+that say different things on the same line stay two rows. The summary counts
+these rows and adds the per-component total as `, N component attribution(s)`
+when it differs; `--fail-on` reads the per-component findings, so grouping
+never changes the exit code. `--per-component` prints every component's own
+rows instead.
 
 ### The last line, and when it is withheld
 
@@ -626,10 +683,10 @@ Summary: [docs/limitations.md](limitations.md). Open work, one entry per
 limit: the [issue tracker](https://github.com/rboudrouss/reactant-analyzer/issues).
 Most impactful:
 
-- Aliases outside tsconfig `paths` stay opaque (monorepo `@workspace/*`
-  without tsconfig entries, vite-config-only aliases). The imported symbol
-  is treated as external and its body is not analyzed, a possible false
-  negative. Write a custom `ImportResolver` for those.
+- Aliases outside tsconfig `paths` and the workspace packages stay opaque
+  (vite-config-only aliases, a package whose source is not at `src/<subpath>`).
+  The imported symbol is treated as external and its body is not analyzed, a
+  possible false negative. Write a custom `ImportResolver` for those.
 - An alias resolving *outside* the discovery root is never read at all, and
   the notice is `--info`-only: pass the target directory too.
 - Utility inlining is statement-level only; `if (util(x))` and `setX(util(y))`

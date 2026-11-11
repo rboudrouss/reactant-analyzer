@@ -7,9 +7,9 @@
 //! assurance channel *issues* the passing checks it never ran. An honest "I
 //! could not tell" became a verified clean.
 //!
-//! The CFG is normalised before extraction instead: a terminator expression
-//! containing a hook call is bound to a temp in the block's statements, and the
-//! terminator reads the temp.
+//! The extractor stages a terminator's hook calls as it stages a statement's
+//! nested ones (#233): each is bound to a temp by a statement at the end of the
+//! block, and the terminator reads the temp.
 
 use std::process::{Command, Output};
 

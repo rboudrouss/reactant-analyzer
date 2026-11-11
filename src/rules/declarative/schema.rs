@@ -114,7 +114,8 @@ pub enum Anchor {
         #[serde(default)]
         kind: Option<HookKindFilter>,
     },
-    /// Alias-resolved setter calls in the render body.
+    /// The setter calls the render runs, one row per call site, resolved
+    /// through aliases and the converged values (`t[1](x)`, `api.setV(x)`).
     RenderSetterCalls,
     /// Non-hook call sites in the render body (#126, ADR-036): the same
     /// relation the `calls` edge exposes, anchored where there is no hook to

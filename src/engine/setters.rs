@@ -4,26 +4,27 @@
 //! alias chains, the may-written slot proof — and the slot-writer relation
 //! (`collect_slot_writers`) the fixpoint stores on `AnalysisResult`.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::ir::ComponentId;
 use crate::{
     domains::{
-        AbstractEnv, StateValue,
-        stores::{EnvVal, Heap, HeapValue},
+        AbstractDomain, AbstractEnv, StateValue,
+        stores::{EnvVal, Heap, HeapValue, Sites},
     },
     engine::{
         AnalysisResult,
         dominance::on_all_paths,
-        written::{self, SiteEnvs, Written},
+        timing::ArgTiming,
+        written::{self, ClosureEnv, SiteEnvs, Written},
     },
     ir::{
         SourceRange,
         cfg::{CFG, Terminator},
         expr::Expr,
         free_vars::{call_free_key, collect_used_vars},
-        hooks::HookEntry,
+        hooks::{HookEntry, HookProvenance},
         stmt::Stmt,
         types::{BlockId, HookLabel, Symbol, Var},
     },
@@ -43,6 +44,11 @@ pub struct SetterCall {
     /// can now tell an effect-body write from one only a keydown reaches
     /// (ADR-034 §4, #93). It used to be computed and thrown away.
     pub class: SetterCallPhase,
+    /// The body the call sits in (pointer identity) and its block there,
+    /// when that body runs it synchronously: the render CFG for a direct
+    /// call, a callback's for one the render runs (#269). `None` from the
+    /// collapsed walks.
+    pub(crate) own: Option<(usize, BlockId)>,
 }
 
 /// The externally-visible half of the walk's phase classification. A subset:
@@ -92,29 +98,118 @@ impl From<WalkClass> for SetterCallPhase {
 
 /// Collect all setter variable names called in `cfg` together with their
 /// call-site span and block ID, descending into FnLit argument bodies and
-/// variable-bound FnLits up to `max_depth` levels.
-pub fn collect_setter_calls(
-    cfg: &CFG,
-    setter_vars: &HashSet<Var>,
-    max_depth: usize,
-) -> Vec<SetterCall> {
-    collect_setter_calls_with_extra(cfg, setter_vars, max_depth, &HashMap::new())
+/// variable-bound FnLits as deep as the fixpoint inlines ([`WALK_DEPTH`]).
+pub fn collect_setter_calls(cfg: &CFG, setter_vars: &HashSet<Var>) -> Vec<SetterCall> {
+    collect_setter_calls_with_extra(cfg, setter_vars, &HashMap::new())
 }
+
+/// How many nested function bodies every walk of this module descends: as
+/// many as the fixpoint inlines, so a write the store holds is a write some
+/// walk finds, whatever rule asks (#266, #267). Past it, both stop and the
+/// component reports the `analysis-limit`.
+pub const WALK_DEPTH: usize = crate::domains::interp::MAX_INLINE_DEPTH;
 
 /// Like `collect_setter_calls` but merges `extra_fn_bindings` so that variable
 /// callbacks defined outside `cfg` are resolved. `cfg`-local entries take precedence.
 pub fn collect_setter_calls_with_extra(
     cfg: &CFG,
     setter_vars: &HashSet<Var>,
-    max_depth: usize,
     extra_fn_bindings: &HashMap<Var, Arc<CFG>>,
 ) -> Vec<SetterCall> {
+    setter_calls(cfg, setter_vars, extra_fn_bindings, None, true)
+}
+
+/// `collect_setter_calls` that also runs the closures the converged values
+/// put behind a called path (`api.inc()`, #233): a write in one is a write of
+/// the call — the same table the writer relation walks. One row per call
+/// site, in walk order: a setter written at two sites is two facts, and a
+/// consumer that clears one site has not cleared the other.
+pub(crate) fn collect_setter_sites_converged(
+    cfg: &CFG,
+    setter_vars: &HashSet<Var>,
+    converged: &ConvergedFns<'_>,
+) -> Vec<SetterCall> {
+    setter_calls(cfg, setter_vars, &HashMap::new(), Some(converged), false)
+}
+
+/// The setter call sites of a component's render, as the converged values see
+/// them (#281): every call the setter walk finds there through a name a body
+/// of the component binds to a setter, or a name or member path the converged
+/// values put one behind (`t.1`, `api.setV`, a parent's setter prop), a
+/// closure such a path holds included. `setter-in-render` judges these sites
+/// and the Tier-A `render_setter_calls` relation lists them: both frontends
+/// see one set.
+pub(crate) struct RenderSetterSites {
+    /// The names a body of the component binds to a setter, through aliases
+    /// (the may table, [`all_setter_labels`]).
+    pub local: SetterTargets,
+    /// The setters the converged values put behind a name or member path.
+    pub converged: HashMap<Var, Vec<SetterProp>>,
+    /// Every name or path either table holds.
+    pub names: HashSet<Var>,
+    /// One row per call site, in walk order, each with its phase class: a
+    /// handler's or a deferred call is a site that does not run in the render.
+    pub sites: Vec<SetterCall>,
+}
+
+impl RenderSetterSites {
+    pub(crate) fn of(comp: &AnalysisResult<StateValue>) -> Self {
+        let params = std::slice::from_ref(&comp.param);
+        let local = all_setter_labels(comp);
+        let converged = converged_call_targets(
+            &collect_component_setter_vars(
+                &comp.render_cfg,
+                params,
+                &comp.block_states,
+                &comp.heap,
+            ),
+            comp.component,
+        );
+        let mut names: HashSet<Var> = local.names().cloned().collect();
+        names.extend(converged.keys().cloned());
+        let sites = if names.is_empty() {
+            Vec::new()
+        } else {
+            let fns = ConvergedFns::of(
+                &comp.render_cfg,
+                params,
+                &comp.hooks,
+                &comp.hook_provenance,
+                &comp.block_states,
+                &comp.heap,
+                comp.component,
+            );
+            collect_setter_sites_converged(&comp.render_cfg, &names, &fns)
+        };
+        RenderSetterSites {
+            local,
+            converged,
+            names,
+            sites,
+        }
+    }
+}
+
+fn setter_calls(
+    cfg: &CFG,
+    setter_vars: &HashSet<Var>,
+    extra_fn_bindings: &HashMap<Var, Arc<CFG>>,
+    converged: Option<&ConvergedFns<'_>>,
+    collapse: bool,
+) -> Vec<SetterCall> {
     let mut fn_bindings = collect_fn_bindings(cfg);
-    for (k, v) in extra_fn_bindings {
+    let callback_fns = converged
+        .filter(|c| std::ptr::eq(cfg, c.render))
+        .map(ConvergedFns::callback_fns);
+    for (k, v) in extra_fn_bindings
+        .iter()
+        .chain(callback_fns.into_iter().flatten())
+    {
         fn_bindings
             .entry(k.clone())
             .or_insert_with(|| Arc::clone(v));
     }
+    let converged = converged.map(|c| c.seen_from(cfg, None));
     let mut found = Found::default();
     let empty = HashSet::new();
     let wrappers = wrapper_callees(cfg);
@@ -122,9 +217,12 @@ pub fn collect_setter_calls_with_extra(
     let mut walk = SetterWalk {
         setter_vars,
         fn_bindings: &fn_bindings,
+        converged: converged.as_ref(),
         walking: HashSet::new(),
         root: cfg as *const CFG as usize,
+        body: cfg as *const CFG as usize,
         effect_body: false,
+        dispatches: false,
         shadowed: &empty,
         repeating: false,
         callback_bodies: &HashMap::new(),
@@ -132,13 +230,26 @@ pub fn collect_setter_calls_with_extra(
         collect_calls: false,
         read_vars: &NO_VARS,
         wrappers: &wrappers,
+        path: Vec::new(),
     };
-    walk.cfg(cfg, max_depth, &mut found, WalkClass::Sync, None, None);
+    walk.cfg(cfg, WALK_DEPTH, &mut found, WalkClass::Sync, None, None);
     let mut found = found.setters;
+    if !collapse {
+        return found
+            .into_iter()
+            .map(|site| SetterCall {
+                var: site.var,
+                span: site.span,
+                block_id: site.at.map(|(b, _)| b),
+                class: site.class.into(),
+                own: site.own,
+            })
+            .collect();
+    }
     // Collapse to the historical one-row-per-var shape, preferring the sync
     // site: its block id serves dominance, where any other class records
     // `None`. The walk itself no longer collapses, so this is the one place
-    // the old granularity still exists — and the only consumer that wants it.
+    // the old granularity still exists.
     found.sort_by_key(|s| s.class); // WalkClass derives Ord with Sync first
     let mut by_var: HashMap<Var, (Option<SourceRange>, Option<BlockId>, WalkClass)> =
         HashMap::new();
@@ -154,6 +265,7 @@ pub fn collect_setter_calls_with_extra(
             span,
             block_id,
             class: class.into(),
+            own: None,
         })
         .collect()
 }
@@ -176,6 +288,12 @@ pub(crate) struct WriteSite {
     pub updater: Updater,
     /// Argument 0 as written, `None` for a bare `setX()`.
     pub arg: Option<Expr>,
+    /// The setter is handed to a callee that calls it (`xs.forEach(setV)`,
+    /// #291): it stores what the callee passes, which no expression here is.
+    pub applied: bool,
+    /// The function names the walk went through to reach the site, outermost
+    /// first — where the write is authored is where they are defined.
+    pub through: Vec<Var>,
 }
 
 /// Every write site in `cfg`, one row per call site — no collapse of any
@@ -186,22 +304,33 @@ pub(crate) struct WriteSite {
 /// handler body is extracted out of the render CFG, so a `set(inc)` whose
 /// `inc` was defined in render is invisible to a walk of the body alone. A
 /// name the walked body binds itself drops out of the set, fail-closed, the
-/// same device as `shadowed`.
+/// same device as `shadowed`; the render binds them. `converged` are the
+/// closures the converged values put behind a name or member path
+/// ([`ConvergedFns`]), as seen from `cfg` ([`ConvergedFns::seen_from`]).
+///
+/// `dispatches`: some body of the program fires event listeners itself
+/// ([`SetterWalk::dispatches`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_write_sites(
     cfg: &CFG,
     setter_vars: &HashSet<Var>,
-    max_depth: usize,
     effect_body: bool,
+    dispatches: bool,
     shadowed: &HashSet<Var>,
     outer_fns: &HashMap<Var, Arc<CFG>>,
+    converged: &ConvergedFns<'_>,
     callback_bodies: &HashMap<HookLabel, Arc<CFG>>,
 ) -> Vec<WriteSite> {
     let mut found = Found::default();
     let wrappers = wrapper_callees(cfg);
     let mut fn_bindings = collect_fn_bindings(cfg);
     let mut certified = certified_fn_names(cfg, &fn_bindings);
+    // The render binds the names `outer_fns` are about: a `useCallback` value
+    // the render hands out is its body there too (#262).
     let mut local_binders: HashSet<Var> = HashSet::new();
-    collect_binders(cfg, &mut local_binders);
+    if !std::ptr::eq(cfg, converged.render) {
+        collect_binders(cfg, &mut local_binders);
+    }
     for (v, body) in outer_fns {
         if local_binders.contains(v) {
             continue;
@@ -211,12 +340,18 @@ pub(crate) fn collect_write_sites(
             .or_insert_with(|| Arc::clone(body));
         certified.insert(v.clone());
     }
+    // A body's own rename of an outer function (`const run = inc` in an
+    // effect) only resolves once the outer names are in.
+    let fn_bindings = resolve_aliases(cfg, &fn_bindings);
     let mut walk = SetterWalk {
         setter_vars,
         fn_bindings: &fn_bindings,
+        converged: Some(converged),
         walking: HashSet::new(),
         root: cfg as *const CFG as usize,
+        body: cfg as *const CFG as usize,
         effect_body,
+        dispatches,
         shadowed,
         repeating: false,
         callback_bodies,
@@ -224,8 +359,9 @@ pub(crate) fn collect_write_sites(
         collect_calls: false,
         read_vars: &NO_VARS,
         wrappers: &wrappers,
+        path: Vec::new(),
     };
-    walk.cfg(cfg, max_depth, &mut found, WalkClass::Sync, None, None);
+    walk.cfg(cfg, WALK_DEPTH, &mut found, WalkClass::Sync, None, None);
     found
         .setters
         .into_iter()
@@ -238,6 +374,8 @@ pub(crate) fn collect_write_sites(
             repeats: s.repeats,
             updater: s.updater,
             arg: s.arg,
+            applied: s.applied,
+            through: s.through,
         })
         .collect()
 }
@@ -257,28 +395,402 @@ pub(crate) struct SetterProp {
     /// handler, writes nothing when called. Both are still writes for a *may*
     /// reader — ⊤ over what the callee does — but only a must may be certified.
     pub must_write: bool,
+    /// Reached through a closure that captured the setter: calling the name
+    /// runs the closure, whose argument is not the one the setter stores.
+    pub closure: bool,
+    /// The component whose closure it is, when `closure`: a child's closure
+    /// a prop ref brings back (#270) names the child's bindings, so a walk
+    /// of this component cannot enter it.
+    pub closure_owner: Option<ComponentId>,
+}
+
+/// One slot a write through a name may land in ([`collect_slot_writers`]).
+#[derive(Debug, Clone, Copy)]
+struct Target {
+    /// `None`: this component's slot.
+    owner: Option<ComponentId>,
+    slot: HookLabel,
+    /// Through a closure that captured the setter: the call's argument is
+    /// not the stored value.
+    carried: bool,
+    /// A call through the name surely writes: [`SetterProp::must_write`] for
+    /// a converged value, which may also be something else (#233).
+    sure: bool,
 }
 
 /// Collect variables in `cfg` whose abstract value at any block exit is
 /// `ComponentSetter { component, label }`, or whose Loc in the heap points to a
 /// FnLit that captures a ComponentSetter (e.g. `() => setCount(0)` passed as prop).
 ///
-/// Returns `var` → [`SetterProp`].
+/// Returns `var` → every [`SetterProp`] it may be, sorted, never empty: a
+/// prop two call sites bind to two setters is both (#175).
 ///
 /// Used by cross-component rules to find props that are parent setters.
 ///
-/// **Blocks are visited in `CFG::blocks` order, not `block_states` order.**
-/// The first env that resolves a var decides its row, and `block_states` is a
-/// `HashMap` — reading it directly made the answer depend on Rust's per-process
-/// hash seed whenever two blocks disagreed (#120). Program order is the one
-/// stable order available here. Which block *should* win is a separate
-/// question, filed as #119.
+/// No block wins: a name's row is every setter some block exit binds it to
+/// (the may side), and a setter is a `must_write` only when every exit
+/// binding the name to anything but ⊥ surely writes it (the must side, #233).
+/// A member path is visited once per object its root may point to, so
+/// `t[1]` of `c ? [v, setV] : [v, noop]` is the setter at one visit and a
+/// closure at the other — a possible write, never a certain one. Blocks are
+/// visited in `CFG::blocks` order, so the rows are deterministic (#120).
+/// `params` are the body's parameters: the props object, whose members
+/// (`props.f`) are the parent's props literal's (#243).
 pub(crate) fn collect_component_setter_vars(
     cfg: &CFG,
+    params: &[Var],
     block_states: &HashMap<BlockId, AbstractEnv<StateValue>>,
     heap: &Heap,
-) -> HashMap<Var, SetterProp> {
-    let mut var_names: HashSet<Var> = HashSet::new();
+) -> HashMap<Var, Vec<SetterProp>> {
+    setter_vars_over([(cfg, params, block_states)], heap)
+}
+
+/// [`collect_component_setter_vars`] over several bodies at once: a name two
+/// of them bind is read off both, as two blocks of one body are.
+fn setter_vars_over<'b>(
+    bodies: impl IntoIterator<
+        Item = (
+            &'b CFG,
+            &'b [Var],
+            &'b HashMap<BlockId, AbstractEnv<StateValue>>,
+        ),
+    >,
+    heap: &Heap,
+) -> HashMap<Var, Vec<SetterProp>> {
+    let mut result: HashMap<Var, Vec<SetterProp>> = HashMap::new();
+    let mut unsure: HashSet<Var> = HashSet::new();
+    for (cfg, params, block_states) in bodies {
+        for_each_converged_path(cfg, params, block_states, heap, |name, ev| {
+            let props = setter_of(ev, heap);
+            if props.is_empty() {
+                if !ev.as_val().is_bottom_value() {
+                    unsure.insert(name.clone());
+                }
+                return;
+            }
+            let row = result.entry(name.clone()).or_default();
+            for p in props {
+                match row.iter_mut().find(|q| {
+                    (q.component, q.label, q.closure) == (p.component, p.label, p.closure)
+                }) {
+                    Some(q) => q.must_write &= p.must_write,
+                    None => row.push(p),
+                }
+            }
+        });
+    }
+    for (name, row) in &mut result {
+        row.sort_by_key(|p| (p.component, p.label, p.closure));
+        if row.len() > 1 || unsure.contains(name) {
+            for p in row.iter_mut() {
+                p.must_write = false;
+            }
+        }
+    }
+    result
+}
+
+/// The closures a call through a name or member path may run, read off the
+/// converged values ([`collect_converged_fns`]), with what certifies that a
+/// call runs one of them for sure: the render CFG and the other bodies a
+/// [`must_member_binding`](crate::ir::bindings::must_member_binding) is
+/// checked against. The table the writer relation and `setter-in-render`
+/// walk (#233).
+pub(crate) struct ConvergedFns<'a> {
+    fns: HashMap<Var, Vec<Arc<CFG>>>,
+    /// The closures the names of a body with no per-block envs of its own
+    /// may point to ([`ConvergedFns::with_closures`]).
+    closures: HashMap<Var, Vec<Arc<CFG>>>,
+    render: &'a CFG,
+    scopes: Vec<(&'a [Var], &'a CFG)>,
+    heap: &'a Heap,
+    component: ComponentId,
+    hooks: &'a [HookEntry],
+    /// [`callback_bound_vars`] of the render and the hook bodies.
+    callback_fns: Arc<HashMap<Var, Arc<CFG>>>,
+    /// The `useEffectEvent` hooks whose value is bound to a name
+    /// `callback_fns` holds: their argument runs where that name is called.
+    called_events: Arc<HashSet<HookLabel>>,
+    /// The timing the package-hook table gives a left hook's arguments
+    /// ([`crate::engine::timing`]).
+    arg_timings: Arc<HashMap<HookLabel, Vec<Option<ArgTiming>>>>,
+}
+
+impl<'a> ConvergedFns<'a> {
+    pub(crate) fn of(
+        render: &'a CFG,
+        params: &[Var],
+        hooks: &'a [HookEntry],
+        provenance: &[HookProvenance],
+        block_states: &HashMap<BlockId, AbstractEnv<StateValue>>,
+        heap: &'a Heap,
+        component: ComponentId,
+    ) -> Self {
+        let bodies: Vec<&CFG> = hooks.iter().filter_map(HookEntry::body_cfg).collect();
+        let events = effect_event_args(hooks, provenance);
+        let callback_fns = callback_bound_vars(render, &bodies, &callback_bodies(hooks), &events);
+        let called_events = hooks
+            .iter()
+            .filter_map(|h| match h {
+                HookEntry::Custom {
+                    label,
+                    binding: Some(v),
+                    ..
+                } if events.contains_key(label) && callback_fns.contains_key(v) => Some(*label),
+                _ => None,
+            })
+            .collect();
+        ConvergedFns {
+            fns: collect_converged_fns(render, params, block_states, heap, component),
+            closures: HashMap::new(),
+            render,
+            scopes: must_alias_scopes(render, hooks),
+            heap,
+            component,
+            hooks,
+            callback_fns: Arc::new(callback_fns),
+            called_events: Arc::new(called_events),
+            arg_timings: Arc::new(crate::engine::timing::left_hook_args(render, hooks)),
+        }
+    }
+
+    /// The same table, with the closures the names of a memo or callback
+    /// body, or of a function literal, may point to, read off the envs of a
+    /// run of each ([`SiteEnvs::closure_envs`], #246). A body no stored env
+    /// covers is reached from any body of the component, so the table is
+    /// every body's.
+    fn with_closures(self, closures: &[ClosureEnv<'_>], heap: &Heap) -> Self {
+        let mut table = HashMap::new();
+        for c in closures {
+            add_converged_fns(&mut table, c.body, c.params, &c.exits, heap, self.component);
+        }
+        ConvergedFns {
+            closures: table,
+            ..self
+        }
+    }
+
+    /// The same table, without the paths whose root `body` binds: there the
+    /// name is the body's own (fail-closed, as `shadowed`) — read off the
+    /// body's converged envs instead, when it has them (`exits`, an effect's
+    /// or a handler's blocks: `get()(x)` in an effect, #46), and off the runs
+    /// of the bodies that keep none (a closure nested in it, #246). The
+    /// render binds the roots the table is about, so it keeps them all.
+    fn seen_from(
+        &self,
+        body: &CFG,
+        exits: Option<&HashMap<BlockId, AbstractEnv<StateValue>>>,
+    ) -> Self {
+        let mut binders = HashSet::new();
+        if !std::ptr::eq(body, self.render) {
+            collect_binders(body, &mut binders);
+        }
+        let mut fns: HashMap<Var, Vec<Arc<CFG>>> = self
+            .fns
+            .iter()
+            .filter(|(path, _)| !binders.contains(path_root(path)))
+            .map(|(path, bodies)| (path.clone(), bodies.clone()))
+            .collect();
+        if let Some(exits) = exits.filter(|_| !binders.is_empty()) {
+            fns.extend(collect_converged_fns(
+                body,
+                &[],
+                exits,
+                self.heap,
+                self.component,
+            ));
+        }
+        for (path, bodies) in &self.closures {
+            let known = fns.entry(path.clone()).or_default();
+            for b in bodies {
+                if !known.iter().any(|k| Arc::ptr_eq(k, b)) {
+                    known.push(Arc::clone(b));
+                }
+            }
+        }
+        ConvergedFns {
+            fns,
+            closures: self.closures.clone(),
+            render: self.render,
+            scopes: self.scopes.clone(),
+            heap: self.heap,
+            component: self.component,
+            hooks: self.hooks,
+            callback_fns: Arc::clone(&self.callback_fns),
+            called_events: Arc::clone(&self.called_events),
+            arg_timings: Arc::clone(&self.arg_timings),
+        }
+    }
+    /// The arguments of the hook at `label` when the expansion left it: the
+    /// fixpoint hands them, at the hook's marker, to code it does not see
+    /// (#254), as a call of an unknown callee hands its own (#262). React
+    /// runs a `useEffectEvent`'s argument only through the function it hands
+    /// back: when a name certifiably holds that function, the argument runs
+    /// where the name is called, not at the marker.
+    fn left_args(&self, label: HookLabel) -> &'a [Expr] {
+        if self.called_events.contains(&label) {
+            return &[];
+        }
+        self.hooks
+            .iter()
+            .find_map(|h| match h {
+                HookEntry::Custom { label: l, args, .. } if *l == label => Some(args.as_slice()),
+                _ => None,
+            })
+            .unwrap_or(&[])
+    }
+    /// The argument, and its timing, a call through `fn_` runs at a time the
+    /// package-hook table gives, when `fn_` is a member of a package hook's
+    /// result: `form.register`, or `register` destructured off it. Both names
+    /// on the way must be certainly bound — once, in the render, and by no
+    /// other body ([`must_binding`](crate::ir::bindings::must_binding)).
+    fn result_member_timing(&self, fn_: &Expr) -> Option<(usize, ArgTiming)> {
+        use crate::ir::bindings::must_binding;
+        let member = match fn_.peel_ts() {
+            m @ Expr::FieldAccess { .. } => m,
+            v @ Expr::Var(_) => must_binding(v, self.render, &self.scopes)?,
+            _ => return None,
+        };
+        let Expr::FieldAccess { obj, field } = member.peel_ts() else {
+            return None;
+        };
+        let Expr::HookMarker(label, _) = must_binding(obj, self.render, &self.scopes)?.peel_ts()
+        else {
+            return None;
+        };
+        self.hooks.iter().find_map(|h| match h {
+            HookEntry::Custom {
+                label: l,
+                name,
+                import_source: Some(src),
+                ..
+            } if l == label => crate::engine::timing::result_member(src, name, field),
+            _ => None,
+        })
+    }
+
+    /// The timing the package-hook table gives argument `i` of the left hook
+    /// at `label`, `None` when it gives none.
+    fn arg_timing(&self, label: HookLabel, i: usize) -> Option<ArgTiming> {
+        *self.arg_timings.get(&label)?.get(i)?
+    }
+    /// The names bound once to a `useCallback` or a `useEffectEvent` value,
+    /// with the body it runs: a call or an argument through one runs that
+    /// body, as the writer relation reads it ([`callback_bound_vars`], #262).
+    fn callback_fns(&self) -> &HashMap<Var, Arc<CFG>> {
+        &self.callback_fns
+    }
+
+    /// The closures a call through `path` may run: those at the path, or,
+    /// when its object names no such member, those its members no constant
+    /// names may hold (#76).
+    fn bodies(&self, path: &str) -> Option<&[Arc<CFG>]> {
+        let any = path
+            .rsplit_once('.')
+            .map(|(obj, _)| format!("{obj}.{ANY_MEMBER}"));
+        self.fns
+            .get(path)
+            .or_else(|| self.fns.get(any.as_deref()?))
+            .map(Vec::as_slice)
+    }
+
+    /// The closures held under the members of the object at `path`, at any
+    /// depth (`opts.onRun`, `opts.cbs.0`): what handing that object over
+    /// hands along with it (#264).
+    fn member_bodies(&self, path: &str) -> Vec<&Arc<CFG>> {
+        let prefix = format!("{path}.");
+        let mut paths: Vec<&Var> = self.fns.keys().filter(|p| p.starts_with(&prefix)).collect();
+        paths.sort();
+        let mut bodies: Vec<&Arc<CFG>> = Vec::new();
+        for b in paths.into_iter().flat_map(|p| &self.fns[p]) {
+            if !bodies.iter().any(|k| Arc::ptr_eq(k, b)) {
+                bodies.push(b);
+            }
+        }
+        bodies
+    }
+
+    /// A call of `fn_` surely runs `body`: the table has no other closure
+    /// for it, and the callee is certainly bound to that literal.
+    fn certain(&self, fn_: &Expr, body: &Arc<CFG>) -> bool {
+        matches!(
+            crate::ir::bindings::must_member_binding(fn_, self.render, &self.scopes),
+            Some(Expr::FnLit { body_cfg, .. }) if Arc::ptr_eq(body_cfg, body)
+        )
+    }
+}
+
+/// Every closure of `component` a name or member path of `cfg` may point to
+/// in some block's converged env (#233): `api.inc` for a hook's or a memo's
+/// returned object, `inc` destructured off a memo. A call through the path
+/// may run any of them — the writer relation walks each body
+/// ([`ConvergedFns`]). Another component's closure stays a carried setter
+/// prop: its body names that component's bindings.
+fn collect_converged_fns(
+    cfg: &CFG,
+    params: &[Var],
+    block_states: &HashMap<BlockId, AbstractEnv<StateValue>>,
+    heap: &Heap,
+    component: ComponentId,
+) -> HashMap<Var, Vec<Arc<CFG>>> {
+    let mut result: HashMap<Var, Vec<Arc<CFG>>> = HashMap::new();
+    add_converged_fns(&mut result, cfg, params, block_states, heap, component);
+    result
+}
+
+/// [`collect_converged_fns`] into `result`, beside what other bodies put
+/// there.
+fn add_converged_fns(
+    result: &mut HashMap<Var, Vec<Arc<CFG>>>,
+    cfg: &CFG,
+    params: &[Var],
+    block_states: &HashMap<BlockId, AbstractEnv<StateValue>>,
+    heap: &Heap,
+    component: ComponentId,
+) {
+    for_each_converged_path(cfg, params, block_states, heap, |name, ev| {
+        let mut ids: Vec<_> = ev.locs().into_iter().flatten().copied().collect();
+        ids.sort();
+        for id in ids {
+            if let Some(HeapValue::Fn {
+                body_cfg, owner, ..
+            }) = heap.get(id)
+                && *owner == component
+            {
+                let bodies = result.entry(name.clone()).or_default();
+                if !bodies.iter().any(|b| Arc::ptr_eq(b, body_cfg)) {
+                    bodies.push(Arc::clone(body_cfg));
+                }
+            }
+        }
+    });
+}
+
+/// The last segment of the member path that stands for every member an
+/// object holds under no constant name (`api.*`). No identifier is `*`, so
+/// no callee path ends with it.
+const ANY_MEMBER: &str = "*";
+
+/// The variable a member path is rooted at: `api` for `api.inc`.
+fn path_root(path: &str) -> &str {
+    path.split('.').next().unwrap_or(path)
+}
+
+/// Visit every name `cfg` binds — its `params`, and every name a statement
+/// binds — then every member path of the objects it points to (`api.tick`,
+/// `t.1`, `props.f`: what [`callee_path`] names a member call by, #216, #233,
+/// #243), with its value in each block's converged env — blocks in program
+/// order, names and members sorted (#120). A member the value may hold
+/// without a site saying so — the value is open, or one of its sites does not
+/// record the member — is also visited as ⊤ (#240).
+fn for_each_converged_path(
+    cfg: &CFG,
+    params: &[Var],
+    block_states: &HashMap<BlockId, AbstractEnv<StateValue>>,
+    heap: &Heap,
+    mut visit: impl FnMut(&Var, &EnvVal<StateValue>),
+) {
+    let mut var_names: HashSet<Var> = params.iter().cloned().collect();
     for block in cfg.blocks.values() {
         for stmt in &block.stmts {
             match stmt {
@@ -293,60 +805,135 @@ pub(crate) fn collect_component_setter_vars(
     let mut var_names: Vec<Var> = var_names.into_iter().collect();
     var_names.sort();
 
-    let mut result: HashMap<Var, SetterProp> = HashMap::new();
     for env in cfg.blocks.keys().filter_map(|b| block_states.get(b)) {
         for var in &var_names {
-            if result.contains_key(var) {
+            let Some(ev) = env.lookup_env_val(var) else {
                 continue;
-            }
-            // Direct component-setter value (exact setter slot).
-            if let Some((component, label)) = env.lookup(var).as_setter() {
-                result.insert(
-                    var.clone(),
-                    SetterProp {
-                        component: *component,
-                        label: *label,
-                        must_write: true,
-                    },
-                );
-                continue;
-            }
-            // Loc pointing to a FnLit that captures a ComponentSetter
-            // (e.g. the parent passed `() => setCount(0)` as a prop).
-            // Allocation sites and captures are hash sets/maps, and the first
-            // setter found wins — so both are walked in sorted order (#120).
-            if let Some(EnvVal::Loc { ids, .. }) = env.lookup_env_val(var) {
-                let mut ids: Vec<_> = ids.iter().copied().collect();
+            };
+            let mut stack: Vec<(Var, EnvVal<StateValue>)> = vec![(var.clone(), ev)];
+            let mut seen: HashSet<crate::ir::types::ExprId> = HashSet::new();
+            while let Some((name, ev)) = stack.pop() {
+                visit(&name, &ev);
+                let Some(sites) = ev.sites() else {
+                    continue;
+                };
+                let fresh = Sites {
+                    ids: sites
+                        .ids
+                        .iter()
+                        .copied()
+                        .filter(|id| seen.insert(*id))
+                        .collect(),
+                    open: sites.open,
+                };
+                let members: BTreeSet<&Var> = fresh
+                    .ids
+                    .iter()
+                    .filter_map(|id| match heap.get(*id) {
+                        Some(HeapValue::Obj(obj)) => Some(obj.named.keys()),
+                        _ => None,
+                    })
+                    .flatten()
+                    .collect();
+                for m in members.into_iter().rev() {
+                    let path = format!("{name}.{m}");
+                    let (entries, open) = heap.members(&fresh, m);
+                    if open {
+                        stack.push((path.clone(), EnvVal::Val(StateValue::top())));
+                    }
+                    stack.extend(entries.into_iter().rev().map(|e| (path.clone(), e.clone())));
+                }
+                // What a member no constant names may hold, under the path
+                // a call through any other member falls back to (#76).
+                let mut ids: Vec<_> = fresh.ids.iter().copied().collect();
                 ids.sort();
                 for id in ids {
-                    if let Some(HeapValue::Fn {
-                        captured, body_cfg, ..
-                    }) = heap.get(id)
+                    if let Some(HeapValue::Obj(obj)) = heap.get(id)
+                        && let Some(others) = &obj.others
                     {
-                        let mut caps: Vec<_> = captured.iter().collect();
-                        caps.sort_by_key(|(k, _)| *k);
-                        for (name, val) in caps {
-                            if let Some((component, label)) = val.as_setter() {
-                                result.insert(
-                                    var.clone(),
-                                    SetterProp {
-                                        component: *component,
-                                        label: *label,
-                                        must_write: body_writes(body_cfg, name),
-                                    },
-                                );
-                                break;
-                            }
-                        }
-                    }
-                    if result.contains_key(var) {
-                        break;
+                        stack.push((format!("{name}.{ANY_MEMBER}"), others.clone()));
                     }
                 }
             }
         }
     }
-    result
+}
+
+/// The name a call goes through: a variable, or a member path rooted at one
+/// (`api.tick`, `t.1` for `t[1]`) — the names the converged-value reading
+/// ([`collect_component_setter_vars`]) gives the members it finds a setter
+/// in. A path cannot collide with a variable: no identifier holds a dot.
+pub(crate) fn callee_path(fn_: &Expr) -> Option<Var> {
+    match fn_.peel_ts() {
+        Expr::Var(name) => Some(name.clone()),
+        Expr::FieldAccess { obj, field } => Some(format!("{}.{field}", callee_path(obj)?)),
+        Expr::IndexAccess { arr, idx } => match idx.peel_ts() {
+            Expr::Lit(crate::ir::expr::Prim::Int(i)) if *i >= 0 => {
+                Some(format!("{}.{i}", callee_path(arr)?))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The setters calling a value with these contents may write: the value
+/// itself, or the closures it may point to that captured one (the parent
+/// passed `() => setCount(0)` as a prop) — one per closure, the first setter
+/// it captured, as before. A value that may be several (two call sites, two
+/// setters) is each of them, and provably none: `must_write` needs one, and a
+/// value that may be something else than a setter (#233) writes none surely,
+/// nor does one that may be a function no site places (#240).
+/// Allocation sites and captures are hash sets/maps, so both are walked in
+/// sorted order (#120).
+fn setter_of(ev: &EnvVal<StateValue>, heap: &Heap) -> Vec<SetterProp> {
+    let open = ev.sites().is_some_and(|s| s.open);
+    let val = ev.as_val();
+    let mut out: Vec<SetterProp> = val
+        .setters()
+        .into_iter()
+        .map(|(component, label)| SetterProp {
+            component,
+            label,
+            must_write: val.surely_setter(),
+            closure: false,
+            closure_owner: None,
+        })
+        .collect();
+    let mut ids: Vec<_> = ev.locs().into_iter().flatten().copied().collect();
+    ids.sort();
+    for id in ids {
+        if let Some(HeapValue::Fn {
+            captured,
+            body_cfg,
+            owner,
+            ..
+        }) = heap.get(id)
+        {
+            let mut caps: Vec<_> = captured.iter().collect();
+            caps.sort_by_key(|(k, _)| *k);
+            if let Some((name, (component, label))) = caps
+                .into_iter()
+                .find_map(|(name, val)| val.as_setter().map(|s| (name, s)))
+            {
+                out.push(SetterProp {
+                    component: *component,
+                    label: *label,
+                    must_write: !open && body_writes(body_cfg, name),
+                    closure: true,
+                    closure_owner: Some(*owner),
+                });
+            }
+        }
+    }
+    out.sort_by_key(|p| (p.component, p.label, p.closure));
+    out.dedup_by_key(|p| (p.component, p.label, p.closure));
+    if out.len() > 1 {
+        for p in &mut out {
+            p.must_write = false;
+        }
+    }
+    out
 }
 
 /// Does `var` still denote a component setter **at this call**?
@@ -419,7 +1006,7 @@ pub(crate) fn setter_reassigned_before_call(
 /// rather than guess from the shape of the binding.
 fn body_writes(body_cfg: &CFG, setter: &Symbol) -> bool {
     let vars: HashSet<Var> = std::iter::once(setter.clone()).collect();
-    collect_setter_calls(body_cfg, &vars, 2)
+    collect_setter_calls(body_cfg, &vars)
         .iter()
         .any(|c| c.class == SetterCallPhase::Sync)
 }
@@ -433,10 +1020,45 @@ fn body_writes(body_cfg: &CFG, setter: &Symbol) -> bool {
 pub(crate) fn cross_component_setters(
     comp: &AnalysisResult<StateValue>,
     component: ComponentId,
-) -> HashMap<Var, SetterProp> {
-    collect_component_setter_vars(&comp.render_cfg, &comp.block_states, &comp.heap)
-        .into_iter()
-        .filter(|(_, prop)| prop.component != component)
+) -> HashMap<Var, Vec<SetterProp>> {
+    collect_component_setter_vars(
+        &comp.render_cfg,
+        std::slice::from_ref(&comp.param),
+        &comp.block_states,
+        &comp.heap,
+    )
+    .into_iter()
+    .filter_map(|(v, props)| {
+        let foreign: Vec<SetterProp> = props
+            .into_iter()
+            .filter(|p| p.component != component)
+            .collect();
+        (!foreign.is_empty()).then_some((v, foreign))
+    })
+    .collect()
+}
+
+/// The setters a call through each name or member path of `comp` may write,
+/// read off the converged values: another component's setter, or this one's
+/// when the value is the setter itself — `t[1]`, `api.setV`, a member a
+/// nested or memoized destructuring reads (#216, #233). A closure of this
+/// component over an own setter is not one: its body is walked instead. A
+/// child's closure over it, which a prop ref brings back, is (#270). The
+/// writer relation and `setter-in-render` read the same table.
+pub(crate) fn converged_call_targets(
+    converged: &HashMap<Var, Vec<SetterProp>>,
+    component: ComponentId,
+) -> HashMap<Var, Vec<SetterProp>> {
+    converged
+        .iter()
+        .filter_map(|(v, props)| {
+            let targets: Vec<SetterProp> = props
+                .iter()
+                .filter(|p| p.component != component || p.closure_owner != Some(component))
+                .cloned()
+                .collect();
+            (!targets.is_empty()).then(|| (v.clone(), targets))
+        })
         .collect()
 }
 
@@ -455,7 +1077,13 @@ fn certified_fn_names(cfg: &CFG, bindings: &HashMap<Var, Arc<CFG>>) -> HashSet<V
         .collect()
 }
 
-/// Scan all Let stmts in `cfg` for `let X = FnLit{...}` and return X → body_cfg.
+/// Every `let X = FnLit{...}` in `cfg`, X → body_cfg, closed over the
+/// aliases of those names (`const run = inc`) the way setter names are.
+///
+/// The aliases are not a nicety: a closure a custom hook returns reaches its
+/// caller only through one — `const { inc } = useCounter()` is
+/// `let inc = __obj_N.inc` once the hook is spliced (#185) — so without them a
+/// call of `inc` was a call of nothing.
 pub(crate) fn collect_fn_bindings(cfg: &CFG) -> HashMap<Var, Arc<CFG>> {
     let mut map: HashMap<Var, Arc<CFG>> = HashMap::new();
     for block in cfg.blocks.values() {
@@ -470,7 +1098,7 @@ pub(crate) fn collect_fn_bindings(cfg: &CFG) -> HashMap<Var, Arc<CFG>> {
             }
         }
     }
-    map
+    resolve_aliases(cfg, &map)
 }
 
 /// Every name bound by a `Let`/`Assign` or an `FnLit` parameter anywhere in
@@ -526,17 +1154,18 @@ pub(crate) fn memo_val_labels(cfg: &CFG) -> HashMap<Var, HookLabel> {
 }
 
 /// `var → hook label` for every `let var = <hook call>` in `cfg`, whatever the
-/// kind: the value slot of a `useState`, a memo, a callback, and — through
-/// `HookMarker`, which every other hook binds — a ref or a custom hook's
-/// return. This is the "what does the source call this hook" table; a label
-/// with no `hook_calls` row can never be looked up in it.
+/// kind: the value slot of a `useState`, or the pair one kept whole returns
+/// (#283), a memo, a callback, and — through `HookMarker`, which every other
+/// hook binds — a ref or a custom hook's return. This is the "what does the
+/// source call this hook" table; a label with no `hook_calls` row can never
+/// be looked up in it.
 pub(crate) fn hook_val_labels(cfg: &CFG) -> HashMap<Var, HookLabel> {
     state_binding_labels(cfg, |rhs| match rhs {
         Expr::StateVal(label)
         | Expr::MemoVal(label)
         | Expr::CallbackVal(label)
         | Expr::HookMarker(label, _) => Some(*label),
-        _ => None,
+        pair => pair.as_state_pair(),
     })
 }
 
@@ -559,23 +1188,84 @@ fn state_binding_labels(
     map
 }
 
-/// Extend a `setter var → state label` map with alias `let a = b` bindings in
-/// `cfg` (b a known setter ⇒ a is too). Iterates to a fixpoint so chains
+/// Extend a `var → label` naming map with alias `let a = b` bindings in
+/// `cfg` (b named ⇒ a is too). Iterates to a fixpoint so chains
 /// `let s1 = setX; let s2 = s1` all resolve.
 ///
 /// Utility inlining binds setter params via such aliases (`let setter = setX`)
 /// inside spliced bodies; rules matching setters by name must follow them or
-/// the spliced setter call goes unseen (false negative).
+/// the spliced setter call goes unseen (false negative). A name keeps one
+/// label, the first it meets: what names a slot. The slots a call through
+/// a setter may write are [`SetterTargets`], which keeps every one.
 pub(crate) fn resolve_setter_aliases(
     cfg: &CFG,
     base: &HashMap<Var, HookLabel>,
 ) -> HashMap<Var, HookLabel> {
+    resolve_aliases(cfg, base)
+}
+
+/// Every body other than the render a read of a render name may sit in or be
+/// reached from, with its parameters: the render's nested functions, and every
+/// hook body with its own (a callback's parameters included). The `elsewhere`
+/// of [`must_slot_read`](crate::ir::bindings::must_slot_read): a binder of a
+/// name in one of them refuses the name's must-alias.
+pub(crate) fn must_alias_scopes<'c>(
+    render_cfg: &'c CFG,
+    hooks: &'c [HookEntry],
+) -> Vec<(&'c [Var], &'c CFG)> {
+    let mut scopes = crate::ir::bindings::nested_bodies(render_cfg);
+    for hook in hooks {
+        let params: &[Var] = match hook {
+            HookEntry::Callback { params, .. } => params,
+            _ => &[],
+        };
+        if let Some(body) = hook.body_cfg() {
+            scopes.push((params, body));
+            scopes.extend(crate::ir::bindings::nested_bodies(body));
+        }
+    }
+    scopes
+}
+
+/// The must reading of `state_val_labels` beside the may table
+/// [`resolve_setter_aliases`] builds: the names the render binds to a slot's
+/// read on every path, and no body of `scopes` ([`must_alias_scopes`])
+/// rebinds. What a proof may read as the slot itself (#210, #222, #231).
+pub(crate) fn must_state_vals(
+    render_cfg: &CFG,
+    scopes: &[(&[Var], &CFG)],
+) -> HashMap<Var, HookLabel> {
+    resolve_setter_aliases(render_cfg, &state_val_labels(render_cfg))
+        .into_iter()
+        .filter(|(v, l)| {
+            crate::ir::bindings::must_slot_read(&Expr::Var(v.clone()), render_cfg, scopes)
+                == Some(*l)
+        })
+        .collect()
+}
+
+/// The alias closure itself, for any fact keyed by a name: `let a = b` / `a = b`
+/// with `b` in the map gives `a` the same entry, chains included. A name
+/// already in the map keeps its own entry.
+fn resolve_aliases<T: Clone>(cfg: &CFG, base: &HashMap<Var, T>) -> HashMap<Var, T> {
+    resolve_aliases_by(&[cfg], base, |_, _| false)
+}
+
+/// [`resolve_aliases`] over every body of `bodies` at once, so a chain that
+/// crosses them is closed whatever their order, and where a name already in
+/// the map takes `merge` of its entry and the alias's: `merge(entry, fact)`
+/// folds `fact` in and says whether the entry grew.
+fn resolve_aliases_by<T: Clone>(
+    bodies: &[&CFG],
+    base: &HashMap<Var, T>,
+    merge: impl Fn(&mut T, &T) -> bool,
+) -> HashMap<Var, T> {
     let mut map = base.clone();
     loop {
         let mut changed = false;
-        for block in cfg.blocks.values() {
+        for block in bodies.iter().flat_map(|cfg| cfg.blocks.values()) {
             for stmt in &block.stmts {
-                // `let s = setX` and `s = setX` both alias the setter — mirror
+                // `let s = setX` and `s = setX` both alias the name — mirror
                 // the interpreter's `bind_rhs`, which treats Let/Assign alike.
                 let alias = match stmt {
                     Stmt::Let {
@@ -591,11 +1281,15 @@ pub(crate) fn resolve_setter_aliases(
                     _ => None,
                 };
                 if let Some((var, src)) = alias
-                    && !map.contains_key(var)
-                    && let Some(&label) = map.get(src)
+                    && let Some(fact) = map.get(src).cloned()
                 {
-                    map.insert(var.clone(), label);
-                    changed = true;
+                    match map.get_mut(var) {
+                        Some(entry) => changed |= merge(entry, &fact),
+                        None => {
+                            map.insert(var.clone(), fact);
+                            changed = true;
+                        }
+                    }
                 }
             }
         }
@@ -606,24 +1300,104 @@ pub(crate) fn resolve_setter_aliases(
     map
 }
 
-/// Alias-resolved `setter var → state label` across the render body and every
-/// hook body. Utility inlining binds setter params via aliases (`let setter =
-/// setX`) inside spliced bodies; rules matching a setter by name must follow
-/// those aliases through every body or a spliced setter call goes unseen (false
-/// negative). The shared recipe of `derived-state`, `state-mutation`,
-/// `stale-closure` and `frozen-initial-state`.
-pub(crate) fn all_setter_labels(comp: &AnalysisResult<StateValue>) -> HashMap<Var, HookLabel> {
+/// Every slot a setter name may write: the setter names a body binds
+/// (`const [x, setX] = useState()`) and their aliases, each alias with the
+/// union of what it is bound to — `s = setA` on one path and `s = setB` on
+/// another make `s` both (#202). A call through a name with several targets
+/// writes one of them, a may-write of each.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SetterTargets(HashMap<Var, BTreeSet<HookLabel>>);
+
+impl SetterTargets {
+    /// The setter names `cfg` binds, each to its own slot.
+    pub(crate) fn bound_in(cfg: &CFG) -> Self {
+        SetterTargets(
+            setter_var_labels(cfg)
+                .into_iter()
+                .map(|(v, l)| (v, BTreeSet::from([l])))
+                .collect(),
+        )
+    }
+
+    /// Closed over the aliases `bodies` write (`let s1 = setX; s2 = s1`, a
+    /// spliced wrapper's `let setter = setX`), chains included.
+    pub(crate) fn resolve(&self, bodies: &[&CFG]) -> Self {
+        SetterTargets(resolve_aliases_by(bodies, &self.0, |entry, fact| {
+            let before = entry.len();
+            entry.extend(fact.iter().copied());
+            entry.len() > before
+        }))
+    }
+
+    /// The slots a call through `var` may write; none for a non-setter.
+    pub(crate) fn targets(&self, var: &str) -> impl Iterator<Item = HookLabel> + '_ {
+        self.0.get(var).into_iter().flatten().copied()
+    }
+
+    /// The one slot a call through `var` may write, when no other setter
+    /// reaches the name.
+    pub(crate) fn sole(&self, var: &str) -> Option<HookLabel> {
+        self.0
+            .get(var)
+            .filter(|s| s.len() == 1)
+            .and_then(|s| s.first().copied())
+    }
+
+    pub(crate) fn contains(&self, var: &str) -> bool {
+        self.0.contains_key(var)
+    }
+
+    /// Every setter name.
+    pub(crate) fn names(&self) -> impl Iterator<Item = &Var> + '_ {
+        self.0.keys()
+    }
+
+    /// Every `(name, slot)` a call through the name may write.
+    pub(crate) fn pairs(&self) -> impl Iterator<Item = (&Var, HookLabel)> + '_ {
+        self.0
+            .iter()
+            .flat_map(|(v, s)| s.iter().map(move |l| (v, *l)))
+    }
+
+    /// The names a call through which may write `slot`.
+    pub(crate) fn aliases_of(&self, slot: HookLabel) -> HashSet<Var> {
+        self.pairs()
+            .filter(|(_, l)| *l == slot)
+            .map(|(v, _)| v.clone())
+            .collect()
+    }
+
+    /// The names no setter but `slot`'s reaches ([`Self::sole`]): what a
+    /// must reading of a write may take. Whether the name is a setter on
+    /// every path is the binding's own question (`must_binding`).
+    pub(crate) fn sure_aliases_of(&self, slot: HookLabel) -> HashSet<Var> {
+        self.0
+            .keys()
+            .filter(|v| self.sole(v) == Some(slot))
+            .cloned()
+            .collect()
+    }
+}
+
+/// Alias-resolved setter targets across the render body and every body nested
+/// in it or in a hook: the bodies the must-alias table is scoped by
+/// ([`must_alias_scopes`]). Utility inlining binds setter params via aliases
+/// (`let setter = setX`) inside spliced bodies, and a closure the render runs
+/// may bind one itself (`const s = setN` in it, #284); rules matching a setter
+/// by name must follow those aliases through every body or such a call goes
+/// unseen (false negative). The one may table of every setter walk.
+pub(crate) fn all_setter_labels(comp: &AnalysisResult<StateValue>) -> SetterTargets {
     setter_labels_of(&comp.render_cfg, &comp.hooks)
 }
 
 /// [`all_setter_labels`] over a render body and its hook table, before they
 /// are an [`AnalysisResult`] — what the fixpoint reads to store its relations.
-pub(crate) fn setter_labels_of(render_cfg: &CFG, hooks: &[HookEntry]) -> HashMap<Var, HookLabel> {
-    let mut labels = setter_var_labels(render_cfg);
-    for cfg in std::iter::once(render_cfg).chain(hooks.iter().filter_map(|h| h.body_cfg())) {
-        labels = resolve_setter_aliases(cfg, &labels);
-    }
-    labels
+pub(crate) fn setter_labels_of(render_cfg: &CFG, hooks: &[HookEntry]) -> SetterTargets {
+    let scopes = must_alias_scopes(render_cfg, hooks);
+    let bodies: Vec<&CFG> = std::iter::once(render_cfg)
+        .chain(scopes.into_iter().map(|(_, body)| body))
+        .collect();
+    SetterTargets::bound_in(render_cfg).resolve(&bodies)
 }
 
 // ── The slot-writer relation (ADR-027 §1) ─────────────────────────────────────
@@ -764,7 +1538,8 @@ pub struct SlotWriter {
     pub owner: Option<ComponentId>,
     /// The block of the region's CFG the write runs in, for a write that runs
     /// synchronously in the region, once per pass — what `must_on_all_paths`
-    /// takes. `None` for a nested, deferred, cleanup or repeating site.
+    /// takes. `None` for a nested, deferred, cleanup or repeating site, and
+    /// for a call through a name with several targets, which writes one.
     pub block: Option<BlockId>,
     /// The block of the region's CFG whose dominating guards the write runs
     /// under: `block` for a synchronous write, the statement that scheduled
@@ -851,8 +1626,78 @@ impl InlineRegions {
     }
 }
 
+/// The body of every `useCallback` of the component, by label.
+fn callback_bodies(hooks: &[HookEntry]) -> HashMap<HookLabel, Arc<CFG>> {
+    hooks
+        .iter()
+        .filter_map(|h| match h {
+            HookEntry::Callback {
+                label, body_cfg, ..
+            } => Some((*label, Arc::new(body_cfg.clone()))),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The argument of every React `useEffectEvent` the expansion left, by label.
+/// React hands back a function that runs it, and runs it nowhere else: the
+/// returned function calls the latest render's argument, and throws when
+/// called during a render.
+fn effect_event_args<'a>(
+    hooks: &'a [HookEntry],
+    provenance: &[HookProvenance],
+) -> HashMap<HookLabel, &'a Expr> {
+    hooks
+        .iter()
+        .filter_map(|h| match h {
+            HookEntry::Custom { label, args, .. }
+                if provenance
+                    .iter()
+                    .any(|p| p.label == *label && p.react && p.origin_hook == "useEffectEvent") =>
+            {
+                args.first().map(|a| (*label, a))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The names bound once, in render and in no other body, to what a React
+/// `useEffectEvent` hands back (#273). That function calls the latest
+/// render's argument, so a stale copy of it is the current one, and React
+/// forbids listing it in a deps array: no deps reading asks for it.
+pub(crate) fn effect_event_names(
+    render: &CFG,
+    hooks: &[HookEntry],
+    provenance: &[HookProvenance],
+) -> HashSet<Var> {
+    let events = effect_event_args(hooks, provenance);
+    let mut elsewhere = HashSet::new();
+    for body in hooks.iter().filter_map(HookEntry::body_cfg) {
+        collect_binders(body, &mut elsewhere);
+    }
+    hooks
+        .iter()
+        .filter_map(|h| match h {
+            HookEntry::Custom {
+                label,
+                binding: Some(v),
+                ..
+            } if events.contains_key(label)
+                && !elsewhere.contains(v)
+                && crate::ir::bindings::binding_of(v, render).is_some() =>
+            {
+                Some(v.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// Names bound exactly once, anywhere below, to the result of a `useCallback`
-/// — mapped to that callback's body.
+/// — mapped to that callback's body — or of a `useEffectEvent` whose
+/// argument is such a name or a function literal (`events`), mapped to the
+/// body the argument is.
 ///
 /// The same single-binding bar the literal certificate uses: a name any body
 /// re-binds is not the memoized function by the time the write runs.
@@ -860,6 +1705,7 @@ fn callback_bound_vars(
     render_cfg: &CFG,
     also: &[&CFG],
     callback_bodies: &HashMap<HookLabel, Arc<CFG>>,
+    events: &HashMap<HookLabel, &Expr>,
 ) -> HashMap<Var, Arc<CFG>> {
     fn scan<'a>(cfg: &'a CFG, out: &mut HashMap<&'a str, Vec<&'a Expr>>) {
         for block in cfg.blocks.values() {
@@ -883,16 +1729,38 @@ fn callback_bound_vars(
     for cfg in also {
         scan(cfg, &mut binds);
     }
+    // A rename hop (`const run = inc`, a hook's forwarded `{ inc }`) is held
+    // to the same bar: every name on the chain is bound exactly once.
+    let sole = |name: &str| -> Option<&Expr> {
+        match binds.get(name)?.as_slice() {
+            [only] => Some(only.peel_ts()),
+            _ => None,
+        }
+    };
     binds
-        .into_iter()
-        .filter_map(|(name, rhs)| {
-            let [only] = rhs.as_slice() else { return None };
-            let Expr::CallbackVal(label) = only.peel_ts() else {
-                return None;
+        .keys()
+        .filter_map(|&name| {
+            let mut cur = sole(name)?;
+            let mut event = false;
+            for _ in 0..crate::ir::bindings::MAX_ALIAS_HOPS {
+                cur = match cur {
+                    Expr::Var(next) => sole(next)?,
+                    // An effect event is its argument, as a rename hop is.
+                    Expr::HookMarker(label, _) if events.contains_key(label) => {
+                        event = true;
+                        events[label].peel_ts()
+                    }
+                    _ => break,
+                };
+            }
+            let body = match cur {
+                Expr::CallbackVal(label) => callback_bodies.get(label)?,
+                // A name bound to a literal is the literal certificate's;
+                // only an effect event's argument is read here.
+                Expr::FnLit { body_cfg, .. } if event => body_cfg,
+                _ => return None,
             };
-            callback_bodies
-                .get(label)
-                .map(|b| (name.to_string(), Arc::clone(b)))
+            Some((name.to_string(), Arc::clone(body)))
         })
         .collect()
 }
@@ -989,37 +1857,77 @@ fn class_phase(class: WalkClass, region: WriterRegion) -> WriterPhase {
 ///
 /// A write into a `useReducer` slot, own or foreign, stores what `reducers`
 /// says the slot's reducer returns, never its argument.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_slot_writers(
     render_cfg: &CFG,
+    params: &[Var],
     hooks: &[HookEntry],
     regions: &InlineRegions,
     hook_provenance: &[crate::ir::hooks::HookProvenance],
-    foreign: &HashMap<Var, SetterProp>,
+    converged: &HashMap<Var, Vec<SetterProp>>,
     envs: &SiteEnvs<'_>,
     reducers: &crate::engine::Reducers<'_>,
+    dispatches: bool,
 ) -> Vec<SlotWriter> {
-    let mut labels = setter_var_labels(render_cfg);
-    for cfg in std::iter::once(render_cfg).chain(hooks.iter().filter_map(|h| h.body_cfg())) {
-        labels = resolve_setter_aliases(cfg, &labels);
+    // Every name a write can go through, with the slots it may write and their
+    // owner — a local name bound to two setters on two paths writes one of
+    // them (#202). A local binding wins a tie (ADR-030 §1). The converged values
+    // (`collect_component_setter_vars`) are read beside the syntactic alias
+    // map: every render binding and member path holding a setter, so an
+    // alias holds the same setter value. An own slot is taken only from a
+    // name that IS the setter — `t[1](0)`, `api.setV(0)` on a hook's result
+    // (#233); a closure over one is walked through its body instead.
+    // A name a converged value binds to several setters (a prop two call
+    // sites pass, #175) writes one of them: a row per candidate. `carried`:
+    // the write runs a closure that captured the setter (`bump={() =>
+    // setN(n + 1)}`), and the call's own argument is not what it stores.
+    let mut targets: HashMap<Var, Vec<Target>> = HashMap::new();
+    for (v, slot) in setter_labels_of(render_cfg, hooks).pairs() {
+        targets.entry(v.clone()).or_default().push(Target {
+            owner: None,
+            slot,
+            carried: false,
+            sure: true,
+        });
     }
-    // Every name a write can go through, with the slot it writes and the slot's
-    // owner. A local binding wins a tie (ADR-030 §1). Foreign names are not
-    // alias-resolved: `cross_component_setters` already reads the converged
-    // value of every render binding, so an alias holds the same setter value.
-    let mut targets: HashMap<Var, (Option<ComponentId>, HookLabel)> =
-        labels.into_iter().map(|(v, l)| (v, (None, l))).collect();
-    for (v, prop) in foreign {
-        targets
-            .entry(v.clone())
-            .or_insert((Some(prop.component), prop.label));
-    }
-    let setter_vars: HashSet<Var> = targets.keys().cloned().collect();
-    // State-read bindings, aliases resolved the same way: a write of one
-    // into its own slot stores the slot's content (`written::classify`).
-    let mut states = state_val_labels(render_cfg);
-    for cfg in std::iter::once(render_cfg).chain(hooks.iter().filter_map(|h| h.body_cfg())) {
-        states = resolve_setter_aliases(cfg, &states);
-    }
+    let add_converged = |targets: &mut HashMap<Var, Vec<Target>>,
+                         converged: &HashMap<Var, Vec<SetterProp>>| {
+        for (v, props) in converged_call_targets(converged, envs.component) {
+            if targets.contains_key(&v) {
+                continue;
+            }
+            let candidates: Vec<Target> = props
+                .iter()
+                .map(|p| Target {
+                    owner: (p.component != envs.component).then_some(p.component),
+                    slot: p.label,
+                    carried: p.closure,
+                    sure: p.must_write,
+                })
+                .collect();
+            targets.insert(v, candidates);
+        }
+    };
+    add_converged(&mut targets, converged);
+    // A name a body with no per-block envs binds — a memo's or a callback's,
+    // a closure's nested in any body, `get()`'s temp in a `forEach` callback
+    // — is read off a run of that body from the env it is reached from
+    // (#246). Any body may reach such a body (a callback called in an
+    // effect, a memo's closure run by one), so the names are every region's.
+    let (closures, closure_heap) = envs.closure_envs(render_cfg, hooks);
+    add_converged(
+        &mut targets,
+        &setter_vars_over(
+            closures.iter().map(|c| (c.body, c.params, &c.exits)),
+            &closure_heap,
+        ),
+    );
+    // A write of the slot's own read stores its content (`written::classify`),
+    // a must fact: the name is bound once, in render, to the read, and no
+    // other body — a hook body, a closure, a callback's parameter — binds it
+    // (#210). The alias map above stays the may reading that finds writes.
+    let elsewhere = must_alias_scopes(render_cfg, hooks);
+    let must_read = |e: &Expr| crate::ir::bindings::must_slot_read(e, render_cfg, &elsewhere);
     // Any local binding of a deferring global's name disables its summary,
     // wherever the call sits (fail-closed across every body, nested `FnLit`
     // scopes included).
@@ -1042,29 +1950,62 @@ pub(crate) fn collect_slot_writers(
     // every body below — the same certificate a consumer needs before it may
     // treat a name as the function it was bound to (ADR-023 §3, #103).
     let hook_bodies: Vec<&CFG> = hooks.iter().filter_map(|h| h.body_cfg()).collect();
-    let callback_bodies: HashMap<HookLabel, Arc<CFG>> = hooks
-        .iter()
-        .filter_map(|h| match h {
-            HookEntry::Callback {
-                label, body_cfg, ..
-            } => Some((*label, Arc::new(body_cfg.clone()))),
-            _ => None,
-        })
-        .collect();
+    let callback_bodies = callback_bodies(hooks);
     let mut outer_fns: HashMap<Var, Arc<CFG>> = collect_fn_bindings(render_cfg)
         .into_iter()
         .filter(|(v, _)| {
             crate::ir::bindings::certified_fn_binding(v, render_cfg, &hook_bodies).is_some()
         })
         .collect();
+    // What no single binding certifies, the converged values may still point
+    // at: a closure behind a member path (`api.inc()`) or a memo's member.
+    let converged_fns = ConvergedFns::of(
+        render_cfg,
+        params,
+        hooks,
+        hook_provenance,
+        envs.render_exits,
+        envs.heap,
+        envs.component,
+    )
+    .with_closures(&closures, &closure_heap);
     // `const inc = useCallback(…)` binds a `CallbackVal`, not an `FnLit`, so
     // the literal certificate never sees it — and a memoized updater read as ⊤
     // fired the non-functional rules on correct code.
-    outer_fns.extend(callback_bound_vars(
-        render_cfg,
-        &hook_bodies,
-        &callback_bodies,
-    ));
+    outer_fns.extend(
+        converged_fns
+            .callback_fns()
+            .iter()
+            .map(|(v, b)| (v.clone(), Arc::clone(b))),
+    );
+
+    // A write reached through a function name is authored where that function
+    // is defined, and a name can carry a closure out of the region it was
+    // written in (`const { inc } = useCounter()`, #185). The row stays Direct
+    // only when every name on the way is defined outside every region; a
+    // definition that cannot be placed certifies nothing (ADR-027 §4,
+    // fail-closed).
+    let authored = |cfg: &CFG, cfg_key: Option<HookLabel>, through: &[Var]| {
+        for name in through {
+            let def = match crate::ir::bindings::binding_site_of(name, cfg) {
+                Some(site) => Some((cfg_key, site)),
+                None => {
+                    crate::ir::bindings::binding_site_of(name, render_cfg).map(|site| (None, site))
+                }
+            };
+            let Some((key, (block, Expr::FnLit { .. } | Expr::CallbackVal(_)))) = def else {
+                return WriteProvenance::Unknown;
+            };
+            if key.is_none() && regions.render_poisoned {
+                return WriteProvenance::Unknown;
+            }
+            let chain = regions.chain(key, block);
+            if !chain.is_empty() {
+                return WriteProvenance::Via(chain);
+            }
+        }
+        WriteProvenance::Direct
+    };
 
     let mut out: Vec<SlotWriter> = Vec::new();
     let push_sites = |region: WriterRegion, cfg: &CFG, out: &mut Vec<SlotWriter>| {
@@ -1076,13 +2017,28 @@ pub(crate) fn collect_slot_writers(
             | WriterRegion::Handler(l) => (Some(l), inlined_origin(l)),
         };
         let effect_body = matches!(region, WriterRegion::Effect(_));
+        // A name the body binds is read in the body's own converged envs,
+        // where it has them — an effect's or a handler's blocks: the value
+        // `get()` returns in `get()(x)` is a name no render env holds (#46).
+        let exits = match region {
+            WriterRegion::Effect(l) => envs.effect_exits.get(&l),
+            WriterRegion::Handler(l) => envs.handler_exits.get(&l),
+            _ => None,
+        };
+        let mut targets = targets.clone();
+        if let Some(exits) = exits {
+            let own = collect_component_setter_vars(cfg, &[], exits, envs.heap);
+            add_converged(&mut targets, &own);
+        }
+        let setter_vars: HashSet<Var> = targets.keys().cloned().collect();
         let mut sites = collect_write_sites(
             cfg,
             &setter_vars,
-            2,
             effect_body,
+            dispatches,
             &shadowed,
             &outer_fns,
+            &converged_fns.seen_from(cfg, exits),
             &callback_bodies,
         );
         // One source site is one row. A local helper called twice pulls its
@@ -1101,16 +2057,51 @@ pub(crate) fn collect_slot_writers(
             HashMap::new();
         for s in &sites {
             if s.class == WalkClass::Sync
-                && let (Some(&target), Some(b)) = (targets.get(&s.var), s.prov_block)
+                && let (Some(ts), Some(b)) = (targets.get(&s.var), s.prov_block)
             {
-                sync_blocks.entry(target).or_default().push(b);
+                for t in ts {
+                    sync_blocks.entry((t.owner, t.slot)).or_default().push(b);
+                }
             }
         }
         let reach = Reachability::of(cfg);
-        for site in sites {
-            let Some(&(owner, slot)) = targets.get(&site.var) else {
-                continue;
+        // What a name a write passes surely holds where it runs (#280): its
+        // one binding in this body, run before the write and shadowed by no
+        // nested body; or, in a body that runs after the render, its
+        // must-alias binding there.
+        let dom = crate::engine::DominatorTree::new(cfg);
+        let nested = crate::ir::bindings::nested_bodies(cfg);
+        let after_render = matches!(region, WriterRegion::Effect(_) | WriterRegion::Handler(_));
+        let bound = |e: &Expr, at: Option<(BlockId, usize)>| -> Option<Expr> {
+            let Expr::Var(v) = e.peel_ts() else {
+                return None;
             };
+            if crate::ir::bindings::binds(v, cfg) {
+                crate::ir::bindings::binding_before(v, cfg, &nested, at?, |a, b| {
+                    dom.dominates(a, b)
+                })
+                .cloned()
+            } else if after_render
+                && !nested
+                    .iter()
+                    .any(|(ps, b)| ps.contains(v) || crate::ir::bindings::binds(v, b))
+            {
+                crate::ir::bindings::must_binding(e, render_cfg, &elsewhere).cloned()
+            } else {
+                None
+            }
+        };
+        for (site, target, sole) in sites.into_iter().flat_map(|s| {
+            let ts = targets.get(&s.var).cloned().unwrap_or_default();
+            let sole = matches!(ts.as_slice(), [t] if t.sure);
+            ts.into_iter().map(move |t| (s.clone(), t, sole))
+        }) {
+            let Target {
+                owner,
+                slot,
+                carried,
+                ..
+            } = target;
             let same_tick = site.repeats
                 || match (site.class, site.prov_block) {
                     (WalkClass::Sync, Some(b)) => {
@@ -1136,16 +2127,22 @@ pub(crate) fn collect_slot_writers(
             let at = (site.class == WalkClass::Sync && !site.repeats)
                 .then_some(site.at)
                 .flatten();
-            let block = at.map(|(b, _)| b);
+            // A call through a name with several targets writes one of them,
+            // and one through a name that may be something else may write
+            // none: no slot is surely written there.
+            let block = at.map(|(b, _)| b).filter(|_| sole);
             let target = (owner.unwrap_or(envs.component), slot);
             let written = match reducers.get(target.0, target.1) {
                 Some(reducer) => written::dispatched(&reducer),
+                None if carried || site.applied => written::carried(),
                 None => written::classify(
                     site.arg.as_ref(),
                     &site.updater,
                     owner.is_none().then_some(slot),
-                    &states,
+                    class_phase(site.class, region),
+                    must_read,
                     |e| envs.eval(region, cfg, at, e),
+                    |e| bound(e, at),
                 ),
             };
             let via = {
@@ -1178,7 +2175,7 @@ pub(crate) fn collect_slot_writers(
                     if cfg_key.is_none() && regions.render_poisoned {
                         WriteProvenance::Unknown
                     } else {
-                        WriteProvenance::Direct
+                        authored(cfg, cfg_key, &site.through)
                     }
                 } else {
                     WriteProvenance::Via(chain)
@@ -1250,14 +2247,25 @@ pub(crate) fn collect_slot_writers(
 struct SetterWalk<'a> {
     setter_vars: &'a HashSet<Var>,
     fn_bindings: &'a HashMap<Var, Arc<CFG>>,
+    /// Names and member paths the converged values point at closures of this
+    /// component ([`ConvergedFns`]): a call through one may run each body.
+    /// `None` for every consumer without converged values.
+    converged: Option<&'a ConvergedFns<'a>>,
     walking: HashSet<usize>,
     /// The walk's outermost CFG (pointer identity) — where effect cleanup
     /// returns and reified listeners are recognized.
     root: usize,
+    /// The CFG the walk is in (pointer identity), the root or a body it
+    /// descended into.
+    body: usize,
     /// The walked root is an effect body: its top-level `addEventListener`
     /// listeners were reified as Handler entries (`extract_subscriptions`),
     /// and its returned function is its cleanup.
     effect_body: bool,
+    /// Some body of the program dispatches events itself, so a listener may
+    /// run synchronously in the dispatching body: it is ⊤, not `Handler`
+    /// ([`Timing::in_program`](crate::engine::registrations::Timing::in_program), #219).
+    dispatches: bool,
     /// Locally-bound names that disable a deferring-global summary
     /// (fail-closed: `let setTimeout = …` anywhere in the component makes
     /// the bare name mean nothing).
@@ -1287,6 +2295,11 @@ struct SetterWalk<'a> {
     /// resolve summaries, which reads as "no wrapper is proven": ⊤, the
     /// fire-more direction.
     wrappers: &'a HashSet<String>,
+    /// The function names the walk descended through to get here, outermost
+    /// first — a stack, pushed on entering a name's body and popped on leaving
+    /// it. Each site keeps a copy: a write inside a closure is authored where
+    /// the closure is defined, which a name can carry out of its region.
+    path: Vec<Var>,
 }
 
 /// No bindings to record reads for — every setter consumer.
@@ -1447,6 +2460,10 @@ struct FoundSite {
     /// site inside a nested body records a block of *that* body's CFG, and
     /// `BlockId` is per-CFG.
     at: Option<(BlockId, usize)>,
+    /// The body the call sits in (pointer identity) and its block there, for
+    /// a site its own body runs synchronously; unlike `at`, never moved to
+    /// the call that runs the body.
+    own: Option<(usize, BlockId)>,
     /// The top-level block the walk descended from — always a block of the
     /// walked root, which makes it the only id that means anything in the
     /// region's CFG. Region membership reads it (a nested callback defined
@@ -1461,6 +2478,11 @@ struct FoundSite {
     updater: Updater,
     /// Argument 0 as written, for the value the row stores (ADR-042 §2).
     arg: Option<Expr>,
+    /// The setter is handed to a callee that calls it ([`WriteSite::applied`]).
+    applied: bool,
+    /// The function names the walk went through to reach the site
+    /// ([`SetterWalk::path`]).
+    through: Vec<Var>,
 }
 
 /// `Array.prototype` HOFs that call their function argument synchronously —
@@ -1485,6 +2507,39 @@ pub(crate) const SYNC_HOF_METHODS: &[&str] = &[
     "flatMap",
     "sort",
 ];
+
+/// Does the sync HOF call `fn_(args)` surely run its callback (argument 0) at
+/// least once (#248)? Only when the receiver is an array literal written at
+/// the call with every entry present and none spread (`[1]`, not `[...xs]`
+/// nor `[, 1]`), and the method calls its callback on a first entry whatever
+/// the entries are: `reduce` and `reduceRight` only past an initial value or
+/// on two entries, `sort` never — a one-entry or all-`undefined` array calls
+/// no comparator. A receiver read off a name is not enough: the heap keeps an
+/// array's entries after a `pop()` or a `length = 0` emptied it.
+fn runs_at_least_once(fn_: &Expr, args: &[Expr]) -> bool {
+    let Expr::FieldAccess { obj, field } = fn_.peel_ts() else {
+        return false;
+    };
+    let Expr::ArrayLit {
+        elems,
+        arity,
+        spread_at,
+        ..
+    } = obj.peel_ts()
+    else {
+        return false;
+    };
+    if !spread_at.is_empty() || arity.exact() != Some(elems.len()) {
+        return false;
+    }
+    let n = elems.len();
+    match field.as_str() {
+        "map" | "forEach" | "filter" | "flatMap" | "find" | "findIndex" | "findLast"
+        | "findLastIndex" | "some" | "every" => n >= 1,
+        "reduce" | "reduceRight" => n >= 2 || (n >= 1 && args.len() >= 2),
+        _ => false,
+    }
+}
 
 /// Callee spellings proven to be a **wrapper**: a library member that returns
 /// a handler around its function argument instead of running it
@@ -1642,7 +2697,7 @@ impl<'a> SetterWalk<'a> {
             let shadowed = !reg.method_only
                 && matches!(fn_.peel_ts(), Expr::Var(n) if self.shadowed.contains(n.as_str()));
             if !shadowed {
-                return match reg.timing {
+                return match reg.timing.in_program(self.dispatches) {
                     Timing::Deferred => WalkClass::Deferred,
                     Timing::Handler => WalkClass::Handler,
                     Timing::Unknown => WalkClass::Unknown,
@@ -1678,6 +2733,22 @@ impl<'a> SetterWalk<'a> {
     /// line at all (#131).
     #[allow(clippy::too_many_arguments)]
     fn cfg(
+        &mut self,
+        cfg: &'a CFG,
+        depth: usize,
+        found: &mut Found,
+        mode: WalkClass,
+        prov: Option<BlockId>,
+        witness: Option<SourceRange>,
+    ) {
+        let outer = std::mem::replace(&mut self.body, cfg as *const CFG as usize);
+        self.cfg_body(cfg, depth, found, mode, prov, witness);
+        self.body = outer;
+    }
+
+    /// [`Self::cfg`], with `self.body` set to `cfg`.
+    #[allow(clippy::too_many_arguments)]
+    fn cfg_body(
         &mut self,
         cfg: &'a CFG,
         depth: usize,
@@ -1730,20 +2801,23 @@ impl<'a> SetterWalk<'a> {
                 // The terminator runs after every statement of the block.
                 let at = block_id.map(|b| (b, block.stmts.len()));
                 match &block.term {
-                    Terminator::Return(expr) => {
+                    Terminator::Return(expr, _) => {
                         // An effect body's returned function is its cleanup
                         // (ADR-027 §2) — descend it as such, whether inline
                         // or bound to a variable. Without this the cleanup's
                         // writes are invisible to the relation.
                         if self.effect_body && at_root && mode == WalkClass::Sync {
-                            let body = match expr {
-                                Expr::FnLit { body_cfg, .. } => Some(&**body_cfg),
-                                Expr::Var(name) => self.fn_bindings.get(name).map(|b| &**b),
-                                _ => None,
+                            let (body, name) = match expr {
+                                Expr::FnLit { body_cfg, .. } => (Some(&**body_cfg), None),
+                                Expr::Var(name) => {
+                                    (self.fn_bindings.get(name).map(|b| &**b), Some(name))
+                                }
+                                _ => (None, None),
                             };
                             if let Some(body) = body
                                 && depth > 0
                             {
+                                self.path.extend(name.cloned());
                                 self.cfg(
                                     body,
                                     depth - 1,
@@ -1752,6 +2826,9 @@ impl<'a> SetterWalk<'a> {
                                     prov_block,
                                     witness,
                                 );
+                                if name.is_some() {
+                                    self.path.pop();
+                                }
                             }
                         }
                         self.expr(expr, witness, at, depth, found, mode, at_root, prov_block);
@@ -1893,19 +2970,24 @@ impl<'a> SetterWalk<'a> {
         // `Promise` executor runs synchronously, and a class the body binds
         // is a local helper like any other.
         if let Expr::Call { fn_, args } | Expr::New { fn_, args, .. } = expr {
+            if let Some(name) = callee_path(fn_)
+                && self.setter_vars.contains(&name)
+            {
+                found.setters.push(FoundSite {
+                    var: name,
+                    class: mode,
+                    span: stmt_span,
+                    at,
+                    own: at.map(|(b, _)| (self.body, b)),
+                    prov_block: prov,
+                    repeats: self.repeating,
+                    updater: self.updater_of(args),
+                    arg: args.first().map(|a| a.peel_ts().clone()),
+                    applied: false,
+                    through: self.path.clone(),
+                });
+            }
             if let Expr::Var(name) = fn_.as_ref() {
-                if self.setter_vars.contains(name) {
-                    found.setters.push(FoundSite {
-                        var: name.clone(),
-                        class: mode,
-                        span: stmt_span,
-                        at,
-                        prov_block: prov,
-                        repeats: self.repeating,
-                        updater: self.updater_of(args),
-                        arg: args.first().map(|a| a.peel_ts().clone()),
-                    });
-                }
                 // B6: direct call to a locally-bound function — its body runs
                 // in the CURRENT mode, so sync-in-helper writes take this call
                 // site's class and block id; writes the helper defers or
@@ -1915,10 +2997,12 @@ impl<'a> SetterWalk<'a> {
                 if depth > 0
                     && let Some(body) = self.fn_bindings.get(name)
                 {
-                    // Inner rows' provenance is this call site: the local
-                    // helper's definition is only reachable from code that
-                    // shares its region (salted names stay region-local).
+                    // Inner rows' provenance block is this call site. Where
+                    // the helper is *defined* is the relation's question: an
+                    // alias can carry a name out of its region (a hook's
+                    // returned closure), so the name rides on `path`.
                     let mut inner = Found::default();
+                    self.path.push(name.clone());
                     self.cfg(
                         body,
                         depth - 1,
@@ -1927,9 +3011,15 @@ impl<'a> SetterWalk<'a> {
                         prov,
                         stmt_span,
                     );
+                    self.path.pop();
                     found.absorb(inner, body, mode, at, prov);
                 }
             }
+            // A call through a name or member path no binding certifies, which
+            // the converged values point at closures of this component
+            // (`api.inc()`, #233): each body may run here, so its writes are
+            // the call's.
+            self.converged_bodies(fn_, mode, at, depth, found, prov, stmt_span);
             // An immediately-invoked function expression runs NOW, at this
             // call site, in this mode — `(async () => { … })()` is how an
             // effect awaits, and it is the standard shape. The walk descended a
@@ -1955,9 +3045,16 @@ impl<'a> SetterWalk<'a> {
             // is exactly what `extract_subscriptions` reified as a Handler
             // entry — its body is walked as its own Handler region, so
             // descending it here would double-count. Anywhere else the same
-            // shape was NOT reified: classify the listener as Handler.
+            // shape was NOT reified: classify the listener as Handler. In a
+            // program that dispatches events, the listener may also run
+            // synchronously in this body's phase: the reified row keeps the
+            // event, and the descent here adds the ⊤ row (#219).
             let listener = expr.subscription_listener().is_some();
-            let reified = listener && self.effect_body && at_root && mode == WalkClass::Sync;
+            let reified = listener
+                && self.effect_body
+                && at_root
+                && mode == WalkClass::Sync
+                && !self.dispatches;
             // A teardown takes the callback back, it does not call it
             // (ADR-034 §5). Descending it here gave every registered listener
             // a second ⊤ row — from the very cleanup that unregisters it —
@@ -1965,12 +3062,19 @@ impl<'a> SetterWalk<'a> {
             if crate::engine::registrations::is_teardown(fn_) {
                 return;
             }
+            // A member of a package hook's result the timing table knows
+            // (`register(name, { onChange })`) runs that argument at its time.
+            let member = self.converged.and_then(|c| c.result_member_timing(fn_));
             for (i, arg) in args.iter().enumerate() {
                 if reified && i == 1 {
                     continue;
                 }
+                if let Some((_, timing)) = member.filter(|(at, _)| *at == i) {
+                    self.timed_arg(arg, Some(timing), depth, found, prov, stmt_span);
+                    continue;
+                }
                 let class = if listener && i == 1 {
-                    WalkClass::Handler
+                    self.listener_class()
                 } else {
                     self.arg_class(fn_, mode)
                 };
@@ -1979,23 +3083,271 @@ impl<'a> SetterWalk<'a> {
                 // CFG cycle to show for it.
                 let outer_repeating = self.repeating;
                 self.repeating = outer_repeating || self.is_sync_hof(fn_);
-                match arg {
-                    // Inline FnLit arg descend body, costs one depth level.
-                    Expr::FnLit { body_cfg, .. } if depth > 0 => {
-                        self.cfg(body_cfg, depth - 1, found, class, prov, stmt_span);
-                    }
-                    // B5: variable arg name resolution, no depth cost — so this is
-                    // the arm that can cycle (`const tick = t => raf(tick)`); the
-                    // `walking` stack is what terminates it.
-                    Expr::Var(name) => {
-                        if let Some(body) = self.fn_bindings.get(name) {
-                            self.cfg(body, depth, found, class, prov, stmt_span);
-                        }
-                    }
-                    _ => {}
-                }
+                // A sync callback's own blocks mean nothing in this CFG: its
+                // rows run at this call, and are placed here only when the
+                // receiver surely runs it, as an IIFE is (#248).
+                let placed = at.filter(|_| i == 0 && runs_at_least_once(fn_, args));
+                self.callback_arg(arg, class, placed, depth, found, prov, stmt_span);
                 self.repeating = outer_repeating;
             }
+        }
+        // A call that fires events (`ref.current.click()`, `dispatchEvent`)
+        // runs the component's JSX handlers of that event before it returns,
+        // or all of them when the name is not known: their writes are
+        // possible writes of this call, in its class (#277), as a registered
+        // listener's are in a dispatching program (#250). Never placed: the
+        // dispatch may reach none of them.
+        if let Expr::Call { fn_, args } | Expr::New { fn_, args, .. } = expr
+            && let Some(event) = crate::engine::registrations::dispatched_event(fn_, args)
+            && let Some(c) = self.converged
+            && depth > 0
+        {
+            for hook in c.hooks {
+                if let HookEntry::Handler {
+                    event: e, body_cfg, ..
+                } = hook
+                    && event.as_deref().is_none_or(|n| n == e)
+                {
+                    let mut inner = Found::default();
+                    self.cfg(body_cfg, depth - 1, &mut inner, mode, prov, stmt_span);
+                    found.absorb(inner, body_cfg, mode, None, prov);
+                }
+            }
+        }
+        // A hook the expansion left receives its arguments at its marker, as
+        // an unknown callee does: the fixpoint escapes them there (#254), and
+        // a closure among them may run at any time (#262). What evaluating
+        // one runs is a render statement ahead of the marker already (#193).
+        // A package hook the timing table knows runs it at that time instead.
+        if let Expr::HookMarker(label, _) = expr
+            && let Some(c) = self.converged
+        {
+            for (i, arg) in c.left_args(*label).iter().enumerate() {
+                let timing = c.arg_timing(*label, i);
+                self.timed_arg(arg, timing, depth, found, prov, stmt_span);
+            }
+        }
+        // A JSX prop React or the child may invoke runs as a listener, the
+        // class extraction gives a literal there (`extract_handlers`); a path
+        // the converged values resolve is walked the same way (#239).
+        if let Expr::NativeElem { props, .. } | Expr::CompApp { props, .. } = expr
+            && let Expr::ObjectLit { fields, .. } = props.peel_ts()
+        {
+            let native = matches!(expr, Expr::NativeElem { .. });
+            let class = self.listener_class();
+            for (name, val) in fields {
+                if crate::lowering::hook_extractor::invoked_prop(native, name) {
+                    self.converged_bodies(val, class, None, depth, found, prov, stmt_span);
+                }
+            }
+        }
+    }
+
+    /// Walk the function a call hands its callee as `arg`, in `class`;
+    /// `placed` is where its rows run in this CFG, when the callee surely
+    /// runs it there.
+    #[allow(clippy::too_many_arguments)]
+    fn callback_arg(
+        &mut self,
+        arg: &'a Expr,
+        class: WalkClass,
+        placed: Option<(BlockId, usize)>,
+        depth: usize,
+        found: &mut Found,
+        prov: Option<BlockId>,
+        stmt_span: Option<SourceRange>,
+    ) {
+        // A setter handed to the callee is called by it, with what it passes
+        // (#291): a write of its slot in the argument's class, placed where a
+        // closure's rows would be.
+        if let Some(name) = callee_path(arg)
+            && self.setter_vars.contains(&name)
+        {
+            found.setters.push(FoundSite {
+                var: name,
+                class,
+                span: stmt_span,
+                at: placed,
+                own: placed.map(|(b, _)| (self.body, b)),
+                prov_block: prov,
+                repeats: self.repeating,
+                updater: Updater::Unknown,
+                arg: None,
+                applied: true,
+                through: self.path.clone(),
+            });
+        }
+        match arg {
+            // Inline FnLit arg descend body, costs one depth level.
+            Expr::FnLit { body_cfg, .. } if depth > 0 => {
+                let mut inner = Found::default();
+                self.cfg(body_cfg, depth - 1, &mut inner, class, prov, stmt_span);
+                found.absorb(inner, body_cfg, class, placed, prov);
+            }
+            // B5: variable arg name resolution, no depth cost — so this is
+            // the arm that can cycle (`const tick = t => raf(tick)`); the
+            // `walking` stack is what terminates it.
+            Expr::Var(name) if self.fn_bindings.contains_key(name) => {
+                let body = &self.fn_bindings[name];
+                let mut inner = Found::default();
+                self.path.push(name.clone());
+                self.cfg(body, depth, &mut inner, class, prov, stmt_span);
+                self.path.pop();
+                found.absorb(inner, body, class, placed, prov);
+            }
+            // A function inside an argument object or array escapes with it
+            // (#254): the callee may call it at any time, or never (#264).
+            Expr::ObjectLit { fields, .. } => {
+                for (_, val) in fields {
+                    self.callback_arg(val, WalkClass::Unknown, None, depth, found, prov, stmt_span);
+                }
+            }
+            Expr::ArrayLit { elems, .. } => {
+                for elem in elems {
+                    self.callback_arg(
+                        elem,
+                        WalkClass::Unknown,
+                        None,
+                        depth,
+                        found,
+                        prov,
+                        stmt_span,
+                    );
+                }
+            }
+            // A path the converged values point at closures of this
+            // component (`setTimeout(api.inc)`, #239): each runs in the
+            // argument's class, at this call only when it is a callback the
+            // receiver surely runs. The closures the object at that path
+            // holds escape with it, as an argument literal's do.
+            _ => {
+                self.converged_bodies(arg, class, placed, depth, found, prov, stmt_span);
+                self.member_bodies(arg, depth, found, prov, stmt_span);
+            }
+        }
+    }
+
+    /// Walk the closures of this component held under the members of the
+    /// object the converged values put behind `arg`, a name or member path
+    /// handed to a callee (`useRun(opts)`, #264): it may call any of them, at
+    /// any time.
+    fn member_bodies(
+        &mut self,
+        arg: &Expr,
+        depth: usize,
+        found: &mut Found,
+        prov: Option<BlockId>,
+        stmt_span: Option<SourceRange>,
+    ) {
+        let Some(converged) = self.converged.filter(|_| depth > 0) else {
+            return;
+        };
+        let Some(name) = callee_path(arg).filter(|n| !self.fn_bindings.contains_key(n)) else {
+            return;
+        };
+        for body in converged.member_bodies(&name) {
+            let mut inner = Found::default();
+            self.path.push(name.clone());
+            self.cfg(
+                body,
+                depth - 1,
+                &mut inner,
+                WalkClass::Sync,
+                prov,
+                stmt_span,
+            );
+            self.path.pop();
+            found.absorb(inner, body, WalkClass::Unknown, None, prov);
+        }
+    }
+
+    /// A listener's class: `Handler`, or ⊤ in a program that dispatches
+    /// events itself, where it may run synchronously in the dispatching body
+    /// ([`Timing::in_program`](crate::engine::registrations::Timing::in_program), #219).
+    /// Walk an argument the timing table times `timing` (⊤ when `None`): an
+    /// options literal member by member, each at the time the table gives
+    /// it, ⊤ for the rest.
+    fn timed_arg(
+        &mut self,
+        arg: &'a Expr,
+        timing: Option<ArgTiming>,
+        depth: usize,
+        found: &mut Found,
+        prov: Option<BlockId>,
+        stmt_span: Option<SourceRange>,
+    ) {
+        if let Some(t @ ArgTiming::Members(_)) = timing
+            && let Expr::ObjectLit { fields, .. } = arg.peel_ts()
+        {
+            for (name, val) in fields {
+                let class = self.timing_class(t.member(name));
+                self.callback_arg(val, class, None, depth, found, prov, stmt_span);
+            }
+            return;
+        }
+        let class = self.timing_class(timing);
+        self.callback_arg(arg, class, None, depth, found, prov, stmt_span);
+    }
+
+    /// The class a package hook's argument timed `timing` runs in
+    /// ([`crate::engine::timing`]); ⊤ for an untimed one, and for an options
+    /// object handed whole.
+    fn timing_class(&self, timing: Option<ArgTiming>) -> WalkClass {
+        match timing {
+            Some(ArgTiming::Deferred) => WalkClass::Deferred,
+            Some(ArgTiming::Listener) => self.listener_class(),
+            Some(ArgTiming::Members(_)) | None => WalkClass::Unknown,
+        }
+    }
+
+    fn listener_class(&self) -> WalkClass {
+        if self.dispatches {
+            WalkClass::Unknown
+        } else {
+            WalkClass::Handler
+        }
+    }
+
+    /// Walk the closures of this component the converged values put behind
+    /// `e`, a name or member path no binding certifies ([`ConvergedFns`]):
+    /// called (`api.inc()`, #233) or handed to a callee or a JSX prop
+    /// (`setTimeout(api.inc)`, `onClick={api.inc}`, #239). Each body may run,
+    /// in `class`; its rows are placed at `at` only when `e` certainly names
+    /// that one closure — otherwise it may run another.
+    #[allow(clippy::too_many_arguments)]
+    fn converged_bodies(
+        &mut self,
+        e: &Expr,
+        class: WalkClass,
+        at: Option<(BlockId, usize)>,
+        depth: usize,
+        found: &mut Found,
+        prov: Option<BlockId>,
+        stmt_span: Option<SourceRange>,
+    ) {
+        let Some(converged) = self.converged.filter(|_| depth > 0) else {
+            return;
+        };
+        let Some(name) = callee_path(e).filter(|n| !self.fn_bindings.contains_key(n)) else {
+            return;
+        };
+        let Some(bodies) = converged.bodies(&name) else {
+            return;
+        };
+        let sure = matches!(bodies, [only] if converged.certain(e, only));
+        for body in bodies {
+            let mut inner = Found::default();
+            self.path.push(name.clone());
+            self.cfg(
+                body,
+                depth - 1,
+                &mut inner,
+                WalkClass::Sync,
+                prov,
+                stmt_span,
+            );
+            self.path.pop();
+            found.absorb(inner, body, class, at.filter(|_| sure), prov);
         }
     }
 }
@@ -2085,9 +3437,12 @@ pub fn collect_slot_reads(render_cfg: &CFG, hooks: &[HookEntry]) -> Vec<SlotRead
         let mut walk = SetterWalk {
             setter_vars: &NO_VARS,
             fn_bindings: &fn_bindings,
+            converged: None,
             walking: HashSet::new(),
             root: cfg as *const CFG as usize,
+            body: cfg as *const CFG as usize,
             effect_body: matches!(region, WriterRegion::Effect(_)),
+            dispatches: false,
             shadowed: &no_shadow,
             repeating: false,
             callback_bodies: &HashMap::new(),
@@ -2095,6 +3450,7 @@ pub fn collect_slot_reads(render_cfg: &CFG, hooks: &[HookEntry]) -> Vec<SlotRead
             collect_calls: false,
             read_vars: &vars,
             wrappers: &NO_WRAPPERS,
+            path: Vec::new(),
         };
         walk.cfg(cfg, 2, &mut found, WalkClass::Sync, None, None);
         for r in found.reads {
@@ -2154,7 +3510,7 @@ pub fn collect_slot_reads(render_cfg: &CFG, hooks: &[HookEntry]) -> Vec<SlotRead
 /// descent are all the walk's, so the relation inherits them instead of
 /// re-deriving them. `region` is the lexical body — exact — and decides what
 /// a synchronous call's phase is called.
-pub fn collect_body_calls(cfg: &CFG, region: WriterRegion, max_depth: usize) -> Vec<BodyCall> {
+pub fn collect_body_calls(cfg: &CFG, region: WriterRegion) -> Vec<BodyCall> {
     let fn_bindings = collect_fn_bindings(cfg);
     let certified = certified_fn_names(cfg, &fn_bindings);
     let empty_vars = HashSet::new();
@@ -2163,9 +3519,12 @@ pub fn collect_body_calls(cfg: &CFG, region: WriterRegion, max_depth: usize) -> 
     let mut walk = SetterWalk {
         setter_vars: &empty_vars,
         fn_bindings: &fn_bindings,
+        converged: None,
         walking: HashSet::new(),
         root: cfg as *const CFG as usize,
+        body: cfg as *const CFG as usize,
         effect_body: matches!(region, WriterRegion::Effect(_)),
+        dispatches: false,
         shadowed: &empty_shadow,
         repeating: false,
         callback_bodies: &HashMap::new(),
@@ -2173,8 +3532,9 @@ pub fn collect_body_calls(cfg: &CFG, region: WriterRegion, max_depth: usize) -> 
         collect_calls: true,
         read_vars: &NO_VARS,
         wrappers: &NO_WRAPPERS,
+        path: Vec::new(),
     };
-    walk.cfg(cfg, max_depth, &mut found, WalkClass::Sync, None, None);
+    walk.cfg(cfg, WALK_DEPTH, &mut found, WalkClass::Sync, None, None);
     let mut rows: Vec<BodyCall> = found
         .calls
         .into_iter()
@@ -2207,7 +3567,7 @@ pub fn collect_body_calls(cfg: &CFG, region: WriterRegion, max_depth: usize) -> 
 pub(crate) fn may_written_slots(
     render_cfg: &CFG,
     hooks: &[HookEntry],
-    setter_labels: &HashMap<Var, HookLabel>,
+    setter_labels: &SetterTargets,
 ) -> HashSet<HookLabel> {
     fn scan_cfg(cfg: &CFG, used: &mut HashSet<Var>) {
         cfg.for_each_expr(&mut |e| collect_used_vars(e, used));
@@ -2232,9 +3592,9 @@ pub(crate) fn may_written_slots(
         }
     }
     setter_labels
-        .iter()
+        .pairs()
         .filter(|(v, _)| used.contains(*v))
-        .map(|(_, l)| *l)
+        .map(|(_, l)| l)
         .collect()
 }
 
@@ -2294,7 +3654,7 @@ pub fn setter_escapes(render_cfg: &CFG, hooks: &[HookEntry], aliases: &HashSet<V
                 }
                 Stmt::ExprStmt(e, _) => in_expr(e, aliases),
             }) || match &block.term {
-                Terminator::Return(e) | Terminator::Branch { cond: e, .. } => in_expr(e, aliases),
+                Terminator::Return(e, _) | Terminator::Branch { cond: e, .. } => in_expr(e, aliases),
                 _ => false,
             }
         })
@@ -2313,15 +3673,6 @@ pub fn setter_escapes(render_cfg: &CFG, hooks: &[HookEntry], aliases: &HashSet<V
         }
         _ => false,
     })
-}
-
-/// The setter aliases of one slot, from a `var -> label` map.
-fn aliases_of(setter_labels: &HashMap<Var, HookLabel>, slot: HookLabel) -> HashSet<Var> {
-    setter_labels
-        .iter()
-        .filter(|(_, l)| **l == slot)
-        .map(|(v, _)| v.clone())
-        .collect()
 }
 
 impl AnalysisResult<StateValue> {
@@ -2363,17 +3714,12 @@ impl AnalysisResult<StateValue> {
     /// Closing the alias set walks every body, so asking per slot would redo
     /// that walk once per slot. Callers that test more than one slot want this.
     pub fn escaping_slots(&self) -> HashSet<crate::ir::types::HookLabel> {
-        let mut labels = setter_var_labels(&self.render_cfg);
-        for cfg in
-            std::iter::once(&self.render_cfg).chain(self.hooks.iter().filter_map(|h| h.body_cfg()))
-        {
-            labels = resolve_setter_aliases(cfg, &labels);
-        }
-        let slots: HashSet<HookLabel> = labels.values().copied().collect();
+        let labels = setter_labels_of(&self.render_cfg, &self.hooks);
+        let slots: HashSet<HookLabel> = labels.pairs().map(|(_, l)| l).collect();
         slots
             .into_iter()
             .filter(|s| {
-                let aliases = aliases_of(&labels, *s);
+                let aliases = labels.aliases_of(*s);
                 !aliases.is_empty() && setter_escapes(&self.render_cfg, &self.hooks, &aliases)
             })
             .collect()
@@ -2418,7 +3764,7 @@ mod tests {
         ]);
 
         let setters: HashSet<Var> = ["setN".to_string()].into_iter().collect();
-        let found = collect_setter_calls(&cfg, &setters, 2);
+        let found = collect_setter_calls(&cfg, &setters);
 
         assert_eq!(
             found.iter().map(|c| c.var.as_str()).collect::<Vec<_>>(),
@@ -2462,7 +3808,7 @@ mod tests {
         ]);
 
         let setters: HashSet<Var> = ["setN".to_string()].into_iter().collect();
-        let found = collect_setter_calls(&cfg, &setters, 2);
+        let found = collect_setter_calls(&cfg, &setters);
 
         assert_eq!(
             found.iter().map(|c| c.var.as_str()).collect::<Vec<_>>(),

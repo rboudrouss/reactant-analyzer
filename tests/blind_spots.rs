@@ -165,7 +165,7 @@ fn findings_and_blind_spots_are_reported_together() {
     let out = reactant(&["tests/fixtures/blind_spots/outside_root/app"]);
     let s = stdout(&out);
     assert!(s.contains("infinite-loop"), "{s}");
-    assert!(s.contains("warning(s) across"), "{s}");
+    assert!(s.contains("error(s) across"), "{s}");
     assert!(s.contains("not analyzed:"), "{s}");
     assert!(s.contains("useThing.ts"), "{s}");
 }

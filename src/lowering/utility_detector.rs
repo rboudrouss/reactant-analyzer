@@ -9,8 +9,8 @@
 use oxc_ast::ast::*;
 
 use super::Candidate;
+use super::body_scan::scan_body;
 use super::detector::{self, FnItem};
-use super::jsx_detect::body_returns_jsx;
 
 pub type UtilityCandidate<'a> = Candidate<'a>;
 
@@ -24,9 +24,9 @@ pub fn detect_utilities<'a>(program: &'a Program<'a>) -> Vec<UtilityCandidate<'a
 }
 
 /// A function is a utility iff its name is neither a hook nor a component and
-/// its body does not return JSX (a JSX-returning function is a component).
+/// its body creates no JSX (a function creating elements renders them).
 fn classify(item: &FnItem) -> bool {
-    is_utility(item.name) && !body_returns_jsx(&item.body.statements)
+    is_utility(item.name) && !scan_body(&item.body.statements).jsx
 }
 
 /// Returns `true` iff `name` is a utility (not a hook, not a component).

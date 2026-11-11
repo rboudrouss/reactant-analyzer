@@ -50,14 +50,13 @@ impl Rule for DerivedState {
         let setter_label = all_setter_labels(result);
         let state_val_label = state_val_labels(&result.render_cfg);
         let state_var_names: HashSet<Var> = state_val_label.keys().cloned().collect();
-        let setter_vars: HashSet<Var> = setter_label.keys().cloned().collect();
+        let setter_vars: HashSet<Var> = setter_label.names().cloned().collect();
 
         // Setters called in render body are not derived-state candidates.
-        let render_setters: HashSet<Var> =
-            collect_setter_calls(&result.render_cfg, &setter_vars, 1)
-                .into_iter()
-                .map(|c| c.var)
-                .collect();
+        let render_setters: HashSet<Var> = collect_setter_calls(&result.render_cfg, &setter_vars)
+            .into_iter()
+            .map(|c| c.var)
+            .collect();
 
         let mut diags = Vec::new();
 
@@ -95,11 +94,10 @@ impl Rule for DerivedState {
                     _ => continue,
                 };
 
-            // Reject self-referential updates (e.g. `setX(x+1)`) accumulation, not derivation.
-            if let (Some(set_lbl), Some(dep_lbl)) = (
-                setter_label.get(&setter_name),
-                state_val_label.get(&dep_var),
-            ) && set_lbl == dep_lbl
+            // Reject self-referential updates (e.g. `setX(x+1)`) accumulation,
+            // not derivation — through any slot the name may write (#202).
+            if let Some(&dep_lbl) = state_val_label.get(&dep_var)
+                && setter_label.targets(&setter_name).any(|l| l == dep_lbl)
             {
                 continue;
             }
@@ -114,11 +112,11 @@ impl Rule for DerivedState {
             //
             // And if the setter left the component at all, the claim is not
             // ours to make: something we cannot see may write the slot.
-            if let Some(&slot) = setter_label.get(&setter_name) {
-                if result.slot_written_outside(slot, WriterRegion::Effect(*eff_label)) {
-                    continue;
-                }
-                if result.slot_setter_escapes(slot) {
+            if setter_label.contains(&setter_name) {
+                if setter_label.targets(&setter_name).any(|slot| {
+                    result.slot_written_outside(slot, WriterRegion::Effect(*eff_label))
+                        || result.slot_setter_escapes(slot)
+                }) {
                     continue;
                 }
             } else if render_setters.contains(&setter_name) {
@@ -127,11 +125,14 @@ impl Rule for DerivedState {
                 continue;
             }
 
+            let names = ctx.source_names();
             let mut d = Diagnostic::warn(
                 "derived-state",
                 format!(
-                    "this effect always sets `{setter_name}` to a call-free expression of \
-                     `{dep_var}` replace with `useMemo` or compute during render"
+                    "this effect always sets `{}` to a call-free expression of \
+                     `{}` replace with `useMemo` or compute during render",
+                    names.name(&setter_name),
+                    names.name(&dep_var)
                 ),
             )
             .with_label(*eff_label);
@@ -140,25 +141,26 @@ impl Rule for DerivedState {
             }
             // Witness (ADR-019): the mirrored source is read, then its
             // function is written to the derived slot.
-            let name_of =
-                |l: crate::ir::types::HookLabel| crate::rules::state_slot_name(l, &state_val_label);
+            let name_of = |l: crate::ir::types::HookLabel| {
+                crate::rules::state_slot_name(l, ctx.source_names(), &state_val_label)
+            };
             d = d.with_step(
                 crate::rules::Step::Read {
                     what: dep_var.clone(),
                 },
                 state_val_label.get(&dep_var).copied(),
                 *span,
-                &name_of,
+                &ctx.names(&name_of),
             );
-            if let Some(slot) = setter_label.get(&setter_name) {
+            if let Some(slot) = setter_label.sole(&setter_name) {
                 d = d.with_step(
                     crate::rules::Step::Write {
-                        slot: *slot,
+                        slot,
                         value: crate::rules::ValueClass::Unknown,
                     },
                     Some(*eff_label),
                     write_span,
-                    &name_of,
+                    &ctx.names(&name_of),
                 );
             }
             diags.push(d);

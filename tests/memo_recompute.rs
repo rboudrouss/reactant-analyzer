@@ -14,7 +14,7 @@ use reactant::rules::RuleCtx;
 
 use reactant::{
     engine::{ComponentRegistry, Config, HookRegistry, RootStrategy, analyze_program},
-    rules::{Diagnostic, all_rules},
+    rules::{Diagnostic, Severity, all_rules},
 };
 
 fn diags(src: &str, comp: &str) -> Vec<Diagnostic> {
@@ -101,4 +101,63 @@ fn memo_with_fresh_inline_dep_still_flagged() {
         fired,
         "a memo with a fresh inline dep must still fire always-unstable-deps"
     );
+}
+
+#[test]
+fn a_primitive_memo_survives_a_truthiness_guard() {
+    // #198: `useMemo(() => 0, [])` is the number 0, not an object. Read as a
+    // reference, `!zero` killed it and the write it guards: no loop claim on a
+    // program React loops on.
+    let src = r#"
+        function MemoZero() {
+            const [n, setN] = useState(0);
+            const zero = useMemo(() => 0, []);
+            useEffect(() => { if (!zero) setN(n + zero + 1); }, [n, zero]);
+            return <div>{n}</div>;
+        }
+    "#;
+    assert!(
+        diags(src, "MemoZero")
+            .iter()
+            .any(|d| d.rule == "infinite-loop"),
+        "the guarded write must reach the loop rule"
+    );
+}
+
+#[test]
+fn a_memo_over_a_fresh_dep_is_not_a_fresh_value() {
+    // #199: a fresh dep recomputes the memo at every render, and the body
+    // hands back `0` every time. Storing it settles: no Error.
+    let src = r#"
+        function App() {
+            const [s, setS] = useState(0);
+            const m = useMemo(() => 0, [{}]);
+            useEffect(() => { setS(m); }, [s]);
+            return <div>{s}</div>;
+        }
+    "#;
+    let errors: Vec<_> = diags(src, "App")
+        .into_iter()
+        .filter(|d| d.rule == "infinite-loop" && d.severity() == Severity::Error)
+        .collect();
+    assert!(errors.is_empty(), "a memo of 0 is not fresh: {errors:?}");
+}
+
+#[test]
+fn a_callback_handed_a_function_is_not_fresh_over_a_fresh_dep() {
+    // `useCallback(f, deps)` hands back `f` itself: a fresh dep recomputes
+    // it, but `f` here is the same function at every render.
+    let src = r#"
+        function handler() {}
+        function C3() {
+            const cb = useCallback(handler, [{}]);
+            useEffect(() => { console.log(cb); }, [cb]);
+            return <div/>;
+        }
+    "#;
+    let on_cb: Vec<_> = diags(src, "C3")
+        .into_iter()
+        .filter(|d| d.rule == "always-unstable-deps" && d.message.contains("`cb`"))
+        .collect();
+    assert!(on_cb.is_empty(), "`cb` is not a new reference: {on_cb:?}");
 }

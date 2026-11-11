@@ -86,17 +86,36 @@ pub enum UnaryOp {
 /// never collide — `...` is not a valid property name.
 pub const SPREAD_KEY_PREFIX: &str = "...";
 
+/// Key prefix of a member under a computed key no constant names (`{ [k]: v
+/// }`): the value is kept for its reads, the name is unknown.
+pub const COMPUTED_KEY_PREFIX: &str = "[computed]";
+
+/// Key prefix of a getter or setter (`{ get x() {…} }`): reading the member
+/// runs the body, so the function literal is not the member's value.
+pub const ACCESSOR_KEY_PREFIX: &str = "[accessor]";
+
+/// Is `key` one lowering made up — a spread, a computed key, an accessor —
+/// rather than a member's name? Such an entry may write any member.
+pub fn is_synthetic_key(key: &str) -> bool {
+    [SPREAD_KEY_PREFIX, COMPUTED_KEY_PREFIX, ACCESSOR_KEY_PREFIX]
+        .iter()
+        .any(|p| key.starts_with(p))
+}
+
 /// The suffix of `fields` a name lookup may read: everything after the last
-/// spread. Members written before one may have been overwritten by something
-/// the per-member map cannot see, so they answer nothing.
+/// entry that may write any member — a spread, a computed key or an
+/// accessor. Members written before one may have been overwritten by
+/// something the expression does not spell, so they answer nothing.
 ///
-/// Shared so the two readers that resolve members by name cannot drift apart
-/// on the rule — the abstract interpreter's `obj_members` and the binding
-/// chase in [`crate::engine::seeds`].
+/// Shared so the syntactic readers that resolve members by name cannot drift
+/// apart on the rule — the binding chase in [`crate::engine::seeds`], the
+/// splice's returned members, the guard proofs. The abstract interpreter
+/// reads the heap's [`Members`](crate::domains::stores::Members) instead,
+/// which copies what a spread's source holds.
 pub fn members_after_last_spread(fields: &[(Symbol, Expr)]) -> &[(Symbol, Expr)] {
     let start = fields
         .iter()
-        .rposition(|(k, _)| k.starts_with(SPREAD_KEY_PREFIX))
+        .rposition(|(k, _)| is_synthetic_key(k))
         .map_or(0, |i| i + 1);
     &fields[start..]
 }
@@ -510,6 +529,58 @@ impl Expr {
         }
     }
 
+    /// [`Self::for_each_child`], mutably: the same children, `FnLit` bodies
+    /// again not crossed.
+    pub fn for_each_child_mut(&mut self, f: &mut impl FnMut(&mut Expr)) {
+        match self {
+            Expr::Lit(_)
+            | Expr::Var(_)
+            | Expr::FnLit { .. }
+            | Expr::StateVal(_)
+            | Expr::StateSetter(_)
+            | Expr::MemoVal(_)
+            | Expr::CallbackVal(_)
+            | Expr::HookMarker(..)
+            | Expr::SummaryVal(_) => {}
+            Expr::ObjectLit { fields, .. } => {
+                for (_, v) in fields {
+                    f(v);
+                }
+            }
+            Expr::ArrayLit { elems, .. } => {
+                for e in elems {
+                    f(e);
+                }
+            }
+            Expr::FieldAccess { obj, .. } => f(obj),
+            Expr::IndexAccess { arr, idx } => {
+                f(arr);
+                f(idx);
+            }
+            Expr::BinOp { lhs, rhs, .. } => {
+                f(lhs);
+                f(rhs);
+            }
+            Expr::UnaryOp { arg, .. } => f(arg),
+            Expr::Call { fn_, args } | Expr::New { fn_, args, .. } => {
+                f(fn_);
+                for a in args {
+                    f(a);
+                }
+            }
+            Expr::CompApp { props, .. } => f(props),
+            Expr::NativeElem {
+                props, children, ..
+            } => {
+                f(props);
+                for c in children {
+                    f(c);
+                }
+            }
+            Expr::TSAnnotated(inner) => f(inner),
+        }
+    }
+
     /// Returns `true` iff the expression tree contains no `Call`, `New` or
     /// `CompApp` node. `FnLit` bodies are not crossed (they are leaves for
     /// `for_each_child`).
@@ -555,5 +626,31 @@ impl Expr {
             e = *inner;
         }
         e
+    }
+
+    /// The pair a `useState` or `useReducer` call returns when the source keeps
+    /// it whole (`const t = useState(0)`, #283): a fresh array of slot
+    /// `label`'s value and its setter, allocated at `id` as React allocates
+    /// one at every render.
+    pub fn state_pair(id: ExprId, label: HookLabel) -> Expr {
+        Expr::ArrayLit {
+            id,
+            elems: vec![Expr::StateVal(label), Expr::StateSetter(label)],
+            arity: Arity::Exact(2),
+            spread_at: Vec::new(),
+        }
+    }
+
+    /// The slot whose [`Expr::state_pair`] this is.
+    pub fn as_state_pair(&self) -> Option<HookLabel> {
+        match self.peel_ts() {
+            Expr::ArrayLit {
+                elems, spread_at, ..
+            } if spread_at.is_empty() => match elems.as_slice() {
+                [Expr::StateVal(v), Expr::StateSetter(s)] if v == s => Some(*v),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 }

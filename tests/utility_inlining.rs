@@ -458,6 +458,65 @@ fn recursion_guard_does_not_loop_forever() {
     assert!(result.component_named("Page").is_some());
 }
 
+/// #232: the recursion guard cut every call of a name already inlined in the
+/// CFG, so the second, sibling `bump(setB)` stayed opaque and the loop
+/// through `b` (written under `[b]`) was missed.
+#[test]
+fn a_utility_called_twice_in_one_body_inlines_both_calls() {
+    let tmp = Tmp::new("twice");
+    let path = tmp.write(
+        "main.tsx",
+        r#"
+        function bump(set) { set(n => n + 1); }
+        function App() {
+            const [a, setA] = useState(0);
+            const [b, setB] = useState(0);
+            useEffect(() => { bump(setA); bump(setB); }, [b]);
+            return <div>{a}{b}</div>;
+        }
+        "#,
+    );
+    let (components, hooks, utilities) = lower_file(&path);
+    let result = analyze(components, hooks, utilities);
+    let ctx = RuleCtx::new(&result, result.component_named("App").unwrap());
+    let loops: Vec<String> = all_rules()
+        .iter()
+        .flat_map(|r| r.check(&ctx))
+        .filter(|d| {
+            d.rule == "infinite-loop" && matches!(d.severity(), Severity::Warning | Severity::Error)
+        })
+        .map(|d| d.message.clone())
+        .collect();
+    assert!(
+        loops.iter().any(|m| m.contains("state `b`")),
+        "the second call's write to `b` must be seen, got {loops:?}"
+    );
+}
+
+/// The guard follows the post-call statements too: in `f() { g(); f(); }`
+/// the recursive `f()` lands in the join block of the nested `g` splice,
+/// still inside `f`'s inlining, so it is cut instead of re-inlined until the
+/// budget runs out.
+#[test]
+fn recursion_after_a_nested_splice_is_still_cut() {
+    let tmp = Tmp::new("recursion-join");
+    let path = tmp.write(
+        "main.tsx",
+        r#"
+        function g() { log(); }
+        function f() { g(); f(); }
+        function Page() {
+            const [c, setC] = useState(0);
+            useEffect(() => { f(); }, []);
+            return <div>{c}</div>;
+        }
+        "#,
+    );
+    let (components, hooks, utilities) = lower_file(&path);
+    let result = analyze(components, hooks, utilities);
+    assert!(result.stats.inline_budget_exhausted.is_empty());
+}
+
 /// The splice budget is a real limit, not a theoretical one — it is exhausted
 /// 20 times over the excalidraw corpus and 6 over memos. Exhausting it leaves
 /// the remaining utility calls opaque, which is sound; staying *silent* about

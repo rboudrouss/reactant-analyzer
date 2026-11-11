@@ -29,6 +29,8 @@ In both cases, the function body is unreachable because the IR doesn't link vari
 
 Each "allocating" node (`FnLit`, `ObjectLit`, `ArrayLit`) receives an `id: ExprId` (newtype `struct ExprId(pub usize)`) assigned by a counter in `BlockBuilder` at lowering time. This is the *allocation site*: same syntactic node → same ExprId across all fixpoint iterations.
 
+An id names one site in the whole program: one counter per file (#134), a splice shifts its callee above the caller ([`Offsets`](../../src/ir/remap.rs)), and the component registry places each component in a range of its own (`ComponentId::site_base`), since a child's heap holds its parents' sites and runs their closures (#243).
+
 ```rust
 // ir/types.rs
 pub struct ExprId(pub usize);
@@ -123,11 +125,30 @@ if class == TriggerClass::Unknown {
 - **`HeapValue::Obj`** holds the per-member map of an object literal and of a
   child's props: a member read (`o.f`, and chains through
   `stores::resolve_locs`) resolves to the member's own value instead of the
-  container's. Members before a spread and getter/setter properties are absent
-  from the map on purpose (they lower under synthetic keys) and fall back to the
-  container. `HeapValue::Arr` stays reserved — `IndexAccess` is still ⊤.
+  container's. Spreads, computed keys and accessors are read as the
+  `Members` paragraph below says. `HeapValue::Arr` is gone: an array literal
+  is an `Obj` of its entries under their indices, and an `IndexAccess` reads
+  a member only when its key is one constant.
 - **Multi-site join**: `locs` can contain several ExprIds for a same variable (ternary branches). All bodies are executed and their effects joined — correct by over-approximation.
 - **Unknown callee without `Loc`** (external helper) → immediate bail → FN. When `depth >= MAX_INLINE_DEPTH`, the `analysis-limit` rule emits an `Info` (visible with `--info`) signaling that callback chains weren't descended.
+
+## Update — an object's members are named or other (#76)
+
+`HeapValue::Obj` holds `Members { named, others, open }`: the members a
+constant names; what was written under a key no constant names (`{ [k]: v }`,
+`o[k] = v`); and whether the object may hold members nothing says, with any
+value. A literal's entries land in order: a named key overrides; a computed key
+no literal spells is joined into every member before it and into `others`; a
+spread copies its source's members when every site it points to is a placed
+object (a member one of them lacks keeps what it held), and a spread of
+anything else, or an accessor, joins ⊤ into every member before it and opens
+the object. A member read off an object that does not name it is one of
+`others`, and open. An array literal names the entries before its first
+spread, when no elision moved them, and is open past it; a mutating call opens
+its receiver. The syntactic readers (`members_after_last_spread`) stop at a
+computed key and an accessor as they stop at a spread. That an object neither
+open nor holding `others` has no other own member rests on the heap's standing
+assumption that nothing the analysis cannot see mutates a placed object.
 
 ## Consequences
 

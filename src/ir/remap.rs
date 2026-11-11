@@ -21,7 +21,7 @@ pub struct Offsets {
     pub labels: HookLabel,
     /// Added to every allocation-site [`ExprId`]. Unique per splice: the same
     /// callee inlined twice is two allocation sites, not one.
-    pub ids: usize,
+    pub ids: u64,
 }
 
 impl Offsets {
@@ -41,9 +41,9 @@ impl Offsets {
 ///
 /// A splice adds this to its running cursor so the next graft lands above it,
 /// which is what makes the *same* callee inlined twice two allocation sites.
-pub fn alloc_id_span(cfg: &CFG) -> usize {
-    let mut max: Option<usize> = None;
-    let mut note = |id: ExprId| max = Some(max.map_or(id.0, |m: usize| m.max(id.0)));
+pub fn alloc_id_span(cfg: &CFG) -> u64 {
+    let mut max: Option<u64> = None;
+    let mut note = |id: ExprId| max = Some(max.map_or(id.0, |m: u64| m.max(id.0)));
     fn walk(e: &Expr, note: &mut impl FnMut(ExprId), depth: usize) {
         if depth == 0 {
             return;
@@ -202,7 +202,7 @@ fn remap_stmt(stmt: Stmt, off: Offsets) -> Stmt {
 
 fn remap_terminator(term: Terminator, off: Offsets) -> Terminator {
     match term {
-        Terminator::Return(e) => Terminator::Return(remap_expr(e, off)),
+        Terminator::Return(e, span) => Terminator::Return(remap_expr(e, off), span),
         Terminator::Branch {
             cond,
             then_,
@@ -302,12 +302,14 @@ fn remap_hook_entry(entry: HookEntry, off: Offsets) -> HookEntry {
             label,
             body_cfg,
             params,
+            literal,
             deps,
             span,
         } => HookEntry::Callback {
             label: label + off.labels,
             body_cfg: remap_cfg(body_cfg, off),
             params,
+            literal,
             deps: deps.map_exprs(|e| remap_expr(e, off)),
             span,
         },
@@ -340,11 +342,13 @@ fn remap_hook_entry(entry: HookEntry, off: Offsets) -> HookEntry {
             event,
             body_cfg,
             span,
+            dom_event,
         } => HookEntry::Handler {
             label: label + off.labels,
             event,
             body_cfg: remap_cfg(body_cfg, off),
             span,
+            dom_event,
         },
     }
 }
@@ -403,7 +407,7 @@ mod tests {
                 rhs: Expr::StateVal(0),
                 span: None,
             }],
-            Terminator::Return(Expr::StateSetter(1)),
+            Terminator::Return(Expr::StateSetter(1), None),
         );
         let remapped = remap_cfg(cfg, Offsets::labels(10));
         let block = &remapped.blocks[&0];
@@ -416,7 +420,7 @@ mod tests {
         ));
         assert!(matches!(
             &block.term,
-            Terminator::Return(Expr::StateSetter(11))
+            Terminator::Return(Expr::StateSetter(11), None)
         ));
     }
 
@@ -433,7 +437,7 @@ mod tests {
                 label: 1,
                 body_cfg: single_block_cfg(
                     vec![Stmt::ExprStmt(Expr::StateSetter(0), None)],
-                    Terminator::Return(Expr::Lit(Prim::Unit)),
+                    Terminator::Return(Expr::Lit(Prim::Unit), None),
                 ),
                 deps: DepsArg::Absent,
                 span: None,

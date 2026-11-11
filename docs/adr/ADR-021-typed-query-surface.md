@@ -203,6 +203,9 @@ belongs there; `check` reads it, never rebuilds it.
 is withdrawn from the rule surface. The `infinite_loop.rs:98` gate keys on a
 *provably-stable* dep (`is_stable`), never a merely non-`PerRender` one. Pinned
 by a near-miss fixture (⊤/`Versioned` dep + unconditional self-write).
+*Superseded for `infinite-loop` by ADR-042 §8 (#265): the gate now stands in
+front of the cross-component arm, and the fixture's self-write under a prop
+dep settles in React.*
 
 ## Soundness arguments
 

@@ -1,6 +1,7 @@
 // oracle: react=loop
-// oracle: known=fn #175
-// L8: the second call site of a child overwrites the first in the results table.
+// L8 (#175): the second call site of a child used to overwrite the first in
+// the results table. The child is analysed under the join of both sites'
+// props: `step` is 0 or 1, and the first instance's loop is seen.
 import { useEffect, useState } from "react";
 
 function Counter({ step }: { step: number }) {

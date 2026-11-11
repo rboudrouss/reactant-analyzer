@@ -16,7 +16,7 @@ impl Rule for WideningInfo {
         let (result, component) = (ctx.program(), ctx.component());
         let result = &result.components[&component];
         let state_names = state_val_labels(&result.render_cfg);
-        let name_of = |l| state_slot_name(l, &state_names);
+        let name_of = |l| state_slot_name(l, ctx.source_names(), &state_names);
         let mut labels: Vec<_> = result.widen_trace.keys().copied().collect();
         labels.sort_unstable();
         labels
@@ -33,7 +33,9 @@ impl Rule for WideningInfo {
                 )
                 // Witness (ADR-019): the engine's own record of the widening.
                 .with_notes(crate::rules::api::witness::slot_history(
-                    result, label, &name_of,
+                    result,
+                    label,
+                    &ctx.names(&name_of),
                 ))
             })
             .collect()

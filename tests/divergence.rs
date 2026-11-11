@@ -162,6 +162,14 @@ fn bounded_string_set_is_clean() {
 
 /// The severities `infinite-loop` reports over `src`.
 fn infinite_loop_severities(src: &str) -> Vec<reactant::rules::Severity> {
+    infinite_loop_findings(src)
+        .into_iter()
+        .map(|(s, _)| s)
+        .collect()
+}
+
+/// The severity and message of each `infinite-loop` finding over `src`.
+fn infinite_loop_findings(src: &str) -> Vec<(reactant::rules::Severity, String)> {
     let alloc = Allocator::default();
     let ret = Parser::new(&alloc, src, SourceType::tsx())
         .with_options(ParseOptions::default())
@@ -181,7 +189,7 @@ fn infinite_loop_severities(src: &str) -> Vec<reactant::rules::Severity> {
             InfiniteLoop
                 .check(&RuleCtx::new(&prog, prog.component_named(&name).unwrap()))
                 .into_iter()
-                .map(|d| d.severity())
+                .map(|d| (d.severity(), d.message))
                 .collect::<Vec<_>>()
         })
         .collect()
@@ -262,4 +270,145 @@ fn a_guarded_toggle_through_an_updater_is_at_most_a_warning() {
         !sevs.contains(&reactant::rules::Severity::Error),
         "{sevs:?}"
     );
+}
+
+// ── A lone step from a bounded start loops as surely as a fresh reference ────
+
+/// `infinite-loop` over one component `C({ start, on })` whose body is `body`.
+fn severities_of(body: &str) -> Vec<reactant::rules::Severity> {
+    infinite_loop_severities(&format!(
+        r#"
+        import {{ useState, useEffect, useRef }} from "react";
+        function C({{ start, on }}) {{
+          {body}
+        }}
+        "#
+    ))
+}
+
+/// The four rows of #144: a counter and an object churn, each with the slot
+/// as its dep or with no deps array, are one certain loop.
+#[test]
+fn a_counter_is_an_error_like_an_object_churn() {
+    for body in [
+        "const [n, setN] = useState(0); useEffect(() => setN(n + 1), [n]); return <p>{n}</p>;",
+        "const [n, setN] = useState(0); useEffect(() => setN(n + 1)); return <p>{n}</p>;",
+        "const [o, setO] = useState({}); useEffect(() => setO({}), [o]); return <p />;",
+        "const [o, setO] = useState({}); useEffect(() => setO({})); return <p />;",
+        // A negative step, an updater, the bound itself.
+        "const [n, setN] = useState(0); useEffect(() => setN(n - 2), [n]); return <p>{n}</p>;",
+        "const [n, setN] = useState(0); useEffect(() => setN((c) => c + 1), [n]); return <p>{n}</p>;",
+        "const [n, setN] = useState(2 ** 50); useEffect(() => setN(n + 1), [n]); return <p>{n}</p>;",
+        // A reset only a click runs cannot stop it: React re-runs the effect
+        // on the new value and it steps again (#280).
+        "const [n, setN] = useState(0); useEffect(() => setN(n + 1), [n]); \
+         return <button onClick={() => setN(0)}>{n}</button>;",
+        // The step through the name it is written into, in the effect or in
+        // the render (#280).
+        "const [n, setN] = useState(0); \
+         useEffect(() => { const next = n + 1; setN(next); }, [n]); return <p>{n}</p>;",
+        "const [n, setN] = useState(0); const next = n + 1; \
+         useEffect(() => setN(next), [n]); return <p>{n}</p>;",
+        // An updater passed by name: the fixpoint does not widen the slot,
+        // and the churn arm that owns the proven edge reports it (#280).
+        "const [n, setN] = useState(0); const inc = (c) => c + 1; \
+         useEffect(() => setN(inc), [n]); return <p>{n}</p>;",
+    ] {
+        assert_eq!(
+            severities_of(body),
+            vec![reactant::rules::Severity::Error],
+            "{body}"
+        );
+    }
+    // Two effects stepping the slot the same way: each is the loop.
+    assert_eq!(
+        severities_of(
+            "const [n, setN] = useState(0); useEffect(() => setN(n + 1), [n]); \
+             useEffect(() => setN((c) => c + 2), [n]); return <p>{n}</p>;"
+        ),
+        vec![reactant::rules::Severity::Error; 2]
+    );
+}
+
+/// A proven loop says what it rests on, whichever arm reports its edge: a
+/// counter a step from a bounded start, with deps or without, an object
+/// churn a fresh reference (#280).
+#[test]
+fn a_proven_loop_says_what_it_rests_on() {
+    let error_saying = |body: &str, words: &str| {
+        let found = infinite_loop_findings(&format!(
+            r#"
+            import {{ useState, useEffect }} from "react";
+            function C() {{
+              {body}
+            }}
+            "#
+        ));
+        assert!(
+            matches!(found.as_slice(), [(reactant::rules::Severity::Error, m)] if m.contains(words)),
+            "{body}: {found:?}"
+        );
+    };
+    let step = "by a step from a bounded start";
+    error_saying(
+        "const [n, setN] = useState(0); useEffect(() => setN(n + 1), [n]); return <p>{n}</p>;",
+        step,
+    );
+    error_saying(
+        "const [n, setN] = useState(0); useEffect(() => setN(n + 1)); return <p>{n}</p>;",
+        step,
+    );
+    error_saying(
+        "const [o, setO] = useState({}); useEffect(() => setO({}), [o]); return <p />;",
+        "fresh reference",
+    );
+    error_saying(
+        "const [o, setO] = useState({}); useEffect(() => setO({})); return <p />;",
+        "fresh reference",
+    );
+}
+
+/// No Error where the step is not proven to change the slot at every run: a
+/// start past the bound (`n + 1` is `n` from 2^53 on, React settles), one the
+/// analysis cannot read, a step that may be 0, one that is not an integer, a
+/// second write in the batch. Nor where another write the program runs by
+/// itself may restore the value a batch started from: a reset on mount, a
+/// write of the value the slot holds, a step the other way, a reset a child
+/// or a ref callback may run, a click handler the program dispatches (#280).
+#[test]
+fn a_step_short_of_the_proof_is_no_error() {
+    for body in [
+        "const [n, setN] = useState(2 ** 53 - 2); useEffect(() => setN(n + 1), [n]); return <p>{n}</p>;",
+        "const [n, setN] = useState(Infinity); useEffect(() => setN(n + 1), [n]); return <p>{n}</p>;",
+        "const [n, setN] = useState(start); useEffect(() => setN(n + 1), [n]); return <p>{n}</p>;",
+        "const [n, setN] = useState(0); useEffect(() => setN(n + 1), [n]); \
+         useEffect(() => setN(0), []); return <p>{n}</p>;",
+        "const [n, setN] = useState(0); useEffect(() => setN(n + 1), [n]); \
+         useEffect(() => { if (n === 3) setN(3); }, [n]); return <p>{n}</p>;",
+        "const [n, setN] = useState(0); useEffect(() => setN(n + 1), [n]); \
+         useEffect(() => setN((c) => c - 1), [n]); return <p>{n}</p>;",
+        "const [n, setN] = useState(0); useEffect(() => setN(n + 1), [n]); \
+         return <Child onReset={() => setN(0)} />;",
+        "const [n, setN] = useState(0); useEffect(() => setN(n + 1), [n]); \
+         return <div ref={() => setN(0)}>{n}</div>;",
+        "const [n, setN] = useState(0); const r = useRef(null); \
+         useEffect(() => { setN(n + 1); r.current?.click(); }, [n]); \
+         return <button ref={r} onClick={() => setN(0)}>{n}</button>;",
+        // A name bound after the write, or to an operand moved since (#280).
+        "const [n, setN] = useState(0); \
+         useEffect(() => { setN(next); var next = n + 1; }, [n]); return <p>{n}</p>;",
+        "const [n, setN] = useState(0); \
+         useEffect(() => { let k = 0; const next = n + k; k = 1; setN(next); }, [n]); \
+         return <p>{n}</p>;",
+        "const [n, setN] = useState(0); useEffect(() => setN(n + (on ? 1 : 0)), [n]); return <p>{n}</p>;",
+        "const [n, setN] = useState(0); useEffect(() => setN(n + 0.5), [n]); return <p>{n}</p>;",
+        "const [n, setN] = useState(0); useEffect(() => { setN(n + 1); setN(n + 2); }, [n]); \
+         return <p>{n}</p>;",
+    ] {
+        let sevs = severities_of(body);
+        assert!(
+            !sevs.contains(&reactant::rules::Severity::Error),
+            "{body}: {sevs:?}"
+        );
+    }
 }

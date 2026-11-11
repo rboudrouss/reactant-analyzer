@@ -23,9 +23,7 @@ use std::sync::Arc;
 
 use crate::engine::{ComponentRegistry, Config, RootStrategy, SymbolGraph};
 use crate::project::{self, ProjectKind};
-use crate::resolver::{
-    DefaultFileDiscoverer, FileDiscoverer, FileSystem, analyze_lowered, lower_files_with,
-};
+use crate::resolver::{DefaultFileDiscoverer, FileSystem, analyze_lowered, lower_files_with};
 use crate::rules::{Diagnostic, ProgramCache, RuleRegistry, SafeCheck, Severity};
 
 use crate::ir::{CompOrigin, ComponentId};
@@ -75,6 +73,9 @@ pub struct CheckOptions {
     /// report still covers only the components defined in the named paths.
     pub follow_imports: bool,
     pub format: ReportFormat,
+    /// `--per-component`: one row per component a finding is reported
+    /// through, instead of one row per finding (#271).
+    pub per_component: bool,
     pub fail_on: FailOn,
     pub project: ProjectOverride,
     /// Resolved by the host (tty + NO_COLOR + --no-color); the driver never
@@ -130,7 +131,8 @@ pub fn run_check(
 
     // ── Project context ───────────────────────────────────────────────────────
     // The first directory argument drives project detection; other paths are
-    // discovered as-is with the same resolver.
+    // discovered as-is, and each resolves through its own project's scope
+    // (see `scope_by_project` below).
     let project_root = paths
         .iter()
         .map(Path::new)
@@ -190,6 +192,10 @@ pub fn run_check(
     let discoverer =
         DefaultFileDiscoverer::new(fs.clone()).with_exclude_dirs(opts.exclude_dirs.clone());
     let mut files: Vec<PathBuf> = Vec::new();
+    // Where each other directory argument starts, and every directory under
+    // the walk holding a project marker: the candidate resolution scopes.
+    let mut starts: Vec<PathBuf> = Vec::new();
+    let mut marked: Vec<PathBuf> = Vec::new();
     for input in paths {
         let p = Path::new(input);
         if fs.is_dir(p) {
@@ -197,14 +203,16 @@ pub fn run_check(
             let walk_root = if *p == *project_root {
                 &ctx.discovery_root
             } else {
+                starts.push(p.to_path_buf());
                 p
             };
-            let found = discoverer.discover(walk_root);
+            let (found, roots) = discoverer.discover_marked(walk_root, &project::is_root_marker);
             if found.is_empty() {
                 let _ = writeln!(err, "[error] no .ts/.tsx/.js/.jsx files found in {input}");
                 return CheckOutput::usage(err);
             }
             files.extend(found);
+            marked.extend(roots);
         } else if fs.is_file(p) {
             files.push(p.to_path_buf());
         } else {
@@ -212,6 +220,9 @@ pub fn run_check(
             return CheckOutput::usage(err);
         }
     }
+    // Each file resolves its imports through the innermost project holding
+    // it; the first argument's context serves the rest.
+    let resolver = project::scope_by_project(ctx.resolver, &starts, &marked, fs.clone());
 
     // ── Follow import edges (#138, opt-in) ────────────────────────────────────
     // The paths the user named stay the report's scope; the closure only makes
@@ -223,8 +234,7 @@ pub fn run_check(
         .collect();
     let mut followed_files: Vec<PathBuf> = Vec::new();
     if opts.follow_imports {
-        followed_files =
-            crate::resolver::import_closure(fs.as_ref(), &files, ctx.resolver.as_ref());
+        followed_files = crate::resolver::import_closure(fs.as_ref(), &files, resolver.as_ref());
         if opts.verbose {
             for path in &followed_files {
                 let _ = writeln!(err, "[verbose] followed import: {}", display(path));
@@ -234,7 +244,7 @@ pub fn run_check(
     }
 
     // ── Lower ─────────────────────────────────────────────────────────────────
-    let mut lowered = lower_files_with(fs.as_ref(), &files, ctx.resolver.as_ref());
+    let mut lowered = lower_files_with(fs.as_ref(), &files, resolver.as_ref());
     // A file the parser recovered from is noise, and stays on the human
     // channel. A *dropped* file is not: everything it held is a silent false
     // negative, so it is reported whatever the format — stderr is a separate
@@ -508,6 +518,9 @@ pub fn run_check(
 }
 
 fn render(report: &CheckReport, opts: &CheckOptions, display: &dyn Fn(&Path) -> String) -> String {
+    // One grouping for both renderers (#271), so the two formats cannot
+    // disagree about which rows a finding is.
+    let locations = locations::LocationIndex::build(&report.components, opts.per_component);
     match opts.format {
         ReportFormat::Human => human::render(
             report,
@@ -515,9 +528,10 @@ fn render(report: &CheckReport, opts: &CheckOptions, display: &dyn Fn(&Path) -> 
             opts.show_clean,
             opts.info,
             opts.trace,
+            &locations,
             display,
         ),
-        ReportFormat::Json => json::render(report, display),
+        ReportFormat::Json => json::render(report, &locations, display),
     }
 }
 

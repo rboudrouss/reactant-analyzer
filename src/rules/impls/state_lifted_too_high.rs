@@ -75,7 +75,7 @@ impl Rule for StateLiftedTooHigh {
             {
                 continue;
             }
-            let slot = state_slot_name(*label, &names);
+            let slot = state_slot_name(*label, ctx.source_names(), &names);
             let target = program.display_name(home.path.last().expect("non-empty").to);
             let mut rerendered: Vec<String> = home
                 .path
@@ -136,7 +136,7 @@ impl Rule for StateLiftedTooHigh {
                     },
                     None,
                     hop.span,
-                    &|l| state_slot_name(l, &names),
+                    &ctx.names(&|l| state_slot_name(l, ctx.source_names(), &names)),
                 );
             }
             diags.push(d);

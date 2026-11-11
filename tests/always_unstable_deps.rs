@@ -274,6 +274,41 @@ fn kind_ambiguous_slice_stays_silent() {
 }
 
 #[test]
+fn slice_and_concat_of_an_array_fire() {
+    // #22: the receiver is a state array, so it can only be a reference, and
+    // `slice`/`concat` copy it at every render.
+    let h = hits(
+        r#"
+        import { useEffect, useState } from "react";
+        function C() {
+            const [items] = useState([3, 1, 2]);
+            const copy = items.slice();
+            const more = items.concat([4]);
+            useEffect(() => {}, [copy]);
+            useEffect(() => {}, [more]);
+            return <div/>;
+        }
+        "#,
+    );
+    assert_eq!(h, 2, "a copy of an array in deps must fire");
+}
+
+#[test]
+fn slice_of_a_string_literal_stays_silent() {
+    let h = hits(
+        r#"
+        import { useEffect } from "react";
+        function C() {
+            const s = "abcdef".slice(1);
+            useEffect(() => {}, [s]);
+            return <div/>;
+        }
+        "#,
+    );
+    assert_eq!(h, 0, "a string's slice is a primitive");
+}
+
+#[test]
 fn in_place_sort_stays_silent() {
     // `.sort()` returns the RECEIVER (same identity), not a fresh array —
     // the opposite fact. Must not read PerRender.
@@ -356,4 +391,200 @@ fn a_member_dep_holding_a_primitive_stays_silent() {
         "#,
     );
     assert_eq!(h, 0, "a number member is compared by value");
+}
+
+// ── A fact that holds through one call site (#175) ───────────────────────────
+
+/// The findings on `component` once the whole program is analysed top-down:
+/// its result is its analysis under the join of every call site's props.
+fn program_diags(src: &str, component: &str) -> Vec<reactant::rules::Diagnostic> {
+    use reactant::engine::{ComponentRegistry, HookRegistry, RootStrategy, analyze_program};
+    let alloc = Allocator::default();
+    let ret = Parser::new(&alloc, src, SourceType::tsx())
+        .with_options(ParseOptions::default())
+        .parse();
+    assert!(
+        ret.diagnostics.is_empty(),
+        "parse errors: {:?}",
+        ret.diagnostics
+    );
+    let components = lower_program(
+        &ret.program,
+        src,
+        std::path::Path::new("test.tsx"),
+        &mut Default::default(),
+    );
+    let prog = analyze_program(
+        ComponentRegistry::from_components(components),
+        HookRegistry::new(),
+        RootStrategy::Heuristic,
+        &Config::default(),
+    );
+    let id = prog.component_named(component).unwrap();
+    AlwaysUnstableDeps.check(&RuleCtx::new(&prog, id))
+}
+
+/// One parent passes a fresh array, another a module constant. The join of
+/// the two is not "a new reference every render", but through `Fresh` the
+/// memo really re-runs on every render: the finding names that parent.
+#[test]
+fn a_prop_fresh_through_one_call_site_is_named_by_that_site() {
+    let d = program_diags(
+        r#"
+        import { useMemo, useState } from "react";
+        const EMPTY = [];
+        function Child({ items }) {
+          const joined = useMemo(() => items.join(","), [items]);
+          return <span>{joined}</span>;
+        }
+        function Stable() {
+          return <Child items={EMPTY} />;
+        }
+        function Fresh({ a }) {
+          const [n, setN] = useState(0);
+          const items = [a, String(n)];
+          return <div onClick={() => setN(n + 1)}><Child items={items} /></div>;
+        }
+        "#,
+        "Child",
+    );
+    assert_eq!(d.len(), 1, "{d:?}");
+    let msg: &str = &d[0].message;
+    assert!(msg.contains("when `<Fresh>` renders it"), "{msg}");
+    assert!(!msg.contains("Stable"), "{msg}");
+}
+
+/// The per-site analysis follows the chain: a memo built from the fresh prop
+/// is itself fresh through that site.
+#[test]
+fn a_memo_chain_from_a_fresh_prop_is_fresh_through_that_site() {
+    let d = program_diags(
+        r#"
+        import { useMemo } from "react";
+        const EMPTY = [];
+        function Child({ items }) {
+          const upper = useMemo(() => items.map((s) => s.toUpperCase()), [items]);
+          const count = useMemo(() => upper.length, [upper]);
+          return <span>{count}</span>;
+        }
+        function Stable() {
+          return <Child items={EMPTY} />;
+        }
+        function Fresh({ a }) {
+          return <Child items={[a]} />;
+        }
+        "#,
+        "Child",
+    );
+    assert_eq!(d.len(), 2, "{d:?}");
+}
+
+#[test]
+fn a_prop_stable_at_every_call_site_stays_silent() {
+    let d = program_diags(
+        r#"
+        import { useMemo } from "react";
+        const EMPTY = [];
+        const ONE = ["a"];
+        function Child({ items }) {
+          const joined = useMemo(() => items.join(","), [items]);
+          return <span>{joined}</span>;
+        }
+        function A() {
+          return <Child items={EMPTY} />;
+        }
+        function B() {
+          return <Child items={ONE} />;
+        }
+        "#,
+        "Child",
+    );
+    assert!(d.is_empty(), "{d:?}");
+}
+
+#[test]
+fn a_member_read_before_the_object_escapes_keeps_its_freshness() {
+    // `opts` reaches a callee the analysis does not see after `items` was
+    // read off it; the object the next render allocates is not held yet, so
+    // `items` is the fresh literal (#258, dub `useTable`'s `columns`).
+    let d = program_diags(
+        r#"
+        import { useMemo } from "react";
+        import { format } from "ext";
+        export function App() {
+          const opts = { items: [1, 2] };
+          const { items } = opts;
+          const total = useMemo(() => items.length, [items]);
+          format(opts);
+          return <div>{total}</div>;
+        }
+        "#,
+        "App",
+    );
+    assert_eq!(d.len(), 1, "{d:?}");
+}
+
+#[test]
+fn a_member_keeps_the_value_its_literal_puts_there_in_this_pass() {
+    // `props.columns` is the memo, fresh every render. An object site keeps
+    // the writes made into its objects after their literal (#258), not the
+    // value an earlier pass's literal put there — the memo before the
+    // fixpoint had computed it (dub `useTable`'s `columns`).
+    let d = program_diags(
+        r#"
+        import { useMemo, useState } from "react";
+        export function App() {
+          const [w] = useState("w");
+          const ws = { w };
+          const columns = useMemo(() => [1, 2].filter((c) => c > 0), [ws]);
+          const props = { columns };
+          const { columns: cols } = props;
+          const normalized = useMemo(() => cols.map((c) => c), [cols]);
+          return <div>{normalized.length}</div>;
+        }
+        "#,
+        "App",
+    );
+    assert_eq!(d.len(), 2, "{d:?}");
+}
+
+#[test]
+fn a_spread_in_deps_is_judged_by_its_elements() {
+    // #272: React compares the elements a spread supplies, never its source.
+    // A fresh array of the caller's deps (`Array.isArray(d) ? d : []`) is no
+    // fresh dep; an array the heap places, whose element is a new object at
+    // every render, is.
+    let opaque = hits(
+        r#"
+        import { useCallback } from "react";
+        function C({ d, store }) {
+            const deps = Array.isArray(d) ? d : [];
+            const cb = useCallback(() => store.get(), [...deps, store]);
+            return <div onClick={cb}/>;
+        }
+        "#,
+    );
+    assert_eq!(opaque, 0, "the source array is not compared");
+    let empty = hits(
+        r#"
+        import { useMemo } from "react";
+        function C() {
+            const deps = [];
+            const v = useMemo(() => 1, [...deps]);
+            return <div>{v}</div>;
+        }
+        "#,
+    );
+    assert_eq!(empty, 0, "a fresh empty array supplies no element");
+    let fresh = hits(
+        r#"
+        import { useMemo } from "react";
+        function C() {
+            const deps = [{ a: 1 }];
+            const v = useMemo(() => 1, [...deps]);
+            return <div>{v}</div>;
+        }
+        "#,
+    );
+    assert_eq!(fresh, 1, "its one element is a new object every render");
 }

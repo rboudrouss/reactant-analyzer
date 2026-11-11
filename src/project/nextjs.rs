@@ -65,6 +65,7 @@ mod tests {
         ModuleFacts {
             directives: directives.iter().map(|s| s.to_string()).collect(),
             imports: imports.iter().map(PathBuf::from).collect(),
+            ..Default::default()
         }
     }
 

@@ -14,7 +14,7 @@ use crate::{
         types::{BlockId, ExprId},
     },
     lowering::JsxOrigins,
-    lowering::expr_lower::{assign_target_ident, empty_cfg, lower_expr},
+    lowering::expr_lower::{assign_target_ident, empty_cfg, lower_expr, property_name, rest_copy},
 };
 
 // ── Allocation-site ids ───────────────────────────────────────────────────────
@@ -30,12 +30,15 @@ use crate::{
 ///
 /// Cloning shares the counter, which is how it reaches a nested body without
 /// changing what a builder owns. One counter per file; the splice gives an
-/// inlined callee its own range (see [`crate::ir::Offsets`]).
+/// inlined callee its own range (see [`crate::ir::Offsets`]), and the
+/// component registry each component its own
+/// ([`crate::ir::ComponentId::site_base`]): a child's heap holds its parents'
+/// sites too (#243).
 #[derive(Debug, Clone, Default)]
-pub struct ExprIds(Rc<Cell<usize>>);
+pub struct ExprIds(Rc<Cell<u64>>);
 
 impl ExprIds {
-    fn next(&self) -> ExprId {
+    pub(super) fn next(&self) -> ExprId {
         let id = self.0.get();
         self.0.set(id + 1);
         ExprId(id)
@@ -228,7 +231,7 @@ impl BlockBuilder {
                     // `stability_verdict` on them read an exit env missing a
                     // real path (a false negative). `Unreachable` now means only
                     // what it says — a `throw`, a stray `break`.
-                    term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                    term: Terminator::Return(Expr::Lit(Prim::Unit), None),
                 },
             );
         }
@@ -293,7 +296,7 @@ fn lower_stmt(stmt: &Statement, builder: &mut BlockBuilder) {
                 .as_ref()
                 .map(|e| lower_expr(e, builder))
                 .unwrap_or(Expr::Lit(Prim::Unit));
-            builder.seal_with(Terminator::Return(expr));
+            builder.seal_with(Terminator::Return(expr, builder.span_at(ret.span.start)));
         }
         Statement::IfStatement(if_) => {
             lower_if(&if_.test, &if_.consequent, if_.alternate.as_ref(), builder);
@@ -774,7 +777,13 @@ fn lower_iter_loop(
 fn lower_switch(sw: &SwitchStatement, builder: &mut BlockBuilder) {
     let exit_block = builder.new_block();
     let disc = lower_expr(&sw.discriminant, builder);
-    builder.push_stmt(Stmt::ExprStmt(disc, None));
+    // Evaluated once, then compared against each case's test.
+    let disc_var = builder.fresh_temp();
+    builder.push_stmt(Stmt::Let {
+        var: disc_var.clone(),
+        rhs: disc,
+        span: None,
+    });
 
     if sw.cases.is_empty() {
         let b = builder.seal_with(Terminator::Jump(exit_block));
@@ -783,12 +792,13 @@ fn lower_switch(sw: &SwitchStatement, builder: &mut BlockBuilder) {
         return;
     }
 
-    // One block per case, fronted by a chain of opaque dispatches: dispatch `i`
-    // either enters case `i` or moves on to dispatch `i + 1`, and the last one
-    // falls to the exit. Which case matches is not a truthiness test on the
-    // discriminant, so every dispatch is opaque, and no case has to match — the
-    // exit is reachable without entering any of them (a `default` clause is
-    // over-approximated as optional).
+    // One block per case, fronted by a chain of dispatches: dispatch `i`
+    // tests `disc == test_i`, either enters case `i` or moves on to dispatch
+    // `i + 1`, and the last one falls to the exit. The test is what the case
+    // depends on: an element rendered under `switch (step.type)` has its mount
+    // condition read `step`. A `default` clause has no test, so its dispatch
+    // is opaque (`true`, which narrows nothing and is taken both ways): it is
+    // over-approximated as optional.
     //
     // Chaining the consequents into one straight line instead was an
     // under-approximation twice over: entering `case 2` without running `case 1`
@@ -803,8 +813,16 @@ fn lower_switch(sw: &SwitchStatement, builder: &mut BlockBuilder) {
 
     for (i, &case_block) in case_blocks.iter().enumerate() {
         let skip_to = later_dispatch.get(i).copied().unwrap_or(exit_block);
+        let cond = match &sw.cases[i].test {
+            Some(test) => Expr::BinOp {
+                op: crate::ir::expr::BinOp::Eq,
+                lhs: Box::new(Expr::Var(disc_var.clone())),
+                rhs: Box::new(lower_expr(test, builder)),
+            },
+            None => Expr::Lit(Prim::Bool(true)),
+        };
         let d = builder.seal_with(Terminator::Branch {
-            cond: Expr::Lit(Prim::Bool(true)),
+            cond,
             then_: case_block,
             else_: skip_to,
             span: None,
@@ -884,12 +902,13 @@ fn lower_binding_pattern(
                 let elem_span = builder.span_at(elem.span().start).or(span);
                 lower_binding_pattern(elem, elem_rhs, elem_span, builder);
             }
-            // `const [a, ...rest] = xs`: bind `rest` to the source — the same
-            // sound over-approximation the object pattern uses for its rest.
-            // Leaving it unbound loses forwarded setters.
+            // `const [a, ...rest] = xs`: `rest` is a new array holding what
+            // `xs` holds ([`rest_copy`], #295). Leaving it unbound loses
+            // forwarded setters.
             if let Some(rest) = &arr.rest {
                 let rest_span = builder.span_at(rest.span.start).or(span);
-                lower_binding_pattern(&rest.argument, Expr::Var(temp.clone()), rest_span, builder);
+                let copy = rest_copy(Expr::Var(temp.clone()), true, builder);
+                lower_binding_pattern(&rest.argument, copy, rest_span, builder);
             }
         }
         BindingPattern::ObjectPattern(obj) => {
@@ -900,49 +919,47 @@ fn lower_binding_pattern(
                 span,
             });
             for prop in &obj.properties {
-                let field = match &prop.key {
-                    PropertyKey::StaticIdentifier(k) => Some(k.name.to_string()),
-                    PropertyKey::StringLiteral(s) => Some(s.value.to_string()),
-                    // `const { [k]: v } = o`: the key expression runs and `v`
-                    // is bound — to an unknown value, not to nothing. Skipping
-                    // the property took the read of `k` with it.
-                    other => {
-                        if let Some(e) = other.as_expression() {
-                            let key_span = builder.span_at(e.span().start).or(span);
-                            let key = lower_expr(e, builder);
-                            builder.push_stmt(Stmt::ExprStmt(key, key_span));
-                        }
-                        None
-                    }
-                };
-                let field_rhs = match field {
-                    Some(field) => Expr::FieldAccess {
-                        obj: Box::new(Expr::Var(temp.clone())),
-                        field,
+                let obj = Box::new(Expr::Var(temp.clone()));
+                let field_rhs = match property_name(&prop.key) {
+                    Some(field) => Expr::FieldAccess { obj, field },
+                    // `const { [k]: v } = o` binds `v` to `o[k]`: the key
+                    // expression runs, and the member it names is read
+                    // when its value names one (#76).
+                    None => match prop.key.as_expression() {
+                        Some(e) => Expr::IndexAccess {
+                            arr: obj,
+                            idx: Box::new(lower_expr(e, builder)),
+                        },
+                        None => Expr::SummaryVal(crate::ir::expr::SummaryValue::Top),
                     },
-                    None => Expr::SummaryVal(crate::ir::expr::SummaryValue::Top),
                 };
                 let prop_span = builder.span_at(prop.span.start).or(span);
                 lower_binding_pattern(&prop.value, field_rhs, prop_span, builder);
             }
-            // Rest element `{ a, ...rest }`: bind `rest` to the source object
-            // itself — a sound over-approximation (rest has a subset of the
-            // fields, each with the same value). Dropping it unbinds `props`
-            // in wrapper components (`({...props}) => <X {...props}/>`) and
-            // loses forwarded setters (TODO.md F4).
+            // Rest element `{ a, ...rest }`: a new object spreading the
+            // source ([`rest_copy`], #295) — every field it may hold, with
+            // its value, and a reference of its own at every render. Dropping
+            // it unbinds `props` in wrapper components (`({...props}) => <X
+            // {...props}/>`) and loses forwarded setters (TODO.md F4).
             if let Some(rest) = &obj.rest {
                 let rest_span = builder.span_at(rest.span.start).or(span);
-                lower_binding_pattern(&rest.argument, Expr::Var(temp.clone()), rest_span, builder);
+                let copy = rest_copy(Expr::Var(temp.clone()), false, builder);
+                lower_binding_pattern(&rest.argument, copy, rest_span, builder);
             }
         }
+        // `{ cb = () => setX(1) }`: the source is read into a temp, which
+        // the default replaces when it is `undefined` (#256); the pattern
+        // binds the temp.
         BindingPattern::AssignmentPattern(ap) => {
-            // The default value is not modeled (the binding keeps `rhs`), but
-            // it *is* evaluated when the source is undefined — emit it so its
-            // reads and side effects survive (`{ cb = () => setX(1) }`).
             let default_span = builder.span_at(ap.right.span().start).or(span);
-            let default = lower_expr(&ap.right, builder);
-            builder.push_stmt(Stmt::ExprStmt(default, default_span));
-            lower_binding_pattern(&ap.left, rhs, span.or(default_span), builder);
+            let temp = format!("__dflt_{}", ap.span.start);
+            builder.push_stmt(Stmt::Let {
+                var: temp.clone(),
+                rhs,
+                span,
+            });
+            lower_default(&temp, &ap.right, true, builder);
+            lower_binding_pattern(&ap.left, Expr::Var(temp), span.or(default_span), builder);
         }
     }
 }
@@ -955,18 +972,88 @@ pub(super) fn inject_param_preamble(
 ) -> Vec<String> {
     let mut names = Vec::new();
     for (i, p) in params.items.iter().enumerate() {
-        match &p.pattern {
-            BindingPattern::BindingIdentifier(id) => {
-                names.push(id.name.to_string());
-            }
-            other => {
-                let temp = format!("__p{}", i);
-                names.push(temp.clone());
-                lower_binding_pattern(other, Expr::Var(temp), None, builder);
-            }
+        let name = match &p.pattern {
+            BindingPattern::BindingIdentifier(id) => id.name.to_string(),
+            _ => format!("__p{}", i),
+        };
+        names.push(name.clone());
+        if let Some(init) = p.initializer.as_deref() {
+            lower_default(&name, init, false, builder);
+        }
+        if !matches!(p.pattern, BindingPattern::BindingIdentifier(_)) {
+            lower_binding_pattern(&p.pattern, Expr::Var(name), None, builder);
         }
     }
     names
+}
+
+/// `source = init` evaluates `init` when the name `source` is `undefined`:
+/// lowered under that test, so its reads and its writes stay where they run
+/// — a setter call, a reassignment of an earlier parameter. One lowering for
+/// a parameter's default (#251) and a destructuring default (`const { f = g }
+/// = o`, #76), `source` then a temp holding the member the pattern reads.
+///
+/// `store`: the default's value is assigned to `source`, which then is the
+/// member or the default (#256); the solver drops the side of the test no
+/// value of `source` takes (#255). A parameter's default is not stored: its
+/// omitted argument is bound where the call is inlined (`param_defaults`,
+/// #230), and a parameter assigned in its body is no longer one a deps
+/// argument can name.
+pub(super) fn lower_default(
+    source: &str,
+    init: &Expression,
+    store: bool,
+    builder: &mut BlockBuilder,
+) {
+    let span = builder.span_at(init.span().start);
+    let then_ = builder.new_block();
+    let join = builder.new_block();
+    let test = builder.seal_with(Terminator::Branch {
+        cond: Expr::BinOp {
+            op: crate::ir::expr::BinOp::Eq,
+            lhs: Box::new(Expr::Var(source.to_string())),
+            rhs: Box::new(Expr::Lit(Prim::Unit)),
+        },
+        then_,
+        else_: join,
+        span,
+    });
+    builder.add_edge(test, then_, EdgeKind::IfTrue);
+    builder.add_edge(test, join, EdgeKind::IfFalse);
+    builder.start_block(then_);
+    let value = lower_expr(init, builder);
+    builder.push_stmt(match store {
+        true => Stmt::Assign {
+            var: source.to_string(),
+            rhs: value,
+            span,
+        },
+        false => Stmt::ExprStmt(value, span),
+    });
+    if !builder.is_terminated() {
+        let end = builder.seal_with(Terminator::Jump(join));
+        builder.add_edge(end, join, EdgeKind::Unconditional);
+    }
+    builder.start_block(join);
+}
+
+/// The default of each formal parameter written `name = default`, aligned
+/// with the names [`inject_param_preamble`] returns: what an omitted argument
+/// stands for (#230). Lowered on its own, so `None` when lowering it emits a
+/// statement or a block (a call's temp, a short-circuit): the default is then
+/// no single expression. `None` too for a parameter with no default.
+pub(super) fn param_defaults(params: &FormalParameters, ctx: &LowerCtx) -> Vec<Option<Expr>> {
+    params
+        .items
+        .iter()
+        .map(|p| {
+            let init = p.initializer.as_deref()?;
+            let mut builder = BlockBuilder::new(ctx);
+            builder.start_block(0);
+            let default = lower_expr(init, &mut builder);
+            (builder.current_stmts.is_empty() && builder.blocks.is_empty()).then_some(default)
+        })
+        .collect()
 }
 
 /// Build a function body CFG with param destructuring preamble.
@@ -994,7 +1081,7 @@ pub fn build_expr_fn_body_cfg(
     if let Some(Statement::ExpressionStatement(es)) = body.statements.first() {
         let expr = lower_expr(&es.expression, &mut builder);
         if !builder.is_terminated() {
-            builder.seal_with(Terminator::Return(expr));
+            builder.seal_with(Terminator::Return(expr, builder.span_at(es.span.start)));
         }
     }
     (param_names, builder.into_cfg(0))
@@ -1053,6 +1140,45 @@ mod tests {
             bound.iter().any(|v| v == "rest"),
             "`rest` must be bound, got {bound:?}"
         );
+    }
+
+    /// A rest element is a new object or array spreading the source, not the
+    /// source itself: `rest` is a different reference at every evaluation
+    /// (#295).
+    #[test]
+    fn a_rest_element_binds_a_fresh_copy_of_its_source() {
+        for (body, array) in [
+            ("const { a, ...rest } = o;", false),
+            ("const [a, ...rest] = xs;", true),
+        ] {
+            let cfg = cfg_of(body);
+            let rhs = cfg.blocks[&cfg.entry]
+                .stmts
+                .iter()
+                .find_map(|s| match s {
+                    Stmt::Let { var, rhs, .. } if var == "rest" => Some(rhs.clone()),
+                    _ => None,
+                })
+                .expect("`rest` is bound");
+            match (rhs, array) {
+                (Expr::ObjectLit { fields, .. }, false) => {
+                    assert!(
+                        matches!(fields.as_slice(), [(k, Expr::Var(_))] if k.starts_with(crate::ir::expr::SPREAD_KEY_PREFIX)),
+                        "{fields:?}"
+                    );
+                }
+                (
+                    Expr::ArrayLit {
+                        elems, spread_at, ..
+                    },
+                    true,
+                ) => {
+                    assert!(matches!(elems.as_slice(), [Expr::Var(_)]), "{elems:?}");
+                    assert_eq!(spread_at, vec![0]);
+                }
+                (other, _) => panic!("{body}: `rest` bound to {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -1198,6 +1324,43 @@ mod tests {
         );
     }
 
+    /// Which case runs depends on the discriminant: each case's dispatch tests
+    /// it, so whatever reads the branch conditions (a mount guard) sees it. A
+    /// `default` has no test and stays opaque.
+    #[test]
+    fn a_switch_dispatch_tests_the_discriminant() {
+        let cfg = cfg_of("switch (s.type) { case \"a\": f(); break; default: g(); }");
+        let conds: Vec<&Expr> = cfg
+            .blocks
+            .values()
+            .filter_map(|b| match &b.term {
+                Terminator::Branch { cond, .. } => Some(cond),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(conds.len(), 2, "{conds:?}");
+        let disc = cfg
+            .blocks
+            .values()
+            .flat_map(|b| &b.stmts)
+            .find_map(|s| match s {
+                Stmt::Let {
+                    var,
+                    rhs: Expr::FieldAccess { field, .. },
+                    ..
+                } if field == "type" => Some(var.clone()),
+                _ => None,
+            })
+            .expect("the discriminant is bound once");
+        assert!(conds.iter().any(|c| matches!(c,
+            Expr::BinOp { lhs, .. } if matches!(lhs.as_ref(), Expr::Var(v) if *v == disc))));
+        assert!(
+            conds
+                .iter()
+                .any(|c| matches!(c, Expr::Lit(Prim::Bool(true))))
+        );
+    }
+
     /// A class body is code. It used to land in `lower_stmt`'s empty arm, so
     /// `class X { m() { setC(1) } }` read as a body that never calls `setC` —
     /// a path the fixpoint never explores.
@@ -1323,7 +1486,7 @@ mod tests {
         assert!(
             matches!(
                 cfg.blocks.get(&cfg.entry).map(|b| &b.term),
-                Some(Terminator::Return(Expr::Lit(Prim::Unit)))
+                Some(Terminator::Return(Expr::Lit(Prim::Unit), _))
             ),
             "got {:?}",
             cfg.blocks.get(&cfg.entry).map(|b| &b.term)

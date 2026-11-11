@@ -26,6 +26,26 @@ fn make_prog(
     reactant::engine::ProgramAnalysisResult::single(name, result)
 }
 
+/// Whether `var` holds more than one value at the render's exit, where the
+/// effects read their deps.
+fn may_hold_several_values_at_exit(src: &str, var: &str) -> bool {
+    let alloc = Allocator::default();
+    let ret = Parser::new(&alloc, src, SourceType::tsx())
+        .with_options(ParseOptions::default())
+        .parse();
+    let comp = lower_program(
+        &ret.program,
+        src,
+        std::path::Path::new("test.tsx"),
+        &mut Default::default(),
+    )
+    .into_iter()
+    .next()
+    .expect("a component");
+    let result = analyze_component(comp, &StateValueTransfer, &Config::default());
+    !result.exit_env().lookup(var).is_single_value()
+}
+
 fn infinite_loop_hits(src: &str) -> usize {
     let alloc = Allocator::default();
     let ret = Parser::new(&alloc, src, SourceType::tsx())
@@ -488,9 +508,10 @@ fn aliased_setter_in_effect_assign_is_tracked() {
 /// under-approximation, and the forbidden direction.
 ///
 /// Here `key` is `"a"` on every path but the break, where it becomes ⊤. Losing
-/// that path made the dep *provably stable*, which suppresses `infinite-loop`
-/// (the effect "can never re-run"), and the divergence went unreported.
-/// Measured: 0 findings before the fix, 1 after.
+/// that path made the dep *provably stable* (one value). The dataflow fact is
+/// that `key` holds more than `"a"` where the effect reads it (#265: it used
+/// to be read off the widening arm of `infinite-loop`, which claimed a loop
+/// the child's own re-render cannot make, its props being kept).
 #[test]
 fn a_value_written_before_break_reaches_the_loop_exit() {
     let src = r#"
@@ -502,15 +523,13 @@ fn a_value_written_before_break_reaches_the_loop_exit() {
             return <div>{n}</div>;
         }
     "#;
-    assert_eq!(
-        infinite_loop_hits(src),
-        1,
-        "the break path makes `key` unknown, so the effect can re-run"
+    assert!(
+        may_hold_several_values_at_exit(src, "key"),
+        "the break path's value of `key` reaches the loop exit"
     );
 
     // Control: with no loop at all, `key` really is the constant and the
-    // suppression is correct — the assertion above is about the edge, not
-    // about the rule being trigger-happy.
+    // suppression is correct — the assertion above is about the edge.
     let no_loop = r#"
         function C() {
             const [n, setN] = useState(0);
@@ -519,6 +538,7 @@ fn a_value_written_before_break_reaches_the_loop_exit() {
             return <div>{n}</div>;
         }
     "#;
+    assert!(!may_hold_several_values_at_exit(no_loop, "key"));
     assert_eq!(infinite_loop_hits(no_loop), 0);
 }
 
@@ -534,7 +554,7 @@ fn a_value_written_before_continue_reaches_the_loop_header() {
             return <div>{n}</div>;
         }
     "#;
-    assert_eq!(infinite_loop_hits(src), 1);
+    assert!(may_hold_several_values_at_exit(src, "key"));
 }
 
 /// `n ?? 7` keeps `n` whenever it is not nullish — `0` included. Lowered as
@@ -590,5 +610,5 @@ fn a_value_written_after_an_all_leaving_switch_is_seen() {
             return <div>{n}</div>;
         }
     "#;
-    assert_eq!(infinite_loop_hits(src), 1);
+    assert!(may_hold_several_values_at_exit(src, "key"));
 }

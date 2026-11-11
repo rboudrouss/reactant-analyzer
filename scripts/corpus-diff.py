@@ -2,9 +2,9 @@
 """Compare two corpus runs by distinct location.
 
 The precision log's comparable column is the number of distinct
-``(file, line, col, message)`` tuples across ``diagnostics``. The JSON keeps one
-row per (finding, component) — #129 groups only at display — so row counts are
-not a clean series.
+``(file, line, col, message)`` tuples across ``diagnostics``. JSON before
+schema v3 kept one row per (finding, component), and v3 groups by rule too
+(#271), so row counts are not a clean series.
 
 Why this exists: on 2026-09-03 an entry wrote its endpoint by subtracting
 measured removals from the start point instead of counting the after-run, and

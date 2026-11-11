@@ -42,7 +42,7 @@ impl Severity {
     /// Lattice rank for the `⊓` clamp (ADR-022 §3): Error > Warning > Info.
     /// Distinct from the enum discriminant, whose order (Error < Warning <
     /// Info) the deterministic output sort depends on.
-    fn rank(self) -> u8 {
+    pub(crate) fn rank(self) -> u8 {
         match self {
             Severity::Error => 2,
             Severity::Warning => 1,
@@ -128,18 +128,19 @@ impl Diagnostic {
         self
     }
 
-    /// Append a typed witness step (ADR-019). `name` maps a state slot to its
-    /// user-facing name — pass a closure over the rule's `state_slot_name`
-    /// table, or [`super::witness::fallback_name`] when no table applies.
+    /// Append a typed witness step (ADR-019). `names` is the rule's
+    /// [`RuleCtx::names`](super::query::RuleCtx::names): a closure over its
+    /// `state_slot_name` table, or [`super::witness::fallback_name`] when no
+    /// table applies.
     pub fn with_step(
         mut self,
         step: Step,
         hook_label: Option<HookLabel>,
         range: Option<SourceRange>,
-        name: &dyn Fn(HookLabel) -> String,
+        names: &super::witness::Names,
     ) -> Self {
         self.notes.push(Note {
-            message: step.render(name),
+            message: step.render(names),
             step,
             hook_label,
             range,

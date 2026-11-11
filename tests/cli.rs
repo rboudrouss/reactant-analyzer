@@ -44,7 +44,7 @@ fn check_vite_project_json() {
 
     let doc: serde_json::Value =
         serde_json::from_str(&stdout(&out)).expect("stdout must be valid JSON");
-    assert_eq!(doc["version"], 2);
+    assert_eq!(doc["version"], 3);
     assert_eq!(doc["files_analyzed"], 2);
     assert_eq!(doc["parse_errors"].as_array().unwrap().len(), 0);
 
@@ -53,7 +53,7 @@ fn check_vite_project_json() {
         .iter()
         .find(|d| d["rule"] == "infinite-loop")
         .expect("infinite-loop diagnostic in JSON output");
-    assert_eq!(inf["severity"], "warning");
+    assert_eq!(inf["severity"], "error");
     assert_eq!(inf["component"], "App");
     // This fixture's effect lives in a hook inlined from `useData.ts`, so v2
     // reports that file next to its line number (v1 asserted `App.tsx` here —
@@ -71,8 +71,8 @@ fn check_vite_project_json() {
     assert!(inf["line"].is_number());
 
     let summary = &doc["summary"];
-    assert_eq!(summary["warnings"], 1);
-    assert_eq!(summary["errors"], 0);
+    assert_eq!(summary["warnings"], 0);
+    assert_eq!(summary["errors"], 1);
     assert_eq!(summary["exit_code"], 1);
 }
 
@@ -132,7 +132,12 @@ fn fail_on_never_exits_zero() {
 
 #[test]
 fn fail_on_error_ignores_warnings() {
-    let out = reactant(&["check", "tests/fixtures/vite_project", "--fail-on", "error"]);
+    let out = reactant(&[
+        "check",
+        "tests/fixtures/callbacks.tsx",
+        "--fail-on",
+        "error",
+    ]);
     assert_eq!(out.status.code(), Some(0), "warnings only → exit 0");
 }
 

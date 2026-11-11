@@ -246,9 +246,12 @@ fn paths_from_config(
 
 /// Load path aliases for a project rooted at `root`.
 ///
-/// Starts at `<root>/tsconfig.json`. If neither it nor its `extends` chain
-/// declares `paths`, its `references[].path` entries are scanned in order
-/// (Vite scaffolds keep `paths` in the referenced `tsconfig.app.json`).
+/// Starts at `<root>/tsconfig.json`, or at `<root>/jsconfig.json` when there
+/// is no `tsconfig.json`: a jsconfig is a tsconfig for a JavaScript project,
+/// and TypeScript reads it only in that absence. If neither it nor its
+/// `extends` chain declares `paths`, its `references[].path` entries are
+/// scanned in order (Vite scaffolds keep `paths` in the referenced
+/// `tsconfig.app.json`).
 ///
 /// Returns `None` when no config exists, or when nothing anywhere in the
 /// chain declares `paths` *or* `baseUrl` — callers then fall back to plain
@@ -256,10 +259,10 @@ fn paths_from_config(
 /// empty `patterns`: no aliases, but non-relative specifiers still resolve
 /// against the base (`import "lib/api"`).
 pub fn load_tsconfig_paths(root: &Path, fs: &dyn FileSystem) -> Option<TsconfigPaths> {
-    let root_config = root.join("tsconfig.json");
-    if !fs.is_file(&root_config) {
-        return None;
-    }
+    let root_config = ["tsconfig.json", "jsconfig.json"]
+        .iter()
+        .map(|name| root.join(name))
+        .find(|config| fs.is_file(config))?;
     let mut visited = HashSet::new();
     // A patternless result (bare `baseUrl`) is held back, not returned: the
     // `references` hop below is what finds a Vite scaffold's real aliases,
@@ -546,6 +549,35 @@ mod tests {
             r#"{ "compilerOptions": { "strict": true } }"#,
         );
         assert!(load_tsconfig_paths(tmp.path(), &crate::resolver::OsFileSystem).is_none());
+    }
+
+    #[test]
+    fn a_jsconfig_declares_paths_like_a_tsconfig() {
+        let tmp = Tmp::new("jsconfig");
+        tmp.write(
+            "jsconfig.json",
+            r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "@/*": ["./src/*"] } } }"#,
+        );
+        let paths = load_tsconfig_paths(tmp.path(), &crate::resolver::OsFileSystem)
+            .expect("jsconfig paths");
+        assert_eq!(paths.patterns[0].0, "@/*");
+    }
+
+    /// TypeScript reads a jsconfig only where no tsconfig exists.
+    #[test]
+    fn a_tsconfig_beside_a_jsconfig_wins() {
+        let tmp = Tmp::new("ts-over-js");
+        tmp.write(
+            "tsconfig.json",
+            r#"{ "compilerOptions": { "paths": { "~/*": ["./app/*"] } } }"#,
+        );
+        tmp.write(
+            "jsconfig.json",
+            r#"{ "compilerOptions": { "paths": { "@/*": ["./src/*"] } } }"#,
+        );
+        let paths = load_tsconfig_paths(tmp.path(), &crate::resolver::OsFileSystem)
+            .expect("tsconfig paths");
+        assert_eq!(paths.patterns[0].0, "~/*");
     }
 
     #[test]

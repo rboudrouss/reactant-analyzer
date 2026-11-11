@@ -1,6 +1,6 @@
 // The API's types, and the calls both entry points expose.
 //
-// `Report` and friends mirror the JSON reporter's wire schema v2
+// `Report` and friends mirror the JSON reporter's wire schema v3
 // (src/driver/json.rs, documented in docs/usage.md), which is the stability
 // contract: `analyze` hands the document back verbatim rather than mapping
 // it into a second shape that would have to be kept in step.
@@ -31,6 +31,11 @@ export interface Options {
   allRoots?: boolean;
   /** Close over resolved import edges beyond the named paths. */
   followImports?: boolean;
+  /**
+   * One diagnostic per component a finding is reported through, instead of
+   * one per finding naming them in `components`.
+   */
+  perComponent?: boolean;
   /** Emit ANSI colors. Off by default, since a string consumer wants none. */
   color?: boolean;
   entry?: string[] | string;
@@ -94,10 +99,10 @@ export interface HostConstants {
   configFileName: string;
 }
 
-// ── The report (wire schema v2) ──────────────────────────────────────────────
+// ── The report (wire schema v3) ──────────────────────────────────────────────
 
 export interface Report {
-  version: 2;
+  version: 3;
   files_analyzed: number;
   parse_errors: ParseError[];
   diagnostics: Diagnostic[];
@@ -126,8 +131,16 @@ export type Severity = "error" | "warning" | "info";
 export interface Diagnostic {
   rule: string;
   severity: Severity;
-  /** Registry display name, `Page@src/a/page.tsx` when names collide. */
+  /**
+   * Registry display name, `Page@src/a/page.tsx` when names collide: the
+   * first of `components` whose own row has this `severity`.
+   */
   component: string;
+  /**
+   * Every component the finding is reported through (a hook inlined into
+   * several). Only `component` under `perComponent`.
+   */
+  components: string[];
   /**
    * The file `line`/`col` point into: the anchor's own file, which for a
    * finding inside a cross-file inlined hook is not `component_file`.
@@ -152,12 +165,13 @@ export type NoteKind =
   | "write"
   | "read"
   | "branch"
-  | "handler"
   | "cycle-edge"
   | "widen"
   | "mutate"
   | "capture"
-  | "init-once";
+  | "init-once"
+  | "forward"
+  | "rerender";
 
 /** One typed witness step: `message` is the prose, the rest is its structure. */
 export interface Note {
@@ -177,7 +191,6 @@ export interface Note {
   value_class?: "fresh" | "same-as-current" | "unknown";
   what?: string;
   desc?: string;
-  event?: string;
   from?: string;
   to?: string;
   iteration?: number;
@@ -219,7 +232,7 @@ export interface Summary {
 export interface ReactantApi {
   /**
    * Check a tree and get the report as data. `report` is the JSON reporter's
-   * document verbatim (wire schema v2).
+   * document verbatim (wire schema v3).
    *
    * Findings are a result, not a failure. Only a usage error throws
    * `UsageError`: a bad option, an unparseable config, a rejected pack.

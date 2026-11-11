@@ -1,8 +1,8 @@
 //! The Tier-A executor: a validated [`ResolvedRule`] running as a [`Rule`].
 //!
 //! Severity is `pin ⊓ polarity`, per finding, at emission (ADR-022 §3): the
-//! finding's ceiling is Error iff a must-guard certified *this* finding
-//! (a `Certified` proof is held), Warning otherwise. The clamp is
+//! finding's ceiling is Error iff every guard of its conjunction is exact or
+//! certified and a `Certified` proof is held, Warning otherwise. The clamp is
 //! structural, not policed — this module sits under `src/rules/` like every
 //! native rule, so it cannot mint a `Certified` (private to `api::query`)
 //! and cannot construct an Error except through `Diagnostic::error(proof, …)`.
@@ -10,15 +10,13 @@
 //! zero author effort (§8). Custom rules have no `safe_check` in v1 (the
 //! trait default).
 
-use std::collections::HashSet;
-
 use crate::ir::SourceRange;
 use crate::ir::hooks::{Arity, HookEntry};
 use crate::ir::types::HookLabel;
 use crate::rules::api::diagnostic::Diagnostic;
 use crate::rules::api::query::{
-    Certified, ConditionalHookCall, DirectWrite, DominatesAllExits, InitSetterCall, MustResult,
-    Provenance, RuleCtx, must_direct_write, must_init_calls_setter, must_setter_on_all_paths,
+    Certified, ConditionalHookCall, DirectWrite, InitSetterCall, MustResult, Provenance,
+    RenderWrite, RuleCtx, must_direct_write, must_init_calls_setter, must_setter_on_all_paths,
 };
 use crate::rules::{Rule, SetterCall};
 
@@ -43,7 +41,7 @@ pub(crate) struct TierARule {
 /// matches to reach the generic `Diagnostic::error`.
 enum Proof {
     Setter(Certified<SetterCall>),
-    Dominates(Certified<DominatesAllExits>),
+    RenderWrite(Certified<RenderWrite>),
     Init(Certified<InitSetterCall>),
     Conditional(Certified<ConditionalHookCall>),
     Direct(Certified<DirectWrite>),
@@ -53,11 +51,41 @@ impl Proof {
     fn provenance(&self) -> &Provenance {
         match self {
             Proof::Setter(c) => c.provenance(),
-            Proof::Dominates(c) => c.provenance(),
+            Proof::RenderWrite(c) => c.provenance(),
             Proof::Init(c) => c.provenance(),
             Proof::Conditional(c) => c.provenance(),
             Proof::Direct(c) => c.provenance(),
         }
+    }
+}
+
+/// What one guard says about a candidate, in three-valued logic. A finding
+/// is the conjunction of its guards, so its verdict is their meet: a proof
+/// certifies its own conjunct, never a may-typed one beside it (#143).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Verdict {
+    /// The guard rejects the candidate.
+    Fail,
+    /// It passes on a fact that may be false: a classifier's verdict, an
+    /// existential over a may-relation, an absence, a bound that does not
+    /// refute, or a `must_*` let through uncertified.
+    May,
+    /// It passes on a certain fact: an exact filter or fold over the row
+    /// (positive-only, absent ⇒ fail, ADR-023), or a `must_*` that certified.
+    Sure,
+}
+
+impl Verdict {
+    fn exact(pass: bool) -> Self {
+        if pass { Verdict::Sure } else { Verdict::Fail }
+    }
+
+    fn may(pass: bool) -> Self {
+        if pass { Verdict::May } else { Verdict::Fail }
+    }
+
+    fn passes(self) -> bool {
+        self != Verdict::Fail
     }
 }
 
@@ -406,11 +434,14 @@ impl Rule for TierARule {
 
 impl TierARule {
     /// Evaluate every guard against one candidate; emit on a full pass. Guards
-    /// run in author order and short-circuit on the first failure.
+    /// run in author order and short-circuit on the first failure; the
+    /// finding's verdict is the meet of theirs.
     fn eval(&self, e: &EntityCtx<'_>, cand: &Candidate<'_, '_>, out: &mut Vec<Diagnostic>) {
         let mut proofs: Vec<Proof> = Vec::new();
+        let mut verdict = Verdict::Sure;
         for guard in &self.def.guards {
-            if !self.eval_guard(e, cand, guard, &mut proofs) {
+            verdict = verdict.min(self.eval_guard(e, cand, guard, &mut proofs));
+            if !verdict.passes() {
                 return;
             }
         }
@@ -424,25 +455,30 @@ impl TierARule {
                 Segment::Field(r, f) => e.render_field(&cand.entity_at(*r), *f),
             })
             .collect();
-        out.push(self.emit(message, proofs, cand.label(), cand.range()));
+        out.push(self.emit(message, verdict, proofs, cand.label(), cand.range()));
     }
 
     /// One guard against one candidate. Recursive for `any_of`; proofs
     /// collected along the way are pushed onto `proofs` whether or not the
     /// guard ends up passing, because a certified sub-claim is evidence for
-    /// the finding either way.
+    /// the finding either way. Each arm states the polarity of its pass,
+    /// `Verdict::exact` or `Verdict::may`.
     fn eval_guard(
         &self,
         e: &EntityCtx<'_>,
         cand: &Candidate<'_, '_>,
         guard: &ResolvedGuard,
         proofs: &mut Vec<Proof>,
-    ) -> bool {
+    ) -> Verdict {
         // Every `bound` match below is exhaustive, not a refutable `let`: a
         // new edge would otherwise validate, load, and silently emit nothing.
         match guard {
+            // A classifier mints nothing (ADR-023): no verdict it returns is a
+            // proof, ⊤ or not, so a guard reading one passes on a may.
             ResolvedGuard::Stability { names, negated, .. } => match cand.bound() {
-                Some(Bound::Dep(dep)) => names.contains(&e.dep_verdict(dep)) != *negated,
+                Some(Bound::Dep(dep)) => {
+                    Verdict::may(names.contains(&e.dep_verdict(dep)) != *negated)
+                }
                 Some(
                     Bound::Setter(_)
                     | Bound::Arg(_)
@@ -456,7 +492,9 @@ impl TierARule {
                 }
             },
             ResolvedGuard::Returns { names, negated, .. } => match cand.bound() {
-                Some(Bound::Arg(arg)) => names.contains(&e.arg_verdict(arg)) != *negated,
+                Some(Bound::Arg(arg)) => {
+                    Verdict::may(names.contains(&e.arg_verdict(arg)) != *negated)
+                }
                 Some(
                     Bound::Setter(_)
                     | Bound::Dep(_)
@@ -482,21 +520,28 @@ impl TierARule {
                         e.provenance(row.info.label)
                     }
                 };
-                match prov {
+                let pass = match prov {
                     Some(p) => {
                         hook.as_ref()
                             .is_none_or(|names| names.iter().any(|n| n == p.origin_hook.as_str()))
                             && direct.is_none_or(|d| p.inlined != d)
                     }
                     None => false,
-                }
+                };
+                Verdict::exact(pass)
             }
             ResolvedGuard::InDeps { negate, .. } => match (cand.row(), cand.bound()) {
                 (Some(row), Some(Bound::Setter(setter))) => {
                     let in_deps = setter
                         .slot
                         .is_some_and(|slot| e.dep_slots(row).contains(&slot));
-                    in_deps != *negate
+                    // A visible dep naming the slot is exact; its absence is
+                    // not, since a spread or an alias can hide one.
+                    if *negate {
+                        Verdict::may(!in_deps)
+                    } else {
+                        Verdict::exact(in_deps)
+                    }
                 }
                 _ => unreachable!("validated: `in_deps` binds a body setter call"),
             },
@@ -505,7 +550,11 @@ impl TierARule {
                 field,
                 one_of,
                 prefix,
-            } => text_matches(e.field_raw(&cand.entity_at(*of), *field), one_of, prefix),
+            } => Verdict::exact(text_matches(
+                e.field_raw(&cand.entity_at(*of), *field),
+                one_of,
+                prefix,
+            )),
             ResolvedGuard::Identity { of, names, negated } => {
                 // Both JSX relations carry the one shared verdict.
                 let identity = match cand.entity_at(*of) {
@@ -517,7 +566,7 @@ impl TierARule {
                         "validated: `identity` binds a JSX site, an argument or a registration"
                     ),
                 };
-                names.contains(&identity_name(identity)) != *negated
+                Verdict::may(names.contains(&identity_name(identity)) != *negated)
             }
             ResolvedGuard::Cleanup { of, names, negated } => {
                 // Validated: `of` binds a kind-pinned effect anchor, so the
@@ -528,19 +577,19 @@ impl TierARule {
                 let Some(row) = cand.row() else {
                     unreachable!("validated: `cleanup` reads an effect-hook anchor")
                 };
-                names.contains(&cleanup_name(e.cleanup(row))) != *negated
+                Verdict::may(names.contains(&cleanup_name(e.cleanup(row))) != *negated)
             }
             ResolvedGuard::Updater { of, names } => {
                 let EntityVal::Writer(w) = cand.entity_at(*of) else {
                     unreachable!("validated: `updater` binds a writers row")
                 };
-                names.contains(&updater_name(&w.updater))
+                Verdict::may(names.contains(&updater_name(&w.updater)))
             }
             ResolvedGuard::UpdaterBody { of, names } => {
                 let EntityVal::Writer(w) = cand.entity_at(*of) else {
                     unreachable!("validated: `updater_body` binds a writers row")
                 };
-                names.contains(&e.updater_purity(&w.updater))
+                Verdict::may(names.contains(&e.updater_purity(&w.updater)))
             }
             ResolvedGuard::Phase { of, names } => {
                 let phase = match cand.entity_at(*of) {
@@ -548,34 +597,36 @@ impl TierARule {
                     EntityVal::Read(r) => r.phase,
                     _ => unreachable!("validated: `phase` binds a calls or reads row"),
                 };
-                names.contains(&phase_name(phase))
+                Verdict::may(names.contains(&phase_name(phase)))
             }
             ResolvedGuard::Provider { of, names } => {
                 let EntityVal::Consumer(c) = cand.entity_at(*of) else {
                     unreachable!("validated: `provider` binds a context_consumers row")
                 };
-                names.contains(&provider_name(c.verdict))
+                Verdict::may(names.contains(&provider_name(c.verdict)))
             }
             ResolvedGuard::SeedSync { of, names } => {
                 let EntityVal::Seed(s) = cand.entity_at(*of) else {
                     unreachable!("validated: `seed_sync` binds a seeds row")
                 };
-                names.contains(&seed_sync_name(s.sync))
+                Verdict::may(names.contains(&seed_sync_name(s.sync)))
             }
             ResolvedGuard::Teardown { of, names } => {
                 let EntityVal::Registration(r) = cand.entity_at(*of) else {
                     unreachable!("validated: `teardown` binds a registrations row")
                 };
-                names.contains(&teardown_name(r.pairing))
+                Verdict::may(names.contains(&teardown_name(r.pairing)))
             }
             ResolvedGuard::Registers { of, firing } => {
                 let EntityVal::Hook(h) = cand.entity_at(*of) else {
                     unreachable!("validated: `registers` binds an effect anchor")
                 };
-                e.registration_rows()
-                    .iter()
-                    .filter(|r| r.effect == h.info.label)
-                    .any(|r| firing.contains(&firing_name(r.firing)))
+                Verdict::may(
+                    e.registration_rows()
+                        .iter()
+                        .filter(|r| r.effect == h.info.label)
+                        .any(|r| firing.contains(&firing_name(r.firing))),
+                )
             }
             ResolvedGuard::SlotOwnership { of, names } => {
                 let EntityVal::Setter(s) = cand.entity_at(*of) else {
@@ -586,7 +637,9 @@ impl TierARule {
                 } else {
                     OwnershipName::Local
                 };
-                names.contains(&owned)
+                // A total fold of the row: whether its call is surely the
+                // setter is the row's own fact, for a `must_*` to certify.
+                Verdict::exact(names.contains(&owned))
             }
             ResolvedGuard::Cycle {
                 of,
@@ -598,14 +651,16 @@ impl TierARule {
                 };
                 // Conjunction of the given fields; both are exact folds of the
                 // graph, so the negative is as answerable as the positive.
-                cross_component.is_none_or(|x| c.cross_component == x)
-                    && all_must.is_none_or(|x| c.all_must == x)
+                Verdict::exact(
+                    cross_component.is_none_or(|x| c.cross_component == x)
+                        && all_must.is_none_or(|x| c.all_must == x),
+                )
             }
             ResolvedGuard::SameTick { of } => {
                 let EntityVal::Writer(w) = cand.entity_at(*of) else {
                     unreachable!("validated: `same_tick` binds a writers row")
                 };
-                w.same_tick
+                Verdict::may(w.same_tick)
             }
             ResolvedGuard::Provenance {
                 of,
@@ -618,7 +673,7 @@ impl TierARule {
                 use crate::engine::setters::WriteProvenance;
                 // Conjunction of the given fields; an unplaceable site fails
                 // both forms (positive-only, ADR-027 §4).
-                match &w.via {
+                let pass = match &w.via {
                     WriteProvenance::Unknown => false,
                     WriteProvenance::Direct => through.is_none() && direct.is_none_or(|d| d),
                     WriteProvenance::Via(chain) => {
@@ -627,7 +682,8 @@ impl TierARule {
                             .is_none_or(|names| chain.iter().any(|c| names.iter().any(|n| n == c)))
                             && direct.is_none_or(|d| !d)
                     }
-                }
+                };
+                Verdict::exact(pass)
             }
             ResolvedGuard::WriterPhases { includes } => {
                 // Validated: the anchor is a state hook — its label is the
@@ -635,7 +691,7 @@ impl TierARule {
                 let Some(row) = cand.row() else {
                     unreachable!("validated: `writer_phases` reads a state-hook anchor")
                 };
-                e.writer_phase_includes(row.info.label, includes)
+                Verdict::may(e.writer_phase_includes(row.info.label, includes))
             }
             // An arity guard needs an arity. A hook with no readable deps
             // array — or one whose lowering dropped or flattened an element —
@@ -653,57 +709,61 @@ impl TierARule {
                     .and_then(|i| i.deps.list())
                     .map(|l| l.arity)
                 else {
-                    return false;
+                    return Verdict::Fail;
                 };
                 match arity {
                     Arity::Exact(m) => {
                         let m = m as u64;
-                        match cmp {
+                        Verdict::exact(match cmp {
                             CountCmp::MoreThan(n) => m > *n,
                             CountCmp::LessThan(n) => m < *n,
                             CountCmp::Equals(n) => m == *n,
-                        }
+                        })
                     }
                     // A flattened spread leaves only a lower bound, so the
                     // guard answers what that bound *refutes* and passes
-                    // otherwise. Refusing outright deleted findings: the arity
-                    // of `[a, …, g, ...rest]` provably exceeds any budget its
+                    // otherwise, on a may unless the bound alone proves it.
+                    // Refusing outright deleted findings: the arity of
+                    // `[a, …, g, ...rest]` provably exceeds any budget its
                     // visible elements already exceed.
                     Arity::AtLeast(m) => {
                         let m = m as u64;
                         match cmp {
-                            CountCmp::MoreThan(_) => true,
-                            CountCmp::LessThan(n) => m < *n,
-                            CountCmp::Equals(n) => m <= *n,
+                            CountCmp::MoreThan(n) if m > *n => Verdict::Sure,
+                            CountCmp::MoreThan(_) => Verdict::May,
+                            CountCmp::LessThan(n) => Verdict::may(m < *n),
+                            CountCmp::Equals(n) => Verdict::may(m <= *n),
                         }
                     }
                 }
             }
-            ResolvedGuard::DepsDeclared { eq } => {
+            ResolvedGuard::DepsDeclared { eq } => Verdict::exact(
                 cand.row()
                     .and_then(|r| r.effect)
                     .is_some_and(|i| i.has_deps_array())
-                    == *eq
-            }
+                    == *eq,
+            ),
             ResolvedGuard::Must { kind, els, .. } => match (self.certify(e, cand, *kind), els) {
                 (Some(p), _) => {
                     proofs.push(p);
-                    true
+                    Verdict::Sure
                 }
-                (None, ElseBehavior::Keep) => true,
-                (None, ElseBehavior::Drop) => false,
+                // Kept uncertified: the claim may hold, nothing proves it.
+                (None, ElseBehavior::Keep) => Verdict::May,
+                (None, ElseBehavior::Drop) => Verdict::Fail,
             },
             // Every branch is evaluated: short-circuiting would make whether a
             // `must_*` branch contributes its proof — and therefore whether the
             // finding can reach Error — depend on the order the author wrote
             // the branches in.
             ResolvedGuard::AnyOf(children) => {
-                // Not `.any()`: it short-circuits, and each call pushes proofs.
-                let mut passed = false;
+                // The join of the branches. Not `.any()`: it short-circuits,
+                // and each call pushes proofs.
+                let mut verdict = Verdict::Fail;
                 for child in children {
-                    passed |= self.eval_guard(e, cand, child, proofs);
+                    verdict = verdict.max(self.eval_guard(e, cand, child, proofs));
                 }
-                passed
+                verdict
             }
             // `none` over an element's props: the anchor is not a hook row, so
             // this is its own arm rather than a case of the one below.
@@ -715,14 +775,15 @@ impl TierARule {
                     unreachable!("validated: `props` binds an `elements` anchor")
                 };
                 let mut scratch: Vec<Proof> = Vec::new();
-                !site.props.iter().any(|prop| {
+                let any = site.props.iter().any(|prop| {
                     let elem = Candidate::Element {
                         site,
                         prop: Some(prop),
                     };
                     body.iter()
-                        .all(|g| self.eval_guard(e, &elem, g, &mut scratch))
-                })
+                        .all(|g| self.eval_guard(e, &elem, g, &mut scratch).passes())
+                });
+                Verdict::may(!any)
             }
             ResolvedGuard::NoneOf { edge, body } => {
                 let Some(row) = cand.row() else {
@@ -738,7 +799,7 @@ impl TierARule {
                         bound: Some(bound),
                     };
                     body.iter()
-                        .all(|g| self.eval_guard(e, &elem, g, &mut scratch))
+                        .all(|g| self.eval_guard(e, &elem, g, &mut scratch).passes())
                 };
                 let any = match edge {
                     EdgeName::Deps => e.deps(row).iter().any(|d| hit(Bound::Dep(d))),
@@ -752,7 +813,9 @@ impl TierARule {
                     EdgeName::Reads => e.reads(row).iter().any(|r| hit(Bound::Read(r))),
                     EdgeName::Props => unreachable!("handled above"),
                 };
-                !any
+                // The relation may under-enumerate, and a missing row makes
+                // the negation pass: a may, like `every`.
+                Verdict::may(!any)
             }
             ResolvedGuard::Every(body) => {
                 let Some(row) = cand.row() else {
@@ -765,7 +828,7 @@ impl TierARule {
                 // supplies no element at all, and a claim about nothing is not
                 // a claim the engine may make.
                 if row.effect.and_then(|i| i.deps.list()).is_none() {
-                    return false;
+                    return Verdict::Fail;
                 }
                 // `proofs` is deliberately not threaded in: a may-typed
                 // quantifier must never contribute Error authority. The
@@ -778,10 +841,10 @@ impl TierARule {
                         bound: Some(Bound::Dep(&dep)),
                     };
                     body.iter()
-                        .all(|g| self.eval_guard(e, &elem, g, &mut scratch))
+                        .all(|g| self.eval_guard(e, &elem, g, &mut scratch).passes())
                 });
                 debug_assert!(scratch.is_empty(), "`every` must not mint a proof");
-                all
+                Verdict::may(all)
             }
         }
     }
@@ -804,12 +867,7 @@ impl TierARule {
                 // must-forwarding handles multi-site/branchy writes, which
                 // the deduplicated `SetterCall.block_id` could not.
                 let slot = setter.slot?;
-                let aliases: HashSet<_> = e
-                    .setter_labels
-                    .iter()
-                    .filter(|(_, l)| **l == slot)
-                    .map(|(v, _)| v.clone())
-                    .collect();
+                let aliases = e.setter_labels.sure_aliases_of(slot);
                 match must_setter_on_all_paths(body, &aliases, None) {
                     MustResult::All(c) => Some(Proof::Setter(c)),
                     _ => None,
@@ -830,10 +888,9 @@ impl TierARule {
                         unreachable!("validated: `must_dominates_all_exits` binds a render setter")
                     }
                 };
-                setter.block_id.and_then(|b| match e.exit_dom().certify(b) {
-                    MustResult::All(c) => Some(Proof::Dominates(c)),
-                    _ => None,
-                })
+                // The call running on every render is half the claim: its
+                // callee must surely be the setter too (#279).
+                e.render_write(setter).map(Proof::RenderWrite)
             }
             MustKind::InitCallsSetter => {
                 let row = cand.row().expect("validated: hook anchor");
@@ -865,30 +922,32 @@ impl TierARule {
         }
     }
 
-    /// `effective = pin ⊓ polarity`: Error iff pinned Error AND a proof is
-    /// held; the proof's provenance (range/label/notes) rides automatically.
-    /// Downgraded/unproven findings still carry the proofs' trace notes.
+    /// `effective = pin ⊓ polarity`: Error iff pinned Error AND the verdict is
+    /// `Sure` with a proof held to build it from; the proof's provenance
+    /// (range/label/notes) rides automatically. Downgraded/unproven findings
+    /// still carry the proofs' trace notes.
     fn emit(
         &self,
         message: String,
+        verdict: Verdict,
         mut proofs: Vec<Proof>,
         label: Option<HookLabel>,
         range: Option<SourceRange>,
     ) -> Diagnostic {
         let id = self.def.id.clone();
-        let d = match (self.def.pin, proofs.is_empty()) {
-            (SeverityPin::Error, false) => {
+        let d = match (self.def.pin, verdict, proofs.is_empty()) {
+            (SeverityPin::Error, Verdict::Sure, false) => {
                 let first = proofs.remove(0);
                 match first {
                     Proof::Setter(c) => Diagnostic::error(id, c, message),
-                    Proof::Dominates(c) => Diagnostic::error(id, c, message),
+                    Proof::RenderWrite(c) => Diagnostic::error(id, c, message),
                     Proof::Init(c) => Diagnostic::error(id, c, message),
                     Proof::Conditional(c) => Diagnostic::error(id, c, message),
                     Proof::Direct(c) => Diagnostic::error(id, c, message),
                 }
             }
-            (SeverityPin::Error | SeverityPin::Warning, _) => Diagnostic::warn(id, message),
-            (SeverityPin::Info, _) => Diagnostic::info(id, message),
+            (SeverityPin::Error | SeverityPin::Warning, ..) => Diagnostic::warn(id, message),
+            (SeverityPin::Info, ..) => Diagnostic::info(id, message),
         };
         let d = proofs
             .iter()

@@ -33,11 +33,101 @@ pub struct ModuleFacts {
     /// (`export … from`, `export * from`), because a barrel re-export carries
     /// a directive boundary exactly like a plain import does.
     pub imports: Vec<PathBuf>,
+    /// The `imports` that stand in for a package's compiled entry
+    /// ([`crate::resolver::ImportResolver::is_compiled_entry`]): the module's
+    /// code, not its directives.
+    pub compiled_entries: Vec<PathBuf>,
+    /// The names this module exports *from another analyzed file* — what a
+    /// barrel is made of (#49, #226).
+    pub re_exports: ReExports,
 }
 
 impl ModuleFacts {
     pub fn has_directive(&self, directive: &str) -> bool {
         self.directives.iter().any(|d| d == directive)
+    }
+}
+
+/// One module's re-exports, restricted to specifiers the `ImportResolver`
+/// mapped to a real file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReExports {
+    /// `(exported, origin file, origin name)`: `export { a as b } from "./x"`,
+    /// and an imported binding exported again (`import { a } from "./x";
+    /// export { a as b }`). A `default` origin is recorded under the exported
+    /// name, the convention a default import already follows.
+    pub named: Vec<(String, PathBuf, String)>,
+    /// `export * from "./x"` targets, in source order.
+    pub star: Vec<PathBuf>,
+    /// The module's own top-level names, recorded only when `star` is
+    /// non-empty: a local export shadows a star re-export, and a declared name
+    /// stands in for "maybe exported locally" — stopping there is sound.
+    pub declared: HashSet<String>,
+}
+
+impl ReExports {
+    pub fn is_empty(&self) -> bool {
+        self.named.is_empty() && self.star.is_empty()
+    }
+}
+
+/// `file → ReExports` for every lowered file that re-exports anything: the
+/// relation an import of a barrel is followed through.
+#[derive(Debug, Clone, Default)]
+pub struct ReExportGraph(HashMap<PathBuf, ReExports>);
+
+impl ReExportGraph {
+    /// The definition `name` exported by `file` stands for, following `file`'s
+    /// re-exports transitively — `(file, name)` itself when `defines` holds
+    /// there. Never a search outside the chain: a name the chain does not
+    /// reach is `None`, and so is a name two `export *` targets both provide
+    /// (ambiguous, which ES excludes from the namespace).
+    pub fn origin(
+        &self,
+        file: &Path,
+        name: &str,
+        defines: &dyn Fn(&Path, &str) -> bool,
+    ) -> Option<(PathBuf, String)> {
+        self.walk(file, name, defines, &mut HashSet::new())
+    }
+
+    fn walk(
+        &self,
+        file: &Path,
+        name: &str,
+        defines: &dyn Fn(&Path, &str) -> bool,
+        seen: &mut HashSet<(PathBuf, String)>,
+    ) -> Option<(PathBuf, String)> {
+        if !seen.insert((file.to_path_buf(), name.to_string())) {
+            return None;
+        }
+        if defines(file, name) {
+            return Some((file.to_path_buf(), name.to_string()));
+        }
+        let edges = self.0.get(file)?;
+        if let Some((_, from, imported)) = edges.named.iter().find(|(e, _, _)| e == name) {
+            return self.walk(from, imported, defines, seen);
+        }
+        if name == "default" || edges.declared.contains(name) {
+            return None;
+        }
+        let mut found: Option<(PathBuf, String)> = None;
+        for from in &edges.star {
+            if let Some(hit) = self.walk(from, name, defines, seen) {
+                if found.as_ref().is_some_and(|f| *f != hit) {
+                    return None;
+                }
+                found = Some(hit);
+            }
+        }
+        // A default import is asked for under its local name. A name the
+        // module neither exports, declares nor reaches through a star would
+        // not link as a named import, so it is the default: `export { default
+        // } from "./x"` forwards it to `./x`, under the same name.
+        found.or_else(|| {
+            let (_, from, _) = edges.named.iter().find(|(e, _, _)| e == "default")?;
+            self.walk(from, name, defines, seen)
+        })
     }
 }
 
@@ -58,6 +148,17 @@ impl ModuleTable {
 
     pub fn facts(&self, path: &Path) -> Option<&ModuleFacts> {
         self.files.get(path)
+    }
+
+    /// The re-export relation of every file that has one.
+    pub fn re_export_graph(&self) -> ReExportGraph {
+        ReExportGraph(
+            self.files
+                .iter()
+                .filter(|(_, f)| !f.re_exports.is_empty())
+                .map(|(p, f)| (p.clone(), f.re_exports.clone()))
+                .collect(),
+        )
     }
 
     pub fn is_empty(&self) -> bool {
@@ -97,6 +198,10 @@ impl ModuleTable {
     /// everything imported below it, so a walk that starts in one environment
     /// ends where the next one is declared. Pass `None` for a plain forward
     /// reachability walk.
+    ///
+    /// A directive walk does not enter a compiled entry either: whether the
+    /// build gave it the directive is not in its source, so it is left out
+    /// exactly as an npm package, which leaves no edge, is.
     pub fn reachable_from<'p>(
         &self,
         seeds: impl IntoIterator<Item = &'p Path>,
@@ -117,7 +222,8 @@ impl ModuleTable {
                 continue;
             };
             for dep in &facts.imports {
-                if !blocked(dep) && seen.insert(dep.clone()) {
+                let compiled = boundary.is_some() && facts.compiled_entries.contains(dep);
+                if !compiled && !blocked(dep) && seen.insert(dep.clone()) {
                     queue.push_back(dep.clone());
                 }
             }
@@ -136,7 +242,107 @@ mod tests {
         ModuleFacts {
             directives: directives.iter().map(|s| s.to_string()).collect(),
             imports: imports.iter().map(PathBuf::from).collect(),
+            ..Default::default()
         }
+    }
+
+    fn graph(entries: &[(&str, ReExports)]) -> ReExportGraph {
+        ReExportGraph(
+            entries
+                .iter()
+                .map(|(p, r)| (PathBuf::from(p), r.clone()))
+                .collect(),
+        )
+    }
+
+    fn named(exported: &str, from: &str, imported: &str) -> (String, PathBuf, String) {
+        (exported.into(), PathBuf::from(from), imported.into())
+    }
+
+    fn star(from: &[&str]) -> ReExports {
+        ReExports {
+            star: from.iter().map(PathBuf::from).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_re_export_chain_is_followed_to_the_definition() {
+        let g = graph(&[
+            (
+                "/index.ts",
+                ReExports {
+                    named: vec![named("useB", "/mid.ts", "useA")],
+                    ..Default::default()
+                },
+            ),
+            ("/mid.ts", star(&["/def.ts"])),
+        ]);
+        let defines = |f: &Path, n: &str| f == Path::new("/def.ts") && n == "useA";
+        assert_eq!(
+            g.origin(Path::new("/index.ts"), "useB", &defines),
+            Some((PathBuf::from("/def.ts"), "useA".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_name_off_the_chain_is_not_found_elsewhere() {
+        let g = graph(&[("/index.ts", star(&["/a.ts"]))]);
+        let defines = |f: &Path, _: &str| f == Path::new("/elsewhere.ts");
+        assert_eq!(g.origin(Path::new("/index.ts"), "useA", &defines), None);
+    }
+
+    #[test]
+    fn two_star_targets_providing_the_name_are_ambiguous() {
+        let g = graph(&[("/index.ts", star(&["/a.ts", "/b.ts"]))]);
+        let defines = |f: &Path, _: &str| f != Path::new("/index.ts");
+        assert_eq!(g.origin(Path::new("/index.ts"), "useA", &defines), None);
+    }
+
+    #[test]
+    fn a_declared_name_shadows_a_star_re_export() {
+        let mut r = star(&["/a.ts"]);
+        r.declared.insert("useA".to_string());
+        let g = graph(&[("/index.ts", r)]);
+        let defines = |f: &Path, _: &str| f == Path::new("/a.ts");
+        assert_eq!(g.origin(Path::new("/index.ts"), "useA", &defines), None);
+    }
+
+    /// `export { default } from "./def"` forwards the default import, which
+    /// is asked for under its local name.
+    #[test]
+    fn a_default_import_follows_a_forwarded_default() {
+        let g = graph(&[(
+            "/index.ts",
+            ReExports {
+                named: vec![named("default", "/def.ts", "default")],
+                ..Default::default()
+            },
+        )]);
+        let defines = |f: &Path, n: &str| f == Path::new("/def.ts") && n == "useA";
+        assert_eq!(
+            g.origin(Path::new("/index.ts"), "useA", &defines),
+            Some((PathBuf::from("/def.ts"), "useA".to_string()))
+        );
+    }
+
+    /// A name a star re-export provides is that named export, not the default.
+    #[test]
+    fn a_star_provided_name_is_not_the_forwarded_default() {
+        let mut r = star(&["/named.ts"]);
+        r.named.push(named("default", "/def.ts", "default"));
+        let g = graph(&[("/index.ts", r)]);
+        let defines = |f: &Path, n: &str| f != Path::new("/index.ts") && n == "useA";
+        assert_eq!(
+            g.origin(Path::new("/index.ts"), "useA", &defines),
+            Some((PathBuf::from("/named.ts"), "useA".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_re_export_cycle_terminates() {
+        let g = graph(&[("/a.ts", star(&["/b.ts"])), ("/b.ts", star(&["/a.ts"]))]);
+        assert_eq!(g.origin(Path::new("/a.ts"), "useA", &|_, _| false), None);
     }
 
     fn table() -> ModuleTable {

@@ -1,5 +1,5 @@
-//! #129 — a finding's identity is its source location, not the component that
-//! inlined it. `tests/fixtures/shared_hook_repeat` holds one defect in one
+//! #129, #271 — a finding's identity is its source location, not the component
+//! that inlined it. `tests/fixtures/shared_hook_repeat` holds one defect in one
 //! shared hook and three components that inline it.
 
 use std::process::{Command, Output};
@@ -29,7 +29,10 @@ fn the_shared_location_is_printed_once_and_says_how_many_reach_it() {
         1,
         "one line per distinct location, not one per consumer:\n{out}"
     );
-    assert!(out.contains("[in 3 components]"), "{out}");
+    assert!(
+        out.contains("[reported through `<Alpha>`, `<Beta>` and `<Gamma>`]"),
+        "{out}"
+    );
     assert!(
         out.contains("2 component(s) hidden"),
         "the two consumers that add no new line are accounted for:\n{out}"
@@ -40,29 +43,53 @@ fn the_shared_location_is_printed_once_and_says_how_many_reach_it() {
 fn the_summary_counts_locations_and_names_the_attributions() {
     let out = human(&[]);
     assert!(
-        out.contains("1 warning(s) across 2 file(s), 3 component attribution(s)."),
+        out.contains("1 error(s) across 2 file(s), 3 component attribution(s)."),
         "{out}"
     );
 }
 
-#[test]
-fn trace_names_the_components_that_share_it() {
-    let out = human(&["--trace"]);
-    assert!(out.contains("in: Alpha, Beta, Gamma"), "{out}");
+fn json(extra: &[&str]) -> serde_json::Value {
+    let mut args = vec!["--format", "json"];
+    args.extend_from_slice(extra);
+    serde_json::from_str(&human(&args)).expect("valid JSON")
 }
 
-#[test]
-fn json_keeps_one_row_per_component() {
-    let out = human(&["--format", "json"]);
-    let doc: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
-    let rows: Vec<_> = doc["diagnostics"]
+fn loop_rows(doc: &serde_json::Value) -> Vec<&serde_json::Value> {
+    doc["diagnostics"]
         .as_array()
         .unwrap()
         .iter()
         .filter(|d| d["rule"] == "infinite-loop")
-        .collect();
-    assert_eq!(rows.len(), 3, "per-component attribution stays in the JSON");
-    assert_eq!(doc["summary"]["warnings"], 3);
+        .collect()
+}
+
+#[test]
+fn json_has_one_row_naming_the_components_it_is_reported_through() {
+    let doc = json(&[]);
+    let rows = loop_rows(&doc);
+    assert_eq!(rows.len(), 1, "one row per finding (#271): {rows:?}");
+    assert_eq!(rows[0]["component"], "Alpha");
+    assert_eq!(
+        rows[0]["components"],
+        serde_json::json!(["Alpha", "Beta", "Gamma"])
+    );
+    assert_eq!(doc["summary"]["errors"], 1);
+}
+
+#[test]
+fn per_component_restores_one_row_per_component() {
+    let doc = json(&["--per-component"]);
+    let rows = loop_rows(&doc);
+    let comps: Vec<_> = rows.iter().map(|d| d["component"].clone()).collect();
+    assert_eq!(comps, ["Alpha", "Beta", "Gamma"]);
+    assert!(
+        rows.iter()
+            .all(|d| d["components"] == serde_json::json!([d["component"]]))
+    );
+    assert_eq!(doc["summary"]["errors"], 3);
+
+    let out = human(&["--per-component"]);
+    assert_eq!(out.matches("infinite-loop").count(), 3, "{out}");
 }
 
 #[test]

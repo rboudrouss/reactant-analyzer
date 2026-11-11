@@ -24,7 +24,7 @@ export function makeApi(loadCore) {
 
   /**
    * A check, reported structurally. `report` is the JSON reporter's document
-   * verbatim (schema v2, `docs/usage.md`) — the wire schema is the stability
+   * verbatim (schema v3, `docs/usage.md`) — the wire schema is the stability
    * contract, so this API adds no second shape to keep in step with it.
    *
    * Returns `{ report, exitCode, stderr }`: findings live in the report, the

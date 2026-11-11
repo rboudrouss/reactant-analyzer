@@ -126,7 +126,7 @@ await test("analyze takes a pack inline", async () => {
     packs: [{ name: "team", json: pack }],
     failOn: "never",
   });
-  assert.equal(report.version, 2);
+  assert.equal(report.version, 3);
   const listed = (await rules({ packs: [{ name: "team", json: pack }] })).text;
   for (const id of ids) assert.ok(listed.includes(id), `${id} is listed`);
 });

@@ -107,7 +107,8 @@ fn guarded_counter_converges_bounded() {
         StateValue::number(Interval {
             lo: 0.0,
             hi: 10.0,
-            is_int: true
+            is_int: true,
+            may_neg_zero: false
         }),
         "guarded counter must converge to [0, 10]"
     );
@@ -130,7 +131,8 @@ fn bounded_local_loop_is_precise() {
         StateValue::number(Interval {
             lo: 0.0,
             hi: 5.0,
-            is_int: true
+            is_int: true,
+            may_neg_zero: false
         }),
         "loop counter bounded by guard constant 5 → setter writes total ∈ [0, 5]"
     );
@@ -149,7 +151,8 @@ fn a_counter_advanced_only_on_continue_converges() {
         StateValue::number(Interval {
             lo: 0.0,
             hi: 5.0,
-            is_int: true
+            is_int: true,
+            may_neg_zero: false
         }),
         "loop counter advanced on the continue path → total ∈ [0, 5]"
     );
