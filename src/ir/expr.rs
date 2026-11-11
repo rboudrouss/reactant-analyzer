@@ -627,4 +627,30 @@ impl Expr {
         }
         e
     }
+
+    /// The pair a `useState` or `useReducer` call returns when the source keeps
+    /// it whole (`const t = useState(0)`, #283): a fresh array of slot
+    /// `label`'s value and its setter, allocated at `id` as React allocates
+    /// one at every render.
+    pub fn state_pair(id: ExprId, label: HookLabel) -> Expr {
+        Expr::ArrayLit {
+            id,
+            elems: vec![Expr::StateVal(label), Expr::StateSetter(label)],
+            arity: Arity::Exact(2),
+            spread_at: Vec::new(),
+        }
+    }
+
+    /// The slot whose [`Expr::state_pair`] this is.
+    pub fn as_state_pair(&self) -> Option<HookLabel> {
+        match self.peel_ts() {
+            Expr::ArrayLit {
+                elems, spread_at, ..
+            } if spread_at.is_empty() => match elems.as_slice() {
+                [Expr::StateVal(v), Expr::StateSetter(s)] if v == s => Some(*v),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
 }

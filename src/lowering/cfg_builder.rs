@@ -38,7 +38,7 @@ use crate::{
 pub struct ExprIds(Rc<Cell<u64>>);
 
 impl ExprIds {
-    fn next(&self) -> ExprId {
+    pub(super) fn next(&self) -> ExprId {
         let id = self.0.get();
         self.0.set(id + 1);
         ExprId(id)

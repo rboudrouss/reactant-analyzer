@@ -111,14 +111,20 @@ impl SourceNames {
         for stmt in cfg.blocks.values().flat_map(|b| &b.stmts) {
             // A slot an inlined hook declares (`storedValue#3`) is named by
             // what the component calls it, the alias table's business.
+            // A state hook's pair kept whole reads its value as `t[0]` (#283).
             if let Stmt::Let { var, rhs, .. } = stmt
-                && let Expr::StateVal(label) = rhs.peel_ts()
+                && let Some((label, name)) = match rhs.peel_ts() {
+                    Expr::StateVal(label) => Some((*label, var.clone())),
+                    pair => pair
+                        .as_state_pair()
+                        .map(|label| (label, format!("{var}{PATH_MARK}0"))),
+                }
                 && !var.starts_with("__")
                 && !var.contains(SPLICE_MARK)
             {
-                let best = slots.entry(*label).or_insert_with(|| var.clone());
-                if var < best {
-                    *best = var.clone();
+                let best = slots.entry(label).or_insert_with(|| name.clone());
+                if name < *best {
+                    *best = name;
                 }
             }
         }

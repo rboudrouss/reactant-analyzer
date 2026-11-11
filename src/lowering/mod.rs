@@ -404,7 +404,7 @@ pub fn lower_custom_hooks_with_resolver(
             let (params, mut body_cfg) = candidate.build_cfg(&ctx);
             let param_defaults = candidate.param_defaults(&ctx);
             let (mut hooks, hook_provenance, mut next_label) =
-                extract_hooks(&mut body_cfg, &imports);
+                extract_hooks(&mut body_cfg, &imports, &ctx.ids);
             extract_handlers(&body_cfg, &mut hooks, &mut next_label);
             extract_subscriptions(&mut hooks, &mut next_label);
             HookIR {
@@ -534,7 +534,7 @@ pub fn lower_program_with_resolver(
         .map(|candidate| {
             let (param_names, mut render_cfg) = candidate.build_cfg(&ctx);
             let (mut hooks, hook_provenance, mut next_label) =
-                extract_hooks(&mut render_cfg, &imports);
+                extract_hooks(&mut render_cfg, &imports, &ctx.ids);
             extract_handlers(&render_cfg, &mut hooks, &mut next_label);
             extract_subscriptions(&mut hooks, &mut next_label);
             let param = param_names

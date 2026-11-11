@@ -3252,7 +3252,7 @@ fn render_writes(body: &str) -> (Vec<Severity>, Vec<Severity>) {
     .expect("pack must load");
     let src = format!(
         r#"
-        import {{ useState }} from "react";
+        import {{ useReducer, useState }} from "react";
         function C({{ c }}) {{
             {body}
             return <div/>;
@@ -3336,6 +3336,23 @@ fn two_render_sites_of_one_setter_are_two_rows() {
     );
     assert_eq!(rows, vec![Severity::Warning, Severity::Error]);
     assert_eq!(native.len(), 1, "{native:?}");
+}
+
+/// #283: a `useState` or `useReducer` result kept whole is the pair React
+/// returns, so a call through its second member writes the slot: a
+/// `setter-in-render` finding and a row of the relation, certified alike.
+#[test]
+fn a_state_pair_kept_whole_writes_through_its_second_member() {
+    for (body, want) in [
+        ("const t = useState(0); t[1](1);", Severity::Error),
+        ("const t = useState(0); if (c) t[1](1);", Severity::Warning),
+        (
+            "const r = useReducer((s, a) => s + a, 0); r[1](1);",
+            Severity::Error,
+        ),
+    ] {
+        assert_eq!(render_writes(body), (vec![want], vec![want]), "{body}");
+    }
 }
 
 // ── #106: the `seeds` edge and the `seed_sync` guard ──────────────────────────

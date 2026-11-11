@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use super::cfg_builder::ExprIds;
 use super::import_resolution::HookOrigin;
 use crate::ir::{
     cfg::{BasicBlock, CFG, Terminator},
@@ -275,9 +276,12 @@ pub(crate) fn prop_to_event(name: &str) -> String {
 /// affected statements in-place. Returns `(hooks, provenance, next_label)`;
 /// `provenance` holds one row per extracted hook call (never for handlers).
 /// Destructuring is resolved: `__arr_N[0]` → `StateVal(L)`, `__arr_N[1]` → `StateSetter(L)`.
+/// A state hook's result kept whole is allocated from `ids`, the file's
+/// allocation-site counter ([`Expr::state_pair`]).
 pub fn extract_hooks(
     cfg: &mut CFG,
     imports: &ImportCtx<'_>,
+    ids: &ExprIds,
 ) -> (Vec<HookEntry>, Vec<HookProvenance>, HookLabel) {
     let mut ex = Extractor {
         hooks: Vec::new(),
@@ -286,6 +290,7 @@ pub fn extract_hooks(
         state_temps: HashMap::new(),
         staged: 0,
         imports,
+        ids,
     };
 
     // Collected up front because the loop takes `&mut cfg.blocks` — the ids
@@ -428,6 +433,8 @@ struct Extractor<'i, 'a> {
     /// Hook arguments staged so far, for fresh temp names.
     staged: usize,
     imports: &'i ImportCtx<'a>,
+    /// The file's allocation-site counter, for the pairs state hooks return.
+    ids: &'i ExprIds,
 }
 
 impl Extractor<'_, '_> {
@@ -443,7 +450,10 @@ impl Extractor<'_, '_> {
                     let is_state_like = call.is_react
                         && matches!(call.origin_name.as_str(), "useState" | "useReducer");
                     let is_arr_temp = var.starts_with("__arr_");
-                    let marker = hook_result_expr(&call, lbl, entry.as_ref());
+                    // Array-destructured useState/useReducer binds nothing: the
+                    // temp's index reads are rewritten by `rewrite_expr`.
+                    let marker = (!(is_state_like && is_arr_temp))
+                        .then(|| hook_result_expr(&call, lbl, entry.as_ref(), self.ids));
                     if let Some(entry) = entry {
                         self.hooks.push(entry);
                     }
@@ -457,16 +467,15 @@ impl Extractor<'_, '_> {
                         }
                     }
 
-                    if is_state_like && is_arr_temp {
-                        // Array-destructured useState/useReducer: drop the temp Let,
-                        // subsequent IndexAccess stmts will be rewritten by rewrite_expr.
-                        self.state_temps.insert(var, lbl);
-                    } else {
-                        out.push(Stmt::Let {
+                    match marker {
+                        Some(rhs) => out.push(Stmt::Let {
                             var,
-                            rhs: marker,
+                            rhs,
                             span: stmt_span,
-                        });
+                        }),
+                        None => {
+                            self.state_temps.insert(var, lbl);
+                        }
                     }
                 }
                 Err(rhs) => {
@@ -1053,7 +1062,12 @@ fn marker_val(entry: Option<&HookEntry>) -> MarkerVal {
 }
 
 /// IR expression that replaces a hook call at its binding site.
-fn hook_result_expr(call: &ResolvedHookCall, label: HookLabel, entry: Option<&HookEntry>) -> Expr {
+fn hook_result_expr(
+    call: &ResolvedHookCall,
+    label: HookLabel,
+    entry: Option<&HookEntry>,
+    ids: &ExprIds,
+) -> Expr {
     if !call.is_react {
         // Custom hooks bind an opaque marker; the engine resolves the real
         // value via HookRegistry inlining or a summary. The marker keeps the
@@ -1061,7 +1075,9 @@ fn hook_result_expr(call: &ResolvedHookCall, label: HookLabel, entry: Option<&Ho
         return Expr::HookMarker(label, MarkerVal::Unknown);
     }
     match call.origin_name.as_str() {
-        "useState" | "useReducer" => Expr::StateVal(label),
+        // Kept whole, a state hook's result is the pair React returns
+        // (#283): `t[1]` is the setter, and `t` a new array at every render.
+        "useState" | "useReducer" => Expr::state_pair(ids.next(), label),
         "useMemo" => Expr::MemoVal(label),
         "useCallback" => Expr::CallbackVal(label),
         _ => Expr::HookMarker(label, marker_val(entry)),
@@ -1210,19 +1226,17 @@ mod tests {
             "parse errors: {:?}",
             ret.diagnostics
         );
+        let lower = crate::lowering::LowerCtx::empty();
         let mut cfg = ret
             .program
             .body
             .iter()
             .find_map(|s| match s {
-                Statement::FunctionDeclaration(f) => f
-                    .body
-                    .as_ref()
-                    .map(|b| build_cfg(b, &crate::lowering::LowerCtx::empty())),
+                Statement::FunctionDeclaration(f) => f.body.as_ref().map(|b| build_cfg(b, &lower)),
                 _ => None,
             })
             .expect("no function found");
-        let (hooks, _, _) = extract_hooks(&mut cfg, &ImportCtx::empty());
+        let (hooks, _, _) = extract_hooks(&mut cfg, &ImportCtx::empty(), &lower.ids);
         (cfg, hooks)
     }
 
@@ -1315,11 +1329,20 @@ mod tests {
                 ..
             }
         ));
+        // Kept whole, the result is the pair React returns, not its value
+        // (#283), and so is a reducer's.
         let stmts = entry_stmts(&cfg);
-        assert!(matches!(
-            find_let_rhs(stmts, "pair"),
-            Some(Expr::StateVal(0))
-        ));
+        assert_eq!(
+            find_let_rhs(stmts, "pair").and_then(Expr::as_state_pair),
+            Some(0)
+        );
+        let (cfg, _) = parse_and_extract(
+            "function S() { const r = useReducer((s, a) => s + a, 0); return <div/>; }",
+        );
+        assert_eq!(
+            find_let_rhs(entry_stmts(&cfg), "r").and_then(Expr::as_state_pair),
+            Some(0)
+        );
     }
 
     // ── render-evaluated arguments (#193) ───────────────────────────────────
@@ -1576,19 +1599,18 @@ mod tests {
             "parse errors: {:?}",
             ret.diagnostics
         );
+        let lower = crate::lowering::LowerCtx::empty();
         let mut cfg = ret
             .program
             .body
             .iter()
             .find_map(|s| match s {
-                Statement::FunctionDeclaration(f) => f
-                    .body
-                    .as_ref()
-                    .map(|b| build_cfg(b, &crate::lowering::LowerCtx::empty())),
+                Statement::FunctionDeclaration(f) => f.body.as_ref().map(|b| build_cfg(b, &lower)),
                 _ => None,
             })
             .expect("no function found");
-        let (mut hooks, _, mut next_label) = extract_hooks(&mut cfg, &ImportCtx::empty());
+        let (mut hooks, _, mut next_label) =
+            extract_hooks(&mut cfg, &ImportCtx::empty(), &lower.ids);
         extract_handlers(&cfg, &mut hooks, &mut next_label);
         (cfg, hooks)
     }
@@ -1724,21 +1746,18 @@ mod tests {
         assert!(ret.diagnostics.is_empty());
         let mut files = crate::ir::FileTable::default();
         let smap = crate::ir::SourceMap::new(src, files.intern(std::path::Path::new("test.tsx")));
+        let lower = crate::lowering::LowerCtx::new(smap, Default::default());
         let mut cfg = ret
             .program
             .body
             .iter()
             .find_map(|s| match s {
-                Statement::FunctionDeclaration(f) => f.body.as_ref().map(|b| {
-                    build_cfg(
-                        b,
-                        &crate::lowering::LowerCtx::new(smap.clone(), Default::default()),
-                    )
-                }),
+                Statement::FunctionDeclaration(f) => f.body.as_ref().map(|b| build_cfg(b, &lower)),
                 _ => None,
             })
             .expect("no function found");
-        let (mut hooks, _, mut next_label) = extract_hooks(&mut cfg, &ImportCtx::empty());
+        let (mut hooks, _, mut next_label) =
+            extract_hooks(&mut cfg, &ImportCtx::empty(), &lower.ids);
         extract_handlers(&cfg, &mut hooks, &mut next_label);
         let handler = hooks
             .iter()
@@ -1762,19 +1781,18 @@ mod tests {
             "parse errors: {:?}",
             ret.diagnostics
         );
+        let lower = crate::lowering::LowerCtx::empty();
         let mut cfg = ret
             .program
             .body
             .iter()
             .find_map(|s| match s {
-                Statement::FunctionDeclaration(f) => f
-                    .body
-                    .as_ref()
-                    .map(|b| build_cfg(b, &crate::lowering::LowerCtx::empty())),
+                Statement::FunctionDeclaration(f) => f.body.as_ref().map(|b| build_cfg(b, &lower)),
                 _ => None,
             })
             .expect("no function found");
-        let (mut hooks, _, mut next_label) = extract_hooks(&mut cfg, &ImportCtx::empty());
+        let (mut hooks, _, mut next_label) =
+            extract_hooks(&mut cfg, &ImportCtx::empty(), &lower.ids);
         extract_handlers(&cfg, &mut hooks, &mut next_label);
         extract_subscriptions(&mut hooks, &mut next_label);
         (cfg, hooks)
@@ -1932,15 +1950,13 @@ mod tests {
         let ret = Parser::new(&alloc, src, SourceType::tsx())
             .with_options(ParseOptions::default())
             .parse();
+        let lower = crate::lowering::LowerCtx::empty();
         let mut cfg = ret
             .program
             .body
             .iter()
             .find_map(|s| match s {
-                Statement::FunctionDeclaration(f) => f
-                    .body
-                    .as_ref()
-                    .map(|b| build_cfg(b, &crate::lowering::LowerCtx::empty())),
+                Statement::FunctionDeclaration(f) => f.body.as_ref().map(|b| build_cfg(b, &lower)),
                 _ => None,
             })
             .expect("no function found");
@@ -1960,7 +1976,7 @@ mod tests {
             local_hooks: &names,
             current_file: None,
         };
-        let (hooks, _, _) = extract_hooks(&mut cfg, &ctx);
+        let (hooks, _, _) = extract_hooks(&mut cfg, &ctx, &lower.ids);
 
         let HookEntry::Custom {
             import_source,
