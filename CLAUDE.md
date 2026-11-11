@@ -37,6 +37,17 @@ Analyseur statique React (niveau 3, interprétation abstraite) en Rust.
   le plus direct possible, sinon rien.
 - **Pas de trailer `Co-Authored-By` Claude.**
 
+## Changelog
+
+- Tout changement visible par un utilisateur (règle, niveau ou message d'un
+  diagnostic, option CLI, format de sortie, précision ou soundness mesurée,
+  performance) ajoute une ligne à la section `[Unreleased]` de `CHANGELOG.md`,
+  dans la même PR. Un refactor interne ou un test seul n'en demande pas.
+- Format Keep a Changelog (`Added` / `Changed` / `Removed` / `Fixed`), une
+  ligne par changement, du point de vue de l'utilisateur, avec le numéro
+  d'issue. Un changement incompatible est marqué **breaking**.
+- À la release, `[Unreleased]` devient la section de la version.
+
 ## Références
 
 - Décisions d'architecture : `docs/adr/`
