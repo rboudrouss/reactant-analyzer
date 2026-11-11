@@ -195,7 +195,7 @@ the finding carries a proof and can reach Error.
 | Kind | Certifies that… |
 |------|-----------------|
 | `must_setter_on_all_paths` | the setter is called on every path through the body. |
-| `must_dominates_all_exits` | the entity dominates every exit. |
+| `must_dominates_all_exits` | the setter call writes on every render: its block dominates every exit, and its callee is the setter on every path (for a parent's setter prop, surely that one). |
 | `must_init_calls_setter` | the initialization calls the setter. |
 | `must_hook_is_conditional` | the hook call is conditional. |
 | `must_direct_write` | the targeted `writers` row is a direct write, outside any spliced region. This is the proof behind a policy rule like "state is only written through our wrapper" pinned at `error`. |

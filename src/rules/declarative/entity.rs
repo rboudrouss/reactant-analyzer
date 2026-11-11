@@ -25,7 +25,8 @@ use crate::ir::free_vars::{AccessPath, dep_paths};
 use crate::ir::hooks::{HookEntry, HookProvenance};
 use crate::ir::types::{BlockId, HookLabel, Var};
 use crate::rules::api::query::{
-    Certified, CleanupVerdict, ConditionalHookCall, ExitDominance, RuleCtx,
+    Certified, CleanupVerdict, ConditionalHookCall, ExitDominance, MustResult, RenderWrite,
+    RuleCtx, must_render_write,
 };
 use crate::rules::helpers::context_flow::{ConsumerRow, ProviderVerdict};
 use crate::rules::helpers::cycles::{CycleRow, collect_cycle_rows};
@@ -36,8 +37,8 @@ use crate::rules::helpers::local_bindings;
 use crate::rules::helpers::providers::{ProviderSite, ValueIdentity, collect_provider_sites};
 use crate::rules::{
     ReturnsVerdict, SetterCall, StabilityVerdict, all_setter_labels, collect_setter_calls,
-    cross_component_setters, hook_kind_word, hook_val_labels, resolve_setter_aliases,
-    state_val_labels,
+    cross_component_setters, hook_kind_word, hook_val_labels, must_alias_scopes,
+    resolve_setter_aliases, state_val_labels,
 };
 
 use super::schema::{
@@ -499,6 +500,31 @@ impl<'a> EntityCtx<'a> {
     pub fn exit_dom(&self) -> &ExitDominance {
         self.exit_dom
             .get_or_init(|| ExitDominance::of(&self.comp.render_cfg))
+    }
+
+    /// Does this render-setter row's call write its slot on every render
+    /// (#279)? Its block dominates every exit, and its callee surely is the
+    /// setter: a local name by its must-alias binding, a foreign prop by
+    /// the converged values (`must_render_write`, the native rule's test).
+    pub fn render_write(&self, s: &SetterEntity) -> Option<Certified<RenderWrite>> {
+        let block = s.block_id?;
+        let scopes = must_alias_scopes(&self.comp.render_cfg, &self.comp.hooks);
+        let props = match s.owner {
+            Some(_) => self.cross_setters().get(&s.var).map(Vec::as_slice),
+            None => None,
+        };
+        match must_render_write(
+            self.exit_dom(),
+            &self.comp.render_cfg,
+            &scopes,
+            &s.var,
+            block,
+            s.owner.is_none(),
+            props,
+        ) {
+            MustResult::All(c) => Some(c),
+            _ => None,
+        }
     }
 
     /// Provenance row of a hook call (ADR-023 step 1), by label.

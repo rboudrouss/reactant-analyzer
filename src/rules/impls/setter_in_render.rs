@@ -13,6 +13,7 @@ use crate::engine::triggers::{Always, Rerun};
 use crate::engine::written::{ClosureEnv, SiteEnvs};
 use crate::engine::{Change, SlotWriter, WriterPhase, WriterRegion, triggers_of};
 use crate::ir::hooks::HookEntry;
+use crate::rules::api::query::must_render_write;
 use crate::rules::helpers::eval_in_exit_env;
 use crate::rules::{
     Diagnostic, ExitDominance, MustResult, Rule, must_alias_scopes, must_dominates_all_exits,
@@ -174,37 +175,24 @@ impl SetterInRender {
             // Unconditional call ⟹ a `Certified` proof — the only path to
             // Error, and it takes two musts. The phase must be `Sync`: a ⊤
             // row is never certain, whatever block it sits in, because the
-            // proof would be about the block, not about the timing. And
-            // calling the variable must provably write: a local helper that
-            // only *carries* a captured setter into a JSX handler writes
-            // nothing when called, and dominance cannot upgrade a may.
-            // A local name must be the setter by a certain binding: the
-            // alias table is a may-map (first binding wins), and a name
-            // bound to the setter on one path and to anything else on
-            // another — `if (c) set = setV`, a hook returning `[v, setV]`
-            // or `[v, noop]`, a closure the render runs that rebinds it
-            // (#235) — writes on some renders only.
-            let certainly_the_setter = !local_setter_info.contains(&call.var)
-                || matches!(
-                    crate::ir::bindings::must_binding(
-                        &Expr::Var(call.var.clone()),
-                        &comp_result.render_cfg,
-                        &scopes
-                    ),
-                    Some(Expr::StateSetter(_))
-                );
-            let certain_write = call.class == SetterCallPhase::Sync
-                && certainly_the_setter
-                && cs_vars
-                    .get(&call.var)
-                    .is_none_or(|ps| ps.iter().all(|p| p.must_write));
-            let proof = certain_write
-                .then_some(call.block_id)
-                .flatten()
-                .and_then(|bid| match exit_dom.certify(bid) {
+            // proof would be about the block, not about the timing. And the
+            // call must surely write (`must_render_write`): dominance cannot
+            // upgrade a may.
+            let proof = match (call.class, call.block_id) {
+                (SetterCallPhase::Sync, Some(bid)) => match must_render_write(
+                    exit_dom,
+                    &comp_result.render_cfg,
+                    &scopes,
+                    &call.var,
+                    bid,
+                    local_setter_info.contains(&call.var),
+                    cs_vars.get(&call.var).map(Vec::as_slice),
+                ) {
                     MustResult::All(c) => Some(c),
                     _ => None,
-                });
+                },
+                _ => None,
+            };
 
             // Sanctioned adjust-during-render idiom: conditional local call
             // whose guards die once the written value is in the slot —

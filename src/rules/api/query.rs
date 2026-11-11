@@ -729,6 +729,53 @@ pub fn must_dominates_all_exits(cfg: &CFG, block: BlockId) -> MustResult<Dominat
     ExitDominance::of(cfg).certify(block)
 }
 
+/// Evidence that a render-body setter call writes its slot on every render.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderWrite {
+    pub block: BlockId,
+}
+
+/// `All` iff the call through `var` at `block` of `render_cfg` writes on every
+/// render: its block dominates every exit, and the callee surely is the
+/// setter. Dominance proves the call runs, not that it writes (#279).
+///
+/// A name the render binds to a setter (`local`) must be bound to it on every
+/// path: the alias table is a may-map (first binding wins), and a name bound
+/// to the setter on one path and to anything else on another — `if (c) set =
+/// setV`, a hook returning `[v, setV]` or `[v, noop]`, a closure the render
+/// runs that rebinds it (#235) — writes on some renders only. So the binding
+/// is the must-alias one, read over `scopes` (`must_alias_scopes`). A name the
+/// converged values put a setter behind (`props`) must provably write: a
+/// helper that only carries a captured setter into a JSX handler writes
+/// nothing when called (`SetterProp::must_write`). A name neither table
+/// knows as a setter is not one.
+pub(in crate::rules) fn must_render_write(
+    exit_dom: &ExitDominance,
+    render_cfg: &CFG,
+    scopes: &[(&[Var], &CFG)],
+    var: &Var,
+    block: BlockId,
+    local: bool,
+    props: Option<&[crate::engine::setters::SetterProp]>,
+) -> MustResult<RenderWrite> {
+    let bound = || {
+        matches!(
+            crate::ir::bindings::must_binding(&Expr::Var(var.clone()), render_cfg, scopes),
+            Some(Expr::StateSetter(_))
+        )
+    };
+    let surely_the_setter = (local || props.is_some())
+        && (!local || bound())
+        && props.is_none_or(|ps| ps.iter().all(|p| p.must_write));
+    match exit_dom.certify(block) {
+        MustResult::All(_) if surely_the_setter => MustResult::All(Certified::mint(
+            RenderWrite { block },
+            Provenance::default(),
+        )),
+        _ => MustResult::None,
+    }
+}
+
 /// Evidence that a `useState` initializer invokes a state setter every render.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InitSetterCall;

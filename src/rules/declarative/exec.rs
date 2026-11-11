@@ -15,8 +15,8 @@ use crate::ir::hooks::{Arity, HookEntry};
 use crate::ir::types::HookLabel;
 use crate::rules::api::diagnostic::Diagnostic;
 use crate::rules::api::query::{
-    Certified, ConditionalHookCall, DirectWrite, DominatesAllExits, InitSetterCall, MustResult,
-    Provenance, RuleCtx, must_direct_write, must_init_calls_setter, must_setter_on_all_paths,
+    Certified, ConditionalHookCall, DirectWrite, InitSetterCall, MustResult, Provenance,
+    RenderWrite, RuleCtx, must_direct_write, must_init_calls_setter, must_setter_on_all_paths,
 };
 use crate::rules::{Rule, SetterCall};
 
@@ -41,7 +41,7 @@ pub(crate) struct TierARule {
 /// matches to reach the generic `Diagnostic::error`.
 enum Proof {
     Setter(Certified<SetterCall>),
-    Dominates(Certified<DominatesAllExits>),
+    RenderWrite(Certified<RenderWrite>),
     Init(Certified<InitSetterCall>),
     Conditional(Certified<ConditionalHookCall>),
     Direct(Certified<DirectWrite>),
@@ -51,7 +51,7 @@ impl Proof {
     fn provenance(&self) -> &Provenance {
         match self {
             Proof::Setter(c) => c.provenance(),
-            Proof::Dominates(c) => c.provenance(),
+            Proof::RenderWrite(c) => c.provenance(),
             Proof::Init(c) => c.provenance(),
             Proof::Conditional(c) => c.provenance(),
             Proof::Direct(c) => c.provenance(),
@@ -888,10 +888,9 @@ impl TierARule {
                         unreachable!("validated: `must_dominates_all_exits` binds a render setter")
                     }
                 };
-                setter.block_id.and_then(|b| match e.exit_dom().certify(b) {
-                    MustResult::All(c) => Some(Proof::Dominates(c)),
-                    _ => None,
-                })
+                // The call running on every render is half the claim: its
+                // callee must surely be the setter too (#279).
+                e.render_write(setter).map(Proof::RenderWrite)
             }
             MustKind::InitCallsSetter => {
                 let row = cand.row().expect("validated: hook anchor");
@@ -941,7 +940,7 @@ impl TierARule {
                 let first = proofs.remove(0);
                 match first {
                     Proof::Setter(c) => Diagnostic::error(id, c, message),
-                    Proof::Dominates(c) => Diagnostic::error(id, c, message),
+                    Proof::RenderWrite(c) => Diagnostic::error(id, c, message),
                     Proof::Init(c) => Diagnostic::error(id, c, message),
                     Proof::Conditional(c) => Diagnostic::error(id, c, message),
                     Proof::Direct(c) => Diagnostic::error(id, c, message),

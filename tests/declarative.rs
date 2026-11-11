@@ -3230,6 +3230,43 @@ fn slot_ownership_needs_a_render_setter_row() {
     assert!(e.message.contains("body setter call"), "{e}");
 }
 
+/// #279: a render-setter row's Error certifies the write, not only that the
+/// call runs. `f` is the setter on one path and a no-op on the other, so its
+/// call dominating every exit proves nothing about the write: a Warning, as
+/// the native `setter-in-render` reports it. The same call through a name
+/// bound to the setter on every path stays an Error.
+#[test]
+fn a_render_write_is_certified_only_through_a_certain_binding() {
+    let pack = one_rule(
+        r#"{"id":"render-write","docs":{"description":"d","why":"w","fix":"f"},
+            "severity":"error","anchor":{"relation":"render_setter_calls"},
+            "guards":[{"kind":"must_dominates_all_exits","of":"anchor"}],
+            "message":"{anchor.setter} writes {anchor.slot} on every render"}"#,
+    );
+    let severities = |body: &str| {
+        let src = format!(
+            r#"
+            import {{ useState }} from "react";
+            function C({{ c }}) {{
+                const [n, setN] = useState(0);
+                {body}
+                return <div>{{n}}</div>;
+            }}
+        "#
+        );
+        run_pack(&pack, &src, &Options::new())
+            .iter()
+            .filter(|d| d.rule == "t/render-write")
+            .map(|d| d.severity())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        severities("let f = setN; if (c) f = () => {}; f(1);"),
+        vec![Severity::Warning]
+    );
+    assert_eq!(severities("const f = setN; f(1);"), vec![Severity::Error]);
+}
+
 // ── #106: the `seeds` edge and the `seed_sync` guard ──────────────────────────
 
 const SEED_PACK: &str = r#"{

@@ -107,7 +107,7 @@ every path", the finding carries a proof and may reach Error.
 | Kind | Certifies that |
 |---|---|
 | `must_setter_on_all_paths` | the setter runs on every path through the body |
-| `must_dominates_all_exits` | the entity dominates all exits |
+| `must_dominates_all_exits` | the setter call writes on every render: its block dominates all exits, and its callee is the setter on every path (for a parent's setter prop, surely that one) |
 | `must_init_calls_setter` | initialization calls the setter |
 | `must_hook_is_conditional` | the hook call is conditional |
 | `must_direct_write` | the targeted `writers` row is a direct write (outside every spliced region) — the proof behind an error-pinned "state only through our wrapper" policy rule |
