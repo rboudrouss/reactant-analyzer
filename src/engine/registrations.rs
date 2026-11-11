@@ -306,7 +306,7 @@ pub fn match_registrar(fn_: &Expr) -> Option<(&'static Registrar, String)> {
         .iter()
         .find(|r| r.name == method && (!r.method_only || is_method))?;
     let display = match (root, is_method) {
-        (Some(r), _) => format!("{r}.{method}"),
+        (Some(r), _) => format!("{}.{method}", crate::ir::source_name(r)),
         (None, true) => format!(".{method}"),
         (None, false) => method.to_string(),
     };

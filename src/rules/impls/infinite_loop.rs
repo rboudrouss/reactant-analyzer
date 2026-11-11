@@ -231,7 +231,7 @@ impl Rule for InfiniteLoop {
                         let msg = format!(
                             "this effect calls `{}`, a state setter of parent `{}`{}. \
                          Parent re-renders → child re-renders → effect fires again: infinite loop",
-                            call.var,
+                            ctx.source_names().name(&call.var),
                             result.display_name(parent_comp),
                             deps_note
                         );

@@ -629,7 +629,10 @@ impl<'a> EntityCtx<'a> {
                 // separate `receiver` field — one fact per field, so a rule
                 // that wants `socket.join` writes two guards and one that
                 // wants any `.join` writes one.
-                EntityVal::Call(c) => Some(c.name.clone()),
+                EntityVal::Call(c) => Some(match c.receiver {
+                    Some(_) => c.name.clone(),
+                    None => self.var_name(&c.name),
+                }),
                 // A read row is named by the binding it went through — the
                 // slot's own name, or the alias the site actually wrote.
                 EntityVal::Read(r) => Some(self.var_name(&r.name)),
@@ -645,7 +648,7 @@ impl<'a> EntityCtx<'a> {
             // matching an empty string.
             Field::Receiver => match v {
                 EntityVal::Read(_) | EntityVal::Element(_) => None,
-                EntityVal::Call(c) => c.receiver.clone(),
+                EntityVal::Call(c) => c.receiver.as_deref().map(|r| self.var_name(r)),
                 EntityVal::Hook(_)
                 | EntityVal::Setter(_)
                 | EntityVal::Dep(_)
@@ -1097,8 +1100,8 @@ fn anonymous(v: &EntityVal<'_, '_>, names: &crate::ir::SourceNames) -> String {
         EntityVal::Read(r) => format!("`{}`", names.name(&r.name)),
         EntityVal::Element(e) => format!("`<{}>`", e.name),
         EntityVal::Call(c) => match &c.receiver {
-            Some(r) => format!("`{}.{}()`", r, c.name),
-            None => format!("`{}()`", c.name),
+            Some(r) => format!("`{}.{}()`", names.name(r), c.name),
+            None => format!("`{}()`", names.name(&c.name)),
         },
         EntityVal::Seed(s) => format!("`{}`", s.path),
         EntityVal::Consumer(c) => format!("`{}`", names.name(&c.name)),

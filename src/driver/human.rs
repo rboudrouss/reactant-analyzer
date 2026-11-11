@@ -168,7 +168,7 @@ pub fn render(
             let var_info = d
                 .var
                 .as_deref()
-                .map(|v| format!("  var:{v}"))
+                .map(|v| format!("  var:{}", crate::ir::source_name(v)))
                 .unwrap_or_default();
             let range_info = d
                 .range

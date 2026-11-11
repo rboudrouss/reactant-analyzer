@@ -125,11 +125,14 @@ impl Rule for DerivedState {
                 continue;
             }
 
+            let names = ctx.source_names();
             let mut d = Diagnostic::warn(
                 "derived-state",
                 format!(
-                    "this effect always sets `{setter_name}` to a call-free expression of \
-                     `{dep_var}` replace with `useMemo` or compute during render"
+                    "this effect always sets `{}` to a call-free expression of \
+                     `{}` replace with `useMemo` or compute during render",
+                    names.name(&setter_name),
+                    names.name(&dep_var)
                 ),
             )
             .with_label(*eff_label);

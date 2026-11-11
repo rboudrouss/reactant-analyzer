@@ -349,7 +349,7 @@ pub(crate) const EFFECTFUL: &[&str] = &[
 /// O(1) builtins so a `PureCheap` verdict never hides expensive work.
 pub(crate) fn classify_callee_name(method: &str, obj_root: Option<&str>) -> (EffectClass, String) {
     let display = |m: &str| match obj_root {
-        Some(r) => format!("{r}.{m}"),
+        Some(r) => format!("{}.{m}", crate::ir::source_name(r)),
         None => m.to_string(),
     };
     if EFFECTFUL.contains(&method) {

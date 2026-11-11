@@ -275,6 +275,92 @@ fn spliced_hook_locals_are_not_shown_with_rename_salt() {
     }
 }
 
+/// A rename salt is `#` glued to an identifier (`setC#0`); `state #3` and
+/// `effect #2` are labels the messages print on purpose.
+fn has_salt(msg: &str) -> bool {
+    msg.as_bytes()
+        .windows(2)
+        .any(|w| w[1] == b'#' && (w[0].is_ascii_alphanumeric() || w[0] == b'_'))
+}
+
+#[test]
+fn rule_messages_name_a_spliced_local_without_its_salt() {
+    // Each rule below names a local of the inlined hook (#234): the setter
+    // and the mirrored state, the setter called with the mutated array, the
+    // receiver of an effectful init and of a registration, the setter a hook
+    // parameter aliases.
+    let src = r#"
+        function useMirror() {
+            const [b, setB] = useState(0);
+            const [c, setC] = useState(0);
+            useEffect(() => { setC(b * 2); }, [b]);
+            return [b, setB, c];
+        }
+        function Mirror() {
+            const [b, setB, c] = useMirror();
+            return <button onClick={() => setB(b + 1)}>{c}</button>;
+        }
+        function useList() {
+            const [items, setItems] = useState([]);
+            const add = (x) => { items.push(x); setItems(items); };
+            return [items, add];
+        }
+        function List() {
+            const [items, add] = useList();
+            return <button onClick={() => add(1)}>{items.length}</button>;
+        }
+        function useInit() {
+            const client = getClient();
+            const [v] = useState(client.subscribe(() => {}));
+            return v;
+        }
+        function Init() {
+            const v = useInit();
+            return <div>{v}</div>;
+        }
+        function useBus() {
+            const bus = getBus();
+            useEffect(() => { bus.addEventListener("x", () => {}); });
+        }
+        function Bus() {
+            useBus();
+            return <div />;
+        }
+        function useSync(set, v) {
+            useEffect(() => { set(v + 1); });
+        }
+        function Child({ setX, x }) {
+            useSync(setX, x);
+            return <div>{x}</div>;
+        }
+        function Parent() {
+            const [x, setX] = useState(0);
+            return <Child setX={setX} x={x} />;
+        }
+    "#;
+    let result = parse_and_analyze(src);
+    let expect = [
+        ("Mirror", "derived-state", "sets `setC` to a call-free expression of `b`"),
+        ("List", "state-mutation", "`setItems` is called with the same"),
+        ("Init", "side-effect-in-init", "calls `client.subscribe`"),
+        ("Bus", "missing-cleanup", "calls `bus.addEventListener`"),
+        ("Child", "cross-component-infinite-loop", "calls `set`, a state setter"),
+    ];
+    for (comp, rule, wording) in expect {
+        let diags = diags_for(&result, comp);
+        for d in &diags {
+            assert!(!has_salt(&d.message), "salt leaked: {}", d.message);
+        }
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.rule == rule && d.message.contains(wording)),
+            "{comp}: expected {rule} saying {wording:?}, got {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+}
+
 // ── FP: a ref returned via object destructure resolves (destructuring rebind) ──
 
 #[test]

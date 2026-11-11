@@ -338,7 +338,7 @@ impl<'a> Collector<'a> {
 /// Source-like display for a chased object expression.
 fn display_expr(e: &Expr) -> String {
     match e {
-        Expr::Var(v) => v.clone(),
+        Expr::Var(v) => crate::ir::source_name(v).into_owned(),
         Expr::StateVal(_) => "state".to_string(),
         Expr::FieldAccess { obj, field } => format!("{}.{field}", display_expr(obj)),
         Expr::IndexAccess { arr, .. } => format!("{}[…]", display_expr(arr)),
@@ -444,7 +444,10 @@ impl Rule for StateMutation {
                 .sure_aliases_of(label)
                 .into_iter()
                 .min()
-                .unwrap_or_else(|| "its setter".to_string());
+                .map_or_else(
+                    || "its setter".to_string(),
+                    |v| ctx.source_names().name(&v).into_owned(),
+                );
             let site = mut_sites[0];
             let set_site = sets
                 .iter()
