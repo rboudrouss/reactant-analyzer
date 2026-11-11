@@ -3381,6 +3381,22 @@ fn a_setter_alias_bound_in_a_closure_the_render_runs_is_a_render_write() {
     }
 }
 
+/// #285: a setter is one `setter-in-render` finding, at its strongest site —
+/// the certified one when a site is, wherever it sits: `setN(2)` writes on
+/// every render whatever `c` is. With no certified site, the first.
+#[test]
+fn a_setter_is_reported_at_its_strongest_site() {
+    let state = "const [n, setN] = useState(0);";
+    for (body, want) in [
+        ("if (c) setN(1); setN(2);", Severity::Error),
+        ("setN(2); if (c) setN(1);", Severity::Error),
+        ("if (c) setN(1); if (!c) setN(2);", Severity::Warning),
+    ] {
+        let (_, native) = render_writes(&format!("{state} {body}"));
+        assert_eq!(native, vec![want], "{body}");
+    }
+}
+
 // ── #106: the `seeds` edge and the `seed_sync` guard ──────────────────────────
 
 const SEED_PACK: &str = r#"{

@@ -1,5 +1,5 @@
 use crate::rules::RuleCtx;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::ir::{
     expr::Expr,
@@ -16,8 +16,8 @@ use crate::ir::hooks::HookEntry;
 use crate::rules::api::query::must_render_write;
 use crate::rules::helpers::eval_in_exit_env;
 use crate::rules::{
-    Diagnostic, ExitDominance, MustResult, Rule, must_alias_scopes, must_dominates_all_exits,
-    must_state_vals,
+    Diagnostic, ExitDominance, MustResult, Rule, Severity, must_alias_scopes,
+    must_dominates_all_exits, must_state_vals,
 };
 
 /// Fires when a state setter is called directly in the render body either a
@@ -339,23 +339,28 @@ impl SetterInRender {
         };
         // Every site is judged: a setter whose render-pass site settles may
         // also be handed to a callee that runs it at any time. A setter is
-        // one finding, its first site, the synchronous ones first, that
-        // nothing clears.
+        // one finding, its strongest site nothing clears (#285): a certified
+        // one if any — `if (c) setN(1); setN(2)` loops on every render
+        // whatever `c` — else the first, the synchronous ones first.
         let mut sites = sites;
         sites.sort_by_key(|s| s.class != SetterCallPhase::Sync);
-        let mut reported: HashSet<Var> = HashSet::new();
-        let mut out = Vec::new();
+        let mut out: Vec<(Var, Diagnostic)> = Vec::new();
         for site in sites {
-            if reported.contains(&site.var) {
-                continue;
-            }
             let var = site.var.clone();
-            if let Some(d) = judge(site) {
-                reported.insert(var);
-                out.push(d);
+            let Some(d) = judge(site) else {
+                continue;
+            };
+            match out.iter_mut().find(|(v, _)| *v == var) {
+                None => out.push((var, d)),
+                Some((_, kept))
+                    if d.severity() == Severity::Error && kept.severity() != Severity::Error =>
+                {
+                    *kept = d;
+                }
+                Some(_) => {}
             }
         }
-        out
+        out.into_iter().map(|(_, d)| d).collect()
     }
 
     /// The writes of a `useMemo` body (#249): it runs during render, each time
