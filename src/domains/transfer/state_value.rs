@@ -894,7 +894,7 @@ fn record_call_site(
 /// `ToNumber(null) = 0`, so a nullable number stays a precise interval —
 /// this is what lets `useState(null)` counters (`setN(n + 1)`) keep widening.
 /// `undefined` coerces to NaN and every other kind is unpredictable → `None`.
-fn as_arith(v: &StateValue) -> Option<Interval> {
+pub(crate) fn as_arith(v: &StateValue) -> Option<Interval> {
     if v.boolean == BoolVal::Bottom
         && v.str == StrConst::Bottom
         && v.reference == Stability::Bottom

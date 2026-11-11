@@ -32,7 +32,9 @@
 //!   value is a new reference every call (`Change::Must`) ∧ so is every
 //!   other write of y, program-wide: React re-renders on the batch's last
 //!   value, and a later `setY(y)` in the same batch undoes the fresh one
-//!   (#188) ∧ the component stays mounted: every element that mounts it
+//!   (#188) — or the write is y's lone step from a bounded start, which
+//!   changes it at every call as surely (`stepping_slots`, #144) — ∧ the
+//!   component stays mounted: every element that mounts it
 //!   keeps it, and its parent stays in turn (#213). An all-must cycle ⇒
 //!   Error.
 //! - `May`: the dep is merely versioned by x, or the write is conditional,
@@ -90,7 +92,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::{
-    domains::{AbstractEnv, StateValue},
+    domains::{AbstractEnv, Interval, StateValue, transfer::as_arith},
     engine::{
         AnalysisResult, Change, ConvergedEval, EffectTrigger, HookKind, ProgramAnalysisResult,
         SlotWriter, WriterPhase, WriterRegion,
@@ -230,6 +232,42 @@ fn initial_only_slots(result: &ProgramAnalysisResult) -> HashSet<QualifiedSlot> 
                 None => true,
             };
             keeps_initial(written.iter().copied(), escapes)
+        })
+        .map(|(slot, _)| slot)
+        .collect()
+}
+
+/// The slots a lone step write moves at every run (#144): the slot starts at
+/// an integer within ±2^50, its setter reaches nothing the rows do not
+/// describe, and its one write program-wide stores its own read plus an
+/// integer step `δ` with 1 ≤ |δ| ≤ 2^20, once per run of its body. Each run
+/// then moves the slot by at least 1 and at most 2^20, exactly, since the
+/// integers it holds stay below 2^53: it changes under `Object.is` at each of
+/// the first 2^30 runs, far past the 50 nested updates React stops a loop at,
+/// the cutoff a loop claim rests on. A start the bound misses is not
+/// claimed: `n + 1` is `n` from 2^53 on, and at ±∞.
+fn stepping_slots(result: &ProgramAnalysisResult) -> HashSet<QualifiedSlot> {
+    const START: f64 = (1u64 << 50) as f64;
+    const STEP: f64 = (1u64 << 20) as f64;
+    let within =
+        |i: &Interval, lo: f64, hi: f64| i.is_int && !i.is_bottom() && lo <= i.lo && i.hi <= hi;
+    let mut rows: HashMap<QualifiedSlot, Vec<&SlotWriter>> = HashMap::new();
+    for (&c, r) in &result.components {
+        for w in &r.slot_writers {
+            rows.entry(node_of(c, w)).or_default().push(w);
+        }
+    }
+    rows.into_iter()
+        .filter(|((owner, label), ws)| {
+            let ([w], Some(r)) = (ws.as_slice(), result.components.get(owner)) else {
+                return false;
+            };
+            !w.same_tick
+                && w.written
+                    .step
+                    .is_some_and(|d| within(&d, 1.0, STEP) || within(&d, -STEP, -1.0))
+                && as_arith(&r.state_init.get(*label)).is_some_and(|s| within(&s, -START, START))
+                && !r.escaping_slots().contains(label)
         })
         .map(|(slot, _)| slot)
         .collect()
@@ -908,6 +946,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
     let never = |comp: ComponentId, w: &SlotWriter| {
         w.written.change == Change::Never || keeps.contains(&node_of(comp, w))
     };
+    let stepping = stepping_slots(result);
     for f in &facts {
         let ctx = &ctxs[&f.comp];
         let invariance = invariance_of(ctx);
@@ -1025,14 +1064,22 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 .filter(|o| node_of(f.comp, o) == node && o.written.change == Change::Must)
                 .filter_map(|o| o.block)
                 .collect();
-            let must_write = w.written.change == Change::Must
-                && w.block.is_some()
-                && on_all_paths(f.body_cfg, &fresh_blocks)
-                && !restorable.contains(&node)
-                // The re-render a loop needs happens only if its component
-                // is still mounted: an ancestor whose guard or key moves may
-                // unmount it in the very batch that should re-run it.
-                && kept_mounted[&f.comp];
+            // A write changes its slot at every call when it stores a new
+            // reference, and so does every other write of the slot, or when
+            // it is the slot's lone step from a bounded start (#144).
+            let changes = if stepping.contains(&node) {
+                w.block
+                    .is_some_and(|b| on_all_paths(f.body_cfg, &HashSet::from([b])))
+            } else {
+                w.written.change == Change::Must
+                    && w.block.is_some()
+                    && on_all_paths(f.body_cfg, &fresh_blocks)
+                    && !restorable.contains(&node)
+            };
+            // The re-render a loop needs happens only if its component is
+            // still mounted: an ancestor whose guard or key moves may unmount
+            // it in the very batch that should re-run it.
+            let must_write = changes && kept_mounted[&f.comp];
             let strength = if must_write {
                 EdgeStrength::Must
             } else {

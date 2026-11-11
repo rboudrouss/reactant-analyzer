@@ -292,7 +292,9 @@ carries an Error.
   derived from the slot, a child writing back the parent's own value it received as a prop, a
   controlled input mirrored through two slots (`setLocal(value)`, then `onChange(local)`). Never an
   Error: the Error still needs a new reference stored on all paths
-  [#157](https://github.com/rboudrouss/reactant-analyzer/issues/157). Each proof reads only what
+  [#157](https://github.com/rboudrouss/reactant-analyzer/issues/157), or the slot's one write
+  moving it by a nonzero integer from an integer start within ±2^50
+  [#144](https://github.com/rboudrouss/reactant-analyzer/issues/144). Each proof reads only what
   it can certify: a slot read through a name bound to it on one arm only, or bound in any other
   body of the component (a closure, a hook body, a parameter), is not the slot, nor is it for
   `setter-in-render`'s adjust-during-render proof

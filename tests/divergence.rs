@@ -263,3 +263,64 @@ fn a_guarded_toggle_through_an_updater_is_at_most_a_warning() {
         "{sevs:?}"
     );
 }
+
+// ── A lone step from a bounded start loops as surely as a fresh reference ────
+
+/// `infinite-loop` over one component `C({ start, on })` whose body is `body`.
+fn severities_of(body: &str) -> Vec<reactant::rules::Severity> {
+    infinite_loop_severities(&format!(
+        r#"
+        import {{ useState, useEffect }} from "react";
+        function C({{ start, on }}) {{
+          {body}
+        }}
+        "#
+    ))
+}
+
+/// The four rows of #144: a counter and an object churn, each with the slot
+/// as its dep or with no deps array, are one certain loop.
+#[test]
+fn a_counter_is_an_error_like_an_object_churn() {
+    for body in [
+        "const [n, setN] = useState(0); useEffect(() => setN(n + 1), [n]); return <p>{n}</p>;",
+        "const [n, setN] = useState(0); useEffect(() => setN(n + 1)); return <p>{n}</p>;",
+        "const [o, setO] = useState({}); useEffect(() => setO({}), [o]); return <p />;",
+        "const [o, setO] = useState({}); useEffect(() => setO({})); return <p />;",
+        // A negative step, an updater, the bound itself.
+        "const [n, setN] = useState(0); useEffect(() => setN(n - 2), [n]); return <p>{n}</p>;",
+        "const [n, setN] = useState(0); useEffect(() => setN((c) => c + 1), [n]); return <p>{n}</p>;",
+        "const [n, setN] = useState(2 ** 50); useEffect(() => setN(n + 1), [n]); return <p>{n}</p>;",
+    ] {
+        assert_eq!(
+            severities_of(body),
+            vec![reactant::rules::Severity::Error],
+            "{body}"
+        );
+    }
+}
+
+/// No Error where the step is not proven to change the slot at every run: a
+/// start past the bound (`n + 1` is `n` from 2^53 on, React settles), one the
+/// analysis cannot read, another write that may restore the slot, a step
+/// that may be 0, one that is not an integer, a second write in the batch.
+#[test]
+fn a_step_short_of_the_proof_is_no_error() {
+    for body in [
+        "const [n, setN] = useState(2 ** 53 - 2); useEffect(() => setN(n + 1), [n]); return <p>{n}</p>;",
+        "const [n, setN] = useState(Infinity); useEffect(() => setN(n + 1), [n]); return <p>{n}</p>;",
+        "const [n, setN] = useState(start); useEffect(() => setN(n + 1), [n]); return <p>{n}</p>;",
+        "const [n, setN] = useState(0); useEffect(() => setN(n + 1), [n]); \
+         return <button onClick={() => setN(0)}>{n}</button>;",
+        "const [n, setN] = useState(0); useEffect(() => setN(n + (on ? 1 : 0)), [n]); return <p>{n}</p>;",
+        "const [n, setN] = useState(0); useEffect(() => setN(n + 0.5), [n]); return <p>{n}</p>;",
+        "const [n, setN] = useState(0); useEffect(() => { setN(n + 1); setN(n + 2); }, [n]); \
+         return <p>{n}</p>;",
+    ] {
+        let sevs = severities_of(body);
+        assert!(
+            !sevs.contains(&reactant::rules::Severity::Error),
+            "{body}: {sevs:?}"
+        );
+    }
+}

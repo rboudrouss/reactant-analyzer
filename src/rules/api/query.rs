@@ -1074,6 +1074,39 @@ pub(in crate::rules) fn must_effect_cycle(
     }
 }
 
+/// Evidence that an effect's write re-runs the effect at every run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelfChurnProof;
+
+/// `All` iff the churn graph carries, on `effect` of `component`, a must edge
+/// from `slot` into itself: the effect re-runs on the slot, and its write, on
+/// every path of its body, changes the slot at every call (a new reference,
+/// or a lone step from a bounded start, #144) in a component that stays
+/// mounted. Read off the raw edge strength, as `must_effect_cycle` reads a
+/// cycle's.
+pub(in crate::rules) fn must_self_churn(
+    edges: &[crate::engine::ChurnEdge],
+    component: ComponentId,
+    effect: HookLabel,
+    slot: HookLabel,
+) -> MustResult<SelfChurnProof> {
+    use crate::engine::EdgeStrength;
+    let node = (component, slot);
+    match edges.iter().find(|e| {
+        e.component == component
+            && e.effect_label == effect
+            && e.from == node
+            && e.to == node
+            && e.strength == EdgeStrength::Must
+    }) {
+        Some(e) => MustResult::All(Certified::mint(
+            SelfChurnProof,
+            Provenance::at(e.write_span, Some(effect)),
+        )),
+        None => MustResult::None,
+    }
+}
+
 /// Evidence that a state object is mutated in place while its setter is called
 /// with the same reference in the same trigger — React's `Object.is` sees no
 /// change and skips the re-render.

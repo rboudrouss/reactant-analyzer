@@ -19,9 +19,10 @@ use std::collections::HashMap;
 
 use crate::{
     domains::{
-        AbstractDomain, AnalysisCtx, Stability, StateValue, StateValueTransfer, Transfer,
+        AbstractDomain, AnalysisCtx, Interval, Stability, StateValue, StateValueTransfer, Transfer,
         interp::{bind_params, callback_args, entry_env_of, exit_env_of, run_cfg},
         stores::{AbstractEnv, EnvVal, Heap, MemoStore, StateStore},
+        transfer::as_arith,
     },
     engine::{
         Reducer,
@@ -29,8 +30,9 @@ use crate::{
     },
     ir::{
         ComponentId,
+        bindings::{must_param, nested_bodies},
         cfg::{CFG, Terminator},
-        expr::Expr,
+        expr::{BinOp, Expr},
         hooks::HookEntry,
         types::{BlockId, HookLabel, Var},
     },
@@ -75,6 +77,13 @@ pub struct Written {
     /// updater's identity `p => p`. A slot every write of which does so
     /// never leaves its initial value ([`keeps_initial`], #223).
     pub own_read: bool,
+    /// The write stores its own slot's read moved by this step, while the
+    /// read is a number: `n + 1`, `1 + n`, `n - k`, an inline `p => p + 1`
+    /// (#144). A relation the value alone cannot carry: once the slot widens,
+    /// `n + 1` over `[0, +∞]` overlaps `n`. `None` for any other write, and
+    /// for a value write in a closure of an older render, whose read is that
+    /// render's.
+    pub step: Option<Interval>,
 }
 
 /// Does a slot never leave its initial value? True when every write of it,
@@ -98,14 +107,14 @@ pub fn keeps_initial<'a>(mut rows: impl Iterator<Item = &'a Written>, escapes: b
 /// `must_read` the slot an expression reads on every path
 /// ([`must_slot_read`](crate::ir::bindings::must_slot_read)), and `phase` when
 /// the write runs: together they say whether the write stores the slot's own
-/// content.
+/// content, or that content moved by a step.
 pub fn classify(
     arg: Option<&Expr>,
     updater: &Updater,
     own_slot: Option<HookLabel>,
     phase: WriterPhase,
     must_read: impl Fn(&Expr) -> Option<HookLabel>,
-    value_of: impl FnOnce(&Expr) -> StateValue,
+    value_of: impl Fn(&Expr) -> StateValue,
 ) -> Written {
     // The slot's own read, in whatever render's closure the write runs.
     let own_read = own_slot.is_some_and(|slot| stores_own_content(arg, slot, &must_read));
@@ -117,15 +126,17 @@ pub fn classify(
             value: StateValue::undefined(),
             expr: None,
             own_read: false,
+            step: None,
         };
     };
     let arg = arg.peel_ts();
     let expr = Some(arg.clone());
-    let returned = |change: Change, value: StateValue| Written {
+    let returned = |change: Change, value: StateValue, step: Option<Interval>| Written {
         own_read: change == Change::Never,
         change,
         value,
         expr: expr.clone(),
+        step,
     };
     match (arg, updater) {
         (
@@ -133,18 +144,91 @@ pub fn classify(
                 params, body_cfg, ..
             },
             _,
-        ) => returned(returns_change(body_cfg, params), returns_value(body_cfg)),
-        (_, Updater::Functional(body)) => returned(returns_change(body, &[]), returns_value(body)),
+        ) => returned(
+            returns_change(body_cfg, params),
+            returns_value(body_cfg),
+            returns_step(body_cfg, params),
+        ),
+        (_, Updater::Functional(body)) => {
+            returned(returns_change(body, &[]), returns_value(body), None)
+        }
         (other, Updater::Unknown) => {
             let value = value_of(other);
+            // A closure of an older render reads that render's value (#205):
+            // its read moved by a step is no step from what the slot holds.
+            let step = own_slot
+                .filter(|_| reads_committed_state(phase))
+                .and_then(|slot| step_of(other, &|e| must_read(e) == Some(slot), &value_of));
             Written {
                 change: value_change(&value, identity),
                 value,
                 expr,
                 own_read,
+                step,
             }
         }
     }
+}
+
+/// What `e` adds to the slot's read: the read itself, or a `+` / `-` of it
+/// with numbers along one spine (`n + 1`, `1 + n`, `n - k`, `n + a - b`),
+/// the read appearing once and under no other operator. Every other operand
+/// is read with `value_of`, through the arithmetic's own numeric coercion
+/// (`as_arith`), so a string, an object or `undefined` among them leaves no
+/// step; whatever an operand depends on, its value where the write runs
+/// bounds it at every run.
+fn step_of(
+    e: &Expr,
+    is_read: &dyn Fn(&Expr) -> bool,
+    value_of: &dyn Fn(&Expr) -> StateValue,
+) -> Option<Interval> {
+    if is_read(e) {
+        return Some(Interval::point(0.0));
+    }
+    let number = |x: &Expr| as_arith(&value_of(x));
+    match e.peel_ts() {
+        Expr::BinOp {
+            op: BinOp::Add,
+            lhs,
+            rhs,
+        } => match (
+            step_of(lhs, is_read, value_of),
+            step_of(rhs, is_read, value_of),
+        ) {
+            (Some(d), None) => d.add(&number(rhs)?),
+            (None, Some(d)) => number(lhs)?.add(&d),
+            _ => None,
+        },
+        Expr::BinOp {
+            op: BinOp::Sub,
+            lhs,
+            rhs,
+        } => match (
+            step_of(lhs, is_read, value_of),
+            step_of(rhs, is_read, value_of),
+        ) {
+            (Some(d), None) => d.sub(&number(rhs)?),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The step an inline updater's returns add to its parameter, which React
+/// hands the slot's pending value: every return is that parameter, never
+/// rebound, moved by numbers ([`step_of`]), read without an env as the
+/// returns are. `None` when one return is not.
+fn returns_step(body: &CFG, params: &[Var]) -> Option<Interval> {
+    let nested = nested_bodies(body);
+    let is_param = |x: &Expr| must_param(x, body, &nested, params) == Some(0);
+    let mut step: Option<Interval> = None;
+    for b in body.blocks.values() {
+        if let Terminator::Return(e, _) = &b.term {
+            let s = step_of(e.peel_ts(), &is_param, &StateValue::from_init)?;
+            step = Some(step.map_or(s, |acc| acc.hull(&s)));
+        }
+    }
+    step
 }
 
 /// What a write into a `useReducer` slot stores: the reducer's return, its
@@ -160,6 +244,7 @@ pub fn dispatched(reducer: &Reducer) -> Written {
                 value: returns_value(body),
                 expr: None,
                 own_read: change == Change::Never,
+                step: None,
             }
         }
         Reducer::Opaque => Written {
@@ -167,6 +252,7 @@ pub fn dispatched(reducer: &Reducer) -> Written {
             value: StateValue::top(),
             expr: None,
             own_read: false,
+            step: None,
         },
     }
 }
@@ -180,6 +266,7 @@ pub fn carried() -> Written {
         value: StateValue::top(),
         expr: None,
         own_read: false,
+        step: None,
     }
 }
 
@@ -695,10 +782,70 @@ mod tests {
         );
     }
 
+    fn bin(op: BinOp, lhs: Expr, rhs: Expr) -> Expr {
+        Expr::BinOp {
+            op,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        }
+    }
+
+    fn int(n: i32) -> Expr {
+        Expr::Lit(Prim::Int(n))
+    }
+
+    /// `x + 1`, `1 + x` and `x - 2` move the slot's own read by a constant.
+    /// A write in an older render's closure, a string operand, a product, a
+    /// second read or a negated read do not (#144).
+    #[test]
+    fn a_value_write_steps_by_what_it_adds_to_the_slots_own_read() {
+        let x = || Expr::Var("x".into());
+        let step = |e: &Expr, phase: WriterPhase| {
+            classify(
+                Some(e),
+                &Updater::Unknown,
+                T,
+                phase,
+                states,
+                StateValue::from_init,
+            )
+            .step
+        };
+        let one = Some(Interval::point(1.0));
+        assert_eq!(step(&bin(BinOp::Add, x(), int(1)), FX), one);
+        assert_eq!(step(&bin(BinOp::Add, int(1), x()), FX), one);
+        assert_eq!(
+            step(&bin(BinOp::Sub, x(), int(2)), FX),
+            Some(Interval::point(-2.0))
+        );
+        let plus_one = bin(BinOp::Add, x(), int(1));
+        assert_eq!(step(&plus_one, WriterPhase::Deferred), None);
+        let concat = bin(BinOp::Add, x(), Expr::Lit(Prim::String("1".into())));
+        assert_eq!(step(&concat, FX), None);
+        assert_eq!(step(&bin(BinOp::Mul, x(), int(2)), FX), None);
+        assert_eq!(step(&bin(BinOp::Add, x(), x()), FX), None);
+        assert_eq!(step(&bin(BinOp::Sub, int(1), x()), FX), None);
+    }
+
+    /// An inline updater steps the pending value React hands it; one that
+    /// returns anything else does not.
+    #[test]
+    fn an_inline_updater_steps_its_parameter() {
+        let p = || Expr::Var("p".into());
+        let step = |e: &Expr| classify(Some(e), &Updater::Unknown, T, FX, states, opaque).step;
+        assert_eq!(
+            step(&updater(bin(BinOp::Add, p(), int(1)), "p")),
+            Some(Interval::point(1.0))
+        );
+        assert_eq!(step(&updater(int(0), "p")), None);
+        assert_eq!(step(&updater(bin(BinOp::Mul, p(), int(2)), "p")), None);
+    }
+
     #[test]
     fn a_value_argument_changes_the_slot_unless_it_is_one_known_value() {
         let arg = Expr::Var("next".into());
-        let change = |v: StateValue| classify(Some(&arg), &Updater::Unknown, T, FX, states, |_| v);
+        let change =
+            |v: StateValue| classify(Some(&arg), &Updater::Unknown, T, FX, states, |_| v.clone());
         assert_eq!(
             change(StateValue::reference(Stability::PerRender)).change,
             Change::Must

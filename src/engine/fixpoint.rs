@@ -499,6 +499,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             }
         }
     }
+    let state_init = state.clone();
 
     loop {
         let mut state_store = state.clone();
@@ -815,6 +816,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         dom_props: comp_dom_props,
         module_consts,
         state_store: final_state,
+        state_init,
         memo_store,
         render_entry: initial_env.clone(),
         block_states,

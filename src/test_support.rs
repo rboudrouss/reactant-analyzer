@@ -118,6 +118,7 @@ pub(crate) fn analysis_result(render_cfg: CFG) -> AnalysisResult<StateValue> {
         dom_props: Default::default(),
         module_consts: Default::default(),
         state_store: StateStore::bottom(),
+        state_init: StateStore::bottom(),
         memo_store: MemoStore::new(),
         render_entry: crate::domains::AbstractEnv::bottom(),
         block_states: HashMap::new(),

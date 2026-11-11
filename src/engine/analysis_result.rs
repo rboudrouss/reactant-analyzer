@@ -195,6 +195,10 @@ pub struct AnalysisResult<D: AbstractDomain> {
     /// that `<X.Provider>` is a React context provider. Empty for hand-built IR.
     pub module_consts: std::sync::Arc<HashMap<Var, crate::ir::ModuleConstInit>>,
     pub state_store: StateStore<D>,
+    /// What each `useState` slot is seeded with, its init evaluated once in
+    /// the entry scope, before any write joins in: where a step proof counts
+    /// from (#144), which the widened `state_store` has lost.
+    pub state_init: StateStore<D>,
     pub memo_store: MemoStore<D>,
     /// Abstract environment at the entry of the render CFG: props and module
     /// constants bound.

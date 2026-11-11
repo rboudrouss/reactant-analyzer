@@ -2436,37 +2436,50 @@ fn a_member_copied_by_a_spread_or_stored_under_a_computed_key_is_called() {
     // computed key the destructuring reads (#76). An unknown spread keeps
     // the member written before it possible, as does a computed key that may
     // name it: a warning, never a certainty. So does a destructuring default
-    // the member leaves `undefined` (#256).
-    for (decl, call) in [
-        ("const { inc = INC } = extra;", "inc();"),
+    // the member leaves `undefined` (#256). Where the call surely reaches it,
+    // the counter is a certain loop (#144) and may be an Error.
+    for (decl, call, may) in [
+        ("const { inc = INC } = extra;", "inc();", true),
         (
             "const { inc = INC } = {} as { inc?: () => void };",
             "inc();",
+            true,
         ),
         (
             "const b = { inc: INC }; const api = { ...b, x: 1 };",
             "api.inc();",
+            false,
         ),
         (
             "const api = { inc: () => {}, ...{ inc: INC } };",
             "api.inc();",
+            false,
         ),
         (
             "const key = 'inc'; const api = { [key]: INC };",
             "api.inc();",
+            false,
         ),
-        ("const api = { [1]: INC };", "api[1]();"),
+        ("const api = { [1]: INC };", "api[1]();", false),
         (
             "const key = 'inc'; const { [key]: f } = { inc: INC };",
             "f();",
+            false,
         ),
-        ("const api = { inc: INC, ...extra };", "api.inc();"),
-        ("const api = { inc: () => {}, [k]: INC };", "api.inc();"),
+        ("const api = { inc: INC, ...extra };", "api.inc();", true),
+        (
+            "const api = { inc: () => {}, [k]: INC };",
+            "api.inc();",
+            true,
+        ),
     ] {
         let decl = decl.replace("INC", "() => setN(n + 1)");
         let sevs = loop_severities(&member_callee_src(&decl, call), "C");
         assert!(!sevs.is_empty(), "{decl} {call}");
-        assert!(!sevs.contains(&Severity::Error), "{decl}: {sevs:?}");
+        assert!(
+            !(may && sevs.contains(&Severity::Error)),
+            "{decl}: {sevs:?}"
+        );
     }
 }
 

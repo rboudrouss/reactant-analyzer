@@ -68,7 +68,8 @@ export function Updater() {
 }
 "#;
     let result = analyze(src);
-    assert_eq!(loops(&result, "Updater"), vec![Severity::Warning]);
+    // A lone step from 0, on every path of an effect that re-runs on it (#144).
+    assert_eq!(loops(&result, "Updater"), vec![Severity::Error]);
     let updater = result.component_named("Updater").unwrap();
     assert!(
         result.shared_state.get(updater, 0).is_bottom_value(),
@@ -104,8 +105,15 @@ export function CondSetter() {
 }
 "#;
     let result = analyze(src);
-    for c in ["AndSetter", "TernSetter", "ArgSetter", "CondSetter"] {
-        assert_eq!(loops(&result, c), vec![Severity::Warning], "{c}");
+    // The write under `flag` may not run; the other two run on every path,
+    // a lone step from 0: a certain loop (#144).
+    for (c, severity) in [
+        ("AndSetter", Severity::Warning),
+        ("TernSetter", Severity::Warning),
+        ("ArgSetter", Severity::Error),
+        ("CondSetter", Severity::Error),
+    ] {
+        assert_eq!(loops(&result, c), vec![severity], "{c}");
     }
 }
 

@@ -17,7 +17,7 @@ use crate::engine::{
     Always, Change, ChurnEdge, ChurnGraph, EdgeStrength, EveryRender, Rerun, WriterRegion,
 };
 use crate::ir::ComponentId;
-use crate::rules::api::query::must_effect_cycle;
+use crate::rules::api::query::{must_effect_cycle, must_self_churn};
 use crate::rules::helpers::cycles::{NodeNames, cycle_path, node_display};
 use crate::rules::{
     Certified, Diagnostic, MustResult, OnAllPaths, Rule, Severity, all_deps_provably_stable,
@@ -83,6 +83,9 @@ impl Rule for InfiniteLoop {
         // Effects already reported by the fixpoint/cross arms — the churn
         // cycle arm skips them (same outage class, one report per effect).
         let mut reported_effects: HashSet<HookLabel> = HashSet::new();
+        // The graph is whole-program data: read it from the ctx cache, which
+        // builds it once for the run (issue #86).
+        let graph = ctx.cache().churn();
 
         for hook in &comp_result.hooks {
             let HookEntry::Effect {
@@ -141,15 +144,29 @@ impl Rule for InfiniteLoop {
                         } else {
                             ""
                         };
-                        let mut diag = Diagnostic::warn(
-                            "infinite-loop",
-                            format!(
-                                "this effect keeps pushing state {}{} to new values \
-                             on every run. Potential infinite render loop",
-                                state_slot_name(state_label, ctx.source_names(), &state_names),
-                                deps_note
+                        let slot = state_slot_name(state_label, ctx.source_names(), &state_names);
+                        let proof =
+                            must_self_churn(&graph.edges, component, *eff_label, state_label);
+                        let mut diag = match proof {
+                            // The churn graph proves the write changes the
+                            // slot at every run and re-runs the effect (#144).
+                            MustResult::All(proof) => Diagnostic::error(
+                                "infinite-loop",
+                                proof,
+                                format!(
+                                    "this effect changes state {slot} at every run, and each \
+                                     change re-runs it: infinite render loop"
+                                ),
                             ),
-                        )
+                            _ => Diagnostic::warn(
+                                "infinite-loop",
+                                format!(
+                                    "this effect keeps pushing state {}{} to new values \
+                             on every run. Potential infinite render loop",
+                                    slot, deps_note
+                                ),
+                            ),
+                        }
                         .with_label(state_label);
 
                         if let Some(r) = comp_result.effect_info.get(eff_label).and_then(|i| i.span)
@@ -240,9 +257,6 @@ impl Rule for InfiniteLoop {
         }
 
         // ── F5b: multi-effect churn cycles (see churn_graph.rs) ───────────────
-        // The graph is whole-program data: read it from the ctx cache, which
-        // builds it once for the run (issue #86).
-        let graph = ctx.cache().churn();
         let (cycle_diags, covered) =
             check_multi_effect_cycles(ctx, graph, result, component, &reported_effects);
         diags.extend(cycle_diags);
