@@ -10,6 +10,7 @@ import { createRequire } from "node:module";
 import { JSDOM } from "jsdom";
 import { transformSync } from "esbuild";
 import { splitFiles, ENTRY } from "./files.mjs";
+import { packageOf } from "./packages.mjs";
 
 const require = createRequire(import.meta.url);
 
@@ -72,9 +73,38 @@ let run = null;
 /** Counts the runs of this worker; see `counted`. */
 let runs = 0;
 
+/**
+ * The functions an imported package exports (components, hooks): the program
+ * did not define them, so `counted` leaves them alone. A wrapper changes the
+ * element type, which a library may compare (react-router's `<Routes>` accepts
+ * only `<Route>` children, by identity).
+ */
+const foreign = new WeakSet();
+/** A package is loaded on its first import, once per worker, and its exports registered. */
+const libraries = new Map();
+
+function library(id) {
+  if (!libraries.has(id)) {
+    const exports = require(id);
+    markForeign(exports, new Set());
+    libraries.set(id, exports);
+  }
+  return libraries.get(id);
+}
+
+/** Registers the functions of a module's exports, through the plain objects it nests. */
+function markForeign(value, seen) {
+  if (typeof value === "function") return void foreign.add(value);
+  if (value === null || typeof value !== "object" || seen.has(value)) return;
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) return;
+  seen.add(value);
+  for (const key of Object.keys(value)) markForeign(value[key], seen);
+}
+
 const wrappers = new WeakMap();
 function counted(type) {
-  if (typeof type !== "function" || (type.prototype && type.prototype.isReactComponent)) return type;
+  if (typeof type !== "function" || foreign.has(type) || (type.prototype && type.prototype.isReactComponent)) return type;
   let w = wrappers.get(type);
   if (!w) {
     const name = type.displayName || type.name || "Anonymous";
@@ -159,6 +189,21 @@ function classifyError(err) {
   return { verdict: "crash", via: msg.split("\n")[0].slice(0, 200) };
 }
 
+/**
+ * An error that reached the worker's top level instead of React's handlers or
+ * a `try` of the runner: a store notified from a promise or a real macrotask
+ * throws React's update-depth error at the caller of `setState`, which is no
+ * longer inside a render. It is judged by `classifyError` like any other: if
+ * it is a loop, it joins the run's errors (and the verdict names the
+ * components that were looping); otherwise this returns false and the caller
+ * lets it kill the worker, which is a `crash`.
+ */
+export function reportUncaught(err) {
+  if (!run || classifyError(err).verdict !== "loop") return false;
+  run.errors.push(err);
+  return true;
+}
+
 export function compile(source, name = ENTRY) {
   return transformSync(source, {
     loader: "tsx",
@@ -194,6 +239,7 @@ function load(source, clock) {
     if (id === "react-dom") return require("react-dom");
     if (id === "react-dom/client") return ReactDOMClient;
     if (id === "ext") return EXT;
+    if (packageOf(id)) return library(id);
     if (id.startsWith("./")) {
       const base = id.slice(2);
       const name = [base, `${base}.tsx`, `${base}.ts`].find((n) => files.has(n));
@@ -213,10 +259,10 @@ function load(source, clock) {
  */
 export async function runProgram(source, { root = "App" } = {}) {
   const clock = virtualClock();
-  const errors = [];
   const warnings = [];
   runs += 1;
-  run = { renders: {}, total: 0, step: 0, stepRenders: {} };
+  const errors = [];
+  run = { renders: {}, total: 0, step: 0, stepRenders: {}, errors };
 
   const origError = console.error;
   const origWarn = console.warn;
