@@ -3397,6 +3397,23 @@ fn a_setter_is_reported_at_its_strongest_site() {
     }
 }
 
+/// #291: a setter an array method calls is a render write at the call, as a
+/// closure argument's is, and placed where one is: an Error where the method
+/// surely calls it — an array literal with an entry (#248) — a Warning on an
+/// array that may be empty. Stored and never called, it writes nothing.
+#[test]
+fn a_setter_an_array_method_calls_in_render_is_a_render_write() {
+    let state = "const [n, setN] = useState(0);";
+    for (body, want) in [
+        ("[1].forEach(setN);", vec![Severity::Error]),
+        ("c.forEach(setN);", vec![Severity::Warning]),
+        ("const keep = [setN];", vec![]),
+    ] {
+        let found = render_writes(&format!("{state} {body}"));
+        assert_eq!(found, (want.clone(), want), "{body}");
+    }
+}
+
 // ── #106: the `seeds` edge and the `seed_sync` guard ──────────────────────────
 
 const SEED_PACK: &str = r#"{

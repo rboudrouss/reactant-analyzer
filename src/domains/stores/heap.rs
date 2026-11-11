@@ -319,20 +319,24 @@ impl Heap {
     /// member of every object it reaches through members, from here on
     /// (#258): each is marked `unseen`. A closure it reaches runs with the
     /// handlers ([`Heap::escaped_fns`]), its own writes landing where they
-    /// do.
-    pub fn escape(&mut self, sites: &Sites) {
+    /// do. Returns the setters those objects hold: that code may call them
+    /// (#291).
+    pub fn escape(&mut self, sites: &Sites) -> Vec<(ComponentId, HookLabel)> {
         self.escaped.extend(sites.ids.iter().copied());
         let mut stack: Vec<ExprId> = sites.ids.iter().copied().collect();
         let mut seen = BTreeSet::new();
+        let mut held = Vec::new();
         while let Some(id) = stack.pop() {
             if !seen.insert(id) {
                 continue;
             }
             if let Some(HeapValue::Obj(obj)) = self.cells.get_mut(&id) {
                 stack.extend(obj.values().filter_map(EnvVal::locs).flatten().copied());
+                held.extend(obj.values().flat_map(|ev| ev.as_val().setters()));
                 obj.unseen = true;
             }
         }
+        held
     }
 
     /// The closures an escaped site reaches, through the members of the

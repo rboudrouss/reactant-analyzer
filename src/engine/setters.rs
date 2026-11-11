@@ -288,6 +288,9 @@ pub(crate) struct WriteSite {
     pub updater: Updater,
     /// Argument 0 as written, `None` for a bare `setX()`.
     pub arg: Option<Expr>,
+    /// The setter is handed to a callee that calls it (`xs.forEach(setV)`,
+    /// #291): it stores what the callee passes, which no expression here is.
+    pub applied: bool,
     /// The function names the walk went through to reach the site, outermost
     /// first — where the write is authored is where they are defined.
     pub through: Vec<Var>,
@@ -371,6 +374,7 @@ pub(crate) fn collect_write_sites(
             repeats: s.repeats,
             updater: s.updater,
             arg: s.arg,
+            applied: s.applied,
             through: s.through,
         })
         .collect()
@@ -2130,7 +2134,7 @@ pub(crate) fn collect_slot_writers(
             let target = (owner.unwrap_or(envs.component), slot);
             let written = match reducers.get(target.0, target.1) {
                 Some(reducer) => written::dispatched(&reducer),
-                None if carried => written::carried(),
+                None if carried || site.applied => written::carried(),
                 None => written::classify(
                     site.arg.as_ref(),
                     &site.updater,
@@ -2474,6 +2478,8 @@ struct FoundSite {
     updater: Updater,
     /// Argument 0 as written, for the value the row stores (ADR-042 §2).
     arg: Option<Expr>,
+    /// The setter is handed to a callee that calls it ([`WriteSite::applied`]).
+    applied: bool,
     /// The function names the walk went through to reach the site
     /// ([`SetterWalk::path`]).
     through: Vec<Var>,
@@ -2977,6 +2983,7 @@ impl<'a> SetterWalk<'a> {
                     repeats: self.repeating,
                     updater: self.updater_of(args),
                     arg: args.first().map(|a| a.peel_ts().clone()),
+                    applied: false,
                     through: self.path.clone(),
                 });
             }
@@ -3150,6 +3157,26 @@ impl<'a> SetterWalk<'a> {
         prov: Option<BlockId>,
         stmt_span: Option<SourceRange>,
     ) {
+        // A setter handed to the callee is called by it, with what it passes
+        // (#291): a write of its slot in the argument's class, placed where a
+        // closure's rows would be.
+        if let Some(name) = callee_path(arg)
+            && self.setter_vars.contains(&name)
+        {
+            found.setters.push(FoundSite {
+                var: name,
+                class,
+                span: stmt_span,
+                at: placed,
+                own: placed.map(|(b, _)| (self.body, b)),
+                prov_block: prov,
+                repeats: self.repeating,
+                updater: Updater::Unknown,
+                arg: None,
+                applied: true,
+                through: self.path.clone(),
+            });
+        }
         match arg {
             // Inline FnLit arg descend body, costs one depth level.
             Expr::FnLit { body_cfg, .. } if depth > 0 => {

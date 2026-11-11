@@ -733,6 +733,34 @@ fn exec_slot_write<T: Transfer>(
     }
 }
 
+/// A setter an in-cycle callee calls — an array method, a `then`, a timer —
+/// is called there (#291), with what the callee passes it (`given`: an array
+/// method's element, any value otherwise): the call transfer of
+/// `arg(supplied)`, `supplied` bound to that value.
+fn apply_setter<T: Transfer>(
+    transfer: &T,
+    arg: &Expr,
+    given: &[EnvVal<T::Domain>],
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+    depth: usize,
+) {
+    if call_targets(transfer, arg, env, ctx).is_empty() {
+        return;
+    }
+    let supplied = [String::from("__supplied")];
+    let mut scope = env.clone();
+    bind_params(&mut scope, &supplied, given);
+    exec_slot_write(
+        transfer,
+        arg,
+        &[Expr::Var(supplied[0].clone())],
+        &scope,
+        ctx,
+        depth,
+    );
+}
+
 /// The slots a call through `fn_` may write, in `env`: those a name is bound
 /// to as a setter, else those the callee's value holds — whatever the callee
 /// is (`setN`, `t[1]`, `api.setV`, a parent's setter prop). The one lookup of
@@ -870,11 +898,10 @@ fn exec_callbacks_depth<T: Transfer>(
                     let given = callback_args(transfer, fn_, i, env, ctx);
                     let returned = exec_fn_value(transfer, arg, &given, env, ctx, depth);
                     escape_returned(returned.as_ref(), ctx);
+                    // A setter is run as a call of it (#291).
+                    apply_setter(transfer, arg, &given, env, ctx, depth);
                 } else {
-                    let sites = alloc_literal(transfer, arg, env, ctx);
-                    if let Some(sites) = &sites {
-                        ctx.heap.escape(sites);
-                    }
+                    let sites = escape(transfer, arg, env, ctx);
                     if binds_args {
                         passed.push(EnvVal::located(sites, transfer.eval_expr(arg, env, ctx)));
                     }
@@ -960,16 +987,24 @@ fn exec_callbacks_depth<T: Transfer>(
 /// callee it does not run, a hook it does not inline, React for an element's
 /// handler, an object it does not place, a child component it cannot resolve
 /// (#289). Every closure the value reaches may be called there, at any time;
-/// [`run_escaped`] runs them.
+/// [`run_escaped`] runs them. So may the setter it is, or one an object it
+/// reaches holds: each is written with any value (#291). Returns the sites
+/// the value points to.
 pub(crate) fn escape<T: Transfer>(
     transfer: &T,
     expr: &Expr,
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
-) {
-    if let Some(sites) = alloc_literal(transfer, expr, env, ctx) {
-        ctx.heap.escape(&sites);
+) -> Option<Sites> {
+    let sites = alloc_literal(transfer, expr, env, ctx);
+    let mut setters = call_targets(transfer, expr, env, ctx);
+    if let Some(sites) = &sites {
+        setters.extend(ctx.heap.escape(sites));
     }
+    for (owner, label) in setters {
+        ctx.write_slot(owner, label, T::Domain::top());
+    }
+    sites
 }
 
 /// What a body returns to code the analysis does not see escapes with it.

@@ -2631,6 +2631,55 @@ fn the_escape_walk_still_marks_what_it_finds_with_any_value() {
     );
 }
 
+// ── #291: a setter handed to a callee that calls it ─────────────────────────
+
+/// `App` whose effect, on `[v]`, runs `body`; `decl` sits at module level.
+fn effect_running(decl: &str, body: &str) -> String {
+    format!(
+        r#"
+import {{ useState, useEffect }} from 'react';
+{decl}
+export function App() {{
+  const [v, setV] = useState(0);
+  useEffect(() => {{ {body} }}, [v]);
+  return <div>{{v}}</div>;
+}}
+"#
+    )
+}
+
+/// The setter is never called by name: an array method, a promise's `then`,
+/// or a function it is handed to calls it with the value it supplies, so the
+/// effect stores `v + 1` at every run; so does the closure an unknown child
+/// holds. What the callee passes is no expression of the site: the write may
+/// change the slot, a Warning.
+#[test]
+fn a_setter_a_callee_calls_is_a_write() {
+    let each = "function each(items, fn) { items.forEach(fn); }";
+    let sources = [
+        effect_running("", "[v + 1].forEach(setV);"),
+        effect_running("", "Promise.resolve(v + 1).then(setV);"),
+        effect_running(each, "each([v + 1], setV);"),
+        unknown_child_holding("[1].forEach(setV);", 0),
+    ];
+    for src in sources {
+        let diags = infinite_loop_diags(&src, "App");
+        assert!(
+            diags.iter().any(|(_, s, _)| *s == Severity::Warning)
+                && !diags.iter().any(|(_, s, _)| *s == Severity::Error),
+            "{src}: {diags:?}"
+        );
+    }
+}
+
+/// The negative: a setter stored, never called, writes nothing.
+#[test]
+fn a_setter_stored_and_never_called_writes_nothing() {
+    let src = effect_running("", "const keep = [setV]; const box = { set: setV };");
+    let diags = infinite_loop_diags(&src, "App");
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
 // ── #253: a closure reached through a local array or a local higher-order fn ─
 
 /// The closure runs in the effect, every run: through the array's entries an
