@@ -132,6 +132,63 @@ pub(crate) fn collect_setter_sites_converged(
     setter_calls(cfg, setter_vars, &HashMap::new(), Some(converged), false)
 }
 
+/// The setter call sites of a component's render, as the converged values see
+/// them (#281): every call the setter walk finds there through a name the
+/// render binds to a setter, or a name or member path the converged values put
+/// one behind (`t.1`, `api.setV`, a parent's setter prop), a closure such a
+/// path holds included. `setter-in-render` judges these sites and the Tier-A
+/// `render_setter_calls` relation lists them: both frontends see one set.
+pub(crate) struct RenderSetterSites {
+    /// The names the render binds to a setter, through aliases (the may
+    /// table).
+    pub local: SetterTargets,
+    /// The setters the converged values put behind a name or member path.
+    pub converged: HashMap<Var, Vec<SetterProp>>,
+    /// Every name or path either table holds.
+    pub names: HashSet<Var>,
+    /// One row per call site, in walk order, each with its phase class: a
+    /// handler's or a deferred call is a site that does not run in the render.
+    pub sites: Vec<SetterCall>,
+}
+
+impl RenderSetterSites {
+    pub(crate) fn of(comp: &AnalysisResult<StateValue>) -> Self {
+        let params = std::slice::from_ref(&comp.param);
+        let local = SetterTargets::bound_in(&comp.render_cfg).resolve(&comp.render_cfg);
+        let converged = converged_call_targets(
+            &collect_component_setter_vars(
+                &comp.render_cfg,
+                params,
+                &comp.block_states,
+                &comp.heap,
+            ),
+            comp.component,
+        );
+        let mut names: HashSet<Var> = local.names().cloned().collect();
+        names.extend(converged.keys().cloned());
+        let sites = if names.is_empty() {
+            Vec::new()
+        } else {
+            let fns = ConvergedFns::of(
+                &comp.render_cfg,
+                params,
+                &comp.hooks,
+                &comp.hook_provenance,
+                &comp.block_states,
+                &comp.heap,
+                comp.component,
+            );
+            collect_setter_sites_converged(&comp.render_cfg, &names, &fns)
+        };
+        RenderSetterSites {
+            local,
+            converged,
+            names,
+            sites,
+        }
+    }
+}
+
 fn setter_calls(
     cfg: &CFG,
     setter_vars: &HashSet<Var>,

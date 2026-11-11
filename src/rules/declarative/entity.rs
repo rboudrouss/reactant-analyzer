@@ -37,8 +37,7 @@ use crate::rules::helpers::local_bindings;
 use crate::rules::helpers::providers::{ProviderSite, ValueIdentity, collect_provider_sites};
 use crate::rules::{
     ReturnsVerdict, SetterCall, StabilityVerdict, all_setter_labels, collect_setter_calls,
-    cross_component_setters, hook_kind_word, hook_val_labels, must_alias_scopes,
-    resolve_setter_aliases, state_val_labels,
+    hook_kind_word, hook_val_labels, must_alias_scopes, resolve_setter_aliases, state_val_labels,
 };
 
 use super::schema::{
@@ -140,9 +139,9 @@ pub(crate) struct EntityCtx<'a> {
     /// Index into `comp.hook_provenance` by label (indices, not references:
     /// `OnceCell` is invariant, so a borrowed map would freeze `'a`).
     provenance: OnceCell<HashMap<HookLabel, usize>>,
-    /// `ComponentSetter`-valued props (#107), resolved on first use by the
-    /// ownership-aware enumeration.
-    cross_setters: OnceCell<HashMap<Var, Vec<crate::engine::setters::SetterProp>>>,
+    /// The render's setter call sites, the ones `setter-in-render` judges
+    /// (#281), resolved on first use by the render-setter enumeration.
+    render_sites: OnceCell<crate::engine::setters::RenderSetterSites>,
     /// The slot → readers relation (#127), computed on first use: unlike the
     /// writers, it is not needed by any native rule, so a component no pack
     /// asks about never walks for it.
@@ -170,7 +169,7 @@ impl<'a> EntityCtx<'a> {
             exit_dom: OnceCell::new(),
             conditional: OnceCell::new(),
             provenance: OnceCell::new(),
-            cross_setters: OnceCell::new(),
+            render_sites: OnceCell::new(),
             slot_reads: OnceCell::new(),
             body_calls: OnceCell::new(),
         }
@@ -195,36 +194,34 @@ impl<'a> EntityCtx<'a> {
         rows
     }
 
-    /// Alias-resolved setter calls in the render body, deterministically
-    /// sorted (`collect_setter_calls` returns HashMap order).
-    /// `foreign` widens the enumeration with `ComponentSetter`-valued props —
-    /// parent setters the top-down pass placed in this component's environment
-    /// (#107).
+    /// The setter calls the render runs, one row per call site and slot it
+    /// may write, deterministically sorted: the sites `setter-in-render`
+    /// judges (#281), through a name bound to a setter or a name or member
+    /// path the converged values put one behind (`t.1`, `api.setV`). A
+    /// handler's or a deferred call is no render call. `foreign` widens the
+    /// enumeration with the slots of other components — parent setters the
+    /// top-down pass placed in this component's environment (#107).
     ///
     /// **Never widened unconditionally.** The validator sets the flag only for
     /// a rule that names ownership, so a pack shipped before this existed
-    /// enumerates exactly the rows it enumerated then: changing what a shipped
-    /// sort binds changes which findings fire (the ADR-027 §2 sequencing
-    /// argument).
+    /// enumerates no row of another component's slot: changing what a
+    /// shipped sort binds changes which findings fire (the ADR-027 §2
+    /// sequencing argument).
     pub fn render_setters(&self, foreign: bool) -> Vec<SetterEntity> {
-        if !foreign {
-            return self.sorted_setters(
-                collect_setter_calls(&self.comp.render_cfg, &self.setter_vars),
-                &HashMap::new(),
-            );
-        }
-        let cross = self.cross_setters();
-        let mut vars = self.setter_vars.clone();
-        vars.extend(cross.keys().cloned());
-        self.sorted_setters(collect_setter_calls(&self.comp.render_cfg, &vars), cross)
+        let found = self.render_sites();
+        self.sorted_setters(
+            found.sites.iter().filter(|c| c.class.may_run_in_body()),
+            &found.local,
+            &found.converged,
+            foreign,
+        )
     }
 
-    /// `var → (owning component, slot)` for every `ComponentSetter`-valued
-    /// prop of this component — the engine resolution the native
-    /// `setter-in-render` rule consumes, read once and shared (ADR-027 §1).
-    fn cross_setters(&self) -> &HashMap<Var, Vec<crate::engine::setters::SetterProp>> {
-        self.cross_setters
-            .get_or_init(|| cross_component_setters(self.comp, self.ctx.component()))
+    /// The render's setter call sites and the tables they resolve through,
+    /// built once per component, shared with `setter-in-render` (#281).
+    fn render_sites(&self) -> &crate::engine::setters::RenderSetterSites {
+        self.render_sites
+            .get_or_init(|| crate::engine::setters::RenderSetterSites::of(self.comp))
     }
 
     /// `hook_origins` rows in label order (labels are unique after the
@@ -388,8 +385,10 @@ impl<'a> EntityCtx<'a> {
             return vec![];
         };
         self.sorted_setters(
-            collect_setter_calls(body, &self.setter_vars),
+            &collect_setter_calls(body, &self.setter_vars),
+            &self.setter_labels,
             &HashMap::new(),
+            false,
         )
     }
 
@@ -504,23 +503,21 @@ impl<'a> EntityCtx<'a> {
 
     /// Does this render-setter row's call write its slot on every render
     /// (#279)? Its block dominates every exit, and its callee surely is the
-    /// setter: a local name by its must-alias binding, a foreign prop by
-    /// the converged values (`must_render_write`, the native rule's test).
+    /// setter: a local name by its must-alias binding, a name or path the
+    /// converged values put a setter behind by those values — the native
+    /// rule's test, over the native rule's tables (`must_render_write`).
     pub fn render_write(&self, s: &SetterEntity) -> Option<Certified<RenderWrite>> {
         let block = s.block_id?;
+        let found = self.render_sites();
         let scopes = must_alias_scopes(&self.comp.render_cfg, &self.comp.hooks);
-        let props = match s.owner {
-            Some(_) => self.cross_setters().get(&s.var).map(Vec::as_slice),
-            None => None,
-        };
         match must_render_write(
             self.exit_dom(),
             &self.comp.render_cfg,
             &scopes,
             &s.var,
             block,
-            s.owner.is_none(),
-            props,
+            found.local.contains(&s.var),
+            found.converged.get(&s.var).map(Vec::as_slice),
         ) {
             MustResult::All(c) => Some(c),
             _ => None,
@@ -1016,38 +1013,45 @@ impl<'a> EntityCtx<'a> {
         pick_name(&self.state_names, label)
     }
 
-    fn sorted_setters(
+    /// One entity per call and slot it may write, deterministically sorted
+    /// (the walks return HashMap order). A local binding wins: a component
+    /// passing its own setter down is not a foreign write. A name bound to
+    /// several setters is one entity per candidate (#202), and so is a name
+    /// or path the converged values put several setters behind; `foreign`
+    /// keeps the entities of another component's slot (#107).
+    fn sorted_setters<'c>(
         &self,
-        calls: Vec<SetterCall>,
-        cross: &HashMap<Var, Vec<crate::engine::setters::SetterProp>>,
+        calls: impl IntoIterator<Item = &'c SetterCall>,
+        local: &crate::engine::setters::SetterTargets,
+        converged: &HashMap<Var, Vec<crate::engine::setters::SetterProp>>,
+        foreign: bool,
     ) -> Vec<SetterEntity> {
+        let me = self.ctx.component();
         let mut setters: Vec<SetterEntity> = calls
             .into_iter()
             .flat_map(|c| {
-                // A local binding wins: a component passing its own setter down
-                // is not a foreign write, and `cross_component_setters` already
-                // filtered self-owned entries out. A prop that may be several
-                // parents' setters is one entity per candidate, and so is a
-                // local name bound to several setters (#202).
-                let local: Vec<_> = self.setter_labels.targets(&c.var).collect();
-                let targets: Vec<(Option<HookLabel>, Option<ComponentId>)> = match local.is_empty()
+                let bound: Vec<_> = local.targets(&c.var).collect();
+                let targets: Vec<(Option<HookLabel>, Option<ComponentId>)> = match bound.is_empty()
                 {
-                    false => local.into_iter().map(|l| (Some(l), None)).collect(),
-                    true => match cross.get(&c.var) {
+                    false => bound.into_iter().map(|l| (Some(l), None)).collect(),
+                    true => match converged.get(&c.var) {
                         Some(props) => props
                             .iter()
-                            .map(|p| (Some(p.label), Some(p.component)))
+                            .map(|p| (Some(p.label), (p.component != me).then_some(p.component)))
                             .collect(),
                         None => vec![(None, None)],
                     },
                 };
-                targets.into_iter().map(move |(slot, owner)| SetterEntity {
-                    slot,
-                    owner,
-                    var: c.var.clone(),
-                    span: c.span,
-                    block_id: c.block_id,
-                })
+                targets
+                    .into_iter()
+                    .filter(move |(_, owner)| foreign || owner.is_none())
+                    .map(move |(slot, owner)| SetterEntity {
+                        slot,
+                        owner,
+                        var: c.var.clone(),
+                        span: c.span,
+                        block_id: c.block_id,
+                    })
             })
             .collect();
         setters.sort_by(|a, b| {

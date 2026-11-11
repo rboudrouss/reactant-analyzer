@@ -39,7 +39,7 @@ Numbers like #67 below are issues on the analyzer's tracker, at
 | Relation | Selects |
 |---|---|
 | `hook_calls` | Every hook call in the component, including the ones reached through custom hooks inlined from other files. Optional `kind`: `state`, `effect`, `memo`, `callback`, `ref`, `custom`, `handler` |
-| `render_setter_calls` | Every setter call in the render body, resolved through aliases |
+| `render_setter_calls` | Every setter call the render may run, one row per call site: the sites native `setter-in-render` judges, resolved through aliases and the converged values (`t[1](x)`, `api.setV(x)`, a closure such a path holds). A call only an event handler or a deferred callback makes is no row (#281) |
 | `hook_origins` | Every provenance row: each hook call whose identity resolved, INCLUDING calls that inlining dissolved. The anchor for identity rules (ban a hook, enforce a wrapper). No `kind`, no edges; `name` is the origin hook's name, `source` its raw import specifier |
 
 | `context_providers` | Every `<Ctx.Provider value={…}>` element in the render body whose `Ctx` is a module-level `createContext` proven by import (#71). Render-only by semantics (a `useMemo`-built provider keeps identity). `name` is the context binding, `identity` the value's identity verdict. No `kind`, no edges |

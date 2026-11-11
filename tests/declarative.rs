@@ -12,7 +12,7 @@ use reactant::domains::StateValueTransfer;
 use reactant::engine::{Config, analyze_component};
 use reactant::lowering::lower_program;
 use reactant::rules::declarative::{PackError, PackLoad, load_pack};
-use reactant::rules::{Diagnostic, RuleCtx, Severity};
+use reactant::rules::{Diagnostic, Rule, RuleCtx, SetterInRender, Severity};
 
 type Options = BTreeMap<String, serde_json::Map<String, serde_json::Value>>;
 
@@ -27,6 +27,17 @@ fn load_err(json: &str) -> PackError {
 /// Analyze `src` (single component) and run every rule of `pack_json` on it.
 fn run_pack(pack_json: &str, src: &str, options: &Options) -> Vec<Diagnostic> {
     let pack = load_pack(pack_json, options).expect("pack must load");
+    let mut out = Vec::new();
+    each_component(src, |ctx| {
+        for rule in &pack.rules {
+            out.extend(rule.rule.check(ctx));
+        }
+    });
+    out
+}
+
+/// Analyze each component of `src` on its own and hand `f` its rule context.
+fn each_component(src: &str, mut f: impl FnMut(&RuleCtx<'_>)) {
     let alloc = Allocator::default();
     let ret = Parser::new(&alloc, src, SourceType::tsx())
         .with_options(ParseOptions::default())
@@ -43,17 +54,12 @@ fn run_pack(pack_json: &str, src: &str, options: &Options) -> Vec<Diagnostic> {
         &mut Default::default(),
     );
     assert!(!components.is_empty(), "no component detected");
-    let mut out = Vec::new();
     for comp in components {
         let name = comp.name.clone();
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         let prog = reactant::engine::ProgramAnalysisResult::single(&name, result);
-        let ctx = RuleCtx::new(&prog, prog.component_named(&name).unwrap());
-        for rule in &pack.rules {
-            out.extend(rule.rule.check(&ctx));
-        }
+        f(&RuleCtx::new(&prog, prog.component_named(&name).unwrap()));
     }
-    out
 }
 
 const TEAM_PACK: &str = include_str!("fixtures/packs/team.json");
@@ -3230,6 +3236,51 @@ fn slot_ownership_needs_a_render_setter_row() {
     assert!(e.message.contains("body setter call"), "{e}");
 }
 
+/// The severities of a render-write rule's rows (an Error only when the row's
+/// write is certain) on a component whose render runs `body`, beside those of
+/// the native `setter-in-render` findings on the same analysis.
+fn render_writes(body: &str) -> (Vec<Severity>, Vec<Severity>) {
+    let pack = load_pack(
+        &one_rule(
+            r#"{"id":"render-write","docs":{"description":"d","why":"w","fix":"f"},
+                "severity":"error","anchor":{"relation":"render_setter_calls"},
+                "guards":[{"kind":"must_dominates_all_exits","of":"anchor"}],
+                "message":"{anchor.setter} writes {anchor.slot} on every render"}"#,
+        ),
+        &Options::new(),
+    )
+    .expect("pack must load");
+    let src = format!(
+        r#"
+        import {{ useState }} from "react";
+        function C({{ c }}) {{
+            {body}
+            return <div/>;
+        }}
+    "#
+    );
+    let (mut rows, mut native) = (Vec::new(), Vec::new());
+    each_component(&src, |ctx| {
+        for rule in &pack.rules {
+            rows.extend(
+                rule.rule
+                    .check(ctx)
+                    .iter()
+                    .filter(|d| d.rule == "t/render-write")
+                    .map(|d| d.severity()),
+            );
+        }
+        native.extend(
+            SetterInRender
+                .check(ctx)
+                .iter()
+                .filter(|d| d.rule == "setter-in-render")
+                .map(|d| d.severity()),
+        );
+    });
+    (rows, native)
+}
+
 /// #279: a render-setter row's Error certifies the write, not only that the
 /// call runs. `f` is the setter on one path and a no-op on the other, so its
 /// call dominating every exit proves nothing about the write: a Warning, as
@@ -3237,34 +3288,54 @@ fn slot_ownership_needs_a_render_setter_row() {
 /// bound to the setter on every path stays an Error.
 #[test]
 fn a_render_write_is_certified_only_through_a_certain_binding() {
-    let pack = one_rule(
-        r#"{"id":"render-write","docs":{"description":"d","why":"w","fix":"f"},
-            "severity":"error","anchor":{"relation":"render_setter_calls"},
-            "guards":[{"kind":"must_dominates_all_exits","of":"anchor"}],
-            "message":"{anchor.setter} writes {anchor.slot} on every render"}"#,
-    );
-    let severities = |body: &str| {
-        let src = format!(
-            r#"
-            import {{ useState }} from "react";
-            function C({{ c }}) {{
-                const [n, setN] = useState(0);
-                {body}
-                return <div>{{n}}</div>;
-            }}
-        "#
-        );
-        run_pack(&pack, &src, &Options::new())
-            .iter()
-            .filter(|d| d.rule == "t/render-write")
-            .map(|d| d.severity())
-            .collect::<Vec<_>>()
-    };
+    let (warning, error) = (vec![Severity::Warning], vec![Severity::Error]);
     assert_eq!(
-        severities("let f = setN; if (c) f = () => {}; f(1);"),
-        vec![Severity::Warning]
+        render_writes("const [n, setN] = useState(0); let f = setN; if (c) f = () => {}; f(1);"),
+        (warning.clone(), warning)
     );
-    assert_eq!(severities("const f = setN; f(1);"), vec![Severity::Error]);
+    assert_eq!(
+        render_writes("const [n, setN] = useState(0); const f = setN; f(1);"),
+        (error.clone(), error)
+    );
+}
+
+/// #281: the relation lists the sites `setter-in-render` judges, through a
+/// value as well as a name: a setter read off the tuple or the object it was
+/// stored in is a row, certified as the native rule certifies the site.
+#[test]
+fn a_setter_reached_through_a_value_is_a_render_setter_row() {
+    for (body, want) in [
+        (
+            "const [v, setV] = useState(0); const t = [v, setV]; t[1](1);",
+            Severity::Error,
+        ),
+        (
+            "const [v, setV] = useState(0); const t = [v, setV]; if (c) t[1](1);",
+            Severity::Warning,
+        ),
+        (
+            "const [v, setV] = useState(0); const api = { setV }; api.setV(1);",
+            Severity::Error,
+        ),
+        (
+            "const [v, setV] = useState(0); const api = { setV }; if (c) api.setV(1);",
+            Severity::Warning,
+        ),
+    ] {
+        assert_eq!(render_writes(body), (vec![want], vec![want]), "{body}");
+    }
+}
+
+/// #281: one row per call site, not per setter. The native rule reports the
+/// setter once; the relation keeps its two render writes apart, each
+/// certified on its own, and a write a deferred callback makes is no row.
+#[test]
+fn two_render_sites_of_one_setter_are_two_rows() {
+    let (rows, native) = render_writes(
+        "const [n, setN] = useState(0); if (c) setN(1); setN(2); setTimeout(() => setN(3));",
+    );
+    assert_eq!(rows, vec![Severity::Warning, Severity::Error]);
+    assert_eq!(native.len(), 1, "{native:?}");
 }
 
 // ── #106: the `seeds` edge and the `seed_sync` guard ──────────────────────────

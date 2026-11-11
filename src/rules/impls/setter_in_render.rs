@@ -8,7 +8,7 @@ use crate::ir::{
 };
 
 use crate::engine::guards::converges_once_written;
-use crate::engine::setters::{SetterCall, SetterCallPhase, SetterTargets};
+use crate::engine::setters::{SetterCall, SetterCallPhase};
 use crate::engine::triggers::{Always, Rerun};
 use crate::engine::written::{ClosureEnv, SiteEnvs};
 use crate::engine::{Change, SlotWriter, WriterPhase, WriterRegion, triggers_of};
@@ -82,29 +82,20 @@ impl SetterInRender {
         let comp_result = &result.components[&component];
         let names = ctx.source_names();
 
-        // Local setters with their aliases (`const s = setN`): a name the
-        // table misses is a call the rule never sees, and a false `verified`
-        // (#176).
-        let local_setter_info =
-            SetterTargets::bound_in(&comp_result.render_cfg).resolve(&comp_result.render_cfg);
-
-        // The setters the converged values put behind a name or member path:
-        // a parent's setter prop, or this component's own setter read off a
-        // value (`t[1]`, a nested or memoized destructuring, #233) — the
-        // table the writer relation reads.
-        let cs_vars: HashMap<Var, Vec<crate::engine::setters::SetterProp>> =
-            crate::engine::setters::converged_call_targets(
-                &crate::engine::setters::collect_component_setter_vars(
-                    &comp_result.render_cfg,
-                    std::slice::from_ref(&comp_result.param),
-                    &comp_result.block_states,
-                    &comp_result.heap,
-                ),
-                component,
-            );
-
-        let mut all_setter_vars: HashSet<Var> = local_setter_info.names().cloned().collect();
-        all_setter_vars.extend(cs_vars.keys().cloned());
+        // The render's setter call sites, the ones the Tier-A
+        // `render_setter_calls` relation lists too (#281): through local
+        // setters and their aliases (`const s = setN`: a name the table
+        // misses is a call the rule never sees, and a false `verified`,
+        // #176), or through a setter the converged values put behind a name
+        // or member path — a parent's setter prop, or this component's own
+        // read off a value (`t[1]`, a nested or memoized destructuring,
+        // #233) — the table the writer relation reads.
+        let crate::engine::setters::RenderSetterSites {
+            local: local_setter_info,
+            converged: cs_vars,
+            names: all_setter_vars,
+            sites,
+        } = crate::engine::setters::RenderSetterSites::of(comp_result);
 
         if all_setter_vars.is_empty() {
             return vec![];
@@ -121,17 +112,6 @@ impl SetterInRender {
         );
         let members = crate::engine::guards::MemberWrites::of(comp_result);
 
-        // A closure the converged values put behind a called path
-        // (`api.inc()`) runs at the call: its writes are render writes there.
-        let converged = crate::engine::setters::ConvergedFns::of(
-            &comp_result.render_cfg,
-            std::slice::from_ref(&comp_result.param),
-            &comp_result.hooks,
-            &comp_result.hook_provenance,
-            &comp_result.block_states,
-            &comp_result.heap,
-            component,
-        );
         // The runs of the closures the render reaches (#246), made once and
         // only when a site inside one needs them.
         let exit = comp_result.exit_env();
@@ -361,11 +341,7 @@ impl SetterInRender {
         // also be handed to a callee that runs it at any time. A setter is
         // one finding, its first site, the synchronous ones first, that
         // nothing clears.
-        let mut sites = crate::engine::setters::collect_setter_sites_converged(
-            &comp_result.render_cfg,
-            &all_setter_vars,
-            &converged,
-        );
+        let mut sites = sites;
         sites.sort_by_key(|s| s.class != SetterCallPhase::Sync);
         let mut reported: HashSet<Var> = HashSet::new();
         let mut out = Vec::new();

@@ -62,7 +62,7 @@
           ]
         },
         {
-          "description": "Alias-resolved setter calls in the render body.",
+          "description": "The setter calls the render runs, one row per call site, resolved\nthrough aliases and the converged values (`t[1](x)`, `api.setV(x)`).",
           "type": "object",
           "properties": {
             "relation": {
