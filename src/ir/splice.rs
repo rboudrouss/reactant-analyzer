@@ -792,11 +792,13 @@ pub fn rename_hook_entry(entry: HookEntry, ren: &HashMap<Var, Var>) -> HookEntry
             event,
             body_cfg,
             span,
+            dom_event,
         } => HookEntry::Handler {
             label,
             event,
             body_cfg: rename_vars_cfg(body_cfg, ren),
             span,
+            dom_event,
         },
         HookEntry::Custom {
             label,

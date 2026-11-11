@@ -270,7 +270,7 @@ fn a_guarded_toggle_through_an_updater_is_at_most_a_warning() {
 fn severities_of(body: &str) -> Vec<reactant::rules::Severity> {
     infinite_loop_severities(&format!(
         r#"
-        import {{ useState, useEffect }} from "react";
+        import {{ useState, useEffect, useRef }} from "react";
         function C({{ start, on }}) {{
           {body}
         }}
@@ -291,6 +291,10 @@ fn a_counter_is_an_error_like_an_object_churn() {
         "const [n, setN] = useState(0); useEffect(() => setN(n - 2), [n]); return <p>{n}</p>;",
         "const [n, setN] = useState(0); useEffect(() => setN((c) => c + 1), [n]); return <p>{n}</p>;",
         "const [n, setN] = useState(2 ** 50); useEffect(() => setN(n + 1), [n]); return <p>{n}</p>;",
+        // A reset only a click runs cannot stop it: React re-runs the effect
+        // on the new value and it steps again (#280).
+        "const [n, setN] = useState(0); useEffect(() => setN(n + 1), [n]); \
+         return <button onClick={() => setN(0)}>{n}</button>;",
     ] {
         assert_eq!(
             severities_of(body),
@@ -298,12 +302,23 @@ fn a_counter_is_an_error_like_an_object_churn() {
             "{body}"
         );
     }
+    // Two effects stepping the slot the same way: each is the loop.
+    assert_eq!(
+        severities_of(
+            "const [n, setN] = useState(0); useEffect(() => setN(n + 1), [n]); \
+             useEffect(() => setN((c) => c + 2), [n]); return <p>{n}</p>;"
+        ),
+        vec![reactant::rules::Severity::Error; 2]
+    );
 }
 
 /// No Error where the step is not proven to change the slot at every run: a
 /// start past the bound (`n + 1` is `n` from 2^53 on, React settles), one the
-/// analysis cannot read, another write that may restore the slot, a step
-/// that may be 0, one that is not an integer, a second write in the batch.
+/// analysis cannot read, a step that may be 0, one that is not an integer, a
+/// second write in the batch. Nor where another write the program runs by
+/// itself may restore the value a batch started from: a reset on mount, a
+/// write of the value the slot holds, a step the other way, a reset a child
+/// or a ref callback may run, a click handler the program dispatches (#280).
 #[test]
 fn a_step_short_of_the_proof_is_no_error() {
     for body in [
@@ -311,7 +326,18 @@ fn a_step_short_of_the_proof_is_no_error() {
         "const [n, setN] = useState(Infinity); useEffect(() => setN(n + 1), [n]); return <p>{n}</p>;",
         "const [n, setN] = useState(start); useEffect(() => setN(n + 1), [n]); return <p>{n}</p>;",
         "const [n, setN] = useState(0); useEffect(() => setN(n + 1), [n]); \
-         return <button onClick={() => setN(0)}>{n}</button>;",
+         useEffect(() => setN(0), []); return <p>{n}</p>;",
+        "const [n, setN] = useState(0); useEffect(() => setN(n + 1), [n]); \
+         useEffect(() => { if (n === 3) setN(3); }, [n]); return <p>{n}</p>;",
+        "const [n, setN] = useState(0); useEffect(() => setN(n + 1), [n]); \
+         useEffect(() => setN((c) => c - 1), [n]); return <p>{n}</p>;",
+        "const [n, setN] = useState(0); useEffect(() => setN(n + 1), [n]); \
+         return <Child onReset={() => setN(0)} />;",
+        "const [n, setN] = useState(0); useEffect(() => setN(n + 1), [n]); \
+         return <div ref={() => setN(0)}>{n}</div>;",
+        "const [n, setN] = useState(0); const r = useRef(null); \
+         useEffect(() => { setN(n + 1); r.current?.click(); }, [n]); \
+         return <button ref={r} onClick={() => setN(0)}>{n}</button>;",
         "const [n, setN] = useState(0); useEffect(() => setN(n + (on ? 1 : 0)), [n]); return <p>{n}</p>;",
         "const [n, setN] = useState(0); useEffect(() => setN(n + 0.5), [n]); return <p>{n}</p>;",
         "const [n, setN] = useState(0); useEffect(() => { setN(n + 1); setN(n + 2); }, [n]); \

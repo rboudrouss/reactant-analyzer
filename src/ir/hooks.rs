@@ -320,10 +320,46 @@ pub enum HookEntry {
         event: String,
         body_cfg: CFG,
         span: Option<SourceRange>,
+        /// An `on*` prop of a native element: React runs it only when that
+        /// DOM event fires there. Not a native `ref` callback (run at
+        /// commit), nor a function a component element receives (its
+        /// component may call it whenever it runs), nor an
+        /// `addEventListener` callback, whose timing `registrations` decides.
+        dom_event: bool,
     },
 }
 
+/// The DOM events only a user's interaction fires, or a dispatching call
+/// (`click()`, `requestSubmit()`, `dispatchEvent`): no focus event
+/// (`autoFocus` fires one at commit), no hover, scroll or load event.
+const INTERACTION_EVENTS: &[&str] = &[
+    "click",
+    "dblclick",
+    "contextmenu",
+    "mousedown",
+    "mouseup",
+    "pointerdown",
+    "pointerup",
+    "touchstart",
+    "touchend",
+    "keydown",
+    "keyup",
+    "keypress",
+    "input",
+    "change",
+    "submit",
+];
+
 impl HookEntry {
+    /// Does React run this entry's body only on a user's interaction with an
+    /// element the component renders, or on a program's dispatch of it? A
+    /// native element's handler of a click, key, pointer, touch, input,
+    /// change or submit event.
+    pub fn runs_on_interaction(&self) -> bool {
+        matches!(self, HookEntry::Handler { event, dom_event: true, .. }
+            if INTERACTION_EVENTS.contains(&event.as_str()))
+    }
+
     pub fn label(&self) -> HookLabel {
         match self {
             HookEntry::State { label, .. }

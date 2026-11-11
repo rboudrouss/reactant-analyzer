@@ -1868,6 +1868,7 @@ fn collect_handler_info(hooks: &[HookEntry]) -> HashMap<HookLabel, HandlerInfo> 
                 event,
                 body_cfg,
                 span,
+                ..
             } = h
             {
                 Some((
@@ -2655,6 +2656,7 @@ mod tests {
                 event: "click".to_string(),
                 body_cfg: body,
                 span: None,
+                dom_event: true,
             },
         ];
         let comp = component(
@@ -2717,6 +2719,7 @@ mod tests {
                 event: "click".to_string(),
                 body_cfg: body,
                 span: None,
+                dom_event: true,
             },
         ];
         let comp = component(
@@ -2855,6 +2858,7 @@ mod tests {
                 event: "click".to_string(),
                 body_cfg: body,
                 span: None,
+                dom_event: true,
             },
         ];
         let comp = component(
@@ -2923,6 +2927,7 @@ mod tests {
                 event: "click".to_string(),
                 body_cfg: body,
                 span: None,
+                dom_event: true,
             },
         ];
         let comp = component(
@@ -3064,6 +3069,7 @@ mod tests {
                 event: "click".to_string(),
                 body_cfg: h_cfg,
                 span: None,
+                dom_event: true,
             },
         ];
         let render_stmts = vec![
@@ -3109,6 +3115,7 @@ mod tests {
                 event: "click".to_string(),
                 body_cfg: body,
                 span: None,
+                dom_event: true,
             },
         ];
         let comp = component(hooks, vec![]);

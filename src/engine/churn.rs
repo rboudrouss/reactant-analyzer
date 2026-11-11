@@ -32,9 +32,10 @@
 //!   value is a new reference every call (`Change::Must`) ∧ so is every
 //!   other write of y, program-wide: React re-renders on the batch's last
 //!   value, and a later `setY(y)` in the same batch undoes the fresh one
-//!   (#188) — or the write is y's lone step from a bounded start, which
-//!   changes it at every call as surely (`stepping_slots`, #144) — ∧ the
-//!   component stays mounted: every element that mounts it
+//!   (#188) — or every write of y that runs without a user steps it one way
+//!   from a bounded start, which changes it at every call as surely
+//!   (`stepping_slots`, #144, #280) — ∧ the component stays mounted: every
+//!   element that mounts it
 //!   keeps it, and its parent stays in turn (#213). An all-must cycle ⇒
 //!   Error.
 //! - `May`: the dep is merely versioned by x, or the write is conditional,
@@ -102,6 +103,7 @@ use crate::{
             converges_under_all_writes, let_bindings, must_slot_paths, mutated_roots, navigates,
             site_guards,
         },
+        registrations::dispatches_events,
         render_deps::written_names,
         setters::{
             memo_val_labels, must_alias_scopes, must_state_vals, resolve_setter_aliases,
@@ -237,36 +239,61 @@ fn initial_only_slots(result: &ProgramAnalysisResult) -> HashSet<QualifiedSlot> 
         .collect()
 }
 
-/// The slots a lone step write moves at every run (#144): the slot starts at
-/// an integer within ±2^50, its setter reaches nothing the rows do not
-/// describe, and its one write program-wide stores its own read plus an
-/// integer step `δ` with 1 ≤ |δ| ≤ 2^20, once per run of its body. Each run
-/// then moves the slot by at least 1 and at most 2^20, exactly, since the
-/// integers it holds stay below 2^53: it changes under `Object.is` at each of
-/// the first 2^30 runs, far past the 50 nested updates React stops a loop at,
-/// the cutoff a loop claim rests on. A start the bound misses is not
-/// claimed: `n + 1` is `n` from 2^53 on, and at ±∞.
+/// The slots every write of which, in a run with no user input, moves the slot
+/// the same way at every call (#144, #280). The slot starts at an integer
+/// within ±2^50, its setter reaches nothing the rows do not describe, and each
+/// write of it program-wide either stores its own read plus an integer step
+/// `δ`, 1 ≤ |δ| ≤ 2^20, of one sign for all of them, once per run of its body;
+/// or runs only on a user's interaction (`HookEntry::runs_on_interaction`), in
+/// a program that dispatches no event: React with no input, the semantics an
+/// Error is judged by, never runs that one. Value steps start from the
+/// committed value and updaters add to the running one, so a batch moves the
+/// slot strictly one way and no write in it restores where it started; and the
+/// integers it holds stay exact, below 2^51, for 2^30 batches per write, far
+/// past the 50 nested updates React stops a loop at, the cutoff a loop claim
+/// rests on. A start the bound misses is not claimed: `n + 1` is `n` from 2^53
+/// on, and at ±∞.
 fn stepping_slots(result: &ProgramAnalysisResult) -> HashSet<QualifiedSlot> {
     const START: f64 = (1u64 << 50) as f64;
     const STEP: f64 = (1u64 << 20) as f64;
     let within =
         |i: &Interval, lo: f64, hi: f64| i.is_int && !i.is_bottom() && lo <= i.lo && i.hi <= hi;
-    let mut rows: HashMap<QualifiedSlot, Vec<&SlotWriter>> = HashMap::new();
+    // A dispatch runs a handler before it returns, with no user: then none
+    // waits for one (#277 adds the rows of the dispatching component's own).
+    let dispatches = result.components.values().any(|c| {
+        dispatches_events(&c.render_cfg)
+            || c.hooks
+                .iter()
+                .filter_map(HookEntry::body_cfg)
+                .any(dispatches_events)
+    });
+    let user_only = |c: ComponentId, w: &SlotWriter| {
+        !dispatches
+            && matches!(w.region, WriterRegion::Handler(l)
+                if result.components[&c].hooks.iter()
+                    .any(|h| h.label() == l && h.runs_on_interaction()))
+    };
+    let mut rows: HashMap<QualifiedSlot, Vec<(ComponentId, &SlotWriter)>> = HashMap::new();
     for (&c, r) in &result.components {
         for w in &r.slot_writers {
-            rows.entry(node_of(c, w)).or_default().push(w);
+            rows.entry(node_of(c, w)).or_default().push((c, w));
         }
     }
     rows.into_iter()
         .filter(|((owner, label), ws)| {
-            let ([w], Some(r)) = (ws.as_slice(), result.components.get(owner)) else {
+            let Some(r) = result.components.get(owner) else {
                 return false;
             };
-            !w.same_tick
-                && w.written
-                    .step
-                    .is_some_and(|d| within(&d, 1.0, STEP) || within(&d, -STEP, -1.0))
-                && as_arith(&r.state_init.get(*label)).is_some_and(|s| within(&s, -START, START))
+            let steps: Option<Vec<Interval>> = ws
+                .iter()
+                .filter(|(c, w)| !user_only(*c, w))
+                .map(|(_, w)| w.written.step.filter(|_| !w.same_tick))
+                .collect();
+            steps.is_some_and(|ds| {
+                !ds.is_empty()
+                    && (ds.iter().all(|d| within(d, 1.0, STEP))
+                        || ds.iter().all(|d| within(d, -STEP, -1.0)))
+            }) && as_arith(&r.state_init.get(*label)).is_some_and(|s| within(&s, -START, START))
                 && !r.escaping_slots().contains(label)
         })
         .map(|(slot, _)| slot)
@@ -1066,10 +1093,18 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 .collect();
             // A write changes its slot at every call when it stores a new
             // reference, and so does every other write of the slot, or when
-            // it is the slot's lone step from a bounded start (#144).
+            // every write of the slot steps it one way from a bounded start
+            // (#144, #280): this effect's steps then cover every path of it.
             let changes = if stepping.contains(&node) {
-                w.block
-                    .is_some_and(|b| on_all_paths(f.body_cfg, &HashSet::from([b])))
+                let step_blocks: HashSet<BlockId> = f
+                    .writes
+                    .iter()
+                    .filter(|o| node_of(f.comp, o) == node && o.written.step.is_some())
+                    .filter_map(|o| o.block)
+                    .collect();
+                w.written.step.is_some()
+                    && w.block.is_some()
+                    && on_all_paths(f.body_cfg, &step_blocks)
             } else {
                 w.written.change == Change::Must
                     && w.block.is_some()

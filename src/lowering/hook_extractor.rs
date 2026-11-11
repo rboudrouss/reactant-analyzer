@@ -60,6 +60,7 @@ fn collect_subscriptions_in_expr(
             event: event_name.to_string(),
             body_cfg: (**body_cfg).clone(),
             span: stmt_span,
+            dom_event: false,
         });
         collect_subscriptions_in_expr(fn_, stmt_span, out, next_label);
         for arg in args.iter().skip(2) {
@@ -183,6 +184,7 @@ fn collect_handlers_in_expr(
                                     .iter()
                                     .find(|(k, _)| k == name)
                                     .and_then(|(_, s)| *s),
+                                dom_event: is_event_prop(name),
                             });
                         }
                     } else {
@@ -216,6 +218,7 @@ fn collect_handlers_in_expr(
                             // `NativeElem`; the element's own position is the
                             // nearest true one, and beats no position at all.
                             span: *span,
+                            dom_event: false,
                         });
                     } else {
                         collect_handlers_in_expr(val, var_bodies, found, next_label);

@@ -1771,6 +1771,7 @@ mod tests {
                 event: "click".to_string(),
                 body_cfg: setter_cfg("setN"),
                 span: None,
+                dom_event: true,
             },
         ];
         let render_stmts = vec![

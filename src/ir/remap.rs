@@ -342,11 +342,13 @@ fn remap_hook_entry(entry: HookEntry, off: Offsets) -> HookEntry {
             event,
             body_cfg,
             span,
+            dom_event,
         } => HookEntry::Handler {
             label: label + off.labels,
             event,
             body_cfg: remap_cfg(body_cfg, off),
             span,
+            dom_event,
         },
     }
 }
