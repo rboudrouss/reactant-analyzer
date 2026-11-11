@@ -3252,7 +3252,7 @@ fn render_writes(body: &str) -> (Vec<Severity>, Vec<Severity>) {
     .expect("pack must load");
     let src = format!(
         r#"
-        import {{ useReducer, useState }} from "react";
+        import {{ useCallback, useReducer, useState }} from "react";
         function C({{ c }}) {{
             {body}
             return <div/>;
@@ -3352,6 +3352,32 @@ fn a_state_pair_kept_whole_writes_through_its_second_member() {
         ),
     ] {
         assert_eq!(render_writes(body), (vec![want], vec![want]), "{body}");
+    }
+}
+
+/// #284: a name a closure binds to a setter is a setter name in it, so the
+/// render running the closure writes through it: a `setter-in-render`
+/// finding and a row of the relation alike. A Warning: `s` is bound in the
+/// closure, which the certain binding (read in the render) refuses. A
+/// handler's closure is no render write.
+#[test]
+fn a_setter_alias_bound_in_a_closure_the_render_runs_is_a_render_write() {
+    let state = "const [n, setN] = useState(0);";
+    for (body, want) in [
+        (
+            format!("{state} const f = () => {{ const s = setN; s(1); }}; f();"),
+            vec![Severity::Warning],
+        ),
+        (
+            format!("{state} const cb = useCallback(() => {{ const s = setN; s(1); }}, []); cb();"),
+            vec![Severity::Warning],
+        ),
+        (
+            format!("{state} const el = <button onClick={{() => {{ const s = setN; s(1); }}}} />;"),
+            vec![],
+        ),
+    ] {
+        assert_eq!(render_writes(&body), (want.clone(), want), "{body}");
     }
 }
 

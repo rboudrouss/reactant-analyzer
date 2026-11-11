@@ -133,14 +133,15 @@ pub(crate) fn collect_setter_sites_converged(
 }
 
 /// The setter call sites of a component's render, as the converged values see
-/// them (#281): every call the setter walk finds there through a name the
-/// render binds to a setter, or a name or member path the converged values put
-/// one behind (`t.1`, `api.setV`, a parent's setter prop), a closure such a
-/// path holds included. `setter-in-render` judges these sites and the Tier-A
-/// `render_setter_calls` relation lists them: both frontends see one set.
+/// them (#281): every call the setter walk finds there through a name a body
+/// of the component binds to a setter, or a name or member path the converged
+/// values put one behind (`t.1`, `api.setV`, a parent's setter prop), a
+/// closure such a path holds included. `setter-in-render` judges these sites
+/// and the Tier-A `render_setter_calls` relation lists them: both frontends
+/// see one set.
 pub(crate) struct RenderSetterSites {
-    /// The names the render binds to a setter, through aliases (the may
-    /// table).
+    /// The names a body of the component binds to a setter, through aliases
+    /// (the may table, [`all_setter_labels`]).
     pub local: SetterTargets,
     /// The setters the converged values put behind a name or member path.
     pub converged: HashMap<Var, Vec<SetterProp>>,
@@ -154,7 +155,7 @@ pub(crate) struct RenderSetterSites {
 impl RenderSetterSites {
     pub(crate) fn of(comp: &AnalysisResult<StateValue>) -> Self {
         let params = std::slice::from_ref(&comp.param);
-        let local = SetterTargets::bound_in(&comp.render_cfg).resolve(&comp.render_cfg);
+        let local = all_setter_labels(comp);
         let converged = converged_call_targets(
             &collect_component_setter_vars(
                 &comp.render_cfg,
@@ -1243,21 +1244,22 @@ pub(crate) fn must_state_vals(
 /// with `b` in the map gives `a` the same entry, chains included. A name
 /// already in the map keeps its own entry.
 fn resolve_aliases<T: Clone>(cfg: &CFG, base: &HashMap<Var, T>) -> HashMap<Var, T> {
-    resolve_aliases_by(cfg, base, |_, _| false)
+    resolve_aliases_by(&[cfg], base, |_, _| false)
 }
 
-/// [`resolve_aliases`] where a name already in the map takes `merge` of its
-/// entry and the alias's: `merge(entry, fact)` folds `fact` in and says
-/// whether the entry grew.
+/// [`resolve_aliases`] over every body of `bodies` at once, so a chain that
+/// crosses them is closed whatever their order, and where a name already in
+/// the map takes `merge` of its entry and the alias's: `merge(entry, fact)`
+/// folds `fact` in and says whether the entry grew.
 fn resolve_aliases_by<T: Clone>(
-    cfg: &CFG,
+    bodies: &[&CFG],
     base: &HashMap<Var, T>,
     merge: impl Fn(&mut T, &T) -> bool,
 ) -> HashMap<Var, T> {
     let mut map = base.clone();
     loop {
         let mut changed = false;
-        for block in cfg.blocks.values() {
+        for block in bodies.iter().flat_map(|cfg| cfg.blocks.values()) {
             for stmt in &block.stmts {
                 // `let s = setX` and `s = setX` both alias the name — mirror
                 // the interpreter's `bind_rhs`, which treats Let/Assign alike.
@@ -1313,10 +1315,10 @@ impl SetterTargets {
         )
     }
 
-    /// Closed over the aliases `cfg` writes (`let s1 = setX; s2 = s1`, a
+    /// Closed over the aliases `bodies` write (`let s1 = setX; s2 = s1`, a
     /// spliced wrapper's `let setter = setX`), chains included.
-    pub(crate) fn resolve(&self, cfg: &CFG) -> Self {
-        SetterTargets(resolve_aliases_by(cfg, &self.0, |entry, fact| {
+    pub(crate) fn resolve(&self, bodies: &[&CFG]) -> Self {
+        SetterTargets(resolve_aliases_by(bodies, &self.0, |entry, fact| {
             let before = entry.len();
             entry.extend(fact.iter().copied());
             entry.len() > before
@@ -1373,12 +1375,13 @@ impl SetterTargets {
     }
 }
 
-/// Alias-resolved setter targets across the render body and every hook body.
-/// Utility inlining binds setter params via aliases (`let setter = setX`)
-/// inside spliced bodies; rules matching a setter by name must follow those
-/// aliases through every body or a spliced setter call goes unseen (false
-/// negative). The shared recipe of `derived-state`, `state-mutation`,
-/// `stale-closure` and `frozen-initial-state`.
+/// Alias-resolved setter targets across the render body and every body nested
+/// in it or in a hook: the bodies the must-alias table is scoped by
+/// ([`must_alias_scopes`]). Utility inlining binds setter params via aliases
+/// (`let setter = setX`) inside spliced bodies, and a closure the render runs
+/// may bind one itself (`const s = setN` in it, #284); rules matching a setter
+/// by name must follow those aliases through every body or such a call goes
+/// unseen (false negative). The one may table of every setter walk.
 pub(crate) fn all_setter_labels(comp: &AnalysisResult<StateValue>) -> SetterTargets {
     setter_labels_of(&comp.render_cfg, &comp.hooks)
 }
@@ -1386,11 +1389,11 @@ pub(crate) fn all_setter_labels(comp: &AnalysisResult<StateValue>) -> SetterTarg
 /// [`all_setter_labels`] over a render body and its hook table, before they
 /// are an [`AnalysisResult`] — what the fixpoint reads to store its relations.
 pub(crate) fn setter_labels_of(render_cfg: &CFG, hooks: &[HookEntry]) -> SetterTargets {
-    let mut labels = SetterTargets::bound_in(render_cfg);
-    for cfg in std::iter::once(render_cfg).chain(hooks.iter().filter_map(|h| h.body_cfg())) {
-        labels = labels.resolve(cfg);
-    }
-    labels
+    let scopes = must_alias_scopes(render_cfg, hooks);
+    let bodies: Vec<&CFG> = std::iter::once(render_cfg)
+        .chain(scopes.into_iter().map(|(_, body)| body))
+        .collect();
+    SetterTargets::bound_in(render_cfg).resolve(&bodies)
 }
 
 // ── The slot-writer relation (ADR-027 §1) ─────────────────────────────────────

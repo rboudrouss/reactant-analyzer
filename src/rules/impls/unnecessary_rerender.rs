@@ -11,8 +11,7 @@ use crate::{
     },
 };
 
-use crate::engine::setters::SetterTargets;
-use crate::rules::{Diagnostic, Rule, state_slot_name, state_val_labels};
+use crate::rules::{Diagnostic, Rule, all_setter_labels, state_slot_name, state_val_labels};
 
 /// Fires when a mount-only effect (`deps: []`) sets a state to a stable constant
 /// that differs from the state's init value.
@@ -80,8 +79,11 @@ impl Rule for UnnecessaryRerender {
             })
             .collect();
 
-        // Setter var → state label, from the render body's `let setX = useState(...)[1]`.
-        let setter_to_label = SetterTargets::bound_in(&result.render_cfg);
+        // Setter var → state labels, through every alias a body of the
+        // component writes (#284): utility inlining binds a setter param via
+        // an alias `let setter = setX` inside the effect body, so a spliced
+        // `setter(B)` is still a call to the underlying state setter.
+        let setters = all_setter_labels(result);
         let state_names = state_val_labels(&result.render_cfg);
 
         let mut diags = Vec::new();
@@ -100,11 +102,6 @@ impl Rule for UnnecessaryRerender {
                 continue; // only mount-only effects (deps = [])
             }
             let eff_span = result.effect_info.get(eff_label).and_then(|i| i.span);
-
-            // Utility inlining binds a setter param via an alias `let setter = setX`
-            // inside the effect body. Follow such aliases so a spliced `setter(B)`
-            // is still recognised as a call to the underlying state setter.
-            let setters = setter_to_label.resolve(body_cfg);
 
             // Order-independent scan: any const setter call anywhere in a
             // mount-only effect forces the extra render, so a flat pass over
