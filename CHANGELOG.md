@@ -84,6 +84,11 @@ on a program React settles; 323 oracle cases, none a known false negative.
 - `missing-deps`: a spread in a deps list is judged by its elements, a
   `useEffectEvent` value is never a missing dep, a row always has a position.
 - `server-component-hook` no longer lists `useId` and `useDebugValue`.
+- Next's `useSelectedLayoutSegments` is no longer read as held (it returns a
+  new array at each call), and the Pages Router's (`next/router`,
+  `next/compat/router`) `push`, `replace`, `reload`, `back`, `prefetch` and
+  `beforePopState` are navigators with no stable identity: effects that
+  depend on them are reported (#299).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error
