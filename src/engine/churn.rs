@@ -147,6 +147,10 @@ pub struct ChurnEdge {
     /// A dep-driven edge from a slot into itself: the self-churn arm's
     /// partition (ADR-020 item 2). Never part of a cycle the graph reports.
     pub self_slot: bool,
+    /// A must edge whose write changes its slot by a step from a bounded
+    /// start, not by a new reference (`stepping_slots`, #144): what its
+    /// message says the loop rests on.
+    pub stepping: bool,
 }
 
 /// Why an effect re-runs after every render, as the edges it carries say.
@@ -1120,6 +1124,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             } else {
                 EdgeStrength::May
             };
+            let steps = must_write && stepping.contains(&node);
 
             let mut push = |from: QualifiedSlot,
                             strength: EdgeStrength,
@@ -1136,6 +1141,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                         write_span: w.span,
                         always: always.cloned(),
                         self_slot,
+                        stepping: steps && strength == EdgeStrength::Must,
                     },
                 );
             };
@@ -1252,6 +1258,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                         write_span: w.span,
                         always: None,
                         self_slot: false,
+                        stepping: false,
                     },
                 );
             }

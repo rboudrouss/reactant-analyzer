@@ -171,6 +171,7 @@ mod row_tests {
             write_span,
             always: None,
             self_slot: false,
+            stepping: false,
         }
     }
 

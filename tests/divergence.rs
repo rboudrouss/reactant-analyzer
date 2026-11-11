@@ -162,6 +162,14 @@ fn bounded_string_set_is_clean() {
 
 /// The severities `infinite-loop` reports over `src`.
 fn infinite_loop_severities(src: &str) -> Vec<reactant::rules::Severity> {
+    infinite_loop_findings(src)
+        .into_iter()
+        .map(|(s, _)| s)
+        .collect()
+}
+
+/// The severity and message of each `infinite-loop` finding over `src`.
+fn infinite_loop_findings(src: &str) -> Vec<(reactant::rules::Severity, String)> {
     let alloc = Allocator::default();
     let ret = Parser::new(&alloc, src, SourceType::tsx())
         .with_options(ParseOptions::default())
@@ -181,7 +189,7 @@ fn infinite_loop_severities(src: &str) -> Vec<reactant::rules::Severity> {
             InfiniteLoop
                 .check(&RuleCtx::new(&prog, prog.component_named(&name).unwrap()))
                 .into_iter()
-                .map(|d| d.severity())
+                .map(|d| (d.severity(), d.message))
                 .collect::<Vec<_>>()
         })
         .collect()
@@ -301,6 +309,10 @@ fn a_counter_is_an_error_like_an_object_churn() {
          useEffect(() => { const next = n + 1; setN(next); }, [n]); return <p>{n}</p>;",
         "const [n, setN] = useState(0); const next = n + 1; \
          useEffect(() => setN(next), [n]); return <p>{n}</p>;",
+        // An updater passed by name: the fixpoint does not widen the slot,
+        // and the churn arm that owns the proven edge reports it (#280).
+        "const [n, setN] = useState(0); const inc = (c) => c + 1; \
+         useEffect(() => setN(inc), [n]); return <p>{n}</p>;",
     ] {
         assert_eq!(
             severities_of(body),
@@ -315,6 +327,44 @@ fn a_counter_is_an_error_like_an_object_churn() {
              useEffect(() => setN((c) => c + 2), [n]); return <p>{n}</p>;"
         ),
         vec![reactant::rules::Severity::Error; 2]
+    );
+}
+
+/// A proven loop says what it rests on, whichever arm reports its edge: a
+/// counter a step from a bounded start, with deps or without, an object
+/// churn a fresh reference (#280).
+#[test]
+fn a_proven_loop_says_what_it_rests_on() {
+    let error_saying = |body: &str, words: &str| {
+        let found = infinite_loop_findings(&format!(
+            r#"
+            import {{ useState, useEffect }} from "react";
+            function C() {{
+              {body}
+            }}
+            "#
+        ));
+        assert!(
+            matches!(found.as_slice(), [(reactant::rules::Severity::Error, m)] if m.contains(words)),
+            "{body}: {found:?}"
+        );
+    };
+    let step = "by a step from a bounded start";
+    error_saying(
+        "const [n, setN] = useState(0); useEffect(() => setN(n + 1), [n]); return <p>{n}</p>;",
+        step,
+    );
+    error_saying(
+        "const [n, setN] = useState(0); useEffect(() => setN(n + 1)); return <p>{n}</p>;",
+        step,
+    );
+    error_saying(
+        "const [o, setO] = useState({}); useEffect(() => setO({}), [o]); return <p />;",
+        "fresh reference",
+    );
+    error_saying(
+        "const [o, setO] = useState({}); useEffect(() => setO({})); return <p />;",
+        "fresh reference",
     );
 }
 

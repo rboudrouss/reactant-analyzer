@@ -138,35 +138,30 @@ impl Rule for InfiniteLoop {
                         if comp_result.diverges(state_label).is_none() {
                             continue; // the cycle bounded the slot
                         }
+                        // A self-loop the churn graph proves is the arm's that
+                        // owns its edge, with the proof and its wording (#280):
+                        // this one only reads that the slot widened.
+                        if matches!(
+                            must_self_churn(&graph.edges, component, *eff_label, state_label),
+                            MustResult::All(_)
+                        ) {
+                            continue;
+                        }
 
                         let deps_note = if deps.is_declared() {
                             " (its deps do not provably gate it, so the effect can re-run every render)"
                         } else {
                             ""
                         };
-                        let slot = state_slot_name(state_label, ctx.source_names(), &state_names);
-                        let proof =
-                            must_self_churn(&graph.edges, component, *eff_label, state_label);
-                        let mut diag = match proof {
-                            // The churn graph proves the write changes the
-                            // slot at every run and re-runs the effect (#144).
-                            MustResult::All(proof) => Diagnostic::error(
-                                "infinite-loop",
-                                proof,
-                                format!(
-                                    "this effect changes state {slot} at every run, and each \
-                                     change re-runs it: infinite render loop"
-                                ),
-                            ),
-                            _ => Diagnostic::warn(
-                                "infinite-loop",
-                                format!(
-                                    "this effect keeps pushing state {}{} to new values \
+                        let mut diag = Diagnostic::warn(
+                            "infinite-loop",
+                            format!(
+                                "this effect keeps pushing state {}{} to new values \
                              on every run. Potential infinite render loop",
-                                    slot, deps_note
-                                ),
+                                state_slot_name(state_label, ctx.source_names(), &state_names),
+                                deps_note
                             ),
-                        }
+                        )
                         .with_label(state_label);
 
                         if let Some(r) = comp_result.effect_info.get(eff_label).and_then(|i| i.span)
@@ -373,17 +368,15 @@ fn check_multi_effect_cycles(
                     )
                 }
             } else if let (Some((why, _)), true) = (&always, certain) {
-                format!(
-                    "this effect {why} and stores a fresh reference into state \
-                     {to_name}, so it re-runs after every render and re-triggers \
-                     itself: infinite render loop"
-                )
+                proven_self_loop(e.stepping, &to_name, Some(why))
             } else if let Some((why, reruns)) = &always {
                 format!(
                     "this effect {why} and may store a fresh reference into state \
                      {to_name}, so it {reruns} after every render and can \
                      re-trigger itself: possible infinite render loop"
                 )
+            } else if cyc.len() == 1 && certain && e.stepping {
+                proven_self_loop(true, &to_name, None)
             } else if cyc.len() == 1 && certain {
                 format!(
                     "this effect stores a fresh reference into state {to_name} \
@@ -395,6 +388,12 @@ fn check_multi_effect_cycles(
                     "this effect may store a fresh reference into state {to_name} \
                      which its own deps react to, so the re-render can run it again: \
                      possible infinite render loop"
+                )
+            } else if certain && cyc.iter().any(|e| e.stepping) {
+                format!(
+                    "these effects form a state-update cycle ({path}) where each \
+                     step changes the slot the next effect re-runs on, at every \
+                     run: infinite render loop"
                 )
             } else if certain {
                 format!(
@@ -510,6 +509,33 @@ fn always_clause(
     (clause, if surely { "re-runs" } else { "may re-run" })
 }
 
+/// The message of a proven self-loop, built here for whichever arm reports
+/// its edge (#280): an effect whose write changes the slot it re-runs on at
+/// every run, by a new reference or by a step from a bounded start
+/// (`ChurnEdge::stepping`). `why` says why an effect re-runs after every
+/// render; `None` is one that depends on the slot.
+fn proven_self_loop(stepping: bool, state: &str, why: Option<&str>) -> String {
+    match (stepping, why) {
+        (false, None) => format!(
+            "this effect recreates object state {state} it depends on. Every run stores a \
+             fresh reference (`Object.is` always fails) and re-triggers itself: infinite \
+             render loop"
+        ),
+        (false, Some(why)) => format!(
+            "this effect {why} and stores a fresh reference into state {state}, so it \
+             re-runs after every render and re-triggers itself: infinite render loop"
+        ),
+        (true, None) => format!(
+            "this effect moves state {state} it depends on by a step from a bounded start, \
+             so every run changes it and re-triggers itself: infinite render loop"
+        ),
+        (true, Some(why)) => format!(
+            "this effect {why} and moves state {state} by a step from a bounded start, so \
+             it re-runs after every render and re-triggers itself: infinite render loop"
+        ),
+    }
+}
+
 // ── Object-churn arm (ADR-017) ────────────────────────────────────────────────
 //
 // `useEffect(() => setObj({...obj}), [obj])` never widens: the reference slot
@@ -518,7 +544,8 @@ fn always_clause(
 // slot itself must-changes when its setter stores a must-fresh reference.
 //
 // Stratification (Error = all-must, per the diagnostic doctrine):
-// - Error:   dep is slot X exactly ∧ setX(fresh) on ALL paths of the body
+// - Error:   dep is slot X exactly ∧ setX(fresh, or a step from a bounded
+//            start, #280) on ALL paths of the body
 // - Warning: dep versioned by X (alias/memo/field) ∧ body may-call setX(fresh?)
 // - Info:    effect deps on object state but freshly sets a DIFFERENT object
 //            state — cross-effect cycles are not analyzed (FN-flavor limit)
@@ -567,11 +594,13 @@ fn check_object_churn(
 
         // Strongest verdict per state label.
         // Best churn finding per slot: (severity, call span, Error proof,
-        // whether the effect stores a new reference into the slot).
+        // whether the effect stores a new reference into the slot, whether
+        // the proven loop rests on a step instead).
         type ChurnBest = (
             Severity,
             Option<SourceRange>,
             Option<Certified<OnAllPaths>>,
+            bool,
             bool,
         );
         let mut best: HashMap<HookLabel, ChurnBest> = HashMap::new();
@@ -586,15 +615,19 @@ fn check_object_churn(
             };
             let allocates = rows().any(|w| w.written.change == Change::Must);
             let (sev, churn_proof) = if e.self_slot {
-                // The Error anchors on the fresh write being on all paths —
+                // The Error anchors on the changing write being on all paths
+                // — a new reference, or a step when the edge rests on one —
                 // re-derived from the writer rows and minted by the
                 // must-primitive, never trusted from the edge's own strength.
-                let fresh_blocks: HashSet<BlockId> = rows()
-                    .filter(|w| w.written.change == Change::Must)
+                let changing_blocks: HashSet<BlockId> = rows()
+                    .filter(|w| match e.stepping {
+                        true => w.written.step.is_some(),
+                        false => w.written.change == Change::Must,
+                    })
                     .filter_map(|w| w.block)
                     .collect();
-                if e.strength == EdgeStrength::Must && !fresh_blocks.is_empty() {
-                    match must_on_all_paths(body_cfg, &fresh_blocks) {
+                if e.strength == EdgeStrength::Must && !changing_blocks.is_empty() {
+                    match must_on_all_paths(body_cfg, &changing_blocks) {
                         MustResult::All(c) => (Severity::Error, Some(c)),
                         _ => (Severity::Warning, None),
                     }
@@ -629,11 +662,14 @@ fn check_object_churn(
                 }
             };
             if replace {
-                best.insert(state_label, (sev, e.write_span, churn_proof, allocates));
+                best.insert(
+                    state_label,
+                    (sev, e.write_span, churn_proof, allocates, e.stepping),
+                );
             }
         }
 
-        for (state_label, (sev, call_span, proof, allocates)) in best {
+        for (state_label, (sev, call_span, proof, allocates, stepping)) in best {
             // One report per effect, as in the cycle arm: an effect the
             // fixpoint arm flagged keeps that report, unless this arm holds
             // the stronger, proven verdict.
@@ -645,11 +681,10 @@ fn check_object_churn(
                 (Severity::Error, Some(proof)) => Diagnostic::error(
                     "infinite-loop",
                     proof,
-                    format!(
-                        "this effect recreates object state {state} it depends on. \
-                         Every run stores a fresh reference (`Object.is` always fails) \
-                         and re-triggers itself: infinite render loop",
-                        state = state_slot_name(state_label, ctx.source_names(), &state_vals)
+                    proven_self_loop(
+                        stepping,
+                        &state_slot_name(state_label, ctx.source_names(), &state_vals),
+                        None,
                     ),
                 ),
                 (Severity::Info, _) if allocates => Diagnostic::info(
