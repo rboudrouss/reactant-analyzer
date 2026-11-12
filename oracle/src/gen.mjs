@@ -245,8 +245,11 @@ function genWrite(r, p, env, where) {
     arg = genExpr(r, env, w.type, 2);
   }
   const async = where === "effect" || where === "callback";
-  // Callback props the parent may leave undefined: `on0?.(setS0(…))` runs the
-  // write only when `on0` is passed (#301).
+  // An optional call whose callee may be nullish skips its arguments, so
+  // `f?.(setS0(…))` runs the write only when `f` is there (#301). The callee is
+  // `ext`'s `absent` (undefined at run time, in any component), `ext`'s `format`
+  // (a function: the write runs), or a callback prop the parent may leave
+  // undefined (only in a child).
   const maybeAbsent = env.writers.filter((x) => x.kind === "propfn" && x.optional && x !== w);
   const wrap = r.weighted([
     [10, "plain"],
@@ -259,7 +262,7 @@ function genWrite(r, p, env, where) {
     [1, "runNow"],
     [async ? 1 : 0, "defer"],
     [w.type === "num" && w.kind === "setter" && arg.kind !== "updater" ? 2 : 0, "helper"],
-    [maybeAbsent.length ? 6 : 0, "optarg"],
+    [5, "optarg"],
   ]);
   if (wrap === "helper") {
     let h = p.helpers.find((x) => x.kind === "bump" && r.chance(0.5));
@@ -272,7 +275,7 @@ function genWrite(r, p, env, where) {
   }
   const s = { kind: "write", target: w.name, arg, wrap };
   if (wrap === "and" || wrap === "ternary") s.cond = genExpr(r, env, "bool", 1);
-  if (wrap === "optarg") s.via = r.pick(maybeAbsent).name;
+  if (wrap === "optarg") s.via = r.weighted([[4, "absent"], [2, "format"], ...maybeAbsent.map((x) => [2, x.name])]);
   // `on0?.(…)`, `runNow?.(() => …)`: an optional call whose callee is never
   // nullish here, or a callback prop the parent may leave undefined.
   if (w.kind === "propfn") s.optional = w.optional || r.chance(0.15);

@@ -6,7 +6,7 @@ import { joinFiles, ENTRY } from "./files.mjs";
 
 const REACT = ["useState", "useEffect", "useLayoutEffect", "useReducer", "useMemo", "useCallback", "useRef"];
 // The package the analyzer cannot see into (react-run.mjs).
-const EXT = ["defer", "runNow"];
+const EXT = ["defer", "runNow", "format", "absent"];
 
 const fileOf = (x) => x.file ?? ENTRY;
 

@@ -35,9 +35,12 @@ export const IN_LOOP = 10;
  * `defer` in a microtask, like `Promise.then`; neither is a timer. `format` is
  * a function of its argument, which the analyzer cannot know (#224).
  * `useRun(x)` is a hook from that package: after every commit it calls `x`,
- * or each function member of `x` (#254).
+ * or each function member of `x` (#254). `absent` is an export that is
+ * `undefined` at run time (an optional export a package version lacks):
+ * `absent?.(f())` never runs `f` (#301).
  */
 const EXT = {
+  absent: undefined,
   runNow: (cb) => cb(),
   defer: (cb) => void Promise.resolve().then(cb),
   format: (x) => `<${x}>`,
