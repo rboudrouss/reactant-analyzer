@@ -180,6 +180,14 @@ export function expr(e, ctx = 0) {
       const s = `${expr(e.l, p)} ${e.op} ${expr(e.r, p + 1)}`;
       return p < ctx ? `(${s})` : s;
     }
+    case "coalesce": {
+      // Parenthesized beside `&&` / `||` (which `??` may not mix with), as an
+      // operand, and as a concise arrow body.
+      const s = `${expr(e.l, 3)} ?? ${expr(e.r, 3)}`;
+      return ctx > 1 || ctx === ARROW_BODY ? `(${s})` : s;
+    }
+    case "optcall":
+      return `${e.fn}?.(${e.args.map((a) => expr(a)).join(", ")})`;
     case "not":
       return `!${expr(e.e, 8)}`;
     case "cond": {

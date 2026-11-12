@@ -300,6 +300,7 @@ function genExpr(r, env, type, depth, fresh = false, prefer = null) {
 }
 
 function grow(r, env, type, base, depth) {
+  if (type !== "bool" && r.chance(0.08)) return coalesce(r, env, type, base, depth);
   switch (type) {
     case "num":
       return r.weighted([
@@ -330,6 +331,21 @@ function grow(r, env, type, base, depth) {
         [1, base],
       ]);
   }
+}
+
+// `l ?? d` (#303): the kept side holds neither `null` nor `undefined`. The
+// left side is a value that is never nullish (`base`), `ext`'s `absent`
+// (always undefined), an optional call of `absent` (skipped: undefined) or of
+// `format` (a string), or a ternary that may be `undefined` or `null`.
+function coalesce(r, env, type, base, depth) {
+  const l = r.weighted([
+    [2, () => base],
+    [1, () => v("absent")],
+    [1, () => ({ kind: "optcall", fn: "absent", args: [genExpr(r, env, "num", 0)] })],
+    [type === "str" ? 2 : 0, () => ({ kind: "optcall", fn: "format", args: [genExpr(r, env, "num", 0)] })],
+    [2, () => ({ kind: "cond", c: genExpr(r, env, "bool", 0), t: base, f: { kind: r.pick(["undefined", "null"]) } })],
+  ])();
+  return { kind: "coalesce", l, r: genExpr(r, env, type, depth - 1, true) };
 }
 
 function literal(r, env, type, depth) {
