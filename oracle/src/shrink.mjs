@@ -9,10 +9,10 @@
 // requires a valid run, and the edit is rejected. The validity check is the
 // semantics, not a second, hand-kept model of scoping.
 
-const EXPR = new Set(["num", "str", "bool", "null", "var", "member", "bin", "not", "cond", "fcall", "obj", "arr", "arrow"]);
+const EXPR = new Set(["num", "str", "bool", "null", "undefined", "var", "member", "bin", "not", "cond", "fcall", "obj", "arr", "arrow"]);
 const STMT = new Set(["write", "helpercall", "call", "if", "refset"]);
 const NULLABLE = new Set(["cleanup", "key", "cond", "spread"]);
-const PLAIN = { wrap: "plain", layout: false, lazy: false, file: "App.tsx" };
+const PLAIN = { wrap: "plain", layout: false, lazy: false, file: "App.tsx", optional: false, wrapOptional: false };
 
 const sortOf = (n) => (EXPR.has(n.kind) ? "expr" : STMT.has(n.kind) ? "stmt" : n.kind);
 

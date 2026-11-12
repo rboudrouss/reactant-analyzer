@@ -287,6 +287,10 @@ carries an Error.
   setter, each name certainly the slot's object (a render name bound to the read, a sole local
   binding, an updater's untouched parameter); a mutation and a set inside one statement, or a
   handler's local alias read from a closure nested in it, stay Warnings [#180](https://github.com/rboudrouss/reactant-analyzer/issues/180).
+- **Optional chains** branch on every `?.` link that skips a call or an index, even when the left
+  side is never nullish (`setN?.(x)`, a local function, a callback prop every parent passes): a
+  write in the skipped part is a possible one, a Warning, not an Error
+  [#301](https://github.com/rboudrouss/reactant-analyzer/issues/301).
 - **The churn graph** keeps a cycle edge on a convergent slot when the proof cannot read what
   would settle it: a write site in another component, whose guards live in that component's
   bodies (the residual of [#39](https://github.com/rboudrouss/reactant-analyzer/issues/39)); a

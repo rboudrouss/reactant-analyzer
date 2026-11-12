@@ -14,7 +14,9 @@ use crate::{
         types::{BlockId, ExprId},
     },
     lowering::JsxOrigins,
-    lowering::expr_lower::{assign_target_ident, empty_cfg, lower_expr, property_name, rest_copy},
+    lowering::expr_lower::{
+        assign_target_ident, empty_cfg, lower_expr, lower_expr_stmt, property_name, rest_copy,
+    },
 };
 
 // ── Allocation-site ids ───────────────────────────────────────────────────────
@@ -287,8 +289,7 @@ fn lower_stmt(stmt: &Statement, builder: &mut BlockBuilder) {
             }
         }
         Statement::ExpressionStatement(es) => {
-            let expr = lower_expr(&es.expression, builder);
-            builder.push_stmt(Stmt::ExprStmt(expr, builder.span_at(es.span.start)));
+            lower_expr_stmt(&es.expression, builder.span_at(es.span.start), builder);
         }
         Statement::ReturnStatement(ret) => {
             let expr = ret

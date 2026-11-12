@@ -102,6 +102,10 @@ on a program React settles; 323 oracle cases, none a known false negative.
   then hands that same object to its setter; a mutation and a set on exclusive
   branches, in different handlers, in a loop or a callback are a Warning that
   says the write-back is possible (#180).
+- An optional chain skips its rest when a `?.` link is nullish: a write in an
+  optional call's arguments, after `a?.b`, or in an index (`cb?.(setN(n + 1))`,
+  `ref.current?.x(setN(…))`) is a possible write, a Warning where it was a
+  false Error (#301).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

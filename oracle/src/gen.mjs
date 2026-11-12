@@ -76,8 +76,11 @@ function genComp(r, p, name, isApp) {
     for (let i = 0; i < n; i++) {
       const type = r.weighted([[4, "num"], [2, "fn"], [1, "obj"], [1, "str"]]);
       const pname = type === "fn" ? `on${i}` : `p${i}`;
-      comp.props.push({ name: pname, type });
-      if (type === "fn") env.writers.push({ name: pname, type: "num", kind: "propfn" });
+      // An optional callback prop: the parent may leave it undefined, and
+      // every call of it is `on0?.(…)` (#301).
+      const optional = type === "fn" && r.chance(0.5);
+      comp.props.push({ name: pname, type, optional });
+      if (type === "fn") env.writers.push({ name: pname, type: "num", kind: "propfn", optional });
       else env.reads.push({ e: v(pname), type });
     }
   }
@@ -226,7 +229,7 @@ function genStmt(r, p, env, where, depth) {
       return { kind: "refset", ref, value: genExpr(r, env, "num", 1) };
     }
     case "call":
-      return { kind: "call", target: r.pick(env.fns), arg: genExpr(r, env, "num", 1) };
+      return { kind: "call", target: r.pick(env.fns), arg: genExpr(r, env, "num", 1), optional: r.chance(0.2) };
     default:
       return null;
   }
@@ -242,6 +245,9 @@ function genWrite(r, p, env, where) {
     arg = genExpr(r, env, w.type, 2);
   }
   const async = where === "effect" || where === "callback";
+  // Callback props the parent may leave undefined: `on0?.(setS0(…))` runs the
+  // write only when `on0` is passed (#301).
+  const maybeAbsent = env.writers.filter((x) => x.kind === "propfn" && x.optional && x !== w);
   const wrap = r.weighted([
     [10, "plain"],
     [2, "and"],
@@ -253,6 +259,7 @@ function genWrite(r, p, env, where) {
     [1, "runNow"],
     [async ? 1 : 0, "defer"],
     [w.type === "num" && w.kind === "setter" && arg.kind !== "updater" ? 2 : 0, "helper"],
+    [maybeAbsent.length ? 6 : 0, "optarg"],
   ]);
   if (wrap === "helper") {
     let h = p.helpers.find((x) => x.kind === "bump" && r.chance(0.5));
@@ -265,6 +272,11 @@ function genWrite(r, p, env, where) {
   }
   const s = { kind: "write", target: w.name, arg, wrap };
   if (wrap === "and" || wrap === "ternary") s.cond = genExpr(r, env, "bool", 1);
+  if (wrap === "optarg") s.via = r.pick(maybeAbsent).name;
+  // `on0?.(…)`, `runNow?.(() => …)`: an optional call whose callee is never
+  // nullish here, or a callback prop the parent may leave undefined.
+  if (w.kind === "propfn") s.optional = w.optional || r.chance(0.15);
+  if (wrap === "runNow" || wrap === "defer") s.wrapOptional = r.chance(0.2);
   return s;
 }
 
@@ -346,7 +358,7 @@ function genView(r, p, comp, env) {
   const n = below.length ? r.weighted([[2, 0], [4, 1], [2, 2]]) : 0;
   for (let i = 0; i < n; i++) {
     const child = r.pick(below);
-    const props = child.props.map((pr) => [pr.name, propValue(r, env, pr.type)]);
+    const props = child.props.map((pr) => [pr.name, propValue(r, env, pr)]);
     children.push({
       kind: "child",
       comp: child.name,
@@ -358,12 +370,24 @@ function genView(r, p, comp, env) {
   return { kind: "el", tag: "div", children };
 }
 
-function propValue(r, env, type) {
+function propValue(r, env, prop) {
+  const type = prop.type;
   if (type !== "fn") return genExpr(r, env, type, 1);
   const setters = env.writers.filter((w) => w.type === "num" && w.kind !== "propfn");
-  const passthrough = env.writers.filter((w) => w.kind === "propfn");
-  const c = r.weighted([[setters.length ? 4 : 0, "setter"], [setters.length ? 3 : 0, "arrow"], [env.fns.length ? 1 : 0, "cb"], [passthrough.length ? 1 : 0, "pass"], [1, "noop"]]);
+  // A prop the parent may itself have left undefined goes only where the
+  // child calls it through `?.`.
+  const passthrough = env.writers.filter((w) => w.kind === "propfn" && (prop.optional || !w.optional));
+  const c = r.weighted([
+    [setters.length ? 4 : 0, "setter"],
+    [setters.length ? 3 : 0, "arrow"],
+    [env.fns.length ? 1 : 0, "cb"],
+    [passthrough.length ? 1 : 0, "pass"],
+    [1, "noop"],
+    [prop.optional ? 2 : 0, "absent"],
+  ]);
   switch (c) {
+    case "absent":
+      return { kind: "undefined" };
     case "setter":
       return v(r.pick(setters).name);
     case "arrow": {
