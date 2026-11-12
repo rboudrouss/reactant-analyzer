@@ -42,12 +42,13 @@ use crate::{
         guards::{call_may_differ, site_guards, write_settles_member},
         render_deps::{Deps, Source},
         setters::{memo_val_labels, resolve_setter_aliases},
+        store::STORE_SLOT,
     },
     ir::{
         ComponentId, QualifiedSlot,
         bindings::{binding_of, must_slot_read},
         cfg::{CFG, Terminator},
-        expr::{Expr, MarkerVal, SummaryValue, mutation_receiver},
+        expr::{Expr, mutation_receiver},
         hooks::{Arity, DepsArg, HookEntry},
         stmt::{MemberKey, Stmt},
         types::{BlockId, HookLabel, Var},
@@ -167,7 +168,6 @@ pub(crate) fn collect_effect_triggers(
         props: HashSet::new(),
     };
     let mut refs_move: HashMap<(HookLabel, bool), bool> = HashMap::new();
-    let held_hooks = held_hook_labels(render_cfg);
     for hook in hooks {
         // A memo's deps list gates its body exactly as an effect's does: React
         // compares both lists the same way, at the same render (#249).
@@ -276,19 +276,19 @@ pub(crate) fn collect_effect_triggers(
                 // into hands back, which may be a new reference at every
                 // render (#294: holding it still was an assumption, and a
                 // hook returning a fresh object per call loops). A summary
-                // that pins the result keeps it: through the value
-                // (`by_identity`, `held`), or the router hooks' values that
-                // move on navigation alone (`held_hooks`). A source a function value
-                // only captures is not read here: the function's identity,
-                // not the cell, is compared.
+                // that pins the result keeps it, through the value
+                // (`by_identity`, `held`). A held result is a read of the
+                // store (ADR-046): a row on the store slot, which moves when a
+                // body writes it. A source a function value only captures is
+                // not read here: the function's identity, not the cell, is
+                // compared.
                 if src.top
                     || (src.impure && call_may_differ(&val, |_| true, true))
                     || src.set.iter().any(|s| {
                         !src.captured.contains(s)
                             && match s {
                                 Source::Ref(l) => moving_ref(*l),
-                                Source::Hook(l) => !held_hooks.contains(l),
-                                Source::Module(_) | Source::Context(_) => true,
+                                Source::Hook(_) | Source::Module(_) | Source::Context(_) => true,
                                 _ => false,
                             }
                     })
@@ -297,6 +297,7 @@ pub(crate) fn collect_effect_triggers(
                 }
                 slots.extend(src.set.iter().filter_map(|s| match s {
                     Source::Slot(l) => Some((component, *l)),
+                    Source::Store => Some(STORE_SLOT),
                     _ => None,
                 }));
                 // What a prop is computed from lives in a parent, which may
@@ -326,21 +327,6 @@ pub(crate) fn collect_effect_triggers(
         };
         out.reruns.insert(*label, class);
     }
-    out
-}
-
-/// The hooks whose summary says the result moves only on navigation, which
-/// the automatic loop cannot raise (`SummaryValue::Held`, the router hooks,
-/// #161): the one hook result a re-run class may read as held (#294).
-fn held_hook_labels(render_cfg: &CFG) -> HashSet<HookLabel> {
-    fn walk(e: &Expr, out: &mut HashSet<HookLabel>) {
-        if let Expr::HookMarker(l, MarkerVal::Summary(SummaryValue::Held)) = e {
-            out.insert(*l);
-        }
-        e.for_each_child(&mut |c| walk(c, out));
-    }
-    let mut out = HashSet::new();
-    render_cfg.for_each_expr(&mut |e| walk(e, &mut out));
     out
 }
 

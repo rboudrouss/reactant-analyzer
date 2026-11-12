@@ -1,9 +1,8 @@
 // oracle: react=loop
-// oracle: known=fn #298
 // react-router's real `useLocation` and `useNavigate`: `navigate` pushes a new
 // location, so `location` is a new object after every commit and the effect on
-// `[location]` runs again, for ever. The analyzer does not see the navigation
-// as a write to the location the effect depends on (#298).
+// `[location]` runs again, for ever. The navigation writes the store the
+// effect's dep reads (#298).
 import { useEffect, useState } from "react";
 import { MemoryRouter, useLocation, useNavigate } from "react-router";
 

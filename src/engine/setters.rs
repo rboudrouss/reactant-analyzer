@@ -16,6 +16,7 @@ use crate::{
     engine::{
         AnalysisResult,
         dominance::on_all_paths,
+        store::STORE_SLOT,
         timing::ArgTiming,
         written::{self, ClosureEnv, SiteEnvs, Written},
     },
@@ -231,6 +232,7 @@ fn setter_calls(
         read_vars: &NO_VARS,
         wrappers: &wrappers,
         path: Vec::new(),
+        store_scopes: None,
     };
     walk.cfg(cfg, WALK_DEPTH, &mut found, WalkClass::Sync, None, None);
     let mut found = found.setters;
@@ -310,6 +312,8 @@ pub(crate) struct WriteSite {
 ///
 /// `dispatches`: some body of the program fires event listeners itself
 /// ([`SetterWalk::dispatches`]).
+///
+/// The same walk places the writes of the store (ADR-046), the second list.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_write_sites(
     cfg: &CFG,
@@ -320,7 +324,7 @@ pub(crate) fn collect_write_sites(
     outer_fns: &HashMap<Var, Arc<CFG>>,
     converged: &ConvergedFns<'_>,
     callback_bodies: &HashMap<HookLabel, Arc<CFG>>,
-) -> Vec<WriteSite> {
+) -> (Vec<WriteSite>, Vec<StoreSite>) {
     let mut found = Found::default();
     let wrappers = wrapper_callees(cfg);
     let mut fn_bindings = collect_fn_bindings(cfg);
@@ -360,9 +364,10 @@ pub(crate) fn collect_write_sites(
         read_vars: &NO_VARS,
         wrappers: &wrappers,
         path: Vec::new(),
+        store_scopes: Some(vec![crate::ir::bindings::local_bindings(converged.render)]),
     };
     walk.cfg(cfg, WALK_DEPTH, &mut found, WalkClass::Sync, None, None);
-    found
+    let setters = found
         .setters
         .into_iter()
         .map(|s| WriteSite {
@@ -377,7 +382,8 @@ pub(crate) fn collect_write_sites(
             applied: s.applied,
             through: s.through,
         })
-        .collect()
+        .collect();
+    (setters, found.stores)
 }
 
 /// One variable that denotes a state setter, and how surely.
@@ -1534,7 +1540,8 @@ pub struct SlotWriter {
     /// so a reader that resolves it against this component's tables names an
     /// unrelated slot (ADR-030 §3); every native reader filters on `owner`.
     /// A foreign row is a may-write: the prop may be a closure that merely
-    /// carries the setter.
+    /// carries the setter. `Some(ComponentId::STORE)`: a write of the store
+    /// (ADR-046), whose `setter` is how the source spells the mover.
     pub owner: Option<ComponentId>,
     /// The block of the region's CFG the write runs in, for a write that runs
     /// synchronously in the region, once per pass — what `must_on_all_paths`
@@ -1550,6 +1557,13 @@ pub struct SlotWriter {
     pub guard_block: Option<BlockId>,
     /// What the write stores (ADR-042 §2).
     pub written: Written,
+}
+
+impl SlotWriter {
+    /// A write of the store (ADR-046), not of any component's slot.
+    pub fn writes_store(&self) -> bool {
+        self.owner == Some(ComponentId::STORE)
+    }
 }
 
 /// Provenance of one write site (ADR-027 §4).
@@ -2008,7 +2022,10 @@ pub(crate) fn collect_slot_writers(
     };
 
     let mut out: Vec<SlotWriter> = Vec::new();
-    let push_sites = |region: WriterRegion, cfg: &CFG, out: &mut Vec<SlotWriter>| {
+    let push_sites = |region: WriterRegion,
+                      cfg: &CFG,
+                      out: &mut Vec<SlotWriter>,
+                      stores: &mut Vec<SlotWriter>| {
         let (cfg_key, hook_origin) = match region {
             WriterRegion::Render => (None, None),
             WriterRegion::Effect(l)
@@ -2031,7 +2048,7 @@ pub(crate) fn collect_slot_writers(
             add_converged(&mut targets, &own);
         }
         let setter_vars: HashSet<Var> = targets.keys().cloned().collect();
-        let mut sites = collect_write_sites(
+        let (mut sites, store_sites) = collect_write_sites(
             cfg,
             &setter_vars,
             effect_body,
@@ -2091,6 +2108,26 @@ pub(crate) fn collect_slot_writers(
                 None
             }
         };
+        // Where a site is authored (ADR-027 §4): the inlined hook's origin and
+        // the splice regions its block sits in, else where the names it went
+        // through are defined. A site with no placeable block, and none of
+        // those, never claims Direct; the defensive entry-graft poisons Direct
+        // in the render CFG (fail-closed).
+        let via_of = |prov: Option<BlockId>, through: &[Var]| {
+            let mut chain: Vec<Symbol> = hook_origin.into_iter().cloned().collect();
+            match prov {
+                Some(b) => chain.extend(regions.chain(cfg_key, b)),
+                None if chain.is_empty() => return WriteProvenance::Unknown,
+                None => {}
+            }
+            if !chain.is_empty() {
+                WriteProvenance::Via(chain)
+            } else if cfg_key.is_none() && regions.render_poisoned {
+                WriteProvenance::Unknown
+            } else {
+                authored(cfg, cfg_key, through)
+            }
+        };
         for (site, target, sole) in sites.into_iter().flat_map(|s| {
             let ts = targets.get(&s.var).cloned().unwrap_or_default();
             let sole = matches!(ts.as_slice(), [t] if t.sure);
@@ -2145,49 +2182,13 @@ pub(crate) fn collect_slot_writers(
                     |e| bound(e, at),
                 ),
             };
-            let via = {
-                let mut chain: Vec<Symbol> = hook_origin.into_iter().cloned().collect();
-                match site.prov_block {
-                    Some(b) => chain.extend(regions.chain(cfg_key, b)),
-                    // No placeable block — never claim Direct on it.
-                    None if chain.is_empty() => {
-                        out.push(SlotWriter {
-                            slot,
-                            setter: site.var,
-                            span: site.span,
-                            region,
-                            phase: class_phase(site.class, region),
-                            via: WriteProvenance::Unknown,
-                            updater,
-                            same_tick,
-                            owner,
-                            block,
-                            guard_block: site.prov_block,
-                            written,
-                        });
-                        continue;
-                    }
-                    None => {}
-                }
-                if chain.is_empty() {
-                    // The defensive entry-graft poisons Direct in the render
-                    // CFG (fail-closed).
-                    if cfg_key.is_none() && regions.render_poisoned {
-                        WriteProvenance::Unknown
-                    } else {
-                        authored(cfg, cfg_key, &site.through)
-                    }
-                } else {
-                    WriteProvenance::Via(chain)
-                }
-            };
             out.push(SlotWriter {
                 slot,
+                via: via_of(site.prov_block, &site.through),
                 setter: site.var,
                 span: site.span,
                 region,
                 phase: class_phase(site.class, region),
-                via,
                 updater,
                 same_tick,
                 owner,
@@ -2196,9 +2197,31 @@ pub(crate) fn collect_slot_writers(
                 written,
             });
         }
+        // A write of the store is a may-write of a slot no component owns
+        // (ADR-046): ⊤ value, never `Must`, never killed — a foreign row.
+        for site in store_sites {
+            let at = (site.class == WalkClass::Sync && !site.repeats)
+                .then_some(site.at)
+                .flatten();
+            stores.push(SlotWriter {
+                slot: STORE_SLOT.1,
+                via: via_of(site.prov_block, &site.through),
+                setter: site.callee,
+                span: site.span,
+                region,
+                phase: class_phase(site.class, region),
+                updater: Updater::Unknown,
+                same_tick: false,
+                owner: Some(ComponentId::STORE),
+                block: at.map(|(b, _)| b),
+                guard_block: site.prov_block,
+                written: written::carried(),
+            });
+        }
     };
 
-    push_sites(WriterRegion::Render, render_cfg, &mut out);
+    let mut stores: Vec<SlotWriter> = Vec::new();
+    push_sites(WriterRegion::Render, render_cfg, &mut out, &mut stores);
     for hook in hooks {
         let (region, body) = match hook {
             HookEntry::Effect {
@@ -2215,21 +2238,23 @@ pub(crate) fn collect_slot_writers(
             } => (WriterRegion::Handler(*label), body_cfg),
             _ => continue,
         };
-        push_sites(region, body, &mut out);
+        push_sites(region, body, &mut out, &mut stores);
     }
 
-    out.sort_by(|a, b| {
-        let key = |w: &SlotWriter| {
-            (
-                w.slot,
-                w.region,
-                w.phase,
-                w.span.map_or((u32::MAX, u32::MAX), |s| s.pos_key()),
-                w.setter.clone(),
-            )
-        };
-        key(a).cmp(&key(b))
-    });
+    let key = |w: &SlotWriter| {
+        (
+            w.slot,
+            w.region,
+            w.phase,
+            w.span.map_or((u32::MAX, u32::MAX), |s| s.pos_key()),
+            w.setter.clone(),
+        )
+    };
+    out.sort_by_key(key);
+    // The store's rows come after every slot's, in the same order.
+    stores.sort_by_key(key);
+    stores.dedup_by(|a, b| key(a) == key(b) && a.via == b.via && a.block == b.block);
+    out.extend(stores);
     out
 }
 
@@ -2300,6 +2325,10 @@ struct SetterWalk<'a> {
     /// it. Each site keeps a copy: a write inside a closure is authored where
     /// the closure is defined, which a name can carry out of its region.
     path: Vec<Var>,
+    /// Also record the writes of the store (ADR-046): the bindings of every
+    /// body on the walk's stack, the render's first, which a mover's name is
+    /// resolved through. `None` for every consumer that does not ask.
+    store_scopes: Option<Vec<HashMap<&'a str, Vec<&'a Expr>>>>,
 }
 
 /// No bindings to record reads for — every setter consumer.
@@ -2388,6 +2417,9 @@ struct Found {
     setters: Vec<FoundSite>,
     calls: Vec<FoundCall>,
     reads: Vec<FoundRead>,
+    /// The writes of the store (ADR-046), filled only when the walk carries
+    /// [`SetterWalk::store_scopes`].
+    stores: Vec<StoreSite>,
 }
 
 impl Found {
@@ -2431,7 +2463,36 @@ impl Found {
                 ..read
             });
         }
+        for store in inner.stores {
+            let sync = store.class == WalkClass::Sync;
+            let every_call = store
+                .at
+                .is_some_and(|(b, _)| on_all_paths(body, &HashSet::from([b])));
+            self.stores.push(StoreSite {
+                class: if sync { mode } else { store.class },
+                at: if sync && every_call { at } else { None },
+                prov_block: prov,
+                ..store
+            });
+        }
     }
+}
+
+/// One write of the store the walk saw (ADR-046): a call
+/// [`store::call_writes`](crate::engine::store::call_writes) says writes it,
+/// a `<Navigate/>`, a `location` member write. Its fields mean what a setter
+/// site's do ([`WriteSite`]).
+#[derive(Debug, Clone)]
+pub(crate) struct StoreSite {
+    /// How the source spells the write (`router.push(…)`, `<Navigate/>`,
+    /// `location.href = …`).
+    pub callee: String,
+    pub span: Option<SourceRange>,
+    pub class: WalkClass,
+    pub prov_block: Option<BlockId>,
+    pub at: Option<(BlockId, usize)>,
+    pub repeats: bool,
+    pub through: Vec<Var>,
 }
 
 /// One raw read site of a tracked binding the walk saw (#127).
@@ -2742,8 +2803,53 @@ impl<'a> SetterWalk<'a> {
         witness: Option<SourceRange>,
     ) {
         let outer = std::mem::replace(&mut self.body, cfg as *const CFG as usize);
+        if let Some(scopes) = &mut self.store_scopes {
+            scopes.push(crate::ir::bindings::local_bindings(cfg));
+        }
         self.cfg_body(cfg, depth, found, mode, prov, witness);
+        if let Some(scopes) = &mut self.store_scopes {
+            scopes.pop();
+        }
         self.body = outer;
+    }
+
+    /// Record a write of the store at this site, when the walk records them.
+    #[allow(clippy::too_many_arguments)]
+    fn store_site(
+        &self,
+        callee: String,
+        found: &mut Found,
+        mode: WalkClass,
+        span: Option<SourceRange>,
+        at: Option<(BlockId, usize)>,
+        prov: Option<BlockId>,
+    ) {
+        found.stores.push(StoreSite {
+            callee,
+            span,
+            class: mode,
+            prov_block: prov,
+            at,
+            repeats: self.repeating,
+            through: self.path.clone(),
+        });
+    }
+
+    /// Does calling `fn_` write the store, its names resolved through every
+    /// body on the walk's stack? `false` when the walk does not record them.
+    fn writes_store(&self, fn_: &'a Expr) -> bool {
+        let Some(scopes) = &self.store_scopes else {
+            return false;
+        };
+        let bound = |v: &str| -> Vec<&'a Expr> {
+            scopes
+                .iter()
+                .filter_map(|s| s.get(v))
+                .flatten()
+                .copied()
+                .collect()
+        };
+        crate::engine::store::call_writes(fn_, &bound)
     }
 
     /// [`Self::cfg`], with `self.body` set to `cfg`.
@@ -2920,6 +3026,13 @@ impl<'a> SetterWalk<'a> {
         // `state.items.push(x)` reads `state`: the receiver of a member write
         // is the one read position the rhs does not carry.
         if let Stmt::MemberWrite { obj, key, .. } = stmt {
+            if self.store_scopes.is_some() && crate::engine::store::member_write_writes(obj) {
+                let target = match key {
+                    crate::ir::stmt::MemberKey::Field(f) => format!("{}.{f}", obj.describe()),
+                    crate::ir::stmt::MemberKey::Index(_) => format!("{}[…]", obj.describe()),
+                };
+                self.store_site(format!("{target} = …"), found, mode, span, at, prov);
+            }
             self.expr(obj, span, at, depth, found, mode, at_root, prov);
             if let crate::ir::stmt::MemberKey::Index(idx) = key {
                 self.expr(idx, span, at, depth, found, mode, at_root, prov);
@@ -2965,6 +3078,18 @@ impl<'a> SetterWalk<'a> {
         });
         for child in children {
             self.expr(child, stmt_span, at, depth, found, mode, at_root, prov);
+        }
+        // A visible mover writes the store wherever it is written (ADR-046).
+        match expr {
+            Expr::Call { fn_, .. } if self.writes_store(fn_) => {
+                self.store_site(expr.describe(), found, mode, stmt_span, at, prov);
+            }
+            Expr::CompApp { name, .. }
+                if self.store_scopes.is_some() && crate::engine::store::element_writes(name) =>
+            {
+                self.store_site(format!("<{name}/>"), found, mode, stmt_span, at, prov);
+            }
+            _ => {}
         }
         // `new X(cb)` runs its arguments through the same machinery: a
         // `Promise` executor runs synchronously, and a class the body binds
@@ -3451,6 +3576,7 @@ pub fn collect_slot_reads(render_cfg: &CFG, hooks: &[HookEntry]) -> Vec<SlotRead
             read_vars: &vars,
             wrappers: &NO_WRAPPERS,
             path: Vec::new(),
+            store_scopes: None,
         };
         walk.cfg(cfg, 2, &mut found, WalkClass::Sync, None, None);
         for r in found.reads {
@@ -3533,6 +3659,7 @@ pub fn collect_body_calls(cfg: &CFG, region: WriterRegion) -> Vec<BodyCall> {
         read_vars: &NO_VARS,
         wrappers: &NO_WRAPPERS,
         path: Vec::new(),
+        store_scopes: None,
     };
     walk.cfg(cfg, WALK_DEPTH, &mut found, WalkClass::Sync, None, None);
     let mut rows: Vec<BodyCall> = found

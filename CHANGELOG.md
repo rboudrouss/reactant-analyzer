@@ -89,6 +89,12 @@ on a program React settles; 323 oracle cases, none a known false negative.
   `next/compat/router`) `push`, `replace`, `reload`, `back`, `prefetch` and
   `beforePopState` are navigators with no stable identity: effects that
   depend on them are reported (#299).
+- An effect that depends on a router hook's held value (`useLocation`, Next's
+  `useSearchParams`, …) and navigates — through `navigate`, `router.push`, the
+  `useSearchParams` setter, a `<Navigate/>`, in any phase but a handler — is
+  reported as a possible loop (Warning); so is one that depends on a memo over
+  such a value, and a loop through two components. The URL is one store slot
+  the analysis does not own (ADR-046, #298).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

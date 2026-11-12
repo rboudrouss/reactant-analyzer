@@ -377,11 +377,13 @@ fn names_unbound(
 ///
 /// A hook whose summary says its result moves only on navigation — the
 /// router's `useSearchParams`, `useParams`, `usePathname`, `useLocation` —
-/// holds too, unless some effect body of the program visibly navigates
-/// (#161): a URL changes through a navigation call or a user event, and
-/// the loop can raise only the former. A member of an object literal holds
-/// when the member does, which is how a value an inlined custom hook hands
-/// back inside `{ searchParams }` keeps what the hook knew.
+/// holds too, unless some body of the program the loop can run visibly
+/// writes the store (#161, ADR-046): a URL changes through a navigation call
+/// or a user event, and the loop can raise only the former. It holds only
+/// while its hook's arguments do: the result moves with them. A member of an
+/// object literal holds when the member does, which is how a value an
+/// inlined custom hook hands back inside `{ searchParams }` keeps what the
+/// hook knew.
 pub struct Invariance<'a> {
     /// The render's bindings ([`let_bindings`]).
     pub render: &'a HashMap<&'a str, Option<&'a Expr>>,
@@ -391,12 +393,15 @@ pub struct Invariance<'a> {
     pub memo_deps: &'a HashMap<HookLabel, &'a [Expr]>,
     /// The names some body of the component writes or mutates.
     pub mutated: &'a HashSet<Var>,
-    /// Some effect, memo or callback body of the program visibly navigates
-    /// (`navigates`), so a navigation-held value may move inside the loop.
-    pub navigates: bool,
+    /// Some body of the program the loop can run writes the store
+    /// (`churn::build_edges`), so a held value may move inside the loop.
+    pub store_moves: bool,
+    /// The render arguments of each hook call a summary answers for, by the
+    /// marker's label: what a held result moves with besides the store.
+    pub hook_args: &'a HashMap<HookLabel, &'a [Expr]>,
 }
 
-impl Invariance<'_> {
+impl<'a> Invariance<'a> {
     /// Does `e`, read in a body with `bindings`, denote the same value on
     /// every run? `props_hold` is false across an edge from another
     /// component's slot, whose change is what moves this component's props.
@@ -458,7 +463,10 @@ impl Invariance<'_> {
         out: &mut Reads,
         seen: &mut HashSet<&'e str>,
         depth: usize,
-    ) -> bool {
+    ) -> bool
+    where
+        'a: 'e,
+    {
         if depth == 0 {
             return false;
         }
@@ -579,11 +587,37 @@ impl Invariance<'_> {
                     seen,
                 )
             }
-            Expr::HookMarker(_, MarkerVal::Summary(sv)) | Expr::SummaryVal(sv) => {
-                matches!(sv, SummaryValue::Held) && !self.navigates
+            // A held value reads nothing the loop moves while the store holds
+            // still, beyond what its hook's arguments read, in the render.
+            Expr::HookMarker(l, MarkerVal::Summary(sv)) => {
+                matches!(sv, SummaryValue::Held)
+                    && !self.store_moves
+                    && self.hook_args.get(l).is_some_and(|args| {
+                        all(&mut args.iter(), &scopes[scopes.len() - 1..], out, seen)
+                    })
             }
+            Expr::SummaryVal(sv) => matches!(sv, SummaryValue::Held) && !self.store_moves,
             _ => false,
         }
+    }
+
+    /// Does the held summary `sv` of the hook call `label` hold? Only while
+    /// the store does not move and its arguments, read in the render, hold.
+    /// A summary value no call labels has no arguments to read.
+    fn summary_holds(
+        &self,
+        sv: &SummaryValue,
+        label: Option<HookLabel>,
+        props_hold: bool,
+        depth: usize,
+    ) -> bool {
+        matches!(sv, SummaryValue::Held)
+            && !self.store_moves
+            && label.is_none_or(|l| {
+                self.hook_args
+                    .get(&l)
+                    .is_some_and(|args| args.iter().all(|a| self.go(a, None, props_hold, depth)))
+            })
     }
 
     fn go(
@@ -615,7 +649,7 @@ impl Invariance<'_> {
             Expr::MemoVal(l) | Expr::CallbackVal(l) => self.memo_holds(*l, props_hold, next),
             Expr::FieldAccess { obj, field } => match self.member(obj, field, body) {
                 Some(Member::Expr(member, scope)) => self.go(member, scope, props_hold, next),
-                Some(Member::Summary(sv)) => matches!(sv, SummaryValue::Held) && !self.navigates,
+                Some(Member::Summary(sv, l)) => self.summary_holds(sv, Some(l), props_hold, next),
                 None => self.go(obj, body, props_hold, next),
             },
             Expr::IndexAccess { arr, idx } => {
@@ -625,8 +659,8 @@ impl Invariance<'_> {
                 };
                 match member {
                     Some(Member::Expr(member, scope)) => self.go(member, scope, props_hold, next),
-                    Some(Member::Summary(sv)) => {
-                        matches!(sv, SummaryValue::Held) && !self.navigates
+                    Some(Member::Summary(sv, l)) => {
+                        self.summary_holds(sv, Some(l), props_hold, next)
                     }
                     None => {
                         self.go(arr, body, props_hold, next) && self.go(idx, body, props_hold, next)
@@ -641,9 +675,10 @@ impl Invariance<'_> {
                 self.go(fn_, body, props_hold, next)
                     && args.iter().all(|a| self.go(a, body, props_hold, next))
             }
-            Expr::HookMarker(_, MarkerVal::Summary(sv)) | Expr::SummaryVal(sv) => {
-                matches!(sv, SummaryValue::Held) && !self.navigates
+            Expr::HookMarker(l, MarkerVal::Summary(sv)) => {
+                self.summary_holds(sv, Some(*l), props_hold, next)
             }
+            Expr::SummaryVal(sv) => self.summary_holds(sv, None, props_hold, next),
             // State, memos, callbacks, other hooks, allocations, elements.
             _ => false,
         }
@@ -700,10 +735,10 @@ impl Invariance<'_> {
             Expr::ObjectLit { fields, .. } => {
                 object_member(fields, field).map(|m| Member::Expr(m, scope))
             }
-            Expr::HookMarker(_, MarkerVal::Summary(SummaryValue::Shape { members, .. })) => members
+            Expr::HookMarker(l, MarkerVal::Summary(SummaryValue::Shape { members, .. })) => members
                 .iter()
                 .find(|(k, _)| k == field)
-                .map(|(_, sv)| Member::Summary(sv)),
+                .map(|(_, sv)| Member::Summary(sv, *l)),
             _ => None,
         }
     }
@@ -712,139 +747,8 @@ impl Invariance<'_> {
 /// What [`Invariance::member`] resolves a member read to.
 enum Member<'e> {
     Expr(&'e Expr, Option<&'e Bindings<'e>>),
-    Summary(&'e SummaryValue),
-}
-
-/// Does `body` visibly navigate: call a function a summary names a
-/// [`SummaryValue::Navigator`] (`useNavigate()`, `router.push`, the setter
-/// of `useSearchParams`), a router or history method by name, a bare
-/// `navigate`/`redirect`, render a `<Navigate/>`, or write `location`?
-/// Nested closures included — a redirect sits in a continuation as often as
-/// in the body. `render` is what the render binds: the navigator is bound
-/// there and called here. A navigation hidden in an opaque callee is not
-/// seen, the assumption [`Invariance`] already makes of every call.
-pub(crate) fn navigates(body: &CFG, render: &HashMap<&str, Vec<&Expr>>) -> bool {
-    const RECEIVERS: &[&str] = &[
-        "router",
-        "history",
-        "navigation",
-        "location",
-        "window",
-        "document",
-    ];
-    const METHODS: &[&str] = &[
-        "push",
-        "replace",
-        "navigate",
-        "assign",
-        "reload",
-        "pushState",
-        "replaceState",
-        "back",
-        "forward",
-        "go",
-    ];
-    const BARE: &[&str] = &["navigate", "redirect"];
-    const ELEMENTS: &[&str] = &["Navigate", "Redirect"];
-    fn root(e: &Expr) -> Option<&str> {
-        e.root_var().map(String::as_str)
-    }
-    struct Scan<'a> {
-        body: HashMap<&'a str, Vec<&'a Expr>>,
-        render: &'a HashMap<&'a str, Vec<&'a Expr>>,
-    }
-    impl Scan<'_> {
-        /// Is `e` a spelling of a navigator, through the bindings?
-        fn navigator(&self, e: &Expr, depth: usize) -> bool {
-            if depth == 0 {
-                return false;
-            }
-            match e.peel_ts() {
-                Expr::HookMarker(_, MarkerVal::Summary(sv)) | Expr::SummaryVal(sv) => {
-                    matches!(sv, SummaryValue::Navigator { .. })
-                }
-                Expr::Var(v) => self
-                    .body
-                    .get(v.as_str())
-                    .or_else(|| self.render.get(v.as_str()))
-                    .is_some_and(|rhss| rhss.iter().any(|r| self.navigator(r, depth - 1))),
-                Expr::FieldAccess { obj, field } => {
-                    matches!(
-                        self.shape_member(obj, field, depth - 1),
-                        Some(SummaryValue::Navigator { .. })
-                    )
-                }
-                Expr::IndexAccess { arr, idx } => {
-                    matches!(idx.peel_ts(), Expr::Lit(Prim::Int(i))
-                        if matches!(self.shape_member(arr, &i.to_string(), depth - 1), Some(SummaryValue::Navigator { .. })))
-                }
-                _ => false,
-            }
-        }
-        /// The summary of member `field` of the shaped hook result `e` names.
-        fn shape_member<'e>(
-            &'e self,
-            e: &'e Expr,
-            field: &str,
-            depth: usize,
-        ) -> Option<&'e SummaryValue> {
-            if depth == 0 {
-                return None;
-            }
-            match e.peel_ts() {
-                Expr::HookMarker(_, MarkerVal::Summary(SummaryValue::Shape { members, .. })) => {
-                    members.iter().find(|(k, _)| k == field).map(|(_, v)| v)
-                }
-                Expr::Var(v) => self
-                    .body
-                    .get(v.as_str())
-                    .or_else(|| self.render.get(v.as_str()))
-                    .and_then(|rhss| {
-                        rhss.iter()
-                            .find_map(|r| self.shape_member(r, field, depth - 1))
-                    }),
-                _ => None,
-            }
-        }
-        fn expr(&self, e: &Expr) -> bool {
-            match e {
-                Expr::Call { fn_, .. } => {
-                    if self.navigator(fn_, 8) {
-                        return true;
-                    }
-                    match fn_.peel_ts() {
-                        Expr::Var(v) if BARE.contains(&v.as_str()) => return true,
-                        Expr::FieldAccess { obj, field }
-                            if METHODS.contains(&field.as_str())
-                                && root(obj).is_some_and(|r| RECEIVERS.contains(&r)) =>
-                        {
-                            return true;
-                        }
-                        _ => {}
-                    }
-                }
-                Expr::CompApp { name, .. } if ELEMENTS.contains(&name.as_str()) => return true,
-                Expr::FnLit { body_cfg, .. } => return navigates(body_cfg, self.render),
-                _ => {}
-            }
-            let mut found = false;
-            e.for_each_child(&mut |c| found |= self.expr(c));
-            found
-        }
-    }
-    let scan = Scan {
-        body: local_bindings(body),
-        render,
-    };
-    let mut found = false;
-    body.for_each_expr(&mut |e| found |= scan.expr(e));
-    found
-        || body.blocks.values().any(|b| {
-            b.stmts.iter().any(|s| {
-                matches!(s, Stmt::MemberWrite { obj, .. }
-                    if root(obj).is_some_and(|r| RECEIVERS[3..].contains(&r)))
-            })
-        })
+    /// A shaped hook result's member, with the label of the hook call.
+    Summary(&'e SummaryValue, HookLabel),
 }
 
 /// The names a body binds ([`let_bindings`]).

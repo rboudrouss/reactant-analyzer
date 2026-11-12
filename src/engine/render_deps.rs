@@ -45,7 +45,7 @@ use crate::engine::{
 };
 use crate::ir::{
     cfg::{CFG, Terminator},
-    expr::{CompOrigin, Expr, Prim, SPREAD_KEY_PREFIX, mutation_receiver},
+    expr::{CompOrigin, Expr, MarkerVal, Prim, SPREAD_KEY_PREFIX, SummaryValue, mutation_receiver},
     free_vars::{collect_used_vars, compute_free_vars},
     hooks::HookEntry,
     source_range::SourceRange,
@@ -87,6 +87,11 @@ pub enum Source {
     /// every component, which is what lets it be carried down the element
     /// tree untranslated.
     Module(Var),
+    /// A whole held hook result (`SummaryValue::Held`): a read of the store
+    /// slot, which moves only when a body writes it (ADR-046). Frame-free like
+    /// `Module`; every reader but the trigger relation reads it as a source
+    /// outside the model, as it reads `Hook`.
+    Store,
 }
 
 /// The module names a function value may write when called: an assignment,
@@ -965,12 +970,20 @@ impl<'a> Analyzer<'a> {
             Expr::Var(v) => self.var(env, v),
             Expr::StateVal(l) => DVal::of(Deps::one(Source::Slot(*l))),
             Expr::StateSetter(l) => DVal::of(Deps::one(Source::Setter(*l))),
-            Expr::HookMarker(l, _) => match self.kinds.get(l) {
+            Expr::HookMarker(l, marker) => match self.kinds.get(l) {
                 Some(HookKind::Ref) => DVal::of(Deps::one(Source::Ref(*l))),
                 // An opaque hook's result may be computed from its arguments,
                 // like any call's (`useContext(Ctx)` reads `Ctx`'s value).
                 Some(HookKind::Custom) | None => {
-                    let mut d = Deps::one(Source::Hook(*l));
+                    // A held result reads the store, and moves with its
+                    // arguments too: an argument computed through an unknown
+                    // call may move it at every render (ADR-046).
+                    let held = matches!(marker, MarkerVal::Summary(SummaryValue::Held));
+                    let mut d = Deps::one(if held {
+                        Source::Store
+                    } else {
+                        Source::Hook(*l)
+                    });
                     let mut kind = Kind::Unknown;
                     if let Some(HookEntry::Custom {
                         args,
@@ -988,7 +1001,9 @@ impl<'a> Analyzer<'a> {
                     // an argument computed through an unknown call adds
                     // nothing to that, and nothing to a function that only
                     // captures the result (#161).
-                    d.impure = false;
+                    if !held {
+                        d.impure = false;
+                    }
                     DVal::of_kind(d, kind)
                 }
                 _ => DVal::empty(),

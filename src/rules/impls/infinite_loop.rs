@@ -14,7 +14,8 @@ use crate::{
 
 use crate::engine::setters::SetterCallPhase;
 use crate::engine::{
-    Always, Change, ChurnEdge, ChurnGraph, EdgeStrength, EveryRender, Rerun, WriterRegion,
+    Always, Carrier, Change, ChurnEdge, ChurnGraph, EdgeStrength, EveryRender, Rerun, STORE_SLOT,
+    WriterRegion,
 };
 use crate::ir::ComponentId;
 use crate::rules::api::query::must_effect_cycle;
@@ -233,16 +234,22 @@ fn check_multi_effect_cycles(
             if e.component != component {
                 continue;
             }
-            if e.to.0 == component {
-                covered.insert((e.effect_label, e.to.1));
+            // A render carries an edge into the store, never a report.
+            let Some(effect_label) = e.carrier.effect() else {
+                continue;
+            };
+            // A cycle through the store adds to what the self-churn arm
+            // reports, it does not stand in for it.
+            if e.to.0 == component && !cycle.store {
+                covered.insert((effect_label, e.to.1));
             }
-            if reported_effects.contains(&e.effect_label) {
+            if reported_effects.contains(&effect_label) {
                 continue; // the cross arm already flagged this effect
             }
             // One report per effect: a swap's two writes are two edges of one
             // cycle in one effect. Cycles come must-first, so the kept report
             // is the strongest.
-            if !cycle_reported.insert(e.effect_label) {
+            if !cycle_reported.insert(effect_label) {
                 continue;
             }
 
@@ -262,6 +269,8 @@ fn check_multi_effect_cycles(
             // The wording follows the proof, not `all_must`: a cross-component
             // cycle can be all-must and still carry no proof (Warning).
             let certain = cycle_proof.is_some();
+            // Nothing that rests on a may-write of the store is proven.
+            debug_assert!(!(certain && cycle.store), "a store cycle is never certain");
             let to_name = node_display(&e.to, component, result, &mut names);
             // A step that may only change a primitive is not a fresh reference.
             let allocates = |e: &ChurnEdge| {
@@ -270,7 +279,7 @@ fn check_multi_effect_cycles(
                     .iter()
                     .any(|w| {
                         w.span == e.write_span
-                            && w.region == WriterRegion::Effect(e.effect_label)
+                            && Some(w.region) == e.carrier.effect().map(WriterRegion::Effect)
                             && w.written.change == Change::Must
                     })
             };
@@ -279,8 +288,22 @@ fn check_multi_effect_cycles(
                 .always
                 .as_ref()
                 .filter(|_| cyc.len() == 1)
-                .map(|a| always_clause(a, result, e.component, e.effect_label));
-            let msg = if !certain && !cyc.iter().all(|e| allocates(e)) {
+                .map(|a| always_clause(a, result, e.component, effect_label));
+            // How the source spells the write of the store this edge rests on.
+            let store_callee = (e.to == STORE_SLOT).then(|| {
+                comp_result
+                    .slot_writers
+                    .iter()
+                    .find(|w| {
+                        w.writes_store()
+                            && w.span == e.write_span
+                            && w.region == WriterRegion::Effect(effect_label)
+                    })
+                    .map_or_else(|| "a store writer".to_string(), |w| w.setter.clone())
+            });
+            let msg = if let (Some(callee), 1) = (&store_callee, cyc.len()) {
+                store_self_loop(comp_result, effect_label, callee, always.as_ref())
+            } else if !certain && !cyc.iter().all(|e| allocates(e)) {
                 if let Some((why, reruns)) = &always {
                     format!(
                         "this effect {why} and may change state {to_name}, so it \
@@ -345,17 +368,20 @@ fn check_multi_effect_cycles(
                 Some(proof) => Diagnostic::error(rule, proof, msg),
                 None => Diagnostic::warn(rule, msg),
             }
-            .with_label(e.effect_label);
+            .with_label(effect_label);
             if let Some(r) = comp_result
                 .effect_info
-                .get(&e.effect_label)
+                .get(&effect_label)
                 .and_then(|i| i.span)
             {
                 diag = diag.with_range(r);
             }
             if let Some(r) = e.write_span {
-                diag = diag.with_step(
-                    crate::rules::Step::Write {
+                let step = match &store_callee {
+                    Some(callee) => crate::rules::Step::StoreWrite {
+                        callee: callee.clone(),
+                    },
+                    None => crate::rules::Step::Write {
                         slot: e.to.1,
                         value: if allocates(e) {
                             crate::rules::ValueClass::Fresh
@@ -363,7 +389,10 @@ fn check_multi_effect_cycles(
                             crate::rules::ValueClass::Unknown
                         },
                     },
-                    Some(e.effect_label),
+                };
+                diag = diag.with_step(
+                    step,
+                    Some(effect_label),
                     Some(r),
                     // Qualified display (may name a parent component's slot).
                     &ctx.names(&|_| to_name.clone()),
@@ -371,7 +400,7 @@ fn check_multi_effect_cycles(
             }
             // Point at the cycle's other steps living in this component.
             for other in &cyc {
-                if other.effect_label == e.effect_label || other.component != component {
+                if other.carrier == e.carrier || other.component != component {
                     continue;
                 }
                 let other_from = node_display(&other.from, component, result, &mut names);
@@ -381,7 +410,7 @@ fn check_multi_effect_cycles(
                         from: other_from,
                         to: other_to,
                     },
-                    Some(other.effect_label),
+                    other.carrier.effect(),
                     other.write_span,
                     &ctx.names(&crate::rules::api::witness::fallback_name),
                 );
@@ -439,6 +468,49 @@ fn always_clause(
         ),
     };
     (clause, if surely { "re-runs" } else { "may re-run" })
+}
+
+/// The message of a loop through the store alone (ADR-046): effect `label`
+/// may write the store through `callee` and re-runs when it moves — on a dep
+/// a library store holds, or after every render (`always`).
+fn store_self_loop(
+    comp: &crate::engine::AnalysisResult<crate::domains::StateValue>,
+    label: HookLabel,
+    callee: &str,
+    always: Option<&(String, &'static str)>,
+) -> String {
+    if let Some((why, reruns)) = always {
+        return format!(
+            "this effect {why} and may write a library store (`{callee}`), so it \
+             {reruns} after every render and no write of it is proven to settle: possible \
+             infinite render loop"
+        );
+    }
+    let dep = comp
+        .effect_triggers
+        .iter()
+        .find(|t| t.hook == label && t.slot == STORE_SLOT)
+        .and_then(|t| {
+            comp.hooks.iter().find_map(|h| match h {
+                HookEntry::Effect { label: l, deps, .. } if *l == label => deps
+                    .list()
+                    .and_then(|d| d.as_slice().get(t.dep))
+                    .map(|e| e.describe()),
+                _ => None,
+            })
+        });
+    match dep {
+        Some(dep) => format!(
+            "this effect depends on `{dep}`, which moves with a library store, and may \
+             write that store (`{callee}`), so it may re-run after its own write: \
+             possible infinite render loop"
+        ),
+        None => format!(
+            "this effect may re-run when a library store changes and may write that store \
+             (`{callee}`), so it may re-run after its own write: possible infinite render \
+             loop"
+        ),
+    }
 }
 
 /// The message of a proven self-loop, built here for whichever arm reports
@@ -518,7 +590,7 @@ fn check_object_churn(
         // the graph arm's, like the self-edge of an effect with no array.
         let edges = graph.edges.iter().filter(|e| {
             e.component == component
-                && e.effect_label == *eff_label
+                && e.carrier == Carrier::Effect(*eff_label)
                 && e.always.is_none()
                 && e.from.0 == component
                 && e.to.0 == component

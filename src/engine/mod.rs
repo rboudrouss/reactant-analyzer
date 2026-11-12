@@ -18,6 +18,7 @@ pub mod render_deps;
 pub mod root_detector;
 pub mod seeds;
 pub mod setters;
+pub mod store;
 pub mod symbol_graph;
 pub mod timing;
 pub mod triggers;
@@ -28,7 +29,7 @@ pub use analysis_result::{
     WidenEvent,
 };
 pub use cfg_analyzer::analyze_cfg;
-pub use churn::{ChurnCycle, ChurnEdge, ChurnGraph, EdgeStrength, EveryRender};
+pub use churn::{Carrier, ChurnCycle, ChurnEdge, ChurnGraph, EdgeStrength, EveryRender};
 pub use component_cache::ComponentCache;
 pub use component_registry::{ComponentKey, ComponentRegistry};
 pub use dominance::{DominatorTree, compute_dominators, dominates, on_all_paths};
@@ -51,6 +52,7 @@ pub use setters::{
     BodyCall, SlotRead, SlotWriter, WriterPhase, WriterRegion, collect_body_calls,
     collect_slot_reads,
 };
+pub use store::STORE_SLOT;
 pub use symbol_graph::{SymbolGraph, SymbolKind, SymbolNode};
 pub use triggers::{Always, EffectTrigger, Rerun, dep_is_fresh, fresh_deps, triggers_of};
 pub use written::{Change, SiteEnvs, Written};
