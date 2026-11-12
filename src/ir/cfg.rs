@@ -45,6 +45,13 @@ pub enum Terminator {
         /// Where the condition is evaluated in the source (None for
         /// synthetic branches and manual-IR tests).
         span: Option<crate::ir::SourceRange>,
+        /// The nullish test of an optional chain link (`a?.b.c(x)`, #301):
+        /// `cond` tests the receiver the link reads right after, in the
+        /// `else_` side. The test is part of reading the chain, so a walk
+        /// that collects *which paths* a body reads takes that read (`a.b.c`)
+        /// and not the bare receiver; the condition's value is `cond`, as
+        /// for any branch.
+        chain_link: bool,
     },
     /// The returned value, and where the `return` is in the source (`None` for
     /// the implicit fall-through return, synthetic returns and manual-IR
@@ -94,30 +101,8 @@ impl CFG {
     /// terminator expressions. Companion of [`crate::ir::expr::Expr::for_each_child`]
     /// for walkers that scan whole bodies. Blocks are visited in id order.
     pub fn for_each_expr<'a>(&'a self, f: &mut impl FnMut(&'a crate::ir::expr::Expr)) {
-        self.for_each_expr_where(&|_| true, f);
-    }
-
-    /// [`Self::for_each_expr`], visiting only the statements `keep` selects.
-    /// The terminator is always visited — a block only has one, and it is
-    /// never a binding.
-    ///
-    /// The free-path walk uses this to skip an aliasing `let`: `const c = x.a`
-    /// renames a read rather than performing one, and recording the whole of
-    /// `x.a` there would drown the members the body actually touches through
-    /// `c`.
-    pub fn for_each_expr_where<'a>(
-        &'a self,
-        keep: &impl Fn(&crate::ir::stmt::Stmt) -> bool,
-        f: &mut impl FnMut(&'a crate::ir::expr::Expr),
-    ) {
         for block in self.blocks.values() {
-            for stmt in block.stmts.iter().filter(|s| keep(s)) {
-                stmt.for_each_expr(f);
-            }
-            match &block.term {
-                Terminator::Return(e, _) | Terminator::Branch { cond: e, .. } => f(e),
-                Terminator::Jump(_) | Terminator::Unreachable => {}
-            }
+            block.for_each_expr(f);
         }
     }
 

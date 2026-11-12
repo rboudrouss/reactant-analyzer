@@ -2191,6 +2191,7 @@ mod tests {
                 stmts: vec![],
                 term: Terminator::Branch {
                     span: None,
+                    chain_link: false,
                     cond: Expr::BinOp {
                         op: crate::ir::expr::BinOp::Lt,
                         lhs: Box::new(Expr::Var("x".to_string())),
@@ -2749,6 +2750,7 @@ mod tests {
                 stmts: vec![],
                 term: Terminator::Branch {
                     span: None,
+                    chain_link: false,
                     cond: Expr::Lit(Prim::Bool(true)),
                     then_: 2,
                     else_: 3,
@@ -2958,6 +2960,7 @@ mod tests {
                 stmts: vec![],
                 term: Terminator::Branch {
                     span: None,
+                    chain_link: false,
                     cond: Expr::BinOp {
                         op: crate::ir::expr::BinOp::Gt,
                         lhs: Box::new(Expr::Var("count".to_string())),
@@ -3120,6 +3123,7 @@ mod tests {
                 stmts: vec![],
                 term: Terminator::Branch {
                     span: None,
+                    chain_link: false,
                     cond: Expr::BinOp {
                         op: crate::ir::expr::BinOp::Gt,
                         lhs: Box::new(Expr::Var("x".to_string())),

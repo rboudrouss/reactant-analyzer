@@ -972,6 +972,7 @@ fn lower_chain_object(
         then_: exit,
         else_: rest,
         span: builder.span_at(at.start),
+        chain_link: true,
     });
     builder.add_edge(bid, exit, EdgeKind::IfTrue);
     builder.add_edge(bid, rest, EdgeKind::IfFalse);
@@ -1002,6 +1003,7 @@ fn lower_ternary(cond: &ConditionalExpression, builder: &mut BlockBuilder) -> Ex
         then_: then_id,
         else_: else_id,
         span,
+        chain_link: false,
     });
     builder.add_edge(bid, then_id, EdgeKind::IfTrue);
     builder.add_edge(bid, else_id, EdgeKind::IfFalse);
@@ -1091,6 +1093,7 @@ fn lower_logical(log: &LogicalExpression, builder: &mut BlockBuilder) -> Expr {
         then_,
         else_,
         span,
+        chain_link: false,
     });
     builder.add_edge(bid, then_, EdgeKind::IfTrue);
     builder.add_edge(bid, else_, EdgeKind::IfFalse);
@@ -1534,6 +1537,7 @@ fn lower_logical_assignment(assign: &AssignmentExpression, builder: &mut BlockBu
         then_,
         else_,
         span,
+        chain_link: false,
     });
     builder.add_edge(bid, then_, EdgeKind::IfTrue);
     builder.add_edge(bid, else_, EdgeKind::IfFalse);
@@ -2286,6 +2290,41 @@ mod tests {
         ] {
             let cfg = build(src);
             assert!(branches(&cfg).is_empty(), "{src}: {:?}", cfg.blocks);
+        }
+    }
+
+    /// Only a chain's own short-circuit is a `chain_link` test, and the paths
+    /// a body reads through it are the chain's: `a?.b?.()` reads `a.b`, not
+    /// a bare `a`. A test the source writes stays a read of `a`.
+    #[test]
+    fn a_chains_nullish_test_reads_as_the_chain() {
+        use crate::ir::free_vars::{AccessPath, compute_free_paths};
+        let links = |cfg: &CFG| -> Vec<bool> {
+            cfg.blocks
+                .values()
+                .filter_map(|b| match &b.term {
+                    Terminator::Branch { chain_link, .. } => Some(*chain_link),
+                    _ => None,
+                })
+                .collect()
+        };
+        let path = |segs: &[&str]| AccessPath {
+            root: "a".to_string(),
+            segments: segs.iter().map(|s| s.to_string()).collect(),
+        };
+        let cfg = build("function f() { a?.b?.(); }");
+        assert_eq!(links(&cfg), [true, true]);
+        assert_eq!(compute_free_paths(&cfg), [path(&["b"])].into());
+        let cfg = build("function f() { a?.c.d(1); }");
+        assert_eq!(compute_free_paths(&cfg), [path(&["c", "d"])].into());
+        for src in [
+            "function f() { if (a == null) return; a.b(); }",
+            "function f() { return a ?? b(); }",
+            "function f() { return a ? b() : c(); }",
+        ] {
+            let cfg = build(src);
+            assert!(links(&cfg).iter().all(|l| !l), "{src}");
+            assert!(compute_free_paths(&cfg).contains(&path(&[])), "{src}");
         }
     }
 

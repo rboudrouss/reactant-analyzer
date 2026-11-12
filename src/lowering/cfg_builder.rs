@@ -350,6 +350,7 @@ fn lower_stmt(stmt: &Statement, builder: &mut BlockBuilder) {
                 then_: body_block,
                 else_: exit_block,
                 span,
+                chain_link: false,
             });
             builder.add_edge(t, body_block, EdgeKind::Back);
             builder.add_edge(t, exit_block, EdgeKind::IfFalse);
@@ -506,6 +507,7 @@ fn lower_try(tr: &TryStatement, builder: &mut BlockBuilder) {
         then_: try_block,
         else_: catch_block,
         span,
+        chain_link: false,
     });
     builder.add_edge(branch, try_block, EdgeKind::IfTrue);
     builder.add_edge(branch, catch_block, EdgeKind::IfFalse);
@@ -562,6 +564,7 @@ fn lower_if(
         then_: then_block,
         else_: else_block,
         span,
+        chain_link: false,
     });
     builder.add_edge(branch_id, then_block, EdgeKind::IfTrue);
     builder.add_edge(branch_id, else_block, EdgeKind::IfFalse);
@@ -620,6 +623,7 @@ fn lower_while(test: &Expression, body: &Statement, builder: &mut BlockBuilder) 
         then_: body_block,
         else_: exit_block,
         span,
+        chain_link: false,
     });
     builder.add_edge(h, body_block, EdgeKind::IfTrue);
     builder.add_edge(h, exit_block, EdgeKind::IfFalse);
@@ -680,6 +684,7 @@ fn lower_for(
         then_: body_block,
         else_: exit_block,
         span,
+        chain_link: false,
     });
     builder.add_edge(h, body_block, EdgeKind::IfTrue);
     builder.add_edge(h, exit_block, EdgeKind::IfFalse);
@@ -738,6 +743,7 @@ fn lower_iter_loop(
         then_: body_block,
         else_: exit_block,
         span: None,
+        chain_link: false,
     });
     builder.add_edge(h, body_block, EdgeKind::IfTrue);
     builder.add_edge(h, exit_block, EdgeKind::IfFalse);
@@ -827,6 +833,7 @@ fn lower_switch(sw: &SwitchStatement, builder: &mut BlockBuilder) {
             then_: case_block,
             else_: skip_to,
             span: None,
+            chain_link: false,
         });
         builder.add_edge(d, case_block, EdgeKind::IfTrue);
         builder.add_edge(d, skip_to, EdgeKind::IfFalse);
@@ -1018,6 +1025,7 @@ pub(super) fn lower_default(
         then_,
         else_: join,
         span,
+        chain_link: false,
     });
     builder.add_edge(test, then_, EdgeKind::IfTrue);
     builder.add_edge(test, join, EdgeKind::IfFalse);

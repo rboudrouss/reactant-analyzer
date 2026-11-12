@@ -208,11 +208,13 @@ fn remap_terminator(term: Terminator, off: Offsets) -> Terminator {
             then_,
             else_,
             span,
+            chain_link,
         } => Terminator::Branch {
             cond: remap_expr(cond, off),
             then_,
             else_,
             span,
+            chain_link,
         },
         t @ (Terminator::Jump(_) | Terminator::Unreachable) => t,
     }

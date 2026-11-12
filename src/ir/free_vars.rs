@@ -1,7 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use crate::ir::{cfg::CFG, expr::Expr, stmt::Stmt, types::Var};
+use crate::ir::{
+    cfg::{CFG, Terminator},
+    expr::Expr,
+    stmt::Stmt,
+    types::Var,
+};
 
 /// A read access rooted at a variable, refined by a chain of field names.
 ///
@@ -171,13 +176,33 @@ fn compute_free_paths_pinned(cfg: &CFG, pinned: &[Expr]) -> HashSet<AccessPath> 
 ///
 /// One function for the body and for every nested `FnLit`, because a closure
 /// renames things exactly as its enclosing body does.
+///
+/// Two things that look like reads are not walked. An aliasing `let`
+/// (`const c = x.a`) renames a read rather than performing one, and recording
+/// the whole of `x.a` there would drown the members the body touches through
+/// `c`. The nullish test of an optional chain link (`chain_link`) is part of
+/// reading the chain: its operand `a` is the receiver the link reads right
+/// after, so `a?.b?.()` reads `a.b` — what a `[a?.b]` dep covers — and not
+/// the bare `a` (#301).
 fn collect_body_paths(cfg: &CFG, pinned: &HashSet<String>, out: &mut HashSet<AccessPath>) {
     let aliases = local_aliases(cfg);
     let mut used: HashSet<AccessPath> = HashSet::new();
-    cfg.for_each_expr_where(
-        &|s| !matches!(s, Stmt::Let { var, .. } if aliases.contains_key(var)),
-        &mut |e| collect_paths(e, pinned, &mut used),
-    );
+    for block in cfg.blocks.values() {
+        for stmt in &block.stmts {
+            if !matches!(stmt, Stmt::Let { var, .. } if aliases.contains_key(var)) {
+                stmt.for_each_expr(&mut |e| collect_paths(e, pinned, &mut used));
+            }
+        }
+        match &block.term {
+            Terminator::Branch {
+                chain_link: true, ..
+            } => {}
+            Terminator::Return(e, _) | Terminator::Branch { cond: e, .. } => {
+                collect_paths(e, pinned, &mut used)
+            }
+            Terminator::Jump(_) | Terminator::Unreachable => {}
+        }
+    }
     resolve_aliases(&aliases, &mut used);
     subtract_local_definitions(cfg, &mut used);
     out.extend(used);

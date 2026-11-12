@@ -103,3 +103,57 @@ fn a_write_after_an_optional_call_stays_certain() {
 fn a_parent_setter_called_through_an_optional_prop_stays_reported() {
     assert_level("Child", "cross-component-infinite-loop", "warning");
 }
+
+/// The paths `missing-deps` names in `component` (`Deps.tsx`), sorted.
+fn missing_deps(component: &str) -> Vec<String> {
+    let out = reactant(&[
+        "tests/fixtures/optional_chain/Deps.tsx",
+        "--config",
+        "tests/fixtures/all-rules.json",
+        "--format",
+        "json",
+        "--fail-on",
+        "never",
+    ]);
+    let doc: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout))
+        .expect("stdout must be valid JSON");
+    let mut paths: Vec<String> = doc["diagnostics"]
+        .as_array()
+        .expect("diagnostics")
+        .iter()
+        .filter(|d| d["component"] == component && d["rule"] == "missing-deps")
+        .map(|d| {
+            let msg = d["message"].as_str().unwrap_or("");
+            msg.split('`').nth(1).unwrap_or(msg).to_string()
+        })
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// The nullish test of an optional link is part of reading the chain: a
+/// `[a?.b]` dep covers `a?.b?.()`, `a?.c.d(1)` with `[a?.c]`, and the
+/// chain's value, as it did before the short-circuit was control flow.
+#[test]
+fn a_dep_on_an_optional_link_covers_the_chains_nullish_test() {
+    for c in [
+        "DepCoversOptionalCall",
+        "DepCoversMemberCall",
+        "DepCoversOptionalMethod",
+        "DepCoversChainValue",
+    ] {
+        assert_eq!(missing_deps(c), Vec::<String>::new(), "{c}");
+    }
+}
+
+/// And it covers nothing else rooted at the receiver: another member, the
+/// receiver passed whole, a dep on another member, no dep at all, or a null
+/// test the source writes itself.
+#[test]
+fn a_dep_on_an_optional_link_covers_no_other_read_of_its_receiver() {
+    assert_eq!(missing_deps("DepMissesAnotherMember"), ["a.other"]);
+    assert_eq!(missing_deps("DepMissesTheWholeReceiver"), ["a"]);
+    assert_eq!(missing_deps("DepOnAnotherMember"), ["a.b"]);
+    assert_eq!(missing_deps("NoDeps"), ["a"]);
+    assert_eq!(missing_deps("WrittenNullTest"), ["a"]);
+}

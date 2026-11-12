@@ -387,6 +387,7 @@ impl BlockOut {
                 then_,
                 else_: join,
                 span: None,
+                chain_link: false,
             };
             cfg.blocks.insert(
                 then_,

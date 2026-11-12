@@ -105,7 +105,9 @@ on a program React settles; 323 oracle cases, none a known false negative.
 - An optional chain skips its rest when a `?.` link is nullish: a write in an
   optional call's arguments, after `a?.b`, or in an index (`cb?.(setN(n + 1))`,
   `ref.current?.x(setN(…))`) is a possible write, a Warning where it was a
-  false Error (#301).
+  false Error (#301). The skip test is part of reading the chain: a
+  `[a?.b]` dep still covers `a?.b?.()` and `a?.b.c(x)` in `missing-deps` and
+  `stale-closure`.
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error
