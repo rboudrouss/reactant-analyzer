@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use crate::rules::RuleCtx;
 use crate::{
-    engine::{HookKind, fresh_deps},
+    engine::{HookKind, ProgramAnalysisResult, fresh_deps, fresh_deps_when_object},
     ir::{
         ComponentId,
         expr::Expr,
@@ -64,6 +64,7 @@ impl Rule for AlwaysUnstableDeps {
         let result = &program.components[&component];
         let mut diags = Vec::new();
         let fresh = fresh_deps(result);
+        let fresh_when_object = fresh_deps_when_object(result);
 
         for hook in &result.hooks {
             let (label, deps, kind, span) = match hook {
@@ -88,40 +89,66 @@ impl Rule for AlwaysUnstableDeps {
 
             // Fresh wherever the component renders, or else through the
             // elements under which it is (#175): those are named.
-            let (indices, via): (BTreeSet<usize>, String) = match fresh.get(&label) {
-                Some(own) => (own.clone(), String::new()),
-                None => {
-                    let through = program.call_graph.fresh_through(component, label);
-                    let parents: BTreeSet<ComponentId> =
-                        through.values().flatten().copied().collect();
-                    (
-                        through.into_keys().collect(),
-                        crate::rules::parent_elements(program, &parents),
-                    )
-                }
+            let (indices, via) = indices_and_via(
+                fresh.get(&label),
+                program.call_graph.fresh_through(component, label),
+                program,
+            );
+            // Then the deps that are a new reference wherever they hold an
+            // object (`a?.map(f)`): the same cost at every render where the
+            // value exists, said as such.
+            let (when_object, via_object) = indices_and_via(
+                fresh_when_object.get(&label),
+                program
+                    .call_graph
+                    .fresh_when_object_through(component, label),
+                program,
+            );
+            let pick = |is: &BTreeSet<usize>, skip: &BTreeSet<usize>| -> Vec<&Expr> {
+                is.difference(skip)
+                    .filter_map(|i| deps_ref.get(*i))
+                    .collect()
             };
-            let unstable: Vec<&Expr> = indices.iter().filter_map(|i| deps_ref.get(*i)).collect();
-
-            if unstable.is_empty() {
-                continue;
-            }
+            let unstable = pick(&indices, &BTreeSet::new());
+            let when_object = pick(&when_object, &indices);
 
             let word = crate::rules::hook_kind_word(kind);
-            let when = if via.is_empty() {
-                String::new()
-            } else {
-                format!(" when {via} renders it")
+            let when = |via: &str| {
+                if via.is_empty() {
+                    String::new()
+                } else {
+                    format!(" when {via} renders it")
+                }
             };
-            let mut d = Diagnostic::warn(
-                "always-unstable-deps",
+            let object_clause = |deps: &[&Expr]| {
                 format!(
+                    "{}, a new reference at every render{} where it holds an object",
+                    fmt_deps(deps),
+                    when(&via_object)
+                )
+            };
+            let message = match (unstable.is_empty(), when_object.is_empty()) {
+                (true, true) => continue,
+                (false, also) => format!(
                     "this {word} depends on {what}, a new reference every \
                      render{when}, so `Object.is` always differs and the {word} \
-                     re-runs on every render regardless of the other deps",
+                     re-runs on every render regardless of the other deps{rest}",
                     what = fmt_deps(&unstable),
+                    when = when(&via),
+                    rest = if also {
+                        String::new()
+                    } else {
+                        format!("; it also depends on {}", object_clause(&when_object))
+                    },
                 ),
-            )
-            .with_label(label);
+                (true, false) => format!(
+                    "this {word} depends on {}, so the {word} re-runs at each such \
+                     render regardless of the other deps",
+                    object_clause(&when_object)
+                ),
+            };
+            let unstable: Vec<&Expr> = unstable.into_iter().chain(when_object).collect();
+            let mut d = Diagnostic::warn("always-unstable-deps", message).with_label(label);
             if let Some(r) = span {
                 d = d.with_range(r);
             }
@@ -141,6 +168,25 @@ impl Rule for AlwaysUnstableDeps {
         }
 
         diags
+    }
+}
+
+/// The deps a fact holds for: the component's own, or else those it holds
+/// for through the elements that render it, with those elements named.
+fn indices_and_via(
+    own: Option<&BTreeSet<usize>>,
+    through: std::collections::BTreeMap<usize, BTreeSet<ComponentId>>,
+    program: &ProgramAnalysisResult,
+) -> (BTreeSet<usize>, String) {
+    match own {
+        Some(own) => (own.clone(), String::new()),
+        None => {
+            let parents: BTreeSet<ComponentId> = through.values().flatten().copied().collect();
+            (
+                through.into_keys().collect(),
+                crate::rules::parent_elements(program, &parents),
+            )
+        }
     }
 }
 

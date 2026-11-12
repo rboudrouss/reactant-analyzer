@@ -79,7 +79,10 @@ pub const RULE_DOCS: &[RuleDoc] = &[
                       single such dep defeats the whole array: the hook re-runs every render \
                       no matter how stable the other deps are. For `useEffect` this means the \
                       effect always fires; for `useMemo`/`useCallback` the memoization is dead \
-                      weight.",
+                      weight. A dep that is such a reference whenever it holds an object, and \
+                      `undefined` or another primitive otherwise (`items?.filter(f)`, \
+                      `items && items.map(f)`, `c ? [x] : undefined`), defeats the array at \
+                      every render where it exists, and is reported as such.",
         "useEffect(() => sync(opts), [{ mode }, id]);",
         "Hoist the literal out of render, memoize it (`useMemo`), or depend on its \
               primitive parts (`[mode, id]`) instead of a fresh wrapper object.",
