@@ -1112,7 +1112,7 @@ pub(in crate::rules) fn must_effect_cycle(
         // them from a `Vec` index.
         let first = cycle.edge_idx.first().map(|&i| &edges[i]);
         let provenance = match first {
-            Some(e) => Provenance::at(e.write_span, Some(e.effect_label)),
+            Some(e) => Provenance::at(e.write_span, e.carrier.effect()),
             None => Provenance::default(),
         };
         MustResult::All(Certified::mint(EffectCycleProof, provenance))

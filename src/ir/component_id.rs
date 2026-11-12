@@ -37,6 +37,12 @@ impl ComponentId {
     /// to the name the IR carries.
     pub const SYNTHETIC: ComponentId = ComponentId(u32::MAX);
 
+    /// The owner of the store slot (`engine::store::STORE_SLOT`, ADR-046):
+    /// every library store and the URL, which no component of the program
+    /// owns. A table never interns it, so it names no component, and a row
+    /// it owns is a foreign write wherever it sits.
+    pub const STORE: ComponentId = ComponentId(u32::MAX - 1);
+
     /// A raw id, for a unit-test fixture that needs several distinct
     /// components without building a table. Production ids come only from
     /// [`ComponentTable::intern`], which is what keeps an id and the table

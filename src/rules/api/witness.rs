@@ -93,6 +93,9 @@ pub enum Step {
     Call { callee: String, class: EffectClass },
     /// State write, with the written value's class.
     Write { slot: HookLabel, value: ValueClass },
+    /// A write of a library store (ADR-046), through the call spelled
+    /// `callee`.
+    StoreWrite { callee: String },
     /// Read of a reactive value (deps rules: the read site).
     Read { what: String },
     /// The site is guarded by this branch condition.
@@ -136,6 +139,7 @@ impl Step {
             Step::Resolve { .. } => "resolve",
             Step::Call { .. } => "call",
             Step::Write { .. } => "write",
+            Step::StoreWrite { .. } => "store-write",
             Step::Read { .. } => "read",
             Step::Branch { .. } => "branch",
             Step::CycleEdge { .. } => "cycle-edge",
@@ -200,6 +204,9 @@ impl Step {
                 ),
                 ValueClass::Unknown => format!("state {} is written here", names.slot(*slot)),
             },
+            Step::StoreWrite { callee } => {
+                format!("`{callee}` may write a library store here")
+            }
             Step::Read { what } => format!("`{}` is read here", names.var(what)),
             Step::Branch { desc } => format!("guarded by {desc}"),
             Step::CycleEdge { from: _, to } => {

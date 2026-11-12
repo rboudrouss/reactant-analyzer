@@ -100,8 +100,7 @@ use crate::{
         dominance::on_all_paths,
         guards::{
             Invariance, MemberWrites, SlotPath, WriteSite, call_may_differ,
-            converges_under_all_writes, let_bindings, must_slot_paths, mutated_roots, navigates,
-            site_guards,
+            converges_under_all_writes, let_bindings, must_slot_paths, mutated_roots, site_guards,
         },
         registrations::dispatches_events,
         render_deps::written_names,
@@ -109,6 +108,7 @@ use crate::{
             memo_val_labels, must_alias_scopes, must_state_vals, resolve_setter_aliases,
             state_val_labels,
         },
+        store::{STORE_SLOT, body_writes},
         triggers::{Always, Rerun},
         triggers_of,
         written::{Written, churning_part, keeps_initial},
@@ -136,9 +136,9 @@ pub struct ChurnEdge {
     pub from: QualifiedSlot,
     pub to: QualifiedSlot,
     pub strength: EdgeStrength,
-    /// Component whose effect carries this edge.
+    /// Component whose effect (or render) carries this edge.
     pub component: ComponentId,
-    pub effect_label: HookLabel,
+    pub carrier: Carrier,
     pub write_span: Option<SourceRange>,
     /// The edge exists because the carrying effect re-runs after every render
     /// (its re-run class, `engine::triggers::Rerun::Always`, or a call
@@ -151,6 +151,25 @@ pub struct ChurnEdge {
     /// start, not by a new reference (`stepping_slots`, #144): what its
     /// message says the loop rests on.
     pub stepping: bool,
+}
+
+/// What re-runs to carry an edge: an effect, or the render of the edge's
+/// component, which writes the store from its body (ADR-046). A finding is
+/// reported at an effect, never at a render.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Carrier {
+    Effect(HookLabel),
+    Render,
+}
+
+impl Carrier {
+    /// The carrying effect, if an effect carries the edge.
+    pub fn effect(self) -> Option<HookLabel> {
+        match self {
+            Carrier::Effect(l) => Some(l),
+            Carrier::Render => None,
+        }
+    }
 }
 
 /// Why an effect re-runs after every render, as the edges it carries say.
@@ -178,6 +197,9 @@ pub struct ChurnCycle {
     /// carriers) — severity is capped at Warning: cross-component must-rerun
     /// cannot be proven (prop deps are `Versioned`, never exact).
     pub cross_component: bool,
+    /// The cycle goes through the store (ADR-046): every edge into it is a
+    /// may-write, so the cycle is never all-must.
+    pub store: bool,
 }
 
 /// The program's churn graph: every edge plus the cycles found in it.
@@ -304,6 +326,33 @@ fn stepping_slots(result: &ProgramAnalysisResult) -> HashSet<QualifiedSlot> {
         .collect()
 }
 
+/// Does the render read a held value — a summary marker whose result, or a
+/// member of it, moves with the store (ADR-046)? Such a component re-renders
+/// when the store is written, and hands its children new props.
+fn reads_held(render_cfg: &CFG) -> bool {
+    use crate::ir::expr::{MarkerVal, SummaryValue};
+    fn held(sv: &SummaryValue) -> bool {
+        match sv {
+            SummaryValue::Held | SummaryValue::Navigator { stable: false } => true,
+            SummaryValue::Shape { members, .. } => members.iter().any(|(_, m)| held(m)),
+            _ => false,
+        }
+    }
+    fn walk(e: &Expr) -> bool {
+        if let Expr::HookMarker(_, MarkerVal::Summary(sv)) = e
+            && held(sv)
+        {
+            return true;
+        }
+        let mut found = false;
+        e.for_each_child(&mut |c| found |= walk(c));
+        found
+    }
+    let mut found = false;
+    render_cfg.for_each_expr(&mut |e| found |= walk(e));
+    found
+}
+
 /// One element of a component in another one's render: where it mounts.
 struct Element<'a> {
     /// The component whose render builds the element, and hands it its
@@ -407,6 +456,8 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         members: MemberWrites<'a>,
         memo_vals: HashMap<Var, HookLabel>,
         memo_deps: HashMap<HookLabel, &'a [Expr]>,
+        /// The render arguments of each hook call left to a summary.
+        hook_args: HashMap<HookLabel, &'a [Expr]>,
         render_lets: HashMap<&'a str, Option<&'a Expr>>,
         mutated: HashSet<Var>,
         /// The props hold across every loop the component's edges can be on:
@@ -454,16 +505,21 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
     // component's effect: the union is program-wide, as `render_deps` reads
     // it.
     let module_written: HashSet<Var> = result.components.values().flat_map(written_names).collect();
-    // A visible navigation in any body the loop can run moves every
-    // navigation-held value program-wide (#161).
-    let navigates = result.components.values().any(|c| {
+    // A visible write of the store in any body the loop can run moves every
+    // held value program-wide (#161, ADR-046): a body that writes it anywhere,
+    // nested closures included, or a row the writer walk placed outside a
+    // handler.
+    let store_moves = result.components.values().any(|c| {
         let render = local_bindings(&c.render_cfg);
-        navigates(&c.render_cfg, &render)
+        body_writes(&c.render_cfg, &render)
             || c.hooks
                 .iter()
                 .filter(|h| !matches!(h, HookEntry::Handler { .. }))
                 .filter_map(HookEntry::body_cfg)
-                .any(|b| navigates(b, &render))
+                .any(|b| body_writes(b, &render))
+            || c.slot_writers
+                .iter()
+                .any(|w| w.writes_store() && w.phase != WriterPhase::Handler)
     });
 
     // The component tree (#213), and the components a write the loop can run
@@ -480,11 +536,23 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 .map(move |w| node_of(c, w))
         })
         .collect();
+    // A store trigger row is live only when some write the loop can run
+    // writes the store: otherwise nothing moves it.
+    let store_written = moved.contains(&STORE_SLOT);
+    let live = |t: &&EffectTrigger| store_written || t.slot != STORE_SLOT;
+    // The components whose render reads a held value: a write of the store
+    // re-renders them (ADR-046).
+    let subscribers: HashSet<ComponentId> = result
+        .components
+        .iter()
+        .filter(|(_, r)| reads_held(&r.render_cfg))
+        .map(|(&c, _)| c)
+        .collect();
     // The props node `P_c` (#207), by its in-edges: every slot of an
     // ancestor some write the loop can run moves — `P_parent → P_c` is
-    // folded in, the ancestors being transitive. An edge out of `P_c` is
-    // pushed from each of them, so every edge stays a slot-to-slot write
-    // edge with its carrying effect.
+    // folded in, the ancestors being transitive — and the store, when an
+    // ancestor reads it. An edge out of `P_c` is pushed from each of them,
+    // so every edge stays a slot-to-slot write edge with its carrying effect.
     let props_in: HashMap<ComponentId, Vec<QualifiedSlot>> = result
         .components
         .keys()
@@ -495,6 +563,9 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 .filter(|s| up.contains(&s.0))
                 .copied()
                 .collect();
+            if store_written && up.iter().any(|a| subscribers.contains(a)) {
+                v.push(STORE_SLOT);
+            }
             v.sort();
             (c, v)
         })
@@ -531,10 +602,21 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                         _ => None,
                     })
                     .collect(),
+                hook_args: comp_result
+                    .hooks
+                    .iter()
+                    .filter_map(|h| match h {
+                        HookEntry::Custom { label, args, .. } => Some((*label, args.as_slice())),
+                        _ => None,
+                    })
+                    .collect(),
                 render_lets: let_bindings(cfg),
                 mutated,
                 // An effect's rows: a memo's write is a render-phase write,
                 // whose re-runs the render's own sites already stand for.
+                // The store is read here as the proofs read it before it
+                // was a node (#161): a store write moves no prop they read
+                // (`docs/limitations.md`).
                 props_hold: comp_result
                     .effect_triggers
                     .iter()
@@ -544,8 +626,8 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                             .get(&t.hook)
                             .is_some_and(|i| i.kind == HookKind::Effect)
                     })
-                    .all(|t| t.slot.0 == comp)
-                    && props_in[&comp].is_empty(),
+                    .all(|t| t.slot.0 == comp || t.slot == STORE_SLOT)
+                    && props_in[&comp].iter().all(|s| *s == STORE_SLOT),
                 exit: comp_result.exit_env(),
             },
         );
@@ -560,7 +642,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         .map(|&c| {
             (
                 c,
-                stays(c, &tree, result, &ctxs, navigates, &mut stays_memo),
+                stays(c, &tree, result, &ctxs, store_moves, &mut stays_memo),
             )
         })
         .collect();
@@ -625,8 +707,9 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             if writes.is_empty() {
                 continue;
             }
-            let triggers: Vec<&EffectTrigger> =
-                triggers_of(&comp_result.effect_triggers, *label).collect();
+            let triggers: Vec<&EffectTrigger> = triggers_of(&comp_result.effect_triggers, *label)
+                .filter(live)
+                .collect();
             let mut exact_local: HashSet<HookLabel> = HashSet::new();
             let mut versioned: HashSet<QualifiedSlot> = HashSet::new();
             for t in &triggers {
@@ -653,7 +736,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     why,
                     surely: match why {
                         Always::FreshDep(i) => deps.get(i).is_some_and(|d| {
-                            !invariance_of(&ctxs[&comp], navigates).holds(
+                            !invariance_of(&ctxs[&comp], store_moves).holds(
                                 d,
                                 &ctxs[&comp].render_lets,
                                 true,
@@ -707,14 +790,15 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 m.entry(s.comp).or_default().push(i);
                 m
             });
-    fn invariance_of<'c>(ctx: &'c CompCtx<'_>, navigates: bool) -> Invariance<'c> {
+    fn invariance_of<'c>(ctx: &'c CompCtx<'_>, store_moves: bool) -> Invariance<'c> {
         Invariance {
             render: &ctx.render_lets,
             state_vals: &ctx.state_vals,
             memo_vals: &ctx.memo_vals,
             memo_deps: &ctx.memo_deps,
             mutated: &ctx.mutated,
-            navigates,
+            store_moves,
+            hook_args: &ctx.hook_args,
         }
     }
     /// Does every element that mounts `c` keep it mounted across the loop,
@@ -729,7 +813,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         tree: &ComponentTree<'_>,
         result: &ProgramAnalysisResult,
         ctxs: &HashMap<ComponentId, CompCtx<'_>>,
-        navigates: bool,
+        store_moves: bool,
         memo: &mut HashMap<ComponentId, bool>,
     ) -> bool {
         if let Some(&s) = memo.get(&c) {
@@ -740,12 +824,12 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             && tree.get(&c).is_none_or(|els| {
                 els.iter().all(|e| {
                     let ctx = &ctxs[&e.parent];
-                    let invariance = invariance_of(ctx, navigates);
+                    let invariance = invariance_of(ctx, store_moves);
                     !e.closure
                         && e.held
                             .iter()
                             .all(|x| invariance.holds(x, &ctx.render_lets, ctx.props_hold))
-                        && stays(e.parent, tree, result, ctxs, navigates, memo)
+                        && stays(e.parent, tree, result, ctxs, store_moves, memo)
                 })
             });
         memo.insert(c, s);
@@ -868,6 +952,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         result: &ProgramAnalysisResult,
         props_in: &HashMap<ComponentId, Vec<QualifiedSlot>>,
         kept_mounted: &HashMap<ComponentId, bool>,
+        store_written: bool,
     ) -> bool {
         let WriterRegion::Effect(l) = s.row.region else {
             return true;
@@ -879,13 +964,13 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             Some(Rerun::Always(_)) => true,
             Some(Rerun::MountOnly) => kept_mounted.get(&s.comp) != Some(&true),
             Some(Rerun::OnSlots) | None => {
-                triggers_of(&r.effect_triggers, l).next().is_some()
+                triggers_of(&r.effect_triggers, l).any(|t| store_written || t.slot != STORE_SLOT)
                     || (r.effect_props.contains(&l)
                         && props_in.get(&s.comp).is_none_or(|p| !p.is_empty()))
             }
         }
     }
-    let invariance_of = |ctx| invariance_of(ctx, navigates);
+    let invariance_of = |ctx| invariance_of(ctx, store_moves);
 
     // The sites that fire at most once in the automatic loop, by least
     // fixpoint (module doc). Monotone — a proven site only removes
@@ -932,7 +1017,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
     // Deduplicate on (from, to, component, effect): keep the strongest, and
     // among equals the earliest write site, so the row a reader anchors on
     // does not depend on relation order.
-    let mut best: HashMap<(QualifiedSlot, QualifiedSlot, ComponentId, HookLabel), ChurnEdge> =
+    let mut best: HashMap<(QualifiedSlot, QualifiedSlot, ComponentId, Carrier), ChurnEdge> =
         HashMap::new();
     let mut one_way: HashMap<QualifiedSlot, bool> = HashMap::new();
     // The slots some write may restore within a batch (#188): React re-renders
@@ -1006,7 +1091,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     node_of(s.comp, s.row) == node
                         && !std::ptr::eq(s.row, *w)
                         && !convergent[*j]
-                        && reruns_in_loop(s, result, &props_in, &kept_mounted)
+                        && reruns_in_loop(s, result, &props_in, &kept_mounted, store_written)
                 })
                 .any(|(_, s)| match s.row.written.change {
                     Change::Never => false,
@@ -1087,6 +1172,9 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             let reads_slot = |x: QualifiedSlot| match &reads {
                 None => true,
                 Some(r) if x.0 == f.comp => r.slots.contains(&x.1),
+                // `reads` fails on a held value while the store moves, so a
+                // write it reads does not read the store.
+                Some(_) if x == STORE_SLOT => false,
                 Some(r) => r.props,
             };
             let fresh_blocks: HashSet<BlockId> = f
@@ -1137,7 +1225,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                         to: node,
                         strength,
                         component: f.comp,
-                        effect_label: f.effect_label,
+                        carrier: Carrier::Effect(f.effect_label),
                         write_span: w.span,
                         always: always.cloned(),
                         self_slot,
@@ -1153,8 +1241,10 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             // reads a prop, or anything, changes when `P_c` moves. Where no
             // edge enters `P_c` — a root, or a component rendered through a
             // value the tree cannot place — the write's own slot stands in
-            // for it, a self-edge, as before the node existed.
+            // for it, a self-edge, as before the node existed. The store
+            // entering it is no slot of an ancestor: the stand-in stays.
             let p_in = &props_in[&f.comp];
+            let no_slot_in = p_in.iter().all(|s| *s == STORE_SLOT);
             let reads_props = reads.as_ref().is_none_or(|r| r.props);
             let from_props: &[QualifiedSlot] = if reads_props { p_in } else { &[] };
             // An effect that re-runs after every render: a change of anything
@@ -1163,7 +1253,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             // reads everything re-triggers itself, whichever turn it runs on.
             let every_render: Vec<QualifiedSlot> = match &reads {
                 Some(r) => {
-                    let props = (r.props && p_in.is_empty()).then_some(node);
+                    let props = (r.props && no_slot_in).then_some(node);
                     r.slots.iter().map(|&l| (f.comp, l)).chain(props).collect()
                 }
                 None => vec![node],
@@ -1254,7 +1344,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                         to: node_of(comp, w),
                         strength: EdgeStrength::May,
                         component: comp,
-                        effect_label,
+                        carrier: Carrier::Effect(effect_label),
                         write_span: w.span,
                         always: None,
                         self_slot: false,
@@ -1265,14 +1355,49 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         }
     }
 
+    // Render-carried edges (ADR-046): a render or memo body that writes the
+    // store runs again whenever its component re-renders, so a change of any
+    // of its slots or of its props may write the store. The store's own
+    // change re-running a render that writes it is a loop without an effect,
+    // outside the graph like `setter-in-render`'s (`docs/limitations.md`).
+    for (&comp, r) in &result.components {
+        let Some(w) = r
+            .slot_writers
+            .iter()
+            .filter(|w| {
+                w.writes_store()
+                    && matches!(w.region, WriterRegion::Render | WriterRegion::Memo(_))
+                    && w.phase != WriterPhase::Handler
+            })
+            .min_by_key(|w| pos(w.span))
+        else {
+            continue;
+        };
+        let slots = r.state_store.labels().into_iter().map(|l| (comp, l));
+        for from in slots.chain(props_in[&comp].iter().copied()) {
+            if from == STORE_SLOT {
+                continue;
+            }
+            insert_edge(
+                &mut best,
+                ChurnEdge {
+                    from,
+                    to: STORE_SLOT,
+                    strength: EdgeStrength::May,
+                    component: comp,
+                    carrier: Carrier::Render,
+                    write_span: w.span,
+                    always: None,
+                    self_slot: false,
+                    stepping: false,
+                },
+            );
+        }
+    }
+
     let mut edges: Vec<ChurnEdge> = best.into_values().collect();
     edges.sort_by(|a, b| {
-        (&a.component, a.effect_label, &a.from, &a.to).cmp(&(
-            &b.component,
-            b.effect_label,
-            &b.from,
-            &b.to,
-        ))
+        (&a.component, a.carrier, &a.from, &a.to).cmp(&(&b.component, b.carrier, &b.from, &b.to))
     });
     return edges;
 
@@ -1281,13 +1406,13 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         s.map_or((u32::MAX, u32::MAX), |r| r.pos_key())
     }
 
-    /// Keep, per (from, to, component, effect), the strongest edge, and
+    /// Keep, per (from, to, component, carrier), the strongest edge, and
     /// among equals the earliest write site.
     fn insert_edge(
-        best: &mut HashMap<(QualifiedSlot, QualifiedSlot, ComponentId, HookLabel), ChurnEdge>,
+        best: &mut HashMap<(QualifiedSlot, QualifiedSlot, ComponentId, Carrier), ChurnEdge>,
         edge: ChurnEdge,
     ) {
-        let key = (edge.from, edge.to, edge.component, edge.effect_label);
+        let key = (edge.from, edge.to, edge.component, edge.carrier);
         best.entry(key)
             .and_modify(|e| {
                 if (edge.strength, std::cmp::Reverse(pos(edge.write_span)))
@@ -1318,13 +1443,22 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
 }
 
 /// Find churn cycles: first in the must-only subgraph (all-must cycles),
-/// then in the full graph, skipping regions already reported. Self-slot
-/// edges are the other arm's and never enter the search.
+/// then through slots alone, then through the store (ADR-046), skipping
+/// regions already reported. A cycle through slots is searched without the
+/// store's edges, so a store edge never changes the cycle a slot loop is
+/// reported with. Self-slot edges are the other arm's and never enter the
+/// search.
 pub fn find_cycles(edges: &[ChurnEdge]) -> Vec<ChurnCycle> {
+    let touches_store = |i: usize| edges[i].from == STORE_SLOT || edges[i].to == STORE_SLOT;
     let must_idx: Vec<usize> = (0..edges.len())
         .filter(|&i| !edges[i].self_slot && edges[i].strength == EdgeStrength::Must)
         .collect();
     let all_idx: Vec<usize> = (0..edges.len()).filter(|&i| !edges[i].self_slot).collect();
+    let slot_idx: Vec<usize> = all_idx
+        .iter()
+        .copied()
+        .filter(|&i| !touches_store(i))
+        .collect();
 
     let mut cycles = Vec::new();
     let mut covered_nodes: HashSet<QualifiedSlot> = HashSet::new();
@@ -1336,7 +1470,15 @@ pub fn find_cycles(edges: &[ChurnEdge]) -> Vec<ChurnCycle> {
         }
         cycles.push(make_cycle(edges, cyc, true));
     }
-    for cyc in cycles_in(edges, &all_idx) {
+    let store_cycles = if slot_idx.len() < all_idx.len() {
+        cycles_in(edges, &all_idx)
+            .into_iter()
+            .filter(|cyc| cyc.iter().any(|&i| touches_store(i)))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    for cyc in cycles_in(edges, &slot_idx).into_iter().chain(store_cycles) {
         // A node already inside an all-must cycle: the Error already flags
         // that loop region — don't re-report a weaker overlapping cycle.
         if cyc.iter().any(|&i| {
@@ -1356,9 +1498,14 @@ fn make_cycle(edges: &[ChurnEdge], edge_idx: Vec<usize>, all_must: bool) -> Chur
         comps.insert(edges[i].to.0);
         comps.insert(edges[i].component);
     }
+    // The store is no component: a store loop inside one component is that
+    // component's loop.
+    let store = comps.remove(&ComponentId::STORE);
+    debug_assert!(!(store && all_must), "an edge into the store is a may-edge");
     ChurnCycle {
         all_must,
         cross_component: comps.len() > 1,
+        store,
         edge_idx,
     }
 }
@@ -1399,10 +1546,10 @@ fn cycles_in(edges: &[ChurnEdge], subset: &[usize]) -> Vec<Vec<usize>> {
         // Every edge inside the component lies on a cycle — its head reaches
         // its tail — so every effect carrying one is on a loop: one the first
         // cycle misses gets its own, the edge and the way back (#263).
-        let mut carried: HashSet<(ComponentId, HookLabel)> = found
+        let mut carried: HashSet<(ComponentId, Carrier)> = found
             .iter()
             .flatten()
-            .map(|&e| (edges[e].component, edges[e].effect_label))
+            .map(|&e| (edges[e].component, edges[e].carrier))
             .collect();
         let mut inner: Vec<usize> = scc
             .iter()
@@ -1411,7 +1558,7 @@ fn cycles_in(edges: &[ChurnEdge], subset: &[usize]) -> Vec<Vec<usize>> {
             .collect();
         inner.sort_unstable();
         for e in inner {
-            if !carried.insert((edges[e].component, edges[e].effect_label)) {
+            if !carried.insert((edges[e].component, edges[e].carrier)) {
                 continue;
             }
             let (from, to) = (node_id[&edges[e].from], node_id[&edges[e].to]);
@@ -1420,7 +1567,7 @@ fn cycles_in(edges: &[ChurnEdge], subset: &[usize]) -> Vec<Vec<usize>> {
                 carried.extend(
                     cycle
                         .iter()
-                        .map(|&i| (edges[i].component, edges[i].effect_label)),
+                        .map(|&i| (edges[i].component, edges[i].carrier)),
                 );
                 found.push(cycle);
             }

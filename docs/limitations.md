@@ -145,15 +145,22 @@ that writes it (see *Cross-file limits*).
   one value, and one crossing any call only when it is no new reference; a reference versioned by
   what the write reads passes both
   [#218](https://github.com/rboudrouss/reactant-analyzer/issues/218),
-  [#224](https://github.com/rboudrouss/reactant-analyzer/issues/224). The convergence proof also assumes
-  that a call it cannot see into does not navigate: a router hook's result (`useSearchParams`,
-  `useParams`, `usePathname`, `useLocation`) holds still across the loop unless some render,
-  effect, memo or callback body of the program visibly navigates — a call through what a summary
-  names a navigator (`useNavigate()`'s result, `router.push`/`replace`, the setter of react-router's
-  `useSearchParams` tuple, under any name the bindings reach), `history.*`, `location.assign`, a
-  write to `location`, a bare `navigate()`/`redirect()`, a `<Navigate/>`. A navigation hidden in
-  an opaque callee, or through a router object handed down as a prop, is not seen
-  [#161](https://github.com/rboudrouss/reactant-analyzer/issues/161).
+  [#224](https://github.com/rboudrouss/reactant-analyzer/issues/224).
+- **Library stores are one slot the analysis does not own** (ADR-046). A held router hook result
+  (`useSearchParams`, `useParams`, `usePathname`, `useLocation`, `useMatch`) is a read of that
+  slot, and a visible mover is a write of it, in every phase but a handler: a call through what a
+  summary names a navigator (`useNavigate()`'s result, `router.push`/`replace`, the setter of
+  react-router's `useSearchParams` tuple, under any name the bindings reach), `history.*`,
+  `location.assign`, a write to `location`, a bare `navigate()`/`redirect()`, a `<Navigate/>`. An
+  effect on a held value that navigates is a possible loop, a Warning, never an Error
+  [#298](https://github.com/rboudrouss/reactant-analyzer/issues/298). Assumed: a call the analysis
+  cannot see into does not write the store, and neither does a router object handed down as a
+  prop; the convergence proof reads a held value as holding still across the loop when no body
+  writes the store and its hook's arguments hold
+  [#161](https://github.com/rboudrouss/reactant-analyzer/issues/161). Still missed: a loop through
+  the store and a render alone (`navigate(…)` in a render body, no effect), outside the churn graph
+  like `setter-in-render`'s; and a store write's effect on a child's props in the convergence and
+  mount proofs, which read the props as holding across it.
 - It also assumes a `useMemo` or `useCallback` with an exact deps list over held values hands back
   its cached value. React documents the cache as a performance hint, not a guarantee: a React that
   dropped it would recompute a fresh value the proof reads as held
@@ -239,9 +246,10 @@ that writes it (see *Cross-file limits*).
   the analysis cannot see into, and a context value it cannot pin to its provider: either may be a
   new reference at every render (a package hook returning a fresh object per call loops), so
   `[useThing()]` or `[useContext(Ctx)]` is a possible re-run at every render, a Warning. Only a
-  hook summary that pins the result keeps it held, the router hooks' navigation-only values
-  [#294](https://github.com/rboudrouss/reactant-analyzer/issues/294), which reverses the hold
-  [#161](https://github.com/rboudrouss/reactant-analyzer/issues/161) assumed. A callback that only
+  hook summary that pins the result keeps it held: a router hook's held value is a read of the
+  store, which re-runs the effect when a body writes it (see *Library stores* above,
+  [#294](https://github.com/rboudrouss/reactant-analyzer/issues/294),
+  [#298](https://github.com/rboudrouss/reactant-analyzer/issues/298)). A callback that only
   names the ref or the binding in its body does not read it: its identity moves with its deps list
   [#227](https://github.com/rboudrouss/reactant-analyzer/issues/227). A dep that moves for another
   reason reads as held: a module binding written only behind a call the analysis cannot see into.

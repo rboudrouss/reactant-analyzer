@@ -412,10 +412,11 @@ Semantics:
   line number that could belong to another file, ADR-024 §1.)*
 - `component_file`: the component's defining file; what `file` meant in v1.
 - `notes`: the finding's witness chain (ADR-019), typed steps explaining
-  why the rule fired. `kind` ∈ `binding | resolve | call | write | read |
-  branch | cycle-edge | widen | mutate | capture | init-once | forward |
-  rerender`; each kind adds its structured
-  fields (`var`, `name`/`target`, `callee`/`effect_class`,
+  why the rule fired. `kind` ∈ `binding | resolve | call | write |
+  store-write | read | branch | cycle-edge | widen | mutate | capture |
+  init-once | forward | rerender`; each kind adds its structured
+  fields (`var`, `name`/`target`, `callee`/`effect_class` (`store-write`:
+  `callee` alone),
   `slot`/`value_class`, `what`, `desc`, `from`/`to`, `iteration`).
   *(v3 drops `handler` and its `event` field: only `infinite-loop`'s
   widening arm emitted it, retired by #265.)*

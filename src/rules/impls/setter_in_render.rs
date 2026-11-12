@@ -392,9 +392,14 @@ impl SetterInRender {
             .slot_writers
             .iter()
             .filter_map(|w| {
+                // A write of the store is no setter's (ADR-046): the churn
+                // graph carries it.
                 let WriterRegion::Memo(memo) = w.region else {
                     return None;
                 };
+                if w.writes_store() {
+                    return None;
+                }
                 // A deferred or handler row runs on another turn; ⊤ may run
                 // in the memo's own run.
                 let sync = match w.phase {

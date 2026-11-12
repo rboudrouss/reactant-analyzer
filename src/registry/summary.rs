@@ -84,13 +84,14 @@ impl SummaryRegistry {
         r.register_many_for_package("next/compat/router", &["useRouter"]);
         // What the URL decides moves only on navigation (#161): the
         // convergence proof reads it as holding still across the automatic
-        // loop.
+        // loop. Not `useSelectedLayoutSegments`: it builds a new array at
+        // each call (next 14.2.5 `client/components/navigation.js:182-231`,
+        // `segmentPath = []`), so it stays a known ⊤ hook (#299).
         for name in [
             "useSearchParams",
             "useParams",
             "usePathname",
             "useSelectedLayoutSegment",
-            "useSelectedLayoutSegments",
         ] {
             r.register_for_package("next/navigation", Box::new(HeldSummary(name)));
         }
@@ -116,10 +117,14 @@ impl SummaryRegistry {
                 Box::new(ShapeSummary(hook, REACT_HOOK_FORM_MEMBERS)),
             );
         }
-        for pkg in ["next/navigation", "next/router", "next/compat/router"] {
+        r.register_for_package(
+            "next/navigation",
+            Box::new(ShapeSummary("useRouter", NEXT_ROUTER_MEMBERS)),
+        );
+        for pkg in ["next/router", "next/compat/router"] {
             r.register_for_package(
                 pkg,
-                Box::new(ShapeSummary("useRouter", NEXT_ROUTER_MEMBERS)),
+                Box::new(ShapeSummary("useRouter", NEXT_PAGES_ROUTER_MEMBERS)),
             );
         }
         for (pkg, hook) in [("swr", "useSWR"), ("swr", "useSWRConfig")] {
@@ -294,6 +299,28 @@ const NEXT_ROUTER_MEMBERS: &[(&str, SummaryValue)] = &[
     ("prefetch", SummaryValue::StableRef),
     ("back", SummaryValue::Navigator { stable: true }),
     ("forward", SummaryValue::Navigator { stable: true }),
+];
+
+/// The Pages Router's `useRouter()` (`next/router`, `next/compat/router`).
+/// Its methods are new closures on every router snapshot:
+/// `makePublicRouterInstance` wraps each of `coreMethodFields` in a fresh
+/// function (next 14.2.5 `client/router.js:81-88,172-179`; 16.2.12
+/// `:81-88,173-180`), and `AppContainer` calls it on every render (`client/index.js:238`,
+/// 16.2.12 `:222`). So they navigate and promise no identity (#299).
+///
+/// `forward` and `refresh` are not members of that instance (they read
+/// `undefined`, which never changes): they keep the reading the shared table
+/// gave them before the two routers were told apart, so nothing it found is
+/// lost.
+const NEXT_PAGES_ROUTER_MEMBERS: &[(&str, SummaryValue)] = &[
+    ("push", SummaryValue::Navigator { stable: false }),
+    ("replace", SummaryValue::Navigator { stable: false }),
+    ("reload", SummaryValue::Navigator { stable: false }),
+    ("back", SummaryValue::Navigator { stable: false }),
+    ("prefetch", SummaryValue::Navigator { stable: false }),
+    ("beforePopState", SummaryValue::Navigator { stable: false }),
+    ("forward", SummaryValue::Navigator { stable: true }),
+    ("refresh", SummaryValue::StableRef),
 ];
 
 /// react-router's `useSearchParams()` → `[searchParams, setSearchParams]`, a
@@ -553,6 +580,61 @@ mod tests {
                 .any(|(k, v)| k == &"1" && matches!(v, SummaryValue::Navigator { .. })),
             "the setter of the tuple navigates"
         );
+    }
+
+    /// `useSelectedLayoutSegments` builds a new array at each call: known,
+    /// never held (#299). Its singular sibling returns a string and stays.
+    #[test]
+    fn selected_layout_segments_is_known_and_not_held() {
+        let r = SummaryRegistry::new_with_common();
+        let s = r
+            .get("useSelectedLayoutSegments", Some("next/navigation"))
+            .unwrap();
+        assert!(!s.held_across_updates());
+        assert!(s.members().is_empty());
+        assert_eq!(s.summarize(&[]), StateValue::top());
+        let one = r
+            .get("useSelectedLayoutSegment", Some("next/navigation"))
+            .unwrap();
+        assert!(one.held_across_updates());
+    }
+
+    /// The pages router's methods are new closures per router snapshot; the
+    /// app router's stay stable (#299).
+    #[test]
+    fn pages_router_methods_navigate_and_promise_no_identity() {
+        let r = SummaryRegistry::new_with_common();
+        let member = |pkg: &str, name: &str| {
+            r.get("useRouter", Some(pkg))
+                .unwrap()
+                .members()
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.clone())
+        };
+        for pkg in ["next/router", "next/compat/router"] {
+            for name in [
+                "push",
+                "replace",
+                "reload",
+                "back",
+                "prefetch",
+                "beforePopState",
+            ] {
+                assert_eq!(
+                    member(pkg, name),
+                    Some(SummaryValue::Navigator { stable: false }),
+                    "{pkg} {name}"
+                );
+            }
+        }
+        for name in ["push", "replace", "back", "forward"] {
+            assert_eq!(
+                member("next/navigation", name),
+                Some(SummaryValue::Navigator { stable: true }),
+                "app router {name}"
+            );
+        }
     }
 
     #[test]

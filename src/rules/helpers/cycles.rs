@@ -35,6 +35,9 @@ pub(in crate::rules) fn node_display(
     result: &ProgramAnalysisResult,
     names: &mut NodeNames,
 ) -> String {
+    if *node == crate::engine::STORE_SLOT {
+        return "a library store".to_string();
+    }
     let (declared, map) = names.entry(node.0).or_insert_with(|| {
         result
             .components
@@ -113,21 +116,23 @@ pub(in crate::rules) fn collect_cycle_rows(
 ) -> Vec<CycleRow> {
     let mut names: NodeNames = HashMap::new();
     let mut rows: Vec<CycleRow> = Vec::new();
-    for cycle in &graph.cycles {
+    // A cycle through the store is not in the pack vocabulary (ADR-046): the
+    // relation shows the slot cycles it always showed.
+    for cycle in graph.cycles.iter().filter(|c| !c.store) {
         let path = cycle_path(&graph.edges, cycle, component, result, &mut names);
         for &i in &cycle.edge_idx {
             let e = &graph.edges[i];
             if e.component != component {
                 continue;
             }
-            let Some(span) = e.write_span else {
+            let (Some(span), Some(effect)) = (e.write_span, e.carrier.effect()) else {
                 continue;
             };
             rows.push(CycleRow {
                 path: path.clone(),
                 cross_component: cycle.cross_component,
                 all_must: cycle.all_must,
-                effect: e.effect_label,
+                effect,
                 span,
             });
         }
@@ -167,7 +172,7 @@ mod row_tests {
             to: (crate::test_support::named(to.0), to.1),
             strength: EdgeStrength::May,
             component: crate::test_support::named(carrier),
-            effect_label: effect,
+            carrier: crate::engine::Carrier::Effect(effect),
             write_span,
             always: None,
             self_slot: false,
@@ -183,6 +188,7 @@ mod row_tests {
                 edge_idx,
                 all_must,
                 cross_component,
+                store: false,
             }],
         }
     }
@@ -242,11 +248,13 @@ mod row_tests {
                     edge_idx: vec![0, 1],
                     all_must: false,
                     cross_component: false,
+                    store: false,
                 },
                 ChurnCycle {
                     edge_idx: vec![0, 1],
                     all_must: false,
                     cross_component: false,
+                    store: false,
                 },
             ],
         };
