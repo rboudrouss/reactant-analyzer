@@ -133,6 +133,11 @@ on a program React settles; 323 oracle cases, none a known false negative.
   copied by a spread. A dependency on an element that may be a new object is
   a possible loop (Warning), and one that surely is a loop as it would be
   through a name; it was silent (#307).
+- `JSON.parse(text)` is any JSON value and `structuredClone(x)` a primitive
+  `x` itself: each is a new reference only where it holds an object. A
+  dependency on one is a possible loop (Warning) and `always-unstable-deps`
+  says "where it holds an object"; `JSON.parse("1") ?? {}` and a reviver's
+  result were a false Error, `structuredClone(1)` a false Warning (#306).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

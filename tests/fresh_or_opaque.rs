@@ -103,10 +103,10 @@ fn a_guard_over_an_import_keeps_its_write() {
 }
 
 /// The value of a known global's call is what it was: `Math.max(…)` alone is
-/// no new reference, and `JSON.parse` keeps the fresh reference the domain
-/// gives it (#306). The domain reads `Math.max(…)` as an opaque value, so
-/// `Math.max(1, 2) ?? {}` is the join's accepted false positive, at Warning
-/// (#305).
+/// no new reference, and `JSON.parse` is any JSON value, a new reference
+/// where it holds an object (#306). The domain reads `Math.max(…)` as an
+/// opaque value, so `Math.max(1, 2) ?? {}` is the join's accepted false
+/// positive, at Warning (#305).
 #[test]
 fn known_globals_keep_their_value() {
     let all = findings();
@@ -124,7 +124,7 @@ fn known_globals_keep_their_value() {
         .map(|(_, _, s, m)| (s.clone(), m.clone()))
         .unwrap_or_default();
     assert!(
-        message.contains("a new reference every render"),
+        message.contains("a new reference at every render where it holds an object"),
         "{message}"
     );
 }

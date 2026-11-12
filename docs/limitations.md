@@ -302,7 +302,9 @@ carries an Error.
   [#304](https://github.com/rboudrouss/reactant-analyzer/issues/304). So is an element read under
   an index or a key no constant names when one element it may select is fresh, even when the key
   always selects a stable one: the key's values are not enumerated
-  [#307](https://github.com/rboudrouss/reactant-analyzer/issues/307).
+  [#307](https://github.com/rboudrouss/reactant-analyzer/issues/307). And so is `JSON.parse(text)`
+  when the text always encodes a primitive: its text is not read
+  [#306](https://github.com/rboudrouss/reactant-analyzer/issues/306).
 - **Optional chains** branch on every `?.` link that skips a call or an index, even when the left
   side is never nullish (`setN?.(x)`, a local function, a callback prop every parent passes): a
   write in the skipped part is a possible one, a Warning, not an Error

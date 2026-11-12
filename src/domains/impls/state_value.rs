@@ -166,6 +166,20 @@ impl StateValue {
         }
     }
 
+    /// Any JSON value, as `JSON.parse` builds it: `null`, a boolean, a
+    /// number, a string, or a new object or array (#306). A new reference
+    /// where it holds an object, never a reference alone.
+    pub fn json_value() -> Self {
+        StateValue {
+            num: Interval::top(),
+            boolean: BoolVal::Top,
+            str: StrConst::Top,
+            reference: Stability::PerRender,
+            null: true,
+            ..Self::bottom_value()
+        }
+    }
+
     pub fn null() -> Self {
         StateValue {
             null: true,

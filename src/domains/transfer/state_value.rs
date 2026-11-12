@@ -278,10 +278,9 @@ fn eval_state_value(
             eval_unary(op, v)
         }
 
-        Expr::Call { fn_, .. } if returns_fresh_reference(fn_, env, ctx) => {
-            StateValue::reference(Stability::PerRender)
+        Expr::Call { fn_, args } => {
+            allocating_call(fn_, args, env, ctx).unwrap_or_else(StateValue::top)
         }
-        Expr::Call { .. } => StateValue::top(),
         // `new` allocates: a fresh reference, whose members stay ⊤ (#158).
         Expr::New { .. } => StateValue::reference(Stability::PerRender),
 
@@ -326,13 +325,13 @@ fn summary_value(sv: &crate::ir::expr::SummaryValue) -> StateValue {
     }
 }
 
-/// Callees whose return value is a *freshly allocated reference* on every
-/// call — never the receiver, never a cached object. Modeled as
-/// `reference(PerRender)` instead of ⊤ (same seeding as `ArrayLit`), which
-/// lets `always-unstable-deps` *prove* that `const items = arr.map(f)` in a
-/// deps array defeats memoization.
+/// What a call of a builtin that allocates hands back, `None` for any other
+/// callee. A *freshly allocated reference* on every call — never the
+/// receiver, never a cached object — is `reference(PerRender)` instead of ⊤
+/// (same seeding as `ArrayLit`), which lets `always-unstable-deps` *prove*
+/// that `const items = arr.map(f)` in a deps array defeats memoization.
 ///
-/// Two cases keep the proof honest (FP-averse):
+/// Three cases keep the proof honest (FP-averse):
 /// - **kind-ambiguous methods** (`slice`, `concat`): on a string receiver
 ///   they return a *primitive*, which `Object.is` value-compares — claiming
 ///   a per-render reference for `id.slice(0, 8)` would be a false proof. So
@@ -342,14 +341,37 @@ fn summary_value(sv: &crate::ir::expr::SummaryValue) -> StateValue {
 /// - **in-place methods** (`sort`, `reverse`, `fill`, `copyWithin`,
 ///   `Object.assign`): they return the receiver itself — same identity, the
 ///   opposite fact.
-fn returns_fresh_reference(
+/// - **builtins that allocate only where the result is an object** (#306):
+///   `JSON.parse` returns whatever the text encodes (`JSON.parse("1")` is
+///   `1`), and anything a reviver returns; `structuredClone(x)` copies a
+///   primitive `x` as itself. Each is a new reference where it is one, and
+///   may be a primitive elsewhere: never a must-fresh reference alone.
+fn allocating_call(
     callee: &Expr,
+    args: &[Expr],
     env: &AbstractEnv<StateValue>,
     ctx: &mut AnalysisCtx<StateValue>,
-) -> bool {
-    match callee {
-        // `structuredClone(x)` always allocates a deep copy.
-        Expr::Var(v) => v == "structuredClone",
+) -> Option<StateValue> {
+    let fresh = StateValue::reference(Stability::PerRender);
+    let allocates = match callee {
+        // A deep copy of an object, the value itself of a primitive; a
+        // function cannot be cloned (it throws).
+        Expr::Var(v) if v == "structuredClone" => {
+            let x = match args.first() {
+                Some(arg) => eval_state_value(arg, env, ctx),
+                None => StateValue::top(),
+            };
+            let object = x.reference != Stability::Bottom || x.setter != SetterVal::Bottom;
+            return Some(StateValue {
+                reference: if object {
+                    Stability::PerRender
+                } else {
+                    Stability::Bottom
+                },
+                setter: SetterVal::Bottom,
+                ..x
+            });
+        }
         Expr::FieldAccess { obj, field } => match field.as_str() {
             // Array methods returning a NEW array, array-only names (a
             // string receiver has none of these).
@@ -362,12 +384,20 @@ fn returns_fresh_reference(
             "keys" | "values" | "entries" | "fromEntries" => {
                 matches!(obj.as_ref(), Expr::Var(v) if v == "Object")
             }
-            "parse" => matches!(obj.as_ref(), Expr::Var(v) if v == "JSON"),
+            // Any JSON value, a new object or array where it is one; with a
+            // reviver, anything the reviver returns.
+            "parse" if matches!(obj.as_ref(), Expr::Var(v) if v == "JSON") => {
+                return Some(match args.len() {
+                    0 | 1 => StateValue::json_value(),
+                    _ => StateValue::top().join(&fresh),
+                });
+            }
             _ => false,
         },
-        Expr::TSAnnotated(inner) => returns_fresh_reference(inner, env, ctx),
+        Expr::TSAnnotated(inner) => return allocating_call(inner, args, env, ctx),
         _ => false,
-    }
+    };
+    allocates.then_some(fresh)
 }
 
 /// Hand `props_expr` to a child the analysis cannot resolve, code it does
@@ -1272,6 +1302,47 @@ mod tests {
             ),
             StateValue::reference(Stability::PerRender)
         );
+    }
+
+    /// `JSON.parse` and `structuredClone` allocate only where their result
+    /// is an object (#306): `JSON.parse("1")` is `1`, `structuredClone(1)`
+    /// is `1`. A clone of an object is a new reference, alone.
+    #[test]
+    fn a_builtin_that_may_return_a_primitive_is_fresh_only_where_it_is_an_object() {
+        let (env, mut state, memo) = empty();
+        let mut heap = Heap::new();
+        let mut ctx = AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap);
+        let call = |fn_: Expr, args: Vec<Expr>| Expr::Call {
+            fn_: Box::new(fn_),
+            args,
+        };
+        let parse = Expr::FieldAccess {
+            obj: Box::new(Expr::Var("JSON".to_string())),
+            field: "parse".to_string(),
+        };
+        let clone = Expr::Var("structuredClone".to_string());
+        let text = Expr::Lit(Prim::String("1".to_string()));
+        let one = Expr::Lit(Prim::Int(1));
+        let obj = Expr::ObjectLit {
+            id: crate::ir::types::ExprId(0),
+            fields: vec![],
+        };
+        let mut eval = |e: Expr| StateValueTransfer.eval_expr(&e, &env, &mut ctx);
+
+        let parsed = eval(call(parse.clone(), vec![text.clone()]));
+        assert!(!parsed.is_unstable_reference_only(), "{parsed:?}");
+        assert!(parsed.is_unstable_reference_when_object(), "{parsed:?}");
+        assert!(!parsed.num.is_bottom() && parsed.null && !parsed.undef);
+
+        // A reviver may return anything, a stable reference included.
+        let revived = eval(call(parse, vec![text, one.clone()]));
+        assert_eq!(revived.reference, Stability::MayBeFresh);
+        assert!(!revived.is_unstable_reference_when_object());
+
+        let cloned = eval(call(clone.clone(), vec![one]));
+        assert_eq!(cloned, StateValue::number(Interval::point(1.0)));
+        let cloned = eval(call(clone, vec![obj]));
+        assert!(cloned.is_unstable_reference_only(), "{cloned:?}");
     }
 
     #[test]
