@@ -157,7 +157,7 @@ pub enum StabilityVerdict {
 }
 
 impl StabilityVerdict {
-    /// Total projection of the six-variant [`Stability`] lattice onto the
+    /// Total projection of the seven-variant [`Stability`] lattice onto the
     /// rule-facing verdict. `Bottom` (⊥, unreachable/uninitialised) is **not**
     /// provably stable, so it folds to `Unknown` (may side) — matching the
     /// existing `is_stable` semantics (true only for `Stable`).
@@ -167,7 +167,9 @@ impl StabilityVerdict {
             Stability::Versioned(slots) => StabilityVerdict::Versioned(slots),
             Stability::VersionedTop => StabilityVerdict::Versioned(BTreeSet::new()),
             Stability::PerRender => StabilityVerdict::PerRender,
-            Stability::Bottom | Stability::Unknown => StabilityVerdict::Unknown,
+            Stability::Bottom | Stability::Unknown | Stability::MayBeFresh => {
+                StabilityVerdict::Unknown
+            }
         }
     }
 

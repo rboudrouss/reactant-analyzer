@@ -249,7 +249,11 @@ that writes it (see *Cross-file limits*).
   hook summary that pins the result keeps it held: a router hook's held value is a read of the
   store, which re-runs the effect when a body writes it (see *Library stores* above,
   [#294](https://github.com/rboudrouss/reactant-analyzer/issues/294),
-  [#298](https://github.com/rboudrouss/reactant-analyzer/issues/298)). A callback that only
+  [#298](https://github.com/rboudrouss/reactant-analyzer/issues/298)). So may a dep that is a new
+  reference on one path and something else on another — `imported ?? {}`, `prop || []`,
+  `c ? CONST : {}`, or a memo such a dep recomputes whose body allocates — though nothing it is
+  computed from moved
+  [#304](https://github.com/rboudrouss/reactant-analyzer/issues/304). A callback that only
   names the ref or the binding in its body does not read it: its identity moves with its deps list
   [#227](https://github.com/rboudrouss/reactant-analyzer/issues/227). A dep that moves for another
   reason reads as held: a module binding written only behind a call the analysis cannot see into.
@@ -287,6 +291,12 @@ carries an Error.
   setter, each name certainly the slot's object (a render name bound to the read, a sole local
   binding, an updater's untouched parameter); a mutation and a set inside one statement, or a
   handler's local alias read from a closure nested in it, stay Warnings [#180](https://github.com/rboudrouss/reactant-analyzer/issues/180).
+- **A dep that is a new reference on one path** (`x ?? {}`, `c ? CONST : {}`) is a possible re-run
+  at every render even when the other path is always taken: a state the program only ever sets
+  to an array (`v == null ? [] : v`), a package export that is never nullish, or a known builtin's
+  result the value domain reads as an opaque value (`Math.max(a, b) ?? {}`,
+  [#305](https://github.com/rboudrouss/reactant-analyzer/issues/305))
+  [#304](https://github.com/rboudrouss/reactant-analyzer/issues/304).
 - **Optional chains** branch on every `?.` link that skips a call or an index, even when the left
   side is never nullish (`setN?.(x)`, a local function, a callback prop every parent passes): a
   write in the skipped part is a possible one, a Warning, not an Error

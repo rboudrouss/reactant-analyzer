@@ -730,8 +730,28 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             // Where the result, the join of every call site's input, says
             // nothing, a dep fresh under one element's input alone re-runs it
             // after every render through that element (#237): a possible
-            // re-run, since another element may hand it a stable value.
-            let always = match comp_result.rerun(*label).and_then(Rerun::always) {
+            // re-run, since another element may hand it a stable value. A
+            // join that only may re-run it (a stable and a fresh input are
+            // `MayBeFresh`, #304) says no more than that element does.
+            let joined = comp_result.rerun(*label).and_then(Rerun::always);
+            let through = || {
+                result
+                    .call_graph
+                    .fresh_through(comp, *label)
+                    .into_iter()
+                    .next()
+                    .map(|(i, through)| EveryRender {
+                        why: Always::FreshDep(i),
+                        surely: false,
+                        through,
+                    })
+            };
+            let site = match joined {
+                Some(Always::MutableDep(_)) | None => through(),
+                _ => None,
+            };
+            let always = match joined {
+                _ if site.is_some() => site,
                 Some(why) => Some(EveryRender {
                     why,
                     surely: match why {
@@ -746,16 +766,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     },
                     through: BTreeSet::new(),
                 }),
-                None => result
-                    .call_graph
-                    .fresh_through(comp, *label)
-                    .into_iter()
-                    .next()
-                    .map(|(i, through)| EveryRender {
-                        why: Always::FreshDep(i),
-                        surely: false,
-                        through,
-                    }),
+                None => None,
             };
             facts.push(EffectFacts {
                 comp,

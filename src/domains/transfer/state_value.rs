@@ -115,8 +115,17 @@ fn memo_value(
     if value.reference.is_bottom() {
         return value;
     }
+    // Recomputed at a render nothing moved, the memo is new there only if
+    // its body may allocate; otherwise it is what its body reads (#304).
+    let may_allocate = matches!(
+        value.reference,
+        Stability::PerRender | Stability::MayBeFresh
+    );
     StateValue {
-        reference: may,
+        reference: match may {
+            Stability::MayBeFresh if !may_allocate => Stability::Unknown,
+            may => may,
+        },
         ..value
     }
 }
@@ -128,6 +137,7 @@ fn memo_value(
 /// No readable list bounds nothing: `Stable` would be a *must* claim about a
 /// list the IR never saw, which is how `useMemo(fn, deps)` used to read as
 /// pinned forever; `[]` pins the hook, but only an array *known* to be empty.
+/// Such a list may hold a new reference at every render: `MayBeFresh`.
 fn deps_change(
     component: ComponentId,
     deps: &DepsArg,
@@ -136,14 +146,14 @@ fn deps_change(
     ctx: &mut AnalysisCtx<StateValue>,
 ) -> (Stability, bool) {
     let Some(list) = deps.list() else {
-        return (Stability::Unknown, false);
+        return (Stability::MayBeFresh, false);
     };
     if list.arity == Arity::Exact(0) {
         return (Stability::Stable, false);
     }
     if list.is_empty() {
         // Every entry is a spread whose source the fold cannot reach.
-        return (Stability::Unknown, false);
+        return (Stability::MayBeFresh, false);
     }
     let mut may = Stability::Bottom;
     let mut fresh = false;
@@ -164,7 +174,7 @@ fn deps_change(
             may = may.join(&if held {
                 val.reference.clone()
             } else {
-                Stability::Unknown
+                Stability::Unknown.join(&val.reference)
             });
             continue;
         }
@@ -177,11 +187,13 @@ fn deps_change(
         fresh |= bound_once && val.is_unstable_reference_only();
         // A dep whose reference is versioned keeps its labels (`to_stability`
         // would erase them if another slot is ⊤); a dep in motion may move at
-        // any render, which is the may side of `PerRender`.
+        // any render, which is the may side of `PerRender`: a number with
+        // what it is computed from, a reference that may be new with nothing
+        // moving (#304).
         may = may.join(&match val.versioned_reference() {
             Some(v) => v,
             None => match val.to_stability() {
-                Stability::PerRender => Stability::Unknown,
+                Stability::PerRender => Stability::Unknown.join(&val.reference),
                 s => s,
             },
         });

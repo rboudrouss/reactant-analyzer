@@ -1395,8 +1395,8 @@ fn write_settles_comparison(
 /// function or element literal, a `new`, a name the body binds to one on any
 /// of its right-hand sides, or an operator that may return one (`a || {}`);
 /// fails closed past the alias depth. Semantically: a spelling the converged
-/// env evaluates to a per-render reference — a render-level `const empty =
-/// {}` the body's bindings do not see.
+/// env evaluates to a reference that may be per-render — a render-level
+/// `const empty = {}` the body's bindings do not see, or `x ?? {}` (#304).
 fn fresh_spelling(e: &Expr, cfg: &CFG, eval: &mut dyn FnMut(&Expr) -> StateValue) -> bool {
     fn go(e: &Expr, bindings: &HashMap<&str, Vec<&Expr>>, depth: usize) -> bool {
         if depth == 0 {
@@ -1418,7 +1418,11 @@ fn fresh_spelling(e: &Expr, cfg: &CFG, eval: &mut dyn FnMut(&Expr) -> StateValue
             _ => false,
         }
     }
-    go(e, &local_bindings(cfg), 8) || eval(e).reference == crate::domains::Stability::PerRender
+    go(e, &local_bindings(cfg), 8)
+        || matches!(
+            eval(e).reference,
+            crate::domains::Stability::PerRender | crate::domains::Stability::MayBeFresh
+        )
 }
 
 /// The spellings that denote this expression's value: itself, and — when it is

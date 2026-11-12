@@ -297,3 +297,18 @@ The must-rerun bit of an effect trigger is read from the sole binding chain
 of the dep name (`ir::bindings::binding_of`), not from the first-wins alias
 map: a temporary a ternary binds once per arm is no exact alias of either
 arm.
+
+## Amendment (2026-11-12, #304): a fresh arm keeps its cause
+
+The re-run class reads an `Unknown` dep through what it is computed from
+(`render_deps`, ADR-041): an opaque value moves with its inputs. An
+allocation has no input, so `Unknown` as the join of `cond ? freshObj :
+stateObj` (the table above) made `absent ?? {}` over an `undefined` import a
+dep that never moves. `Stability` gains a ⊤ above `Unknown` and `PerRender`,
+`MayBeFresh`: any join with `PerRender` reaches it, and the re-run class
+reads it as a possible re-run at every render (Warning: the must side is
+`Never`). `Unknown` is now "no bound, no allocation of this render" — what
+`StateValue::top()` and every opaque read already meant; `top()` stays
+`Unknown`, so a value nothing binds is not read as possibly fresh. A memo a
+`MayBeFresh` dep recomputes is `MayBeFresh` when its body may allocate,
+`Unknown` otherwise.

@@ -121,7 +121,7 @@ mod tests {
         let mut s = Store::new();
         s.update(0, Stability::Stable);
         s.update(0, Stability::PerRender);
-        assert_eq!(s.get(0), Stability::Unknown);
+        assert_eq!(s.get(0), Stability::MayBeFresh);
     }
 
     #[test]
@@ -132,7 +132,7 @@ mod tests {
         b.update(0, Stability::PerRender);
         b.update(1, Stability::Stable);
         let j = a.join(&b);
-        assert_eq!(j.get(0), Stability::Unknown);
+        assert_eq!(j.get(0), Stability::MayBeFresh);
         assert_eq!(j.get(1), Stability::Stable);
     }
 

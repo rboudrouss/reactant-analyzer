@@ -122,6 +122,11 @@ on a program React settles; 323 oracle cases, none a known false negative.
   render"; a write that leaves `undefined` settles an `x != null` guard. A
   strict `=== null` / `=== undefined` still drops only the value it names
   (#303).
+- A dependency that is a new reference on one path and something else on the
+  other — `imported ?? {}`, `config.opts || []`, `prop ?? {}`,
+  `c ? CONST : {}`, or a memo it recomputes — may be new at every render with
+  nothing it is computed from moving: `infinite-loop` reports the effect as a
+  possible loop (Warning) where it was silent (#304).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error
