@@ -115,7 +115,7 @@ use crate::{
     },
     ir::{
         ComponentId, QualifiedSlot, SourceRange,
-        bindings::local_bindings,
+        bindings::{local_bindings, must_param, nested_bodies},
         cfg::{CFG, Terminator},
         expr::{Expr, SPREAD_KEY_PREFIX, object_member},
         hooks::HookEntry,
@@ -922,7 +922,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 Expr::FnLit {
                     params, body_cfg, ..
                 } => {
-                    let [p] = params.as_slice() else {
+                    let [_] = params.as_slice() else {
                         return None;
                     };
                     let mut returns = body_cfg.blocks.values().filter_map(|b| match &b.term {
@@ -932,7 +932,10 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     let (Some(r), None) = (returns.next(), returns.next()) else {
                         return None;
                     };
-                    step(r, &|x| matches!(x.peel_ts(), Expr::Var(v) if v == p))
+                    // The parameter as React hands it: one the body rebinds
+                    // holds another value at the return (#214).
+                    let nested = nested_bodies(body_cfg);
+                    step(r, &|x| must_param(x, body_cfg, &nested, params) == Some(0))
                 }
                 other => step(other, &|x| match x.peel_ts() {
                     Expr::StateVal(l) => *l == label,
@@ -1761,9 +1764,13 @@ fn updater_overwrites(written_expr: Option<&Expr>) -> Option<HashSet<Symbol>> {
     else {
         return None;
     };
-    let [prev] = params.as_slice() else {
+    let [_] = params.as_slice() else {
         return None;
     };
+    // The parameter as React hands it: one the body rebinds holds another
+    // object at the return (#214).
+    let nested = nested_bodies(body_cfg);
+    let is_prev = |e: &Expr| must_param(e, body_cfg, &nested, params) == Some(0);
     let mut out = HashSet::new();
     let mut returns = 0usize;
     for block in body_cfg.blocks.values() {
@@ -1771,7 +1778,7 @@ fn updater_overwrites(written_expr: Option<&Expr>) -> Option<HashSet<Symbol>> {
             continue;
         };
         returns += 1;
-        out.extend(literal_overwrites(e.peel_ts(), prev)?);
+        out.extend(literal_overwrites(e.peel_ts(), &is_prev)?);
     }
     (returns > 0).then_some(out)
 }
@@ -1780,8 +1787,8 @@ fn updater_overwrites(written_expr: Option<&Expr>) -> Option<HashSet<Symbol>> {
 /// `prev` itself overwrites nothing. Any other shape — a different spread
 /// source, a second spread, a key the lowering could not name — proves
 /// nothing, because a member it cannot see may be one the deps read.
-fn literal_overwrites(e: &Expr, prev: &Var) -> Option<HashSet<Symbol>> {
-    if matches!(e, Expr::Var(v) if v == prev) {
+fn literal_overwrites(e: &Expr, is_prev: &dyn Fn(&Expr) -> bool) -> Option<HashSet<Symbol>> {
+    if is_prev(e) {
         return Some(HashSet::new());
     }
     let Expr::ObjectLit { fields, .. } = e else {
@@ -1790,8 +1797,7 @@ fn literal_overwrites(e: &Expr, prev: &Var) -> Option<HashSet<Symbol>> {
     let [(spread, src), rest @ ..] = fields.as_slice() else {
         return None;
     };
-    if !spread.starts_with(SPREAD_KEY_PREFIX) || !matches!(src.peel_ts(), Expr::Var(v) if v == prev)
-    {
+    if !spread.starts_with(SPREAD_KEY_PREFIX) || !is_prev(src) {
         return None;
     }
     rest.iter()

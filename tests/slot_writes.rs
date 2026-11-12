@@ -180,6 +180,103 @@ export function Opaque() {
     assert_eq!(slot, StateValue::top());
 }
 
+// ── #214: a nested body's return is its parameter only when never rebound ──
+
+/// The reducer and updater programs of #214: React loops on each (303
+/// renders, `oracle/cases/reducer-branch-assign-loops.tsx`,
+/// `updater-branch-assign-loops.tsx`). The return names the parameter, but a
+/// branch rebound it: the write may change the slot.
+#[test]
+fn a_reducer_or_updater_that_rebinds_its_parameter_may_change_the_slot() {
+    let src = r#"
+import { useReducer, useState, useEffect } from 'react';
+function reducer(s: number, a: string) { if (a === "x") { s = s + 1; } return s; }
+export function Reducer() {
+  const [n, dispatch] = useReducer(reducer, 0);
+  useEffect(() => { dispatch("x"); });
+  return <div>{n}</div>;
+}
+export function Updater() {
+  const [n, setN] = useState(0);
+  useEffect(() => { setN((c) => { if (c >= 0) { c = c + 1; } return c; }); });
+  return <div>{n}</div>;
+}
+"#;
+    let result = analyze(src);
+    assert_eq!(loops(&result, "Reducer"), vec![Severity::Warning]);
+    assert_eq!(loops(&result, "Updater"), vec![Severity::Warning]);
+}
+
+/// The neighbour that settles: every return is the parameter as React hands
+/// it, so the write never changes the slot.
+#[test]
+fn a_reducer_that_returns_its_untouched_parameter_on_every_path_settles() {
+    let src = r#"
+import { useReducer, useEffect } from 'react';
+function keep(s: number, a: string) { if (a === "x") { return s; } const t = s; return t; }
+export function Keeps() {
+  const [n, dispatch] = useReducer(keep, 0);
+  useEffect(() => { dispatch("x"); });
+  return <div>{n}</div>;
+}
+"#;
+    assert_eq!(loops(&analyze(src), "Keeps"), vec![]);
+}
+
+/// A spread of the parameter preserves its members only when the parameter
+/// is the slot's object: rebound to a literal whose `a` moves, the dep `s.a`
+/// changes at every write (React loops).
+#[test]
+fn a_spread_of_a_rebound_parameter_preserves_nothing() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function Rebound() {
+  const [s, setS] = useState({ a: 0, b: 0 });
+  useEffect(() => {
+    setS((prev) => { prev = { a: prev.a + 1, b: prev.b }; return { ...prev, b: 1 }; });
+  }, [s.a]);
+  return <div>{s.a}</div>;
+}
+"#;
+    assert_eq!(loops(&analyze(src), "Rebound"), vec![Severity::Warning]);
+}
+
+/// The branch assignment of #214 in the other nested bodies — a timer and a
+/// promise callback, a local function — reaches the write as in the inline
+/// form: each is a finding.
+#[test]
+fn a_branch_assignment_in_a_nested_body_reaches_the_write() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function Timer() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    setTimeout(() => { let step = 0; if (n >= 0) { step = 1; } setN(n + step); });
+  }, [n]);
+  return <div>{n}</div>;
+}
+export function Then() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    Promise.resolve().then(() => { let step = 0; if (n >= 0) { step = 1; } setN(n + step); });
+  }, [n]);
+  return <div>{n}</div>;
+}
+export function Local() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    const next = (v: number) => { let w = v; if (v >= 0) { w = v + 1; } return w; };
+    setN(next(n));
+  }, [n]);
+  return <div>{n}</div>;
+}
+"#;
+    let result = analyze(src);
+    for c in ["Timer", "Then", "Local"] {
+        assert_eq!(loops(&result, c), vec![Severity::Warning], "{c}");
+    }
+}
+
 // ── Another component's slot ────────────────────────────────────────────────
 
 #[test]

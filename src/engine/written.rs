@@ -314,9 +314,10 @@ fn returns_value(body: &CFG) -> StateValue {
 
 /// What a functional updater's (or a reducer's) returns do to the slot, read
 /// without an env (the body runs in its own scope): `Must` when every return
-/// allocates, `Never` when every return is the state parameter itself,
-/// `Once` when all of them are one literal, `May` otherwise or when nothing
-/// returns.
+/// allocates, `Never` when every return is the state parameter itself —
+/// never rebound, as [`returns_step`] reads it: a `s = s + 1` on a path
+/// returns another value (#214) —, `Once` when all of them are one literal,
+/// `May` otherwise or when nothing returns.
 fn returns_change(body: &CFG, params: &[Var]) -> Change {
     let returns: Vec<&Expr> = body
         .blocks
@@ -335,7 +336,8 @@ fn returns_change(body: &CFG, params: &[Var]) -> Change {
             Expr::ObjectLit { .. } | Expr::ArrayLit { .. } | Expr::FnLit { .. } | Expr::New { .. }
         )
     };
-    let identity = |e: &&Expr| matches!(e, Expr::Var(v) if params.first() == Some(v));
+    let nested = nested_bodies(body);
+    let identity = |e: &&Expr| must_param(e, body, &nested, params) == Some(0);
     if returns.iter().all(allocates) {
         Change::Must
     } else if returns.iter().all(identity) {

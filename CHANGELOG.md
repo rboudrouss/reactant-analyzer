@@ -95,6 +95,9 @@ on a program React settles; 323 oracle cases, none a known false negative.
   reported as a possible loop (Warning); so is one that depends on a memo over
   such a value, and a loop through two components. The URL is one store slot
   the analysis does not own (ADR-046, #298).
+- A reducer or a functional updater that rebinds its state parameter before
+  returning it (`if (a === "x") { s = s + 1; } return s;`) is no longer read
+  as returning the state unchanged: the loop it drives is reported (#214).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error
