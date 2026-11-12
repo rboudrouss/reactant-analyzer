@@ -104,6 +104,32 @@ fn a_parent_setter_called_through_an_optional_prop_stays_reported() {
     assert_level("Child", "cross-component-infinite-loop", "warning");
 }
 
+/// A setter reported at several sites of equal strength is anchored at the
+/// first one in the source (`Anchor.tsx`, line 11), not at the first one the
+/// walk meets once a `?.` has split the handlers' blocks.
+#[test]
+fn a_setter_row_anchors_at_its_first_site_in_the_source() {
+    let out = reactant(&[
+        "tests/fixtures/optional_chain/Anchor.tsx",
+        "--config",
+        "tests/fixtures/all-rules.json",
+        "--format",
+        "json",
+        "--fail-on",
+        "never",
+    ]);
+    let doc: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout))
+        .expect("stdout must be valid JSON");
+    let lines: Vec<u64> = doc["diagnostics"]
+        .as_array()
+        .expect("diagnostics")
+        .iter()
+        .filter(|d| d["rule"] == "setter-in-render")
+        .filter_map(|d| d["line"].as_u64())
+        .collect();
+    assert_eq!(lines, [11], "{doc}");
+}
+
 /// The paths `missing-deps` names in `component` (`Deps.tsx`), sorted.
 fn missing_deps(component: &str) -> Vec<String> {
     let out = reactant(&[

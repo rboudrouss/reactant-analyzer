@@ -341,9 +341,17 @@ impl SetterInRender {
         // also be handed to a callee that runs it at any time. A setter is
         // one finding, its strongest site nothing clears (#285): a certified
         // one if any — `if (c) setN(1); setN(2)` loops on every render
-        // whatever `c` — else the first, the synchronous ones first.
+        // whatever `c` — else the first, the synchronous ones first. First
+        // in the source, not in the walk: the walk's order follows the
+        // lowering's blocks, which a `?.` in a handler reorders (#301).
         let mut sites = sites;
-        sites.sort_by_key(|s| s.class != SetterCallPhase::Sync);
+        sites.sort_by_key(|s| {
+            (
+                s.class != SetterCallPhase::Sync,
+                s.span.is_none(),
+                s.span.map(|r| (r.file, r.pos_key())),
+            )
+        });
         let mut out: Vec<(Var, Diagnostic)> = Vec::new();
         for site in sites {
             let var = site.var.clone();

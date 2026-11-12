@@ -113,6 +113,8 @@ on a program React settles; 323 oracle cases, none a known false negative.
   false Error (#301). The skip test is part of reading the chain: a
   `[a?.b]` dep still covers `a?.b?.()` and `a?.b.c(x)` in `missing-deps` and
   `stale-closure`.
+- `setter-in-render` anchors a setter reported at several equal sites at the
+  first one in the source, whatever order the analysis walks them in (#301).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error
