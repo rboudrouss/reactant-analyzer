@@ -25,8 +25,16 @@ pub enum BinOp {
     Div,
     And,
     Or,
+    /// `===`, and every other strict comparison the lowering emits (a
+    /// `switch` case, a default's `=== undefined`).
     Eq,
+    /// `!==`.
     Neq,
+    /// `==`: `x == null` and `x == undefined` hold for both `null` and
+    /// `undefined`, which is the test `??`, `??=` and an optional link make.
+    LooseEq,
+    /// `!=`.
+    LooseNeq,
     Lt,
     Gt,
     Leq,

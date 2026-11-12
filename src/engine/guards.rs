@@ -1365,8 +1365,8 @@ fn write_settles_comparison(
     // update whose value is `Object.is`-equal to the current one, so a slot
     // holding `NaN` re-written with `NaN` neither re-renders nor re-runs.
     let settled = match op {
-        Eq | Leq | Geq => true,
-        Neq | Lt | Gt => false,
+        Eq | LooseEq | Leq | Geq => true,
+        Neq | LooseNeq | Lt | Gt => false,
         _ => return false,
     };
     if settled == taken {
@@ -1487,6 +1487,8 @@ pub(crate) fn write_settles_member<'m>(
             let flipped = match op {
                 Eq => Eq,
                 Neq => Neq,
+                LooseEq => LooseEq,
+                LooseNeq => LooseNeq,
                 Lt => Gt,
                 Gt => Lt,
                 Leq => Geq,

@@ -946,6 +946,8 @@ fn eval_binop(op: &BinOp, lhs: StateValue, rhs: StateValue) -> StateValue {
         // `str` at ⊥ so a guard over the result still narrows.
         BinOp::Eq
         | BinOp::Neq
+        | BinOp::LooseEq
+        | BinOp::LooseNeq
         | BinOp::Lt
         | BinOp::Gt
         | BinOp::Leq

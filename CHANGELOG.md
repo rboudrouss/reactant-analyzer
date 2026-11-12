@@ -115,6 +115,13 @@ on a program React settles; 323 oracle cases, none a known false negative.
   `stale-closure`.
 - `setter-in-render` anchors a setter reported at several equal sites at the
   first one in the source, whatever order the analysis walks them in (#301).
+- `??`, `??=`, an optional link and a written `x == null` / `x != null` hold
+  neither `null` nor `undefined` where the test fails: `a?.map(f) ?? []` and
+  `(c ? [1] : undefined) ?? []` are a new array at every render again, an
+  `infinite-loop` Error and `always-unstable-deps`'s "a new reference every
+  render"; a write that leaves `undefined` settles an `x != null` guard. A
+  strict `=== null` / `=== undefined` still drops only the value it names
+  (#303).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

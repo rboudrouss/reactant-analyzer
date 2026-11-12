@@ -964,11 +964,7 @@ fn lower_chain_object(
     let exit = *exit.get_or_insert_with(|| builder.new_block());
     let rest = builder.new_block();
     let bid = builder.seal_with(Terminator::Branch {
-        cond: Expr::BinOp {
-            op: IrBinOp::Eq,
-            lhs: Box::new(value.clone()),
-            rhs: Box::new(Expr::Lit(Prim::Null)),
-        },
+        cond: nullish_test(value.clone()),
         then_: exit,
         else_: rest,
         span: builder.span_at(at.start),
@@ -1053,9 +1049,9 @@ fn lower_ternary(cond: &ConditionalExpression, builder: &mut BlockBuilder) -> Ex
 ///
 /// `??` tests nullishness, not truthiness, and its branch says so: lowered
 /// as `||`, the join side was narrowed truthy and `0 ?? d` lost its `0`, and
-/// a guard `!(a ?? b)` was read as "`b` is falsy" where `b` never ran. The IR
-/// conflates `==` and `===`, so the join side only drops `null` — the sound
-/// envelope of both (cf. `narrow_env_for_branch`).
+/// a guard `!(a ?? b)` was read as "`b` is falsy" where `b` never ran. The
+/// test is the loose [`nullish_test`], so the join side holds neither `null`
+/// nor `undefined` (#303).
 ///
 /// Pre-declare + Assign: stability(__tN) = stability(a) ⊔ stability(b)
 fn lower_logical(log: &LogicalExpression, builder: &mut BlockBuilder) -> Expr {
@@ -1077,15 +1073,7 @@ fn lower_logical(log: &LogicalExpression, builder: &mut BlockBuilder) -> Expr {
         // truthy → join (keep a); falsy → rhs
         LogicalOperator::Or => (Expr::Var(tmp.clone()), join_id, rhs_id),
         // nullish → rhs; anything else → join (keep a)
-        LogicalOperator::Coalesce => (
-            Expr::BinOp {
-                op: IrBinOp::Eq,
-                lhs: Box::new(Expr::Var(tmp.clone())),
-                rhs: Box::new(Expr::Lit(Prim::Null)),
-            },
-            rhs_id,
-            join_id,
-        ),
+        LogicalOperator::Coalesce => (nullish_test(Expr::Var(tmp.clone())), rhs_id, join_id),
     };
 
     let bid = builder.seal_with(Terminator::Branch {
@@ -1522,15 +1510,7 @@ fn lower_logical_assignment(assign: &AssignmentExpression, builder: &mut BlockBu
     let (cond, then_, else_) = match assign.operator.to_logical_operator() {
         Some(LogicalOperator::And) => (read.clone(), rhs_id, join_id),
         Some(LogicalOperator::Or) => (read.clone(), join_id, rhs_id),
-        _ => (
-            Expr::BinOp {
-                op: IrBinOp::Eq,
-                lhs: Box::new(read.clone()),
-                rhs: Box::new(Expr::Lit(Prim::Null)),
-            },
-            rhs_id,
-            join_id,
-        ),
+        _ => (nullish_test(read.clone()), rhs_id, join_id),
     };
     let bid = builder.seal_with(Terminator::Branch {
         cond,
@@ -1588,14 +1568,27 @@ fn faithful_compound_binop(op: AssignmentOperator) -> Option<IrBinOp> {
     }
 }
 
+/// `e == null`, the test JavaScript makes for `??`, `??=` and an optional
+/// link: loose, so it holds for `undefined` too, and its false side holds
+/// neither (#303).
+fn nullish_test(e: Expr) -> Expr {
+    Expr::BinOp {
+        op: IrBinOp::LooseEq,
+        lhs: Box::new(e),
+        rhs: Box::new(Expr::Lit(Prim::Null)),
+    }
+}
+
 fn lower_binop(op: BinaryOperator) -> IrBinOp {
     match op {
         BinaryOperator::Addition => IrBinOp::Add,
         BinaryOperator::Subtraction => IrBinOp::Sub,
         BinaryOperator::Multiplication => IrBinOp::Mul,
         BinaryOperator::Division => IrBinOp::Div,
-        BinaryOperator::Equality | BinaryOperator::StrictEquality => IrBinOp::Eq,
-        BinaryOperator::Inequality | BinaryOperator::StrictInequality => IrBinOp::Neq,
+        BinaryOperator::StrictEquality => IrBinOp::Eq,
+        BinaryOperator::StrictInequality => IrBinOp::Neq,
+        BinaryOperator::Equality => IrBinOp::LooseEq,
+        BinaryOperator::Inequality => IrBinOp::LooseNeq,
         BinaryOperator::LessThan => IrBinOp::Lt,
         BinaryOperator::GreaterThan => IrBinOp::Gt,
         BinaryOperator::LessEqualThan => IrBinOp::Leq,
@@ -1821,7 +1814,7 @@ mod tests {
             panic!("expected a branch, got {:?}", entry.term);
         };
         assert!(
-            matches!(cond, Expr::BinOp { op: IrBinOp::Eq, rhs, .. }
+            matches!(cond, Expr::BinOp { op: IrBinOp::LooseEq, rhs, .. }
                 if matches!(rhs.as_ref(), Expr::Lit(Prim::Null))),
             "expected `t == null`, got {cond:?}"
         );
@@ -2156,7 +2149,7 @@ mod tests {
 
     /// `cond` is `<tested> == null`, with `tested` spelled as `key`.
     fn tests_nullish(cond: &Expr, key: &str) -> bool {
-        matches!(cond, Expr::BinOp { op: IrBinOp::Eq, lhs, rhs }
+        matches!(cond, Expr::BinOp { op: IrBinOp::LooseEq, lhs, rhs }
             if matches!(rhs.as_ref(), Expr::Lit(Prim::Null))
                 && crate::ir::free_vars::call_free_key(lhs).as_deref() == Some(key))
     }
