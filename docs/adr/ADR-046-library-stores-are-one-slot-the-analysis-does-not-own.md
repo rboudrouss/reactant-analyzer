@@ -24,8 +24,10 @@ that navigates ran once in the analysis and looped in React (probe p5, #298).
    `STORE_SLOT`, for an effect's deps and a memo's alike. A `Shape`'s held member keeps the reading
    it had (`Source::Hook`, a possible re-run at every render).
 3. **A visible mover writes it**: one function, `store::call_writes` (with `element_writes` and
-   `member_write_writes`), decides it — exactly the forms the convergence proof read as a
-   navigation before. The writer walk places each such call as a slot-writer row with
+   `member_write_writes`), decides it — the forms the convergence proof read as a navigation
+   before, except that a row reads `window` and `document` only through their `location`,
+   `history` or `navigation` (`document.title = …` moves no URL), while the proof's veto keeps the
+   wider reading it had (`store::Forms`). The writer walk places each such call as a slot-writer row with
    `owner: Some(ComponentId::STORE)`, `Change::May` and a ⊤ value, in every phase: a foreign write,
    never killed, never `Must`; a handler's row carries no edge, as a handler's setter row does
    not. A render or memo body's write of the store is carried by the render: an edge into the

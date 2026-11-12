@@ -2849,7 +2849,7 @@ impl<'a> SetterWalk<'a> {
                 .copied()
                 .collect()
         };
-        crate::engine::store::call_writes(fn_, &bound)
+        crate::engine::store::call_writes(fn_, &bound, crate::engine::store::Forms::Row)
     }
 
     /// [`Self::cfg`], with `self.body` set to `cfg`.
@@ -3026,7 +3026,13 @@ impl<'a> SetterWalk<'a> {
         // `state.items.push(x)` reads `state`: the receiver of a member write
         // is the one read position the rhs does not carry.
         if let Stmt::MemberWrite { obj, key, .. } = stmt {
-            if self.store_scopes.is_some() && crate::engine::store::member_write_writes(obj) {
+            if self.store_scopes.is_some()
+                && crate::engine::store::member_write_writes(
+                    obj,
+                    key,
+                    crate::engine::store::Forms::Row,
+                )
+            {
                 let target = match key {
                     crate::ir::stmt::MemberKey::Field(f) => format!("{}.{f}", obj.describe()),
                     crate::ir::stmt::MemberKey::Index(_) => format!("{}[…]", obj.describe()),

@@ -267,3 +267,55 @@ fn a_store_loop_across_two_components_is_claimed_on_both() {
         );
     }
 }
+
+/// A write under `document` or `window` moves the URL only through their
+/// `location`: a page title set on every route change writes no store.
+#[test]
+fn a_document_write_that_is_not_a_location_writes_no_store() {
+    assert_silent(
+        r#"
+        import { useEffect } from "react";
+        import { useLocation } from "react-router-dom";
+        export function C() {
+          const location = useLocation();
+          useEffect(() => {
+            document.title = location.pathname;
+            document.body.style.overflow = "hidden";
+            const clean = document.title.replace("x", "y");
+            window.scrollTo(0, clean.length);
+          }, [location]);
+          return null;
+        }
+        "#,
+        "C",
+    );
+}
+
+/// `window.location.href = …` and `window.history.pushState(…)` do.
+#[test]
+fn a_write_through_window_location_or_history_writes_the_store() {
+    for write in [
+        r#"window.location.href = "/x/" + Math.random();"#,
+        r#"window.location = "/x/" + Math.random();"#,
+        r#"location.hash = String(Math.random());"#,
+        r#"window.history.pushState({}, "", "/x/" + Math.random());"#,
+        r#"document.location.assign("/x/" + Math.random());"#,
+    ] {
+        assert_store_loop(
+            &format!(
+                r#"
+                import {{ useEffect }} from "react";
+                import {{ useLocation }} from "react-router-dom";
+                export function C() {{
+                  const location = useLocation();
+                  useEffect(() => {{
+                    {write}
+                  }}, [location]);
+                  return null;
+                }}
+                "#
+            ),
+            "C",
+        );
+    }
+}
