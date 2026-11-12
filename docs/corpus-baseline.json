@@ -1,6 +1,6 @@
 {
   "total": 2676,
-  "digest": "bc2c694d040f5f59491b90c84594dde354443953eea3d02f25564c392753307a",
+  "digest": "572df5be77a622dc30e4dc10e0ba8f17bc708b71f1cabda3df3bba945310b0f7",
   "by_rule": {
     "always-unstable-deps": 636,
     "conditional-hook": 10,
@@ -25,7 +25,7 @@
     "bulletproof-react": 10,
     "chakra-ui": 43,
     "commerce": 5,
-    "dub": 832,
+    "dub": 831,
     "excalidraw": 53,
     "mantine": 478,
     "memos": 116,
@@ -33,7 +33,7 @@
     "novel": 6,
     "precedent": 1,
     "shadcn-admin": 29,
-    "twenty": 1044,
+    "twenty": 1045,
     "zustand": 4
   },
   "corpus": "00e5fa79fa000c85"
