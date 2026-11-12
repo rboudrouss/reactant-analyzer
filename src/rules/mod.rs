@@ -27,10 +27,11 @@ pub use api::diagnostic::{Diagnostic, Severity};
 pub use api::query::{
     Certified, CleanupVerdict, ConditionalHookCall, DominatesAllExits, EffectCycleProof,
     ExitDominance, InitSetterCall, May, Motion, MovingFeeder, MustResult, OnAllPaths, OptionKind,
-    OptionSpec, Provenance, ReturnsVerdict, RuleConfig, RuleCtx, SameRefMutation, StabilityVerdict,
-    StaleCapture, classify_motion, cleanup_verdict, may_change_of, must_dominates_all_exits,
-    must_frozen_seed, must_init_calls_setter, must_on_all_paths, must_same_ref_mutation,
-    must_setter_on_all_paths, must_stale_capture, returns_verdict_of, stability_verdict_of,
+    OptionSpec, Provenance, RefSite, ReturnsVerdict, RuleConfig, RuleCtx, SameRefMutation,
+    StabilityVerdict, StaleCapture, classify_motion, cleanup_verdict, may_change_of,
+    must_dominates_all_exits, must_frozen_seed, must_init_calls_setter, must_on_all_paths,
+    must_same_ref_mutation, must_setter_on_all_paths, must_stale_capture, returns_verdict_of,
+    stability_verdict_of,
 };
 pub use api::witness::{EffectClass, Note, ResolveTarget, Step, ValueClass};
 pub use docs::{RULE_DOCS, RuleDoc, rule_doc};

@@ -98,6 +98,10 @@ on a program React settles; 323 oracle cases, none a known false negative.
 - A reducer or a functional updater that rebinds its state parameter before
   returning it (`if (a === "x") { s = s + 1; } return s;`) is no longer read
   as returning the state unchanged: the loop it drives is reported (#214).
+- `state-mutation` is an Error only when one run mutates the state object and
+  then hands that same object to its setter; a mutation and a set on exclusive
+  branches, in different handlers, in a loop or a callback are a Warning that
+  says the write-back is possible (#180).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

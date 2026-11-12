@@ -331,7 +331,10 @@ pub const RULE_DOCS: &[RuleDoc] = &[
         "Mutating a state object (`arr.push(x)`, `obj.f = v`) keeps its reference \
                       identity; calling the setter with that same reference makes React bail \
                       out (`Object.is(old, new)` is true) and skip the re-render. The UI \
-                      silently freezes (Error). Mutating an object received via props writes \
+                      silently freezes: an Error when one run mutates the object and then \
+                      hands it to the setter, a Warning when the two may run apart (on \
+                      exclusive branches, in different handlers, in a loop or a callback). \
+                      Mutating an object received via props writes \
                       into data owned by the parent (Warning).",
         "const [items, setItems] = useState([]);\n\
                   const add = (x) => { items.push(x); setItems(items); };",

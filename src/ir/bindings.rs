@@ -230,6 +230,32 @@ pub fn must_binding<'e>(
     None
 }
 
+/// [`must_binding`] for a body that reads names of an enclosing one: the
+/// chain stops at the first name `scope` does not bind, which it returns —
+/// `const list = items` in a handler ends at `items`, a render name.
+pub fn must_binding_within<'e>(
+    expr: &'e Expr,
+    scope: &'e CFG,
+    elsewhere: &[(&[Var], &CFG)],
+) -> Option<&'e Expr> {
+    let mut cur = expr.peel_ts();
+    for _ in 0..MAX_ALIAS_HOPS + 2 {
+        match cur {
+            Expr::Var(v) if binds(v, scope) => {
+                if elsewhere
+                    .iter()
+                    .any(|(params, body)| params.contains(v) || binds(v, body))
+                {
+                    return None;
+                }
+                cur = sole_binding_in(v, scope)?.1;
+            }
+            other => return Some(other),
+        }
+    }
+    None
+}
+
 /// [`must_binding`] through members: `api.inc` is the member `inc` of the
 /// object literal `api` is certainly bound to (the readable one, after every
 /// spread), `t[1]` the element of an exact array literal — when nothing can

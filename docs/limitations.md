@@ -283,6 +283,10 @@ carries an Error.
   store a fresh reference on every dispatch; a reducer the analysis cannot reach (a prop, an
   unresolved import) stores ⊤ [#170](https://github.com/rboudrouss/reactant-analyzer/issues/170).
 - **`state-mutation`** on a DOM-typed prop whose type is imported from another file [#38](https://github.com/rboudrouss/reactant-analyzer/issues/38).
+  It is an Error only when one run of one body mutates the slot's object and then hands it to the
+  setter, each name certainly the slot's object (a render name bound to the read, a sole local
+  binding, an updater's untouched parameter); a mutation and a set inside one statement, or a
+  handler's local alias read from a closure nested in it, stay Warnings [#180](https://github.com/rboudrouss/reactant-analyzer/issues/180).
 - **The churn graph** keeps a cycle edge on a convergent slot when the proof cannot read what
   would settle it: a write site in another component, whose guards live in that component's
   bodies (the residual of [#39](https://github.com/rboudrouss/reactant-analyzer/issues/39)); a

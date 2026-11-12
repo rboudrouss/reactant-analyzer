@@ -1,8 +1,9 @@
 //! End-to-end tests for the `state-mutation` rule.
 //!
-//! Arm A (Error): a state-rooted object is mutated in place AND the slot's
-//! setter is called with the same reference — React bails out on `Object.is`
-//! and skips the re-render.
+//! Arm A: a state-rooted object is mutated in place AND the slot's setter is
+//! called with the same reference — React bails out on `Object.is` and skips
+//! the re-render. An Error when one run mutates and then sets, a Warning when
+//! the two only may co-execute (#180).
 //! Arm B (Warning): a props-rooted object is mutated.
 
 use oxc_allocator::Allocator;
@@ -173,6 +174,171 @@ fn mutation_in_effect_set_in_effect_errors() {
     );
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
     assert_eq!(d[0].severity(), Severity::Error);
+}
+
+#[test]
+fn mutation_and_set_under_one_guard_errors() {
+    // Every run that mutates then sets, and no run sets without mutating.
+    let d = diags(
+        r#"
+        import { useState } from "react";
+        function List({ flag }) {
+          const [items, setItems] = useState([]);
+          const add = (x) => {
+            if (flag) {
+              items.push(x);
+              setItems(items);
+            }
+          };
+          return <button onClick={() => add(1)}>add</button>;
+        }
+        "#,
+    );
+    assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
+    assert_eq!(d[0].severity(), Severity::Error);
+}
+
+// ── Arm A, the sites only may co-execute: a Warning (#180) ───────────────────
+
+/// One finding, a Warning that says the write-back is possible.
+fn assert_possible(d: &[reactant::rules::Diagnostic]) {
+    assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
+    assert_eq!(d[0].severity(), Severity::Warning, "{}", d[0].message);
+    assert!(
+        d[0].message
+            .contains("may be called with the same reference"),
+        "message: {}",
+        d[0].message
+    );
+}
+
+#[test]
+fn mutation_and_set_on_exclusive_branches_warns() {
+    // The issue's program: no click both mutates and sets.
+    assert_possible(&diags(
+        r#"
+        import { useState } from "react";
+        export function ExclusiveBranches({ flag }) {
+          const [items, setItems] = useState([]);
+          const onClick = () => {
+            if (flag) { items.push("x"); } else { setItems(items); }
+          };
+          return <button onClick={onClick}>{items.length}</button>;
+        }
+        "#,
+    ));
+}
+
+#[test]
+fn mutation_in_one_branch_and_set_after_the_merge_warns() {
+    // A run with `flag` false calls `setItems(items)` without having mutated
+    // anything: "mutated in place and set with the same reference" is not
+    // the run's story.
+    assert_possible(&diags(
+        r#"
+        import { useState } from "react";
+        function List({ flag }) {
+          const [items, setItems] = useState([]);
+          const add = (x) => {
+            if (flag) { items.push(x); }
+            setItems(items);
+          };
+          return <button onClick={() => add(1)}>add</button>;
+        }
+        "#,
+    ));
+}
+
+#[test]
+fn set_then_mutation_warns() {
+    // React compares `items` with the object the slot holds when the set
+    // runs: the same object, unmutated yet, so it bails out; the push then
+    // changes the state object with no render scheduled. The mutation is the
+    // defect, but no set hands the mutated object back.
+    assert_possible(&diags(
+        r#"
+        import { useState } from "react";
+        function List() {
+          const [items, setItems] = useState([]);
+          const add = (x) => {
+            setItems(items);
+            items.push(x);
+          };
+          return <button onClick={() => add(1)}>add</button>;
+        }
+        "#,
+    ));
+}
+
+#[test]
+fn mutation_and_set_in_two_handlers_warns() {
+    assert_possible(&diags(
+        r#"
+        import { useState } from "react";
+        function List() {
+          const [items, setItems] = useState([]);
+          const add = (x) => { items.push(x); };
+          const save = () => { setItems(items); };
+          return <div><button onClick={() => add(1)}>add</button><button onClick={save}>save</button></div>;
+        }
+        "#,
+    ));
+}
+
+#[test]
+fn mutation_in_a_foreach_callback_then_set_warns() {
+    // The callback runs once per element of `xs`, possibly never.
+    assert_possible(&diags(
+        r#"
+        import { useState } from "react";
+        function List({ xs }) {
+          const [items, setItems] = useState([]);
+          const addAll = () => {
+            xs.forEach((x) => items.push(x));
+            setItems(items);
+          };
+          return <button onClick={addAll}>add</button>;
+        }
+        "#,
+    ));
+}
+
+#[test]
+fn mutation_in_a_loop_then_set_warns() {
+    // The loop body may run zero times.
+    assert_possible(&diags(
+        r#"
+        import { useState } from "react";
+        function List({ xs }) {
+          const [items, setItems] = useState([]);
+          const addAll = () => {
+            for (const x of xs) { items.push(x); }
+            setItems(items);
+          };
+          return <button onClick={addAll}>add</button>;
+        }
+        "#,
+    ));
+}
+
+#[test]
+fn mutation_of_a_name_that_may_be_a_copy_warns() {
+    // With `fresh` true, `next` is a copy: the set hands React a new object.
+    assert_possible(&diags(
+        r#"
+        import { useState } from "react";
+        function List({ fresh }) {
+          const [items, setItems] = useState([]);
+          const add = (x) => {
+            let next = items;
+            if (fresh) { next = [...items]; }
+            next.push(x);
+            setItems(next);
+          };
+          return <button onClick={() => add(1)}>add</button>;
+        }
+        "#,
+    ));
 }
 
 // ── Arm A negatives ──────────────────────────────────────────────────────────
