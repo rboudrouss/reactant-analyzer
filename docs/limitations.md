@@ -253,7 +253,10 @@ that writes it (see *Cross-file limits*).
   reference on one path and something else on another — `imported ?? {}`, `prop || []`,
   `c ? CONST : {}`, or a memo such a dep recomputes whose body allocates — though nothing it is
   computed from moved
-  [#304](https://github.com/rboudrouss/reactant-analyzer/issues/304). A callback that only
+  [#304](https://github.com/rboudrouss/reactant-analyzer/issues/304), and an element read whose
+  index or key may select such an element (`arr[c ? 1 : 0]` over `[CONST, {}]`), off a name or
+  directly off a literal
+  [#307](https://github.com/rboudrouss/reactant-analyzer/issues/307). A callback that only
   names the ref or the binding in its body does not read it: its identity moves with its deps list
   [#227](https://github.com/rboudrouss/reactant-analyzer/issues/227). A dep that moves for another
   reason reads as held: a module binding written only behind a call the analysis cannot see into.
@@ -296,7 +299,10 @@ carries an Error.
   to an array (`v == null ? [] : v`), a package export that is never nullish, or a known builtin's
   result the value domain reads as an opaque value (`Math.max(a, b) ?? {}`,
   [#305](https://github.com/rboudrouss/reactant-analyzer/issues/305))
-  [#304](https://github.com/rboudrouss/reactant-analyzer/issues/304).
+  [#304](https://github.com/rboudrouss/reactant-analyzer/issues/304). So is an element read under
+  an index or a key no constant names when one element it may select is fresh, even when the key
+  always selects a stable one: the key's values are not enumerated
+  [#307](https://github.com/rboudrouss/reactant-analyzer/issues/307).
 - **Optional chains** branch on every `?.` link that skips a call or an index, even when the left
   side is never nullish (`setN?.(x)`, a local function, a callback prop every parent passes): a
   write in the skipped part is a possible one, a Warning, not an Error

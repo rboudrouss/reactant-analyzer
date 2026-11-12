@@ -618,8 +618,9 @@ pub(crate) fn alloc_literal<T: Transfer>(
             (*id, members)
         }
         // An entry before the first spread sits at its index when no
-        // elision moved it; past a spread, every position may hold any entry
-        // of the source, which the heap does not place.
+        // elision moved it. Any other entry, and every element of a spread
+        // source the heap places, may sit at any position the index does not
+        // fix (#307); a source it does not place leaves the array open.
         Expr::ArrayLit {
             id,
             elems,
@@ -627,20 +628,54 @@ pub(crate) fn alloc_literal<T: Transfer>(
             spread_at,
         } => {
             let placed = elems.len() - spread_at.len() == arity.at_least();
-            let prefix = spread_at.iter().min().copied().unwrap_or(elems.len());
+            let prefix = match placed {
+                true => spread_at.iter().min().copied().unwrap_or(elems.len()),
+                false => 0,
+            };
             let mut named = HashMap::new();
-            if placed {
-                for (i, value) in elems.iter().take(prefix).enumerate() {
-                    named.insert(i.to_string(), member_entry(transfer, value, env, ctx));
-                }
+            for (i, value) in elems.iter().take(prefix).enumerate() {
+                named.insert(i.to_string(), member_entry(transfer, value, env, ctx));
             }
-            let members = match placed && arity.exact().is_some() {
+            let mut members = match placed && arity.exact().is_some() {
                 true => Members::exactly(named),
                 false => Members::at_least(named),
             };
+            for (i, value) in elems.iter().enumerate().skip(prefix) {
+                if !spread_at.contains(&i) {
+                    members.hold_unplaced(&member_entry(transfer, value, env, ctx));
+                    continue;
+                }
+                let Some(source) = alloc_literal(transfer, value, env, ctx) else {
+                    continue;
+                };
+                let held: Vec<EnvVal<StateValue>> = source
+                    .ids
+                    .iter()
+                    .filter_map(|id| match ctx.heap.get(*id) {
+                        Some(HeapValue::Obj(obj)) => Some(obj.values().cloned()),
+                        _ => None,
+                    })
+                    .flatten()
+                    .collect();
+                for entry in &held {
+                    members.hold_unplaced(entry);
+                }
+            }
             (*id, members)
         }
         Expr::MemoVal(label) => return ctx.memo.sites(*label).cloned(),
+        // A member read places what [`resolve_locs`] places, off a literal
+        // receiver as well (`[x ?? {}][0]`, `{ a: {} }.a`, #307).
+        Expr::FieldAccess { obj, field } => {
+            let sites = alloc_literal(transfer, obj, env, ctx)?;
+            return ctx.heap.member_sites(&sites, Some(field));
+        }
+        Expr::IndexAccess { arr, idx } => {
+            let sites = alloc_literal(transfer, arr, env, ctx)?;
+            return ctx
+                .heap
+                .member_sites(&sites, member_key(idx, env).as_deref());
+        }
         other => return resolve_locs(other, env, ctx.heap),
     };
     ctx.heap.alloc_obj(id, members);

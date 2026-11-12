@@ -127,6 +127,12 @@ on a program React settles; 323 oracle cases, none a known false negative.
   `c ? CONST : {}`, or a memo it recomputes — may be new at every render with
   nothing it is computed from moving: `infinite-loop` reports the effect as a
   possible loop (Warning) where it was silent (#304).
+- An element read keeps the elements it may select: an index or a key no
+  constant names (`arr[c ? 1 : 0]`, `cfg[k]`), a read directly off a literal
+  (`[x ?? {}][0]`, `{ a: {} }.a`), an element past a spread or an elision, or
+  copied by a spread. A dependency on an element that may be a new object is
+  a possible loop (Warning), and one that surely is a loop as it would be
+  through a name; it was silent (#307).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

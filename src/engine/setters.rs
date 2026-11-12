@@ -843,7 +843,7 @@ fn for_each_converged_path(
                     .collect();
                 for m in members.into_iter().rev() {
                     let path = format!("{name}.{m}");
-                    let (entries, open) = heap.members(&fresh, m);
+                    let (entries, open) = heap.members(&fresh, Some(m));
                     if open {
                         stack.push((path.clone(), EnvVal::Val(StateValue::top())));
                     }

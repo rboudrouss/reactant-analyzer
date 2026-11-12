@@ -10,7 +10,7 @@ use crate::{
             alloc_literal, call_targets, closure_env, escape, exec_stmt_with_callbacks,
             returned_sites, run_cfg,
         },
-        stores::{AbstractEnv, EnvVal, Heap, HeapValue, Sites, member_key, resolve_locs},
+        stores::{AbstractEnv, EnvVal, Heap, HeapValue, Sites, member_key},
     },
     engine::component_registry::ChildLookup,
     ir::{
@@ -754,19 +754,53 @@ fn props_cache_key(
     key
 }
 
-/// Evaluate field access: read the member off every heap object the receiver
-/// may denote (a whole member chain, not just a bare variable), and, when the
-/// receiver may also be something no site places or a site does not record
-/// the member, what the member of anything is (#240).
+/// Evaluate field access: a member read under the field's name.
 fn eval_field_access(
     obj: &Expr,
     field: &Symbol,
     env: &AbstractEnv<StateValue>,
     ctx: &mut AnalysisCtx<StateValue>,
 ) -> StateValue {
-    let (vals, open) = match resolve_locs(obj, env, ctx.heap) {
+    eval_member(obj, Some(field), env, ctx)
+}
+
+/// A **constant** index is a member read, and the heap answers it exactly as it
+/// answers a named one.
+///
+/// Array destructuring lowers to `IndexAccess` with a literal index — `const
+/// [value, setValue] = useAtom(a)` becomes `__arr[0]` / `__arr[1]` — so a
+/// tuple-returning hook's per-slot contract becomes reachable through the same
+/// per-member map a named member already uses (#37). Before this, every indexed
+/// read was ⊤, which is why jotai's setter looked unstable.
+///
+/// A key that is one string names that member too (`o["k"]`, `o[k]` with `k`
+/// one constant, #76). Any other index may select any member: the join of
+/// every entry and of what no entry says (#307), so an element that may be a
+/// new reference keeps that arm. A negative index is not a member either.
+fn eval_index_access(
+    arr: &Expr,
+    idx: &Expr,
+    env: &AbstractEnv<StateValue>,
+    ctx: &mut AnalysisCtx<StateValue>,
+) -> StateValue {
+    let key = member_key(idx, env);
+    eval_member(arr, key.as_ref(), env, ctx)
+}
+
+/// Read `member` (`None`: a key no constant names) off every heap object the
+/// receiver may denote — a whole member chain, a name, or a literal, placed
+/// as any literal is ([`alloc_literal`], #307) — and, when the receiver may
+/// also be something no site places or the key may select a member no entry
+/// records, join what the member of anything is (#240).
+fn eval_member(
+    obj: &Expr,
+    member: Option<&Symbol>,
+    env: &AbstractEnv<StateValue>,
+    ctx: &mut AnalysisCtx<StateValue>,
+) -> StateValue {
+    let (vals, open) = match alloc_literal(&StateValueTransfer, obj, env, ctx) {
         Some(sites) => {
-            let (entries, open) = ctx.heap.members(&sites, field);
+            let (entries, open) = ctx.heap.members(&sites, member.map(String::as_str));
             (entries.into_iter().map(EnvVal::as_val).collect(), open)
         }
         None => (Vec::new(), true),
@@ -780,37 +814,18 @@ fn eval_field_access(
     // (the field's *kind* stays unknown — every other slot is ⊤). Same
     // no-mutation-during-render assumption as the `StateVal` read-side
     // conversion above; in-place writes have their own diagnostics
-    // (`state-mutation`). ADR-017 §Limitations, member-deps.
+    // (`state-mutation`). ADR-017 §Limitations, member-deps. A key no
+    // constant names moves with what it is computed from too, which the
+    // labels do not say.
     let obj_val = eval_state_value(obj, env, ctx);
     let any = StateValue {
-        reference: obj_val.versioned_reference().unwrap_or(Stability::Unknown),
+        reference: match member {
+            Some(_) => obj_val.versioned_reference().unwrap_or(Stability::Unknown),
+            None => Stability::Unknown,
+        },
         ..StateValue::top()
     };
     placed.map_or(any.clone(), |p| p.join(&any))
-}
-
-/// A **constant** index is a member read, and the heap answers it exactly as it
-/// answers a named one.
-///
-/// Array destructuring lowers to `IndexAccess` with a literal index — `const
-/// [value, setValue] = useAtom(a)` becomes `__arr[0]` / `__arr[1]` — so a
-/// tuple-returning hook's per-slot contract becomes reachable through the same
-/// per-member map a named member already uses (#37). Before this, every indexed
-/// read was ⊤, which is why jotai's setter looked unstable.
-///
-/// A key that is one string names that member too (`o["k"]`, `o[k]` with `k`
-/// one constant, #76). Any other index stays ⊤: which element `xs[i]`
-/// denotes is not a member read. A negative index is not a member either.
-fn eval_index_access(
-    arr: &Expr,
-    idx: &Expr,
-    env: &AbstractEnv<StateValue>,
-    ctx: &mut AnalysisCtx<StateValue>,
-) -> StateValue {
-    match member_key(idx, env) {
-        Some(m) => eval_field_access(arr, &m, env, ctx),
-        None => StateValue::top(),
-    }
 }
 
 /// Extract per-prop abstract values from a props expression.
