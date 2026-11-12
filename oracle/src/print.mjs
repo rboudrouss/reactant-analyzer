@@ -58,7 +58,8 @@ function printHelper(h, exported) {
 }
 
 function printComp(c, usedElsewhere) {
-  const params = c.props.length ? `{ ${c.props.map((p) => p.name).join(", ")} }` : "";
+  const param = (p) => (p.default ? `${p.name} = ${expr(p.default)}` : p.name);
+  const params = c.props.length ? `{ ${c.props.map(param).join(", ")} }` : "";
   const lines = [`${c.exported || usedElsewhere ? "export " : ""}function ${c.name}(${params}) {`];
   for (const it of c.body) lines.push(indent(item(it), 1));
   lines.push(`  return ${jsx(c.view, 1)};`, "}");
@@ -185,6 +186,17 @@ export function expr(e, ctx = 0) {
       // operand, and as a concise arrow body.
       const s = `${expr(e.l, 3)} ?? ${expr(e.r, 3)}`;
       return ctx > 1 || ctx === ARROW_BODY ? `(${s})` : s;
+    }
+    case "or": {
+      // Parenthesized as an operand (beside `??` it must be), and as a
+      // concise arrow body.
+      const s = `${expr(e.l, 3)} || ${expr(e.r, 3)}`;
+      return ctx > 1 || ctx === ARROW_BODY ? `(${s})` : s;
+    }
+    case "index": {
+      // `{ a: x }["a"]` as a concise arrow body would open a block.
+      const s = `${expr(e.obj, 9)}[${expr(e.idx)}]`;
+      return ctx === ARROW_BODY ? `(${s})` : s;
     }
     case "optcall":
       return `${e.fn}?.(${e.args.map((a) => expr(a)).join(", ")})`;
