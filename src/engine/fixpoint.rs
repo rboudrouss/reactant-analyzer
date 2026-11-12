@@ -1011,9 +1011,7 @@ pub fn analyze_program(
             ..inter_for(*child, vec![*caller])
         };
         let result = probe.analyze_under(ir, input.clone());
-        let facts = crate::engine::SiteFacts {
-            fresh_deps: crate::engine::fresh_deps(&result),
-        };
+        let facts = crate::engine::SiteFacts::of(&result);
         if let Some(row) = call_graph.borrow_mut().site_mut(*caller, *child, *span) {
             row.own = Some(facts);
         }
@@ -1055,10 +1053,9 @@ pub fn analyze_program(
                 ..inter_for(*child, vec![*grand, *caller])
             };
             let result = probe.analyze_under(ir, derived);
-            let facts = crate::engine::SiteFacts {
-                fresh_deps: crate::engine::fresh_deps(&result),
-            };
-            if facts.fresh_deps.is_empty() {
+            let facts = crate::engine::SiteFacts::of(&result);
+            // The may fact holds wherever the must one does.
+            if facts.fresh_when_object.is_empty() {
                 continue;
             }
             if let Some(row) = call_graph.borrow_mut().site_mut(*caller, *child, *span) {
@@ -2191,6 +2188,7 @@ mod tests {
                 stmts: vec![],
                 term: Terminator::Branch {
                     span: None,
+                    chain_link: false,
                     cond: Expr::BinOp {
                         op: crate::ir::expr::BinOp::Lt,
                         lhs: Box::new(Expr::Var("x".to_string())),
@@ -2749,6 +2747,7 @@ mod tests {
                 stmts: vec![],
                 term: Terminator::Branch {
                     span: None,
+                    chain_link: false,
                     cond: Expr::Lit(Prim::Bool(true)),
                     then_: 2,
                     else_: 3,
@@ -2958,6 +2957,7 @@ mod tests {
                 stmts: vec![],
                 term: Terminator::Branch {
                     span: None,
+                    chain_link: false,
                     cond: Expr::BinOp {
                         op: crate::ir::expr::BinOp::Gt,
                         lhs: Box::new(Expr::Var("count".to_string())),
@@ -3120,6 +3120,7 @@ mod tests {
                 stmts: vec![],
                 term: Terminator::Branch {
                     span: None,
+                    chain_link: false,
                     cond: Expr::BinOp {
                         op: crate::ir::expr::BinOp::Gt,
                         lhs: Box::new(Expr::Var("x".to_string())),

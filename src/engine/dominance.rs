@@ -74,14 +74,37 @@ pub fn dominates(cfg: &CFG, a: BlockId, b: BlockId) -> bool {
 /// the set post-dominates the entry. The must-reach fact behind
 /// `must_on_all_paths` and the churn graph's `Must` edges (ADR-042 §6).
 pub fn on_all_paths(cfg: &CFG, blocks: &HashSet<BlockId>) -> bool {
-    if blocks.contains(&cfg.entry) {
+    on_all_paths_from(cfg, cfg.entry, blocks)
+}
+
+/// True when every run of `cfg` that reaches the point `first` and the one
+/// that reaches `then` (a block and a statement index in it, the terminator
+/// at `stmts.len()`) are the same runs, `first` before `then`: one block in
+/// that order, or `first`'s block dominates `then`'s and `then`'s
+/// post-dominates `first`'s. Both must be reachable. A path out through a
+/// `throw` (`Unreachable`) is an exit like a `return`.
+pub fn co_executes_in_order(cfg: &CFG, first: (BlockId, usize), then: (BlockId, usize)) -> bool {
+    let reachable: HashSet<BlockId> = cfg.rpo().into_iter().collect();
+    if !reachable.contains(&first.0) || !reachable.contains(&then.0) {
+        return false;
+    }
+    if first.0 == then.0 {
+        return first.1 < then.1;
+    }
+    dominates(cfg, first.0, then.0) && on_all_paths_from(cfg, first.0, &HashSet::from([then.0]))
+}
+
+/// True when every path of `cfg` from `from` to an exit passes through one
+/// of `blocks`.
+fn on_all_paths_from(cfg: &CFG, from: BlockId, blocks: &HashSet<BlockId>) -> bool {
+    if blocks.contains(&from) {
         return true;
     }
     // BFS avoiding `blocks`; reaching an exit block means a path escapes.
     let succ_map = cfg.successor_map();
     let mut visited: HashSet<BlockId> = HashSet::new();
-    let mut queue = vec![cfg.entry];
-    visited.insert(cfg.entry);
+    let mut queue = vec![from];
+    visited.insert(from);
     while let Some(bid) = queue.pop() {
         let succs = succ_map.get(&bid).map(Vec::as_slice).unwrap_or(&[]);
         if succs.is_empty() {
@@ -299,6 +322,7 @@ mod tests {
                 stmts: vec![],
                 term: Terminator::Branch {
                     span: None,
+                    chain_link: false,
                     cond: Expr::Lit(Prim::Bool(true)),
                     then_: 1,
                     else_: 2,

@@ -44,8 +44,8 @@ use crate::rules::{ConvergedEval, Note, SetterCall, Step, arg_is_call_free, loca
 /// the cycle).
 ///
 /// Some primitives legitimately leave it [`Default`]: they are handed the shape
-/// of the proof and not its location — `must_same_ref_mutation` receives
-/// container ids, `must_init_calls_setter` an `Expr` (which carries no span),
+/// of the proof and not its location — `must_init_calls_setter` an `Expr`
+/// (which carries no span),
 /// `must_on_all_paths` a block set. Empty provenance there is honest, not an
 /// omission; enriching it would mean widening those signatures for a position
 /// the rule already has.
@@ -1121,27 +1121,71 @@ pub(in crate::rules) fn must_effect_cycle(
     }
 }
 
-/// Evidence that a state object is mutated in place while its setter is called
-/// with the same reference in the same trigger — React's `Object.is` sees no
-/// change and skips the re-render.
+/// Evidence that a state object is mutated in place and then handed back to
+/// its setter by the same run — React's `Object.is` sees no change and skips
+/// the re-render.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SameRefMutation;
 
-/// `All` iff a mutation site and a setter-call site share a container (the same
-/// event/trigger scope) — the certain `state-mutation` Error (ADR-021 §3);
-/// `None` otherwise (a MAY: mutation and set on different triggers).
+/// One site of the pairing [`must_same_ref_mutation`] certifies: the object
+/// expression it touches (a mutation's receiver, a setter's argument, an
+/// updater's return), the body it sits in and its point there (block,
+/// statement index; the terminator at `stmts.len()`).
+pub struct RefSite<'a> {
+    pub body: &'a CFG,
+    pub at: (BlockId, usize),
+    pub expr: &'a Expr,
+    pub span: Option<SourceRange>,
+    /// The state parameter of the updater whose body this is, and the slot
+    /// whose object React hands it.
+    pub param: Option<(&'a Var, HookLabel)>,
+}
+
+/// `All` iff one run of a body mutates the object of `slot` in place and then
+/// hands that object to its setter (#180): both sites sit in one body and
+/// co-execute in that order ([`co_executes_in_order`]), and each expression
+/// certainly is the slot's object — its sole binding chain in the body ends
+/// at the slot's read, at a render name `must_reads` ties to it, or at the
+/// updater's untouched parameter; a mutation's receiver may be a member of
+/// it. `None` otherwise: the two sites only may co-execute, or the reference
+/// only may be the slot's.
+///
+/// [`co_executes_in_order`]: crate::engine::dominance::co_executes_in_order
 pub fn must_same_ref_mutation(
-    mutation_containers: &HashSet<usize>,
-    setter_containers: &HashSet<usize>,
+    slot: HookLabel,
+    mutation: &RefSite<'_>,
+    set: &RefSite<'_>,
+    must_reads: &HashMap<Var, HookLabel>,
 ) -> MustResult<SameRefMutation> {
-    if mutation_containers
-        .intersection(setter_containers)
-        .next()
-        .is_some()
+    let is_slot = |site: &RefSite<'_>, members: bool| {
+        let nested = crate::ir::bindings::nested_bodies(site.body);
+        let mut cur = site.expr;
+        for _ in 0..crate::ir::bindings::MAX_ALIAS_HOPS {
+            match crate::ir::bindings::must_binding_within(cur, site.body, &nested) {
+                Some(Expr::StateVal(l)) => return *l == slot,
+                Some(Expr::FieldAccess { obj, .. }) if members => cur = obj,
+                Some(Expr::IndexAccess { arr, .. }) if members => cur = arr,
+                Some(Expr::Var(v)) if site.param.is_some_and(|(p, _)| p == v) => {
+                    return site.param.is_some_and(|(_, l)| l == slot)
+                        && !nested
+                            .iter()
+                            .any(|(ps, b)| ps.contains(v) || crate::ir::bindings::binds(v, b));
+                }
+                Some(Expr::Var(v)) => return must_reads.get(v) == Some(&slot),
+                _ => return false,
+            }
+        }
+        false
+    };
+    if std::ptr::eq(mutation.body, set.body)
+        && crate::engine::dominance::co_executes_in_order(mutation.body, mutation.at, set.at)
+        && is_slot(mutation, true)
+        && is_slot(set, false)
     {
-        // No provenance: the inputs are container ids, so neither the mutation
-        // site nor the setter call reaches this primitive. The rule anchors it.
-        MustResult::All(Certified::mint(SameRefMutation, Provenance::default()))
+        MustResult::All(Certified::mint(
+            SameRefMutation,
+            Provenance::at(mutation.span, Some(slot)),
+        ))
     } else {
         MustResult::None
     }

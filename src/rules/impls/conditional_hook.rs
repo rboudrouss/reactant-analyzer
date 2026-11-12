@@ -115,6 +115,7 @@ mod tests {
                 stmts: vec![],
                 term: Terminator::Branch {
                     span: None,
+                    chain_link: false,
                     cond: Expr::Lit(Prim::Bool(true)),
                     then_: 1,
                     else_: 2,
@@ -231,6 +232,7 @@ mod tests {
                 stmts: vec![],
                 term: Terminator::Branch {
                     span: Some(guard_span),
+                    chain_link: false,
                     cond: Expr::Lit(Prim::Bool(true)),
                     then_: 1,
                     else_: 2,
@@ -252,6 +254,7 @@ mod tests {
                 stmts: vec![],
                 term: Terminator::Branch {
                     span: Some(diamond_span),
+                    chain_link: false,
                     cond: Expr::Lit(Prim::Bool(true)),
                     then_: 3,
                     else_: 4,
@@ -497,6 +500,7 @@ mod tests {
                 stmts: vec![],
                 term: Terminator::Branch {
                     span: None,
+                    chain_link: false,
                     cond: Expr::Lit(Prim::Bool(true)),
                     then_: 1,
                     else_: 2,

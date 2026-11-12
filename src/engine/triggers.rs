@@ -507,25 +507,44 @@ pub fn dep_is_fresh(
 /// React compares the elements it supplies, never `src` (#272): it is when
 /// every array the heap places `src` at holds an element that is one. A
 /// source the heap does not place, or that may hold elements no entry says,
-/// answers nothing.
-fn spread_is_fresh(src: &Expr, env: &AbstractEnv<StateValue>, heap: &Heap) -> bool {
+/// answers nothing. `fresh` is the fact asked of an element.
+fn spread_is_fresh(
+    src: &Expr,
+    env: &AbstractEnv<StateValue>,
+    heap: &Heap,
+    fresh: fn(&StateValue) -> bool,
+) -> bool {
     let Some(sites) = crate::domains::stores::resolve_locs(src, env, heap) else {
         return false;
     };
     !sites.open
         && !sites.ids.is_empty()
         && sites.ids.iter().all(|id| match heap.get(*id) {
-            Some(crate::domains::HeapValue::Obj(obj)) if !obj.is_open() => obj
-                .named
-                .values()
-                .any(|ev| ev.as_val().is_unstable_reference_only()),
+            Some(crate::domains::HeapValue::Obj(obj)) if !obj.is_open() => {
+                obj.named.values().any(|ev| fresh(&ev.as_val()))
+            }
             _ => false,
         })
 }
 
 /// Every effect, memo and callback of `result` with a written deps list
-/// that holds a dep [`dep_is_fresh`], and the indices of those deps.
+/// that holds a dep [`dep_is_fresh`], and the indices of those deps. A must
+/// fact: the loop rules' `Always::FreshDep` reads it.
 pub fn fresh_deps(result: &AnalysisResult<StateValue>) -> FreshDeps {
+    deps_where(result, StateValue::is_unstable_reference_only)
+}
+
+/// The deps that are a new reference at every render where they hold an
+/// object ([`StateValue::is_unstable_reference_when_object`]): `a?.map(f)`,
+/// `a && a.map(f)`. Not a must fact — only `always-unstable-deps` reads it,
+/// never a proof.
+pub fn fresh_deps_when_object(result: &AnalysisResult<StateValue>) -> FreshDeps {
+    deps_where(result, StateValue::is_unstable_reference_when_object)
+}
+
+/// The deps of every hook of `result` whose value at the render's exit has
+/// the fact `fresh`.
+fn deps_where(result: &AnalysisResult<StateValue>, fresh: fn(&StateValue) -> bool) -> FreshDeps {
     let env = result.exit_env();
     // One scratch heap for the whole component: a member dep (`obj.f`) only
     // resolves through the converged heap (#135).
@@ -541,27 +560,27 @@ pub fn fresh_deps(result: &AnalysisResult<StateValue>) -> FreshDeps {
         let Some(list) = deps.list() else {
             continue;
         };
-        let fresh: BTreeSet<usize> = list
+        let found: BTreeSet<usize> = list
             .as_slice()
             .iter()
             .enumerate()
             .filter(|(i, dep)| {
                 if list.spread_at.contains(i) {
-                    return spread_is_fresh(dep, &env, &heap);
+                    return spread_is_fresh(dep, &env, &heap, fresh);
                 }
-                dep_is_fresh(
-                    result.component,
+                fresh(&crate::engine::eval::eval_in_stores(
                     dep,
                     &env,
+                    result.component,
                     &result.state_store,
                     &result.memo_store,
                     &mut heap,
-                )
+                ))
             })
             .map(|(i, _)| i)
             .collect();
-        if !fresh.is_empty() {
-            out.insert(*label, fresh);
+        if !found.is_empty() {
+            out.insert(*label, found);
         }
     }
     out

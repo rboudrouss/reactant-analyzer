@@ -6,7 +6,7 @@ import { joinFiles, ENTRY } from "./files.mjs";
 
 const REACT = ["useState", "useEffect", "useLayoutEffect", "useReducer", "useMemo", "useCallback", "useRef"];
 // The package the analyzer cannot see into (react-run.mjs).
-const EXT = ["defer", "runNow"];
+const EXT = ["defer", "runNow", "format", "absent"];
 
 const fileOf = (x) => x.file ?? ENTRY;
 
@@ -112,7 +112,7 @@ function arg(a) {
 export function stmt(s) {
   switch (s.kind) {
     case "write": {
-      const call = `${s.target}(${arg(s.arg)})`;
+      const call = writeCall(s);
       switch (s.wrap) {
         case "plain":
           return `${call};`;
@@ -128,7 +128,9 @@ export function stmt(s) {
           return `(() => ${call})();`;
         case "defer":
         case "runNow":
-          return `${s.wrap}(() => ${call});`;
+          return `${s.wrap}${opt(s.wrapOptional)}(() => ${call});`;
+        case "optarg":
+          return `${s.via}?.(${call});`;
         default:
           throw new Error(`print: wrap ${s.wrap}`);
       }
@@ -136,7 +138,7 @@ export function stmt(s) {
     case "helpercall":
       return `${s.helper}(${s.target}, ${expr(s.arg)});`;
     case "call":
-      return `${s.target}(${expr(s.arg)});`;
+      return `${callCall(s)};`;
     case "if":
       return s.else.length
         ? `if (${expr(s.cond)}) ${block(s.then, 0)} else ${block(s.else, 0)}`
@@ -147,6 +149,11 @@ export function stmt(s) {
       throw new Error(`print: stmt ${s.kind}`);
   }
 }
+
+// `f?.(x)` for an optional call, `f(x)` otherwise.
+const opt = (optional) => (optional ? "?." : "");
+const writeCall = (s) => `${s.target}${opt(s.optional)}(${arg(s.arg)})`;
+const callCall = (s) => `${s.target}${opt(s.optional)}(${expr(s.arg)})`;
 
 // The context of a concise arrow body, where a leading `{` would open a block.
 const ARROW_BODY = -1;
@@ -162,6 +169,8 @@ export function expr(e, ctx = 0) {
       return String(e.v);
     case "null":
       return "null";
+    case "undefined":
+      return "undefined";
     case "var":
       return e.name;
     case "member":
@@ -197,8 +206,8 @@ export function expr(e, ctx = 0) {
 
 function stmtExprBody(s) {
   // An inline handler prop: `(v) => setN(v + 1)`, a write without its `;`.
-  if (s.kind === "write" && s.wrap === "plain") return `${s.target}(${arg(s.arg)})`;
-  if (s.kind === "call") return `${s.target}(${expr(s.arg)})`;
+  if (s.kind === "write" && s.wrap === "plain") return writeCall(s);
+  if (s.kind === "call") return callCall(s);
   return expr(s);
 }
 

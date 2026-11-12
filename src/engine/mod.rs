@@ -54,5 +54,7 @@ pub use setters::{
 };
 pub use store::STORE_SLOT;
 pub use symbol_graph::{SymbolGraph, SymbolKind, SymbolNode};
-pub use triggers::{Always, EffectTrigger, Rerun, dep_is_fresh, fresh_deps, triggers_of};
+pub use triggers::{
+    Always, EffectTrigger, Rerun, dep_is_fresh, fresh_deps, fresh_deps_when_object, triggers_of,
+};
 pub use written::{Change, SiteEnvs, Written};

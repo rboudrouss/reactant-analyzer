@@ -165,11 +165,13 @@ pub fn splice_callee_into_cfg(
                 then_,
                 else_,
                 span,
+                chain_link,
             } => Terminator::Branch {
                 cond,
                 then_: then_ + block_offset,
                 else_: else_ + block_offset,
                 span,
+                chain_link,
             },
             Terminator::Return(ret, _) => {
                 if let Some(var) = bound_var {
@@ -599,11 +601,13 @@ fn rename_vars_term(term: Terminator, ren: &HashMap<Var, Var>) -> Terminator {
             then_,
             else_,
             span,
+            chain_link,
         } => Terminator::Branch {
             cond: rename_vars_expr(cond, ren),
             then_,
             else_,
             span,
+            chain_link,
         },
         t @ (Terminator::Jump(_) | Terminator::Unreachable) => t,
     }
@@ -986,11 +990,13 @@ fn subst_vars_cfg(cfg: CFG, subst: &HashMap<Var, Expr>) -> CFG {
                     then_,
                     else_,
                     span,
+                    chain_link,
                 } => Terminator::Branch {
                     cond: subst_vars_expr(cond, subst),
                     then_,
                     else_,
                     span,
+                    chain_link,
                 },
                 t @ (Terminator::Jump(_) | Terminator::Unreachable) => t,
             };
@@ -1364,6 +1370,7 @@ mod tests {
                     then_: 1,
                     else_: 2,
                     span: None,
+                    chain_link: false,
                 },
             );
             cblocks.insert(id, b);

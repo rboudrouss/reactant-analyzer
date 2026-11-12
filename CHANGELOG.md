@@ -68,6 +68,11 @@ on a program React settles; 323 oracle cases, none a known false negative.
   `infinite-loop`'s wording says what a proven loop rests on.
 - Analysis is slower on large monorepos now that cross-package imports
   resolve (ADR-045 keeps memory flat; twenty roughly doubles in wall time).
+- `always-unstable-deps` also reports a dep that is a new reference at every
+  render where it holds an object and a primitive otherwise
+  (`items?.filter(f)`, `items && items.map(f)`, `c ? [x] : undefined`), with
+  that wording; the loop rules and their Errors still read only a dep that is
+  a new reference at every render (#301).
 
 ### Removed
 
@@ -95,6 +100,21 @@ on a program React settles; 323 oracle cases, none a known false negative.
   reported as a possible loop (Warning); so is one that depends on a memo over
   such a value, and a loop through two components. The URL is one store slot
   the analysis does not own (ADR-046, #298).
+- A reducer or a functional updater that rebinds its state parameter before
+  returning it (`if (a === "x") { s = s + 1; } return s;`) is no longer read
+  as returning the state unchanged: the loop it drives is reported (#214).
+- `state-mutation` is an Error only when one run mutates the state object and
+  then hands that same object to its setter; a mutation and a set on exclusive
+  branches, in different handlers, in a loop or a callback are a Warning that
+  says the write-back is possible (#180).
+- An optional chain skips its rest when a `?.` link is nullish: a write in an
+  optional call's arguments, after `a?.b`, or in an index (`cb?.(setN(n + 1))`,
+  `ref.current?.x(setN(…))`) is a possible write, a Warning where it was a
+  false Error (#301). The skip test is part of reading the chain: a
+  `[a?.b]` dep still covers `a?.b?.()` and `a?.b.c(x)` in `missing-deps` and
+  `stale-closure`.
+- `setter-in-render` anchors a setter reported at several equal sites at the
+  first one in the source, whatever order the analysis walks them in (#301).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

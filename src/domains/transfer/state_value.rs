@@ -1701,6 +1701,7 @@ mod tests {
                 }],
                 term: Terminator::Branch {
                     span: None,
+                    chain_link: false,
                     cond: Expr::Var("a".to_string()),
                     then_: 1,
                     else_: 2,
@@ -1799,6 +1800,7 @@ mod tests {
                 stmts: vec![],
                 term: Terminator::Branch {
                     span: None,
+                    chain_link: false,
                     cond: Expr::Lit(Prim::Bool(true)),
                     then_: 1,
                     else_: 2,
@@ -1924,6 +1926,7 @@ mod tests {
                 stmts: vec![],
                 term: Terminator::Branch {
                     span: None,
+                    chain_link: false,
                     cond: Expr::Lit(Prim::Bool(true)),
                     then_: 2,
                     else_: 3,
@@ -2088,6 +2091,7 @@ mod tests {
                 }],
                 term: Terminator::Branch {
                     span: None,
+                    chain_link: false,
                     cond: Expr::Var("c".to_string()),
                     then_: 1,
                     else_: 2,
@@ -2163,6 +2167,7 @@ mod tests {
                 stmts: vec![],
                 term: Terminator::Branch {
                     span: None,
+                    chain_link: false,
                     cond: Expr::Lit(Prim::Bool(true)),
                     then_: 2,
                     else_: 4,

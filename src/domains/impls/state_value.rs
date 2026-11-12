@@ -304,6 +304,18 @@ impl StateValue {
         self.reference == Stability::PerRender && self.populated_kinds().only(KindMask::REF)
     }
 
+    /// True when every object the value may be is a per-render-fresh
+    /// reference, and anything else it may be is not an object (`undefined`,
+    /// `null`, a number, the `other` primitives — what `a && …` keeps of an
+    /// opaque `a` when it is falsy): a new reference at every render where it
+    /// holds an object — `a?.map(f)`, `a && a.map(f)`, `c ? [x] : undefined`.
+    /// A setter is a stable function, so it rules the fact out. A *may* fact,
+    /// since at a render where it is not an object it says nothing: no proof
+    /// reads it, [`Self::is_unstable_reference_only`] is the must one.
+    pub fn is_unstable_reference_when_object(&self) -> bool {
+        self.reference == Stability::PerRender && self.setter == SetterVal::Bottom
+    }
+
     /// True when the value can only be a reference: `Object.is` then compares
     /// identities, and the reference's change component is the whole story of
     /// when the value differs. Anything else is compared by value.
@@ -1442,6 +1454,35 @@ mod tests {
         assert!(
             !StateValue::reference(Stability::PerRender)
                 .join(&StateValue::null())
+                .is_unstable_reference_only()
+        );
+    }
+
+    #[test]
+    fn unstable_reference_when_object_detection() {
+        let fresh = StateValue::reference(Stability::PerRender);
+        for v in [
+            fresh.clone(),
+            fresh.join(&StateValue::undefined()),
+            fresh.join(&StateValue::null()),
+            fresh.join(&StateValue::number(Interval::point(0.0))),
+            // `a && a.map(f)` with an opaque `a`: its falsy part, or a fresh array.
+            fresh.join(&StateValue::top().narrow_falsy()),
+        ] {
+            assert!(v.is_unstable_reference_when_object(), "{v:?}");
+        }
+        for v in [
+            StateValue::top(),
+            StateValue::undefined(),
+            fresh.join(&StateValue::reference(Stability::Stable)),
+            fresh.join(&cs("Foo", 0)),
+        ] {
+            assert!(!v.is_unstable_reference_when_object(), "{v:?}");
+        }
+        // Not the must fact: the joins with a primitive are not "every render".
+        assert!(
+            !fresh
+                .join(&StateValue::undefined())
                 .is_unstable_reference_only()
         );
     }
