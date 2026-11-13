@@ -77,8 +77,8 @@ pub trait AbstractDomain: Clone + PartialEq + PartialOrd + std::fmt::Debug {
     // Branch narrowing: default = identity (sound, imprecise).
     // Override for numeric domains to refine interval bounds on branch conditions.
 
-    // Nullability narrowing (ADR-015). The IR conflates `==`/`===` into `Eq`,
-    // so the refinements below are the sound envelope of both semantics.
+    // Nullability narrowing (ADR-015). A failed loose `x == null` is both
+    // drops (`narrow_env_for_branch`, #303).
     /// Taken `x !== null` (or false `x === null`): null impossible.
     fn narrow_drop_null(self) -> Self {
         self

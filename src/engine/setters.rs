@@ -233,6 +233,7 @@ fn setter_calls(
         wrappers: &wrappers,
         path: Vec::new(),
         store_scopes: None,
+        scopes: vec![(cfg, Some(BTreeSet::new()))],
     };
     walk.cfg(cfg, WALK_DEPTH, &mut found, WalkClass::Sync, None, None);
     let mut found = found.setters;
@@ -272,6 +273,36 @@ fn setter_calls(
         .collect()
 }
 
+/// The names a write's argument may read from a body whose bindings the
+/// region's env does not hold (#310). A write in a body the walk entered — an
+/// IIFE, a helper, a callback — is read at the call that runs that body, in
+/// the region's env; a name that body binds (a local, a parameter, a lowering
+/// temp) is its own there, whatever the region binds under the same name, and
+/// so is a name a body reached by name captures where it is written. Such a
+/// name holds nothing the env knows: its value is ⊤, and no proof reads the
+/// argument's spelling in the region's scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Foreign {
+    /// These names: none for a write in the walked body itself, else every
+    /// name a body on the way binds, and the region's own names when a body
+    /// on the way is written in the render, where they do not reach.
+    Names(BTreeSet<Var>),
+    /// Any name a body other than the render binds: a body on the way was
+    /// reached through a value, and may be written anywhere.
+    Any,
+}
+
+impl Foreign {
+    /// Is `v` one of the names, given `bound_elsewhere` — every name a body
+    /// other than the render binds — for [`Foreign::Any`]?
+    pub fn hides(&self, v: &str, bound_elsewhere: &HashSet<Var>) -> bool {
+        match self {
+            Foreign::Names(names) => names.contains(v),
+            Foreign::Any => bound_elsewhere.contains(v),
+        }
+    }
+}
+
 /// One raw write site: the setter variable, a witness span, the phase class
 /// the walk context assigned (ADR-027 §1-§2), and the top-level block the
 /// walk descended from (region membership for provenance, ADR-027 §4).
@@ -290,6 +321,9 @@ pub(crate) struct WriteSite {
     pub updater: Updater,
     /// Argument 0 as written, `None` for a bare `setX()`.
     pub arg: Option<Expr>,
+    /// The names `arg` may read from a body whose bindings the region's env
+    /// does not hold ([`Foreign`]).
+    pub foreign: Foreign,
     /// The setter is handed to a callee that calls it (`xs.forEach(setV)`,
     /// #291): it stores what the callee passes, which no expression here is.
     pub applied: bool,
@@ -365,6 +399,7 @@ pub(crate) fn collect_write_sites(
         wrappers: &wrappers,
         path: Vec::new(),
         store_scopes: Some(vec![crate::ir::bindings::local_bindings(converged.render)]),
+        scopes: vec![(cfg, Some(BTreeSet::new()))],
     };
     walk.cfg(cfg, WALK_DEPTH, &mut found, WalkClass::Sync, None, None);
     let setters = found
@@ -379,6 +414,7 @@ pub(crate) fn collect_write_sites(
             repeats: s.repeats,
             updater: s.updater,
             arg: s.arg,
+            foreign: s.foreign,
             applied: s.applied,
             through: s.through,
         })
@@ -843,7 +879,7 @@ fn for_each_converged_path(
                     .collect();
                 for m in members.into_iter().rev() {
                     let path = format!("{name}.{m}");
-                    let (entries, open) = heap.members(&fresh, m);
+                    let (entries, open) = heap.members(&fresh, Some(m));
                     if open {
                         stack.push((path.clone(), EnvVal::Val(StateValue::top())));
                     }
@@ -1942,6 +1978,13 @@ pub(crate) fn collect_slot_writers(
     // (#210). The alias map above stays the may reading that finds writes.
     let elsewhere = must_alias_scopes(render_cfg, hooks);
     let must_read = |e: &Expr| crate::ir::bindings::must_slot_read(e, render_cfg, &elsewhere);
+    // Every name a body other than the render binds: what a write in a body
+    // reached through a value may read from outside the region ([`Foreign`]).
+    let bound_elsewhere: HashSet<Var> = elsewhere
+        .iter()
+        .flat_map(|(params, body)| crate::ir::bindings::own_names(params, body))
+        .map(str::to_string)
+        .collect();
     // Any local binding of a deferring global's name disables its summary,
     // wherever the call sits (fail-closed across every body, nested `FnLit`
     // scopes included).
@@ -2022,8 +2065,10 @@ pub(crate) fn collect_slot_writers(
     };
 
     let mut out: Vec<SlotWriter> = Vec::new();
+    // `params`: the body's parameters (a callback's), which no env binds.
     let push_sites = |region: WriterRegion,
                       cfg: &CFG,
+                      params: &[Var],
                       out: &mut Vec<SlotWriter>,
                       stores: &mut Vec<SlotWriter>| {
         let (cfg_key, hook_origin) = match region {
@@ -2157,7 +2202,21 @@ pub(crate) fn collect_slot_writers(
                     }
                     _ => false,
                 };
-            let updater = site.updater.clone();
+            // A name the argument reads from another body holds nothing this
+            // region knows (#310): ⊤ in the value, no binding certificate, no
+            // updater body resolved by that name, and no spelling a proof may
+            // read in this region's scope.
+            let hides =
+                |v: &str| site.foreign.hides(v, &bound_elsewhere) || params.iter().any(|p| p == v);
+            let reads_hidden = |e: &Expr| {
+                let mut read = HashSet::new();
+                crate::ir::free_vars::collect_used_vars(e, &mut read);
+                read.iter().any(|v| hides(v))
+            };
+            let updater = match (&site.updater, site.arg.as_ref().map(Expr::peel_ts)) {
+                (Updater::Functional(_), Some(Expr::Var(v))) if hides(v) => Updater::Unknown,
+                (u, _) => u.clone(),
+            };
             // A position only a write that runs synchronously in this region,
             // once per pass, can claim: a repeating site runs 0..N times and
             // every other class runs on another turn or in another CFG.
@@ -2169,19 +2228,22 @@ pub(crate) fn collect_slot_writers(
             // none: no slot is surely written there.
             let block = at.map(|(b, _)| b).filter(|_| sole);
             let target = (owner.unwrap_or(envs.component), slot);
-            let written = match reducers.get(target.0, target.1) {
+            let mut written = match reducers.get(target.0, target.1) {
                 Some(reducer) => written::dispatched(&reducer),
                 None if carried || site.applied => written::carried(),
                 None => written::classify(
                     site.arg.as_ref(),
-                    &site.updater,
+                    &updater,
                     owner.is_none().then_some(slot),
                     class_phase(site.class, region),
-                    must_read,
-                    |e| envs.eval(region, cfg, at, e),
-                    |e| bound(e, at),
+                    |e| (!reads_hidden(e)).then(|| must_read(e)).flatten(),
+                    |e| envs.eval(region, cfg, at, e, &hides),
+                    |e| (!reads_hidden(e)).then(|| bound(e, at)).flatten(),
                 ),
             };
+            if written.expr.as_ref().is_some_and(reads_hidden) {
+                written.expr = None;
+            }
             out.push(SlotWriter {
                 slot,
                 via: via_of(site.prov_block, &site.through),
@@ -2221,24 +2283,27 @@ pub(crate) fn collect_slot_writers(
     };
 
     let mut stores: Vec<SlotWriter> = Vec::new();
-    push_sites(WriterRegion::Render, render_cfg, &mut out, &mut stores);
+    push_sites(WriterRegion::Render, render_cfg, &[], &mut out, &mut stores);
     for hook in hooks {
-        let (region, body) = match hook {
+        let (region, body, params) = match hook {
             HookEntry::Effect {
                 label, body_cfg, ..
-            } => (WriterRegion::Effect(*label), body_cfg),
+            } => (WriterRegion::Effect(*label), body_cfg, &[][..]),
             HookEntry::Memo {
                 label, body_cfg, ..
-            } => (WriterRegion::Memo(*label), body_cfg),
+            } => (WriterRegion::Memo(*label), body_cfg, &[][..]),
             HookEntry::Callback {
-                label, body_cfg, ..
-            } => (WriterRegion::Callback(*label), body_cfg),
+                label,
+                body_cfg,
+                params,
+                ..
+            } => (WriterRegion::Callback(*label), body_cfg, &params[..]),
             HookEntry::Handler {
                 label, body_cfg, ..
-            } => (WriterRegion::Handler(*label), body_cfg),
+            } => (WriterRegion::Handler(*label), body_cfg, &[][..]),
             _ => continue,
         };
-        push_sites(region, body, &mut out, &mut stores);
+        push_sites(region, body, params, &mut out, &mut stores);
     }
 
     let key = |w: &SlotWriter| {
@@ -2329,6 +2394,21 @@ struct SetterWalk<'a> {
     /// body on the walk's stack, the render's first, which a mover's name is
     /// resolved through. `None` for every consumer that does not ask.
     store_scopes: Option<Vec<HashMap<&'a str, Vec<&'a Expr>>>>,
+    /// Every body on the walk's stack, the root's first, with the names a
+    /// write in or below it reads from outside the region's env ([`Foreign`];
+    /// `None` is [`Foreign::Any`]).
+    scopes: Vec<(&'a CFG, Option<BTreeSet<Var>>)>,
+}
+
+/// How the walk reaches a body ([`SetterWalk::enter`]).
+#[derive(Clone, Copy)]
+enum Reached<'a> {
+    /// A function literal written in the body the walk is in, with its
+    /// parameters: an IIFE, a callback argument, an inline cleanup.
+    Inline(&'a [Var]),
+    /// Through a name or a value: a helper, a `useCallback` body, a closure
+    /// the converged values point at.
+    Named,
 }
 
 /// No bindings to record reads for — every setter consumer.
@@ -2539,6 +2619,8 @@ struct FoundSite {
     updater: Updater,
     /// Argument 0 as written, for the value the row stores (ADR-042 §2).
     arg: Option<Expr>,
+    /// The names `arg` may read from a body the region's env does not hold.
+    foreign: Foreign,
     /// The setter is handed to a callee that calls it ([`WriteSite::applied`]).
     applied: bool,
     /// The function names the walk went through to reach the site
@@ -2813,6 +2895,63 @@ impl<'a> SetterWalk<'a> {
         self.body = outer;
     }
 
+    /// [`Self::cfg`] for a body the walk enters from the one it is in. A
+    /// write below reads the names `body` binds as its own, never the
+    /// region's ([`Foreign`], #310). A body reached by name captures where
+    /// it is written: in a body on the stack, whose own names the stack
+    /// already accounts for; in the render, which the region's env holds
+    /// except under the names the root rebinds; anywhere else, unknown.
+    #[allow(clippy::too_many_arguments)]
+    fn enter(
+        &mut self,
+        body: &'a CFG,
+        reached: Reached<'a>,
+        depth: usize,
+        found: &mut Found,
+        mode: WalkClass,
+        prov: Option<BlockId>,
+        witness: Option<SourceRange>,
+    ) {
+        use crate::ir::bindings::{literal_params, own_names};
+        let root = self.scopes[0].0;
+        let render = self.converged.map(|c| c.render);
+        let names = match reached {
+            Reached::Inline(params) => Some(own_names(params, body).map(str::to_string).collect()),
+            Reached::Named => {
+                if let Some(params) = self
+                    .scopes
+                    .iter()
+                    .rev()
+                    .find_map(|(scope, _)| literal_params(scope, body))
+                {
+                    Some(own_names(params, body).map(str::to_string).collect())
+                } else if let Some(params) = render.and_then(|r| literal_params(r, body)) {
+                    let mut names: BTreeSet<Var> =
+                        own_names(params, body).map(str::to_string).collect();
+                    names.extend(own_names(&[], root).map(str::to_string));
+                    Some(names)
+                } else {
+                    None
+                }
+            }
+        };
+        self.scopes.push((body, names));
+        self.cfg(body, depth, found, mode, prov, witness);
+        self.scopes.pop();
+    }
+
+    /// The names a write found here reads from outside the region's env.
+    fn foreign(&self) -> Foreign {
+        let mut out = BTreeSet::new();
+        for (_, names) in &self.scopes {
+            match names {
+                Some(names) => out.extend(names.iter().cloned()),
+                None => return Foreign::Any,
+            }
+        }
+        Foreign::Names(out)
+    }
+
     /// Record a write of the store at this site, when the walk records them.
     #[allow(clippy::too_many_arguments)]
     fn store_site(
@@ -2913,19 +3052,24 @@ impl<'a> SetterWalk<'a> {
                         // or bound to a variable. Without this the cleanup's
                         // writes are invisible to the relation.
                         if self.effect_body && at_root && mode == WalkClass::Sync {
-                            let (body, name) = match expr {
-                                Expr::FnLit { body_cfg, .. } => (Some(&**body_cfg), None),
-                                Expr::Var(name) => {
-                                    (self.fn_bindings.get(name).map(|b| &**b), Some(name))
-                                }
-                                _ => (None, None),
+                            let (body, name, reached) = match expr {
+                                Expr::FnLit {
+                                    body_cfg, params, ..
+                                } => (Some(&**body_cfg), None, Reached::Inline(params)),
+                                Expr::Var(name) => (
+                                    self.fn_bindings.get(name).map(|b| &**b),
+                                    Some(name),
+                                    Reached::Named,
+                                ),
+                                _ => (None, None, Reached::Named),
                             };
                             if let Some(body) = body
                                 && depth > 0
                             {
                                 self.path.extend(name.cloned());
-                                self.cfg(
+                                self.enter(
                                     body,
+                                    reached,
                                     depth - 1,
                                     found,
                                     WalkClass::Cleanup,
@@ -3114,6 +3258,7 @@ impl<'a> SetterWalk<'a> {
                     repeats: self.repeating,
                     updater: self.updater_of(args),
                     arg: args.first().map(|a| a.peel_ts().clone()),
+                    foreign: self.foreign(),
                     applied: false,
                     through: self.path.clone(),
                 });
@@ -3134,8 +3279,9 @@ impl<'a> SetterWalk<'a> {
                     // returned closure), so the name rides on `path`.
                     let mut inner = Found::default();
                     self.path.push(name.clone());
-                    self.cfg(
+                    self.enter(
                         body,
+                        Reached::Named,
                         depth - 1,
                         &mut inner,
                         WalkClass::Sync,
@@ -3159,11 +3305,14 @@ impl<'a> SetterWalk<'a> {
             // and the reason #117's await split bought nothing on the shape it
             // was aimed at.
             if depth > 0
-                && let Expr::FnLit { body_cfg, .. } = fn_.peel_ts()
+                && let Expr::FnLit {
+                    body_cfg, params, ..
+                } = fn_.peel_ts()
             {
                 let mut inner = Found::default();
-                self.cfg(
+                self.enter(
                     body_cfg,
+                    Reached::Inline(params),
                     depth - 1,
                     &mut inner,
                     WalkClass::Sync,
@@ -3240,7 +3389,15 @@ impl<'a> SetterWalk<'a> {
                     && event.as_deref().is_none_or(|n| n == e)
                 {
                     let mut inner = Found::default();
-                    self.cfg(body_cfg, depth - 1, &mut inner, mode, prov, stmt_span);
+                    self.enter(
+                        body_cfg,
+                        Reached::Named,
+                        depth - 1,
+                        &mut inner,
+                        mode,
+                        prov,
+                        stmt_span,
+                    );
                     found.absorb(inner, body_cfg, mode, None, prov);
                 }
             }
@@ -3304,15 +3461,26 @@ impl<'a> SetterWalk<'a> {
                 repeats: self.repeating,
                 updater: Updater::Unknown,
                 arg: None,
+                foreign: self.foreign(),
                 applied: true,
                 through: self.path.clone(),
             });
         }
         match arg {
             // Inline FnLit arg descend body, costs one depth level.
-            Expr::FnLit { body_cfg, .. } if depth > 0 => {
+            Expr::FnLit {
+                body_cfg, params, ..
+            } if depth > 0 => {
                 let mut inner = Found::default();
-                self.cfg(body_cfg, depth - 1, &mut inner, class, prov, stmt_span);
+                self.enter(
+                    body_cfg,
+                    Reached::Inline(params),
+                    depth - 1,
+                    &mut inner,
+                    class,
+                    prov,
+                    stmt_span,
+                );
                 found.absorb(inner, body_cfg, class, placed, prov);
             }
             // B5: variable arg name resolution, no depth cost — so this is
@@ -3322,7 +3490,15 @@ impl<'a> SetterWalk<'a> {
                 let body = &self.fn_bindings[name];
                 let mut inner = Found::default();
                 self.path.push(name.clone());
-                self.cfg(body, depth, &mut inner, class, prov, stmt_span);
+                self.enter(
+                    body,
+                    Reached::Named,
+                    depth,
+                    &mut inner,
+                    class,
+                    prov,
+                    stmt_span,
+                );
                 self.path.pop();
                 found.absorb(inner, body, class, placed, prov);
             }
@@ -3379,8 +3555,9 @@ impl<'a> SetterWalk<'a> {
         for body in converged.member_bodies(&name) {
             let mut inner = Found::default();
             self.path.push(name.clone());
-            self.cfg(
+            self.enter(
                 body,
+                Reached::Named,
                 depth - 1,
                 &mut inner,
                 WalkClass::Sync,
@@ -3469,8 +3646,9 @@ impl<'a> SetterWalk<'a> {
         for body in bodies {
             let mut inner = Found::default();
             self.path.push(name.clone());
-            self.cfg(
+            self.enter(
                 body,
+                Reached::Named,
                 depth - 1,
                 &mut inner,
                 WalkClass::Sync,
@@ -3583,6 +3761,7 @@ pub fn collect_slot_reads(render_cfg: &CFG, hooks: &[HookEntry]) -> Vec<SlotRead
             wrappers: &NO_WRAPPERS,
             path: Vec::new(),
             store_scopes: None,
+            scopes: vec![(cfg, Some(BTreeSet::new()))],
         };
         walk.cfg(cfg, 2, &mut found, WalkClass::Sync, None, None);
         for r in found.reads {
@@ -3666,6 +3845,7 @@ pub fn collect_body_calls(cfg: &CFG, region: WriterRegion) -> Vec<BodyCall> {
         wrappers: &NO_WRAPPERS,
         path: Vec::new(),
         store_scopes: None,
+        scopes: vec![(cfg, Some(BTreeSet::new()))],
     };
     walk.cfg(cfg, WALK_DEPTH, &mut found, WalkClass::Sync, None, None);
     let mut rows: Vec<BodyCall> = found

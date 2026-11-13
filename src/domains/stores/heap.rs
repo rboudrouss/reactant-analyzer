@@ -119,6 +119,13 @@ impl Members {
         for slot in self.named.values_mut() {
             *slot = slot.join(value);
         }
+        self.hold_unplaced(value);
+    }
+
+    /// An entry at a position nothing fixes (an array element past a spread
+    /// or an elision): a member no constant names may hold it, and no named
+    /// member does, since each named one sits where its index says (#307).
+    pub fn hold_unplaced(&mut self, value: &EnvVal<StateValue>) {
         self.others = Some(
             self.others
                 .as_ref()
@@ -406,9 +413,24 @@ impl Heap {
     /// no entry says — the sites are open, or one of them is not an object
     /// recording the member (#240). An object that does not name the member
     /// may still hold it among its `others` (#76).
-    pub fn members(&self, sites: &Sites, member: &str) -> (Vec<&EnvVal<StateValue>>, bool) {
+    ///
+    /// `None` is a key no constant names (`xs[i]`, `o[c ? "a" : "b"]`): it
+    /// may select any member, so the read is every entry of every object, and
+    /// open, since it may also select a member no entry says (#307).
+    pub fn members(&self, sites: &Sites, member: Option<&str>) -> (Vec<&EnvVal<StateValue>>, bool) {
         let mut ids: Vec<_> = sites.ids.iter().copied().collect();
         ids.sort();
+        let Some(member) = member else {
+            let entries = ids
+                .into_iter()
+                .filter_map(|id| match self.get(id) {
+                    Some(HeapValue::Obj(obj)) => Some(obj.values()),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            return (entries, true);
+        };
         let mut open = sites.open;
         let mut entries = Vec::new();
         for id in ids {
@@ -428,6 +450,24 @@ impl Heap {
             }
         }
         (entries, open)
+    }
+
+    /// The allocation sites `member` of a value pointing to `sites` may be
+    /// ([`Heap::members`]), open when it may also be something no site
+    /// places; `None` when no entry places any.
+    pub fn member_sites(&self, sites: &Sites, member: Option<&str>) -> Option<Sites> {
+        let (entries, open) = self.members(sites, member);
+        let sites = entries.into_iter().fold(
+            Sites {
+                open,
+                ..Sites::default()
+            },
+            |acc, ev| match ev.sites() {
+                Some(s) => acc.join(s),
+                None => acc.opened(),
+            },
+        );
+        (!sites.ids.is_empty()).then_some(sites)
     }
 
     /// The part of the heap reachable from `roots`: every location a member
@@ -637,24 +677,14 @@ pub fn resolve_locs<D: AbstractDomain>(
     let (obj, member) = match expr {
         Expr::Var(v) => return env.lookup_env_val(v).and_then(|ev| ev.sites().cloned()),
         Expr::TSAnnotated(inner) => return resolve_locs(inner, env, heap),
-        Expr::FieldAccess { obj, field } => (obj, field.clone()),
+        Expr::FieldAccess { obj, field } => (obj, Some(field.clone())),
         // A constant index is a member read (`t[1]`, `o["k"]`, `o[k]` with
-        // `k` one string), as `eval_index_access` reads it.
-        Expr::IndexAccess { arr, idx } => (arr, member_key(idx, env)?),
+        // `k` one string); any other index may be any member (#307), as
+        // `eval_index_access` reads it.
+        Expr::IndexAccess { arr, idx } => (arr, member_key(idx, env)),
         _ => return None,
     };
-    let (entries, open) = heap.members(&resolve_locs(obj, env, heap)?, &member);
-    let sites = entries.into_iter().fold(
-        Sites {
-            open,
-            ..Sites::default()
-        },
-        |acc, ev| match ev.sites() {
-            Some(s) => acc.join(s),
-            None => acc.opened(),
-        },
-    );
-    (!sites.ids.is_empty()).then_some(sites)
+    heap.member_sites(&resolve_locs(obj, env, heap)?, member.as_deref())
 }
 
 /// The one member a key expression names, when it names one: a literal
@@ -706,16 +736,31 @@ mod tests {
     fn a_read_of_a_member_no_constant_names_is_one_of_the_others() {
         let mut h = obj(0.0);
         let sites = Sites::closed([ExprId(7)]);
-        assert!(h.members(&sites, "other").0.is_empty());
+        assert!(h.members(&sites, Some("other")).0.is_empty());
         if let Some(HeapValue::Obj(o)) = h.get_mut(ExprId(7)) {
             o.write_any(&EnvVal::Val(StateValue::number(Interval::point(1.0))));
         }
-        let (entries, open) = h.members(&sites, "other");
+        let (entries, open) = h.members(&sites, Some("other"));
         assert_eq!(entries.len(), 1);
         assert!(open, "the member may also be absent");
         // Written under a key that may be `step` as well.
-        let step = &h.members(&sites, "step").0[0].as_val();
+        let step = &h.members(&sites, Some("step")).0[0].as_val();
         assert_eq!(step.num, Interval::point(0.0).hull(&Interval::point(1.0)));
+    }
+
+    #[test]
+    fn a_read_under_a_key_no_constant_names_is_every_entry_and_open() {
+        // #307: `o[k]` may select `step`, a member under `others`, or a
+        // member no entry says.
+        let mut h = obj(0.0);
+        if let Some(HeapValue::Obj(o)) = h.get_mut(ExprId(7)) {
+            o.others = Some(EnvVal::Val(StateValue::reference(
+                crate::domains::impls::Stability::PerRender,
+            )));
+        }
+        let (entries, open) = h.members(&Sites::closed([ExprId(7)]), None);
+        assert_eq!(entries.len(), 2, "`step` and the others: {entries:?}");
+        assert!(open, "the key may name a member no entry says");
     }
 
     #[test]

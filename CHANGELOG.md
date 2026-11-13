@@ -115,6 +115,41 @@ on a program React settles; 323 oracle cases, none a known false negative.
   `stale-closure`.
 - `setter-in-render` anchors a setter reported at several equal sites at the
   first one in the source, whatever order the analysis walks them in (#301).
+- `??`, `??=`, an optional link and a written `x == null` / `x != null` hold
+  neither `null` nor `undefined` where the test fails: `a?.map(f) ?? []` and
+  `(c ? [1] : undefined) ?? []` are a new array at every render again, an
+  `infinite-loop` Error and `always-unstable-deps`'s "a new reference every
+  render"; a write that leaves `undefined` settles an `x != null` guard. A
+  strict `=== null` / `=== undefined` still drops only the value it names
+  (#303).
+- A dependency that is a new reference on one path and something else on the
+  other — `imported ?? {}`, `config.opts || []`, `prop ?? {}`,
+  `c ? CONST : {}`, or a memo it recomputes — may be new at every render with
+  nothing it is computed from moving: `infinite-loop` reports the effect as a
+  possible loop (Warning) where it was silent (#304).
+- An element read keeps the elements it may select: an index or a key no
+  constant names (`arr[c ? 1 : 0]`, `cfg[k]`), a read directly off a literal
+  (`[x ?? {}][0]`, `{ a: {} }.a`), an element past a spread or an elision, or
+  copied by a spread. A dependency on an element that may be a new object is
+  a possible loop (Warning), and one that surely is a loop as it would be
+  through a name; it was silent (#307).
+- `JSON.parse(text)` is any JSON value and `structuredClone(x)` a primitive
+  `x` itself: each is a new reference only where it holds an object. A
+  dependency on one is a possible loop (Warning) and `always-unstable-deps`
+  says "where it holds an object"; `JSON.parse("1") ?? {}` and a reviver's
+  result were a false Error, `structuredClone(1)` a false Warning (#306).
+- A write in a closure the effect runs (an IIFE, a local or render helper, a
+  `useCallback` body, an array callback, a timer) stores what its own names
+  hold: a local, a parameter or a lowering temp that shares its name with one
+  of the effect or the render is not read as that one, and a helper called by
+  name sees the names where it is written, not where it is called. The loops
+  it drives were silent (#310).
+- An effect re-runs at every render for certain, and a write changes its
+  slot for certain, only where the component's own run allocates the value:
+  a prop the parent allocates — through a destructuring default too
+  (`{ p = 0 }`) — is new only when the parent renders. Such a loop is a
+  Warning where it was a false Error; a default the child allocates
+  (`{ p = [] }` given `undefined`) stays an Error (#309).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

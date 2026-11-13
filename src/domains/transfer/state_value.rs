@@ -10,7 +10,7 @@ use crate::{
             alloc_literal, call_targets, closure_env, escape, exec_stmt_with_callbacks,
             returned_sites, run_cfg,
         },
-        stores::{AbstractEnv, EnvVal, Heap, HeapValue, Sites, member_key, resolve_locs},
+        stores::{AbstractEnv, EnvVal, Heap, HeapValue, Sites, member_key},
     },
     engine::component_registry::ChildLookup,
     ir::{
@@ -115,8 +115,17 @@ fn memo_value(
     if value.reference.is_bottom() {
         return value;
     }
+    // Recomputed at a render nothing moved, the memo is new there only if
+    // its body may allocate; otherwise it is what its body reads (#304).
+    let may_allocate = matches!(
+        value.reference,
+        Stability::PerRender | Stability::MayBeFresh
+    );
     StateValue {
-        reference: may,
+        reference: match may {
+            Stability::MayBeFresh if !may_allocate => Stability::Unknown,
+            may => may,
+        },
         ..value
     }
 }
@@ -128,6 +137,7 @@ fn memo_value(
 /// No readable list bounds nothing: `Stable` would be a *must* claim about a
 /// list the IR never saw, which is how `useMemo(fn, deps)` used to read as
 /// pinned forever; `[]` pins the hook, but only an array *known* to be empty.
+/// Such a list may hold a new reference at every render: `MayBeFresh`.
 fn deps_change(
     component: ComponentId,
     deps: &DepsArg,
@@ -136,14 +146,14 @@ fn deps_change(
     ctx: &mut AnalysisCtx<StateValue>,
 ) -> (Stability, bool) {
     let Some(list) = deps.list() else {
-        return (Stability::Unknown, false);
+        return (Stability::MayBeFresh, false);
     };
     if list.arity == Arity::Exact(0) {
         return (Stability::Stable, false);
     }
     if list.is_empty() {
         // Every entry is a spread whose source the fold cannot reach.
-        return (Stability::Unknown, false);
+        return (Stability::MayBeFresh, false);
     }
     let mut may = Stability::Bottom;
     let mut fresh = false;
@@ -164,7 +174,7 @@ fn deps_change(
             may = may.join(&if held {
                 val.reference.clone()
             } else {
-                Stability::Unknown
+                Stability::Unknown.join(&val.reference)
             });
             continue;
         }
@@ -177,11 +187,13 @@ fn deps_change(
         fresh |= bound_once && val.is_unstable_reference_only();
         // A dep whose reference is versioned keeps its labels (`to_stability`
         // would erase them if another slot is ⊤); a dep in motion may move at
-        // any render, which is the may side of `PerRender`.
+        // any render, which is the may side of `PerRender`: a number with
+        // what it is computed from, a reference that may be new with nothing
+        // moving (#304).
         may = may.join(&match val.versioned_reference() {
             Some(v) => v,
             None => match val.to_stability() {
-                Stability::PerRender => Stability::Unknown,
+                Stability::PerRender => Stability::Unknown.join(&val.reference),
                 s => s,
             },
         });
@@ -266,10 +278,9 @@ fn eval_state_value(
             eval_unary(op, v)
         }
 
-        Expr::Call { fn_, .. } if returns_fresh_reference(fn_, env, ctx) => {
-            StateValue::reference(Stability::PerRender)
+        Expr::Call { fn_, args } => {
+            allocating_call(fn_, args, env, ctx).unwrap_or_else(StateValue::top)
         }
-        Expr::Call { .. } => StateValue::top(),
         // `new` allocates: a fresh reference, whose members stay ⊤ (#158).
         Expr::New { .. } => StateValue::reference(Stability::PerRender),
 
@@ -314,13 +325,13 @@ fn summary_value(sv: &crate::ir::expr::SummaryValue) -> StateValue {
     }
 }
 
-/// Callees whose return value is a *freshly allocated reference* on every
-/// call — never the receiver, never a cached object. Modeled as
-/// `reference(PerRender)` instead of ⊤ (same seeding as `ArrayLit`), which
-/// lets `always-unstable-deps` *prove* that `const items = arr.map(f)` in a
-/// deps array defeats memoization.
+/// What a call of a builtin that allocates hands back, `None` for any other
+/// callee. A *freshly allocated reference* on every call — never the
+/// receiver, never a cached object — is `reference(PerRender)` instead of ⊤
+/// (same seeding as `ArrayLit`), which lets `always-unstable-deps` *prove*
+/// that `const items = arr.map(f)` in a deps array defeats memoization.
 ///
-/// Two cases keep the proof honest (FP-averse):
+/// Three cases keep the proof honest (FP-averse):
 /// - **kind-ambiguous methods** (`slice`, `concat`): on a string receiver
 ///   they return a *primitive*, which `Object.is` value-compares — claiming
 ///   a per-render reference for `id.slice(0, 8)` would be a false proof. So
@@ -330,14 +341,40 @@ fn summary_value(sv: &crate::ir::expr::SummaryValue) -> StateValue {
 /// - **in-place methods** (`sort`, `reverse`, `fill`, `copyWithin`,
 ///   `Object.assign`): they return the receiver itself — same identity, the
 ///   opposite fact.
-fn returns_fresh_reference(
+/// - **builtins that allocate only where the result is an object** (#306):
+///   `JSON.parse` returns whatever the text encodes (`JSON.parse("1")` is
+///   `1`), and anything a reviver returns; `structuredClone(x)` copies a
+///   primitive `x` as itself. Each is a new reference where it is one, and
+///   may be a primitive elsewhere: never a must-fresh reference alone.
+fn allocating_call(
     callee: &Expr,
+    args: &[Expr],
     env: &AbstractEnv<StateValue>,
     ctx: &mut AnalysisCtx<StateValue>,
-) -> bool {
-    match callee {
-        // `structuredClone(x)` always allocates a deep copy.
-        Expr::Var(v) => v == "structuredClone",
+) -> Option<StateValue> {
+    if !returns_no_input(callee) {
+        return None;
+    }
+    let fresh = StateValue::reference(Stability::PerRender);
+    let allocates = match callee {
+        // A deep copy of an object, the value itself of a primitive; a
+        // function cannot be cloned (it throws).
+        Expr::Var(v) if v == "structuredClone" => {
+            let x = match args.first() {
+                Some(arg) => eval_state_value(arg, env, ctx),
+                None => StateValue::top(),
+            };
+            let object = x.reference != Stability::Bottom || x.setter != SetterVal::Bottom;
+            return Some(StateValue {
+                reference: if object {
+                    Stability::PerRender
+                } else {
+                    Stability::Bottom
+                },
+                setter: SetterVal::Bottom,
+                ..x
+            });
+        }
         Expr::FieldAccess { obj, field } => match field.as_str() {
             // Array methods returning a NEW array, array-only names (a
             // string receiver has none of these).
@@ -350,10 +387,40 @@ fn returns_fresh_reference(
             "keys" | "values" | "entries" | "fromEntries" => {
                 matches!(obj.as_ref(), Expr::Var(v) if v == "Object")
             }
+            // Any JSON value, a new object or array where it is one; with a
+            // reviver, anything the reviver returns.
+            "parse" if matches!(obj.as_ref(), Expr::Var(v) if v == "JSON") => {
+                return Some(match args.len() {
+                    0 | 1 => StateValue::json_value(),
+                    _ => StateValue::top().join(&fresh),
+                });
+            }
+            _ => false,
+        },
+        Expr::TSAnnotated(inner) => return allocating_call(inner, args, env, ctx),
+        _ => false,
+    };
+    allocates.then_some(fresh)
+}
+
+/// The callees [`allocating_call`] reads, the one list of them: each returns
+/// a new array or object, or a primitive, never one of its inputs — what a
+/// proof that a value is not an input's needs of a call (#309). Like that
+/// table, it takes an array method's receiver to be an array (#312).
+pub(crate) fn returns_no_input(callee: &Expr) -> bool {
+    match callee {
+        Expr::Var(v) => v == "structuredClone",
+        Expr::FieldAccess { obj, field } => match field.as_str() {
+            "map" | "filter" | "flat" | "flatMap" | "toSorted" | "toReversed" | "toSpliced"
+            | "with" | "split" | "slice" | "concat" => true,
+            "from" | "of" => matches!(obj.as_ref(), Expr::Var(v) if v == "Array"),
+            "keys" | "values" | "entries" | "fromEntries" => {
+                matches!(obj.as_ref(), Expr::Var(v) if v == "Object")
+            }
             "parse" => matches!(obj.as_ref(), Expr::Var(v) if v == "JSON"),
             _ => false,
         },
-        Expr::TSAnnotated(inner) => returns_fresh_reference(inner, env, ctx),
+        Expr::TSAnnotated(inner) => returns_no_input(inner),
         _ => false,
     }
 }
@@ -742,19 +809,53 @@ fn props_cache_key(
     key
 }
 
-/// Evaluate field access: read the member off every heap object the receiver
-/// may denote (a whole member chain, not just a bare variable), and, when the
-/// receiver may also be something no site places or a site does not record
-/// the member, what the member of anything is (#240).
+/// Evaluate field access: a member read under the field's name.
 fn eval_field_access(
     obj: &Expr,
     field: &Symbol,
     env: &AbstractEnv<StateValue>,
     ctx: &mut AnalysisCtx<StateValue>,
 ) -> StateValue {
-    let (vals, open) = match resolve_locs(obj, env, ctx.heap) {
+    eval_member(obj, Some(field), env, ctx)
+}
+
+/// A **constant** index is a member read, and the heap answers it exactly as it
+/// answers a named one.
+///
+/// Array destructuring lowers to `IndexAccess` with a literal index — `const
+/// [value, setValue] = useAtom(a)` becomes `__arr[0]` / `__arr[1]` — so a
+/// tuple-returning hook's per-slot contract becomes reachable through the same
+/// per-member map a named member already uses (#37). Before this, every indexed
+/// read was ⊤, which is why jotai's setter looked unstable.
+///
+/// A key that is one string names that member too (`o["k"]`, `o[k]` with `k`
+/// one constant, #76). Any other index may select any member: the join of
+/// every entry and of what no entry says (#307), so an element that may be a
+/// new reference keeps that arm. A negative index is not a member either.
+fn eval_index_access(
+    arr: &Expr,
+    idx: &Expr,
+    env: &AbstractEnv<StateValue>,
+    ctx: &mut AnalysisCtx<StateValue>,
+) -> StateValue {
+    let key = member_key(idx, env);
+    eval_member(arr, key.as_ref(), env, ctx)
+}
+
+/// Read `member` (`None`: a key no constant names) off every heap object the
+/// receiver may denote — a whole member chain, a name, or a literal, placed
+/// as any literal is ([`alloc_literal`], #307) — and, when the receiver may
+/// also be something no site places or the key may select a member no entry
+/// records, join what the member of anything is (#240).
+fn eval_member(
+    obj: &Expr,
+    member: Option<&Symbol>,
+    env: &AbstractEnv<StateValue>,
+    ctx: &mut AnalysisCtx<StateValue>,
+) -> StateValue {
+    let (vals, open) = match alloc_literal(&StateValueTransfer, obj, env, ctx) {
         Some(sites) => {
-            let (entries, open) = ctx.heap.members(&sites, field);
+            let (entries, open) = ctx.heap.members(&sites, member.map(String::as_str));
             (entries.into_iter().map(EnvVal::as_val).collect(), open)
         }
         None => (Vec::new(), true),
@@ -768,37 +869,18 @@ fn eval_field_access(
     // (the field's *kind* stays unknown — every other slot is ⊤). Same
     // no-mutation-during-render assumption as the `StateVal` read-side
     // conversion above; in-place writes have their own diagnostics
-    // (`state-mutation`). ADR-017 §Limitations, member-deps.
+    // (`state-mutation`). ADR-017 §Limitations, member-deps. A key no
+    // constant names moves with what it is computed from too, which the
+    // labels do not say.
     let obj_val = eval_state_value(obj, env, ctx);
     let any = StateValue {
-        reference: obj_val.versioned_reference().unwrap_or(Stability::Unknown),
+        reference: match member {
+            Some(_) => obj_val.versioned_reference().unwrap_or(Stability::Unknown),
+            None => Stability::Unknown,
+        },
         ..StateValue::top()
     };
     placed.map_or(any.clone(), |p| p.join(&any))
-}
-
-/// A **constant** index is a member read, and the heap answers it exactly as it
-/// answers a named one.
-///
-/// Array destructuring lowers to `IndexAccess` with a literal index — `const
-/// [value, setValue] = useAtom(a)` becomes `__arr[0]` / `__arr[1]` — so a
-/// tuple-returning hook's per-slot contract becomes reachable through the same
-/// per-member map a named member already uses (#37). Before this, every indexed
-/// read was ⊤, which is why jotai's setter looked unstable.
-///
-/// A key that is one string names that member too (`o["k"]`, `o[k]` with `k`
-/// one constant, #76). Any other index stays ⊤: which element `xs[i]`
-/// denotes is not a member read. A negative index is not a member either.
-fn eval_index_access(
-    arr: &Expr,
-    idx: &Expr,
-    env: &AbstractEnv<StateValue>,
-    ctx: &mut AnalysisCtx<StateValue>,
-) -> StateValue {
-    match member_key(idx, env) {
-        Some(m) => eval_field_access(arr, &m, env, ctx),
-        None => StateValue::top(),
-    }
 }
 
 /// Extract per-prop abstract values from a props expression.
@@ -946,6 +1028,8 @@ fn eval_binop(op: &BinOp, lhs: StateValue, rhs: StateValue) -> StateValue {
         // `str` at ⊥ so a guard over the result still narrows.
         BinOp::Eq
         | BinOp::Neq
+        | BinOp::LooseEq
+        | BinOp::LooseNeq
         | BinOp::Lt
         | BinOp::Gt
         | BinOp::Leq
@@ -1243,6 +1327,47 @@ mod tests {
             ),
             StateValue::reference(Stability::PerRender)
         );
+    }
+
+    /// `JSON.parse` and `structuredClone` allocate only where their result
+    /// is an object (#306): `JSON.parse("1")` is `1`, `structuredClone(1)`
+    /// is `1`. A clone of an object is a new reference, alone.
+    #[test]
+    fn a_builtin_that_may_return_a_primitive_is_fresh_only_where_it_is_an_object() {
+        let (env, mut state, memo) = empty();
+        let mut heap = Heap::new();
+        let mut ctx = AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap);
+        let call = |fn_: Expr, args: Vec<Expr>| Expr::Call {
+            fn_: Box::new(fn_),
+            args,
+        };
+        let parse = Expr::FieldAccess {
+            obj: Box::new(Expr::Var("JSON".to_string())),
+            field: "parse".to_string(),
+        };
+        let clone = Expr::Var("structuredClone".to_string());
+        let text = Expr::Lit(Prim::String("1".to_string()));
+        let one = Expr::Lit(Prim::Int(1));
+        let obj = Expr::ObjectLit {
+            id: crate::ir::types::ExprId(0),
+            fields: vec![],
+        };
+        let mut eval = |e: Expr| StateValueTransfer.eval_expr(&e, &env, &mut ctx);
+
+        let parsed = eval(call(parse.clone(), vec![text.clone()]));
+        assert!(!parsed.is_unstable_reference_only(), "{parsed:?}");
+        assert!(parsed.is_unstable_reference_when_object(), "{parsed:?}");
+        assert!(!parsed.num.is_bottom() && parsed.null && !parsed.undef);
+
+        // A reviver may return anything, a stable reference included.
+        let revived = eval(call(parse, vec![text, one.clone()]));
+        assert_eq!(revived.reference, Stability::MayBeFresh);
+        assert!(!revived.is_unstable_reference_when_object());
+
+        let cloned = eval(call(clone.clone(), vec![one]));
+        assert_eq!(cloned, StateValue::number(Interval::point(1.0)));
+        let cloned = eval(call(clone, vec![obj]));
+        assert!(cloned.is_unstable_reference_only(), "{cloned:?}");
     }
 
     #[test]

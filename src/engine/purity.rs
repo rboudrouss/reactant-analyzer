@@ -451,6 +451,8 @@ pub fn binop(op: &BinOp, l: Kind, r: Kind) -> Kind {
         | BinOp::UShr => Kind::Num,
         BinOp::Eq
         | BinOp::Neq
+        | BinOp::LooseEq
+        | BinOp::LooseNeq
         | BinOp::Lt
         | BinOp::Gt
         | BinOp::Leq

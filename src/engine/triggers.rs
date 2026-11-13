@@ -223,9 +223,10 @@ pub(crate) fn collect_effect_triggers(
                 } else {
                     mutable.get_or_insert(i);
                 }
-            } else if val.reference == Stability::PerRender {
-                // A new reference on some path (`c ? {} : undefined`): new at
-                // every render that takes it.
+            } else if matches!(val.reference, Stability::PerRender | Stability::MayBeFresh) {
+                // A new reference on some path (`c ? {} : undefined`, `x ??
+                // {}`): new at every render that takes it, with nothing it is
+                // computed from moving (#304).
                 mutable.get_or_insert(i);
             }
             // A spread stands for elements nothing here sees: they hold only
@@ -254,7 +255,10 @@ pub(crate) fn collect_effect_triggers(
                 slots.extend(labels.iter().copied());
             }
             let by_identity = val.is_reference_only()
-                && !matches!(val.reference, Stability::Unknown | Stability::VersionedTop);
+                && !matches!(
+                    val.reference,
+                    Stability::Unknown | Stability::VersionedTop | Stability::MayBeFresh
+                );
             // One value at every render (`useMemo(() => 3, [s])`) moves with
             // nothing it is computed from; a name holds it at the call only
             // when it is bound once.

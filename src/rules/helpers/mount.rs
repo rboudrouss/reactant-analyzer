@@ -227,7 +227,7 @@ fn carries(
     seed_props.iter().any(|name| match row.props.get(name) {
         Some(val) => match &val.reference {
             Stability::Versioned(labels) => feeders.iter().any(|f| labels.contains(f)),
-            Stability::VersionedTop | Stability::Unknown => true,
+            Stability::VersionedTop | Stability::Unknown | Stability::MayBeFresh => true,
             _ => false,
         },
         None => spreads,

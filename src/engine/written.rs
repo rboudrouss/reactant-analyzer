@@ -15,7 +15,7 @@
 //! replaces evaluated every argument in the render exit env, where an
 //! effect-local `const next = {…}` is unknown and read `Maybe`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     domains::{
@@ -455,32 +455,51 @@ impl SiteEnvs<'_> {
     /// block's entry env replayed through the statements before the call.
     /// With no position — a nested, deferred or repeating site — the region's
     /// exit env, which over-approximates every binding the closure captured.
+    ///
+    /// That env holds the names of `cfg` and of the render. `hides` are the
+    /// names `expr` reads from another body — a write in a closure reads the
+    /// closure's `x`, not the region's (#310) — and they are ⊤; so are
+    /// `cfg`'s own names where the env is the render's (a memo or callback
+    /// body keeps no envs of its own).
     pub fn eval(
         &self,
         region: WriterRegion,
         cfg: &CFG,
         at: Option<(BlockId, usize)>,
         expr: &Expr,
+        hides: &dyn Fn(&str) -> bool,
     ) -> StateValue {
         let mut state = self.state.clone();
         let mut heap = self.heap.clone();
         let mut ac = AnalysisCtx::null(self.component, &mut state, self.memo, &mut heap);
-        match self.env_at(region, cfg, at, &mut ac) {
-            Some(env) => StateValueTransfer.eval_expr(expr, &env, &mut ac),
-            None => StateValue::bottom(),
+        let Some((mut env, holds_body)) = self.env_at(region, cfg, at, &mut ac) else {
+            return StateValue::bottom();
+        };
+        let own: HashSet<&str> = if holds_body {
+            HashSet::new()
+        } else {
+            crate::ir::bindings::own_names(&[], cfg).collect()
+        };
+        let mut read = HashSet::new();
+        crate::ir::free_vars::collect_used_vars(expr, &mut read);
+        for v in read.iter().filter(|v| hides(v) || own.contains(v.as_str())) {
+            env.forget(v);
         }
+        StateValueTransfer.eval_expr(expr, &env, &mut ac)
     }
 
     /// `None` for a site in a block the converged run never reaches — a side
     /// of a branch no value takes: the write never runs, so it stores
-    /// nothing.
+    /// nothing. Otherwise the env, and whether it holds `cfg`'s own names —
+    /// not when it is the render's exit env standing in for a body that
+    /// keeps none.
     fn env_at(
         &self,
         region: WriterRegion,
         cfg: &CFG,
         at: Option<(BlockId, usize)>,
         ac: &mut AnalysisCtx<'_, StateValue>,
-    ) -> Option<AbstractEnv<StateValue>> {
+    ) -> Option<(AbstractEnv<StateValue>, bool)> {
         let (entry, exits) = match region {
             WriterRegion::Render => (self.render_entry, Some(self.render_exits)),
             WriterRegion::Effect(l) => (self.exit, self.effect_exits.get(&l)),
@@ -489,11 +508,10 @@ impl SiteEnvs<'_> {
             WriterRegion::Memo(_) | WriterRegion::Callback(_) => (self.exit, None),
         };
         let (Some((block, stmt)), Some(exits)) = (at, exits) else {
-            return Some(
-                exits
-                    .and_then(|ex| exit_env_of(cfg, ex))
-                    .unwrap_or_else(|| self.exit.clone()),
-            );
+            return Some(match exits.and_then(|ex| exit_env_of(cfg, ex)) {
+                Some(env) => (env, true),
+                None => (self.exit.clone(), region == WriterRegion::Render),
+            });
         };
         if !exits.is_empty() && !exits.contains_key(&block) {
             return None;
@@ -504,7 +522,9 @@ impl SiteEnvs<'_> {
                 StateValueTransfer.exec_stmt(s, &mut env, ac);
             }
         }
-        Some(env)
+        // With no exit env of any block, the entry env stands in for every
+        // block before this one.
+        Some((env, !exits.is_empty() || region == WriterRegion::Render))
     }
 
     /// Every body of the component the fixpoint keeps no per-block envs for

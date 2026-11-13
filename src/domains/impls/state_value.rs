@@ -166,6 +166,20 @@ impl StateValue {
         }
     }
 
+    /// Any JSON value, as `JSON.parse` builds it: `null`, a boolean, a
+    /// number, a string, or a new object or array (#306). A new reference
+    /// where it holds an object, never a reference alone.
+    pub fn json_value() -> Self {
+        StateValue {
+            num: Interval::top(),
+            boolean: BoolVal::Top,
+            str: StrConst::Top,
+            reference: Stability::PerRender,
+            null: true,
+            ..Self::bottom_value()
+        }
+    }
+
     pub fn null() -> Self {
         StateValue {
             null: true,
@@ -231,7 +245,7 @@ impl StateValue {
         num.is_top()
             && *boolean == BoolVal::Top
             && *str == StrConst::Top
-            && *reference == Stability::Unknown
+            && matches!(reference, Stability::Unknown | Stability::MayBeFresh)
             && *null
             && *undef
             && !setter.is_closed()
@@ -316,6 +330,13 @@ impl StateValue {
         self.reference == Stability::PerRender && self.setter == SetterVal::Bottom
     }
 
+    /// True when the value cannot be a reference, a setter or an opaque value:
+    /// only primitives, or nothing at all. It forwards no identity.
+    pub fn holds_no_reference(&self) -> bool {
+        self.populated_kinds()
+            .only(KindMask::NUM | KindMask::BOOL | KindMask::STR | KindMask::NULL | KindMask::UNDEF)
+    }
+
     /// True when the value can only be a reference: `Object.is` then compares
     /// identities, and the reference's change component is the whole story of
     /// when the value differs. Anything else is compared by value.
@@ -351,12 +372,13 @@ impl StateValue {
     /// genuinely changes every render. (`PerRender` here is kind-agnostic: "may
     /// change every render", not necessarily a reference — ADR-017.)
     /// The residual `other` slot forces `Unknown` (an opaque value must never
-    /// claim definite (in)stability).
+    /// claim definite (in)stability), `MayBeFresh` when the value may also be
+    /// a reference this render allocated (#304).
     ///
     /// Used by rules and `recompute_memo` that still reason in stability terms.
     pub fn to_stability(&self) -> Stability {
         if self.other {
-            return Stability::Unknown;
+            return Stability::Unknown.join(&self.reference);
         }
         let mut acc = Stability::Bottom;
         let mut in_motion = false;
@@ -411,14 +433,17 @@ impl StateValue {
     /// Used by `InfiniteLoop` to distinguish a setter that writes a bounded value
     /// (branch narrowing held the growth) from one that truly diverges:
     /// - Infinite interval bounds → numeric counter without a binding guard
-    /// - Per-render reference slot → new object/function literal every render
+    /// - Per-render reference slot → new object/function literal every render,
+    ///   or at some renders (`c ? D : {}`, #304)
     /// - String ⊤ → a string that left every finite set (`s + "x"`, #173)
     /// - Residual ⊤ → precision lost, conservatively unbounded
     ///
     /// Booleans, `null`, `undefined` and setters have finite concrete sets, so
     /// their ⊤ is not growth.
     pub fn is_unbounded(&self) -> bool {
-        self.unbounded_primitive().is_some() || self.reference == Stability::PerRender || self.other
+        self.unbounded_primitive().is_some()
+            || matches!(self.reference, Stability::PerRender | Stability::MayBeFresh)
+            || self.other
     }
 
     /// The primitive kinds of this value that range over infinitely many
@@ -697,7 +722,9 @@ impl AbstractDomain for StateValue {
             Stability::Bottom => Stability::Bottom,
             Stability::Stable => Stability::Stable,
             v @ (Stability::Versioned(_) | Stability::VersionedTop) => v,
-            Stability::PerRender | Stability::Unknown => Stability::Unknown,
+            // A reference that may be fresh is truthy whatever its identity:
+            // as a choice it moves with what it is computed from.
+            Stability::PerRender | Stability::Unknown | Stability::MayBeFresh => Stability::Unknown,
         }
     }
 
@@ -878,10 +905,17 @@ mod tests {
     }
 
     #[test]
-    fn top_is_greatest() {
+    fn top_is_greatest_but_for_a_fresh_reference() {
         assert!(num_point(0.0) <= StateValue::top());
-        assert!(StateValue::reference(Stability::PerRender) <= StateValue::top());
         assert!(StateValue::null() <= StateValue::top());
+        // `top()` is an opaque value, which no allocation of this render
+        // reaches: joined with one it may be fresh (#304).
+        let fresh = StateValue::reference(Stability::PerRender);
+        assert!(fresh.partial_cmp(&StateValue::top()).is_none());
+        let j = StateValue::top().join(&fresh);
+        assert_eq!(j.reference, Stability::MayBeFresh);
+        assert!(j.is_top_value());
+        assert!(StateValue::top() <= j && fresh <= j);
     }
 
     #[test]

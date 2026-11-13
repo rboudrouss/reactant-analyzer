@@ -249,7 +249,14 @@ that writes it (see *Cross-file limits*).
   hook summary that pins the result keeps it held: a router hook's held value is a read of the
   store, which re-runs the effect when a body writes it (see *Library stores* above,
   [#294](https://github.com/rboudrouss/reactant-analyzer/issues/294),
-  [#298](https://github.com/rboudrouss/reactant-analyzer/issues/298)). A callback that only
+  [#298](https://github.com/rboudrouss/reactant-analyzer/issues/298)). So may a dep that is a new
+  reference on one path and something else on another — `imported ?? {}`, `prop || []`,
+  `c ? CONST : {}`, or a memo such a dep recomputes whose body allocates — though nothing it is
+  computed from moved
+  [#304](https://github.com/rboudrouss/reactant-analyzer/issues/304), and an element read whose
+  index or key may select such an element (`arr[c ? 1 : 0]` over `[CONST, {}]`), off a name or
+  directly off a literal
+  [#307](https://github.com/rboudrouss/reactant-analyzer/issues/307). A callback that only
   names the ref or the binding in its body does not read it: its identity moves with its deps list
   [#227](https://github.com/rboudrouss/reactant-analyzer/issues/227). A dep that moves for another
   reason reads as held: a module binding written only behind a call the analysis cannot see into.
@@ -287,6 +294,17 @@ carries an Error.
   setter, each name certainly the slot's object (a render name bound to the read, a sole local
   binding, an updater's untouched parameter); a mutation and a set inside one statement, or a
   handler's local alias read from a closure nested in it, stay Warnings [#180](https://github.com/rboudrouss/reactant-analyzer/issues/180).
+- **A dep that is a new reference on one path** (`x ?? {}`, `c ? CONST : {}`) is a possible re-run
+  at every render even when the other path is always taken: a state the program only ever sets
+  to an array (`v == null ? [] : v`), a package export that is never nullish, or a known builtin's
+  result the value domain reads as an opaque value (`Math.max(a, b) ?? {}`,
+  [#305](https://github.com/rboudrouss/reactant-analyzer/issues/305))
+  [#304](https://github.com/rboudrouss/reactant-analyzer/issues/304). So is an element read under
+  an index or a key no constant names when one element it may select is fresh, even when the key
+  always selects a stable one: the key's values are not enumerated
+  [#307](https://github.com/rboudrouss/reactant-analyzer/issues/307). And so is `JSON.parse(text)`
+  when the text always encodes a primitive: its text is not read
+  [#306](https://github.com/rboudrouss/reactant-analyzer/issues/306).
 - **Optional chains** branch on every `?.` link that skips a call or an index, even when the left
   side is never nullish (`setN?.(x)`, a local function, a callback prop every parent passes): a
   write in the skipped part is a possible one, a Warning, not an Error
@@ -324,6 +342,18 @@ carries an Error.
   [#209](https://github.com/rboudrouss/reactant-analyzer/issues/209); and a write that reads a slot
   its effect does not depend on keeps an edge from that slot, even when the read sits on an arm
   that never runs (`false ? s1 : 2`) [#204](https://github.com/rboudrouss/reactant-analyzer/issues/204).
+- **A write in a closure reads what the closure binds as unknown.** In an IIFE, a helper, a
+  callback, a timer or a cleanup, the closure's own locals and parameters, and the temps a `?:`,
+  `??` or `&&` there lowers to, are ⊤ in the value the write stores; through a helper called by
+  name, so is every name the calling body rebinds. `.then(() => setS(c ? 2 : 1))` is then a
+  possible loop where it settles [#310](https://github.com/rboudrouss/reactant-analyzer/issues/310).
+- **A value an input hands the component is new only when the parent renders.** A fresh dep or
+  a fresh write is certain only where the component's own run allocates it (a literal, an
+  element, an allocating builtin, a member a constant names of one, a memo over one, a name
+  bound only to those); a prop, a context value or a hook result — through a destructuring
+  default too — is a possible loop, a Warning, even when the parent does re-render at every
+  commit. A default counts as allocated where the prop holds no reference
+  [#309](https://github.com/rboudrouss/reactant-analyzer/issues/309).
 - **An effect loop is an Error only when nothing in the batch can undo it.** React re-renders on
   the last value a batch leaves in the slot, and the engine does not order the writes of one batch
   (two effects, a layout effect and the passive effects React flushes before its re-render, a

@@ -74,12 +74,15 @@ function genComp(r, p, name, isApp) {
   if (!isApp) {
     const n = r.int(0, 2);
     for (let i = 0; i < n; i++) {
-      const type = r.weighted([[4, "num"], [2, "fn"], [1, "obj"], [1, "str"]]);
+      const type = r.weighted([[4, "num"], [2, "fn"], [2, "obj"], [1, "str"], [1, "arr"]]);
       const pname = type === "fn" ? `on${i}` : `p${i}`;
       // An optional callback prop: the parent may leave it undefined, and
       // every call of it is `on0?.(…)` (#301).
       const optional = type === "fn" && r.chance(0.5);
-      comp.props.push({ name: pname, type, optional });
+      // A default that allocates (`{ p0 = [] }`): where the parent passes
+      // `undefined` or leaves the prop out, it is a new object at every render.
+      const dflt = (type === "obj" || type === "arr") && r.chance(0.7) ? literal(r, { reads: [] }, type, 0) : null;
+      comp.props.push({ name: pname, type, optional, default: dflt });
       if (type === "fn") env.writers.push({ name: pname, type: "num", kind: "propfn", optional });
       else env.reads.push({ e: v(pname), type });
     }
@@ -104,6 +107,29 @@ function genComp(r, p, name, isApp) {
     const name = `obj${comp.body.length}`;
     comp.body.push({ kind: "local", name, value: genExpr(r, env, "obj", 1, true) });
     env.reads.push({ e: v(name), type: "obj" });
+  }
+  // A local that is a value or a fresh default (#304): `x ?? {}`, `x || []`,
+  // `c ? x : {}`, the shape of `const opts = config.opts ?? {}`.
+  if (r.chance(0.15)) {
+    const type = r.pick(["obj", "arr"]);
+    const reads = env.reads.filter((x) => x.type === type);
+    const base = reads.length && r.chance(0.8) ? r.pick(reads).e : literal(r, env, type, 0);
+    const name = `or${comp.body.length}`;
+    comp.body.push({ kind: "local", name, value: fallback(r, env, type, base, 1) });
+    env.reads.push({ e: v(name), type });
+  }
+  // An element read through a name: the container is a local, the read
+  // another (#307).
+  if (r.chance(0.12)) {
+    const type = r.pick(["obj", "arr"]);
+    const reads = env.reads.filter((x) => x.type === type);
+    const base = reads.length && r.chance(0.7) ? r.pick(reads).e : literal(r, env, type, 0);
+    const { obj, idx } = container(r, env, type, base, 1);
+    const holder = `xs${comp.body.length}`;
+    comp.body.push({ kind: "local", name: holder, value: obj });
+    const name = `el${comp.body.length}`;
+    comp.body.push({ kind: "local", name, value: { kind: "index", obj: v(holder), idx } });
+    env.reads.push({ e: v(name), type });
   }
   if (r.chance(0.15) && env.writers.some((w) => w.kind === "setter")) {
     const target = r.pick(env.writers.filter((w) => w.kind === "setter"));
@@ -300,6 +326,11 @@ function genExpr(r, env, type, depth, fresh = false, prefer = null) {
 }
 
 function grow(r, env, type, base, depth) {
+  if (type !== "bool" && r.chance(0.1)) return fallback(r, env, type, base, depth);
+  if ((type === "obj" || type === "arr") && r.chance(0.08)) {
+    const { obj, idx } = container(r, env, type, base, depth);
+    return { kind: "index", obj, idx };
+  }
   switch (type) {
     case "num":
       return r.weighted([
@@ -332,6 +363,50 @@ function grow(r, env, type, base, depth) {
   }
 }
 
+// A value or a default that may be a new allocation (#303, #304): `l ?? d`,
+// `l || d`, `c ? base : d`. The default `d` is generated fresh. A ternary's
+// test is a generated boolean, `absent` or `runNow`. For `??` and
+// `||`, the left side is a value that is never nullish (`base`), `ext`'s
+// `absent` (always undefined), an optional call of `absent` (skipped:
+// undefined) or of `format` (a string), or a ternary that may be `undefined`
+// or `null`; `||` also falls back on `0`, `""` and `false`. A ternary's other
+// arm is `base`, so the value is never nullish where it is read.
+function fallback(r, env, type, base, depth) {
+  const d = genExpr(r, env, type, depth - 1, true);
+  const form = r.pick(["coalesce", "or", "cond"]);
+  if (form === "cond") {
+    // The test may be a value the analysis cannot see: `absent` (undefined)
+    // or `runNow` (a function).
+    const c = r.weighted([[2, () => genExpr(r, env, "bool", 0)], [1, () => v("absent")], [1, () => v("runNow")]])();
+    return r.chance(0.5) ? { kind: "cond", c, t: base, f: d } : { kind: "cond", c, t: d, f: base };
+  }
+  const l = r.weighted([
+    [2, () => base],
+    [1, () => v("absent")],
+    [1, () => ({ kind: "optcall", fn: "absent", args: [genExpr(r, env, "num", 0)] })],
+    [type === "str" ? 2 : 0, () => ({ kind: "optcall", fn: "format", args: [genExpr(r, env, "num", 0)] })],
+    [2, () => ({ kind: "cond", c: genExpr(r, env, "bool", 0), t: base, f: { kind: r.pick(["undefined", "null"]) } })],
+  ])();
+  return { kind: form, l, r: d };
+}
+
+// A container holding `base` and a new allocation, and an index that selects
+// one of them (#307): `[x, { v: 0 }][i]`, `{ a: x, b: {} }[k]`, the index a
+// constant or a ternary. Every index the program may take is in range.
+function container(r, env, type, base, depth) {
+  const fresh = literal(r, env, type, depth - 1);
+  const [a, b] = r.chance(0.5) ? [base, fresh] : [fresh, base];
+  const pickOne = (x, y) =>
+    r.weighted([
+      [1, () => x],
+      [1, () => y],
+      [2, () => ({ kind: "cond", c: genExpr(r, env, "bool", 0), t: x, f: y })],
+    ])();
+  if (r.chance(0.5)) return { obj: { kind: "arr", spread: null, items: [a, b] }, idx: pickOne(num(0), num(1)) };
+  const key = (k) => ({ kind: "str", v: k });
+  return { obj: { kind: "obj", spread: null, fields: [["a", a], ["b", b]] }, idx: pickOne(key("a"), key("b")) };
+}
+
 function literal(r, env, type, depth) {
   switch (type) {
     case "num": {
@@ -361,7 +436,12 @@ function genView(r, p, comp, env) {
   const n = below.length ? r.weighted([[2, 0], [4, 1], [2, 2]]) : 0;
   for (let i = 0; i < n; i++) {
     const child = r.pick(below);
-    const props = child.props.map((pr) => [pr.name, propValue(r, env, pr)]);
+    // A prop with a default is passed, passed as `undefined`, or left out.
+    const props = child.props.flatMap((pr) => {
+      const given = pr.default ? r.pick(["value", "undefined", "omit"]) : "value";
+      if (given === "omit") return [];
+      return [[pr.name, given === "undefined" ? { kind: "undefined" } : propValue(r, env, pr)]];
+    });
     children.push({
       kind: "child",
       comp: child.name,

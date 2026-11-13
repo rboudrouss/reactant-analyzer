@@ -47,7 +47,7 @@ pub(crate) fn describe_value(val: &StateValue) -> &'static str {
         Stability::Versioned(_) | Stability::VersionedTop => {
             "its value changes when state is updated"
         }
-        Stability::Unknown => "its value may change between renders",
+        Stability::Unknown | Stability::MayBeFresh => "its value may change between renders",
     }
 }
 

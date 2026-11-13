@@ -494,3 +494,37 @@ fn each_fn_lit<'c>(e: &'c Expr, f: &mut impl FnMut(&'c CFG)) {
     }
     e.for_each_child(&mut |c| each_fn_lit(c, f));
 }
+
+/// The parameters of the function literal `scope` writes at its own level
+/// (not inside a literal nested in it) whose body is `body`, by identity;
+/// `None` when `scope` does not write it.
+pub fn literal_params<'c>(scope: &'c CFG, body: &CFG) -> Option<&'c [Var]> {
+    fn find<'c>(e: &'c Expr, body: &CFG, out: &mut Option<&'c [Var]>) {
+        if let Expr::FnLit {
+            params, body_cfg, ..
+        } = e
+        {
+            if std::ptr::eq(&**body_cfg, body) {
+                *out = Some(params);
+            }
+            return;
+        }
+        e.for_each_child(&mut |c| find(c, body, out));
+    }
+    let mut out = None;
+    scope.for_each_expr(&mut |e| {
+        if out.is_none() {
+            find(e, body, &mut out);
+        }
+    });
+    out
+}
+
+/// Every name a function body binds for itself: its parameters, and each
+/// name it binds or assigns at its own level.
+pub fn own_names<'c>(params: &'c [Var], body: &'c CFG) -> impl Iterator<Item = &'c str> {
+    params
+        .iter()
+        .map(String::as_str)
+        .chain(local_bindings(body).into_keys())
+}
