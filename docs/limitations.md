@@ -342,6 +342,11 @@ carries an Error.
   [#209](https://github.com/rboudrouss/reactant-analyzer/issues/209); and a write that reads a slot
   its effect does not depend on keeps an edge from that slot, even when the read sits on an arm
   that never runs (`false ? s1 : 2`) [#204](https://github.com/rboudrouss/reactant-analyzer/issues/204).
+- **A write in a closure reads what the closure binds as unknown.** In an IIFE, a helper, a
+  callback, a timer or a cleanup, the closure's own locals and parameters, and the temps a `?:`,
+  `??` or `&&` there lowers to, are ⊤ in the value the write stores; through a helper called by
+  name, so is every name the calling body rebinds. `.then(() => setS(c ? 2 : 1))` is then a
+  possible loop where it settles [#310](https://github.com/rboudrouss/reactant-analyzer/issues/310).
 - **An effect loop is an Error only when nothing in the batch can undo it.** React re-renders on
   the last value a batch leaves in the slot, and the engine does not order the writes of one batch
   (two effects, a layout effect and the passive effects React flushes before its re-render, a
