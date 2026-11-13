@@ -138,6 +138,12 @@ on a program React settles; 323 oracle cases, none a known false negative.
   dependency on one is a possible loop (Warning) and `always-unstable-deps`
   says "where it holds an object"; `JSON.parse("1") ?? {}` and a reviver's
   result were a false Error, `structuredClone(1)` a false Warning (#306).
+- A write in a closure the effect runs (an IIFE, a local or render helper, a
+  `useCallback` body, an array callback, a timer) stores what its own names
+  hold: a local, a parameter or a lowering temp that shares its name with one
+  of the effect or the render is not read as that one, and a helper called by
+  name sees the names where it is written, not where it is called. The loops
+  it drives were silent (#310).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

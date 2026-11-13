@@ -416,6 +416,16 @@ impl<D: AbstractDomain> AbstractEnv<D> {
         self.callback_bindings.get(var)
     }
 
+    /// Drop every binding of `var`: it reads as an unbound name, ⊤, with no
+    /// sites, setter, callback or slot certificate.
+    pub fn forget(&mut self, var: &str) {
+        self.stabs.remove(var);
+        self.locs.remove(var);
+        self.setter_bindings.remove(var);
+        self.callback_bindings.remove(var);
+        self.slot_bindings.remove(var);
+    }
+
     /// Pointwise join over the entries that differ: a name both sides bind
     /// to the same value keeps it (the join is idempotent), and a name only
     /// one side binds joins with `D::top()`.
