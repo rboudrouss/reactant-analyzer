@@ -347,6 +347,13 @@ carries an Error.
   `??` or `&&` there lowers to, are ⊤ in the value the write stores; through a helper called by
   name, so is every name the calling body rebinds. `.then(() => setS(c ? 2 : 1))` is then a
   possible loop where it settles [#310](https://github.com/rboudrouss/reactant-analyzer/issues/310).
+- **A value an input hands the component is new only when the parent renders.** A fresh dep or
+  a fresh write is certain only where the component's own run allocates it (a literal, an
+  element, an allocating builtin, a member a constant names of one, a memo over one, a name
+  bound only to those); a prop, a context value or a hook result — through a destructuring
+  default too — is a possible loop, a Warning, even when the parent does re-render at every
+  commit. A default counts as allocated where the prop holds no reference
+  [#309](https://github.com/rboudrouss/reactant-analyzer/issues/309).
 - **An effect loop is an Error only when nothing in the batch can undo it.** React re-renders on
   the last value a batch leaves in the slot, and the engine does not order the writes of one batch
   (two effects, a layout effect and the passive effects React flushes before its re-render, a

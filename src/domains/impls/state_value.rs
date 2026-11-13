@@ -330,6 +330,13 @@ impl StateValue {
         self.reference == Stability::PerRender && self.setter == SetterVal::Bottom
     }
 
+    /// True when the value cannot be a reference, a setter or an opaque value:
+    /// only primitives, or nothing at all. It forwards no identity.
+    pub fn holds_no_reference(&self) -> bool {
+        self.populated_kinds()
+            .only(KindMask::NUM | KindMask::BOOL | KindMask::STR | KindMask::NULL | KindMask::UNDEF)
+    }
+
     /// True when the value can only be a reference: `Object.is` then compares
     /// identities, and the reference's change component is the whole story of
     /// when the value differs. Anything else is compared by value.

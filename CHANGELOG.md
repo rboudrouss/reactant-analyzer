@@ -144,6 +144,12 @@ on a program React settles; 323 oracle cases, none a known false negative.
   of the effect or the render is not read as that one, and a helper called by
   name sees the names where it is written, not where it is called. The loops
   it drives were silent (#310).
+- An effect re-runs at every render for certain, and a write changes its
+  slot for certain, only where the component's own run allocates the value:
+  a prop the parent allocates — through a destructuring default too
+  (`{ p = 0 }`) — is new only when the parent renders. Such a loop is a
+  Warning where it was a false Error; a default the child allocates
+  (`{ p = [] }` given `undefined`) stays an Error (#309).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

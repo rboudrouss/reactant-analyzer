@@ -93,7 +93,10 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::{
-    domains::{AbstractEnv, Interval, StateValue, transfer::as_arith},
+    domains::{
+        AbstractEnv, Interval, StateValue,
+        transfer::{as_arith, returns_no_input},
+    },
     engine::{
         AnalysisResult, Change, ConvergedEval, EffectTrigger, HookKind, ProgramAnalysisResult,
         SlotWriter, WriterPhase, WriterRegion,
@@ -111,14 +114,15 @@ use crate::{
         store::{STORE_SLOT, body_writes},
         triggers::{Always, Rerun},
         triggers_of,
-        written::{Written, churning_part, keeps_initial},
+        written::{SiteEnvs, Written, churning_part, keeps_initial},
     },
     ir::{
         ComponentId, QualifiedSlot, SourceRange,
-        bindings::{local_bindings, must_param, nested_bodies},
+        bindings::{binds, local_bindings, must_param, nested_bodies},
         cfg::{CFG, Terminator},
-        expr::{Expr, SPREAD_KEY_PREFIX, object_member},
+        expr::{Expr, Prim, SPREAD_KEY_PREFIX, object_member},
         hooks::HookEntry,
+        stmt::Stmt,
         types::{BlockId, HookLabel, Symbol, Var},
     },
 };
@@ -459,6 +463,9 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         /// The render arguments of each hook call left to a summary.
         hook_args: HashMap<HookLabel, &'a [Expr]>,
         render_lets: HashMap<&'a str, Option<&'a Expr>>,
+        /// Every body but the render, with its parameters
+        /// (`setters::must_alias_scopes`).
+        scopes: Vec<(&'a [Var], &'a CFG)>,
         mutated: HashSet<Var>,
         /// The props hold across every loop the component's edges can be on:
         /// no write the loop can run moves a slot of an ancestor (#206), and
@@ -611,6 +618,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     })
                     .collect(),
                 render_lets: let_bindings(cfg),
+                scopes,
                 mutated,
                 // An effect's rows: a memo's write is a render-phase write,
                 // whose re-runs the render's own sites already stand for.
@@ -750,17 +758,17 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 Some(Always::MutableDep(_)) | None => through(),
                 _ => None,
             };
+            // Surely, a fresh dep re-runs the effect after every render of
+            // this component only where this render allocates it: a prop, a
+            // context value or a default over a prop is new only when the
+            // parent renders (#309).
             let always = match joined {
                 _ if site.is_some() => site,
                 Some(why) => Some(EveryRender {
                     why,
                     surely: match why {
                         Always::FreshDep(i) => deps.get(i).is_some_and(|d| {
-                            !invariance_of(&ctxs[&comp], store_moves).holds(
-                                d,
-                                &ctxs[&comp].render_lets,
-                                true,
-                            )
+                            fresh_here(&ctxs[&comp], comp_result, d, &comp_result.render_cfg)
                         }),
                         _ => why.certain(),
                     },
@@ -801,6 +809,42 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 m.entry(s.comp).or_default().push(i);
                 m
             });
+    /// [`allocated_every_run`] for `e`, read in `body` of the component of
+    /// `ctx`: a render binding holds no reference where the converged
+    /// render env, at its statement, says it holds none.
+    fn fresh_here<'c>(
+        ctx: &'c CompCtx<'c>,
+        comp: &'c AnalysisResult<StateValue>,
+        e: &'c Expr,
+        body: &'c CFG,
+    ) -> bool {
+        let envs = SiteEnvs::of(comp, &ctx.exit);
+        let render = &comp.render_cfg;
+        let no_reference = |at: (BlockId, usize), rhs: &Expr| {
+            envs.eval(WriterRegion::Render, render, Some(at), rhs, &|_| false)
+                .holds_no_reference()
+        };
+        let memos = comp
+            .hooks
+            .iter()
+            .filter_map(|h| match h {
+                HookEntry::Memo {
+                    label, body_cfg, ..
+                } => Some((*label, Some(body_cfg))),
+                HookEntry::Callback { label, .. } => Some((*label, None)),
+                _ => None,
+            })
+            .filter_map(|(l, b)| ctx.memo_deps.get(&l).map(|d| (l, (b, *d))))
+            .collect();
+        Allocated {
+            render,
+            elsewhere: &ctx.scopes,
+            mutated: &ctx.mutated,
+            memos,
+            no_reference: &no_reference,
+        }
+        .fresh(e, body, 8)
+    }
     fn invariance_of<'c>(ctx: &'c CompCtx<'_>, store_moves: bool) -> Invariance<'c> {
         Invariance {
             render: &ctx.render_lets,
@@ -1040,12 +1084,14 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
     // before its re-render, a mount-only effect, a callback prop a child
     // calls, which is a `Handler` row — so a fresh write proves a change only
     // when every write of its slot is fresh. Fresh at every call means a new
-    // reference (`Change::Must`) that does not hold while props hold: a prop
-    // the parent allocates is new at the parent's renders, and `setS(p)`
-    // stores the same `p` again when the component re-renders alone.
+    // reference (`Change::Must`) its body allocates at every run: a prop the
+    // parent allocates is new at the parent's renders, and `setS(p)` stores
+    // the same `p` again when the component re-renders alone (#309). A row
+    // with no expression is an updater or reducer whose every return
+    // allocates, or an argument read in a body the region's env does not
+    // hold (#310), whose value then is no input's only where it allocates.
     let mut restorable: HashSet<QualifiedSlot> = HashSet::new();
     for (&comp, r) in &result.components {
-        let invariance = invariance_of(&ctxs[&comp]);
         for w in &r.slot_writers {
             let body = match w.region {
                 WriterRegion::Render => Some(&r.render_cfg),
@@ -1060,10 +1106,10 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             };
             let fresh = w.written.change == Change::Must
                 && body.is_some_and(|b| {
-                    !w.written
+                    w.written
                         .expr
                         .as_ref()
-                        .is_some_and(|e| invariance.holds(e, &let_bindings(b), true))
+                        .is_none_or(|e| fresh_here(&ctxs[&comp], r, e, b))
                 });
             if !fresh {
                 restorable.insert(node_of(comp, w));
@@ -1740,6 +1786,161 @@ fn find_cycle_from(
 ///
 /// `triggers` are the effect's rows of the trigger relation: a dep reacts to
 /// `label` when one of its rows names this component's slot.
+/// Is a value, read in a body of a component (the render or a hook body), one
+/// no input hands it — a reference allocated afresh at each run of that body,
+/// never one a prop, a context, a hook's result, a slot or a memo holds? A
+/// positive proof, where the failure of [`Invariance::holds`] is none (#309):
+/// an object, array or function literal, an element, a builtin call that
+/// returns none of its inputs ([`returns_no_input`]), the member a constant
+/// names of such a literal; a memo or callback with a dep that is one, so it
+/// recomputes at every run, and (a memo) whose every return is one; or a name
+/// only its scope binds — no other body binds it — each binding of which is
+/// one, or, in the render, holds no reference where it runs (`no_reference`,
+/// given its position and right-hand side): a primitive, the `undefined` a
+/// default replaces.
+struct Allocated<'a> {
+    render: &'a CFG,
+    /// Every body but the render, with its parameters.
+    elsewhere: &'a [(&'a [Var], &'a CFG)],
+    /// The names some body writes or mutates: a member of what they hold
+    /// may be anything.
+    mutated: &'a HashSet<Var>,
+    /// Each memo's and callback's body (`None` for a callback, whose value
+    /// is the function itself) and exact deps.
+    memos: HashMap<HookLabel, (Option<&'a CFG>, &'a [Expr])>,
+    no_reference: &'a dyn Fn((BlockId, usize), &Expr) -> bool,
+}
+
+impl<'a> Allocated<'a> {
+    fn fresh(&self, e: &'a Expr, scope: &'a CFG, depth: usize) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        let next = depth - 1;
+        match e.peel_ts() {
+            Expr::ObjectLit { .. }
+            | Expr::ArrayLit { .. }
+            | Expr::FnLit { .. }
+            | Expr::NativeElem { .. }
+            | Expr::CompApp { .. } => true,
+            Expr::Call { fn_, .. } => returns_no_input(fn_),
+            Expr::FieldAccess { obj, field } => self
+                .member(obj, field, scope, next)
+                .is_some_and(|(m, s)| self.fresh(m, s, next)),
+            Expr::IndexAccess { arr, idx } => {
+                let key = match idx.peel_ts() {
+                    Expr::Lit(Prim::Int(i)) => i.to_string(),
+                    Expr::Lit(Prim::String(s)) => s.to_string(),
+                    _ => return false,
+                };
+                self.member(arr, &key, scope, next)
+                    .is_some_and(|(m, s)| self.fresh(m, s, next))
+            }
+            Expr::MemoVal(l) | Expr::CallbackVal(l) => {
+                self.memos.get(l).is_some_and(|(body, deps)| {
+                    deps.iter().any(|d| self.fresh(d, self.render, next))
+                        && body.is_none_or(|b| {
+                            let mut returns = b.blocks.values().filter_map(|blk| match &blk.term {
+                                Terminator::Return(r, _) => Some(r),
+                                _ => None,
+                            });
+                            returns.all(|r| self.fresh(r, b, next))
+                        })
+                })
+            }
+            Expr::Var(v) => self.bindings(v, scope).is_some_and(|(in_render, rhss)| {
+                !rhss.is_empty()
+                    && rhss.iter().all(|&(at, rhs, s)| {
+                        self.fresh(rhs, s, next) || (in_render && (self.no_reference)(at, rhs))
+                    })
+            }),
+            _ => false,
+        }
+    }
+
+    /// The expression a constant `key` of `e` is, as written in a literal, and
+    /// the scope it reads in: a member of an object literal after its last
+    /// spread, an element of an array literal with no spread or elision, or
+    /// one of a name bound once to such a literal that no body mutates.
+    fn member(
+        &self,
+        e: &'a Expr,
+        key: &str,
+        scope: &'a CFG,
+        depth: usize,
+    ) -> Option<(&'a Expr, &'a CFG)> {
+        if depth == 0 {
+            return None;
+        }
+        match e.peel_ts() {
+            Expr::ObjectLit { fields, .. } => object_member(fields, key).map(|m| (m, scope)),
+            Expr::ArrayLit {
+                elems,
+                arity,
+                spread_at,
+                ..
+            } if spread_at.is_empty() && arity.exact() == Some(elems.len()) => key
+                .parse::<usize>()
+                .ok()
+                .and_then(|i| elems.get(i))
+                .map(|m| (m, scope)),
+            Expr::FieldAccess { obj, field } => {
+                let (inner, s) = self.member(obj, field, scope, depth - 1)?;
+                self.member(inner, key, s, depth - 1)
+            }
+            Expr::Var(v) if !self.mutated.contains(v) => match self.bindings(v, scope)? {
+                (_, rhss) if rhss.len() == 1 => {
+                    let (_, rhs, s) = rhss[0];
+                    self.member(rhs, key, s, depth - 1)
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Every binding of `v` read in `scope`: whether it resolves in the
+    /// render, and each binding's position, right-hand side and scope. `None`
+    /// when another body may assign the same `v` — one that assigns it and
+    /// neither declares it nor takes it as a parameter, which would make it
+    /// its own — or `scope`'s parameter is `v`.
+    #[allow(clippy::type_complexity)]
+    fn bindings(
+        &self,
+        v: &str,
+        scope: &'a CFG,
+    ) -> Option<(bool, Vec<((BlockId, usize), &'a Expr, &'a CFG)>)> {
+        let in_render = std::ptr::eq(scope, self.render) || !binds(v, scope);
+        let scope = if in_render { self.render } else { scope };
+        let stmts = |b: &'a CFG| b.blocks.values().flat_map(|blk| blk.stmts.iter());
+        let declares =
+            |b: &'a CFG| stmts(b).any(|s| matches!(s, Stmt::Let { var, .. } if var == v));
+        let assigns =
+            |b: &'a CFG| stmts(b).any(|s| matches!(s, Stmt::Assign { var, .. } if var == v));
+        if self.elsewhere.iter().any(|(params, b)| {
+            let param = params.iter().any(|p| p == v);
+            if std::ptr::eq(*b, scope) {
+                param
+            } else {
+                !param && !declares(b) && assigns(b)
+            }
+        }) {
+            return None;
+        }
+        let mut out = Vec::new();
+        for (&bid, block) in &scope.blocks {
+            for (i, stmt) in block.stmts.iter().enumerate() {
+                if let Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. } = stmt
+                    && var == v
+                {
+                    out.push(((bid, i), rhs, scope));
+                }
+            }
+        }
+        Some((in_render, out))
+    }
+}
+
 fn can_retrigger(
     dep_exprs: &[Expr],
     triggers: &[&EffectTrigger],

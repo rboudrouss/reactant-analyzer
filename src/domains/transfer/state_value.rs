@@ -352,6 +352,9 @@ fn allocating_call(
     env: &AbstractEnv<StateValue>,
     ctx: &mut AnalysisCtx<StateValue>,
 ) -> Option<StateValue> {
+    if !returns_no_input(callee) {
+        return None;
+    }
     let fresh = StateValue::reference(Stability::PerRender);
     let allocates = match callee {
         // A deep copy of an object, the value itself of a primitive; a
@@ -398,6 +401,28 @@ fn allocating_call(
         _ => false,
     };
     allocates.then_some(fresh)
+}
+
+/// The callees [`allocating_call`] reads, the one list of them: each returns
+/// a new array or object, or a primitive, never one of its inputs — what a
+/// proof that a value is not an input's needs of a call (#309). Like that
+/// table, it takes an array method's receiver to be an array (#312).
+pub(crate) fn returns_no_input(callee: &Expr) -> bool {
+    match callee {
+        Expr::Var(v) => v == "structuredClone",
+        Expr::FieldAccess { obj, field } => match field.as_str() {
+            "map" | "filter" | "flat" | "flatMap" | "toSorted" | "toReversed" | "toSpliced"
+            | "with" | "split" | "slice" | "concat" => true,
+            "from" | "of" => matches!(obj.as_ref(), Expr::Var(v) if v == "Array"),
+            "keys" | "values" | "entries" | "fromEntries" => {
+                matches!(obj.as_ref(), Expr::Var(v) if v == "Object")
+            }
+            "parse" => matches!(obj.as_ref(), Expr::Var(v) if v == "JSON"),
+            _ => false,
+        },
+        Expr::TSAnnotated(inner) => returns_no_input(inner),
+        _ => false,
+    }
 }
 
 /// Hand `props_expr` to a child the analysis cannot resolve, code it does
