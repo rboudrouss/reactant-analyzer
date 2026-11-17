@@ -215,6 +215,9 @@ on a program React settles; 323 oracle cases, none a known false negative.
   one, as a prop of the async component that awaits it, is a possible loop
   (Warning) again; it was silent since #317. It is never a certain new
   reference, so `always-unstable-deps` does not claim it.
+- A handler's parameter holds whatever the event or the child calling it
+  passes, never the render's binding of the same name: `const v = 0; …
+  onClick={(v) => setS(v)}` no longer stores `0` into `s` (#314).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

@@ -9,7 +9,7 @@ use crate::ir::{
     hooks::{DepsArg, HookEntry, HookProvenance},
     source_range::SourceRange,
     stmt::{MemberKey, Stmt},
-    types::{BlockId, HookLabel},
+    types::{BlockId, HookLabel, Var},
 };
 
 // ── Subscription extraction (addEventListener in effect bodies) ───────────────
@@ -50,7 +50,7 @@ fn collect_subscriptions_in_expr(
     // `target.addEventListener("event", handlerFn)` in an effect body registers
     // a subscription → emit a Handler. Recurse into the receiver and any extra
     // args, but NOT arg[1] (the handler FnLit — extracted as the Handler's CFG).
-    if let Some((event_name, body_cfg)) = expr.subscription_listener() {
+    if let Some((event_name, params, body_cfg)) = expr.subscription_listener() {
         let Expr::Call { fn_, args } = expr else {
             unreachable!("subscription_listener only matches calls")
         };
@@ -60,6 +60,7 @@ fn collect_subscriptions_in_expr(
             label,
             event: event_name.to_string(),
             body_cfg: (**body_cfg).clone(),
+            params: params.to_vec(),
             span: stmt_span,
             dom_event: false,
         });
@@ -103,26 +104,31 @@ pub fn extract_handlers(cfg: &CFG, hooks: &mut Vec<HookEntry>, next_label: &mut 
     // Pre-pass: resolvable handler bodies by variable name.
     // `let cb = () => …` and `let cb = useCallback(…)` (rewritten to
     // `CallbackVal(l)` by extract_hooks, which runs before us).
-    let callback_bodies: HashMap<HookLabel, &CFG> = hooks
+    let callback_bodies: HashMap<HookLabel, Handler> = hooks
         .iter()
         .filter_map(|h| match h {
             HookEntry::Callback {
-                label, body_cfg, ..
-            } => Some((*label, body_cfg)),
+                label,
+                body_cfg,
+                params,
+                ..
+            } => Some((*label, (params.clone(), body_cfg.clone()))),
             _ => None,
         })
         .collect();
-    let mut var_bodies: HashMap<&str, CFG> = HashMap::new();
+    let mut var_bodies: HashMap<&str, Handler> = HashMap::new();
     for block in cfg.blocks.values() {
         for stmt in &block.stmts {
             if let Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. } = stmt {
                 match rhs {
-                    Expr::FnLit { body_cfg, .. } => {
-                        var_bodies.insert(var.as_str(), (**body_cfg).clone());
+                    Expr::FnLit {
+                        params, body_cfg, ..
+                    } => {
+                        var_bodies.insert(var.as_str(), (params.clone(), (**body_cfg).clone()));
                     }
                     Expr::CallbackVal(l) => {
                         if let Some(body) = callback_bodies.get(l) {
-                            var_bodies.insert(var.as_str(), (*body).clone());
+                            var_bodies.insert(var.as_str(), body.clone());
                         }
                     }
                     // Bare setters (`onOpenChange={setOpen}`) are NOT handled
@@ -145,18 +151,23 @@ pub fn extract_handlers(cfg: &CFG, hooks: &mut Vec<HookEntry>, next_label: &mut 
 }
 
 /// Resolve one event-prop value to a handler body, if analyzable.
-fn handler_body(val: &Expr, var_bodies: &HashMap<&str, CFG>) -> Option<CFG> {
+fn handler_body(val: &Expr, var_bodies: &HashMap<&str, Handler>) -> Option<Handler> {
     match val {
-        Expr::FnLit { body_cfg, .. } => Some((**body_cfg).clone()),
+        Expr::FnLit {
+            params, body_cfg, ..
+        } => Some((params.clone(), (**body_cfg).clone())),
         Expr::Var(v) => var_bodies.get(v.as_str()).cloned(),
         Expr::TSAnnotated(e) => handler_body(e, var_bodies),
         _ => None,
     }
 }
 
+/// A handler's parameters and body.
+type Handler = (Vec<Var>, CFG);
+
 fn collect_handlers_in_expr(
     expr: &Expr,
-    var_bodies: &HashMap<&str, CFG>,
+    var_bodies: &HashMap<&str, Handler>,
     found: &mut Vec<HookEntry>,
     next_label: &mut HookLabel,
 ) {
@@ -174,13 +185,14 @@ fn collect_handlers_in_expr(
                     // (events / mount-unmount). Other native props are DOM
                     // data, never invoked.
                     if invoked_prop(true, name) {
-                        if let Some(body_cfg) = handler_body(val, var_bodies) {
+                        if let Some((params, body_cfg)) = handler_body(val, var_bodies) {
                             let label = *next_label;
                             *next_label += 1;
                             found.push(HookEntry::Handler {
                                 label,
                                 event: prop_to_event(name),
                                 body_cfg,
+                                params,
                                 span: prop_spans
                                     .iter()
                                     .find(|(k, _)| k == name)
@@ -208,13 +220,14 @@ fn collect_handlers_in_expr(
         Expr::CompApp { props, span, .. } => {
             if let Expr::ObjectLit { fields, .. } = props.as_ref() {
                 for (name, val) in fields {
-                    if let Some(body_cfg) = handler_body(val, var_bodies) {
+                    if let Some((params, body_cfg)) = handler_body(val, var_bodies) {
                         let label = *next_label;
                         *next_label += 1;
                         found.push(HookEntry::Handler {
                             label,
                             event: prop_to_event(name),
                             body_cfg,
+                            params,
                             // `CompApp` carries no per-prop spans, unlike
                             // `NativeElem`; the element's own position is the
                             // nearest true one, and beats no position at all.

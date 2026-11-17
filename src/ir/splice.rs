@@ -811,15 +811,21 @@ pub fn rename_hook_entry(entry: HookEntry, ren: &HashMap<Var, Var>) -> HookEntry
             label,
             event,
             body_cfg,
+            params,
             span,
             dom_event,
-        } => HookEntry::Handler {
-            label,
-            event,
-            body_cfg: rename_vars_cfg(body_cfg, ren),
-            span,
-            dom_event,
-        },
+        } => {
+            // The body scope shadows its own params, as a callback's does.
+            let inner = without(ren, &params);
+            HookEntry::Handler {
+                label,
+                event,
+                body_cfg: rename_vars_cfg(body_cfg, &inner),
+                params,
+                span,
+                dom_event,
+            }
+        }
         HookEntry::Custom {
             label,
             name,

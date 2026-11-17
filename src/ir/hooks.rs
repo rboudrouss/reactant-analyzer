@@ -319,6 +319,10 @@ pub enum HookEntry {
         /// DOM event name without the "on" prefix, lowercased: "click", "change", "submit"…
         event: String,
         body_cfg: CFG,
+        /// Parameters of the handler, bound where its body runs to what the
+        /// event or the child calling it passes, never to a same-named
+        /// binding of the render (#314).
+        params: Vec<Var>,
         span: Option<SourceRange>,
         /// An `on*` prop of a native element: React runs it only when that
         /// DOM event fires there. Not a native `ref` callback (run at

@@ -617,15 +617,24 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         // ── Handler passes (in-cycle) ─────────────────────────────────────────
         // Handlers run 0..N times → include in fixpoint for sound range approx.
         // NOT tracked in widened_labels (handler-caused widening ≠ InfiniteLoop).
+        // Each runs from the render's exit env with its parameters ⊤, as an
+        // escaped closure does (#314): an event holds no function of the
+        // component, and what a child passes back escaped when it was handed
+        // down.
         let mut state_from_handlers = StateStore::bottom();
         for hook in &hooks {
             if let HookEntry::Handler {
-                label, body_cfg, ..
+                label,
+                body_cfg,
+                params,
+                ..
             } = hook
             {
+                let mut entry = env_exit.clone();
+                crate::domains::interp::bind_params(&mut entry, params, &[]);
                 let (h_bs, h_state) = pass(
                     body_cfg,
-                    env_exit.clone(),
+                    entry,
                     &state_store,
                     &state_store,
                     &memo_store,
@@ -2638,6 +2647,7 @@ mod tests {
                 label: 1,
                 event: "click".to_string(),
                 body_cfg: body,
+                params: vec![],
                 span: None,
                 dom_event: true,
             },
@@ -2666,6 +2676,56 @@ mod tests {
         assert!(
             !result.handler_block_states.contains_key(&0),
             "state hook has no handler_block_states entry"
+        );
+    }
+
+    #[test]
+    fn a_handler_parameter_is_not_the_render_binding_of_its_name() {
+        // Render: `const v = 5`; handler `(v) => setS(v)`. The handler writes
+        // what the event or the child passes it, not the render's 5 (#314).
+        let body = handler_cfg(vec![Stmt::ExprStmt(
+            Expr::Call {
+                fn_: Box::new(Expr::Var("setS".to_string())),
+                args: vec![Expr::Var("v".to_string())],
+            },
+            None,
+        )]);
+        let hooks = vec![
+            HookEntry::State {
+                label: 0,
+                reducer: None,
+                init: Expr::Lit(Prim::Int(0)),
+                span: None,
+            },
+            HookEntry::Handler {
+                label: 1,
+                event: "click".to_string(),
+                body_cfg: body,
+                params: vec!["v".to_string()],
+                span: None,
+                dom_event: true,
+            },
+        ];
+        let comp = component(
+            hooks,
+            vec![
+                Stmt::Let {
+                    var: "v".to_string(),
+                    rhs: Expr::Lit(Prim::Int(5)),
+                    span: None,
+                },
+                Stmt::Let {
+                    var: "setS".to_string(),
+                    rhs: Expr::StateSetter(0),
+                    span: None,
+                },
+            ],
+        );
+        let result = analyze_component(comp, &StateValueTransfer, &Config::default());
+        assert!(
+            result.state_store.get(0).is_top_value(),
+            "{:?}",
+            result.state_store.get(0)
         );
     }
 
@@ -2701,6 +2761,7 @@ mod tests {
                 label: 1,
                 event: "click".to_string(),
                 body_cfg: body,
+                params: vec![],
                 span: None,
                 dom_event: true,
             },
@@ -2841,6 +2902,7 @@ mod tests {
                 label: 1,
                 event: "click".to_string(),
                 body_cfg: body,
+                params: vec![],
                 span: None,
                 dom_event: true,
             },
@@ -2910,6 +2972,7 @@ mod tests {
                 label: 1,
                 event: "click".to_string(),
                 body_cfg: body,
+                params: vec![],
                 span: None,
                 dom_event: true,
             },
@@ -3053,6 +3116,7 @@ mod tests {
                 label: 2,
                 event: "click".to_string(),
                 body_cfg: h_cfg,
+                params: vec![],
                 span: None,
                 dom_event: true,
             },
@@ -3099,6 +3163,7 @@ mod tests {
                 label: 1,
                 event: "click".to_string(),
                 body_cfg: body,
+                params: vec![],
                 span: None,
                 dom_event: true,
             },

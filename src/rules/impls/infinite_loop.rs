@@ -1748,6 +1748,7 @@ mod tests {
                         growing_write(),
                         None,
                     )]),
+                    params: vec![],
                     span: None,
                     dom_event: true,
                 });
