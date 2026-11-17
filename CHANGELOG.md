@@ -186,6 +186,11 @@ on a program React settles; 323 oracle cases, none a known false negative.
   receiver, several entries). A child calling the setters its parent hands it
   this way is reported as its `for…of` twin is, and a parameter named like a
   render setter is no longer read as that setter (#316).
+- `state-mutation` reads a callback's parameter as what the call passes it:
+  `items.forEach((item) => item.count++)` (or a `map` callback, a nested
+  one, an IIFE given `items`) before `setItems(items)` is a Warning, as the
+  `for…of` and indexed spellings are; it was silent. A prop's entries
+  mutated this way are a prop mutation (#318).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

@@ -2449,10 +2449,11 @@ impl<'a> Scope<'a> {
     }
 }
 
-/// What a call hands the body it runs, which the walk binds its parameters
-/// to, as the interpreter does (#253, #316).
+/// What a call hands the body it runs, which binds its parameters, as the
+/// interpreter binds them (#253): the setter walk's calls through a
+/// parameter (#316), `state-mutation`'s receivers (#318).
 #[derive(Clone, Copy)]
-enum Passed<'a> {
+pub(crate) enum Passed<'a> {
     /// Nothing the walk follows: a cleanup, a handler, a callee's argument.
     Nothing,
     /// The call's arguments, by position: an IIFE, a helper called by name.
@@ -2460,6 +2461,35 @@ enum Passed<'a> {
     /// The entries of the receiver of a synchronous array method, at the
     /// positions its callback receives them ([`callback_args`](crate::domains::interp::interpreter::callback_args)).
     Entries { receiver: &'a Expr, method: &'a str },
+}
+
+impl<'a> Passed<'a> {
+    /// What a call through `fn_` passes the function it is handed as
+    /// argument `index`: the receiver's entries for a synchronous array
+    /// method's callback, nothing the walk follows otherwise.
+    pub(crate) fn to_callback(fn_: &'a Expr, index: usize) -> Self {
+        match fn_ {
+            Expr::FieldAccess { obj, field }
+                if index == 0 && SYNC_HOF_METHODS.contains(&field.as_str()) =>
+            {
+                Passed::Entries {
+                    receiver: obj,
+                    method: field,
+                }
+            }
+            _ => Passed::Nothing,
+        }
+    }
+
+    /// The parameters an array method passes an entry to: `reduce`'s
+    /// second, both of `sort`'s, the first of every other.
+    pub(crate) fn entry_positions(method: &str) -> &'static [usize] {
+        match method {
+            "reduce" | "reduceRight" => &[1],
+            "sort" => &[0, 1],
+            _ => &[0],
+        }
+    }
 }
 
 /// One callee a parameter the walk bound may hold: an expression of a body
@@ -3118,12 +3148,8 @@ impl<'a> SetterWalk<'a> {
                 let Some(entries) = self.entries(receiver) else {
                     return HashMap::new();
                 };
-                let at: &[usize] = match method {
-                    "reduce" | "reduceRight" => &[1],
-                    "sort" => &[0, 1],
-                    _ => &[0],
-                };
-                at.iter()
+                Passed::entry_positions(method)
+                    .iter()
                     .filter_map(|&i| params.get(i))
                     .map(|p| (p.clone(), entries.clone()))
                     .collect()
@@ -3496,16 +3522,7 @@ impl<'a> SetterWalk<'a> {
                 // rows run at this call, and are placed here only when the
                 // receiver surely runs it, as an IIFE is (#248).
                 let placed = at.filter(|_| i == 0 && runs_at_least_once(fn_, args));
-                // What the method passes the callback: the receiver's entries.
-                let passed = match fn_.peel_ts() {
-                    Expr::FieldAccess { obj, field } if i == 0 && self.is_sync_hof(fn_) => {
-                        Passed::Entries {
-                            receiver: obj,
-                            method: field,
-                        }
-                    }
-                    _ => Passed::Nothing,
-                };
+                let passed = Passed::to_callback(fn_, i);
                 self.callback_arg(arg, class, placed, passed, depth, found, prov, stmt_span);
                 self.repeating = outer_repeating;
             }

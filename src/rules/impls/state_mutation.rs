@@ -10,6 +10,7 @@ use crate::ir::{
     types::{BlockId, HookLabel, Var},
 };
 
+use crate::engine::setters::Passed;
 use crate::rules::helpers::purity::mutation_receiver;
 use crate::rules::{
     Diagnostic, MustResult, RefSite, Rule, Step, ValueClass, all_setter_labels, must_alias_scopes,
@@ -94,11 +95,13 @@ impl<'a> Site<'a> {
 
 /// One lexical scope of the chase: local `let`/`assign` bindings, plus names
 /// that must NOT resolve outward (function params shadow their surroundings),
-/// plus updater params known to BE the current slot value (`setX(p => …)`).
+/// plus params whose root the call that runs the body gives: an updater's,
+/// the current slot value (`setX(p => …)`); an array method callback's, the
+/// receiver's entries; an IIFE's, its argument (#318).
 struct Scope<'a> {
     bindings: HashMap<&'a str, Vec<&'a Expr>>,
     shadowed: HashSet<&'a str>,
-    param_roots: HashMap<&'a str, HookLabel>,
+    roots: HashMap<&'a str, MutRoot>,
 }
 
 impl<'a> Scope<'a> {
@@ -114,7 +117,7 @@ impl<'a> Scope<'a> {
         Scope {
             bindings,
             shadowed: HashSet::new(),
-            param_roots: HashMap::new(),
+            roots: HashMap::new(),
         }
     }
 
@@ -122,7 +125,7 @@ impl<'a> Scope<'a> {
         Scope {
             bindings: HashMap::new(),
             shadowed: params.iter().map(|p| p.as_str()).collect(),
-            param_roots: HashMap::new(),
+            roots: HashMap::new(),
         }
     }
 }
@@ -173,8 +176,8 @@ impl<'a> Collector<'a> {
                     return MutRoot::Other;
                 }
                 for scope in scopes.iter().rev() {
-                    if let Some(l) = scope.param_roots.get(v.as_str()) {
-                        return MutRoot::State(*l);
+                    if let Some(root) = scope.roots.get(v.as_str()) {
+                        return *root;
                     }
                     if scope.shadowed.contains(v.as_str()) {
                         return MutRoot::Other;
@@ -296,21 +299,65 @@ impl<'a> Collector<'a> {
                         _ => {}
                     }
                 }
-                self.walk_expr(fn_, scopes, at);
-                for a in args {
-                    self.walk_expr(a, scopes, at);
+                // A literal the call runs — called where it is written, or
+                // handed to an array method — has its parameters bound to
+                // what the call passes it.
+                match fn_.peel_ts() {
+                    Expr::FnLit {
+                        params, body_cfg, ..
+                    } => self.walk_fn(params, body_cfg, Passed::Args(args), scopes, at),
+                    _ => self.walk_expr(fn_, scopes, at),
+                }
+                for (i, a) in args.iter().enumerate() {
+                    match a.peel_ts() {
+                        Expr::FnLit {
+                            params, body_cfg, ..
+                        } => {
+                            let passed = Passed::to_callback(fn_, i);
+                            self.walk_fn(params, body_cfg, passed, scopes, at);
+                        }
+                        _ => self.walk_expr(a, scopes, at),
+                    }
                 }
             }
             // A nested function runs on the same trigger family: same container.
             Expr::FnLit {
                 params, body_cfg, ..
-            } => {
-                scopes.push(Scope::params(params));
-                self.walk_cfg(body_cfg, scopes, at.container, None);
-                scopes.pop();
-            }
+            } => self.walk_fn(params, body_cfg, Passed::Nothing, scopes, at),
             other => other.for_each_child(&mut |c| self.walk_expr(c, scopes, at)),
         }
+    }
+
+    /// Walk a function body, its parameters rooted where what `passed` them
+    /// roots (#318): an argument's root for an IIFE's, the receiver's for an
+    /// array method callback's (an entry shares its container's identity, as
+    /// `items[i]` does). Rooted in `scopes`, where the call is written; a
+    /// parameter nothing binds shadows its surroundings.
+    fn walk_fn(
+        &mut self,
+        params: &'a [Var],
+        body_cfg: &'a CFG,
+        passed: Passed<'a>,
+        scopes: &mut Vec<Scope<'a>>,
+        at: At<'a>,
+    ) {
+        let mut scope = Scope::params(params);
+        let bound: Vec<(&'a Var, &'a Expr)> = match passed {
+            Passed::Nothing => Vec::new(),
+            Passed::Args(args) => params.iter().zip(args).collect(),
+            Passed::Entries { receiver, method } => Passed::entry_positions(method)
+                .iter()
+                .filter_map(|&i| params.get(i))
+                .map(|p| (p, receiver))
+                .collect(),
+        };
+        for (p, e) in bound {
+            let root = self.chase(e, scopes, &mut HashSet::new());
+            scope.roots.insert(p.as_str(), root);
+        }
+        scopes.push(scope);
+        self.walk_cfg(body_cfg, scopes, at.container, None);
+        scopes.pop();
     }
 
     /// Functional updater `setX(p => …)`: React passes the slot's current
@@ -328,7 +375,7 @@ impl<'a> Collector<'a> {
         let mut scope = Scope::params(params);
         if let Some(p) = params.first() {
             scope.shadowed.remove(p.as_str());
-            scope.param_roots.insert(p.as_str(), label);
+            scope.roots.insert(p.as_str(), MutRoot::State(label));
         }
         scopes.push(scope);
         let param = params.first().map(|p| (p, label));
@@ -418,7 +465,7 @@ impl Rule for StateMutation {
                 Scope {
                     bindings: render_scope.bindings.clone(),
                     shadowed: HashSet::new(),
-                    param_roots: HashMap::new(),
+                    roots: HashMap::new(),
                 },
                 Scope::params(params),
             ];
