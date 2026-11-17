@@ -1,6 +1,6 @@
 {
   "total": 2679,
-  "digest": "5dfa89cd426e98934711d2e62c3c21a6f69e4d579c61aeb55926f35cef215c6d",
+  "digest": "06eb25fcf9301c0ee2f7a6166cd1eb0161f54fd0b018d02e249c1d2d9d21e71f",
   "by_rule": {
     "always-unstable-deps": 636,
     "conditional-hook": 10,
