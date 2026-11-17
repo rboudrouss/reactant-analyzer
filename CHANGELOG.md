@@ -178,6 +178,14 @@ on a program React settles; 323 oracle cases, none a known false negative.
   f(n + 1)` was silent) and an effect depending on `load()` re-runs at every
   render. A generator's body runs only when driven: a write in it is a
   Warning where it was a false Error (#317).
+- A setter called in the render through a callback's parameter is a render
+  write: an array method's callback receives the receiver's entries, an IIFE
+  or a helper its arguments. `[setN].forEach((set) => set(n + 1))` was
+  silent; it is an Error, as the IIFE and helper spellings now are (they were
+  a Warning), and a Warning where the entry may not be called (a named
+  receiver, several entries). A child calling the setters its parent hands it
+  this way is reported as its `for…of` twin is, and a parameter named like a
+  render setter is no longer read as that setter (#316).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

@@ -233,7 +233,7 @@ fn setter_calls(
         wrappers: &wrappers,
         path: Vec::new(),
         store_scopes: None,
-        scopes: vec![(cfg, Some(BTreeSet::new()))],
+        scopes: vec![Scope::root(cfg)],
     };
     walk.cfg(cfg, WALK_DEPTH, &mut found, WalkClass::Sync, None, None);
     let mut found = found.setters;
@@ -399,7 +399,7 @@ pub(crate) fn collect_write_sites(
         wrappers: &wrappers,
         path: Vec::new(),
         store_scopes: Some(vec![crate::ir::bindings::local_bindings(converged.render)]),
-        scopes: vec![(cfg, Some(BTreeSet::new()))],
+        scopes: vec![Scope::root(cfg)],
     };
     walk.cfg(cfg, WALK_DEPTH, &mut found, WalkClass::Sync, None, None);
     let setters = found
@@ -2422,10 +2422,53 @@ struct SetterWalk<'a> {
     /// body on the walk's stack, the render's first, which a mover's name is
     /// resolved through. `None` for every consumer that does not ask.
     store_scopes: Option<Vec<HashMap<&'a str, Vec<&'a Expr>>>>,
-    /// Every body on the walk's stack, the root's first, with the names a
-    /// write in or below it reads from outside the region's env ([`Foreign`];
-    /// `None` is [`Foreign::Any`]).
-    scopes: Vec<(&'a CFG, Option<BTreeSet<Var>>)>,
+    /// Every body on the walk's stack, the root's first ([`Scope`]).
+    scopes: Vec<Scope<'a>>,
+}
+
+/// A body on the walk's stack.
+struct Scope<'a> {
+    body: &'a CFG,
+    /// The names a write in or below it reads from outside the region's env
+    /// ([`Foreign`]; `None` is [`Foreign::Any`]).
+    names: Option<BTreeSet<Var>>,
+    /// Its parameters the walk bound to what the call that runs it passes
+    /// ([`Passed`]), each to every callee it may hold.
+    held: HashMap<Var, Vec<Held<'a>>>,
+}
+
+impl<'a> Scope<'a> {
+    /// The walk's outermost body, which binds nothing the region's env does
+    /// not hold.
+    fn root(body: &'a CFG) -> Self {
+        Scope {
+            body,
+            names: Some(BTreeSet::new()),
+            held: HashMap::new(),
+        }
+    }
+}
+
+/// What a call hands the body it runs, which the walk binds its parameters
+/// to, as the interpreter does (#253, #316).
+#[derive(Clone, Copy)]
+enum Passed<'a> {
+    /// Nothing the walk follows: a cleanup, a handler, a callee's argument.
+    Nothing,
+    /// The call's arguments, by position: an IIFE, a helper called by name.
+    Args(&'a [Expr]),
+    /// The entries of the receiver of a synchronous array method, at the
+    /// positions its callback receives them ([`callback_args`](crate::domains::interp::interpreter::callback_args)).
+    Entries { receiver: &'a Expr, method: &'a str },
+}
+
+/// One callee a parameter the walk bound may hold: an expression of a body
+/// on the stack, or a member path of the receiver the setter and closure
+/// tables name.
+#[derive(Clone)]
+enum Held<'a> {
+    Expr(&'a Expr),
+    Path(Var),
 }
 
 /// How the walk reaches a body ([`SetterWalk::enter`]).
@@ -2929,11 +2972,16 @@ impl<'a> SetterWalk<'a> {
     /// it is written: in a body on the stack, whose own names the stack
     /// already accounts for; in the render, which the region's env holds
     /// except under the names the root rebinds; anywhere else, unknown.
+    ///
+    /// Its parameters are bound to what the call `passed` them (#316), as
+    /// the interpreter binds them (#253): a call through one in the body is
+    /// a call through what it holds ([`Self::held`]).
     #[allow(clippy::too_many_arguments)]
     fn enter(
         &mut self,
         body: &'a CFG,
         reached: Reached<'a>,
+        passed: Passed<'a>,
         depth: usize,
         found: &mut Found,
         mode: WalkClass,
@@ -2941,29 +2989,36 @@ impl<'a> SetterWalk<'a> {
         witness: Option<SourceRange>,
     ) {
         use crate::ir::bindings::{literal_params, own_names};
-        let root = self.scopes[0].0;
+        let root = self.scopes[0].body;
         let render = self.converged.map(|c| c.render);
-        let names = match reached {
-            Reached::Inline(params) => Some(own_names(params, body).map(str::to_string).collect()),
+        let (params, names) = match reached {
+            Reached::Inline(params) => (
+                Some(params),
+                Some(own_names(params, body).map(str::to_string).collect()),
+            ),
             Reached::Named => {
                 if let Some(params) = self
                     .scopes
                     .iter()
                     .rev()
-                    .find_map(|(scope, _)| literal_params(scope, body))
+                    .find_map(|scope| literal_params(scope.body, body))
                 {
-                    Some(own_names(params, body).map(str::to_string).collect())
+                    (
+                        Some(params),
+                        Some(own_names(params, body).map(str::to_string).collect()),
+                    )
                 } else if let Some(params) = render.and_then(|r| literal_params(r, body)) {
                     let mut names: BTreeSet<Var> =
                         own_names(params, body).map(str::to_string).collect();
                     names.extend(own_names(&[], root).map(str::to_string));
-                    Some(names)
+                    (Some(params), Some(names))
                 } else {
-                    None
+                    (None, None)
                 }
             }
         };
-        self.scopes.push((body, names));
+        let held = params.map_or_else(HashMap::new, |p| self.bind(p, passed));
+        self.scopes.push(Scope { body, names, held });
         self.cfg(body, depth, found, mode, prov, witness);
         self.scopes.pop();
     }
@@ -2971,13 +3026,109 @@ impl<'a> SetterWalk<'a> {
     /// The names a write found here reads from outside the region's env.
     fn foreign(&self) -> Foreign {
         let mut out = BTreeSet::new();
-        for (_, names) in &self.scopes {
-            match names {
+        for scope in &self.scopes {
+            match &scope.names {
                 Some(names) => out.extend(names.iter().cloned()),
                 None => return Foreign::Any,
             }
         }
         Foreign::Names(out)
+    }
+
+    /// What the walk bound `name` to, when the innermost body on the stack
+    /// that binds it is one whose parameter it bound (#316). `None` for a
+    /// name it did not bind — the region's, or a body's own local — which
+    /// resolves as a name.
+    fn held(&self, name: &str) -> Option<&[Held<'a>]> {
+        for scope in self.scopes.iter().rev() {
+            if let Some(held) = scope.held.get(name) {
+                return Some(held);
+            }
+            if scope.names.as_ref().is_none_or(|n| n.contains(name)) {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// The callees `e`, an expression of a body on the stack, may be: what
+    /// the walk bound it to, or itself.
+    fn resolve(&self, e: &'a Expr) -> Vec<Held<'a>> {
+        match e.peel_ts() {
+            Expr::Var(name) => self
+                .held(name)
+                .map_or_else(|| vec![Held::Expr(e)], <[_]>::to_vec),
+            _ => vec![Held::Expr(e)],
+        }
+    }
+
+    /// Every entry `receiver` may hold, `None` when the walk cannot list
+    /// them: the elements of an array literal with no spread, or the members
+    /// the setter and closure tables name under its path (`all.0`, `all.*`),
+    /// when no body on the stack rebinds its root.
+    fn entries(&self, receiver: &'a Expr) -> Option<Vec<Held<'a>>> {
+        match receiver.peel_ts() {
+            Expr::ArrayLit {
+                elems, spread_at, ..
+            } => spread_at
+                .is_empty()
+                .then(|| elems.iter().flat_map(|e| self.resolve(e)).collect()),
+            other => {
+                let path = callee_path(other)?;
+                let rebound = self.scopes.iter().skip(1).any(|s| {
+                    s.names
+                        .as_ref()
+                        .is_none_or(|n| n.contains(path_root(&path)))
+                });
+                if rebound {
+                    return None;
+                }
+                let prefix = format!("{path}.");
+                let fns = self.converged.map(|c| c.fns.keys());
+                let mut members: Vec<&Var> = self
+                    .setter_vars
+                    .iter()
+                    .chain(fns.into_iter().flatten())
+                    .filter(|k| {
+                        k.strip_prefix(&prefix)
+                            .is_some_and(|member| !member.contains('.'))
+                    })
+                    .collect();
+                members.sort();
+                members.dedup();
+                Some(members.into_iter().map(|k| Held::Path(k.clone())).collect())
+            }
+        }
+    }
+
+    /// Bind `params` to what a call `passed` the body: an argument by
+    /// position, or the receiver's entries at the positions an array method
+    /// passes them — `reduce`'s second, both of `sort`'s, the first of every
+    /// other. A parameter the walk cannot bind is left out, and resolves as a
+    /// name: one past the last argument, which its default may fill.
+    fn bind(&self, params: &[Var], passed: Passed<'a>) -> HashMap<Var, Vec<Held<'a>>> {
+        match passed {
+            Passed::Nothing => HashMap::new(),
+            Passed::Args(args) => params
+                .iter()
+                .zip(args)
+                .map(|(p, a)| (p.clone(), self.resolve(a)))
+                .collect(),
+            Passed::Entries { receiver, method } => {
+                let Some(entries) = self.entries(receiver) else {
+                    return HashMap::new();
+                };
+                let at: &[usize] = match method {
+                    "reduce" | "reduceRight" => &[1],
+                    "sort" => &[0, 1],
+                    _ => &[0],
+                };
+                at.iter()
+                    .filter_map(|&i| params.get(i))
+                    .map(|p| (p.clone(), entries.clone()))
+                    .collect()
+            }
+        }
     }
 
     /// Record a write of the store at this site, when the walk records them.
@@ -3098,6 +3249,7 @@ impl<'a> SetterWalk<'a> {
                                 self.enter(
                                     body,
                                     reached,
+                                    Passed::Nothing,
                                     depth - 1,
                                     found,
                                     WalkClass::Cleanup,
@@ -3273,81 +3425,30 @@ impl<'a> SetterWalk<'a> {
         // `Promise` executor runs synchronously, and a class the body binds
         // is a local helper like any other.
         if let Expr::Call { fn_, args } | Expr::New { fn_, args, .. } = expr {
-            if let Some(name) = callee_path(fn_)
-                && self.setter_vars.contains(&name)
-            {
-                found.setters.push(FoundSite {
-                    var: name,
-                    class: mode,
-                    span: stmt_span,
-                    at,
-                    own: at.map(|(b, _)| (self.body, b)),
-                    prov_block: prov,
-                    repeats: self.repeating,
-                    updater: self.updater_of(args),
-                    arg: args.first().map(|a| a.peel_ts().clone()),
-                    foreign: self.foreign(),
-                    applied: false,
-                    through: self.path.clone(),
-                });
-            }
-            if let Expr::Var(name) = fn_.as_ref() {
-                // B6: direct call to a locally-bound function — its body runs
-                // in the CURRENT mode, so sync-in-helper writes take this call
-                // site's class and block id; writes the helper defers or
-                // nests keep their own class (a `setTimeout` inside a sync
-                // helper is not a sync write — lifting it was an
-                // under-approximation).
-                if depth > 0
-                    && let Some(body) = self.fn_bindings.get(name)
-                {
-                    // Inner rows' provenance block is this call site. Where
-                    // the helper is *defined* is the relation's question: an
-                    // alias can carry a name out of its region (a hook's
-                    // returned closure), so the name rides on `path`.
-                    let mut inner = Found::default();
-                    self.path.push(name.clone());
-                    self.enter(
-                        body,
-                        Reached::Named,
-                        depth - 1,
-                        &mut inner,
-                        WalkClass::Sync,
-                        prov,
-                        stmt_span,
-                    );
-                    self.path.pop();
-                    found.absorb(inner, body, mode, at, prov);
+            // A call through a parameter the walk bound is a call through
+            // what it holds, never through the parameter's name (#316): of
+            // one of them, placed at this call only when it holds one.
+            let held = match fn_.peel_ts() {
+                Expr::Var(p) => self.held(p).map(<[_]>::to_vec),
+                _ => None,
+            };
+            match held {
+                Some(held) => {
+                    let at = at.filter(|_| held.len() == 1);
+                    for callee in held {
+                        self.call_through(callee, args, at, depth, found, mode, prov, stmt_span);
+                    }
                 }
-            }
-            // A call through a name or member path no binding certifies, which
-            // the converged values point at closures of this component
-            // (`api.inc()`, #233): each body may run here, so its writes are
-            // the call's.
-            self.converged_bodies(fn_, mode, at, depth, found, prov, stmt_span);
-            // An immediately-invoked function expression runs NOW, at this
-            // call site, in this mode — `(async () => { … })()` is how an
-            // effect awaits, and it is the standard shape. The walk descended a
-            // *named* local helper (B6 above) and not this one, so every write
-            // inside an IIFE was invisible to the relation: a false negative,
-            // and the reason #117's await split bought nothing on the shape it
-            // was aimed at.
-            if depth > 0
-                && let Expr::FnLit {
-                    body_cfg, params, ..
-                } = fn_.peel_ts()
-            {
-                let mut inner = Found::default();
-                self.enter(
-                    body_cfg,
-                    Reached::Inline(params),
-                    depth - 1,
-                    &mut inner,
-                    WalkClass::Sync,
+                None => self.call_through(
+                    Held::Expr(fn_),
+                    args,
+                    at,
+                    depth,
+                    found,
+                    mode,
                     prov,
                     stmt_span,
-                );
-                found.absorb(inner, body_cfg, mode, at, prov);
+                ),
             }
             // The listener `FnLit` of an effect-top-level `addEventListener`
             // is exactly what `extract_subscriptions` reified as a Handler
@@ -3395,7 +3496,17 @@ impl<'a> SetterWalk<'a> {
                 // rows run at this call, and are placed here only when the
                 // receiver surely runs it, as an IIFE is (#248).
                 let placed = at.filter(|_| i == 0 && runs_at_least_once(fn_, args));
-                self.callback_arg(arg, class, placed, depth, found, prov, stmt_span);
+                // What the method passes the callback: the receiver's entries.
+                let passed = match fn_.peel_ts() {
+                    Expr::FieldAccess { obj, field } if i == 0 && self.is_sync_hof(fn_) => {
+                        Passed::Entries {
+                            receiver: obj,
+                            method: field,
+                        }
+                    }
+                    _ => Passed::Nothing,
+                };
+                self.callback_arg(arg, class, placed, passed, depth, found, prov, stmt_span);
                 self.repeating = outer_repeating;
             }
         }
@@ -3420,6 +3531,7 @@ impl<'a> SetterWalk<'a> {
                     self.enter(
                         body_cfg,
                         Reached::Named,
+                        Passed::Nothing,
                         depth - 1,
                         &mut inner,
                         mode,
@@ -3453,34 +3565,212 @@ impl<'a> SetterWalk<'a> {
             let class = self.listener_class();
             for (name, val) in fields {
                 if crate::lowering::hook_extractor::invoked_prop(native, name) {
-                    self.converged_bodies(val, class, None, depth, found, prov, stmt_span);
+                    self.converged_bodies(
+                        callee_path(val),
+                        Some(val),
+                        Passed::Nothing,
+                        class,
+                        None,
+                        depth,
+                        found,
+                        prov,
+                        stmt_span,
+                    );
                 }
             }
         }
     }
 
+    /// A call of `callee` with `args`, at `at` in `mode`: a write when it is
+    /// a setter, the body it runs when it is a local helper, a closure the
+    /// converged values put behind it, or a literal called where it is
+    /// written — the parameters of that body bound to `args`.
+    #[allow(clippy::too_many_arguments)]
+    fn call_through(
+        &mut self,
+        callee: Held<'a>,
+        args: &'a [Expr],
+        at: Option<(BlockId, usize)>,
+        depth: usize,
+        found: &mut Found,
+        mode: WalkClass,
+        prov: Option<BlockId>,
+        stmt_span: Option<SourceRange>,
+    ) {
+        let (fn_, name) = match callee {
+            Held::Expr(e) => (Some(e), callee_path(e)),
+            Held::Path(p) => (None, Some(p)),
+        };
+        if let Some(name) = &name
+            && self.setter_vars.contains(name)
+        {
+            found.setters.push(FoundSite {
+                var: name.clone(),
+                class: mode,
+                span: stmt_span,
+                at,
+                own: at.map(|(b, _)| (self.body, b)),
+                prov_block: prov,
+                repeats: self.repeating,
+                updater: self.updater_of(args),
+                arg: args.first().map(|a| a.peel_ts().clone()),
+                foreign: self.foreign(),
+                applied: false,
+                through: self.path.clone(),
+            });
+        }
+        if let Some(Expr::Var(name)) = fn_ {
+            // B6: direct call to a locally-bound function — its body runs
+            // in the CURRENT mode, so sync-in-helper writes take this call
+            // site's class and block id; writes the helper defers or
+            // nests keep their own class (a `setTimeout` inside a sync
+            // helper is not a sync write — lifting it was an
+            // under-approximation).
+            if depth > 0
+                && let Some(body) = self.fn_bindings.get(name)
+            {
+                // Inner rows' provenance block is this call site. Where
+                // the helper is *defined* is the relation's question: an
+                // alias can carry a name out of its region (a hook's
+                // returned closure), so the name rides on `path`.
+                let mut inner = Found::default();
+                self.path.push(name.clone());
+                self.enter(
+                    body,
+                    Reached::Named,
+                    Passed::Args(args),
+                    depth - 1,
+                    &mut inner,
+                    WalkClass::Sync,
+                    prov,
+                    stmt_span,
+                );
+                self.path.pop();
+                found.absorb(inner, body, mode, at, prov);
+            }
+        }
+        // A call through a name or member path no binding certifies, which
+        // the converged values point at closures of this component
+        // (`api.inc()`, #233): each body may run here, so its writes are
+        // the call's.
+        self.converged_bodies(
+            name,
+            fn_,
+            Passed::Args(args),
+            mode,
+            at,
+            depth,
+            found,
+            prov,
+            stmt_span,
+        );
+        // An immediately-invoked function expression runs NOW, at this
+        // call site, in this mode — `(async () => { … })()` is how an
+        // effect awaits, and it is the standard shape. The walk descended a
+        // *named* local helper (B6 above) and not this one, so every write
+        // inside an IIFE was invisible to the relation: a false negative,
+        // and the reason #117's await split bought nothing on the shape it
+        // was aimed at.
+        if depth > 0
+            && let Some(Expr::FnLit {
+                body_cfg, params, ..
+            }) = fn_.map(Expr::peel_ts)
+        {
+            let mut inner = Found::default();
+            self.enter(
+                body_cfg,
+                Reached::Inline(params),
+                Passed::Args(args),
+                depth - 1,
+                &mut inner,
+                WalkClass::Sync,
+                prov,
+                stmt_span,
+            );
+            found.absorb(inner, body_cfg, mode, at, prov);
+        }
+    }
+
     /// Walk the function a call hands its callee as `arg`, in `class`;
     /// `placed` is where its rows run in this CFG, when the callee surely
-    /// runs it there.
+    /// runs it there, and `passed` what it passes it.
     #[allow(clippy::too_many_arguments)]
     fn callback_arg(
         &mut self,
         arg: &'a Expr,
         class: WalkClass,
         placed: Option<(BlockId, usize)>,
+        passed: Passed<'a>,
         depth: usize,
         found: &mut Found,
         prov: Option<BlockId>,
         stmt_span: Option<SourceRange>,
     ) {
-        // A setter handed to the callee is called by it, with what it passes
-        // (#291): a write of its slot in the argument's class, placed where a
-        // closure's rows would be.
-        if let Some(name) = callee_path(arg)
-            && self.setter_vars.contains(&name)
+        // A parameter the walk bound hands what it holds (#316), each read
+        // where the walk bound it, never by name again.
+        if let Expr::Var(p) = arg.peel_ts()
+            && let Some(held) = self.held(p).map(<[_]>::to_vec)
         {
+            let placed = placed.filter(|_| held.len() == 1);
+            for callee in held {
+                match callee {
+                    Held::Expr(e) => self.callback_value(
+                        e,
+                        callee_path(e),
+                        class,
+                        placed,
+                        passed,
+                        depth,
+                        found,
+                        prov,
+                        stmt_span,
+                    ),
+                    Held::Path(path) => {
+                        self.handed_setter(&path, class, placed, found, prov, stmt_span);
+                        self.converged_bodies(
+                            Some(path),
+                            None,
+                            passed,
+                            class,
+                            placed,
+                            depth,
+                            found,
+                            prov,
+                            stmt_span,
+                        );
+                    }
+                }
+            }
+            return;
+        }
+        self.callback_value(
+            arg,
+            callee_path(arg),
+            class,
+            placed,
+            passed,
+            depth,
+            found,
+            prov,
+            stmt_span,
+        );
+    }
+
+    /// A setter at `name` handed to a callee is called by it, with what it
+    /// passes (#291): a write of its slot in the argument's class, placed
+    /// where a closure's rows would be.
+    fn handed_setter(
+        &self,
+        name: &Var,
+        class: WalkClass,
+        placed: Option<(BlockId, usize)>,
+        found: &mut Found,
+        prov: Option<BlockId>,
+        stmt_span: Option<SourceRange>,
+    ) {
+        if self.setter_vars.contains(name) {
             found.setters.push(FoundSite {
-                var: name,
+                var: name.clone(),
                 class,
                 span: stmt_span,
                 at: placed,
@@ -3494,6 +3784,26 @@ impl<'a> SetterWalk<'a> {
                 through: self.path.clone(),
             });
         }
+    }
+
+    /// [`Self::callback_arg`] for `arg`, a value a body on the stack spells,
+    /// `name` its path.
+    #[allow(clippy::too_many_arguments)]
+    fn callback_value(
+        &mut self,
+        arg: &'a Expr,
+        name: Option<Var>,
+        class: WalkClass,
+        placed: Option<(BlockId, usize)>,
+        passed: Passed<'a>,
+        depth: usize,
+        found: &mut Found,
+        prov: Option<BlockId>,
+        stmt_span: Option<SourceRange>,
+    ) {
+        if let Some(name) = &name {
+            self.handed_setter(name, class, placed, found, prov, stmt_span);
+        }
         match arg {
             // Inline FnLit arg descend body, costs one depth level.
             Expr::FnLit {
@@ -3503,6 +3813,7 @@ impl<'a> SetterWalk<'a> {
                 self.enter(
                     body_cfg,
                     Reached::Inline(params),
+                    passed,
                     depth - 1,
                     &mut inner,
                     class,
@@ -3514,13 +3825,14 @@ impl<'a> SetterWalk<'a> {
             // B5: variable arg name resolution, no depth cost — so this is
             // the arm that can cycle (`const tick = t => raf(tick)`); the
             // `walking` stack is what terminates it.
-            Expr::Var(name) if self.fn_bindings.contains_key(name) => {
-                let body = &self.fn_bindings[name];
+            Expr::Var(fn_name) if self.fn_bindings.contains_key(fn_name) => {
+                let body = &self.fn_bindings[fn_name];
                 let mut inner = Found::default();
-                self.path.push(name.clone());
+                self.path.push(fn_name.clone());
                 self.enter(
                     body,
                     Reached::Named,
+                    passed,
                     depth,
                     &mut inner,
                     class,
@@ -3534,7 +3846,16 @@ impl<'a> SetterWalk<'a> {
             // (#254): the callee may call it at any time, or never (#264).
             Expr::ObjectLit { fields, .. } => {
                 for (_, val) in fields {
-                    self.callback_arg(val, WalkClass::Unknown, None, depth, found, prov, stmt_span);
+                    self.callback_arg(
+                        val,
+                        WalkClass::Unknown,
+                        None,
+                        Passed::Nothing,
+                        depth,
+                        found,
+                        prov,
+                        stmt_span,
+                    );
                 }
             }
             Expr::ArrayLit { elems, .. } => {
@@ -3543,6 +3864,7 @@ impl<'a> SetterWalk<'a> {
                         elem,
                         WalkClass::Unknown,
                         None,
+                        Passed::Nothing,
                         depth,
                         found,
                         prov,
@@ -3556,7 +3878,17 @@ impl<'a> SetterWalk<'a> {
             // receiver surely runs. The closures the object at that path
             // holds escape with it, as an argument literal's do.
             _ => {
-                self.converged_bodies(arg, class, placed, depth, found, prov, stmt_span);
+                self.converged_bodies(
+                    name,
+                    Some(arg),
+                    passed,
+                    class,
+                    placed,
+                    depth,
+                    found,
+                    prov,
+                    stmt_span,
+                );
                 self.member_bodies(arg, depth, found, prov, stmt_span);
             }
         }
@@ -3586,6 +3918,7 @@ impl<'a> SetterWalk<'a> {
             self.enter(
                 body,
                 Reached::Named,
+                Passed::Nothing,
                 depth - 1,
                 &mut inner,
                 WalkClass::Sync,
@@ -3617,12 +3950,14 @@ impl<'a> SetterWalk<'a> {
         {
             for (name, val) in fields {
                 let class = self.timing_class(t.member(name));
-                self.callback_arg(val, class, None, depth, found, prov, stmt_span);
+                let nothing = Passed::Nothing;
+                self.callback_arg(val, class, None, nothing, depth, found, prov, stmt_span);
             }
             return;
         }
         let class = self.timing_class(timing);
-        self.callback_arg(arg, class, None, depth, found, prov, stmt_span);
+        let nothing = Passed::Nothing;
+        self.callback_arg(arg, class, None, nothing, depth, found, prov, stmt_span);
     }
 
     /// The class a package hook's argument timed `timing` runs in
@@ -3649,11 +3984,15 @@ impl<'a> SetterWalk<'a> {
     /// called (`api.inc()`, #233) or handed to a callee or a JSX prop
     /// (`setTimeout(api.inc)`, `onClick={api.inc}`, #239). Each body may run,
     /// in `class`; its rows are placed at `at` only when `e` certainly names
-    /// that one closure — otherwise it may run another.
+    /// that one closure — otherwise it may run another. `name` is `e`'s
+    /// path, or a member path of a receiver the walk bound a parameter to
+    /// (no `e`, never certain); `passed` is what each body is handed.
     #[allow(clippy::too_many_arguments)]
     fn converged_bodies(
         &mut self,
-        e: &Expr,
+        name: Option<Var>,
+        e: Option<&Expr>,
+        passed: Passed<'a>,
         class: WalkClass,
         at: Option<(BlockId, usize)>,
         depth: usize,
@@ -3664,19 +4003,20 @@ impl<'a> SetterWalk<'a> {
         let Some(converged) = self.converged.filter(|_| depth > 0) else {
             return;
         };
-        let Some(name) = callee_path(e).filter(|n| !self.fn_bindings.contains_key(n)) else {
+        let Some(name) = name.filter(|n| !self.fn_bindings.contains_key(n)) else {
             return;
         };
         let Some(bodies) = converged.bodies(&name) else {
             return;
         };
-        let sure = matches!(bodies, [only] if converged.certain(e, only));
+        let sure = e.is_some_and(|e| matches!(bodies, [only] if converged.certain(e, only)));
         for body in bodies {
             let mut inner = Found::default();
             self.path.push(name.clone());
             self.enter(
                 body,
                 Reached::Named,
+                passed,
                 depth - 1,
                 &mut inner,
                 WalkClass::Sync,
@@ -3789,7 +4129,7 @@ pub fn collect_slot_reads(render_cfg: &CFG, hooks: &[HookEntry]) -> Vec<SlotRead
             wrappers: &NO_WRAPPERS,
             path: Vec::new(),
             store_scopes: None,
-            scopes: vec![(cfg, Some(BTreeSet::new()))],
+            scopes: vec![Scope::root(cfg)],
         };
         walk.cfg(cfg, 2, &mut found, WalkClass::Sync, None, None);
         for r in found.reads {
@@ -3873,7 +4213,7 @@ pub fn collect_body_calls(cfg: &CFG, region: WriterRegion) -> Vec<BodyCall> {
         wrappers: &NO_WRAPPERS,
         path: Vec::new(),
         store_scopes: None,
-        scopes: vec![(cfg, Some(BTreeSet::new()))],
+        scopes: vec![Scope::root(cfg)],
     };
     walk.cfg(cfg, WALK_DEPTH, &mut found, WalkClass::Sync, None, None);
     let mut rows: Vec<BodyCall> = found
