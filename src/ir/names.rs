@@ -90,12 +90,13 @@ fn is_call_temp(var: &str) -> bool {
 }
 
 /// The prefixes of the names lowering mints: an expression's value (`__t`,
-/// `__sw`), a call's (`__call_`, `__hook_`, `__hookarg_`), a destructured
-/// value, element or default (`__dstr_`, `__arr_`, `__obj_`, `__dflt_`), a
-/// destructured parameter (`__p`).
+/// `__sw`, `__of`), a call's (`__call_`, `__hook_`, `__hookarg_`), a
+/// destructured value, element or default (`__dstr_`, `__arr_`, `__obj_`,
+/// `__dflt_`), a destructured parameter (`__p`).
 const TEMP_PREFIXES: &[&str] = &[
     "__t",
     "__sw",
+    "__of",
     "__call_",
     "__hookarg_",
     "__hook_",

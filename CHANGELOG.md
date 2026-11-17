@@ -161,6 +161,12 @@ on a program React settles; 323 oracle cases, none a known false negative.
   do; a stale capture through a pair is a Warning. A slot reached through such
   a pair is named as the component calls it (`t[0]`, `n`), never `state #2`
   (#288).
+- A `for…of` variable is an element of the iterated value, as an array
+  method's callback parameter is: a setter it holds writes its slot and an
+  object it holds is the state it sits in. `for (const set of [setN])
+  set(n + 1)` in an effect or the render, a child iterating its parent's
+  setters, and `for (const item of items) item.count++` before
+  `setItems(items)` were silent.
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

@@ -285,6 +285,12 @@ impl BlockBuilder {
         self.temp_at("__sw", at)
     }
 
+    /// The temp a `for…of` reads the iterated value `at` into once, apart
+    /// from [`Self::fresh_temp`] for the reason [`Self::switch_temp`] is.
+    pub(super) fn iter_temp(&mut self, at: oxc_span::Span) -> String {
+        self.temp_at("__of", at)
+    }
+
     fn temp_at(&mut self, prefix: &str, at: oxc_span::Span) -> String {
         let t = format!("{prefix}{}_{}", at.start, at.end);
         self.ctx.temps.record(&t, at);
@@ -359,10 +365,10 @@ fn lower_stmt(stmt: &Statement, builder: &mut BlockBuilder) {
             );
         }
         Statement::ForInStatement(f) => {
-            lower_iter_loop(&f.left, &f.right, &f.body, builder);
+            lower_iter_loop(&f.left, &f.right, &f.body, false, builder);
         }
         Statement::ForOfStatement(f) => {
-            lower_iter_loop(&f.left, &f.right, &f.body, builder);
+            lower_iter_loop(&f.left, &f.right, &f.body, true, builder);
         }
         Statement::DoWhileStatement(dw) => {
             // The test gets its own block: `continue` in a `do…while` runs it,
@@ -754,22 +760,42 @@ fn lower_for(
 /// Simplified for-in / for-of: single loop with unknown bound.
 ///
 /// The head is lowered in full (TODO.md loop-head FP/FN):
-/// - the iterated expression is evaluated in the preheader, so
+/// - the iterated expression is evaluated once, in the preheader, so
 ///   `for (const x of foo)` registers a read of `foo` (dep soundness);
-/// - the loop variable is bound at the top of the body to `Top` — the
-///   per-iteration element/key is unknowable, same treatment as HOF
-///   callback params and catch params — so a loop var shadowing an outer
-///   binding is not read as a capture of it.
+/// - the loop variable is bound at the top of the body, so a loop var
+///   shadowing an outer binding is not read as a capture of it. A `for…of`
+///   variable is an element of the iterated value, `iterated[⊤]`: the join
+///   of the entries of every array the heap places it at, ⊤ wherever it may
+///   be something else — what an array method passes its callback, so
+///   `for (const set of [setN]) set(x)` writes as `[setN].forEach(set =>
+///   set(x))` does. A `for…in` key is a string the analysis does not know:
+///   `Top`.
 fn lower_iter_loop(
     left: &ForStatementLeft,
     right: &Expression,
     body: &Statement,
+    of: bool,
     builder: &mut BlockBuilder,
 ) {
-    // Preheader: the iterated expression is read once at loop entry.
+    // Preheader: the iterated expression is read once at loop entry, into
+    // the temp every iteration reads its element off.
     let iterated = lower_expr(right, builder);
     let iter_span = builder.span_at(right.span().start);
-    builder.push_stmt(Stmt::ExprStmt(iterated, iter_span));
+    let element = if of {
+        let held = builder.iter_temp(right.span());
+        builder.push_stmt(Stmt::Let {
+            var: held.clone(),
+            rhs: iterated,
+            span: iter_span,
+        });
+        Expr::IndexAccess {
+            arr: Box::new(Expr::Var(held)),
+            idx: Box::new(Expr::SummaryVal(crate::ir::expr::SummaryValue::Top)),
+        }
+    } else {
+        builder.push_stmt(Stmt::ExprStmt(iterated, iter_span));
+        Expr::SummaryVal(crate::ir::expr::SummaryValue::Top)
+    };
 
     let header = builder.new_block();
     let body_block = builder.new_block();
@@ -790,12 +816,11 @@ fn lower_iter_loop(
     builder.add_edge(h, exit_block, EdgeKind::IfFalse);
 
     builder.start_block(body_block);
-    let top = Expr::SummaryVal(crate::ir::expr::SummaryValue::Top);
     match left {
         ForStatementLeft::VariableDeclaration(decl) => {
             for d in &decl.declarations {
                 let span = builder.span_at(d.span.start);
-                lower_binding_pattern(&d.id, top.clone(), span, builder);
+                lower_binding_pattern(&d.id, element.clone(), span, builder);
             }
         }
         // Pre-declared target (`for (x of arr)`): re-assign the outer var.
@@ -805,7 +830,7 @@ fn lower_iter_loop(
                 let span = builder.span_at(other.span().start);
                 builder.push_stmt(Stmt::Assign {
                     var,
-                    rhs: top,
+                    rhs: element,
                     span,
                 });
             }
