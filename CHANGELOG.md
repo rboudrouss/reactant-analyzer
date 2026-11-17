@@ -207,6 +207,10 @@ on a program React settles; 323 oracle cases, none a known false negative.
   (#320). A call through such a value held in an object or a prop now runs
   its body, as an arrow's: slower on code built that way (mantine, locally:
   282 s → 764 s).
+- A name whose value reads the name itself (`acc = [...acc, f]`,
+  `o = { a: o.a }`, `hs = [...hs]` handed to a callee) may hold anything
+  past its first unfolding: the analysis no longer aborts on a stack overflow
+  on such code (chakra-ui), and a setter the name may hold is still a write.
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

@@ -4,6 +4,7 @@
 //! alias chains, the may-written slot proof — and the slot-writer relation
 //! (`collect_slot_writers`) the fixpoint stores on `AnalysisResult`.
 
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -234,6 +235,7 @@ fn setter_calls(
         path: Vec::new(),
         store_scopes: None,
         scopes: vec![Scope::root(cfg)],
+        following: RefCell::default(),
     };
     walk.cfg(cfg, WALK_DEPTH, &mut found, WalkClass::Sync, None, None);
     let mut found = found.setters;
@@ -400,6 +402,7 @@ pub(crate) fn collect_write_sites(
         path: Vec::new(),
         store_scopes: Some(vec![crate::ir::bindings::local_bindings(converged.render)]),
         scopes: vec![Scope::root(cfg)],
+        following: RefCell::default(),
     };
     walk.cfg(cfg, WALK_DEPTH, &mut found, WalkClass::Sync, None, None);
     let setters = found
@@ -2424,6 +2427,23 @@ struct SetterWalk<'a> {
     store_scopes: Option<Vec<HashMap<&'a str, Vec<&'a Expr>>>>,
     /// Every body on the walk's stack, the root's first ([`Scope`]).
     scopes: Vec<Scope<'a>>,
+    /// The values of its bindings the walk is following into their own
+    /// expression ([`SetterWalk::follow`]): a stack, as `walking` is.
+    following: RefCell<HashSet<Following>>,
+}
+
+/// A value a binding of the walk holds, followed into its expression: the
+/// expression's identity, the depth of the walk's stack, and how.
+type Following = (usize, usize, Follow);
+
+/// How the walk follows a value one of its bindings holds.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum Follow {
+    /// Reads member `key` of it, any member when `None`
+    /// ([`SetterWalk::members`]).
+    Member(Option<String>),
+    /// Hands it to a callee ([`SetterWalk::callback_arg`]).
+    Handed,
 }
 
 /// A body on the walk's stack.
@@ -3314,65 +3334,103 @@ impl<'a> SetterWalk<'a> {
                     },
                     sure: false,
                 }),
-                Held::Expr(e) => match e.peel_ts() {
-                    Expr::ArrayLit {
-                        elems,
-                        spread_at,
-                        arity,
-                        ..
-                    } => {
-                        let at = key.and_then(|k| k.parse::<usize>().ok());
-                        let placed = spread_at.iter().all(|&s| at.is_some_and(|i| s > i))
-                            && arity.exact() == Some(elems.len());
-                        match at {
-                            Some(i) if placed => {
-                                if let Some(x) = elems.get(i) {
-                                    out.join(self.resolve(x));
-                                }
-                            }
-                            _ => out.join(Bound {
-                                items: self.entries(e),
-                                sure: false,
-                            }),
-                        }
+                Held::Expr(e) => match self.follow(e, Follow::Member(key.map(str::to_string))) {
+                    Some(this) => {
+                        out.join(self.expr_members(e, key));
+                        self.unfollow(&this);
                     }
-                    Expr::ObjectLit { fields, .. } => {
-                        for (k, v) in fields {
-                            if k.starts_with(crate::ir::expr::SPREAD_KEY_PREFIX)
-                                || k.starts_with(crate::ir::expr::ACCESSOR_KEY_PREFIX)
-                            {
-                                out.join(Bound {
-                                    items: vec![Held::Opaque(v)],
-                                    sure: false,
-                                });
-                            } else if key.is_none_or(|key| key == k)
-                                || crate::ir::expr::is_synthetic_key(k)
-                            {
-                                out.join(self.resolve(v));
-                            }
-                        }
-                    }
-                    other => match callee_path(other) {
-                        Some(p) => out.join(Bound {
-                            items: match key {
-                                Some(k) => vec![Held::Path(format!("{p}.{k}"))],
-                                None => self.entries(e),
-                            },
-                            sure: false,
-                        }),
-                        // A function's or a primitive's members are no
-                        // value a setter or a closure of this component
-                        // flows into; anything else may hold one.
-                        None if matches!(other, Expr::FnLit { .. } | Expr::Lit(_)) => {}
-                        None => out.join(Bound {
-                            items: vec![Held::Opaque(e)],
-                            sure: false,
-                        }),
-                    },
+                    None => out.join(Bound {
+                        items: vec![Held::Opaque(e)],
+                        sure: false,
+                    }),
                 },
             }
         }
         out.sure = false;
+        out
+    }
+
+    /// Start following `e`, a value a binding of the walk holds, into its
+    /// expression, as `how`; `None` when the walk is already following it
+    /// so at this depth of its stack. A binding may read its own name
+    /// (`acc = [...acc, f]`, `o = { a: o.a }`): following it then meets the
+    /// same following again with nothing between that changes what it gives
+    /// (no body entered, and each reader is a function of its arguments and
+    /// of the stack's bindings), so it would recurse forever. Met again, the
+    /// value is opaque: it may hold anything (fail-closed). A following that
+    /// ends is unchanged.
+    fn follow(&self, e: &'a Expr, how: Follow) -> Option<Following> {
+        let this = (std::ptr::from_ref(e) as usize, self.scopes.len(), how);
+        self.following
+            .borrow_mut()
+            .insert(this.clone())
+            .then_some(this)
+    }
+
+    /// Done following what [`Self::follow`] started.
+    fn unfollow(&self, this: &Following) {
+        self.following.borrow_mut().remove(this);
+    }
+
+    /// [`Self::members`] of one expression `e`, which a name the walk bound
+    /// may hold.
+    fn expr_members(&self, e: &'a Expr, key: Option<&str>) -> Bound<'a> {
+        let mut out = Bound::default();
+        match e.peel_ts() {
+            Expr::ArrayLit {
+                elems,
+                spread_at,
+                arity,
+                ..
+            } => {
+                let at = key.and_then(|k| k.parse::<usize>().ok());
+                let placed = spread_at.iter().all(|&s| at.is_some_and(|i| s > i))
+                    && arity.exact() == Some(elems.len());
+                match at {
+                    Some(i) if placed => {
+                        if let Some(x) = elems.get(i) {
+                            out.join(self.resolve(x));
+                        }
+                    }
+                    _ => out.join(Bound {
+                        items: self.entries(e),
+                        sure: false,
+                    }),
+                }
+            }
+            Expr::ObjectLit { fields, .. } => {
+                for (k, v) in fields {
+                    if k.starts_with(crate::ir::expr::SPREAD_KEY_PREFIX)
+                        || k.starts_with(crate::ir::expr::ACCESSOR_KEY_PREFIX)
+                    {
+                        out.join(Bound {
+                            items: vec![Held::Opaque(v)],
+                            sure: false,
+                        });
+                    } else if key.is_none_or(|key| key == k) || crate::ir::expr::is_synthetic_key(k)
+                    {
+                        out.join(self.resolve(v));
+                    }
+                }
+            }
+            other => match callee_path(other) {
+                Some(p) => out.join(Bound {
+                    items: match key {
+                        Some(k) => vec![Held::Path(format!("{p}.{k}"))],
+                        None => self.entries(e),
+                    },
+                    sure: false,
+                }),
+                // A function's or a primitive's members are no value a
+                // setter or a closure of this component flows into; anything
+                // else may hold one.
+                None if matches!(other, Expr::FnLit { .. } | Expr::Lit(_)) => {}
+                None => out.join(Bound {
+                    items: vec![Held::Opaque(e)],
+                    sure: false,
+                }),
+            },
+        }
         out
     }
 
@@ -4124,17 +4182,23 @@ impl<'a> SetterWalk<'a> {
             for callee in held.items {
                 match callee {
                     Held::Opaque(e) => self.opaque(e, class, depth, found, prov, stmt_span),
-                    Held::Expr(e) => self.callback_value(
-                        e,
-                        callee_path(e),
-                        class,
-                        placed,
-                        passed,
-                        depth,
-                        found,
-                        prov,
-                        stmt_span,
-                    ),
+                    Held::Expr(e) => match self.follow(e, Follow::Handed) {
+                        Some(this) => {
+                            self.callback_value(
+                                e,
+                                callee_path(e),
+                                class,
+                                placed,
+                                passed,
+                                depth,
+                                found,
+                                prov,
+                                stmt_span,
+                            );
+                            self.unfollow(&this);
+                        }
+                        None => self.opaque(e, class, depth, found, prov, stmt_span),
+                    },
                     Held::Path(path) => {
                         self.handed_setter(&path, class, placed, found, prov, stmt_span);
                         self.converged_bodies(
@@ -4821,6 +4885,7 @@ pub fn collect_slot_reads(render_cfg: &CFG, hooks: &[HookEntry]) -> Vec<SlotRead
             path: Vec::new(),
             store_scopes: None,
             scopes: vec![Scope::root(cfg)],
+            following: RefCell::default(),
         };
         walk.cfg(cfg, 2, &mut found, WalkClass::Sync, None, None);
         for r in found.reads {
@@ -4905,6 +4970,7 @@ pub fn collect_body_calls(cfg: &CFG, region: WriterRegion) -> Vec<BodyCall> {
         path: Vec::new(),
         store_scopes: None,
         scopes: vec![Scope::root(cfg)],
+        following: RefCell::default(),
     };
     walk.cfg(cfg, WALK_DEPTH, &mut found, WalkClass::Sync, None, None);
     let mut rows: Vec<BodyCall> = found
