@@ -204,7 +204,9 @@ on a program React settles; 323 oracle cases, none a known false negative.
   `useCallback` (a literal, or `useCallback(f, deps)`) or `useEffectEvent`
   value that writes its state, called by a child's effect through a prop,
   is the possible loop the arrow it memoizes already was; it was silent
-  (#320).
+  (#320). A call through such a value held in an object or a prop now runs
+  its body, as an arrow's: slower on code built that way (mantine, locally:
+  282 s → 764 s).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

@@ -92,8 +92,9 @@ that writes it (see *Cross-file limits*).
   argument from a spread on, its default, every value the body or a closure in it assigns it, the
   member a destructuring pattern reads, an array method's entry and receiver (#316). What the walk
   cannot list (a call's result, `xs.flatMap(f)` as a receiver) is a possible call of every setter
-  and closure that may flow into it. A rest parameter (`(...fs)`) and `arguments` are not bound:
-  a setter they receive is still a write of the call that hands it over (#291). Utility *inlining* is statement-position only [#52](https://github.com/rboudrouss/reactant-analyzer/issues/52). A setter
+  and closure that may flow into it. A rest parameter (`(...fs)`) and `arguments` are not bound
+  [#324](https://github.com/rboudrouss/reactant-analyzer/issues/324): a setter passed to the call
+  is still a possible write of it (#291), never a placed one. Utility *inlining* is statement-position only [#52](https://github.com/rboudrouss/reactant-analyzer/issues/52). A setter
   or a closure called through a call that returns it (`get()(x)`, `makeSetter()(x)`,
   `api.get()(x)`) is written where the call's value is read: off the converged envs of the render,
   an effect or a handler [#46](https://github.com/rboudrouss/reactant-analyzer/issues/46), and off a
