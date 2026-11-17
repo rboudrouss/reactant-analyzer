@@ -4543,19 +4543,35 @@ impl<'a> SetterWalk<'a> {
         }
         match e.peel_ts() {
             Expr::Var(v) => self.reach_name(v, out, seen),
-            Expr::FnLit { body_cfg, .. } => {
+            Expr::FnLit {
+                params, body_cfg, ..
+            } => {
                 out.closures.push((body_cfg, None));
-                for v in crate::ir::free_vars::compute_free_vars(body_cfg) {
-                    self.reach_name(&v, out, seen);
-                }
+                self.reach_returns(params, body_cfg, out, seen);
             }
             other => {
                 if let Some(path) = callee_path(other) {
                     self.reach_path(&path, out);
+                    // A member read off a value the tables place holds what
+                    // they list at or under its path, not its object's other
+                    // members.
+                    if self.tables_place(path_root(&path)) {
+                        return;
+                    }
                 }
                 other.for_each_child(&mut |c| self.reach_expr(c, out, seen));
             }
         }
+    }
+
+    /// The setter or closure tables list members under `root`: what a path
+    /// rooted there holds is read off them.
+    fn tables_place(&self, root: &str) -> bool {
+        let prefix = format!("{root}.");
+        self.setter_vars.iter().any(|k| k.starts_with(&prefix))
+            || self
+                .converged
+                .is_some_and(|c| c.fns.keys().any(|k| k.starts_with(&prefix)))
     }
 
     /// [`Self::reach_expr`] for a name the walk did not bind.
@@ -4566,12 +4582,93 @@ impl<'a> SetterWalk<'a> {
         self.reach_path(v, out);
         if let Some(body) = self.fn_bindings.get(v) {
             out.closures.push((body, Some(v.to_string())));
-            for free in crate::ir::free_vars::compute_free_vars(body) {
-                self.reach_name(&free, out, seen);
-            }
+            let params = self
+                .scopes
+                .iter()
+                .rev()
+                .find_map(|s| crate::ir::bindings::literal_params(s.body, body))
+                .or_else(|| {
+                    self.converged
+                        .and_then(|c| crate::ir::bindings::literal_params(c.render, body))
+                })
+                .unwrap_or(&[]);
+            self.reach_returns(params, body, out, seen);
         }
         for rhs in self.bindings_of(v) {
             self.reach_expr(rhs, out, seen);
+        }
+    }
+
+    /// What a function value hands back when called: the setters and
+    /// closures that may flow into its returns. A value flowing into an
+    /// opaque one is called by it, or by code that returns what the call
+    /// returns; what it only captures, it writes in its body, which the
+    /// caller enters ([`Self::opaque`]). Its parameters hold what that code
+    /// passes, which flows in through the code's own inputs.
+    fn reach_returns(
+        &self,
+        params: &[Var],
+        body: &'a CFG,
+        out: &mut Reach<'a>,
+        seen: &mut (HashSet<usize>, HashSet<Var>),
+    ) {
+        let locals: HashSet<&str> = crate::ir::bindings::own_names(&[], body).collect();
+        for block in body.blocks.values() {
+            if let Terminator::Return(e, _) = &block.term {
+                self.reach_in(e, (params, &locals), body, out, seen);
+            }
+        }
+    }
+
+    /// [`Self::reach_expr`] for `e`, an expression of `body`, a function
+    /// the walk is not in: its own names are read off its bindings, its
+    /// parameters hold nothing more, and a free name is the walk's.
+    fn reach_in(
+        &self,
+        e: &'a Expr,
+        names: (&[Var], &HashSet<&str>),
+        body: &'a CFG,
+        out: &mut Reach<'a>,
+        seen: &mut (HashSet<usize>, HashSet<Var>),
+    ) {
+        if !seen.0.insert(e as *const Expr as usize) {
+            return;
+        }
+        let (params, locals) = names;
+        let local = |v: &str| params.iter().any(|p| p == v) || locals.contains(v);
+        match e.peel_ts() {
+            Expr::Var(v) if params.iter().any(|p| p == v) => {}
+            Expr::Var(v) if locals.contains(v.as_str()) => {
+                for block in body.blocks.values() {
+                    for stmt in &block.stmts {
+                        if let Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. } = stmt
+                            && var == v
+                        {
+                            self.reach_in(rhs, names, body, out, seen);
+                        }
+                    }
+                }
+            }
+            Expr::Var(v) => self.reach_name(v, out, seen),
+            Expr::FnLit {
+                params: inner,
+                body_cfg,
+                ..
+            } => {
+                out.closures.push((body_cfg, None));
+                self.reach_returns(inner, body_cfg, out, seen);
+            }
+            other => {
+                if let Some(path) = callee_path(other)
+                    && !local(path_root(&path))
+                {
+                    self.reach_path(&path, out);
+                    if self.tables_place(path_root(&path)) {
+                        return;
+                    }
+                }
+                other.for_each_child(&mut |c| self.reach_in(c, names, body, out, seen));
+            }
         }
     }
 

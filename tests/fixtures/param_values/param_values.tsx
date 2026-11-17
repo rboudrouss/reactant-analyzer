@@ -133,6 +133,21 @@ export function EffectReassigned() {
   return <div>{n}</div>;
 }
 
+// A setter a callback returns flows into the opaque receiver.
+export function RenderReturnedByCallback() {
+  const [n, setN] = useState(0);
+  [0].flatMap(() => [setN]).forEach((set) => set(n + 1));
+  return <div>{n}</div>;
+}
+
+export function EffectReturnedByCallback() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    [0].flatMap(() => [setN]).forEach((set) => set(n + 1));
+  }, [n]);
+  return <div>{n}</div>;
+}
+
 // Not certain: the argument may be the setter or not, or the body may
 // replace it on one path. A possible write, never a proven one.
 export function ConditionalArgument(props: { c: boolean }) {

@@ -57,6 +57,7 @@ const SHAPES: &[&str] = &[
     "ReceiverParam",
     "DerivedReceiver",
     "Reassigned",
+    "ReturnedByCallback",
 ];
 
 #[test]
