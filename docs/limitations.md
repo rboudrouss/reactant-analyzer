@@ -364,9 +364,11 @@ carries an Error.
   possible loop where it settles [#310](https://github.com/rboudrouss/reactant-analyzer/issues/310).
 - **No promise and no iterator is modeled.** A call of a generator or an async function is a new
   object whose contents are unknown; what a `yield` or a `return` hands out, and what an `await`
-  is given, is handed to code the analysis does not see, and an `await` is ⊤. A setter a
-  generator yields is then written with any value: `for (const x of gen()) setN(x)` over
-  `function* gen() { yield 0; }` is a possible loop where it settles. A generator's body runs
+  is given, is handed to code the analysis does not see, and an `await` is ⊤ or a new object.
+  A setter a generator yields is then written with any value: `for (const x of gen()) setN(x)`
+  over `function* gen() { yield 0; }` is a possible loop where it settles. An effect depending
+  on an awaited value (through a prop of the component that awaits it) is a possible loop even
+  where the `await` settles to the same object every time. A generator's body runs
   where it is called, as far as its consumer may drive it, so a write in it is never certain
   [#317](https://github.com/rboudrouss/reactant-analyzer/issues/317).
 - **A value an input hands the component is new only when the parent renders.** A fresh dep or

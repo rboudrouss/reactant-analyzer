@@ -77,6 +77,26 @@ export function LocalAsyncCallAsDep() {
   return <div>{n}</div>;
 }
 
+async function loadList() {
+  return [{ v: 1 }];
+}
+
+function ListChild({ list }: { list: object[] }) {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    setN(n + 1);
+  }, [list]);
+  return <div>{n}</div>;
+}
+
+// What an `await` settles to may be new at every render of the component
+// that awaits it, and may be the same object: a dep on it may re-run, never
+// surely.
+export async function AwaitedList() {
+  const list = await loadList();
+  return <ListChild list={list} />;
+}
+
 // What an `await` resolves to is unknown, but a setter it is handed still
 // writes (React: loops).
 export function AwaitedSetter() {

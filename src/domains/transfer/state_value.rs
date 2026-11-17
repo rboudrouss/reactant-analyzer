@@ -17,7 +17,7 @@ use crate::{
         ComponentId,
         bindings::binding_of,
         cfg::CFG,
-        expr::{BinOp, CompOrigin, Expr, MarkerVal, Prim, UnaryOp},
+        expr::{BinOp, CompOrigin, Expr, MarkerVal, Prim, SummaryValue, UnaryOp},
         hooks::{Arity, DepsArg, HookEntry},
         stmt::Stmt,
         types::{ExprId, Symbol},
@@ -299,6 +299,13 @@ fn eval_state_value(
             eval_unary(op, v)
         }
 
+        // Code the analysis does not see, handed `args` (the lowering's
+        // `handed_out`): what an `await` or a `for await` element settles to,
+        // which code that runs when it settles produces. Anything, a new
+        // object included (#304): never a must-fresh reference.
+        Expr::Call { fn_, .. } if matches!(fn_.as_ref(), Expr::SummaryVal(SummaryValue::Top)) => {
+            StateValue::top().join(&StateValue::reference(Stability::PerRender))
+        }
         Expr::Call { fn_, args } => {
             allocating_call(fn_, args, env, ctx).unwrap_or_else(StateValue::top)
         }

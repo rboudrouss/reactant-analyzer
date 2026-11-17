@@ -83,6 +83,21 @@ fn an_async_call_is_a_new_promise() {
 }
 
 #[test]
+fn an_awaited_value_may_be_new_never_surely() {
+    let all = findings();
+    assert_eq!(
+        level(&all, "ListChild", "infinite-loop").as_deref(),
+        Some("warning"),
+        "{all:#?}"
+    );
+    assert_eq!(
+        level(&all, "ListChild", "always-unstable-deps"),
+        None,
+        "{all:#?}"
+    );
+}
+
+#[test]
 fn an_awaited_setter_still_writes() {
     let all = findings();
     assert!(

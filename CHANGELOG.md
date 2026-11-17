@@ -211,6 +211,10 @@ on a program React settles; 323 oracle cases, none a known false negative.
   `o = { a: o.a }`, `hs = [...hs]` handed to a callee) may hold anything
   past its first unfolding: the analysis no longer aborts on a stack overflow
   on such code (chakra-ui), and a setter the name may hold is still a write.
+- An awaited value may be a new object at any render: an effect depending on
+  one, as a prop of the async component that awaits it, is a possible loop
+  (Warning) again; it was silent since #317. It is never a certain new
+  reference, so `always-unstable-deps` does not claim it.
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

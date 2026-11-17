@@ -1192,7 +1192,9 @@ impl FnKind {
 /// its argument, so every setter or closure it holds escapes (#254). What a
 /// `yield` or a `return` gives a generator's consumer, what a `return` gives
 /// an async function's awaiter, and what an `await` makes of its operand —
-/// the analysis models no promise and no iterator (#317).
+/// the analysis models no promise and no iterator (#317). The value handed
+/// back is anything, a new object included: an awaited value may be new at
+/// any render.
 pub(super) fn handed_out(value: Expr) -> Expr {
     Expr::Call {
         fn_: Box::new(Expr::SummaryVal(SummaryValue::Top)),
