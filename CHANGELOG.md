@@ -150,6 +150,11 @@ on a program React settles; 323 oracle cases, none a known false negative.
   (`{ p = 0 }`) — is new only when the parent renders. Such a loop is a
   Warning where it was a false Error; a default the child allocates
   (`{ p = [] }` given `undefined`) stays an Error (#309).
+- A message names the value of `a ?? b`, `c ? x : y`, `a && b` or `a?.f()`
+  by its source text (an effect that depends on `obj?.get()`, a prop
+  `a ? onX : onX`, a registrar `(a ?? window).setInterval`), never by a
+  lowering temp (`__t0`); the human `var:` tag is left out for such a value
+  (#293).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

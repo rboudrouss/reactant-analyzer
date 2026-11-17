@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Identity of a source file, interned in a [`FileTable`] (ADR-019).
@@ -9,13 +10,28 @@ use std::path::{Path, PathBuf};
 pub struct FileId(u32);
 
 /// Interning table `FileId ↔ PathBuf`, built once during lowering (one entry
-/// per parsed file) and carried through to the renderers.
+/// per parsed file) and carried through to the renderers, with what each
+/// file's lowering temps stand for in its source.
 #[derive(Debug, Default, Clone)]
 pub struct FileTable {
     paths: Vec<PathBuf>,
+    /// The source text a lowering temp stands for (`__t12_30` → `a ?? b`),
+    /// keyed by its file and its name, which its span makes unique there.
+    temps: HashMap<(FileId, String), String>,
 }
 
 impl FileTable {
+    /// Record that temp `var` of `file` holds the value of the source
+    /// `text`.
+    pub fn name_temp(&mut self, file: FileId, var: String, text: &str) {
+        self.temps.insert((file, var), text.to_string());
+    }
+
+    /// The source text temp `var` of `file` stands for, as written.
+    pub fn temp_text(&self, file: FileId, var: &str) -> Option<&str> {
+        self.temps.get(&(file, var.to_string())).map(String::as_str)
+    }
+
     /// Intern `path`, returning the existing id when already present.
     pub fn intern(&mut self, path: &Path) -> FileId {
         if let Some(i) = self.paths.iter().position(|p| p == path) {
@@ -71,6 +87,11 @@ impl SourceMap {
             line_starts: Vec::new(),
             file: FileId(u32::MAX),
         }
+    }
+
+    /// The file this map places spans in.
+    pub fn file(&self) -> FileId {
+        self.file
     }
 
     /// Convert a byte offset into a span, `None` when the map is empty.

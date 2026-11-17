@@ -1090,7 +1090,7 @@ fn anonymous(v: &EntityVal<'_, '_>, names: &crate::ir::SourceNames) -> String {
         // The dependency as written, never its position: an index into `elems`
         // stops being an index into the source array once lowering drops an
         // elision or flattens a spread (#118).
-        EntityVal::Dep(d) => format!("`{}`", d.expr.describe()),
+        EntityVal::Dep(d) => format!("`{}`", names.describe(d.expr)),
         EntityVal::Arg(a) => format!("argument #{}", a.index),
         EntityVal::Origin(p) => format!("`{}`", p.origin_hook),
         EntityVal::Writer(w) => format!("`{}`", names.name(&w.setter)),
@@ -1105,7 +1105,7 @@ fn anonymous(v: &EntityVal<'_, '_>, names: &crate::ir::SourceNames) -> String {
         },
         EntityVal::Seed(s) => format!("`{}`", s.path),
         EntityVal::Consumer(c) => format!("`{}`", names.name(&c.name)),
-        EntityVal::Registration(r) => format!("`{}`", r.display),
+        EntityVal::Registration(r) => format!("`{}`", r.shown(names)),
     }
 }
 

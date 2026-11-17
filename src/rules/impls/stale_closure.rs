@@ -365,7 +365,7 @@ impl Rule for StaleClosure {
                     let candidate = PathFinding {
                         severity,
                         proof,
-                        registrar: reg.display.clone(),
+                        registrar: reg.shown(ctx.source_names()),
                         reg_span: reg.span,
                         resolved_via: via.map(str::to_string),
                         slots: live_local.clone(),

@@ -302,7 +302,13 @@ fn check_multi_effect_cycles(
                     .map_or_else(|| "a store writer".to_string(), |w| w.setter.clone())
             });
             let msg = if let (Some(callee), 1) = (&store_callee, cyc.len()) {
-                store_self_loop(comp_result, effect_label, callee, always.as_ref())
+                store_self_loop(
+                    comp_result,
+                    ctx.source_names(),
+                    effect_label,
+                    callee,
+                    always.as_ref(),
+                )
             } else if !certain && !cyc.iter().all(|e| allocates(e)) {
                 if let Some((why, reruns)) = &always {
                     format!(
@@ -433,6 +439,7 @@ fn always_clause(
 ) -> (String, &'static str) {
     let comp = &program.components[&component];
     let (why, surely) = (always.why, always.surely);
+    let names = crate::rules::helpers::source_names_of(comp, &program.file_table);
     let dep = |i: usize| {
         comp.hooks
             .iter()
@@ -440,7 +447,7 @@ fn always_clause(
                 HookEntry::Effect { label: l, deps, .. } if *l == label => deps
                     .list()
                     .and_then(|d| d.as_slice().get(i))
-                    .map(|e| e.describe()),
+                    .map(|e| names.describe(e)),
                 _ => None,
             })
             .unwrap_or_else(|| "a dep".to_string())
@@ -475,6 +482,7 @@ fn always_clause(
 /// a library store holds, or after every render (`always`).
 fn store_self_loop(
     comp: &crate::engine::AnalysisResult<crate::domains::StateValue>,
+    names: &crate::ir::SourceNames,
     label: HookLabel,
     callee: &str,
     always: Option<&(String, &'static str)>,
@@ -495,7 +503,7 @@ fn store_self_loop(
                 HookEntry::Effect { label: l, deps, .. } if *l == label => deps
                     .list()
                     .and_then(|d| d.as_slice().get(t.dep))
-                    .map(|e| e.describe()),
+                    .map(|e| names.describe(e)),
                 _ => None,
             })
         });

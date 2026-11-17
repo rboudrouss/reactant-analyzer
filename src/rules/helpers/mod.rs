@@ -131,13 +131,16 @@ pub(crate) fn state_slot_name(
 /// them: for a message about another component's slots.
 pub(crate) fn source_names_of(
     comp: &crate::engine::AnalysisResult<crate::domains::StateValue>,
+    files: &crate::ir::FileTable,
 ) -> crate::ir::SourceNames {
     crate::ir::SourceNames::of(
         &comp.render_cfg,
+        &comp.hooks,
         &comp.hook_provenance,
         comp.inline_origins
             .iter()
             .filter_map(|o| Some((o.bound.as_ref()?, o.name.as_str()))),
+        files,
     )
 }
 
@@ -319,7 +322,7 @@ mod tests {
             let_("scrollDismissActive", Expr::StateVal(3)),
             let_("isDragging", Expr::Var("scrollDismissActive".into())),
         ]);
-        let names = crate::ir::SourceNames::of(&cfg, &[], []);
+        let names = crate::ir::SourceNames::of(&cfg, &[], &[], [], &Default::default());
         let mut m: HashMap<Var, HookLabel> = HashMap::new();
         m.insert("scrollDismissActive".into(), 3);
         m.insert("isDragging".into(), 3);

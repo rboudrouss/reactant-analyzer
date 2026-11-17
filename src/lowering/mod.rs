@@ -443,6 +443,7 @@ pub fn lower_custom_hooks_with_resolver(
         hook_provenance: vec![],
         alias_of: Some(hook),
     }));
+    ctx.name_temps(source, files);
     out
 }
 
@@ -529,7 +530,7 @@ pub fn lower_program_with_resolver(
         local_hooks: &local_hooks,
         current_file: Some(file),
     };
-    detect_components(program)
+    let components = detect_components(program)
         .into_iter()
         .map(|candidate| {
             let (param_names, mut render_cfg) = candidate.build_cfg(&ctx);
@@ -556,7 +557,9 @@ pub fn lower_program_with_resolver(
                 module_consts: module_consts.clone(),
             }
         })
-        .collect()
+        .collect();
+    ctx.name_temps(source, files);
+    components
 }
 
 #[cfg(test)]

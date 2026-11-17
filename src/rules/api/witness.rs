@@ -338,7 +338,10 @@ pub(crate) const EFFECTFUL: &[&str] = &[
 /// `Math.floor`) and return its display name. The pure set is restricted to
 /// O(1) builtins so a `PureCheap` verdict never hides expensive work.
 pub(crate) fn classify_callee_name(method: &str, obj_root: Option<&str>) -> (EffectClass, String) {
+    // A receiver lowering named stands for an expression these producers
+    // cannot print: the method alone, as `.then` is for a call's result.
     let display = |m: &str| match obj_root {
+        Some(r) if crate::ir::is_lowering_temp(r) => format!(".{m}"),
         Some(r) => format!("{}.{m}", crate::ir::source_name(r)),
         None => m.to_string(),
     };

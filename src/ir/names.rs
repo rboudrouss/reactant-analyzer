@@ -5,18 +5,22 @@
 //! source text: the `#salt` an inlined hook's locals carry, the `.1` of an
 //! index segment (`t[1]` is the path `t.1`, which is what the converged-value
 //! tables key a member call by), and a lowering temp (`__call_207` for the
-//! value `get()` returns, `__hook_0` for what `useThing()` returns). The first
-//! two are syntax, read off the name by [`source_name`]; the third is a
-//! binding, read off the temp's `Let` by [`SourceNames`].
+//! value `get()` returns, `__hook_0` for what `useThing()` returns, `__t12_30`
+//! for the value of `a ?? b`). The first two are syntax, read off the name by
+//! [`source_name`]; the third is a binding, read off the temp's `Let` by
+//! [`SourceNames`]: its callee, or the source text the lowering recorded for
+//! it in the [`FileTable`]. Every message names a variable or an expression
+//! through [`SourceNames`].
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 
 use crate::ir::{
+    FileTable,
     bindings::nested_bodies,
     cfg::CFG,
     expr::Expr,
-    hooks::HookProvenance,
+    hooks::{HookEntry, HookProvenance},
     splice::SPLICE_MARK,
     stmt::Stmt,
     types::{HookLabel, Var},
@@ -59,12 +63,17 @@ fn push_path(out: &mut String, path: &str) {
 }
 
 /// The lowering temps that stand for a call's value, with the callee of that
-/// call as the source wrote it. Built once per body from the temps' own
-/// `Let`s, so a temp an inlined hook carried in (renamed, `__hook_0#2`) is
-/// found where the splice put it.
+/// call as the source wrote it, and the temps that stand for any other
+/// expression's value, with its source text. Built once per body from the
+/// temps' own `Let`s, so a temp an inlined hook carried in (renamed,
+/// `__hook_0#2`) is found where the splice put it.
 #[derive(Debug, Default)]
 pub struct SourceNames {
     callees: HashMap<Var, Expr>,
+    /// A temp the lowering minted for an expression's value (`a ?? b`,
+    /// `c ? x : y`, `a?.f()`), read in the [`FileTable`] of the file its
+    /// `Let` sits in.
+    texts: HashMap<Var, String>,
     /// The name the render's `useState` destructuring declares for each slot
     /// (`const [n, setN]`): a `Let` of the slot's read the component itself
     /// writes, not an inlined hook, the smallest such name if there are
@@ -77,6 +86,37 @@ pub struct SourceNames {
 /// expression `__hook_N` (`useThing().set(x)`, #233).
 fn is_call_temp(var: &str) -> bool {
     var.starts_with("__call_") || var.starts_with("__hook_")
+}
+
+/// The prefixes of the names lowering mints: an expression's value (`__t`,
+/// `__sw`), a call's (`__call_`, `__hook_`, `__hookarg_`), a destructured
+/// value, element or default (`__dstr_`, `__arr_`, `__obj_`, `__dflt_`), a
+/// destructured parameter (`__p`).
+const TEMP_PREFIXES: &[&str] = &[
+    "__t",
+    "__sw",
+    "__call_",
+    "__hookarg_",
+    "__hook_",
+    "__dstr_",
+    "__arr_",
+    "__obj_",
+    "__dflt_",
+    "__p",
+];
+
+/// `true` for a name lowering minted, whatever salt or member path follows
+/// it: a prefix of [`TEMP_PREFIXES`] then digits (`__t12_30`, `__p0.a`,
+/// `__hook_1#2`). A source name may start with `__` too (`__DEV__`), so the
+/// shape is checked whole. No message prints such a name.
+pub fn is_lowering_temp(var: &str) -> bool {
+    let root = var.split([PATH_MARK, SPLICE_MARK]).next().unwrap_or(var);
+    TEMP_PREFIXES.iter().any(|p| {
+        root.strip_prefix(p).is_some_and(|rest| {
+            rest.starts_with(|c: char| c.is_ascii_digit())
+                && rest.bytes().all(|b| b.is_ascii_digit() || b == b'_')
+        })
+    })
 }
 
 /// The temp a destructuring default binds, `__dflt_N` (#256): written once
@@ -92,15 +132,19 @@ pub fn is_default_temp(var: &str) -> bool {
 const MAX_TEMP_DEPTH: usize = 8;
 
 impl SourceNames {
-    /// The call temps bound anywhere in `cfg`, its function literals included.
-    /// `provenance` names a hook marker's callee. A call inlined into `cfg`
-    /// left no call behind, only the variable the splice bound its return to:
-    /// `inlined` lists those, as (variable, callee).
+    /// The temps bound anywhere in render `cfg` or the bodies of its `hooks`,
+    /// their function literals included. `provenance` names a hook marker's
+    /// callee. A call inlined into `cfg` left no call behind, only the
+    /// variable the splice bound its return to: `inlined` lists those, as
+    /// (variable, callee). `files` holds the text of every other temp.
     pub fn of<'a>(
         cfg: &CFG,
+        hooks: &[HookEntry],
         provenance: &[HookProvenance],
         inlined: impl IntoIterator<Item = (&'a Var, &'a str)>,
+        files: &FileTable,
     ) -> Self {
+        let mut texts = HashMap::new();
         let mut callees = HashMap::new();
         for (var, callee) in inlined {
             if is_call_temp(var) {
@@ -128,13 +172,23 @@ impl SourceNames {
                 }
             }
         }
-        let bodies = std::iter::once(cfg).chain(nested_bodies(cfg).into_iter().map(|(_, b)| b));
+        // The render, the bodies hook extraction took out of it, and every
+        // function nested in either.
+        let roots = std::iter::once(cfg).chain(hooks.iter().filter_map(HookEntry::body_cfg));
+        let bodies = roots.flat_map(|root| {
+            std::iter::once(root).chain(nested_bodies(root).into_iter().map(|(_, b)| b))
+        });
         for body in bodies {
             for block in body.blocks.values() {
                 for stmt in &block.stmts {
-                    let Stmt::Let { var, rhs, .. } = stmt else {
+                    let Stmt::Let { var, rhs, span } = stmt else {
                         continue;
                     };
+                    let unsalted = var.split_once(SPLICE_MARK).map_or(var.as_str(), |(v, _)| v);
+                    if let Some(text) = span.and_then(|at| files.temp_text(at.file, unsalted)) {
+                        texts.insert(var.clone(), excerpt(text));
+                        continue;
+                    }
                     if !is_call_temp(var) {
                         continue;
                     }
@@ -152,7 +206,11 @@ impl SourceNames {
                 }
             }
         }
-        SourceNames { callees, slots }
+        SourceNames {
+            callees,
+            texts,
+            slots,
+        }
     }
 
     /// The name the `useState` destructuring declares for slot `label`, as
@@ -161,11 +219,18 @@ impl SourceNames {
         self.slots.get(&label).map(|v| source_name(v))
     }
 
-    /// [`source_name`], with a call temp at the root read as the call it binds:
-    /// `__call_207` → `get(…)`, `__hook_0.set` → `useThing(…).set`, and a temp
-    /// whose callee is itself a temp (`get()()`) → `get(…)(…)`.
+    /// [`source_name`], with a temp at the root read as what it stands for:
+    /// `__t12_30` → `a ?? b`, a call temp as the call it binds
+    /// (`__call_207` → `get(…)`, `__hook_0.set` → `useThing(…).set`), and a
+    /// temp whose callee is itself a temp (`get()()`) → `get(…)(…)`.
     pub fn name<'a>(&'a self, var: &'a str) -> Cow<'a, str> {
         self.name_at(var, 0)
+    }
+
+    /// An expression as a message prints it: [`Expr::describe`], with every
+    /// variable on its spine read through this table.
+    pub fn describe(&self, e: &Expr) -> String {
+        self.expr_at(e, 0)
     }
 
     fn name_at<'a>(&'a self, var: &'a str, depth: usize) -> Cow<'a, str> {
@@ -173,6 +238,14 @@ impl SourceNames {
             Some(at) => var.split_at(at),
             None => (var, ""),
         };
+        if let Some(text) = self.texts.get(root) {
+            if path.is_empty() {
+                return Cow::Borrowed(text);
+            }
+            let mut out = format!("({text})");
+            push_path(&mut out, path);
+            return Cow::Owned(out);
+        }
         let Some(callee) = self.callees.get(root).filter(|_| depth < MAX_TEMP_DEPTH) else {
             return source_name(var);
         };
@@ -186,11 +259,34 @@ impl SourceNames {
     fn expr_at(&self, e: &Expr, depth: usize) -> String {
         match e.peel_ts() {
             Expr::Var(v) => self.name_at(v, depth).into_owned(),
-            Expr::FieldAccess { obj, field } => format!("{}.{field}", self.expr_at(obj, depth)),
-            Expr::IndexAccess { arr, .. } => format!("{}[…]", self.expr_at(arr, depth)),
-            Expr::Call { fn_, .. } => format!("{}(…)", self.expr_at(fn_, depth)),
+            Expr::FieldAccess { obj, field } => format!("{}.{field}", self.operand(obj, depth)),
+            Expr::IndexAccess { arr, .. } => format!("{}[…]", self.operand(arr, depth)),
+            Expr::Call { fn_, .. } => format!("{}(…)", self.operand(fn_, depth)),
+            Expr::New { fn_, .. } => format!("new {}(…)", self.operand(fn_, depth)),
             other => other.describe(),
         }
+    }
+
+    /// [`Self::expr_at`] for the object of a member or a callee: a temp's
+    /// text in parentheses (`(a ?? b).x`, not `a ?? b.x`).
+    fn operand(&self, e: &Expr, depth: usize) -> String {
+        match e.peel_ts() {
+            Expr::Var(v) if self.texts.contains_key(v) => format!("({})", self.texts[v]),
+            _ => self.expr_at(e, depth),
+        }
+    }
+}
+
+/// Longest source text, in characters, a message quotes for a temp.
+const MAX_TEXT: usize = 40;
+
+/// `text` on one line, cut after [`MAX_TEXT`] characters: a temp can stand
+/// for a ternary whose arms are whole functions.
+fn excerpt(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match flat.char_indices().nth(MAX_TEXT) {
+        Some((at, _)) => format!("{}…", flat[..at].trim_end()),
+        None => flat,
     }
 }
 
@@ -222,11 +318,53 @@ mod tests {
                 edges: vec![],
             },
             &[],
+            &[],
             [(&"__call_207".to_string(), "get")],
+            &FileTable::default(),
         );
         assert_eq!(names.name("__call_207"), "get(…)");
         assert_eq!(names.name("__call_207.1"), "get(…)[1]");
         assert_eq!(names.name("t.1"), "t[1]");
+    }
+
+    /// A temp reads as the source text it stands for, found in the file its
+    /// `Let` sits in, whatever salt a splice gave it; a member of it keeps
+    /// the text whole.
+    #[test]
+    fn a_value_temp_reads_as_its_source_text() {
+        let mut files = FileTable::default();
+        let file = files.intern(std::path::Path::new("a.tsx"));
+        files.name_temp(file, "__t4_10".to_string(), "a  ??\n  b");
+        let at = crate::ir::SourceRange {
+            file,
+            line: 1,
+            col: 4,
+        };
+        let bind = |var: &str| Stmt::Let {
+            var: var.to_string(),
+            rhs: Expr::Var("a".to_string()),
+            span: Some(at),
+        };
+        let cfg = crate::test_support::single_block_cfg(vec![bind("__t4_10"), bind("__t4_10#2")]);
+        let names = SourceNames::of(&cfg, &[], &[], [], &files);
+        assert_eq!(names.name("__t4_10"), "a ?? b");
+        assert_eq!(names.name("__t4_10#2"), "a ?? b");
+        assert_eq!(names.name("__t4_10.x"), "(a ?? b).x");
+        assert_eq!(
+            names.describe(&Expr::Call {
+                fn_: Box::new(Expr::Var("__t4_10".to_string())),
+                args: vec![],
+            }),
+            "(a ?? b)(…)"
+        );
+    }
+
+    #[test]
+    fn a_long_text_is_cut() {
+        let long = "cond ? () => setFieldKeys((keys) => ({ ...keys, [path]: 1 })) : null";
+        let short = excerpt(long);
+        assert!(short.ends_with('…'));
+        assert!(short.chars().count() <= MAX_TEXT + 1);
     }
 
     #[test]
@@ -244,7 +382,9 @@ mod tests {
         let names = SourceNames::of(
             &crate::test_support::single_block_cfg(vec![outer]),
             &[],
+            &[],
             [(&"__call_5".to_string(), "get")],
+            &FileTable::default(),
         );
         assert_eq!(names.name("__call_9"), "get(…)(…)");
     }

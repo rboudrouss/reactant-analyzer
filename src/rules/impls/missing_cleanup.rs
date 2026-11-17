@@ -83,7 +83,10 @@ impl Rule for MissingCleanup {
                 continue;
             };
 
-            let mut names: Vec<&str> = repeating.iter().map(|r| r.display.as_str()).collect();
+            let mut names: Vec<String> = repeating
+                .iter()
+                .map(|r| r.shown(ctx.source_names()))
+                .collect();
             names.dedup();
             let what = match names.as_slice() {
                 [one] => format!("`{one}`"),

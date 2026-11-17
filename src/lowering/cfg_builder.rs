@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
@@ -7,7 +7,7 @@ use oxc_span::GetSpan;
 
 use crate::{
     ir::{
-        SourceMap,
+        FileTable, SourceMap,
         cfg::{BasicBlock, CFG, Edge, EdgeKind, Terminator},
         expr::{Expr, Prim},
         stmt::Stmt,
@@ -47,8 +47,22 @@ impl ExprIds {
     }
 }
 
+/// The temps a file's lowering mints for an expression's value
+/// ([`BlockBuilder::fresh_temp`]), with the span each stands for. Shared by
+/// every body of the file, as [`ExprIds`] is; read back into the
+/// [`FileTable`] once the file is lowered ([`LowerCtx::name_temps`]).
+#[derive(Debug, Clone, Default)]
+pub struct TempSpans(Rc<RefCell<Vec<(String, oxc_span::Span)>>>);
+
+impl TempSpans {
+    fn record(&self, var: &str, at: oxc_span::Span) {
+        self.0.borrow_mut().push((var.to_string(), at));
+    }
+}
+
 /// Everything one file's lowering shares with every body it builds: the span
-/// table, the allocation-site counter, and the JSX callee origins.
+/// table, the allocation-site counter, the temps it mints, and the JSX callee
+/// origins.
 ///
 /// One carrier rather than three parameters. Nested bodies are lowered through
 /// their own `BlockBuilder`, so a per-file fact only reaches a `FnLit` body if
@@ -59,6 +73,8 @@ pub struct LowerCtx {
     pub smap: SourceMap,
     /// Shared with every other body of this file — see [`ExprIds`].
     pub ids: ExprIds,
+    /// Shared with every other body of this file — see [`TempSpans`].
+    pub temps: TempSpans,
     pub jsx: JsxOrigins,
 }
 
@@ -67,7 +83,19 @@ impl LowerCtx {
         Self {
             smap,
             ids: ExprIds::default(),
+            temps: TempSpans::default(),
             jsx,
+        }
+    }
+
+    /// Record in `files` what each temp minted so far stands for: the text of
+    /// `source` at its span. Called once a file's bodies are lowered.
+    pub fn name_temps(&self, source: &str, files: &mut FileTable) {
+        let file = self.smap.file();
+        for (var, at) in self.temps.0.borrow_mut().drain(..) {
+            if let Some(text) = source.get(at.start as usize..at.end as usize) {
+                files.name_temp(file, var, text);
+            }
         }
     }
 
@@ -87,7 +115,6 @@ pub(super) struct BlockBuilder {
     counter: usize,
     current_stmts: Vec<Stmt>,
     terminated: bool,
-    temp_counter: usize,
     /// Enclosing breakables, innermost last. A `switch` is breakable but not
     /// continuable, so `continue_to` is `None` there.
     loop_stack: Vec<LoopFrame>,
@@ -113,7 +140,6 @@ impl BlockBuilder {
             counter: 1, // block 0 is entry
             current_stmts: Vec::new(),
             terminated: false,
-            temp_counter: 0,
             loop_stack: Vec::new(),
             pending_label: None,
             ctx: ctx.clone(),
@@ -244,9 +270,24 @@ impl BlockBuilder {
         }
     }
 
-    pub(super) fn fresh_temp(&mut self) -> String {
-        let t = format!("__t{}", self.temp_counter);
-        self.temp_counter += 1;
+    /// The temp that holds the value of the expression at `at` (`a ?? b`,
+    /// `c ? x : y`, `a?.f()`): named by its source span, as a call temp is
+    /// (`__call_`), so no other body of the file binds the same name, and the
+    /// span's text is what a message prints for it ([`LowerCtx::name_temps`]).
+    pub(super) fn fresh_temp(&mut self, at: oxc_span::Span) -> String {
+        self.temp_at("__t", at)
+    }
+
+    /// The temp a `switch` evaluates its discriminant `at` into once. Apart
+    /// from [`Self::fresh_temp`]: a discriminant `a ?? b` already has a temp
+    /// at that span.
+    pub(super) fn switch_temp(&mut self, at: oxc_span::Span) -> String {
+        self.temp_at("__sw", at)
+    }
+
+    fn temp_at(&mut self, prefix: &str, at: oxc_span::Span) -> String {
+        let t = format!("{prefix}{}_{}", at.start, at.end);
+        self.ctx.temps.record(&t, at);
         t
     }
 
@@ -785,11 +826,11 @@ fn lower_switch(sw: &SwitchStatement, builder: &mut BlockBuilder) {
     let exit_block = builder.new_block();
     let disc = lower_expr(&sw.discriminant, builder);
     // Evaluated once, then compared against each case's test.
-    let disc_var = builder.fresh_temp();
+    let disc_var = builder.switch_temp(sw.discriminant.span());
     builder.push_stmt(Stmt::Let {
         var: disc_var.clone(),
         rhs: disc,
-        span: None,
+        span: builder.span_at(sw.discriminant.span().start),
     });
 
     if sw.cases.is_empty() {

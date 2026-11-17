@@ -455,9 +455,12 @@ impl Expr {
     /// elision or flattens a spread (#118).
     ///
     /// Roots read through [`crate::ir::source_name`], so a spliced capture's
-    /// internal `#salt` never reaches the user.
+    /// internal `#salt` never reaches the user, and a name lowering minted
+    /// reads `(…)`: only [`crate::ir::SourceNames::describe`] knows what it
+    /// stands for.
     pub fn describe(&self) -> String {
         match self.peel_ts() {
+            Expr::Var(v) if crate::ir::is_lowering_temp(v) => "(…)".to_string(),
             Expr::Var(v) => crate::ir::source_name(v).to_string(),
             Expr::FieldAccess { obj, field } => format!("{}.{field}", obj.describe()),
             Expr::IndexAccess { arr, .. } => format!("{}[…]", arr.describe()),

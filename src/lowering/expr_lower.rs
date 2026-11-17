@@ -669,7 +669,7 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
             let value = match value {
                 v @ (Expr::Var(_) | Expr::Lit(_)) => v,
                 v => {
-                    let tmp = builder.fresh_temp();
+                    let tmp = builder.fresh_temp(aw.argument.span());
                     // The binding is synthetic, its position is not: everything
                     // the walk finds under `await fetch(…)` takes its witness
                     // from the statement it sits in, and a spanless hoist made
@@ -803,7 +803,7 @@ fn lower_chain(chain: &ChainExpression, use_: ChainUse, builder: &mut BlockBuild
             Expr::Lit(Prim::Unit)
         }
         ChainUse::Value => {
-            let tmp = builder.fresh_temp();
+            let tmp = builder.fresh_temp(chain.span);
             let span = builder.span_at(chain.span.start);
             let join = builder.new_block();
             builder.push_stmt(Stmt::Let {
@@ -952,7 +952,7 @@ fn lower_chain_object(
     let value = match bind_call_value(value, at, builder) {
         v if crate::ir::free_vars::call_free_key(&v).is_some() => v,
         v => {
-            let tmp = builder.fresh_temp();
+            let tmp = builder.fresh_temp(at);
             builder.push_stmt(Stmt::Let {
                 var: tmp.clone(),
                 rhs: v,
@@ -991,7 +991,7 @@ fn lower_ternary(cond: &ConditionalExpression, builder: &mut BlockBuilder) -> Ex
     let then_id = builder.new_block();
     let else_id = builder.new_block();
     let join_id = builder.new_block();
-    let tmp = builder.fresh_temp();
+    let tmp = builder.fresh_temp(cond.span);
 
     let span = builder.span_at(cond.test.span().start);
     let bid = builder.seal_with(Terminator::Branch {
@@ -1055,7 +1055,7 @@ fn lower_ternary(cond: &ConditionalExpression, builder: &mut BlockBuilder) -> Ex
 ///
 /// Pre-declare + Assign: stability(__tN) = stability(a) ⊔ stability(b)
 fn lower_logical(log: &LogicalExpression, builder: &mut BlockBuilder) -> Expr {
-    let tmp = builder.fresh_temp();
+    let tmp = builder.fresh_temp(log.span);
     let span = builder.span_at(log.left.span().start);
     let left = lower_expr(&log.left, builder);
     builder.push_stmt(Stmt::Let {
@@ -1469,11 +1469,11 @@ fn lower_assignment_maybe_default(
 /// but a call-free path is bound to a temp first.
 fn lower_logical_assignment(assign: &AssignmentExpression, builder: &mut BlockBuilder) -> Expr {
     let span = builder.span_at(assign.span.start);
-    let once = |e: Expr, builder: &mut BlockBuilder| {
+    let once = |e: Expr, at: oxc_span::Span, builder: &mut BlockBuilder| {
         if crate::ir::free_vars::call_free_key(&e).is_some() {
             return e;
         }
-        let tmp = builder.fresh_temp();
+        let tmp = builder.fresh_temp(at);
         builder.push_stmt(Stmt::Let {
             var: tmp.clone(),
             rhs: e,
@@ -1482,12 +1482,21 @@ fn lower_logical_assignment(assign: &AssignmentExpression, builder: &mut BlockBu
         Expr::Var(tmp)
     };
     let name = assign_target_ident(&assign.left);
+    // The source of the target's object and computed key, which name their
+    // temps.
+    let (obj_at, key_at) = match &assign.left {
+        AssignmentTarget::ComputedMemberExpression(m) => (m.object.span(), m.expression.span()),
+        other => match other.as_member_expression() {
+            Some(m) => (m.object().span(), other.span()),
+            None => (other.span(), other.span()),
+        },
+    };
     let member = match name {
         Some(_) => None,
         None => assign_target_member(&assign.left, builder).map(|(obj, key)| {
-            let obj = once(obj, builder);
+            let obj = once(obj, obj_at, builder);
             let key = match key {
-                MemberKey::Index(i) => MemberKey::Index(once(i, builder)),
+                MemberKey::Index(i) => MemberKey::Index(once(i, key_at, builder)),
                 field => field,
             };
             (obj, key)

@@ -65,17 +65,16 @@ struct Site<'a> {
     /// The object expression: a mutation's receiver, a setter's argument, an
     /// updater's return.
     expr: &'a Expr,
-    /// Display text of the mutated object expression (`items`, `user.tags`).
-    desc: String,
 }
 
 impl<'a> Site<'a> {
     fn new(at: At<'a>, expr: &'a Expr) -> Self {
-        Site {
-            at,
-            expr,
-            desc: display_expr(expr),
-        }
+        Site { at, expr }
+    }
+
+    /// Display text of the mutated object expression (`items`, `user.tags`).
+    fn desc(&self, names: &crate::ir::SourceNames) -> String {
+        display_expr(self.expr, names)
     }
 
     fn span(&self) -> Option<SourceRange> {
@@ -356,13 +355,13 @@ impl<'a> Collector<'a> {
 }
 
 /// Source-like display for a chased object expression.
-fn display_expr(e: &Expr) -> String {
+fn display_expr(e: &Expr, names: &crate::ir::SourceNames) -> String {
     match e {
-        Expr::Var(v) => crate::ir::source_name(v).into_owned(),
+        Expr::Var(v) => names.name(v).into_owned(),
         Expr::StateVal(_) => "state".to_string(),
-        Expr::FieldAccess { obj, field } => format!("{}.{field}", display_expr(obj)),
-        Expr::IndexAccess { arr, .. } => format!("{}[…]", display_expr(arr)),
-        Expr::TSAnnotated(inner) => display_expr(inner),
+        Expr::FieldAccess { obj, field } => format!("{}.{field}", display_expr(obj, names)),
+        Expr::IndexAccess { arr, .. } => format!("{}[…]", display_expr(arr, names)),
+        Expr::TSAnnotated(inner) => display_expr(inner, names),
         _ => "this object".to_string(),
     }
 }
@@ -509,14 +508,13 @@ impl Rule for StateMutation {
                     (Diagnostic::warn("state-mutation", message), site, *set_site)
                 }
             };
-            d = d.with_label(label).with_var(site.desc.clone());
+            let desc = site.desc(ctx.source_names());
+            d = d.with_label(label).with_var(desc.clone());
             if let Some(r) = site.span() {
                 d = d.with_range(r);
             }
             d = d.with_step(
-                Step::Mutate {
-                    target: site.desc.clone(),
-                },
+                Step::Mutate { target: desc },
                 Some(label),
                 site.span(),
                 &ctx.names(&name_of),
@@ -543,22 +541,20 @@ impl Rule for StateMutation {
         prop_sites.sort_by_key(|s| s.span().map(|r| r.pos_key()));
         prop_sites.dedup_by_key(|s| s.span().map(|r| r.pos_key()));
         for site in prop_sites {
+            let desc = site.desc(ctx.source_names());
             let mut d = Diagnostic::warn(
                 "state-mutation",
                 format!(
-                    "`{}` roots in this component's props, so mutating it writes into an object \
-                     owned by the parent; copy it before changing",
-                    site.desc
+                    "`{desc}` roots in this component's props, so mutating it writes into an \
+                     object owned by the parent; copy it before changing"
                 ),
             )
-            .with_var(site.desc.clone());
+            .with_var(desc.clone());
             if let Some(r) = site.span() {
                 d = d.with_range(r);
             }
             d = d.with_step(
-                Step::Mutate {
-                    target: site.desc.clone(),
-                },
+                Step::Mutate { target: desc },
                 None,
                 site.span(),
                 &ctx.names(&name_of),

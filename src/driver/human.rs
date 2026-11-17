@@ -165,9 +165,12 @@ pub fn render(
                 .hook_label
                 .map(|l| format!("  [hook:{l}]"))
                 .unwrap_or_default();
+            // A name lowering minted is no tag the reader can find; the
+            // message names what it stands for.
             let var_info = d
                 .var
                 .as_deref()
+                .filter(|v| !crate::ir::is_lowering_temp(v))
                 .map(|v| format!("  var:{}", crate::ir::source_name(v)))
                 .unwrap_or_default();
             let range_info = d

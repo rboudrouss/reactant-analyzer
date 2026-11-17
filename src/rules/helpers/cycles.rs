@@ -44,7 +44,7 @@ pub(in crate::rules) fn node_display(
             .get(&node.0)
             .map(|r| {
                 (
-                    super::source_names_of(r),
+                    super::source_names_of(r, &result.file_table),
                     super::setters::resolve_setter_aliases(
                         &r.render_cfg,
                         &super::setters::state_val_labels(&r.render_cfg),

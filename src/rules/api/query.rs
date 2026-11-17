@@ -421,8 +421,9 @@ impl<'a> RuleCtx<'a> {
     /// expression a lowering temp stands for, not its spelling. Built on first
     /// use.
     pub fn source_names(&self) -> &crate::ir::SourceNames {
-        self.source_names
-            .get_or_init(|| crate::rules::helpers::source_names_of(self.comp))
+        self.source_names.get_or_init(|| {
+            crate::rules::helpers::source_names_of(self.comp, &self.program().file_table)
+        })
     }
 
     /// The one printer of a message's names: slots through `slot` (the rule's
@@ -942,7 +943,7 @@ pub fn classify_motion(val: &StateValue, result: &ProgramAnalysisResult) -> Moti
                     "state {} of `{}`",
                     crate::rules::state_slot_name(
                         *slot,
-                        &crate::rules::helpers::source_names_of(owner_result),
+                        &crate::rules::helpers::source_names_of(owner_result, &result.file_table),
                         &owner_states
                     ),
                     result.display_name(*owner)

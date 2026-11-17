@@ -63,6 +63,8 @@ impl Rule for AlwaysUnstableDeps {
         let (program, component) = (ctx.program(), ctx.component());
         let result = &program.components[&component];
         let mut diags = Vec::new();
+        let names = ctx.source_names();
+        let fmt_deps = |deps: &[&Expr]| fmt_deps(deps, names);
         let fresh = fresh_deps(result);
         let fresh_when_object = fresh_deps_when_object(result);
 
@@ -196,8 +198,11 @@ fn indices_and_via(
 /// lowering drops an elision or flattens a spread, so `[a, , { k: 1 }]` used to
 /// report "index 1" for an object the author wrote third. The expression is
 /// what the reader can actually find.
-fn fmt_deps(deps: &[&Expr]) -> String {
-    let mut names: Vec<String> = deps.iter().map(|d| format!("`{}`", d.describe())).collect();
+fn fmt_deps(deps: &[&Expr], source: &crate::ir::SourceNames) -> String {
+    let mut names: Vec<String> = deps
+        .iter()
+        .map(|d| format!("`{}`", source.describe(d)))
+        .collect();
     names.dedup();
     match names.as_slice() {
         [one] => one.clone(),
