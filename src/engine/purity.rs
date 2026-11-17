@@ -346,6 +346,11 @@ pub fn call(
         (Callee::Method(k, name), false) => METHODS.iter().find(|x| x.on == k && x.name == name),
         (Callee::Method(..), true) => None,
     }?;
+    // A spread at or before the position it runs may hand it anything.
+    let positional = Expr::positional_args(args).len();
+    if positional < args.len() && found.runs.is_some_and(|i| i >= positional) {
+        return None;
+    }
     let ran = found.runs.and_then(|i| args.get(i).map(|a| (i, a)));
     let runs_known = ran.is_none_or(|(i, a)| match a.peel_ts() {
         Expr::FnLit {

@@ -259,6 +259,12 @@ pub enum Expr {
         fn_: Box<Expr>,
         args: Vec<Expr>,
     },
+    /// `...xs` as an argument of a call or a `new`: the iterable whose
+    /// entries take the positions from here on, however many it holds. It
+    /// occurs only in `args`, and from the first one on no argument has a
+    /// known position ([`Expr::positional_args`]). Evaluated, it is no value
+    /// of its own: what it hands the callee is `xs`'s entries.
+    Spread(Box<Expr>),
     /// `new X(args)`: a call that always allocates. The value domain reads it
     /// as a fresh reference whose members are ⊤, and every syntactic proof
     /// reads it where it reads an object literal — lowered to a plain `Call`
@@ -487,7 +493,19 @@ impl Expr {
             Expr::StateSetter(l) => format!("the setter of hook #{l}"),
             Expr::HookMarker(l, _) => format!("hook #{l}"),
             Expr::SummaryVal(_) | Expr::TSAnnotated(_) => "an unmodelled value".to_string(),
+            Expr::Spread(inner) => format!("...{}", inner.describe()),
         }
+    }
+
+    /// The arguments of a call whose position is known: those before the
+    /// first [`Expr::Spread`]. Every parameter from there on may receive any
+    /// argument from there on, or an entry of a spread.
+    pub fn positional_args(args: &[Expr]) -> &[Expr] {
+        let end = args
+            .iter()
+            .position(|a| matches!(a, Expr::Spread(_)))
+            .unwrap_or(args.len());
+        &args[..end]
     }
 
     pub fn for_each_child<'a>(&'a self, f: &mut impl FnMut(&'a Expr)) {
@@ -536,7 +554,7 @@ impl Expr {
                     f(c);
                 }
             }
-            Expr::TSAnnotated(inner) => f(inner),
+            Expr::TSAnnotated(inner) | Expr::Spread(inner) => f(inner),
         }
     }
 
@@ -588,7 +606,7 @@ impl Expr {
                     f(c);
                 }
             }
-            Expr::TSAnnotated(inner) => f(inner),
+            Expr::TSAnnotated(inner) | Expr::Spread(inner) => f(inner),
         }
     }
 

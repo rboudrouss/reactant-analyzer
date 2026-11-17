@@ -313,7 +313,7 @@ impl<'a> Collector<'a> {
                         Expr::FnLit {
                             params, body_cfg, ..
                         } => {
-                            let passed = Passed::to_callback(fn_, i);
+                            let passed = Passed::to_callback(fn_, args, i);
                             self.walk_fn(params, body_cfg, passed, scopes, at);
                         }
                         _ => self.walk_expr(a, scopes, at),
@@ -344,10 +344,15 @@ impl<'a> Collector<'a> {
         let mut scope = Scope::params(params);
         let bound: Vec<(&'a Var, &'a Expr)> = match passed {
             Passed::Nothing => Vec::new(),
-            Passed::Args(args) => params.iter().zip(args).collect(),
-            Passed::Entries { receiver, method } => Passed::entry_positions(method)
+            Passed::Args(args) => params.iter().zip(Expr::positional_args(args)).collect(),
+            // An entry, and the array itself, share the receiver's identity.
+            Passed::Entries {
+                receiver, method, ..
+            } => Passed::entry_positions(method)
                 .iter()
-                .filter_map(|&i| params.get(i))
+                .copied()
+                .chain(Passed::receiver_position(method))
+                .filter_map(|i| params.get(i))
                 .map(|p| (p, receiver))
                 .collect(),
         };

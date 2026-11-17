@@ -198,16 +198,18 @@ pub fn must_slot_read(expr: &Expr, scope: &CFG, elsewhere: &[(&[Var], &CFG)]) ->
 }
 
 /// The parameter of `params` that `expr` denotes on every path: itself, or
-/// a name whose chain of sole bindings in `scope` ends at it — the `deps` of
-/// a `deps = []` parameter, which lowers to `let deps = __p1` (#230). No
+/// a name whose chain of sole bindings in `scope` ends at it (#230). No
 /// body binds a chain name again: not `scope` (the parameter itself
 /// included), not `elsewhere`, under the certificate [`must_slot_read`]
-/// states.
+/// states. `defaulted` says which parameters have a default: the one store
+/// it lowers to (`deps = []`) leaves the parameter denoting the argument, or
+/// the default when the call omits it — which the caller reads.
 pub fn must_param(
     expr: &Expr,
     scope: &CFG,
     elsewhere: &[(&[Var], &CFG)],
     params: &[Var],
+    defaulted: &dyn Fn(usize) -> bool,
 ) -> Option<usize> {
     let mut cur = expr.peel_ts();
     for _ in 0..MAX_ALIAS_HOPS + 2 {
@@ -221,11 +223,22 @@ pub fn must_param(
             return None;
         }
         if let Some(i) = params.iter().position(|p| p == v) {
-            return (!binds(v, scope)).then_some(i);
+            let stores = binding_count(v, scope);
+            let allowed = usize::from(defaulted(i));
+            return (stores <= allowed).then_some(i);
         }
         cur = sole_binding_in(v, scope)?.1;
     }
     None
+}
+
+/// How many statements of `cfg` bind `var`.
+fn binding_count(var: &str, cfg: &CFG) -> usize {
+    cfg.blocks
+        .values()
+        .flat_map(|b| &b.stmts)
+        .filter(|s| matches!(s, Stmt::Let { var: v, .. } | Stmt::Assign { var: v, .. } if v == var))
+        .count()
 }
 
 /// [`must_slot_read`] through member reads: the slot `expr` reads on every

@@ -1067,6 +1067,8 @@ impl<'a> Analyzer<'a> {
                 let v = self.eval(arg, env);
                 DVal::of_kind(v.deps, v.kind)
             }
+            // Entries of its operand, of no known kind.
+            Expr::Spread(arg) => DVal::of(self.eval(arg, env).deps),
             Expr::Call { fn_, args } | Expr::New { fn_, args, .. } => {
                 let name = match fn_.peel_ts() {
                     Expr::Var(v) => Some(v.as_str()),

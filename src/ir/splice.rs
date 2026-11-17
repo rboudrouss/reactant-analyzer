@@ -133,16 +133,31 @@ pub fn splice_callee_into_cfg(
     let join_block_id: BlockId = block_offset + callee_block_map.len();
 
     // 4. Param-binding prefix: `let renamed_param = arg;` (args are caller-side,
-    //    never renamed).
-    let param_lets: Vec<Stmt> = renamed_params
+    //    never renamed), for the arguments whose position is known. One from
+    //    the first spread on may reach any parameter from there on, or none
+    //    (`arguments`): it is evaluated and handed to code the analysis does
+    //    not see, as an unknown callee's argument is (#254), and those
+    //    parameters are left unbound, as past the last argument.
+    let positional = Expr::positional_args(args);
+    let mut param_lets: Vec<Stmt> = renamed_params
         .iter()
-        .zip(args.iter())
+        .zip(positional.iter())
         .map(|(p, a)| Stmt::Let {
             var: p.clone(),
             rhs: a.clone(),
             span: call_span,
         })
         .collect();
+    let unbound = &args[positional.len().min(renamed_params.len())..];
+    if !unbound.is_empty() {
+        param_lets.push(Stmt::ExprStmt(
+            Expr::Call {
+                fn_: Box::new(Expr::SummaryVal(crate::ir::expr::SummaryValue::Top)),
+                args: unbound.to_vec(),
+            },
+            call_span,
+        ));
+    }
 
     // 5. Offset callee blocks; rewrite each `Return(e)` into
     //    `[bound_var = e;] Jump(join)`. A returned literal destructured by the
@@ -705,6 +720,7 @@ fn rename_vars_expr(expr: Expr, ren: &HashMap<Var, Var>) -> Expr {
             prop_spans,
         },
         Expr::TSAnnotated(inner) => Expr::TSAnnotated(Box::new(rename_vars_expr(*inner, ren))),
+        Expr::Spread(inner) => Expr::Spread(Box::new(rename_vars_expr(*inner, ren))),
         leaf @ (Expr::Lit(_)
         | Expr::StateVal(_)
         | Expr::StateSetter(_)
@@ -937,6 +953,7 @@ pub fn subst_vars_expr(expr: Expr, subst: &HashMap<Var, Expr>) -> Expr {
             prop_spans,
         },
         Expr::TSAnnotated(inner) => Expr::TSAnnotated(Box::new(subst_vars_expr(*inner, subst))),
+        Expr::Spread(inner) => Expr::Spread(Box::new(subst_vars_expr(*inner, subst))),
         leaf @ (Expr::Lit(_)
         | Expr::StateVal(_)
         | Expr::StateSetter(_)

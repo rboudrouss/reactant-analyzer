@@ -164,6 +164,7 @@ pub fn remap_expr(expr: Expr, off: Offsets) -> Expr {
             prop_spans,
         },
         Expr::TSAnnotated(inner) => Expr::TSAnnotated(Box::new(remap_expr(*inner, off))),
+        Expr::Spread(inner) => Expr::Spread(Box::new(remap_expr(*inner, off))),
 
         // Leaves with no HookLabel or sub-Expr.
         leaf @ (Expr::Lit(_) | Expr::Var(_) | Expr::SummaryVal(_)) => leaf,

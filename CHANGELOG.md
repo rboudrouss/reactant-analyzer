@@ -191,6 +191,15 @@ on a program React settles; 323 oracle cases, none a known false negative.
   one, an IIFE given `items`) before `setItems(items)` is a Warning, as the
   `for…of` and indexed spellings are; it was silent. A prop's entries
   mutated this way are a prop mutation (#318).
+- A parameter holds everything it may: its argument, every argument from a
+  spread on (`run(...args)`), its default (`(f = setN) => f(n + 1)` called
+  with nothing or `undefined`), every value its body assigns it, the member a
+  destructuring pattern reads (`([set]) => …`, `({ s }) => …`), and an array
+  method's receiver (`(set, i, arr) => arr[i](…)`); a receiver the analysis
+  cannot list (`xs.flatMap(f).forEach(…)`) may call any setter that flows
+  into it. Each was silent in the render or an effect, and a parameter the
+  body reassigns read as its argument only (#316). A call keeps its spread
+  arguments: those after a spread no longer bind to a shifted parameter.
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

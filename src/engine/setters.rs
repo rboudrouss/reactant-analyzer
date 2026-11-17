@@ -23,7 +23,7 @@ use crate::{
     ir::{
         SourceRange,
         cfg::{CFG, Terminator},
-        expr::Expr,
+        expr::{Expr, Prim},
         free_vars::{call_free_key, collect_used_vars},
         hooks::{HookEntry, HookProvenance},
         stmt::Stmt,
@@ -2432,9 +2432,53 @@ struct Scope<'a> {
     /// The names a write in or below it reads from outside the region's env
     /// ([`Foreign`]; `None` is [`Foreign::Any`]).
     names: Option<BTreeSet<Var>>,
-    /// Its parameters the walk bound to what the call that runs it passes
-    /// ([`Passed`]), each to every callee it may hold.
-    held: HashMap<Var, Vec<Held<'a>>>,
+    /// What the walk bound its names to ([`SetterWalk::bind_body`]): its
+    /// parameters, and every local one of whose bindings reads a bound name.
+    held: HashMap<Var, Bound<'a>>,
+    /// What the call that runs it passed its parameters
+    /// ([`SetterWalk::bind_passed`]), before the body assigns them.
+    passed: HashMap<Var, Bound<'a>>,
+}
+
+/// `body` declares `var` itself, so an assignment of it there is its own.
+fn nested_declares(body: &CFG, var: &str) -> bool {
+    body.blocks
+        .values()
+        .flat_map(|b| &b.stmts)
+        .any(|s| matches!(s, Stmt::Let { var: v, .. } if v == var))
+}
+
+/// Every value a name the walk bound may hold, and whether it surely holds
+/// the one item listed: a parameter given one certain argument, which no
+/// default and no assignment may replace.
+#[derive(Clone, Default)]
+struct Bound<'a> {
+    items: Vec<Held<'a>>,
+    sure: bool,
+}
+
+impl<'a> Bound<'a> {
+    fn one(item: Held<'a>) -> Self {
+        Bound {
+            items: vec![item],
+            sure: true,
+        }
+    }
+
+    /// The join with `other`: certain of nothing.
+    fn join(&mut self, other: Bound<'a>) {
+        for item in other.items {
+            if !self.items.iter().any(|known| known.same(&item)) {
+                self.items.push(item);
+            }
+        }
+        self.sure = false;
+    }
+
+    /// Placed where it is certain of its one item.
+    fn sure_one(&self) -> bool {
+        self.sure && self.items.len() == 1
+    }
 }
 
 impl<'a> Scope<'a> {
@@ -2445,6 +2489,7 @@ impl<'a> Scope<'a> {
             body,
             names: Some(BTreeSet::new()),
             held: HashMap::new(),
+            passed: HashMap::new(),
         }
     }
 }
@@ -2456,25 +2501,36 @@ impl<'a> Scope<'a> {
 pub(crate) enum Passed<'a> {
     /// Nothing the walk follows: a cleanup, a handler, a callee's argument.
     Nothing,
-    /// The call's arguments, by position: an IIFE, a helper called by name.
+    /// The call's arguments, by position up to the first spread
+    /// ([`Expr::positional_args`]): an IIFE, a helper called by name.
     Args(&'a [Expr]),
-    /// The entries of the receiver of a synchronous array method, at the
-    /// positions its callback receives them ([`callback_args`](crate::domains::interp::interpreter::callback_args)).
-    Entries { receiver: &'a Expr, method: &'a str },
+    /// What a synchronous array method passes its callback
+    /// ([`callback_args`](crate::domains::interp::interpreter::callback_args)):
+    /// the receiver's entries, an index, and the receiver itself — `reduce`'s
+    /// accumulator first, which is its initial value or what the callback
+    /// returned. `args` are the method call's.
+    Entries {
+        receiver: &'a Expr,
+        method: &'a str,
+        args: &'a [Expr],
+    },
 }
 
 impl<'a> Passed<'a> {
-    /// What a call through `fn_` passes the function it is handed as
-    /// argument `index`: the receiver's entries for a synchronous array
-    /// method's callback, nothing the walk follows otherwise.
-    pub(crate) fn to_callback(fn_: &'a Expr, index: usize) -> Self {
+    /// What a call through `fn_` with `args` passes the function it is
+    /// handed as argument `index`: the receiver's entries for a synchronous
+    /// array method's callback, nothing the walk follows otherwise.
+    pub(crate) fn to_callback(fn_: &'a Expr, args: &'a [Expr], index: usize) -> Self {
         match fn_ {
             Expr::FieldAccess { obj, field }
-                if index == 0 && SYNC_HOF_METHODS.contains(&field.as_str()) =>
+                if index == 0
+                    && SYNC_HOF_METHODS.contains(&field.as_str())
+                    && !matches!(args.first(), Some(Expr::Spread(_))) =>
             {
                 Passed::Entries {
                     receiver: obj,
                     method: field,
+                    args,
                 }
             }
             _ => Passed::Nothing,
@@ -2490,15 +2546,53 @@ impl<'a> Passed<'a> {
             _ => &[0],
         }
     }
+
+    /// The parameter an array method passes its receiver to: `reduce`'s
+    /// fourth, none of `sort`'s, the third of every other.
+    pub(crate) fn receiver_position(method: &str) -> Option<usize> {
+        match method {
+            "reduce" | "reduceRight" => Some(3),
+            "sort" => None,
+            _ => Some(2),
+        }
+    }
 }
 
-/// One callee a parameter the walk bound may hold: an expression of a body
-/// on the stack, or a member path of the receiver the setter and closure
-/// tables name.
+/// One value a name the walk bound may hold: an expression of a body on
+/// the stack (a name it did not bind, which the tables resolve, or a
+/// literal), a member path the setter and closure tables name, or a value
+/// it cannot place, which may be anything its expression may hold.
 #[derive(Clone)]
 enum Held<'a> {
     Expr(&'a Expr),
     Path(Var),
+    /// What the walk cannot list — a call's result, a receiver it cannot
+    /// place: a call of it may call any setter or closure that may flow into
+    /// the expression ([`SetterWalk::reach`]), fail-closed.
+    Opaque(&'a Expr),
+}
+
+impl Held<'_> {
+    fn same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Held::Expr(a), Held::Expr(b)) | (Held::Opaque(a), Held::Opaque(b)) => {
+                std::ptr::eq(*a, *b)
+            }
+            (Held::Path(a), Held::Path(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+/// What may flow into an opaque value ([`SetterWalk::reach`]): the setters,
+/// by the name or member path the tables know them by, and the closures.
+#[derive(Default)]
+struct Reach<'a> {
+    setters: Vec<Var>,
+    /// Literals and helper bodies, with the name a helper is called by.
+    closures: Vec<(&'a CFG, Option<Var>)>,
+    /// Member paths the converged closure table may name a closure at.
+    paths: Vec<Var>,
 }
 
 /// How the walk reaches a body ([`SetterWalk::enter`]).
@@ -2780,7 +2874,7 @@ fn runs_at_least_once(fn_: &Expr, args: &[Expr]) -> bool {
     match field.as_str() {
         "map" | "forEach" | "filter" | "flatMap" | "find" | "findIndex" | "findLast"
         | "findLastIndex" | "some" | "every" => n >= 1,
-        "reduce" | "reduceRight" => n >= 2 || (n >= 1 && args.len() >= 2),
+        "reduce" | "reduceRight" => n >= 2 || (n >= 1 && Expr::positional_args(args).len() >= 2),
         _ => false,
     }
 }
@@ -3047,8 +3141,16 @@ impl<'a> SetterWalk<'a> {
                 }
             }
         };
-        let held = params.map_or_else(HashMap::new, |p| self.bind(p, passed));
-        self.scopes.push(Scope { body, names, held });
+        let bound = params.map_or_else(HashMap::new, |p| self.bind_passed(p, passed));
+        self.scopes.push(Scope {
+            body,
+            names,
+            held: bound.clone(),
+            passed: bound,
+        });
+        if let Some(params) = params {
+            self.bind_body(params, body);
+        }
         self.cfg(body, depth, found, mode, prov, witness);
         self.scopes.pop();
     }
@@ -3066,10 +3168,10 @@ impl<'a> SetterWalk<'a> {
     }
 
     /// What the walk bound `name` to, when the innermost body on the stack
-    /// that binds it is one whose parameter it bound (#316). `None` for a
-    /// name it did not bind — the region's, or a body's own local — which
-    /// resolves as a name.
-    fn held(&self, name: &str) -> Option<&[Held<'a>]> {
+    /// that binds it is one whose names it bound (#316). `None` for a name it
+    /// did not bind — the region's, or a body's own local no bound name
+    /// flows into — which resolves as a name.
+    fn held(&self, name: &str) -> Option<&Bound<'a>> {
         for scope in self.scopes.iter().rev() {
             if let Some(held) = scope.held.get(name) {
                 return Some(held);
@@ -3081,80 +3183,371 @@ impl<'a> SetterWalk<'a> {
         None
     }
 
-    /// The callees `e`, an expression of a body on the stack, may be: what
-    /// the walk bound it to, or itself.
-    fn resolve(&self, e: &'a Expr) -> Vec<Held<'a>> {
+    /// What `e` may hold when it reads a name the walk bound at its root:
+    /// the name's values, or the members of them a member chain reads.
+    fn items_of(&self, e: &'a Expr) -> Option<Bound<'a>> {
         match e.peel_ts() {
-            Expr::Var(name) => self
-                .held(name)
-                .map_or_else(|| vec![Held::Expr(e)], <[_]>::to_vec),
-            _ => vec![Held::Expr(e)],
+            Expr::Var(name) => self.held(name).cloned(),
+            Expr::FieldAccess { obj, field } => {
+                let base = self.items_of(obj)?;
+                Some(self.members(&base, Some(field.as_str())))
+            }
+            Expr::IndexAccess { arr, idx } => {
+                let base = self.items_of(arr)?;
+                let key = match idx.peel_ts() {
+                    Expr::Lit(Prim::Int(i)) if *i >= 0 => Some(i.to_string()),
+                    Expr::Lit(Prim::String(s)) => Some(s.clone()),
+                    _ => None,
+                };
+                Some(self.members(&base, key.as_deref()))
+            }
+            _ => None,
         }
     }
 
-    /// Every entry `receiver` may hold, `None` when the walk cannot list
-    /// them: the elements of an array literal with no spread, or the members
-    /// the setter and closure tables name under its path (`all.0`, `all.*`),
-    /// when no body on the stack rebinds its root.
-    fn entries(&self, receiver: &'a Expr) -> Option<Vec<Held<'a>>> {
+    /// Every value `e`, an expression of a body on the stack, may hold:
+    /// what the walk bound the name it reads to, else itself when the tables
+    /// or the walk can follow it (a name, a member path, a literal), else an
+    /// opaque value.
+    fn resolve(&self, e: &'a Expr) -> Bound<'a> {
+        if let Some(bound) = self.items_of(e) {
+            return bound;
+        }
+        match e.peel_ts() {
+            // An argument spread: any of its entries.
+            Expr::Spread(inner) => Bound {
+                items: self.entries(inner),
+                sure: false,
+            },
+            Expr::Var(_)
+            | Expr::FnLit { .. }
+            | Expr::ArrayLit { .. }
+            | Expr::ObjectLit { .. }
+            | Expr::StateSetter(_)
+            | Expr::Lit(_) => Bound::one(Held::Expr(e)),
+            other if callee_path(other).is_some() => Bound::one(Held::Expr(e)),
+            _ => Bound {
+                items: vec![Held::Opaque(e)],
+                sure: false,
+            },
+        }
+    }
+
+    /// Every entry `receiver` may hold: the elements of an array literal
+    /// (every entry of a spread one), the members of a value the walk bound,
+    /// or the members the setter and closure tables name under its path
+    /// (`all.0`, `all.*`) when no body on the stack rebinds its root; else
+    /// the receiver, opaque.
+    fn entries(&self, receiver: &'a Expr) -> Vec<Held<'a>> {
+        if let Some(bound) = self.items_of(receiver) {
+            return self.members(&bound, None).items;
+        }
         match receiver.peel_ts() {
             Expr::ArrayLit {
                 elems, spread_at, ..
-            } => spread_at
-                .is_empty()
-                .then(|| elems.iter().flat_map(|e| self.resolve(e)).collect()),
+            } => {
+                let mut out = Bound::default();
+                for (i, e) in elems.iter().enumerate() {
+                    if spread_at.contains(&i) {
+                        out.join(Bound {
+                            items: self.entries(e),
+                            sure: false,
+                        });
+                    } else {
+                        out.join(self.resolve(e));
+                    }
+                }
+                out.items
+            }
             other => {
-                let path = callee_path(other)?;
+                let Some(path) = callee_path(other) else {
+                    return vec![Held::Opaque(receiver)];
+                };
                 let rebound = self.scopes.iter().skip(1).any(|s| {
                     s.names
                         .as_ref()
                         .is_none_or(|n| n.contains(path_root(&path)))
                 });
                 if rebound {
-                    return None;
+                    return vec![Held::Opaque(receiver)];
                 }
-                let prefix = format!("{path}.");
-                let fns = self.converged.map(|c| c.fns.keys());
-                let mut members: Vec<&Var> = self
-                    .setter_vars
-                    .iter()
-                    .chain(fns.into_iter().flatten())
-                    .filter(|k| {
-                        k.strip_prefix(&prefix)
-                            .is_some_and(|member| !member.contains('.'))
-                    })
-                    .collect();
-                members.sort();
-                members.dedup();
-                Some(members.into_iter().map(|k| Held::Path(k.clone())).collect())
+                self.table_members(&path)
             }
         }
     }
 
-    /// Bind `params` to what a call `passed` the body: an argument by
-    /// position, or the receiver's entries at the positions an array method
-    /// passes them — `reduce`'s second, both of `sort`'s, the first of every
-    /// other. A parameter the walk cannot bind is left out, and resolves as a
-    /// name: one past the last argument, which its default may fill.
-    fn bind(&self, params: &[Var], passed: Passed<'a>) -> HashMap<Var, Vec<Held<'a>>> {
-        match passed {
-            Passed::Nothing => HashMap::new(),
-            Passed::Args(args) => params
-                .iter()
-                .zip(args)
-                .map(|(p, a)| (p.clone(), self.resolve(a)))
-                .collect(),
-            Passed::Entries { receiver, method } => {
-                let Some(entries) = self.entries(receiver) else {
-                    return HashMap::new();
-                };
-                Passed::entry_positions(method)
-                    .iter()
-                    .filter_map(|&i| params.get(i))
-                    .map(|p| (p.clone(), entries.clone()))
-                    .collect()
+    /// The member paths one segment under `path` the setter and closure
+    /// tables name.
+    fn table_members(&self, path: &str) -> Vec<Held<'a>> {
+        let prefix = format!("{path}.");
+        let fns = self.converged.map(|c| c.fns.keys());
+        let mut members: Vec<&Var> = self
+            .setter_vars
+            .iter()
+            .chain(fns.into_iter().flatten())
+            .filter(|k| {
+                k.strip_prefix(&prefix)
+                    .is_some_and(|member| !member.contains('.'))
+            })
+            .collect();
+        members.sort();
+        members.dedup();
+        members.into_iter().map(|k| Held::Path(k.clone())).collect()
+    }
+
+    /// What member `key` (any member when `None`) of the values of `base`
+    /// may hold: the element or field a literal spells (any one a spread or a
+    /// computed key may put there), the member path of a name, every member
+    /// the tables list under a path; a member of an opaque value is opaque.
+    fn members(&self, base: &Bound<'a>, key: Option<&str>) -> Bound<'a> {
+        let mut out = Bound::default();
+        for item in &base.items {
+            match item {
+                Held::Opaque(e) => out.join(Bound {
+                    items: vec![Held::Opaque(e)],
+                    sure: false,
+                }),
+                Held::Path(p) => out.join(Bound {
+                    items: match key {
+                        Some(k) => vec![Held::Path(format!("{p}.{k}"))],
+                        None => self.table_members(p),
+                    },
+                    sure: false,
+                }),
+                Held::Expr(e) => match e.peel_ts() {
+                    Expr::ArrayLit {
+                        elems,
+                        spread_at,
+                        arity,
+                        ..
+                    } => {
+                        let at = key.and_then(|k| k.parse::<usize>().ok());
+                        let placed = spread_at.iter().all(|&s| at.is_some_and(|i| s > i))
+                            && arity.exact() == Some(elems.len());
+                        match at {
+                            Some(i) if placed => {
+                                if let Some(x) = elems.get(i) {
+                                    out.join(self.resolve(x));
+                                }
+                            }
+                            _ => out.join(Bound {
+                                items: self.entries(e),
+                                sure: false,
+                            }),
+                        }
+                    }
+                    Expr::ObjectLit { fields, .. } => {
+                        for (k, v) in fields {
+                            if k.starts_with(crate::ir::expr::SPREAD_KEY_PREFIX)
+                                || k.starts_with(crate::ir::expr::ACCESSOR_KEY_PREFIX)
+                            {
+                                out.join(Bound {
+                                    items: vec![Held::Opaque(v)],
+                                    sure: false,
+                                });
+                            } else if key.is_none_or(|key| key == k)
+                                || crate::ir::expr::is_synthetic_key(k)
+                            {
+                                out.join(self.resolve(v));
+                            }
+                        }
+                    }
+                    other => match callee_path(other) {
+                        Some(p) => out.join(Bound {
+                            items: match key {
+                                Some(k) => vec![Held::Path(format!("{p}.{k}"))],
+                                None => self.entries(e),
+                            },
+                            sure: false,
+                        }),
+                        // A function's or a primitive's members are no
+                        // value a setter or a closure of this component
+                        // flows into; anything else may hold one.
+                        None if matches!(other, Expr::FnLit { .. } | Expr::Lit(_)) => {}
+                        None => out.join(Bound {
+                            items: vec![Held::Opaque(e)],
+                            sure: false,
+                        }),
+                    },
+                },
             }
         }
+        out.sure = false;
+        out
+    }
+
+    /// What a call `passed` its parameters (#316), as the interpreter binds
+    /// them (#253): an argument by position, every argument from the first
+    /// spread on (with every entry of a spread) for a parameter from there
+    /// on, nothing callable past the last; an array method's entries, an
+    /// index, its receiver, `reduce`'s accumulator. Called before the body is
+    /// on the stack: the arguments read the caller's names. What the body
+    /// assigns is joined by [`Self::bind_body`].
+    fn bind_passed(&self, params: &[Var], passed: Passed<'a>) -> HashMap<Var, Bound<'a>> {
+        let mut out = HashMap::new();
+        match passed {
+            Passed::Nothing => {}
+            Passed::Args(args) => {
+                let positional = Expr::positional_args(args);
+                let mut spread = Bound::default();
+                for a in &args[positional.len()..] {
+                    spread.join(self.resolve(a));
+                }
+                for (i, p) in params.iter().enumerate() {
+                    let mut bound = positional
+                        .get(i)
+                        .map_or_else(Bound::default, |a| self.resolve(a));
+                    if i >= positional.len() && positional.len() < args.len() {
+                        bound.join(spread.clone());
+                    }
+                    out.insert(p.clone(), bound);
+                }
+            }
+            Passed::Entries {
+                receiver,
+                method,
+                args,
+            } => {
+                let items = self.entries(receiver);
+                let entries = Bound {
+                    sure: items.len() == 1
+                        && matches!(receiver.peel_ts(), Expr::ArrayLit { elems, .. }
+                            if elems.len() == 1 && self.resolve(&elems[0]).sure_one()),
+                    items,
+                };
+                // Every parameter it passes something: a number by default
+                // (the index), which calls nothing.
+                for p in params.iter().take(4) {
+                    out.insert(p.clone(), Bound::default());
+                }
+                for &i in Passed::entry_positions(method) {
+                    if let Some(p) = params.get(i) {
+                        out.insert(p.clone(), entries.clone());
+                    }
+                }
+                if let Some(p) = Passed::receiver_position(method).and_then(|i| params.get(i)) {
+                    out.insert(p.clone(), self.resolve(receiver));
+                }
+                if matches!(method, "reduce" | "reduceRight")
+                    && let Some(p) = params.first()
+                {
+                    // The initial value, or what the callback returned.
+                    let mut acc = Bound {
+                        items: vec![Held::Opaque(receiver)],
+                        sure: false,
+                    };
+                    for a in args {
+                        acc.join(Bound {
+                            items: vec![Held::Opaque(a)],
+                            sure: false,
+                        });
+                    }
+                    out.insert(p.clone(), acc);
+                }
+            }
+        }
+        out
+    }
+
+    /// Join into the bound names of `body`, the innermost scope, everything
+    /// the body assigns them — a default (lowered to a store), a
+    /// reassignment, in the body or in a closure in it — and bind each local
+    /// one of whose bindings reads a bound name, to every value all of its
+    /// bindings may give it: `const [set] = p` reads `p[0]` (#316).
+    fn bind_body(&mut self, params: &[Var], body: &'a CFG) {
+        // Every binding of a name of `body`: its own, and an assignment in a
+        // closure in it that neither takes nor declares the name.
+        let mut bindings: Vec<(&'a str, &'a Expr)> = Vec::new();
+        for block in body.blocks.values() {
+            for stmt in &block.stmts {
+                if let Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. } = stmt {
+                    bindings.push((var.as_str(), rhs));
+                }
+            }
+        }
+        let own: HashSet<&str> = crate::ir::bindings::own_names(params, body).collect();
+        for (ps, nested) in crate::ir::bindings::nested_bodies(body) {
+            for block in nested.blocks.values() {
+                for stmt in &block.stmts {
+                    if let Stmt::Assign { var, rhs, .. } = stmt
+                        && own.contains(var.as_str())
+                        && !ps.contains(var)
+                        && !nested_declares(nested, var)
+                    {
+                        bindings.push((var.as_str(), rhs));
+                    }
+                }
+            }
+        }
+        bindings.sort_by_key(|(v, _)| *v);
+        // A chain of member reads that grows with each pass (`a = a.x`) is
+        // the one thing that keeps this from settling: past the bound, each
+        // binding still moving is opaque, which holds anything.
+        let passes = bindings.len() + 2;
+        for pass in 0..=passes {
+            let mut next: HashMap<Var, Bound<'a>> = HashMap::new();
+            let held = &self.scopes.last().expect("body is on the stack").held;
+            let mut i = 0;
+            while i < bindings.len() {
+                let name = bindings[i].0;
+                let mut j = i;
+                while j < bindings.len() && bindings[j].0 == name {
+                    j += 1;
+                }
+                let rhss = &bindings[i..j];
+                i = j;
+                let is_param = params.iter().any(|p| p == name);
+                // A parameter the call passed nothing the walk follows holds
+                // an argument it does not know: it stays a name.
+                if is_param && !held.contains_key(name) {
+                    continue;
+                }
+                let param = is_param && held.contains_key(name);
+                let reads_bound = rhss.iter().any(|(_, rhs)| {
+                    let mut read = HashSet::new();
+                    collect_used_vars(rhs, &mut read);
+                    read.iter().any(|v| self.held(v).is_some())
+                });
+                if !param && !held.contains_key(name) && !reads_bound {
+                    continue;
+                }
+                let mut bound = self.passed_of(name, params).unwrap_or_default();
+                for (_, rhs) in rhss {
+                    if pass == passes {
+                        bound.join(Bound {
+                            items: vec![Held::Opaque(rhs)],
+                            sure: false,
+                        });
+                    } else {
+                        bound.join(self.resolve(rhs));
+                    }
+                }
+                next.insert(name.to_string(), bound);
+            }
+            let scope = self.scopes.last_mut().expect("body is on the stack");
+            let mut changed = false;
+            for (name, bound) in next {
+                let grew = scope.held.get(&name).is_none_or(|old| {
+                    old.items.len() != bound.items.len() || old.sure != bound.sure
+                });
+                if grew {
+                    scope.held.insert(name, bound);
+                    changed = true;
+                }
+            }
+            if !changed {
+                return;
+            }
+        }
+    }
+
+    /// What the call bound parameter `name` of the innermost scope to, before
+    /// its body assigned it.
+    fn passed_of(&self, name: &str, params: &[Var]) -> Option<Bound<'a>> {
+        if !params.iter().any(|p| p == name) {
+            return None;
+        }
+        self.scopes.last().and_then(|s| s.passed.get(name)).cloned()
     }
 
     /// Record a write of the store at this site, when the walk records them.
@@ -3451,17 +3844,14 @@ impl<'a> SetterWalk<'a> {
         // `Promise` executor runs synchronously, and a class the body binds
         // is a local helper like any other.
         if let Expr::Call { fn_, args } | Expr::New { fn_, args, .. } = expr {
-            // A call through a parameter the walk bound is a call through
-            // what it holds, never through the parameter's name (#316): of
-            // one of them, placed at this call only when it holds one.
-            let held = match fn_.peel_ts() {
-                Expr::Var(p) => self.held(p).map(<[_]>::to_vec),
-                _ => None,
-            };
-            match held {
+            // A call through a name the walk bound, or a member of one, is a
+            // call through what it may hold, never through the name (#316):
+            // of one of them, placed at this call only when it surely holds
+            // the one it lists.
+            match self.items_of(fn_) {
                 Some(held) => {
-                    let at = at.filter(|_| held.len() == 1);
-                    for callee in held {
+                    let at = at.filter(|_| held.sure_one());
+                    for callee in held.items {
                         self.call_through(callee, args, at, depth, found, mode, prov, stmt_span);
                     }
                 }
@@ -3522,7 +3912,7 @@ impl<'a> SetterWalk<'a> {
                 // rows run at this call, and are placed here only when the
                 // receiver surely runs it, as an IIFE is (#248).
                 let placed = at.filter(|_| i == 0 && runs_at_least_once(fn_, args));
-                let passed = Passed::to_callback(fn_, i);
+                let passed = Passed::to_callback(fn_, args, i);
                 self.callback_arg(arg, class, placed, passed, depth, found, prov, stmt_span);
                 self.repeating = outer_repeating;
             }
@@ -3617,6 +4007,10 @@ impl<'a> SetterWalk<'a> {
         let (fn_, name) = match callee {
             Held::Expr(e) => (Some(e), callee_path(e)),
             Held::Path(p) => (None, Some(p)),
+            Held::Opaque(e) => {
+                self.opaque(e, mode, depth, found, prov, stmt_span);
+                return;
+            }
         };
         if let Some(name) = &name
             && self.setter_vars.contains(name)
@@ -3723,14 +4117,13 @@ impl<'a> SetterWalk<'a> {
         prov: Option<BlockId>,
         stmt_span: Option<SourceRange>,
     ) {
-        // A parameter the walk bound hands what it holds (#316), each read
-        // where the walk bound it, never by name again.
-        if let Expr::Var(p) = arg.peel_ts()
-            && let Some(held) = self.held(p).map(<[_]>::to_vec)
-        {
-            let placed = placed.filter(|_| held.len() == 1);
-            for callee in held {
+        // A name the walk bound, or a member of one, hands what it may hold
+        // (#316), each read where the walk bound it, never by name again.
+        if let Some(held) = self.items_of(arg) {
+            let placed = placed.filter(|_| held.sure_one());
+            for callee in held.items {
                 match callee {
+                    Held::Opaque(e) => self.opaque(e, class, depth, found, prov, stmt_span),
                     Held::Expr(e) => self.callback_value(
                         e,
                         callee_path(e),
@@ -3889,6 +4282,20 @@ impl<'a> SetterWalk<'a> {
                     );
                 }
             }
+            // A spread argument hands its operand's entries, as an argument
+            // array does its elements.
+            Expr::Spread(inner) => {
+                self.callback_arg(
+                    inner,
+                    WalkClass::Unknown,
+                    None,
+                    Passed::Nothing,
+                    depth,
+                    found,
+                    prov,
+                    stmt_span,
+                );
+            }
             // A path the converged values point at closures of this
             // component (`setTimeout(api.inc)`, #239): each runs in the
             // argument's class, at this call only when it is a callback the
@@ -4043,6 +4450,176 @@ impl<'a> SetterWalk<'a> {
             self.path.pop();
             found.absorb(inner, body, class, at.filter(|_| sure), prov);
         }
+    }
+
+    /// A call, in `class`, of a value the walk cannot place (fail-closed):
+    /// a possible call of every setter that may flow into `e` — the row a
+    /// setter handed to a callee is (#291) — and a possible run of every
+    /// closure that may, never placed.
+    #[allow(clippy::too_many_arguments)]
+    fn opaque(
+        &mut self,
+        e: &'a Expr,
+        class: WalkClass,
+        depth: usize,
+        found: &mut Found,
+        prov: Option<BlockId>,
+        stmt_span: Option<SourceRange>,
+    ) {
+        let reach = self.reach(e);
+        for setter in &reach.setters {
+            self.handed_setter(setter, class, None, found, prov, stmt_span);
+        }
+        if depth == 0 {
+            return;
+        }
+        for (body, name) in reach.closures {
+            let mut inner = Found::default();
+            self.path.extend(name.clone());
+            self.enter(
+                body,
+                Reached::Named,
+                Passed::Nothing,
+                depth - 1,
+                &mut inner,
+                WalkClass::Sync,
+                prov,
+                stmt_span,
+            );
+            if name.is_some() {
+                self.path.pop();
+            }
+            found.absorb(inner, body, class, None, prov);
+        }
+        for path in reach.paths {
+            let nothing = Passed::Nothing;
+            self.converged_bodies(
+                Some(path),
+                None,
+                nothing,
+                class,
+                None,
+                depth,
+                found,
+                prov,
+                stmt_span,
+            );
+        }
+    }
+
+    /// Every setter and closure of this component that may flow into `e`,
+    /// an expression of a body on the stack: through what the walk bound the
+    /// names it reads to, the bindings of the others in the bodies on the
+    /// stack and in the render, the members the tables list under them, the
+    /// captures of the functions it reaches (which a call may return).
+    fn reach(&self, e: &'a Expr) -> Reach<'a> {
+        let mut out = Reach::default();
+        let mut seen = (HashSet::new(), HashSet::new());
+        self.reach_expr(e, &mut out, &mut seen);
+        out.setters.sort();
+        out.setters.dedup();
+        out.paths.sort();
+        out.paths.dedup();
+        out
+    }
+
+    fn reach_expr(
+        &self,
+        e: &'a Expr,
+        out: &mut Reach<'a>,
+        seen: &mut (HashSet<usize>, HashSet<Var>),
+    ) {
+        if !seen.0.insert(e as *const Expr as usize) {
+            return;
+        }
+        if let Some(bound) = self.items_of(e) {
+            for item in bound.items {
+                match item {
+                    Held::Expr(x) | Held::Opaque(x) => self.reach_expr(x, out, seen),
+                    Held::Path(p) => self.reach_path(&p, out),
+                }
+            }
+            return;
+        }
+        match e.peel_ts() {
+            Expr::Var(v) => self.reach_name(v, out, seen),
+            Expr::FnLit { body_cfg, .. } => {
+                out.closures.push((body_cfg, None));
+                for v in crate::ir::free_vars::compute_free_vars(body_cfg) {
+                    self.reach_name(&v, out, seen);
+                }
+            }
+            other => {
+                if let Some(path) = callee_path(other) {
+                    self.reach_path(&path, out);
+                }
+                other.for_each_child(&mut |c| self.reach_expr(c, out, seen));
+            }
+        }
+    }
+
+    /// [`Self::reach_expr`] for a name the walk did not bind.
+    fn reach_name(&self, v: &str, out: &mut Reach<'a>, seen: &mut (HashSet<usize>, HashSet<Var>)) {
+        if !seen.1.insert(v.to_string()) {
+            return;
+        }
+        self.reach_path(v, out);
+        if let Some(body) = self.fn_bindings.get(v) {
+            out.closures.push((body, Some(v.to_string())));
+            for free in crate::ir::free_vars::compute_free_vars(body) {
+                self.reach_name(&free, out, seen);
+            }
+        }
+        for rhs in self.bindings_of(v) {
+            self.reach_expr(rhs, out, seen);
+        }
+    }
+
+    /// The setter at `path` and the ones the tables list under it, and the
+    /// path itself for the converged closures.
+    fn reach_path(&self, path: &str, out: &mut Reach<'a>) {
+        let prefix = format!("{path}.");
+        for k in self.setter_vars {
+            if k == path || k.starts_with(&prefix) {
+                out.setters.push(k.clone());
+            }
+        }
+        if let Some(c) = self.converged {
+            for k in c.fns.keys() {
+                if k == path || k.starts_with(&prefix) {
+                    out.paths.push(k.clone());
+                }
+            }
+        }
+    }
+
+    /// The right-hand sides `v` is bound to in the innermost body on the
+    /// stack that binds it, or else in the walked root and the render.
+    fn bindings_of(&self, v: &str) -> Vec<&'a Expr> {
+        let binds = |body: &'a CFG| -> Vec<&'a Expr> {
+            body.blocks
+                .values()
+                .flat_map(|b| &b.stmts)
+                .filter_map(|s| match s {
+                    Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. } if var == v => {
+                        Some(rhs)
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        for scope in self.scopes.iter().skip(1).rev() {
+            if scope.names.as_ref().is_none_or(|n| n.contains(v)) {
+                return binds(scope.body);
+            }
+        }
+        let mut out = binds(self.scopes[0].body);
+        if let Some(render) = self.converged.map(|c| c.render)
+            && !std::ptr::eq(render, self.scopes[0].body)
+        {
+            out.extend(binds(render));
+        }
+        out
     }
 }
 

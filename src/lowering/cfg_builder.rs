@@ -1084,7 +1084,7 @@ pub(super) fn inject_param_preamble(
         };
         names.push(name.clone());
         if let Some(init) = p.initializer.as_deref() {
-            lower_default(&name, init, false, builder);
+            lower_default(&name, init, true, builder);
         }
         if !matches!(p.pattern, BindingPattern::BindingIdentifier(_)) {
             lower_binding_pattern(&p.pattern, Expr::Var(name), None, builder);
@@ -1101,10 +1101,11 @@ pub(super) fn inject_param_preamble(
 ///
 /// `store`: the default's value is assigned to `source`, which then is the
 /// member or the default (#256); the solver drops the side of the test no
-/// value of `source` takes (#255). A parameter's default is not stored: its
-/// omitted argument is bound where the call is inlined (`param_defaults`,
-/// #230), and a parameter assigned in its body is no longer one a deps
-/// argument can name.
+/// value of `source` takes (#255). A parameter's default is stored too, as
+/// JavaScript does: what the parameter holds is its argument or its default,
+/// for every reader of the body (a call that omits the argument, or passes
+/// `undefined`). A deps argument naming it is still the parameter
+/// ([`must_param`](crate::ir::bindings::must_param)).
 pub(super) fn lower_default(
     source: &str,
     init: &Expression,

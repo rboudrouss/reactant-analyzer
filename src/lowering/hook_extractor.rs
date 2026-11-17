@@ -637,17 +637,25 @@ impl Extractor<'_, '_> {
                 values.push(arg.clone());
                 continue;
             }
+            // A spread's operand is what runs; the argument stays a spread.
+            let (operand, spread) = match arg {
+                Expr::Spread(inner) => (&**inner, true),
+                other => (other, false),
+            };
             let var = format!("__hookarg_{}", self.staged);
             self.staged += 1;
             self.stmt(
                 Stmt::Let {
                     var: var.clone(),
-                    rhs: arg.clone(),
+                    rhs: operand.clone(),
                     span,
                 },
                 out,
             );
-            values.push(Expr::Var(var));
+            values.push(match spread {
+                true => Expr::Spread(Box::new(Expr::Var(var))),
+                false => Expr::Var(var),
+            });
         }
         if let Some(lazy) = lazy_initializer(call, args) {
             let fn_ = values[lazy.callee].clone();
@@ -933,8 +941,12 @@ fn make_hook_entry(
     span: Option<SourceRange>,
 ) -> Option<HookEntry> {
     let name = call.origin_name.as_str();
+    // A React hook reads its arguments by position, which a spread hides
+    // (`useEffect(...args)`): the call is a hook the analysis does not model,
+    // whose arguments its marker hands out (#254).
+    let spread = Expr::positional_args(&args).len() < args.len();
     let mut it = args.into_iter();
-    if !call.is_react {
+    if !call.is_react || spread {
         // A hook, but not React's (defined locally, or imported from a
         // package or a local file): a Custom hook like any other, resolved
         // through the HookRegistry / SummaryRegistry. `name` is the origin's

@@ -83,9 +83,13 @@ that writes it (see *Cross-file limits*).
   local function's parameter (`const f = (g) => g(); f(() => setN(1))`) or an array method's
   callback parameter (`fs.forEach((f) => f())`, the parameter being the array's entries) runs
   where it is called [#253](https://github.com/rboudrouss/reactant-analyzer/issues/253), a possible
-  write: the call is not proven to be of that one closure. In render, `setter-in-render` does
-  not read the callback parameter, so `[() => setN(1)].forEach((f) => f())` there is not its
-  finding. Utility *inlining* is statement-position only [#52](https://github.com/rboudrouss/reactant-analyzer/issues/52). A setter
+  write: the call is not proven to be of that one closure. The setter walk (the render's and the
+  regions the loop rules read) reads a parameter as everything it may hold: its argument, every
+  argument from a spread on, its default, every value the body or a closure in it assigns it, the
+  member a destructuring pattern reads, an array method's entry and receiver (#316). What the walk
+  cannot list (a call's result, `xs.flatMap(f)` as a receiver) is a possible call of every setter
+  and closure that may flow into it. A rest parameter (`(...fs)`) and `arguments` are not bound:
+  a setter they receive is still a write of the call that hands it over (#291). Utility *inlining* is statement-position only [#52](https://github.com/rboudrouss/reactant-analyzer/issues/52). A setter
   or a closure called through a call that returns it (`get()(x)`, `makeSetter()(x)`,
   `api.get()(x)`) is written where the call's value is read: off the converged envs of the render,
   an effect or a handler [#46](https://github.com/rboudrouss/reactant-analyzer/issues/46), and off a
@@ -186,13 +190,15 @@ that writes it (see *Cross-file limits*).
   a spread of a value the heap does not place may overwrite every member before it, which stay
   possible. A computed key resolves when a literal spells it (`{ [1]: a }`, `o["k"]`) or, in a
   read or a destructuring, when its value is one string (`const { [k]: v } = o`); in an object
-  literal it may be any member. Not modeled: an array entry past a spread (its index is ⊤), a
-  spread argument `f(...args)`, kept for its reads, so a setter forwarded through
-  `f(...handlers)` is not seen, nor do the closures it holds escape, and a parameter's default as
-  the parameter's value outside a spliced hook [#76](https://github.com/rboudrouss/reactant-analyzer/issues/76).
-  Because the call keeps no trace of the spread, the arguments after it may sit at other
-  positions: a local function's parameters are bound to its arguments (#253), and the arguments
-  still run with the handlers.
+  literal it may be any member. Not modeled: an array entry past a spread (its index is ⊤)
+  [#76](https://github.com/rboudrouss/reactant-analyzer/issues/76). A spread argument
+  `f(...args)` is kept, marked: a parameter from it on may hold any entry of it or any later
+  argument, and a callee the analysis does not see receives its entries as it receives an
+  argument's. A setter held in a *named* container handed to such a callee (`foo(arr)`,
+  `foo(...arr)` with `arr = [setN]`) is not a write
+  [#322](https://github.com/rboudrouss/reactant-analyzer/issues/322); an array literal is
+  (`foo([setN])`). A parameter's default is its value when the argument is omitted or
+  `undefined`, as JavaScript stores it.
 - **Mount-coupled seeds.** `frozen-initial-state` drops to Info, hidden without `--info`, when every
   call site renders the consumer under a `key` built from the seeding prop, or under a guard built
   from it (`{msg && <Toast msg={msg}/>}`). Neither shape is a proof: a `msg` moving between two

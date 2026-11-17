@@ -726,13 +726,15 @@ fn teardown_in_expr(
 /// The boolean third argument is `capture`, not `once`, and does not count.
 fn is_self_removing(reg: &Registrar, args: &[Expr]) -> bool {
     reg.name == "addEventListener"
-        && args.get(2).is_some_and(|o| match o.peel_ts() {
-            Expr::ObjectLit { fields, .. } => matches!(
-                crate::ir::expr::object_member(fields, "once").map(Expr::peel_ts),
-                Some(Expr::Lit(crate::ir::expr::Prim::Bool(true)))
-            ),
-            _ => false,
-        })
+        && Expr::positional_args(args)
+            .get(2)
+            .is_some_and(|o| match o.peel_ts() {
+                Expr::ObjectLit { fields, .. } => matches!(
+                    crate::ir::expr::object_member(fields, "once").map(Expr::peel_ts),
+                    Some(Expr::Lit(crate::ir::expr::Prim::Bool(true)))
+                ),
+                _ => false,
+            })
 }
 
 // ── The scan ──────────────────────────────────────────────────────────────────
@@ -789,7 +791,7 @@ fn scan_expr(
     match expr {
         Expr::Call { fn_, args } => {
             if let Some((reg, display)) = match_registrar(fn_)
-                && let Some(cb) = args.get(reg.cb_arg)
+                && let Some(cb) = Expr::positional_args(args).get(reg.cb_arg)
             {
                 out.push(Registration {
                     effect,

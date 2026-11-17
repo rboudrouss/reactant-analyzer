@@ -246,7 +246,7 @@ fn step_of(
 /// returns are. `None` when one return is not.
 fn returns_step(body: &CFG, params: &[Var]) -> Option<Interval> {
     let nested = nested_bodies(body);
-    let is_param = |x: &Expr| must_param(x, body, &nested, params) == Some(0);
+    let is_param = |x: &Expr| must_param(x, body, &nested, params, &|_| false) == Some(0);
     let mut step: Option<Interval> = None;
     for b in body.blocks.values() {
         if let Terminator::Return(e, _) = &b.term {
@@ -337,7 +337,7 @@ fn returns_change(body: &CFG, params: &[Var]) -> Change {
         )
     };
     let nested = nested_bodies(body);
-    let identity = |e: &&Expr| must_param(e, body, &nested, params) == Some(0);
+    let identity = |e: &&Expr| must_param(e, body, &nested, params, &|_| false) == Some(0);
     if returns.iter().all(allocates) {
         Change::Must
     } else if returns.iter().all(identity) {

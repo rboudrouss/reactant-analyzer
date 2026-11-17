@@ -712,15 +712,16 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
     }
 }
 
-/// Lower a call/`new` argument list. A `...spread` argument cannot keep a
-/// position — parameters bind positionally when a callee is inlined — so it is
-/// emitted as a statement instead of guessed into a slot, which preserves its
-/// reads without claiming which parameter receives it.
+/// Lower a call/`new` argument list. A `...spread` argument is kept, marked
+/// [`Expr::Spread`]: what it holds reaches the callee, and no argument from
+/// there on has a known position ([`Expr::positional_args`]).
 fn lower_arguments(arguments: &[Argument], builder: &mut BlockBuilder) -> Vec<Expr> {
     let mut args = vec![];
     for a in arguments {
         match a {
-            Argument::SpreadElement(sp) => lower_for_effect(&sp.argument, builder),
+            Argument::SpreadElement(sp) => {
+                args.push(Expr::Spread(Box::new(lower_expr(&sp.argument, builder))));
+            }
             other => {
                 if let Some(e) = other.as_expression() {
                     args.push(lower_expr(e, builder));

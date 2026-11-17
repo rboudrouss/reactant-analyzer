@@ -990,7 +990,9 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     // The parameter as React hands it: one the body rebinds
                     // holds another value at the return (#214).
                     let nested = nested_bodies(body_cfg);
-                    step(r, &|x| must_param(x, body_cfg, &nested, params) == Some(0))
+                    step(r, &|x| {
+                        must_param(x, body_cfg, &nested, params, &|_| false) == Some(0)
+                    })
                 }
                 other => step(other, &|x| match x.peel_ts() {
                     Expr::StateVal(l) => *l == label,
@@ -1982,7 +1984,7 @@ fn updater_overwrites(written_expr: Option<&Expr>) -> Option<HashSet<Symbol>> {
     // The parameter as React hands it: one the body rebinds holds another
     // object at the return (#214).
     let nested = nested_bodies(body_cfg);
-    let is_prev = |e: &Expr| must_param(e, body_cfg, &nested, params) == Some(0);
+    let is_prev = |e: &Expr| must_param(e, body_cfg, &nested, params, &|_| false) == Some(0);
     let mut out = HashSet::new();
     let mut returns = 0usize;
     for block in body_cfg.blocks.values() {

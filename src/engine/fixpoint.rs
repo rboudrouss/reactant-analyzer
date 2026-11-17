@@ -1349,10 +1349,13 @@ fn expand_custom_hooks(
         // Param→arg substitution for State inits: they are seeded in a separate
         // env (module consts + props), which the render-body param bindings
         // never reach, so `useState(initial)` must inline the concrete arg.
+        // Only an argument whose position is known names a parameter.
+        let positional = Expr::positional_args(&call_args);
+        let omits = |i: usize| i >= call_args.len();
         let param_subst: HashMap<String, Expr> = hook_ir
             .params
             .iter()
-            .zip(call_args.iter())
+            .zip(positional.iter())
             .map(|(p, a)| (p.clone(), a.clone()))
             .collect();
 
@@ -1392,12 +1395,13 @@ fn expand_custom_hooks(
                         &hook_ir.body_cfg,
                         &elsewhere,
                         &hook_ir.params,
+                        &|i| hook_ir.param_defaults.get(i).is_some_and(Option::is_some),
                     ),
                     _ => None,
                 };
-                let arg = param.and_then(|i| call_args.get(i).cloned());
+                let arg = param.and_then(|i| positional.get(i).cloned());
                 let default = param
-                    .filter(|_| arg.is_none())
+                    .filter(|&i| omits(i))
                     .and_then(|i| hook_ir.param_defaults.get(i).cloned().flatten());
                 if let (Some(d), Some(deps)) = (default, h.deps_mut()) {
                     *deps = DepsArg::from_expr(crate::ir::remap_expr(d, off));
@@ -1474,7 +1478,7 @@ fn expand_custom_hooks(
             let param_lets: Vec<Stmt> = hook_ir
                 .params
                 .iter()
-                .zip(call_args.iter())
+                .zip(positional.iter())
                 .map(|(p, a)| Stmt::Let {
                     var: rename.get(p).cloned().unwrap_or_else(|| p.clone()),
                     rhs: a.clone(),

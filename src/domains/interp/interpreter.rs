@@ -913,8 +913,11 @@ fn exec_callbacks_depth<T: Transfer>(
             exec_callbacks_depth(transfer, fn_, env, ctx, depth);
             let runs_args = class == TriggerClass::InCycle && !capped;
             let binds_args = class == TriggerClass::Unknown && !capped;
-            // What a local callee's parameters are bound to (#253).
+            // What a local callee's parameters are bound to (#253): the
+            // arguments up to the first spread, whose entries may take any
+            // position from there on — ⊤ past it, as past the last argument.
             let mut passed: Vec<EnvVal<T::Domain>> = Vec::new();
+            let positional = Expr::positional_args(args).len();
             for (i, arg) in args.iter().enumerate() {
                 if !matches!(arg, Expr::FnLit { .. }) {
                     exec_callbacks_depth(transfer, arg, env, ctx, depth);
@@ -927,9 +930,9 @@ fn exec_callbacks_depth<T: Transfer>(
                 // also runs in the slot write below, of a subscription, of an
                 // unknown callee, or past the inlining budget — is handed to
                 // code the analysis does not run (#254). So is one a local
-                // function receives as a parameter below: the lowering drops
-                // a spread argument, so the position it binds is not sure.
-                if runs_args {
+                // function receives as a parameter below: that call is a
+                // write of what it may call, whatever it binds it to.
+                if runs_args && i < positional {
                     let given = callback_args(transfer, fn_, i, env, ctx);
                     let returned = exec_fn_value(transfer, arg, &given, env, ctx, depth);
                     escape_returned(returned.as_ref(), ctx);
@@ -937,7 +940,7 @@ fn exec_callbacks_depth<T: Transfer>(
                     apply_setter(transfer, arg, &given, env, ctx, depth);
                 } else {
                     let sites = escape(transfer, arg, env, ctx);
-                    if binds_args {
+                    if binds_args && i < positional {
                         passed.push(EnvVal::located(sites, transfer.eval_expr(arg, env, ctx)));
                     }
                 }
@@ -1031,6 +1034,11 @@ pub(crate) fn escape<T: Transfer>(
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
 ) -> Option<Sites> {
+    // A spread argument hands over the entries of its operand, which
+    // escape with it.
+    if let Expr::Spread(inner) = expr {
+        return escape(transfer, inner, env, ctx);
+    }
     let sites = alloc_literal(transfer, expr, env, ctx);
     let mut setters = call_targets(transfer, expr, env, ctx);
     if let Some(sites) = &sites {
@@ -1135,8 +1143,9 @@ pub(crate) fn bind_params<D: AbstractDomain>(
 /// An array method's callback receives the receiver's entries: the join of
 /// the entries of every array the heap places the receiver at, ⊤ joined in
 /// where it may be anything else — at position 0, at position 1 for
-/// `reduce`'s accumulator-first callback, at both for `sort`'s comparator.
-/// Every other position, and every other callee's callback, gets ⊤.
+/// `reduce`'s accumulator-first callback, at both for `sort`'s comparator —
+/// and the receiver itself after the index. Every other position, and every
+/// other callee's callback, gets ⊤.
 pub(crate) fn callback_args<T: Transfer>(
     transfer: &T,
     callee: &Expr,
@@ -1151,7 +1160,10 @@ pub(crate) fn callback_args<T: Transfer>(
         return Vec::new();
     }
     let top = EnvVal::Val(StateValue::top());
-    let entry = match alloc_literal(transfer, obj, env, ctx) {
+    let receiver = alloc_literal(transfer, obj, env, ctx);
+    // The array itself, after the index.
+    let array = EnvVal::located(receiver.clone(), transfer.eval_expr(obj, env, ctx));
+    let entry = match receiver {
         Some(sites) => {
             let mut ids: Vec<_> = sites.ids.iter().copied().collect();
             ids.sort();
@@ -1180,9 +1192,9 @@ pub(crate) fn callback_args<T: Transfer>(
     );
     let any = EnvVal::Val(T::Domain::top());
     match field.as_str() {
-        "reduce" | "reduceRight" => vec![any, entry],
+        "reduce" | "reduceRight" => vec![any.clone(), entry, any, array],
         "sort" => vec![entry.clone(), entry],
-        _ => vec![entry],
+        _ => vec![entry, any, array],
     }
 }
 

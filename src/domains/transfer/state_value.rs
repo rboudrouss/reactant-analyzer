@@ -290,6 +290,13 @@ fn eval_state_value(
         Expr::TSAnnotated(inner) => eval_state_value(inner, env, ctx),
 
         Expr::SummaryVal(sv) => summary_value(sv),
+
+        // A spread argument stands for entries of its operand at positions
+        // nobody knows: any value.
+        Expr::Spread(inner) => {
+            eval_state_value(inner, env, ctx);
+            StateValue::top()
+        }
     }
 }
 

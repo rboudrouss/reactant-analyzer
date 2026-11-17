@@ -254,7 +254,7 @@ impl<'a> EntityCtx<'a> {
         else {
             return ValueIdentity::Unknown;
         };
-        let Some(expr) = args.get(arg.index) else {
+        let Some(expr) = Expr::positional_args(args).get(arg.index) else {
             return ValueIdentity::Unknown;
         };
         let Some(info) = self.comp.hook_calls.iter().find(|i| i.label == arg.label) else {
