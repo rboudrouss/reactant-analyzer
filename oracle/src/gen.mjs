@@ -289,6 +289,8 @@ function genWrite(r, p, env, where) {
     [async ? 1 : 0, "defer"],
     [w.type === "num" && w.kind === "setter" && arg.kind !== "updater" ? 2 : 0, "helper"],
     [5, "optarg"],
+    // Yielded by a generator and called by the loop that drives it (#317).
+    [1, "yield"],
   ]);
   if (wrap === "helper") {
     let h = p.helpers.find((x) => x.kind === "bump" && r.chance(0.5));
@@ -300,6 +302,11 @@ function genWrite(r, p, env, where) {
     return { kind: "helpercall", helper: h.name, target: w.name, arg: genExpr(r, env, "num", 1) };
   }
   const s = { kind: "write", target: w.name, arg, wrap };
+  if (wrap === "yield") {
+    let h = p.helpers.find((x) => x.kind === "yielder");
+    if (!h) p.helpers.push((h = { kind: "yielder", name: helperName(p, "yieldIt") }));
+    s.via = h.name;
+  }
   if (wrap === "and" || wrap === "ternary") s.cond = genExpr(r, env, "bool", 1);
   if (wrap === "optarg") s.via = r.weighted([[4, "absent"], [2, "format"], ...maybeAbsent.map((x) => [2, x.name])]);
   // `on0?.(…)`, `runNow?.(() => …)`: an optional call whose callee is never

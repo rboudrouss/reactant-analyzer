@@ -11,6 +11,7 @@
 use oxc_ast::ast::*;
 
 use super::Candidate;
+use super::cfg_builder::FnKind;
 
 /// A top-level function-like binding the walker found: its name, parameters,
 /// body, and (folded) return-type annotation. A detector's [`Classify`] reads
@@ -24,6 +25,8 @@ pub(crate) struct FnItem<'a> {
     /// `true` for a concise arrow body (`x => expr`) — see
     /// [`Candidate::expression`](crate::lowering::Candidate::expression).
     pub expression: bool,
+    /// See [`Candidate::kind`](crate::lowering::Candidate::kind).
+    pub kind: FnKind,
 }
 
 /// Predicate deciding whether a walked function is a candidate of this kind.
@@ -129,6 +132,7 @@ pub(crate) fn consider_fn<'a>(
             return_type: func.return_type.as_deref().or(extra_type_ann),
             // A `function` never has a concise body.
             expression: false,
+            kind: FnKind::of(func.r#async, func.generator),
         },
         classify,
         out,
@@ -151,6 +155,7 @@ pub(crate) fn consider_arrow<'a>(
             body: &arrow.body,
             return_type: arrow.return_type.as_deref().or(extra_type_ann),
             expression: arrow.expression,
+            kind: FnKind::of(arrow.r#async, false),
         },
         classify,
         out,
@@ -164,6 +169,7 @@ fn push_if<'a>(item: FnItem<'a>, classify: Classify, out: &mut Vec<Candidate<'a>
             params: item.params,
             body: item.body,
             expression: item.expression,
+            kind: item.kind,
         });
     }
 }

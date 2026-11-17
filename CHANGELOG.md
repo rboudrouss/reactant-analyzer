@@ -171,6 +171,13 @@ on a program React settles; 323 oracle cases, none a known false negative.
   set(n + 1)` in an effect or the render, a child iterating its parent's
   setters, and `for (const item of items) item.count++` before
   `setItems(items)` were silent.
+- A call of a generator or an async function is a new object (an iterator, a
+  promise), not the value its body returns, and an `await` is unknown: what a
+  `yield` or a `return` hands out reaches the code that consumes it, so a
+  setter a generator yields writes its slot (`for (const f of gen(setN))
+  f(n + 1)` was silent) and an effect depending on `load()` re-runs at every
+  render. A generator's body runs only when driven: a write in it is a
+  Warning where it was a false Error (#317).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

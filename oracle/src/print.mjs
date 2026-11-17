@@ -52,6 +52,8 @@ function printHelper(h, exported) {
       return `${ex}function ${h.name}(s, a) {\n  return ${expr(h.body)};\n}`;
     case "hook":
       return `${ex}function ${h.name}(init) {\n  const [v, setV] = useState(init);\n  return [v, setV];\n}`;
+    case "yielder":
+      return `${ex}function* ${h.name}(f) {\n  yield f;\n}`;
     default:
       throw new Error(`print: helper ${h.kind}`);
   }
@@ -132,6 +134,8 @@ export function stmt(s) {
           return `${s.wrap}${opt(s.wrapOptional)}(() => ${call});`;
         case "optarg":
           return `${s.via}?.(${call});`;
+        case "yield":
+          return `for (const f of ${s.via}(${s.target})) ${writeCall({ ...s, target: "f" })};`;
         default:
           throw new Error(`print: wrap ${s.wrap}`);
       }

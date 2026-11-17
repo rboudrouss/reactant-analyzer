@@ -9,7 +9,7 @@ use crate::{
     ir::{
         FileTable, SourceMap,
         cfg::{BasicBlock, CFG, Edge, EdgeKind, Terminator},
-        expr::{Expr, Prim},
+        expr::{Expr, Prim, SummaryValue},
         stmt::Stmt,
         types::{BlockId, ExprId},
     },
@@ -216,6 +216,30 @@ impl BlockBuilder {
         self.terminated = false;
     }
 
+    /// The consumer of a generator may stop driving it here, for good (#317):
+    /// before its first step and at every `yield`. Sealed as a branch on a
+    /// condition nothing knows, one arm returning, so nothing past this point
+    /// is certain to run. A no-op on a terminated block, as for an `await`.
+    pub(super) fn may_stop(&mut self) {
+        if self.terminated {
+            return;
+        }
+        let go = self.new_block();
+        let stop = self.new_block();
+        let from = self.seal_with(Terminator::Branch {
+            cond: Expr::SummaryVal(SummaryValue::Top),
+            then_: go,
+            else_: stop,
+            span: None,
+            chain_link: false,
+        });
+        self.add_edge(from, go, EdgeKind::IfTrue);
+        self.add_edge(from, stop, EdgeKind::IfFalse);
+        self.start_block(stop);
+        self.seal_with(Terminator::Return(Expr::Lit(Prim::Unit), None));
+        self.start_block(go);
+    }
+
     /// Seal the current block and continue in a fresh one across an `Await`
     /// edge (#117). Control is unconditional — dominance and reachability are
     /// unchanged — but the successor is marked as running after a suspension.
@@ -365,10 +389,10 @@ fn lower_stmt(stmt: &Statement, builder: &mut BlockBuilder) {
             );
         }
         Statement::ForInStatement(f) => {
-            lower_iter_loop(&f.left, &f.right, &f.body, false, builder);
+            lower_iter_loop(&f.left, &f.right, &f.body, None, builder);
         }
         Statement::ForOfStatement(f) => {
-            lower_iter_loop(&f.left, &f.right, &f.body, true, builder);
+            lower_iter_loop(&f.left, &f.right, &f.body, Some(f.r#await), builder);
         }
         Statement::DoWhileStatement(dw) => {
             // The test gets its own block: `continue` in a `do…while` runs it,
@@ -451,8 +475,9 @@ fn lower_stmt(stmt: &Statement, builder: &mut BlockBuilder) {
         Statement::FunctionDeclaration(func) => {
             if let Some(id) = &func.id {
                 let ctx = builder.ctx.clone();
+                let kind = FnKind::of(func.r#async, func.generator);
                 let (params, body_cfg) = if let Some(body) = func.body.as_deref() {
-                    build_fn_body_cfg(&func.params, body, &ctx)
+                    build_fn_body_cfg(&func.params, body, kind, &ctx)
                 } else {
                     (vec![], empty_cfg())
                 };
@@ -768,29 +793,36 @@ fn lower_for(
 ///   of the entries of every array the heap places it at, ⊤ wherever it may
 ///   be something else — what an array method passes its callback, so
 ///   `for (const set of [setN]) set(x)` writes as `[setN].forEach(set =>
-///   set(x))` does. A `for…in` key is a string the analysis does not know:
-///   `Top`.
+///   set(x))` does. A `for await…of` variable is that element awaited
+///   ([`handed_out`], #317). A `for…in` key is a string the analysis does
+///   not know: `Top`.
+///
+/// `of` is `None` for a `for…in`, else whether the `for…of` awaits.
 fn lower_iter_loop(
     left: &ForStatementLeft,
     right: &Expression,
     body: &Statement,
-    of: bool,
+    of: Option<bool>,
     builder: &mut BlockBuilder,
 ) {
     // Preheader: the iterated expression is read once at loop entry, into
     // the temp every iteration reads its element off.
     let iterated = lower_expr(right, builder);
     let iter_span = builder.span_at(right.span().start);
-    let element = if of {
+    let element = if let Some(awaits) = of {
         let held = builder.iter_temp(right.span());
         builder.push_stmt(Stmt::Let {
             var: held.clone(),
             rhs: iterated,
             span: iter_span,
         });
-        Expr::IndexAccess {
+        let element = Expr::IndexAccess {
             arr: Box::new(Expr::Var(held)),
-            idx: Box::new(Expr::SummaryVal(crate::ir::expr::SummaryValue::Top)),
+            idx: Box::new(Expr::SummaryVal(SummaryValue::Top)),
+        };
+        match awaits {
+            true => handed_out(element),
+            false => element,
         }
     } else {
         builder.push_stmt(Stmt::ExprStmt(iterated, iter_span));
@@ -1131,23 +1163,91 @@ pub(super) fn param_defaults(params: &FormalParameters, ctx: &LowerCtx) -> Vec<O
         .collect()
 }
 
+/// What a call of a function evaluates to, which its kind decides (#317).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FnKind {
+    /// The call evaluates to what the body returns.
+    Plain,
+    /// `async`: the call runs the body up to its first `await` and evaluates
+    /// to a new promise, which the body's `return` settles.
+    Async,
+    /// `function*`, `async function*`: the call evaluates to a new iterator
+    /// and runs nothing; the body runs as far as the consumer drives it.
+    Generator,
+}
+
+impl FnKind {
+    pub fn of(is_async: bool, generator: bool) -> Self {
+        match (is_async, generator) {
+            (_, true) => FnKind::Generator,
+            (true, false) => FnKind::Async,
+            (false, false) => FnKind::Plain,
+        }
+    }
+}
+
+/// `value` handed to code the analysis does not see, which hands back a
+/// value it does not know: the call of an unknown function with `value` as
+/// its argument, so every setter or closure it holds escapes (#254). What a
+/// `yield` or a `return` gives a generator's consumer, what a `return` gives
+/// an async function's awaiter, and what an `await` makes of its operand —
+/// the analysis models no promise and no iterator (#317).
+pub(super) fn handed_out(value: Expr) -> Expr {
+    Expr::Call {
+        fn_: Box::new(Expr::SummaryVal(SummaryValue::Top)),
+        args: vec![value],
+    }
+}
+
+/// Seal `cfg`, a body of `kind`, so each `return` hands the caller what the
+/// call evaluates to (#317): for an async function or a generator, one new
+/// object the analysis does not model (a promise, an iterator), the returned
+/// value handed out to the code that consumes it.
+fn hand_back(mut cfg: CFG, kind: FnKind, ctx: &LowerCtx) -> CFG {
+    if kind == FnKind::Plain {
+        return cfg;
+    }
+    let id = ctx.ids.next();
+    for block in cfg.blocks.values_mut() {
+        let Terminator::Return(value, span) = &mut block.term else {
+            continue;
+        };
+        let made = Expr::New {
+            id,
+            fn_: Box::new(Expr::SummaryVal(SummaryValue::Top)),
+            args: vec![],
+        };
+        let value = std::mem::replace(value, made);
+        if !matches!(value, Expr::Lit(_)) {
+            block.stmts.push(Stmt::ExprStmt(handed_out(value), *span));
+        }
+    }
+    cfg
+}
+
 /// Build a function body CFG with param destructuring preamble.
 pub fn build_fn_body_cfg(
     params: &FormalParameters,
     body: &FunctionBody,
+    kind: FnKind,
     ctx: &LowerCtx,
 ) -> (Vec<String>, CFG) {
     let mut builder = BlockBuilder::new(ctx);
     builder.start_block(0);
     let param_names = inject_param_preamble(params, &mut builder);
+    if kind == FnKind::Generator {
+        builder.may_stop();
+    }
     lower_stmts(&body.statements, &mut builder);
-    (param_names, builder.into_cfg(0))
+    (param_names, hand_back(builder.into_cfg(0), kind, ctx))
 }
 
-/// Like [`build_fn_body_cfg`] for concise arrow bodies (`x => expr`).
+/// Like [`build_fn_body_cfg`] for concise arrow bodies (`x => expr`), which
+/// no generator has.
 pub fn build_expr_fn_body_cfg(
     params: &FormalParameters,
     body: &FunctionBody,
+    kind: FnKind,
     ctx: &LowerCtx,
 ) -> (Vec<String>, CFG) {
     let mut builder = BlockBuilder::new(ctx);
@@ -1159,7 +1259,7 @@ pub fn build_expr_fn_body_cfg(
             builder.seal_with(Terminator::Return(expr, builder.span_at(es.span.start)));
         }
     }
-    (param_names, builder.into_cfg(0))
+    (param_names, hand_back(builder.into_cfg(0), kind, ctx))
 }
 
 #[cfg(test)]

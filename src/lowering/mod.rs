@@ -140,20 +140,38 @@ pub struct Candidate<'a> {
     /// returns unit, and every consumer of `useThing` is left with an
     /// unresolvable hook (#5).
     pub expression: bool,
+    /// What a call of the function evaluates to: an `async` or generator
+    /// function's call is not its `return` value (#317).
+    pub kind: cfg_builder::FnKind,
 }
 
 impl Candidate<'_> {
     /// Lower this candidate's body to a CFG, honouring a concise arrow's
-    /// implicit return.
+    /// implicit return and what a call of the function's kind evaluates to.
     ///
     /// The single place that dispatch happens, so a new consumer of
     /// [`Candidate`] cannot forget it — which is how the flag came to be
     /// dropped in the first place.
     pub(crate) fn build_cfg(&self, ctx: &LowerCtx) -> (Vec<String>, crate::ir::cfg::CFG) {
+        self.build_cfg_as(self.kind, ctx)
+    }
+
+    /// [`Self::build_cfg`] for a component's render: React awaits an async
+    /// component's promise and renders what the body returns, so the render's
+    /// `return` is its output whatever the function's kind.
+    pub(crate) fn build_render_cfg(&self, ctx: &LowerCtx) -> (Vec<String>, crate::ir::cfg::CFG) {
+        self.build_cfg_as(cfg_builder::FnKind::Plain, ctx)
+    }
+
+    fn build_cfg_as(
+        &self,
+        kind: cfg_builder::FnKind,
+        ctx: &LowerCtx,
+    ) -> (Vec<String>, crate::ir::cfg::CFG) {
         if self.expression {
-            cfg_builder::build_expr_fn_body_cfg(self.params, self.body, ctx)
+            cfg_builder::build_expr_fn_body_cfg(self.params, self.body, kind, ctx)
         } else {
-            cfg_builder::build_fn_body_cfg(self.params, self.body, ctx)
+            cfg_builder::build_fn_body_cfg(self.params, self.body, kind, ctx)
         }
     }
 
@@ -533,7 +551,7 @@ pub fn lower_program_with_resolver(
     let components = detect_components(program)
         .into_iter()
         .map(|candidate| {
-            let (param_names, mut render_cfg) = candidate.build_cfg(&ctx);
+            let (param_names, mut render_cfg) = candidate.build_render_cfg(&ctx);
             let (mut hooks, hook_provenance, mut next_label) =
                 extract_hooks(&mut render_cfg, &imports, &ctx.ids);
             extract_handlers(&render_cfg, &mut hooks, &mut next_label);

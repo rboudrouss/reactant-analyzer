@@ -16,7 +16,8 @@ use crate::ir::{
 };
 
 use super::cfg_builder::{
-    BlockBuilder, build_expr_fn_body_cfg, build_fn_body_cfg, build_stmts_cfg, lower_default,
+    BlockBuilder, FnKind, build_expr_fn_body_cfg, build_fn_body_cfg, build_stmts_cfg, handed_out,
+    lower_default,
 };
 
 /// An opaque value of unknown kind (⊤). Used for expressions the analysis does
@@ -144,7 +145,8 @@ pub(super) fn lower_class(class: &Class, builder: &mut BlockBuilder) -> Expr {
             ClassElement::MethodDefinition(m) => {
                 computed_key(&m.key, builder);
                 if let Some(body) = m.value.body.as_deref() {
-                    let (params, body_cfg) = build_fn_body_cfg(&m.value.params, body, &ctx);
+                    let kind = FnKind::of(m.value.r#async, m.value.generator);
+                    let (params, body_cfg) = build_fn_body_cfg(&m.value.params, body, kind, &ctx);
                     let fn_id = builder.next_expr_id();
                     fields.push((
                         synthetic_key(builder, "[method]"),
@@ -513,10 +515,11 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
             let ctx = builder.ctx.clone();
             // Concise body (`x => expr`) carries an implicit return; block body
             // (`x => { ... }`) lowers like any function body.
+            let kind = FnKind::of(arrow.r#async, false);
             let (params, body_cfg) = if arrow.expression {
-                build_expr_fn_body_cfg(&arrow.params, &arrow.body, &ctx)
+                build_expr_fn_body_cfg(&arrow.params, &arrow.body, kind, &ctx)
             } else {
-                build_fn_body_cfg(&arrow.params, &arrow.body, &ctx)
+                build_fn_body_cfg(&arrow.params, &arrow.body, kind, &ctx)
             };
             Expr::FnLit {
                 id,
@@ -527,8 +530,9 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
         Expression::FunctionExpression(func) => {
             let id = builder.next_expr_id();
             let ctx = builder.ctx.clone();
+            let kind = FnKind::of(func.r#async, func.generator);
             let (params, body_cfg) = if let Some(body) = func.body.as_deref() {
-                build_fn_body_cfg(&func.params, body, &ctx)
+                build_fn_body_cfg(&func.params, body, kind, &ctx)
             } else {
                 (vec![], empty_cfg())
             };
@@ -646,15 +650,20 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
             value
         }
         Expression::ClassExpression(class) => lower_class(class, builder),
-        // `await` splits the block (#117, ADR-035). The value is still the
-        // awaited argument — nothing about the DATA flow changes — but the
-        // statement being lowered, and every statement after it, execute on a
-        // later turn of the event loop. Sealing here puts them in the successor,
-        // which is what lets the writer walk stamp them `deferred` instead of
-        // claiming, falsely, that lexis is execution.
+        // `await` splits the block (#117, ADR-035): the statement being
+        // lowered, and every statement after it, execute on a later turn of
+        // the event loop. Sealing here puts them in the successor, which is
+        // what lets the writer walk stamp them `deferred` instead of claiming,
+        // falsely, that lexis is execution.
         //
         // The split is skipped when the current block is already sealed: a
         // `return await f()` has nothing left to defer.
+        //
+        // The value is not the operand: a thenable operand has its `then`
+        // called and the await yields what that settles to, which the
+        // analysis does not model (an async function's call is a promise,
+        // #317). The operand is handed out ([`handed_out`]), which keeps a
+        // setter or closure it holds, and the value is unknown.
         Expression::AwaitExpression(aw) => {
             let value = lower_expr(&aw.argument, builder);
             // The awaited expression is evaluated BEFORE the suspension:
@@ -683,13 +692,21 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                 }
             };
             builder.split_at_await();
-            value
+            handed_out(value)
         }
-        Expression::YieldExpression(y) => y
-            .argument
-            .as_ref()
-            .map(|e| lower_expr(e, builder))
-            .unwrap_or(Expr::Lit(Prim::Unit)),
+        // A `yield` (or `yield*`, which yields every entry of its operand)
+        // hands its operand to the generator's consumer, code the analysis
+        // does not see; the consumer may never resume it, and resumes it with
+        // whatever it passes `next` (#317).
+        Expression::YieldExpression(y) => {
+            if let Some(e) = &y.argument {
+                let value = lower_expr(e, builder);
+                let span = builder.span_at(y.span.start);
+                builder.push_stmt(Stmt::ExprStmt(handed_out(value), span));
+            }
+            builder.may_stop();
+            opaque()
+        }
 
         _ => opaque(),
     }

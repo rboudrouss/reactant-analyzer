@@ -351,6 +351,13 @@ carries an Error.
   `??` or `&&` there lowers to, are ⊤ in the value the write stores; through a helper called by
   name, so is every name the calling body rebinds. `.then(() => setS(c ? 2 : 1))` is then a
   possible loop where it settles [#310](https://github.com/rboudrouss/reactant-analyzer/issues/310).
+- **No promise and no iterator is modeled.** A call of a generator or an async function is a new
+  object whose contents are unknown; what a `yield` or a `return` hands out, and what an `await`
+  is given, is handed to code the analysis does not see, and an `await` is ⊤. A setter a
+  generator yields is then written with any value: `for (const x of gen()) setN(x)` over
+  `function* gen() { yield 0; }` is a possible loop where it settles. A generator's body runs
+  where it is called, as far as its consumer may drive it, so a write in it is never certain
+  [#317](https://github.com/rboudrouss/reactant-analyzer/issues/317).
 - **A value an input hands the component is new only when the parent renders.** A fresh dep or
   a fresh write is certain only where the component's own run allocates it (a literal, an
   element, an allocating builtin, a member a constant names of one, a memo over one, a name
