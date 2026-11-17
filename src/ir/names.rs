@@ -108,7 +108,7 @@ const TEMP_PREFIXES: &[&str] = &[
 ];
 
 /// `true` for a name lowering minted, whatever salt or member path follows
-/// it: a prefix of [`TEMP_PREFIXES`] then digits (`__t12_30`, `__p0.a`,
+/// it: a prefix lowering mints (`TEMP_PREFIXES`) then digits (`__t12_30`, `__p0.a`,
 /// `__hook_1#2`). A source name may start with `__` too (`__DEV__`), so the
 /// shape is checked whole. No message prints such a name.
 pub fn is_lowering_temp(var: &str) -> bool {

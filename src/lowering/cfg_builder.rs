@@ -48,7 +48,7 @@ impl ExprIds {
 }
 
 /// The temps a file's lowering mints for an expression's value
-/// ([`BlockBuilder::fresh_temp`]), with the span each stands for. Shared by
+/// (`BlockBuilder::fresh_temp`), with the span each stands for. Shared by
 /// every body of the file, as [`ExprIds`] is; read back into the
 /// [`FileTable`] once the file is lowered ([`LowerCtx::name_temps`]).
 #[derive(Debug, Clone, Default)]
