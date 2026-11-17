@@ -1198,11 +1198,13 @@ fn try_extract_setter_call<'e>(
     expr: &'e Expr,
     setter_vars: &HashSet<Var>,
 ) -> Option<(Var, &'e Expr)> {
+    // Through a name or a member path (`t[1]` is `t.1`), as the setter
+    // walk matches a call.
     if let Expr::Call { fn_, args } = expr
-        && let Expr::Var(name) = fn_.as_ref()
-        && setter_vars.contains(name)
+        && let Some(name) = crate::engine::setters::callee_path(fn_)
+        && setter_vars.contains(&name)
     {
-        Some((name.clone(), args.first()?))
+        Some((name, args.first()?))
     } else {
         None
     }

@@ -1432,6 +1432,34 @@ pub(crate) fn all_setter_labels(comp: &AnalysisResult<StateValue>) -> SetterTarg
     setter_labels_of(&comp.render_cfg, &comp.hooks)
 }
 
+/// [`all_setter_labels`], with the member paths the converged values put one
+/// of the component's own setters behind: `t.1` of a stored pair (`const t =
+/// useState(0)`, `const t = [v, setV]`), `api.setV` (#288). The reading the
+/// writer relation and `setter-in-render` make of a call through a path
+/// ([`RenderSetterSites`]), for a rule that matches setter calls by name: a
+/// path holding a closure over a setter is not one, its body is walked.
+pub(crate) fn setter_targets_with_paths(comp: &AnalysisResult<StateValue>) -> SetterTargets {
+    let mut targets = all_setter_labels(comp);
+    let converged = collect_component_setter_vars(
+        &comp.render_cfg,
+        std::slice::from_ref(&comp.param),
+        &comp.block_states,
+        &comp.heap,
+    );
+    for (path, props) in converged {
+        // A name is the may table's: only a member path is added.
+        if !path.contains('.') {
+            continue;
+        }
+        for p in props {
+            if p.component == comp.component && !p.closure {
+                targets.0.entry(path.clone()).or_default().insert(p.label);
+            }
+        }
+    }
+    targets
+}
+
 /// [`all_setter_labels`] over a render body and its hook table, before they
 /// are an [`AnalysisResult`] — what the fixpoint reads to store its relations.
 pub(crate) fn setter_labels_of(render_cfg: &CFG, hooks: &[HookEntry]) -> SetterTargets {
@@ -3904,9 +3932,11 @@ pub(crate) fn may_written_slots(
             _ => {}
         }
     }
+    // A member path (`t.1`, [`setter_targets_with_paths`]) is referenced
+    // where its root is.
     setter_labels
         .pairs()
-        .filter(|(v, _)| used.contains(*v))
+        .filter(|(v, _)| used.contains(v.split('.').next().unwrap_or(v)))
         .map(|(_, l)| l)
         .collect()
 }

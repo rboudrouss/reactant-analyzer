@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 use crate::ir::{
     FileTable,
-    bindings::nested_bodies,
+    bindings::{element_binding, nested_bodies},
     cfg::CFG,
     expr::Expr,
     hooks::{HookEntry, HookProvenance},
@@ -77,7 +77,8 @@ pub struct SourceNames {
     /// The name the render's `useState` destructuring declares for each slot
     /// (`const [n, setN]`): a `Let` of the slot's read the component itself
     /// writes, not an inlined hook, the smallest such name if there are
-    /// several (#278).
+    /// several (#278); else a member of a stored pair (`t[0]`), or a name the
+    /// slot reaches through a custom hook's result (#288).
     slots: HashMap<HookLabel, Var>,
 }
 
@@ -152,23 +153,52 @@ impl SourceNames {
             }
         }
         let mut slots: HashMap<HookLabel, Var> = HashMap::new();
+        let mut ranked: HashMap<HookLabel, (bool, bool, Var)> = HashMap::new();
         for stmt in cfg.blocks.values().flat_map(|b| &b.stmts) {
             // A slot an inlined hook declares (`storedValue#3`) is named by
             // what the component calls it, the alias table's business.
-            // A state hook's pair kept whole reads its value as `t[0]` (#283).
-            if let Stmt::Let { var, rhs, .. } = stmt
-                && let Some((label, name)) = match rhs.peel_ts() {
-                    Expr::StateVal(label) => Some((*label, var.clone())),
-                    pair => pair
-                        .as_state_pair()
-                        .map(|label| (label, format!("{var}{PATH_MARK}0"))),
+            let Stmt::Let { var, rhs, .. } = stmt else {
+                continue;
+            };
+            if var.starts_with("__") || var.contains(SPLICE_MARK) {
+                continue;
+            }
+            // The slot the name holds, or the slots the array it holds keeps
+            // at its positions: a state hook's pair kept whole reads its
+            // value as `t[0]` (#283), and so does a tuple `[v, setV]` or a
+            // custom hook's returned pair, destructured or not (#288).
+            let mut named: Vec<(HookLabel, Var)> = Vec::new();
+            let name = Expr::Var(var.clone());
+            let held = match rhs.peel_ts() {
+                Expr::StateVal(_) => Some(rhs.peel_ts()),
+                _ => element_binding(&name, cfg),
+            };
+            match held {
+                Some(Expr::StateVal(label)) => named.push((*label, var.clone())),
+                Some(Expr::ArrayLit { elems, .. }) => {
+                    for (i, e) in elems.iter().enumerate() {
+                        if let Some(Expr::StateVal(label)) = element_binding(e, cfg) {
+                            named.push((*label, format!("{var}{PATH_MARK}{i}")));
+                        }
+                    }
                 }
-                && !var.starts_with("__")
-                && !var.contains(SPLICE_MARK)
-            {
-                let best = slots.entry(label).or_insert_with(|| name.clone());
-                if name < *best {
-                    *best = name;
+                _ => {}
+            }
+            // The name a declaration binds wins (`const [n] = …`, `const t =
+            // useState(0)`) over one renaming another name (`const c = n`,
+            // #278, unless nothing else names the slot: `const t =
+            // useCounter()`), a name over a member of a stored array, then
+            // the smallest.
+            let renames = matches!(rhs.peel_ts(), Expr::Var(_));
+            let rank = |n: &Var| (renames, n.contains(PATH_MARK), n.clone());
+            for (label, name) in named {
+                let key = rank(&name);
+                match ranked.get(&label) {
+                    Some(best) if *best <= key => {}
+                    _ => {
+                        ranked.insert(label, key);
+                        slots.insert(label, name);
+                    }
                 }
             }
         }

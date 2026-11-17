@@ -155,6 +155,12 @@ on a program React settles; 323 oracle cases, none a known false negative.
   `a ? onX : onX`, a registrar `(a ?? window).setInterval`), never by a
   lowering temp (`__t0`); the human `var:` tag is left out for such a value
   (#293).
+- `stale-closure` and `derived-state` read a slot and its setter through a
+  stored pair (`const t = useState(0)` then `t[0]`, `t[1]`; `const t = [v,
+  setV]`; the destructured result of a hook returning one), as the loop rules
+  do; a stale capture through a pair is a Warning. A slot reached through such
+  a pair is named as the component calls it (`t[0]`, `n`), never `state #2`
+  (#288).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

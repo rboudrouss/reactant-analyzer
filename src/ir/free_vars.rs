@@ -3,7 +3,7 @@ use std::fmt;
 
 use crate::ir::{
     cfg::{CFG, Terminator},
-    expr::Expr,
+    expr::{Expr, Prim},
     stmt::Stmt,
     types::Var,
 };
@@ -87,7 +87,12 @@ impl fmt::Display for AccessPath {
         // internal `#salt` alpha-rename marker, which must not reach the user.
         f.write_str(&crate::ir::source_name(&self.root))?;
         for seg in &self.segments {
-            write!(f, ".{seg}")?;
+            // An element ([`compute_free_paths_indexed`]) reads as an index.
+            if seg.bytes().all(|b| b.is_ascii_digit()) {
+                write!(f, "[{seg}]")?;
+            } else {
+                write!(f, ".{seg}")?;
+            }
         }
         Ok(())
     }
@@ -131,6 +136,32 @@ pub fn compute_free_paths(cfg: &CFG) -> HashSet<AccessPath> {
     compute_free_paths_pinned(cfg, &[])
 }
 
+/// [`compute_free_paths`] where a constant index names the element it reads,
+/// as a field does: `t[0]` is `{root: t, segments: [0]}`, the spelling
+/// [`crate::engine::setters`]' `callee_path` gives `t[1]`. What tells a
+/// stored pair's value (`t[0]`) from its setter (`t[1]`, #288).
+pub fn compute_free_paths_indexed(cfg: &CFG) -> HashSet<AccessPath> {
+    let mut used = HashSet::new();
+    collect_body_paths(
+        cfg,
+        &Walk {
+            pinned: HashSet::new(),
+            indexed: true,
+        },
+        &mut used,
+    );
+    used
+}
+
+/// How a read walk spells what it records: the deps-pinned keys it skips
+/// ([`free_paths_and_pinned`]), and whether a constant index names its
+/// element ([`compute_free_paths_indexed`]) or stops the path.
+#[derive(Default)]
+struct Walk {
+    pinned: HashSet<String>,
+    indexed: bool,
+}
+
 /// The body's free paths, and the subset of them the deps array already
 /// **pins**: reads that occur *only* inside a sub-expression appearing
 /// verbatim in `deps`.
@@ -163,9 +194,12 @@ pub fn free_paths_and_pinned(
 }
 
 fn compute_free_paths_pinned(cfg: &CFG, pinned: &[Expr]) -> HashSet<AccessPath> {
-    let keys: HashSet<String> = pinned.iter().filter_map(pure_key).collect();
+    let walk = Walk {
+        pinned: pinned.iter().filter_map(pure_key).collect(),
+        indexed: false,
+    };
     let mut used: HashSet<AccessPath> = HashSet::new();
-    collect_body_paths(cfg, &keys, &mut used);
+    collect_body_paths(cfg, &walk, &mut used);
     used
 }
 
@@ -184,13 +218,13 @@ fn compute_free_paths_pinned(cfg: &CFG, pinned: &[Expr]) -> HashSet<AccessPath> 
 /// reading the chain: its operand `a` is the receiver the link reads right
 /// after, so `a?.b?.()` reads `a.b` — what a `[a?.b]` dep covers — and not
 /// the bare `a` (#301).
-fn collect_body_paths(cfg: &CFG, pinned: &HashSet<String>, out: &mut HashSet<AccessPath>) {
-    let aliases = local_aliases(cfg);
+fn collect_body_paths(cfg: &CFG, walk: &Walk, out: &mut HashSet<AccessPath>) {
+    let aliases = local_aliases(cfg, walk.indexed);
     let mut used: HashSet<AccessPath> = HashSet::new();
     for block in cfg.blocks.values() {
         for stmt in &block.stmts {
             if !matches!(stmt, Stmt::Let { var, .. } if aliases.contains_key(var)) {
-                stmt.for_each_expr(&mut |e| collect_paths(e, pinned, &mut used));
+                stmt.for_each_expr(&mut |e| collect_paths(e, walk, &mut used));
             }
         }
         match &block.term {
@@ -198,7 +232,7 @@ fn collect_body_paths(cfg: &CFG, pinned: &HashSet<String>, out: &mut HashSet<Acc
                 chain_link: true, ..
             } => {}
             Terminator::Return(e, _) | Terminator::Branch { cond: e, .. } => {
-                collect_paths(e, pinned, &mut used)
+                collect_paths(e, walk, &mut used)
             }
             Terminator::Jump(_) | Terminator::Unreachable => {}
         }
@@ -213,7 +247,7 @@ fn collect_body_paths(cfg: &CFG, pinned: &HashSet<String>, out: &mut HashSet<Acc
 /// bound twice is not a rename, and a right-hand side that is anything but a
 /// plain chain (a call, an index, an object literal) is a computation whose
 /// reads have to be recorded where they happen.
-fn local_aliases(cfg: &CFG) -> HashMap<Var, AccessPath> {
+fn local_aliases(cfg: &CFG, indexed: bool) -> HashMap<Var, AccessPath> {
     let mut counts: HashMap<&Var, usize> = HashMap::new();
     let mut candidates: HashMap<Var, AccessPath> = HashMap::new();
     for block in cfg.blocks.values() {
@@ -229,7 +263,7 @@ fn local_aliases(cfg: &CFG) -> HashMap<Var, AccessPath> {
             // `!opaque` already implies `side` is empty (only a dynamic index
             // pushes one), but the walk skips this statement wholesale, so an
             // off-chain sub-expression here would be a read lost outright.
-            if let Some((root, segments, false)) = extract_path(rhs, &mut side)
+            if let Some((root, segments, false)) = extract_path(rhs, &mut side, indexed)
                 && side.is_empty()
             {
                 candidates.insert(var.clone(), AccessPath { root, segments });
@@ -289,10 +323,20 @@ fn subtract_local_definitions(cfg: &CFG, used: &mut HashSet<AccessPath>) {
 /// pins — so it is dropped (leaning to a false positive, never a negative).
 /// Non-variable deps (literals, calls) yield no path.
 pub fn dep_paths(deps: &[Expr]) -> Vec<AccessPath> {
+    declared_paths(deps, false)
+}
+
+/// [`dep_paths`] where a constant index names its element (`[t[0]]`
+/// declares `t.0`), the reading of [`compute_free_paths_indexed`].
+pub fn dep_paths_indexed(deps: &[Expr]) -> Vec<AccessPath> {
+    declared_paths(deps, true)
+}
+
+fn declared_paths(deps: &[Expr], indexed: bool) -> Vec<AccessPath> {
     deps.iter()
         .filter_map(|e| {
             let mut side = Vec::new();
-            match extract_path(e, &mut side) {
+            match extract_path(e, &mut side, indexed) {
                 Some((root, segments, opaque)) if !opaque => Some(AccessPath { root, segments }),
                 _ => None,
             }
@@ -316,14 +360,28 @@ pub fn path_covered(used: &AccessPath, declared: &[AccessPath]) -> bool {
 /// `side` for the caller to recurse into. Returns `(root, segments, opaque)`
 /// where `opaque` marks a dynamic index encountered in the chain (segments
 /// are then meaningless — collapsed to the bare root).
-fn extract_path<'e>(e: &'e Expr, side: &mut Vec<&'e Expr>) -> Option<(Var, Vec<String>, bool)> {
+fn extract_path<'e>(
+    e: &'e Expr,
+    side: &mut Vec<&'e Expr>,
+    indexed: bool,
+) -> Option<(Var, Vec<String>, bool)> {
     match e {
         Expr::Var(v) => Some((v.clone(), Vec::new(), false)),
-        Expr::TSAnnotated(inner) => extract_path(inner, side),
+        Expr::TSAnnotated(inner) => extract_path(inner, side, indexed),
         Expr::FieldAccess { obj, field } => {
-            extract_path(obj, side).map(|(root, mut segs, opaque)| {
+            extract_path(obj, side, indexed).map(|(root, mut segs, opaque)| {
                 if !opaque {
                     segs.push(field.clone());
+                }
+                (root, segs, opaque)
+            })
+        }
+        // A constant index names its element, when the walk asks for it.
+        Expr::IndexAccess { arr, idx } if indexed && const_index(idx).is_some() => {
+            let i = const_index(idx)?;
+            extract_path(arr, side, indexed).map(|(root, mut segs, opaque)| {
+                if !opaque {
+                    segs.push(i.to_string());
                 }
                 (root, segs, opaque)
             })
@@ -335,7 +393,7 @@ fn extract_path<'e>(e: &'e Expr, side: &mut Vec<&'e Expr>) -> Option<(Var, Vec<S
             // handle the read passes through, and a `[theme.snackBar]` dep covers
             // it exactly as `[x.a]` already covers `x.a.b`. Only the segments
             // *below* the index are lost — `opaque` stops the caller pushing more.
-            extract_path(arr, side).map(|(root, segs, _)| (root, segs, true))
+            extract_path(arr, side, indexed).map(|(root, segs, _)| (root, segs, true))
         }
         other => {
             side.push(other);
@@ -344,17 +402,25 @@ fn extract_path<'e>(e: &'e Expr, side: &mut Vec<&'e Expr>) -> Option<(Var, Vec<S
     }
 }
 
+/// The element a constant, non-negative index names.
+fn const_index(idx: &Expr) -> Option<i32> {
+    match idx.peel_ts() {
+        Expr::Lit(Prim::Int(i)) if *i >= 0 => Some(*i),
+        _ => None,
+    }
+}
+
 /// Collect the access paths read by a single expression (the per-`Expr`
 /// kernel of [`compute_free_paths`]; no local-definition subtraction).
 pub fn collect_used_paths(expr: &Expr, out: &mut HashSet<AccessPath>) {
-    collect_paths(expr, &HashSet::new(), out);
+    collect_paths(expr, &Walk::default(), out);
 }
 
 /// The kernel of [`collect_used_paths`], carrying the set of deps-pinned
 /// canonical keys down the walk — into nested closures too, since a read is
 /// pinned wherever in the body it sits.
-fn collect_paths(expr: &Expr, pinned: &HashSet<String>, out: &mut HashSet<AccessPath>) {
-    if !pinned.is_empty() && pure_key(expr).is_some_and(|k| pinned.contains(&k)) {
+fn collect_paths(expr: &Expr, walk: &Walk, out: &mut HashSet<AccessPath>) {
+    if !walk.pinned.is_empty() && pure_key(expr).is_some_and(|k| walk.pinned.contains(&k)) {
         return;
     }
     match expr {
@@ -363,11 +429,11 @@ fn collect_paths(expr: &Expr, pinned: &HashSet<String>, out: &mut HashSet<Access
         // off-chain sub-exprs it collects — never a generic child descent.
         Expr::Var(_) | Expr::FieldAccess { .. } | Expr::IndexAccess { .. } => {
             let mut side = Vec::new();
-            if let Some((root, segments, _)) = extract_path(expr, &mut side) {
+            if let Some((root, segments, _)) = extract_path(expr, &mut side, walk.indexed) {
                 out.insert(AccessPath { root, segments });
             }
             for s in side {
-                collect_paths(s, pinned, out);
+                collect_paths(s, walk, out);
             }
         }
         // `for_each_child` does not cross `FnLit`; the capture set is the
@@ -376,11 +442,11 @@ fn collect_paths(expr: &Expr, pinned: &HashSet<String>, out: &mut HashSet<Access
             params, body_cfg, ..
         } => {
             let mut inner: HashSet<AccessPath> = HashSet::new();
-            collect_body_paths(body_cfg, pinned, &mut inner);
+            collect_body_paths(body_cfg, walk, &mut inner);
             out.extend(inner.into_iter().filter(|p| !params.contains(&p.root)));
         }
         // Everything else: structural descent via the canonical child walker.
-        _ => expr.for_each_child(&mut |c| collect_paths(c, pinned, out)),
+        _ => expr.for_each_child(&mut |c| collect_paths(c, walk, out)),
     }
 }
 

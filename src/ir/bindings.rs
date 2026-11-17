@@ -127,6 +127,60 @@ pub fn binding_site_of<'c>(var: &str, cfg: &'c CFG) -> Option<(BlockId, &'c Expr
     Some(cur)
 }
 
+/// What `expr` holds, read through renames and through the elements of a
+/// stored array: the end of the chain of sole bindings in `cfg` a name
+/// starts ([`binding_of`]), where `x[i]`, a constant index of an `x` bound to
+/// an array literal whose positions are its elements (no spread, no hole),
+/// reads element `i`. That is the pair `useState` returns kept whole (`t[0]`,
+/// #283), a tuple `[v, setV]`, and what a destructuring of either binds
+/// (`__arr[0]`). A *may* reading: the array is an object some body may
+/// mutate after it is built, and nothing here proves otherwise (#288).
+pub fn element_binding<'c>(expr: &'c Expr, cfg: &'c CFG) -> Option<&'c Expr> {
+    let mut cur = expr.peel_ts();
+    for _ in 0..MAX_ALIAS_HOPS + 2 {
+        cur = match cur {
+            Expr::Var(v) => binding_of(v, cfg)?.peel_ts(),
+            Expr::IndexAccess { arr, idx } => {
+                let Expr::Lit(crate::ir::expr::Prim::Int(i)) = idx.peel_ts() else {
+                    return None;
+                };
+                let Expr::ArrayLit {
+                    elems,
+                    arity,
+                    spread_at,
+                    ..
+                } = element_binding(arr, cfg)?
+                else {
+                    return None;
+                };
+                if !spread_at.is_empty() || arity.exact() != Some(elems.len()) {
+                    return None;
+                }
+                elems.get(usize::try_from(*i).ok()?)?.peel_ts()
+            }
+            other => return Some(other),
+        };
+    }
+    None
+}
+
+/// The slots whose value `expr` may hold through [`element_binding`]: the
+/// slot itself (`StateVal(l)`, `n` of `const [n] = useCounter()`), or every
+/// slot value element of the array it holds (`t` of `const t = useState(0)`).
+pub fn stored_slot_values(expr: &Expr, cfg: &CFG) -> Vec<HookLabel> {
+    match element_binding(expr, cfg) {
+        Some(Expr::StateVal(l)) => vec![*l],
+        Some(Expr::ArrayLit { elems, .. }) => elems
+            .iter()
+            .filter_map(|e| match element_binding(e, cfg)? {
+                Expr::StateVal(l) => Some(*l),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// The state slot `expr` reads on every path: `StateVal(l)` itself, or a name
 /// whose sole binding in `scope`, through renames that are sole bindings too,
 /// is `StateVal(l)`. A must-alias, where `resolve_setter_aliases` keeps every

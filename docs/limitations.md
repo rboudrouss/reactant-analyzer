@@ -139,6 +139,10 @@ that writes it (see *Cross-file limits*).
   [#30](https://github.com/rboudrouss/reactant-analyzer/issues/30), and `redundant-set-state` on a reference: the domain
   knows a reference is stable, not which one it is, so `setV(A)` while `v` holds `A` is not
   reported, the price of not reporting `setV(B)` [#179](https://github.com/rboudrouss/reactant-analyzer/issues/179).
+- A slot read through a stored pair (`const t = useState(0)` then `t[0]`, `const t = [v, setV]`)
+  is read off the array's elements, a reading the analysis does not prove (the array is an object
+  a body may mutate): `stale-closure` reports such a capture as a Warning, never an Error, where
+  the destructured `n` of the same program is an Error [#288](https://github.com/rboudrouss/reactant-analyzer/issues/288).
 - The guard proofs assume a call over held inputs returns the same value on every run. The
   reads-kill does not: a write whose value crosses a call not known pure (see *Which calls are
   functions of their inputs* below) is read as a function of its inputs only when that value is
