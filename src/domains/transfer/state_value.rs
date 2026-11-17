@@ -66,9 +66,12 @@ impl Transfer for StateValueTransfer {
         ctx: &mut AnalysisCtx<StateValue>,
     ) -> EnvVal<StateValue> {
         // One recompute: a memo's body, run against the real stores (ADR-020
-        // item 8), with the sites it returns; a new function for a callback
-        // literal; for any other callback, its argument, which nothing here
-        // reads. A body no run returns from bounds nothing.
+        // item 8), with the sites it returns; for a callback, the function it
+        // hands back (#320) — a literal's closure, allocated at the hook's
+        // site with what it captures here, as an inline arrow is, or the
+        // argument itself. Every reader of a closure (a call through a name,
+        // a prop, an escape) then finds the callback where it finds an arrow.
+        // A body no run returns from bounds nothing.
         let (deps, value, sites) = match memo {
             HookEntry::Memo { body_cfg, deps, .. } => {
                 let run = run_cfg(self, body_cfg, env.clone(), ctx, 0);
@@ -76,11 +79,29 @@ impl Transfer for StateValueTransfer {
                 (deps, run.ret, sites)
             }
             HookEntry::Callback {
+                label,
+                body_cfg,
+                params,
                 literal: true,
                 deps,
                 ..
-            } => (deps, StateValue::reference(Stability::PerRender), None),
-            HookEntry::Callback { deps, .. } => (deps, StateValue::top(), None),
+            } => {
+                let body = ctx
+                    .query
+                    .callback_body(*label)
+                    .unwrap_or_else(|| std::sync::Arc::new(body_cfg.clone()));
+                let id = ctx.component.hook_site(*label);
+                ctx.heap.alloc_fn(id, params, &body, env, ctx.component);
+                let sites = Some(Sites::closed([id]));
+                (deps, StateValue::reference(Stability::PerRender), sites)
+            }
+            HookEntry::Callback { deps, .. } => match memo.callback_argument() {
+                Some(arg) => {
+                    let sites = alloc_literal(self, arg, env, ctx);
+                    (deps, eval_state_value(arg, env, ctx), sites)
+                }
+                None => (deps, StateValue::top(), None),
+            },
             _ => return EnvVal::Val(StateValue::top()),
         };
         let value = memo_value(component, deps, value, render_cfg, env, ctx);

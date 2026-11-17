@@ -372,6 +372,31 @@ impl HookEntry {
         }
     }
 
+    /// What a `useCallback` hands back when its argument is no function
+    /// literal (`useCallback(f, deps)`): the argument itself, which lowering
+    /// keeps as the callee of its body's one `return` (calling the hook's
+    /// value calls it). `None` for a literal and for any other hook.
+    pub fn callback_argument(&self) -> Option<&Expr> {
+        let HookEntry::Callback {
+            body_cfg,
+            literal: false,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let mut returns = body_cfg.blocks.values().filter_map(|b| match &b.term {
+            crate::ir::cfg::Terminator::Return(Expr::Call { fn_, args }, _) if args.is_empty() => {
+                Some(&**fn_)
+            }
+            _ => None,
+        });
+        match (returns.next(), returns.next(), body_cfg.blocks.len()) {
+            (Some(arg), None, 1) => Some(arg),
+            _ => None,
+        }
+    }
+
     /// Source range of the hook call site, when lowering recorded one.
     pub fn span(&self) -> Option<SourceRange> {
         match self {

@@ -512,13 +512,21 @@ fn bind_rhs<T: Transfer>(
     // heap instead of inheriting the container's `PerRender` (issue #88).
     // Anything else points nowhere the heap knows: the sites of the name's
     // previous binding are not what it holds now (#240).
-    let sites = alloc_literal(transfer, rhs, env, ctx);
+    let mut sites = alloc_literal(transfer, rhs, env, ctx);
+    // A hook that hands back a function running its argument
+    // (`useEffectEvent`): a call through the value runs that function, which
+    // is where it points for every reader (#320).
+    if let Expr::HookMarker(label, _) = rhs
+        && let Some(arg) = ctx.query.hands_back(*label)
+    {
+        sites = alloc_literal(transfer, arg, env, ctx);
+    }
     env.bind_locs(var.to_string(), sites);
     // `useRef` returns the hook's one object (#268): the closures a body
     // writes into `current` are what a call through it runs. It persists
     // across renders, so a value read through it stays unknown.
     if let Expr::HookMarker(label, MarkerVal::StableRef) = rhs {
-        let id = ctx.component.ref_site(*label);
+        let id = ctx.component.hook_site(*label);
         if ctx.heap.get(id).is_none() {
             let members = Members {
                 persists: true,
@@ -663,7 +671,10 @@ pub(crate) fn alloc_literal<T: Transfer>(
             }
             (*id, members)
         }
-        Expr::MemoVal(label) => return ctx.memo.sites(*label).cloned(),
+        // A memo, or a callback, points where its recompute's value does.
+        Expr::MemoVal(label) | Expr::CallbackVal(label) => {
+            return ctx.memo.sites(*label).cloned();
+        }
         // A member read places what [`resolve_locs`] places, off a literal
         // receiver as well (`[x ?? {}][0]`, `{ a: {} }.a`, #307).
         Expr::FieldAccess { obj, field } => {
@@ -1067,7 +1078,7 @@ pub(crate) fn seed_ref<T: Transfer>(
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
 ) {
-    let id = ctx.component.ref_site(label);
+    let id = ctx.component.hook_site(label);
     let sites = alloc_literal(transfer, init, env, ctx);
     // What a ref holds escapes, as a write into `current` does.
     if let Some(sites) = &sites {

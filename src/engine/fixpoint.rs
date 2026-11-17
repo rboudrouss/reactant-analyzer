@@ -392,15 +392,19 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             _ => None,
         })
         .collect();
+    let hands_back = crate::engine::setters::effect_event_args(&hooks, &hook_provenance);
     let query = FixpointCtx {
         callbacks: &callback_bodies,
         reducers: &reducers,
         dispatches,
         hook_args: &hook_args,
+        hands_back: &hands_back,
     };
-    // A `useCallback` value is a function the heap does not place — its body
-    // lives in the hook entry — so where it goes is not followed: its body
-    // may run wherever an escaped closure may (#254).
+    // A `useCallback` value is placed where its recompute hands it back (a
+    // literal's closure at the hook's site, or the argument's sites, #320),
+    // which a name holding it may not follow (a rename through a body the
+    // heap does not see): its body may also run wherever an escaped closure
+    // may (#254).
     let escaped_bodies: Vec<(&[Var], &CFG)> = hooks
         .iter()
         .filter_map(|h| match h {

@@ -60,6 +60,13 @@ pub trait QueryContext {
     fn hook_args(&self, _label: crate::ir::types::HookLabel) -> &[crate::ir::expr::Expr] {
         &[]
     }
+
+    /// The function the value of the hook `label` the fixpoint did not
+    /// inline calls, when it hands back one that runs its argument: React's
+    /// `useEffectEvent` (#320). A call through the value runs that function.
+    fn hands_back(&self, _label: crate::ir::types::HookLabel) -> Option<&crate::ir::expr::Expr> {
+        None
+    }
 }
 
 // ── NullCtx ───────────────────────────────────────────────────────────────────
@@ -340,6 +347,9 @@ pub struct FixpointCtx<'a> {
     /// See `QueryContext::hook_args`.
     pub hook_args:
         &'a std::collections::HashMap<crate::ir::types::HookLabel, Vec<crate::ir::expr::Expr>>,
+    /// See `QueryContext::hands_back`.
+    pub hands_back:
+        &'a std::collections::HashMap<crate::ir::types::HookLabel, &'a crate::ir::expr::Expr>,
 }
 
 impl QueryContext for FixpointCtx<'_> {
@@ -360,5 +370,9 @@ impl QueryContext for FixpointCtx<'_> {
 
     fn hook_args(&self, label: crate::ir::types::HookLabel) -> &[crate::ir::expr::Expr] {
         self.hook_args.get(&label).map_or(&[], Vec::as_slice)
+    }
+
+    fn hands_back(&self, label: crate::ir::types::HookLabel) -> Option<&crate::ir::expr::Expr> {
+        self.hands_back.get(&label).copied()
     }
 }

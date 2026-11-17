@@ -1721,7 +1721,7 @@ fn callback_bodies(hooks: &[HookEntry]) -> HashMap<HookLabel, Arc<CFG>> {
 /// React hands back a function that runs it, and runs it nowhere else: the
 /// returned function calls the latest render's argument, and throws when
 /// called during a render.
-fn effect_event_args<'a>(
+pub(crate) fn effect_event_args<'a>(
     hooks: &'a [HookEntry],
     provenance: &[HookProvenance],
 ) -> HashMap<HookLabel, &'a Expr> {

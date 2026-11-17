@@ -200,6 +200,11 @@ on a program React settles; 323 oracle cases, none a known false negative.
   into it. Each was silent in the render or an effect, and a parameter the
   body reassigns read as its argument only (#316). A call keeps its spread
   arguments: those after a spread no longer bind to a shifted parameter.
+- A function a hook hands back is a closure wherever it goes: a parent's
+  `useCallback` (a literal, or `useCallback(f, deps)`) or `useEffectEvent`
+  value that writes its state, called by a child's effect through a prop,
+  is the possible loop the arrow it memoizes already was; it was silent
+  (#320).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

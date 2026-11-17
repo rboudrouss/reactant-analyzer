@@ -53,7 +53,7 @@ that writes it (see *Cross-file limits*).
   npm-package callee (`pkgFn(() => setN(1))`, `new IntersectionObserver(cb)`), a hook it does not
   inline (`useTable({ onClick })`), React through an element's `on*` or `ref`, an object the heap
   does not place (`props.box.current = cb`), what such a function returns, a callback past the inlining
-  depth, and every `useCallback` body, whose value the heap does not follow — runs with the
+  depth, and every `useCallback` body — runs with the
   handlers, at an unknown time [#254](https://github.com/rboudrouss/reactant-analyzer/issues/254):
   its writes reach the state store as possible writes, never as writes of the body that handed it
   over. So a loop it closes in an effect is claimed only through the slot values it moves, as a
@@ -64,8 +64,12 @@ that writes it (see *Cross-file limits*).
   [#264](https://github.com/rboudrouss/reactant-analyzer/issues/264). React's
   `useEffectEvent` is the exception: its argument — a literal, or a name bound to one or to a
   `useCallback` value — runs where a name bound once to the function it hands back is called, as a
-  `useCallback` value does; the value itself stays opaque, so a call through it React would reject
-  during render is still read as running the argument. A few package hooks have a timing of their
+  `useCallback` value does, and a call through its value runs the argument, so a call React would
+  reject during render is still read as running it. A function a hook hands back is where every
+  reader finds a closure, wherever the value goes (a prop a child calls, #320): a `useCallback`
+  literal's closure, `useCallback(f, deps)`'s `f`, what a memo returns, `useEffectEvent`'s
+  argument. A package's wrapper with no summary (`useCallbackRef`) is a hook the analysis does
+  not inline: its argument runs with the handlers. A few package hooks have a timing of their
   own (`engine::timing`): `use-debounce`'s `useDebouncedCallback(fn, wait)` runs `fn` deferred
   when it gets no options and its result is only called, cancelled or listed in deps (a `flush`, a
   `leading` option or a result handed elsewhere keep it of unknown timing), and `usehooks-ts`'s
