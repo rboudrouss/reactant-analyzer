@@ -161,6 +161,10 @@ on a program React settles; 323 oracle cases, none a known false negative.
   do; a stale capture through a pair is a Warning. A slot reached through such
   a pair is named as the component calls it (`t[0]`, `n`), never `state #2`
   (#288).
+- A slot written only through a stored pair (`t[1](x)`) is no longer read as
+  a slot that never changes: `frozen-initial-state` reports a child seeded
+  from it as it does for a destructured parent; it was silent, or an Info
+  for the child's own pair (#288).
 - A `for…of` variable is an element of the iterated value, as an array
   method's callback parameter is: a setter it holds writes its slot and an
   object it holds is the state it sits in. `for (const set of [setN])

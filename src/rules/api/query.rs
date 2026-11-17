@@ -905,7 +905,9 @@ fn slot_write_evidence(
     owner: &AnalysisResult<StateValue>,
     slot: HookLabel,
 ) -> (bool, Option<SourceRange>) {
-    let setter_labels = crate::rules::all_setter_labels(owner);
+    // A slot written only through a stored pair (`t[1]`, #288) is written:
+    // the stillness proof reads every setter path the converged values hold.
+    let setter_labels = crate::rules::setter_targets_with_paths(owner);
     let may = crate::rules::may_written_slots(&owner.render_cfg, &owner.hooks, &setter_labels);
     if !may.contains(&slot) {
         return (false, None);

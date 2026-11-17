@@ -87,6 +87,17 @@ fn a_mirror_through_a_pair_is_reported() {
     }
 }
 
+/// A parent slot written only through `t[1]` is no still slot: the child that
+/// freezes it is reported as the destructured parent's child is.
+#[test]
+fn a_slot_written_through_a_pair_moves() {
+    let all = findings();
+    let rule = "frozen-initial-state";
+    let destructured = level(&all, "FrozenChild", rule);
+    assert_eq!(destructured.as_deref(), Some("error"), "{all:#?}");
+    assert_eq!(level(&all, "FrozenChildOfPair", rule), destructured);
+}
+
 #[test]
 fn a_slot_kept_in_a_pair_is_named_as_the_component_calls_it() {
     let all = findings();

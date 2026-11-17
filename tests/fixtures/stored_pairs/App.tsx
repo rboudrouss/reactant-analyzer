@@ -126,3 +126,24 @@ export function HookPairDestructured() {
   }, [n]);
   return <div>{n}</div>;
 }
+
+// ---- frozen-initial-state: a parent slot written only through `t[1]` moves
+function FrozenParentDestructured() {
+  const [user, setUser] = useState({ name: "a" });
+  return <FrozenChild user={user} onRename={() => setUser({ name: "b" })} />;
+}
+
+function FrozenParentPair() {
+  const t = useState({ name: "a" });
+  return <FrozenChildOfPair user={t[0]} onRename={() => t[1]({ name: "b" })} />;
+}
+
+function FrozenChild({ user }: any) {
+  const [local, setLocal] = useState(user);
+  return <button onClick={() => setLocal({ name: "c" })}>{local.name}</button>;
+}
+
+function FrozenChildOfPair({ user }: any) {
+  const [local, setLocal] = useState(user);
+  return <button onClick={() => setLocal({ name: "c" })}>{local.name}</button>;
+}

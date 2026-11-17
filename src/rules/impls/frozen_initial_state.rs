@@ -13,8 +13,8 @@ use crate::{
 
 use crate::rules::{
     Certified, Diagnostic, Motion, MovingFeeder, MustResult, Rule, Severity, Step, ValueClass,
-    all_setter_labels, classify_motion, helpers::mount::MountCoupling, may_written_slots,
-    must_frozen_seed, state_slot_name, state_val_labels,
+    classify_motion, helpers::mount::MountCoupling, may_written_slots, must_frozen_seed,
+    setter_targets_with_paths, state_slot_name, state_val_labels,
 };
 
 /// Fires when a `useState` initializer reads a prop and nothing ever syncs
@@ -89,7 +89,8 @@ impl Rule for FrozenInitialState {
         let (result, component) = (ctx.program(), ctx.component());
         let comp = &result.components[&component];
         let render_cfg = &comp.render_cfg;
-        let setter_labels = all_setter_labels(comp);
+        // A slot written only through a stored pair (`t[1]`) is written (#288).
+        let setter_labels = setter_targets_with_paths(comp);
         let state_labels = state_val_labels(render_cfg);
         let locally_written = may_written_slots(render_cfg, &comp.hooks, &setter_labels);
         let name_of = |l: HookLabel| state_slot_name(l, ctx.source_names(), &state_labels);
