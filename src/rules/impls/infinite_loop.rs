@@ -208,6 +208,10 @@ impl Rule for InfiniteLoop {
 /// in another component reports in that component's own check). Also returns
 /// the `(effect label, local state label)` writes covered by a reported
 /// cycle so the self-churn Info arm doesn't duplicate them.
+///
+/// Only the cycles with an edge of `component` are rendered: nothing of a
+/// cycle without one is read here, and the display names are a cache of a pure
+/// function, so the output is the same as rendering them all.
 fn check_multi_effect_cycles(
     ctx: &RuleCtx,
     graph: &ChurnGraph,
@@ -229,6 +233,13 @@ fn check_multi_effect_cycles(
 
     for cycle in cycles {
         let cyc: Vec<&ChurnEdge> = cycle.edge_idx.iter().map(|&i| &edges[i]).collect();
+        // A cycle none of whose edges this component carries reports nothing
+        // here (the loop below skips every edge of another component), and its
+        // path is read only inside that loop: skipping it is exact. Without the
+        // test every component renders every cycle of the program.
+        if !cyc.iter().any(|e| e.component == component) {
+            continue;
+        }
         let path = cycle_path(edges, cycle, component, result, &mut names);
         for e in &cyc {
             if e.component != component {

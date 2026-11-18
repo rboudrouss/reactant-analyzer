@@ -76,6 +76,9 @@ on a program React settles; 323 oracle cases, none a known false negative.
   back edges, selecting branches) are built once per fixpoint, not at each
   run; `@mantine/form` 15 s → 14 s, chakra-ui 12 s → 8 s with the change
   above, findings unchanged.
+- Faster `infinite-loop` on programs with many effect cycles: a component
+  renders only the cycles it carries an edge of; mantine 471 s → 416 s,
+  findings unchanged.
 - `always-unstable-deps` also reports a dep that is a new reference at every
   render where it holds an object and a primitive otherwise
   (`items?.filter(f)`, `items && items.map(f)`, `c ? [x] : undefined`), with
