@@ -34,15 +34,16 @@ use crate::{
     ir::{
         ComponentId,
         cfg::CFG,
-        types::{ExprId, HookLabel},
+        types::{ExprId, HookLabel, Var},
     },
 };
 
 /// A state slot: its owner and its label there.
 pub type Slot = (ComponentId, HookLabel);
 
-/// The position [`Escapes`] records for a call's callee itself, handed to
-/// code the analysis does not run (past the inlining budget).
+/// The position [`Escapes`] records, at a call, for what its in-cycle
+/// callee's callbacks returned to it (`hs.map((h) => h)`): handed back to
+/// code the analysis does not run, it escapes there.
 pub const CALLEE: usize = usize::MAX;
 
 /// The position [`Escapes`] records, at an effect's hook site, for the
@@ -139,6 +140,9 @@ pub struct CallRelation {
     escapes: HashMap<(ExprId, usize), Escapes>,
     /// The body each site in [`Targets::bodies`] / [`Escapes::bodies`] runs.
     cfgs: HashMap<ExprId, Arc<CFG>>,
+    /// The name each slot's setter is bound to in its owner's render: what a
+    /// row keyed by its slot prints, whatever the call spelled.
+    slot_names: HashMap<Slot, Var>,
 }
 
 impl CallRelation {
@@ -156,6 +160,71 @@ impl CallRelation {
     /// The body of a site the relation lists.
     pub fn body(&self, site: ExprId) -> Option<&Arc<CFG>> {
         self.cfgs.get(&site)
+    }
+
+    /// Every slot a run of the body at `site` may write, at any depth: the
+    /// setters of every call in it the fixpoint evaluated, what the bodies
+    /// those calls run write, and what the values they hand on reach — the
+    /// writes a reader that stops descending still owes (a walk past its
+    /// budget). `memo` keeps each body's complete answer.
+    pub fn writes_of(
+        &self,
+        site: ExprId,
+        memo: &mut HashMap<ExprId, BTreeSet<Slot>>,
+    ) -> BTreeSet<Slot> {
+        self.writes_in(site, memo, &mut Vec::new()).0
+    }
+
+    /// [`Self::writes_of`], with the bodies being computed on `stack`. A
+    /// body met again on the stack answers nothing yet, and every body above
+    /// it is then partial until that one completes: an answer is kept only
+    /// once every cycle it touched is closed (the second component: the
+    /// lowest stack index touched, `usize::MAX` for none).
+    fn writes_in(
+        &self,
+        site: ExprId,
+        memo: &mut HashMap<ExprId, BTreeSet<Slot>>,
+        stack: &mut Vec<ExprId>,
+    ) -> (BTreeSet<Slot>, usize) {
+        if let Some(done) = memo.get(&site) {
+            return (done.clone(), usize::MAX);
+        }
+        if let Some(i) = stack.iter().position(|s| *s == site) {
+            return (BTreeSet::new(), i);
+        }
+        let me = stack.len();
+        stack.push(site);
+        let mut low = usize::MAX;
+        let mut out = BTreeSet::new();
+        let mut inner: Vec<ExprId> = Vec::new();
+        if let Some(body) = self.cfgs.get(&site) {
+            let mut anchors: Vec<(ExprId, usize)> = Vec::new();
+            body.for_each_expr(&mut |e| collect_anchors(e, &mut anchors));
+            for (anchor, n) in anchors {
+                if let Some(t) = self.calls.get(&anchor) {
+                    out.extend(t.setters.iter().copied());
+                    inner.extend(t.bodies.iter().copied());
+                }
+                for pos in (0..n).chain([CALLEE]) {
+                    if let Some(e) = self.escapes.get(&(anchor, pos)) {
+                        out.extend(e.setters.iter().copied());
+                        inner.extend(e.bodies.iter().copied());
+                    }
+                }
+            }
+        }
+        for b in inner {
+            let (w, l) = self.writes_in(b, memo, stack);
+            out.extend(w);
+            low = low.min(l);
+        }
+        stack.pop();
+        if low >= me {
+            memo.insert(site, out.clone());
+            (out, usize::MAX)
+        } else {
+            (out, low)
+        }
     }
 
     /// Every call id with a row.
@@ -194,6 +263,28 @@ impl CallRelation {
         self.cfgs.entry(site).or_insert_with(|| Arc::clone(body));
     }
 
+    /// The name the setter of `slot` is bound to in its owner, when one is
+    /// written in the source (never a lowering temp).
+    pub fn slot_name(&self, slot: Slot) -> Option<&Var> {
+        self.slot_names.get(&slot)
+    }
+
+    /// Name the slots of `owner` after the setters its render binds: for
+    /// each, the name the source wrote — a lowering temp (`__…`) never, a
+    /// spliced hook's binding without its salt (`setV#0` is `setV`) — the
+    /// shortest, then the first in order.
+    pub fn name_slots(&mut self, owner: ComponentId, render: &CFG) {
+        let mut names: Vec<(Var, HookLabel)> = crate::engine::setters::setter_var_labels(render)
+            .into_iter()
+            .filter(|(v, _)| !v.starts_with("__"))
+            .map(|(v, l)| (v.split('#').next().unwrap_or(&v).to_string(), l))
+            .collect();
+        names.sort_by(|(a, _), (b, _)| (a.len(), a).cmp(&(b.len(), b)));
+        for (name, label) in names {
+            self.slot_names.entry((owner, label)).or_insert(name);
+        }
+    }
+
     /// The join of two relations: every row of either, a row of both joined.
     pub fn join(&mut self, other: &CallRelation) {
         for (id, t) in &other.calls {
@@ -207,7 +298,29 @@ impl CallRelation {
         for (site, body) in &other.cfgs {
             self.cfgs.entry(*site).or_insert_with(|| Arc::clone(body));
         }
+        for (slot, name) in &other.slot_names {
+            self.slot_names.entry(*slot).or_insert_with(|| name.clone());
+        }
     }
+}
+
+/// The anchors of `e` and of its sub-expressions — a call's or a `new`'s id
+/// with its argument count, a JSX element's props object with its prop
+/// count. A function literal written there runs only through a row that
+/// lists it, which reads its body then.
+fn collect_anchors(e: &crate::ir::expr::Expr, anchors: &mut Vec<(ExprId, usize)>) {
+    use crate::ir::expr::Expr;
+    match e {
+        Expr::Call { id, args, .. } | Expr::New { id, args, .. } => anchors.push((*id, args.len())),
+        Expr::NativeElem { props, .. } | Expr::CompApp { props, .. } => {
+            if let Expr::ObjectLit { id, fields, .. } = props.peel_ts() {
+                anchors.push((*id, fields.len()));
+            }
+        }
+        Expr::FnLit { .. } => return,
+        _ => {}
+    }
+    e.for_each_child(&mut |c| collect_anchors(c, anchors));
 }
 
 #[cfg(test)]

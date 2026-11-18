@@ -38,6 +38,16 @@ spellings.
    Every call of a block the fixpoint reached has a row; a call of a body no pass ran has none.
 4. **Who may read it.** Engine relations computed at convergence (the writer walk, P8), never
    the rules directly; a rule reads the rows those relations build.
+5. **The writer walk reads it and binds nothing** (P8). It keeps the traversal, the phase of
+   each position (the timing table, cleanup and listener recognition, the `await` split) and the
+   placement. At a call it writes the row's setters and enters the row's bodies, placed only when
+   the row is `sure`; at a handed position (an argument, a JSX prop it does not reify as a
+   handler region, a hook argument, an effect's cleanup, and at `CALLEE` what an in-cycle
+   callee's callbacks returned) it writes every setter and enters every body the value reaches.
+   A body of another component hides every name it reads. Past the walk's depth a body still
+   runs: `CallRelation::writes_of` gives every slot it may write at any depth, unplaced. A row
+   is keyed by (call site, slot, region) and prints the site's own spelling, else the slot's
+   setter. The rules layer's own name walks (`setter-in-render`, body scans) are not readers yet.
 
 ## Consequences
 

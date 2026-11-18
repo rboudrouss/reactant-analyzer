@@ -1101,6 +1101,11 @@ fn exec_callbacks_depth<T: Transfer>(
                     let given = callback_args(transfer, fn_, i, env, ctx);
                     let mut ran = Ran::default();
                     let returned = exec_fn_value(transfer, arg, &given, env, ctx, depth, &mut ran);
+                    // What it returns goes back to the callee: it escapes
+                    // there, at the call (ADR-047).
+                    if let Some(sites) = returned.as_ref().and_then(EnvVal::sites) {
+                        record_reach((*id, crate::engine::calls::CALLEE), Some(sites), &[], ctx);
+                    }
                     escape_returned(returned.as_ref(), ctx);
                     // A setter is run as a call of it (#291).
                     let applied = apply_setter(transfer, arg, &given, env, ctx, depth);
@@ -1137,13 +1142,7 @@ fn exec_callbacks_depth<T: Transfer>(
                         ran = Ran::listing();
                         exec_fn_value(transfer, fn_, &[], env, ctx, depth, &mut ran);
                     }
-                    escape_at(
-                        transfer,
-                        fn_,
-                        env,
-                        ctx,
-                        Some((*id, crate::engine::calls::CALLEE)),
-                    );
+                    escape(transfer, fn_, env, ctx);
                 } else {
                     returned = exec_fn_value(transfer, fn_, &passed, env, ctx, depth, &mut ran);
                 }

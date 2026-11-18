@@ -268,6 +268,16 @@ on a program React settles; 323 oracle cases, none a known false negative.
   (`Array.from(hs)`, an array method) and cannot run the object itself is
   handed to that callee: it may run, and its writes count — `Array.from(hs)
   .forEach((h) => h())` was silent in the store.
+- The writer rows every loop rule reads come from what the fixpoint ran at
+  each call (ADR-047), not from names the walk re-binds: a closure that
+  flows through an array method's result (`hs.map((h) => h).forEach((h) =>
+  h())`), a returned closure called (`const h = mk(); h()`), a computed
+  member (`tbl[k]()`) or a setter held in a container handed to unknown
+  code now writes; a same-named variable of another body is no longer read
+  as a setter (#287); one slot is one row per call site, printed with what
+  the source wrote there or the slot's own setter, never a lowering temp;
+  a write through a helper called with different setters is a Warning
+  (#292, #316, #322).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

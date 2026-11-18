@@ -598,7 +598,6 @@ impl SiteEnvs<'_> {
 /// every block a run of it reached ([`SiteEnvs::closure_envs`]).
 pub(crate) struct ClosureEnv<'c> {
     pub body: &'c CFG,
-    pub params: &'c [Var],
     pub exits: HashMap<BlockId, AbstractEnv<StateValue>>,
 }
 
@@ -686,11 +685,7 @@ fn run_literal<'c>(
     bind_params(&mut env, params, args);
     let exits = run_cfg(&StateValueTransfer, body, env.clone(), ac, 0).exits;
     reach_literals(ac, body, &env, &exits, out);
-    out.push(ClosureEnv {
-        body,
-        params,
-        exits,
-    });
+    out.push(ClosureEnv { body, exits });
 }
 
 #[cfg(test)]

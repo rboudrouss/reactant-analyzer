@@ -116,38 +116,62 @@ pub fn extract_handlers(cfg: &CFG, hooks: &mut Vec<HookEntry>, next_label: &mut 
             _ => None,
         })
         .collect();
-    let mut var_bodies: HashMap<&str, Handler> = HashMap::new();
-    for block in cfg.blocks.values() {
-        for stmt in &block.stmts {
-            if let Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. } = stmt {
-                match rhs {
-                    Expr::FnLit {
-                        params, body_cfg, ..
-                    } => {
-                        var_bodies.insert(var.as_str(), (params.clone(), (**body_cfg).clone()));
-                    }
-                    Expr::CallbackVal(l) => {
-                        if let Some(body) = callback_bodies.get(l) {
-                            var_bodies.insert(var.as_str(), body.clone());
-                        }
-                    }
-                    // Bare setters (`onOpenChange={setOpen}`) are NOT handled
-                    // here: whether the receiver may call them with arbitrary
-                    // args depends on whether the child is analyzable, which
-                    // only the engine knows (see eval_comp_app's unknown-child
-                    // havoc). Synthesizing a ⊤-write at lowering time would
-                    // clobber the precise inter-component analysis of known
-                    // children (e.g. `onChange={setN}` between two analyzed
-                    // components).
-                    _ => {}
-                }
-            }
-        }
-    }
+    let var_bodies = bound_handlers(cfg, |rhs| match rhs {
+        Expr::FnLit {
+            params, body_cfg, ..
+        } => Some((params.clone(), (**body_cfg).clone())),
+        Expr::CallbackVal(l) => callback_bodies.get(l).cloned(),
+        // Bare setters (`onOpenChange={setOpen}`) are NOT handled here:
+        // whether the receiver may call them with arbitrary args depends on
+        // whether the child is analyzable, which only the engine knows (see
+        // eval_comp_app's unknown-child havoc). Synthesizing a ⊤-write at
+        // lowering time would clobber the precise inter-component analysis
+        // of known children (e.g. `onChange={setN}` between two analyzed
+        // components).
+        _ => None,
+    });
 
     let mut found: Vec<HookEntry> = Vec::new();
     cfg.for_each_expr(&mut |e| collect_handlers_in_expr(e, &var_bodies, &mut found, next_label));
     hooks.extend(found);
+}
+
+/// The names [`extract_handlers`] resolves a handler prop through: every
+/// `let`/assignment of `cfg` whose right-hand side `pick` takes.
+fn bound_handlers<T>(cfg: &CFG, pick: impl Fn(&Expr) -> Option<T>) -> HashMap<&str, T> {
+    let mut out = HashMap::new();
+    for block in cfg.blocks.values() {
+        for stmt in &block.stmts {
+            if let Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. } = stmt
+                && let Some(t) = pick(rhs)
+            {
+                out.insert(var.as_str(), t);
+            }
+        }
+    }
+    out
+}
+
+/// The render's names a handler prop written as one is reified through
+/// ([`extract_handlers`]): a prop `onClick={h}` with `h` among them, or a
+/// literal, is a `Handler` region of its own — a walk of the render does not
+/// run it again.
+pub(crate) fn handler_names(cfg: &CFG, hooks: &[HookEntry]) -> HashSet<String> {
+    let callbacks: HashSet<HookLabel> = hooks
+        .iter()
+        .filter_map(|h| match h {
+            HookEntry::Callback { label, .. } => Some(*label),
+            _ => None,
+        })
+        .collect();
+    bound_handlers(cfg, |rhs| match rhs {
+        Expr::FnLit { .. } => Some(()),
+        Expr::CallbackVal(l) => callbacks.contains(l).then_some(()),
+        _ => None,
+    })
+    .into_keys()
+    .map(str::to_string)
+    .collect()
 }
 
 /// Resolve one event-prop value to a handler body, if analyzable.

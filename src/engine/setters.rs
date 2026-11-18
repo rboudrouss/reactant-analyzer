@@ -16,10 +16,11 @@ use crate::{
     },
     engine::{
         AnalysisResult,
+        calls::{CallRelation, Slot},
         dominance::on_all_paths,
         store::STORE_SLOT,
         timing::ArgTiming,
-        written::{self, ClosureEnv, SiteEnvs, Written},
+        written::{self, SiteEnvs, Written},
     },
     ir::{
         SourceRange,
@@ -236,6 +237,10 @@ fn setter_calls(
         store_scopes: None,
         scopes: vec![Scope::root(cfg)],
         following: RefCell::default(),
+        calls: None,
+        cleanup: None,
+        handlers: &NO_VARS,
+        summaries: RefCell::default(),
     };
     walk.cfg(cfg, WALK_DEPTH, &mut found, WalkClass::Sync, None, None);
     let mut found = found.setters;
@@ -292,6 +297,9 @@ pub(crate) enum Foreign {
     /// Any name a body other than the render binds: a body on the way was
     /// reached through a value, and may be written anywhere.
     Any,
+    /// Every name: a body on the way is another component's (a parent's
+    /// closure a child calls), none of whose names is the region's.
+    All,
 }
 
 impl Foreign {
@@ -301,6 +309,7 @@ impl Foreign {
         match self {
             Foreign::Names(names) => names.contains(v),
             Foreign::Any => bound_elsewhere.contains(v),
+            Foreign::All => true,
         }
     }
 }
@@ -311,6 +320,8 @@ impl Foreign {
 #[derive(Debug, Clone)]
 pub(crate) struct WriteSite {
     pub var: Var,
+    /// The slot written, as the call relation names it.
+    pub slot: Option<Slot>,
     pub span: Option<SourceRange>,
     pub class: WalkClass,
     pub prov_block: Option<BlockId>,
@@ -334,17 +345,18 @@ pub(crate) struct WriteSite {
     pub through: Vec<Var>,
 }
 
-/// Every write site in `cfg`, one row per call site — no collapse of any
-/// kind. The slot-writer relation needs the distinct rows: a slot written
-/// twice in one body is a different fact from a slot written once.
+/// Every write site in `cfg`, one row per (call site, slot) — no collapse of
+/// any kind. The slot-writer relation needs the distinct rows: a slot
+/// written twice in one body is a different fact from a slot written once.
 ///
-/// `outer_fns` carries function bindings certified in an enclosing scope — a
-/// handler body is extracted out of the render CFG, so a `set(inc)` whose
-/// `inc` was defined in render is invisible to a walk of the body alone. A
-/// name the walked body binds itself drops out of the set, fail-closed, the
-/// same device as `shadowed`; the render binds them. `converged` are the
-/// closures the converged values put behind a name or member path
-/// ([`ConvergedFns`]), as seen from `cfg` ([`ConvergedFns::seen_from`]).
+/// What a call writes and runs, what a handed value reaches and what an
+/// effect returns are read off the call relation `calls` (ADR-047), by call
+/// id and position: the walk binds nothing. It keeps what is about the
+/// syntax: the traversal, the phase of each position, placement, the
+/// spelling. `outer_fns` carries function bindings certified in an
+/// enclosing scope, read only to prove an updater a function literal
+/// (`set(inc)`). `converged` gives the timing tables of the hooks the
+/// expansion left. `cleanup` is the walked effect's hook site.
 ///
 /// `dispatches`: some body of the program fires event listeners itself
 /// ([`SetterWalk::dispatches`]).
@@ -353,14 +365,18 @@ pub(crate) struct WriteSite {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_write_sites(
     cfg: &CFG,
-    setter_vars: &HashSet<Var>,
-    effect_body: bool,
+    calls: &CallRelation,
+    cleanup: Option<crate::ir::types::ExprId>,
     dispatches: bool,
     shadowed: &HashSet<Var>,
     outer_fns: &HashMap<Var, Arc<CFG>>,
     converged: &ConvergedFns<'_>,
     callback_bodies: &HashMap<HookLabel, Arc<CFG>>,
+    handlers: &HashSet<Var>,
 ) -> (Vec<WriteSite>, Vec<StoreSite>) {
+    static NO_SETTERS: std::sync::LazyLock<HashSet<Var>> = std::sync::LazyLock::new(HashSet::new);
+    let setter_vars = &*NO_SETTERS;
+    let effect_body = cleanup.is_some();
     let mut found = Found::default();
     let wrappers = wrapper_callees(cfg);
     let mut fn_bindings = collect_fn_bindings(cfg);
@@ -403,6 +419,10 @@ pub(crate) fn collect_write_sites(
         store_scopes: Some(vec![crate::ir::bindings::local_bindings(converged.render)]),
         scopes: vec![Scope::root(cfg)],
         following: RefCell::default(),
+        calls: Some(calls),
+        cleanup,
+        handlers,
+        summaries: RefCell::default(),
     };
     walk.cfg(cfg, WALK_DEPTH, &mut found, WalkClass::Sync, None, None);
     let setters = found
@@ -410,6 +430,7 @@ pub(crate) fn collect_write_sites(
         .into_iter()
         .map(|s| WriteSite {
             var: s.var,
+            slot: s.slot,
             span: s.span,
             class: s.class,
             prov_block: s.prov_block,
@@ -447,20 +468,6 @@ pub(crate) struct SetterProp {
     /// a prop ref brings back (#270) names the child's bindings, so a walk
     /// of this component cannot enter it.
     pub closure_owner: Option<ComponentId>,
-}
-
-/// One slot a write through a name may land in ([`collect_slot_writers`]).
-#[derive(Debug, Clone, Copy)]
-struct Target {
-    /// `None`: this component's slot.
-    owner: Option<ComponentId>,
-    slot: HookLabel,
-    /// Through a closure that captured the setter: the call's argument is
-    /// not the stored value.
-    carried: bool,
-    /// A call through the name surely writes: [`SetterProp::must_write`] for
-    /// a converged value, which may also be something else (#233).
-    sure: bool,
 }
 
 /// Collect variables in `cfg` whose abstract value at any block exit is
@@ -596,22 +603,6 @@ impl<'a> ConvergedFns<'a> {
             callback_fns: Arc::new(callback_fns),
             called_events: Arc::new(called_events),
             arg_timings: Arc::new(crate::engine::timing::left_hook_args(render, hooks)),
-        }
-    }
-
-    /// The same table, with the closures the names of a memo or callback
-    /// body, or of a function literal, may point to, read off the envs of a
-    /// run of each ([`SiteEnvs::closure_envs`], #246). A body no stored env
-    /// covers is reached from any body of the component, so the table is
-    /// every body's.
-    fn with_closures(self, closures: &[ClosureEnv<'_>], heap: &Heap) -> Self {
-        let mut table = HashMap::new();
-        for c in closures {
-            add_converged_fns(&mut table, c.body, c.params, &c.exits, heap, self.component);
-        }
-        ConvergedFns {
-            closures: table,
-            ..self
         }
     }
 
@@ -1864,7 +1855,15 @@ fn callback_bound_vars(
 /// a fact that must survive the collapse: being reached from two call sites is
 /// co-execution.
 fn dedup_source_sites(sites: &mut Vec<WriteSite>) {
-    let mut seen: HashMap<(Var, SourceRange, WalkClass), usize> = HashMap::new();
+    // A site the relation keys by its slot is that slot's, however spelled.
+    type Key = (Option<Slot>, Var, SourceRange, WalkClass);
+    let key = |site: &WriteSite, span: SourceRange| -> Key {
+        match site.slot {
+            Some(slot) => (Some(slot), Var::new(), span, site.class),
+            None => (None, site.var.clone(), span, site.class),
+        }
+    };
+    let mut seen: HashMap<Key, usize> = HashMap::new();
     let mut out: Vec<WriteSite> = Vec::with_capacity(sites.len());
     for site in std::mem::take(sites) {
         // A site with no span cannot be identified with another; keep it.
@@ -1872,10 +1871,11 @@ fn dedup_source_sites(sites: &mut Vec<WriteSite>) {
             out.push(site);
             continue;
         };
-        match seen.get(&(site.var.clone(), span, site.class)) {
+        let k = key(&site, span);
+        match seen.get(&k) {
             Some(&i) => out[i].repeats = true,
             None => {
-                seen.insert((site.var.clone(), span, site.class), out.len());
+                seen.insert(k, out.len());
                 out.push(site);
             }
         }
@@ -1957,64 +1957,18 @@ pub(crate) fn collect_slot_writers(
     hooks: &[HookEntry],
     regions: &InlineRegions,
     hook_provenance: &[crate::ir::hooks::HookProvenance],
-    converged: &HashMap<Var, Vec<SetterProp>>,
+    calls: &CallRelation,
     envs: &SiteEnvs<'_>,
     reducers: &crate::engine::Reducers<'_>,
     dispatches: bool,
 ) -> Vec<SlotWriter> {
-    // Every name a write can go through, with the slots it may write and their
-    // owner — a local name bound to two setters on two paths writes one of
-    // them (#202). A local binding wins a tie (ADR-030 §1). The converged values
-    // (`collect_component_setter_vars`) are read beside the syntactic alias
-    // map: every render binding and member path holding a setter, so an
-    // alias holds the same setter value. An own slot is taken only from a
-    // name that IS the setter — `t[1](0)`, `api.setV(0)` on a hook's result
-    // (#233); a closure over one is walked through its body instead.
-    // A name a converged value binds to several setters (a prop two call
-    // sites pass, #175) writes one of them: a row per candidate. `carried`:
-    // the write runs a closure that captured the setter (`bump={() =>
-    // setN(n + 1)}`), and the call's own argument is not what it stores.
-    let mut targets: HashMap<Var, Vec<Target>> = HashMap::new();
-    for (v, slot) in setter_labels_of(render_cfg, hooks).pairs() {
-        targets.entry(v.clone()).or_default().push(Target {
-            owner: None,
-            slot,
-            carried: false,
-            sure: true,
-        });
-    }
-    let add_converged = |targets: &mut HashMap<Var, Vec<Target>>,
-                         converged: &HashMap<Var, Vec<SetterProp>>| {
-        for (v, props) in converged_call_targets(converged, envs.component) {
-            if targets.contains_key(&v) {
-                continue;
-            }
-            let candidates: Vec<Target> = props
-                .iter()
-                .map(|p| Target {
-                    owner: (p.component != envs.component).then_some(p.component),
-                    slot: p.label,
-                    carried: p.closure,
-                    sure: p.must_write,
-                })
-                .collect();
-            targets.insert(v, candidates);
-        }
-    };
-    add_converged(&mut targets, converged);
-    // A name a body with no per-block envs binds — a memo's or a callback's,
-    // a closure's nested in any body, `get()`'s temp in a `forEach` callback
-    // — is read off a run of that body from the env it is reached from
-    // (#246). Any body may reach such a body (a callback called in an
-    // effect, a memo's closure run by one), so the names are every region's.
-    let (closures, closure_heap) = envs.closure_envs(render_cfg, hooks);
-    add_converged(
-        &mut targets,
-        &setter_vars_over(
-            closures.iter().map(|c| (c.body, c.params, &c.exits)),
-            &closure_heap,
-        ),
-    );
+    // What every call writes and runs is the call relation's (ADR-047): a
+    // site is keyed by the slot it writes, with its owner, whatever name it
+    // is spelled with, and a call through a value two contexts bind to two
+    // setters writes either (#175, #202) — a row per slot, placed only where
+    // the relation is sure. No name table: a name another body binds is
+    // never read as this one's (#287), and one slot spelled two ways is one
+    // row (D2).
     // A write of the slot's own read stores its content (`written::classify`),
     // a must fact: the name is bound once, in render, to the read, and no
     // other body — a hook body, a closure, a callback's parameter — binds it
@@ -2057,8 +2011,10 @@ pub(crate) fn collect_slot_writers(
             crate::ir::bindings::certified_fn_binding(v, render_cfg, &hook_bodies).is_some()
         })
         .collect();
-    // What no single binding certifies, the converged values may still point
-    // at: a closure behind a member path (`api.inc()`) or a memo's member.
+    // The JSX props the lowering made handler regions of their own.
+    let handlers = crate::lowering::hook_extractor::handler_names(render_cfg, hooks);
+    // The timing tables of the hooks the expansion left, and the
+    // `useCallback` bodies a memoized updater is proven by.
     let converged_fns = ConvergedFns::of(
         render_cfg,
         params,
@@ -2067,8 +2023,7 @@ pub(crate) fn collect_slot_writers(
         envs.render_exits,
         envs.heap,
         envs.component,
-    )
-    .with_closures(&closures, &closure_heap);
+    );
     // `const inc = useCallback(…)` binds a `CallbackVal`, not an `FnLit`, so
     // the literal certificate never sees it — and a memoized updater read as ⊤
     // fired the non-functional rules on correct code.
@@ -2121,30 +2076,27 @@ pub(crate) fn collect_slot_writers(
             | WriterRegion::Callback(l)
             | WriterRegion::Handler(l) => (Some(l), inlined_origin(l)),
         };
-        let effect_body = matches!(region, WriterRegion::Effect(_));
-        // A name the body binds is read in the body's own converged envs,
-        // where it has them — an effect's or a handler's blocks: the value
-        // `get()` returns in `get()(x)` is a name no render env holds (#46).
+        // An effect returns its cleanup, which the relation keeps at the
+        // effect's hook site.
+        let cleanup = match region {
+            WriterRegion::Effect(l) => Some(envs.component.hook_site(l)),
+            _ => None,
+        };
         let exits = match region {
             WriterRegion::Effect(l) => envs.effect_exits.get(&l),
             WriterRegion::Handler(l) => envs.handler_exits.get(&l),
             _ => None,
         };
-        let mut targets = targets.clone();
-        if let Some(exits) = exits {
-            let own = collect_component_setter_vars(cfg, &[], exits, envs.heap);
-            add_converged(&mut targets, &own);
-        }
-        let setter_vars: HashSet<Var> = targets.keys().cloned().collect();
         let (mut sites, store_sites) = collect_write_sites(
             cfg,
-            &setter_vars,
-            effect_body,
+            calls,
+            cleanup,
             dispatches,
             &shadowed,
             &outer_fns,
             &converged_fns.seen_from(cfg, exits),
             &callback_bodies,
+            &handlers,
         );
         // One source site is one row. A local helper called twice pulls its
         // inner write in twice, and both copies name the same source span —
@@ -2158,15 +2110,12 @@ pub(crate) fn collect_slot_writers(
         // resolving one in the region CFG answers about an unrelated block.
         // Only sync sites can co-execute within a tick — a deferred or handler
         // write is a separate turn by construction.
-        let mut sync_blocks: HashMap<(Option<ComponentId>, HookLabel), Vec<BlockId>> =
-            HashMap::new();
+        let mut sync_blocks: HashMap<Slot, Vec<BlockId>> = HashMap::new();
         for s in &sites {
             if s.class == WalkClass::Sync
-                && let (Some(ts), Some(b)) = (targets.get(&s.var), s.prov_block)
+                && let (Some(slot), Some(b)) = (s.slot, s.prov_block)
             {
-                for t in ts {
-                    sync_blocks.entry((t.owner, t.slot)).or_default().push(b);
-                }
+                sync_blocks.entry(slot).or_default().push(b);
             }
         }
         let reach = Reachability::of(cfg);
@@ -2216,22 +2165,17 @@ pub(crate) fn collect_slot_writers(
                 authored(cfg, cfg_key, through)
             }
         };
-        for (site, target, sole) in sites.into_iter().flat_map(|s| {
-            let ts = targets.get(&s.var).cloned().unwrap_or_default();
-            let sole = matches!(ts.as_slice(), [t] if t.sure);
-            ts.into_iter().map(move |t| (s.clone(), t, sole))
-        }) {
-            let Target {
-                owner,
-                slot,
-                carried,
-                ..
-            } = target;
+        for site in sites {
+            // Every site of this walk is the relation's, keyed by its slot.
+            let Some((target_owner, slot)) = site.slot else {
+                continue;
+            };
+            let owner = (target_owner != envs.component).then_some(target_owner);
             let same_tick = site.repeats
                 || match (site.class, site.prov_block) {
                     (WalkClass::Sync, Some(b)) => {
                         let blocks = sync_blocks
-                            .get(&(owner, slot))
+                            .get(&(target_owner, slot))
                             .map_or(&[][..], Vec::as_slice);
                         // Co-execution is symmetric — "these two land in the
                         // same tick" does not care which runs first — so the
@@ -2266,14 +2210,13 @@ pub(crate) fn collect_slot_writers(
             let at = (site.class == WalkClass::Sync && !site.repeats)
                 .then_some(site.at)
                 .flatten();
-            // A call through a name with several targets writes one of them,
-            // and one through a name that may be something else may write
-            // none: no slot is surely written there.
-            let block = at.map(|(b, _)| b).filter(|_| sole);
-            let target = (owner.unwrap_or(envs.component), slot);
-            let mut written = match reducers.get(target.0, target.1) {
+            // A call with several targets writes one of them, and one through
+            // a value that may be something else may write none: the walk
+            // placed a site only where the relation is sure of its one slot.
+            let block = at.map(|(b, _)| b);
+            let mut written = match reducers.get(target_owner, slot) {
                 Some(reducer) => written::dispatched(&reducer),
-                None if carried || site.applied => written::carried(),
+                None if site.applied => written::carried(),
                 None => written::classify(
                     site.arg.as_ref(),
                     &updater,
@@ -2287,10 +2230,22 @@ pub(crate) fn collect_slot_writers(
             if written.expr.as_ref().is_some_and(reads_hidden) {
                 written.expr = None;
             }
+            // A row prints what the source wrote at the site, else its
+            // slot's name — never a lowering temp or a splice's salt (D2).
+            let written_here = !site.var.is_empty()
+                && !site.var.contains('#')
+                && !site.var.split('.').any(|seg| seg.starts_with("__"));
+            let setter = match written_here {
+                true => site.var,
+                false => calls
+                    .slot_name((target_owner, slot))
+                    .cloned()
+                    .unwrap_or(site.var),
+            };
             out.push(SlotWriter {
                 slot,
                 via: via_of(site.prov_block, &site.through),
-                setter: site.var,
+                setter,
                 span: site.span,
                 region,
                 phase: class_phase(site.class, region),
@@ -2442,6 +2397,21 @@ struct SetterWalk<'a> {
     /// The values of its bindings the walk is following into their own
     /// expression ([`SetterWalk::follow`]): a stack, as `walking` is.
     following: RefCell<HashSet<Following>>,
+    /// The call relation (ADR-047). `Some`: what a call runs, what a value
+    /// handed by position holds and what an effect returns are read off it,
+    /// by call id and position — the walk binds nothing and matches no name,
+    /// and a write is keyed by its slot. `None`: the walk of the rules
+    /// layer, which matches `setter_vars` by name.
+    calls: Option<&'a CallRelation>,
+    /// The walked effect's hook site: where the relation keeps what it
+    /// returns ([`crate::engine::calls::CLEANUP`]).
+    cleanup: Option<crate::ir::types::ExprId>,
+    /// The render's names a JSX prop is reified through as a `Handler`
+    /// region ([`handler_names`](crate::lowering::hook_extractor::handler_names)).
+    handlers: &'a HashSet<Var>,
+    /// What each body the walk had no budget to enter may write
+    /// ([`SetterWalk::past_budget`]), computed once.
+    summaries: RefCell<HashMap<crate::ir::types::ExprId, BTreeSet<Slot>>>,
 }
 
 /// A value a binding of the walk holds, followed into its expression: the
@@ -2470,6 +2440,8 @@ struct Scope<'a> {
     /// What the call that runs it passed its parameters
     /// ([`SetterWalk::bind_passed`]), before the body assigns them.
     passed: HashMap<Var, Bound<'a>>,
+    /// The body is another component's: every name it reads is foreign.
+    other_component: bool,
 }
 
 /// `body` declares `var` itself, so an assignment of it there is its own.
@@ -2522,6 +2494,7 @@ impl<'a> Scope<'a> {
             names: Some(BTreeSet::new()),
             held: HashMap::new(),
             passed: HashMap::new(),
+            other_component: false,
         }
     }
 }
@@ -2636,6 +2609,9 @@ enum Reached<'a> {
     /// Through a name or a value: a helper, a `useCallback` body, a closure
     /// the converged values point at.
     Named,
+    /// A closure of another component the call relation lists (a parent's
+    /// a child calls): every name it reads is that component's.
+    Other,
 }
 
 /// No bindings to record reads for — every setter consumer.
@@ -2820,6 +2796,10 @@ struct FoundCall {
 /// One raw call site the walk saw.
 struct FoundSite {
     var: Var,
+    /// The slot written, when the call relation names it (ADR-047): a row
+    /// is keyed by its slot, never by the name it is spelled with. `None`
+    /// for a walk that matches names (`setter_vars`).
+    slot: Option<Slot>,
     class: WalkClass,
     span: Option<SourceRange>,
     /// The statement the site runs in — block and statement index — `Some`
@@ -3148,6 +3128,7 @@ impl<'a> SetterWalk<'a> {
         let root = self.scopes[0].body;
         let render = self.converged.map(|c| c.render);
         let (params, names) = match reached {
+            Reached::Other => (None, None),
             Reached::Inline(params) => (
                 Some(params),
                 Some(own_names(params, body).map(str::to_string).collect()),
@@ -3173,14 +3154,21 @@ impl<'a> SetterWalk<'a> {
                 }
             }
         };
-        let bound = params.map_or_else(HashMap::new, |p| self.bind_passed(p, passed));
+        // With the call relation, the walk binds nothing: what a call in the
+        // body runs is the relation's row for it.
+        let binds = self.calls.is_none();
+        let bound = match params {
+            Some(p) if binds => self.bind_passed(p, passed),
+            _ => HashMap::new(),
+        };
         self.scopes.push(Scope {
             body,
             names,
             held: bound.clone(),
             passed: bound,
+            other_component: matches!(reached, Reached::Other),
         });
-        if let Some(params) = params {
+        if let Some(params) = params.filter(|_| binds) {
             self.bind_body(params, body);
         }
         self.cfg(body, depth, found, mode, prov, witness);
@@ -3189,6 +3177,9 @@ impl<'a> SetterWalk<'a> {
 
     /// The names a write found here reads from outside the region's env.
     fn foreign(&self) -> Foreign {
+        if self.scopes.iter().any(|s| s.other_component) {
+            return Foreign::All;
+        }
         let mut out = BTreeSet::new();
         for scope in &self.scopes {
             match &scope.names {
@@ -3719,7 +3710,28 @@ impl<'a> SetterWalk<'a> {
                         // (ADR-027 §2) — descend it as such, whether inline
                         // or bound to a variable. Without this the cleanup's
                         // writes are invisible to the relation.
-                        if self.effect_body && at_root && mode == WalkClass::Sync {
+                        if self.effect_body
+                            && at_root
+                            && mode == WalkClass::Sync
+                            && let Some(calls) = self.calls
+                        {
+                            if depth > 0 {
+                                let anchor = self
+                                    .cleanup
+                                    .map(|site| (site, crate::engine::calls::CLEANUP));
+                                self.relation_handed(
+                                    calls,
+                                    anchor,
+                                    expr,
+                                    WalkClass::Cleanup,
+                                    None,
+                                    depth,
+                                    found,
+                                    prov_block,
+                                    witness,
+                                );
+                            }
+                        } else if self.effect_body && at_root && mode == WalkClass::Sync {
                             let (body, name, reached) = match expr {
                                 Expr::FnLit {
                                     body_cfg, params, ..
@@ -3913,19 +3925,43 @@ impl<'a> SetterWalk<'a> {
         // `new X(cb)` runs its arguments through the same machinery: a
         // `Promise` executor runs synchronously, and a class the body binds
         // is a local helper like any other.
-        if let Expr::Call { fn_, args, .. } | Expr::New { fn_, args, .. } = expr {
-            // A call through a name the walk bound, or a member of one, is a
-            // call through what it may hold, never through the name (#316):
-            // of one of them, placed at this call only when it surely holds
-            // the one it lists.
-            match self.items_of(fn_) {
-                Some(held) => {
+        if let Expr::Call { id, fn_, args } | Expr::New { id, fn_, args } = expr {
+            // With the call relation, a call writes and runs what its row
+            // lists (ADR-047): nothing is read off a name.
+            let relation = self.calls;
+            let call_id = matches!(expr, Expr::Call { .. }).then_some(*id);
+            match (relation, self.items_of(fn_)) {
+                (Some(calls), _) => {
+                    if let Some(call) = call_id {
+                        self.relation_call(
+                            calls, call, fn_, args, at, depth, found, mode, prov, stmt_span,
+                        );
+                        // What the callee's callbacks returned to it escaped
+                        // there: it may run at any time.
+                        self.relation_handed(
+                            calls,
+                            Some((call, crate::engine::calls::CALLEE)),
+                            expr,
+                            WalkClass::Unknown,
+                            None,
+                            depth,
+                            found,
+                            prov,
+                            stmt_span,
+                        );
+                    }
+                }
+                // A call through a name the walk bound, or a member of one,
+                // is a call through what it may hold, never through the name
+                // (#316): of one of them, placed at this call only when it
+                // surely holds the one it lists.
+                (None, Some(held)) => {
                     let at = at.filter(|_| held.sure_one());
                     for callee in held.items {
                         self.call_through(callee, args, at, depth, found, mode, prov, stmt_span);
                     }
                 }
-                None => self.call_through(
+                (None, None) => self.call_through(
                     Held::Expr(fn_),
                     args,
                     at,
@@ -3965,7 +4001,19 @@ impl<'a> SetterWalk<'a> {
                     continue;
                 }
                 if let Some((_, timing)) = member.filter(|(at, _)| *at == i) {
-                    self.timed_arg(arg, Some(timing), depth, found, prov, stmt_span);
+                    match relation {
+                        Some(calls) => self.relation_timed(
+                            calls,
+                            (*id, i),
+                            arg,
+                            Some(timing),
+                            depth,
+                            found,
+                            prov,
+                            stmt_span,
+                        ),
+                        None => self.timed_arg(arg, Some(timing), depth, found, prov, stmt_span),
+                    }
                     continue;
                 }
                 let class = if listener && i == 1 {
@@ -3982,8 +4030,25 @@ impl<'a> SetterWalk<'a> {
                 // rows run at this call, and are placed here only when the
                 // receiver surely runs it, as an IIFE is (#248).
                 let placed = at.filter(|_| i == 0 && runs_at_least_once(fn_, args));
-                let passed = Passed::to_callback(fn_, args, i);
-                self.callback_arg(arg, class, placed, passed, depth, found, prov, stmt_span);
+                match relation {
+                    Some(calls) => self.relation_handed(
+                        calls,
+                        Some((*id, i)),
+                        arg,
+                        class,
+                        placed,
+                        depth,
+                        found,
+                        prov,
+                        stmt_span,
+                    ),
+                    None => {
+                        let passed = Passed::to_callback(fn_, args, i);
+                        self.callback_arg(
+                            arg, class, placed, passed, depth, found, prov, stmt_span,
+                        );
+                    }
+                }
                 self.repeating = outer_repeating;
             }
         }
@@ -4029,19 +4094,56 @@ impl<'a> SetterWalk<'a> {
         {
             for (i, arg) in c.left_args(*label).iter().enumerate() {
                 let timing = c.arg_timing(*label, i);
-                self.timed_arg(arg, timing, depth, found, prov, stmt_span);
+                match self.calls {
+                    Some(calls) => self.relation_timed(
+                        calls,
+                        (c.component.hook_site(*label), i),
+                        arg,
+                        timing,
+                        depth,
+                        found,
+                        prov,
+                        stmt_span,
+                    ),
+                    None => self.timed_arg(arg, timing, depth, found, prov, stmt_span),
+                }
             }
         }
         // A JSX prop React or the child may invoke runs as a listener, the
         // class extraction gives a literal there (`extract_handlers`); a path
         // the converged values resolve is walked the same way (#239).
         if let Expr::NativeElem { props, .. } | Expr::CompApp { props, .. } = expr
-            && let Expr::ObjectLit { fields, .. } = props.peel_ts()
+            && let Expr::ObjectLit { id, fields, .. } = props.peel_ts()
         {
             let native = matches!(expr, Expr::NativeElem { .. });
             let class = self.listener_class();
-            for (name, val) in fields {
-                if crate::lowering::hook_extractor::invoked_prop(native, name) {
+            for (i, (name, val)) in fields.iter().enumerate() {
+                if !crate::lowering::hook_extractor::invoked_prop(native, name) {
+                    continue;
+                }
+                if let Some(calls) = self.calls {
+                    // A literal there, or a name the render binds to one or
+                    // to a `useCallback`, is a handler region of its own
+                    // (`extract_handlers`): only what anything else holds.
+                    let reified = match val.peel_ts() {
+                        Expr::FnLit { .. } => true,
+                        Expr::Var(v) => self.handlers.contains(v),
+                        _ => false,
+                    };
+                    if !reified {
+                        self.relation_handed(
+                            calls,
+                            Some((*id, i)),
+                            val,
+                            class,
+                            None,
+                            depth,
+                            found,
+                            prov,
+                            stmt_span,
+                        );
+                    }
+                } else {
                     self.converged_bodies(
                         callee_path(val),
                         Some(val),
@@ -4055,6 +4157,321 @@ impl<'a> SetterWalk<'a> {
                     );
                 }
             }
+        }
+    }
+
+    /// A body at `site` the walk has no budget left to enter still runs
+    /// here: every slot it may write at any depth
+    /// ([`CallRelation::writes_of`]) is a write of this position, in
+    /// `class`, never placed, its value what the body passes (⊤).
+    fn past_budget(
+        &mut self,
+        calls: &'a CallRelation,
+        site: crate::ir::types::ExprId,
+        class: WalkClass,
+        found: &mut Found,
+        prov: Option<BlockId>,
+        stmt_span: Option<SourceRange>,
+    ) {
+        let slots = calls.writes_of(site, &mut self.summaries.borrow_mut());
+        for slot in slots {
+            found.setters.push(FoundSite {
+                var: Var::new(),
+                slot: Some(slot),
+                class,
+                span: stmt_span,
+                at: None,
+                own: None,
+                prov_block: prov,
+                repeats: self.repeating,
+                updater: Updater::Unknown,
+                arg: None,
+                foreign: Foreign::All,
+                applied: true,
+                through: self.path.clone(),
+            });
+        }
+    }
+
+    /// The body at `site` is a closure of another component than the one
+    /// walked: its site lies in that component's range.
+    fn of_other_component(&self, site: crate::ir::types::ExprId) -> bool {
+        let own = self.converged.map(|c| c.component);
+        own.is_some_and(|own| ComponentId::site_owner(site).is_some_and(|o| o != own))
+    }
+
+    /// Call `id`, as the call relation answers it (ADR-047): a write of each
+    /// slot its row lists, and a run of each body, in `mode`, at this call.
+    /// Placed at `at` only when the row is `sure` — every evaluation ran
+    /// exactly that one target. A call no pass reached has no row, and runs
+    /// nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn relation_call(
+        &mut self,
+        calls: &'a CallRelation,
+        id: crate::ir::types::ExprId,
+        fn_: &'a Expr,
+        args: &'a [Expr],
+        at: Option<(BlockId, usize)>,
+        depth: usize,
+        found: &mut Found,
+        mode: WalkClass,
+        prov: Option<BlockId>,
+        stmt_span: Option<SourceRange>,
+    ) {
+        let Some(row) = calls.targets(id) else {
+            return;
+        };
+        let at = at.filter(|_| row.sure());
+        let spelling = callee_path(fn_);
+        for &slot in &row.setters {
+            found.setters.push(FoundSite {
+                var: spelling.clone().unwrap_or_default(),
+                slot: Some(slot),
+                class: mode,
+                span: stmt_span,
+                at,
+                own: at.map(|(b, _)| (self.body, b)),
+                prov_block: prov,
+                repeats: self.repeating,
+                updater: self.updater_of(args),
+                arg: args.first().map(|a| a.peel_ts().clone()),
+                foreign: self.foreign(),
+                applied: false,
+                through: self.path.clone(),
+            });
+        }
+        for &site in &row.bodies {
+            let Some(body) = calls.body(site) else {
+                continue;
+            };
+            if depth == 0 {
+                self.past_budget(calls, site, mode, found, prov, stmt_span);
+                continue;
+            }
+            let reached = match fn_.peel_ts() {
+                Expr::FnLit { id, params, .. } if *id == site => Reached::Inline(params),
+                _ if self.of_other_component(site) => Reached::Other,
+                _ => Reached::Named,
+            };
+            // Where the body is authored is where the name it is called by
+            // is defined (ADR-027 §4).
+            let name = spelling
+                .clone()
+                .filter(|_| matches!(reached, Reached::Named));
+            let mut inner = Found::default();
+            self.path.extend(name.clone());
+            self.enter(
+                body,
+                reached,
+                Passed::Nothing,
+                depth - 1,
+                &mut inner,
+                WalkClass::Sync,
+                prov,
+                stmt_span,
+            );
+            if name.is_some() {
+                self.path.pop();
+            }
+            found.absorb(inner, body, mode, at, prov);
+        }
+    }
+
+    /// The value `arg` handed at `anchor` (a call's argument, a `new`'s, a
+    /// JSX prop, a hook argument, an effect's cleanup), as the call relation
+    /// answers it (ADR-047): every setter it reaches is called by the code it
+    /// is handed to, with what that code passes (#291), and every body it
+    /// reaches runs there, in `class`. A literal or an array or object of
+    /// them is the code's to call at any time (#254, #264): ⊤ for what the
+    /// literal holds. Placed at `placed` (a callback the receiver surely
+    /// runs, #248) only for the one literal written there.
+    #[allow(clippy::too_many_arguments)]
+    fn relation_handed(
+        &mut self,
+        calls: &'a CallRelation,
+        anchor: Option<(crate::ir::types::ExprId, usize)>,
+        arg: &'a Expr,
+        class: WalkClass,
+        placed: Option<(BlockId, usize)>,
+        depth: usize,
+        found: &mut Found,
+        prov: Option<BlockId>,
+        stmt_span: Option<SourceRange>,
+    ) {
+        let Some(row) = anchor.and_then(|(a, pos)| calls.escapes(a, pos)) else {
+            return;
+        };
+        let held_class = match arg.peel_ts() {
+            Expr::ObjectLit { .. } | Expr::ArrayLit { .. } | Expr::Spread(_) => WalkClass::Unknown,
+            _ => class,
+        };
+        let spelling = callee_path(arg);
+        for &slot in &row.setters {
+            found.setters.push(FoundSite {
+                var: spelling.clone().unwrap_or_default(),
+                slot: Some(slot),
+                class: held_class,
+                span: stmt_span,
+                at: None,
+                own: None,
+                prov_block: prov,
+                repeats: self.repeating,
+                updater: Updater::Unknown,
+                arg: None,
+                foreign: self.foreign(),
+                applied: true,
+                through: self.path.clone(),
+            });
+        }
+        for &site in &row.bodies {
+            let Some(body) = calls.body(site) else {
+                continue;
+            };
+            // Every body costs a level: a value may reach many, each of
+            // which hands on more. Past the budget, what it writes is read
+            // off the relation ([`Self::past_budget`]).
+            let cost = 1;
+            let (reached, here) = match arg.peel_ts() {
+                Expr::FnLit { id, params, .. } if *id == site => (Reached::Inline(params), true),
+                _ if self.of_other_component(site) => (Reached::Other, false),
+                _ => (Reached::Named, false),
+            };
+            if depth < cost {
+                let class = if here { class } else { held_class };
+                self.past_budget(calls, site, class, found, prov, stmt_span);
+                continue;
+            }
+            let name = spelling.clone().filter(|_| !here);
+            let mut inner = Found::default();
+            self.path.extend(name.clone());
+            self.enter(
+                body,
+                reached,
+                Passed::Nothing,
+                depth - cost,
+                &mut inner,
+                if here { class } else { held_class },
+                prov,
+                stmt_span,
+            );
+            if name.is_some() {
+                self.path.pop();
+            }
+            let placed = placed.filter(|_| here && row.bodies.len() == 1 && row.setters.is_empty());
+            found.absorb(
+                inner,
+                body,
+                if here { class } else { held_class },
+                placed,
+                prov,
+            );
+        }
+    }
+
+    /// [`Self::relation_handed`] for an argument the timing table times
+    /// `timing` (⊤ when `None`): an options literal's own function members
+    /// each at the time the table gives it, everything else it reaches ⊤.
+    #[allow(clippy::too_many_arguments)]
+    fn relation_timed(
+        &mut self,
+        calls: &'a CallRelation,
+        anchor: (crate::ir::types::ExprId, usize),
+        arg: &'a Expr,
+        timing: Option<ArgTiming>,
+        depth: usize,
+        found: &mut Found,
+        prov: Option<BlockId>,
+        stmt_span: Option<SourceRange>,
+    ) {
+        let (Some(t @ ArgTiming::Members(_)), Expr::ObjectLit { fields, .. }) =
+            (timing, arg.peel_ts())
+        else {
+            let class = self.timing_class(timing);
+            self.relation_handed(
+                calls,
+                Some(anchor),
+                arg,
+                class,
+                None,
+                depth,
+                found,
+                prov,
+                stmt_span,
+            );
+            return;
+        };
+        let Some(row) = calls.escapes(anchor.0, anchor.1) else {
+            return;
+        };
+        let mut timed: HashSet<crate::ir::types::ExprId> = HashSet::new();
+        for (name, val) in fields {
+            if let Expr::FnLit {
+                id,
+                params,
+                body_cfg,
+            } = val.peel_ts()
+                && row.bodies.contains(id)
+                && depth > 0
+            {
+                timed.insert(*id);
+                let class = self.timing_class(t.member(name));
+                let mut inner = Found::default();
+                self.enter(
+                    body_cfg,
+                    Reached::Inline(params),
+                    Passed::Nothing,
+                    depth - 1,
+                    &mut inner,
+                    class,
+                    prov,
+                    stmt_span,
+                );
+                found.absorb(inner, body_cfg, class, None, prov);
+            }
+        }
+        let spelling = callee_path(arg);
+        for &slot in &row.setters {
+            found.setters.push(FoundSite {
+                var: spelling.clone().unwrap_or_default(),
+                slot: Some(slot),
+                class: WalkClass::Unknown,
+                span: stmt_span,
+                at: None,
+                own: None,
+                prov_block: prov,
+                repeats: self.repeating,
+                updater: Updater::Unknown,
+                arg: None,
+                foreign: self.foreign(),
+                applied: true,
+                through: self.path.clone(),
+            });
+        }
+        for &site in row.bodies.iter().filter(|s| !timed.contains(s)) {
+            let Some(body) = calls.body(site) else {
+                continue;
+            };
+            if depth == 0 {
+                self.past_budget(calls, site, WalkClass::Unknown, found, prov, stmt_span);
+                continue;
+            }
+            let reached = match self.of_other_component(site) {
+                true => Reached::Other,
+                false => Reached::Named,
+            };
+            let mut inner = Found::default();
+            self.enter(
+                body,
+                reached,
+                Passed::Nothing,
+                depth - 1,
+                &mut inner,
+                WalkClass::Unknown,
+                prov,
+                stmt_span,
+            );
+            found.absorb(inner, body, WalkClass::Unknown, None, prov);
         }
     }
 
@@ -4087,6 +4504,7 @@ impl<'a> SetterWalk<'a> {
         {
             found.setters.push(FoundSite {
                 var: name.clone(),
+                slot: None,
                 class: mode,
                 span: stmt_span,
                 at,
@@ -4257,6 +4675,7 @@ impl<'a> SetterWalk<'a> {
         if self.setter_vars.contains(name) {
             found.setters.push(FoundSite {
                 var: name.clone(),
+                slot: None,
                 class,
                 span: stmt_span,
                 at: placed,
@@ -4898,6 +5317,10 @@ pub fn collect_slot_reads(render_cfg: &CFG, hooks: &[HookEntry]) -> Vec<SlotRead
             store_scopes: None,
             scopes: vec![Scope::root(cfg)],
             following: RefCell::default(),
+            calls: None,
+            cleanup: None,
+            handlers: &NO_VARS,
+            summaries: RefCell::default(),
         };
         walk.cfg(cfg, 2, &mut found, WalkClass::Sync, None, None);
         for r in found.reads {
@@ -4983,6 +5406,10 @@ pub fn collect_body_calls(cfg: &CFG, region: WriterRegion) -> Vec<BodyCall> {
         store_scopes: None,
         scopes: vec![Scope::root(cfg)],
         following: RefCell::default(),
+        calls: None,
+        cleanup: None,
+        handlers: &NO_VARS,
+        summaries: RefCell::default(),
     };
     walk.cfg(cfg, WALK_DEPTH, &mut found, WalkClass::Sync, None, None);
     let mut rows: Vec<BodyCall> = found

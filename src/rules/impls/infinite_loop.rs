@@ -1442,8 +1442,10 @@ mod tests {
                 ],
             }),
         };
+        // Its own call id: two calls of one id are one row of the call
+        // relation (ADR-047).
         let call = Expr::Call {
-            id: crate::ir::expr::SYNTHETIC_CALL,
+            id: crate::ir::types::ExprId(crate::ir::expr::CALL_SITES + 1),
             fn_: Box::new(Expr::FieldAccess {
                 obj: Box::new(Expr::Var("p".to_string())),
                 field: "then".to_string(),

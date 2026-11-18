@@ -87,12 +87,19 @@ that writes it (see *Cross-file limits*).
   local function's parameter (`const f = (g) => g(); f(() => setN(1))`) or an array method's
   callback parameter (`fs.forEach((f) => f())`, the parameter being the array's entries) runs
   where it is called [#253](https://github.com/rboudrouss/reactant-analyzer/issues/253), a possible
-  write: the call is not proven to be of that one closure. The setter walk (the render's and the
-  regions the loop rules read) reads a parameter as everything it may hold: its argument, every
-  argument from a spread on, its default, every value the body or a closure in it assigns it, the
-  member a destructuring pattern reads, an array method's entry and receiver (#316). What the walk
-  cannot list (a call's result, `xs.flatMap(f)` as a receiver) is a possible call of every setter
-  and closure that may flow into it. A rest parameter (`(...fs)`) and `arguments` are not bound
+  write: the call is not proven to be of that one closure. The writer rows every loop rule reads
+  are the fixpoint's own answer (the call relation, ADR-047): a call writes the setters and runs
+  the bodies its evaluations saw, joined over every context, and a value handed to code the
+  analysis does not run writes, at that point, every setter it reaches and runs every closure it
+  reaches, of unknown timing. A row is keyed by (call site, slot, region): one slot spelled two
+  ways at one site is one row, printed with what the source wrote there, else the slot's own
+  setter. **A helper called with one setter in one place and another elsewhere writes either at
+  every call of it**, so a write through it is a Warning, never an Error; an Error through a
+  helper's parameter needs every call of the helper to pass the one setter. Past the walk's depth
+  the writes of a body still count, unplaced. `setter-in-render` and a few rules' own body scans
+  (`stale-closure`, the mount guards, `derived-state`, a pack's `body_setter_calls`) still read
+  setters by name through the older walk, which binds a parameter to what the call passes
+  (#316). A rest parameter (`(...fs)`) and `arguments` are not bound
   [#324](https://github.com/rboudrouss/reactant-analyzer/issues/324): a setter passed to the call
   is still a possible write of it (#291), never a placed one. Utility *inlining* is statement-position only [#52](https://github.com/rboudrouss/reactant-analyzer/issues/52). A setter
   or a closure called through a call that returns it (`get()(x)`, `makeSetter()(x)`,
@@ -199,10 +206,9 @@ that writes it (see *Cross-file limits*).
   [#76](https://github.com/rboudrouss/reactant-analyzer/issues/76). A spread argument
   `f(...args)` is kept, marked: a parameter from it on may hold any entry of it or any later
   argument, and a callee the analysis does not see receives its entries as it receives an
-  argument's. A setter held in a *named* container handed to such a callee (`foo(arr)`,
-  `foo(...arr)` with `arr = [setN]`) is not a write
-  [#322](https://github.com/rboudrouss/reactant-analyzer/issues/322); an array literal is
-  (`foo([setN])`). A parameter's default is its value when the argument is omitted or
+  argument's. A setter held in a container handed to such a callee (`foo(arr)`, `foo([setN])`)
+  is a possible write there, as the store already had it
+  [#322](https://github.com/rboudrouss/reactant-analyzer/issues/322). A parameter's default is its value when the argument is omitted or
   `undefined`, as JavaScript stores it.
 - **Mount-coupled seeds.** `frozen-initial-state` drops to Info, hidden without `--info`, when every
   call site renders the consumer under a `key` built from the seeding prop, or under a guard built

@@ -414,10 +414,11 @@ fn callbacks_fixture_no_regression() {
     // AllSettledLoop, AnyLoop, VarCallbackLoop, VarCallbackThenLoop,
     // VarCallbackIntervalLoop, VarCallbackForEachLoop, NestedHelperLoop,
     // RenderCbInEffectLoop (B5 cross-pass: cb défini en render, utilisé dans effect),
-    // CustomHelperMayLoop (closure échappée dans un callee inconnu, #254) = 13
+    // CustomHelperMayLoop (closure échappée dans un callee inconnu, #254),
+    // DeepHelperOk (au-delà de la profondeur de la marche, ADR-047) = 14
     // Les 3 nouveaux (ResizeHandlerWithDepsOk, KeydownHandlerOk, MultiListenerOk) = 0.
     assert_eq!(
-        hits, 13,
-        "callbacks.tsx regression: expected 13 infinite-loop hits"
+        hits, 14,
+        "callbacks.tsx regression: expected 14 infinite-loop hits"
     );
 }

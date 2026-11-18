@@ -798,6 +798,8 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     let effect_info = collect_effect_info(&hooks);
     let handler_info = collect_handler_info(&hooks);
     let hooks_clone = hooks.clone();
+    let mut calls = calls.into_inner();
+    calls.name_slots(comp_id, &render_cfg);
     let pending = RelationInputs {
         inline_regions,
         reducers: reducers.into_own(),
@@ -834,7 +836,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         effect_props: Default::default(),
         iterations: iteration,
         heap,
-        calls: std::sync::Arc::new(calls.into_inner()),
+        calls: std::sync::Arc::new(calls),
         relations_pending: None,
     };
     // An inter-component analysis may be thrown away (a child re-analysed
@@ -881,16 +883,11 @@ fn compute_relations(
     let profile = crate::profile::pass("relations:writers");
     let reducers = crate::engine::Reducers::registered(comp_id, reducers, program_reducers);
     let env_exit = result.exit_env();
-    // A write through a parent's setter prop is a row too, owner-qualified
-    // (ADR-042 §2) — the same resolution `setter-in-render` reads — and so is
-    // one through a name or member the converged values bind to an own setter.
+    // What every call writes and runs is the call relation's (ADR-047): a
+    // write through a parent's setter prop is a row too, owner-qualified
+    // (ADR-042 §2).
     let render_params = std::slice::from_ref(&result.param);
-    let converged_setters = crate::engine::setters::collect_component_setter_vars(
-        &result.render_cfg,
-        render_params,
-        &result.block_states,
-        &result.heap,
-    );
+    let calls = std::sync::Arc::clone(&result.calls);
     // The envs each row's argument is evaluated in: the converged stores, and
     // the per-block envs of the region the row sits in.
     let site_envs = crate::engine::written::SiteEnvs {
@@ -910,7 +907,7 @@ fn compute_relations(
         &result.hooks,
         &inline_regions,
         &result.hook_provenance,
-        &converged_setters,
+        &calls,
         &site_envs,
         &reducers,
         dispatches,
@@ -1123,6 +1120,11 @@ pub fn analyze_program(
         let mut program_calls = crate::engine::CallRelation::default();
         for id in &ids {
             program_calls.join(&results[id].calls);
+            // Every component's slots, named: a closure of a parent written
+            // in a child's analysis names the parent's setter.
+            if let Some(ir) = registry.ir_of(*id) {
+                program_calls.name_slots(*id, &ir.render_cfg);
+            }
         }
         let program_calls = std::sync::Arc::new(program_calls);
         for result in results.values_mut() {
