@@ -153,13 +153,17 @@ type Map<K, V> = OrdMap<K, V>;
 pub struct AbstractEnv<D: AbstractDomain> {
     stabs: Map<Var, D>,
     locs: Map<Var, Sites>,
-    /// The setters a name may be: one per path that bound it, unioned at a
-    /// join (#202).
+    /// The setters a name is one of, when every binding it may hold here
+    /// is a setter of this component: one per path that bound it, unioned
+    /// at a join of two such bindings (#202). A name's label is the label of
+    /// its current binding(s), never of an earlier one (#327): a binding
+    /// replaces it ([`AbstractEnv::extend`]), and a join with a binding that
+    /// carries none drops it — the name's value then says what it may be.
     setter_bindings: Map<Var, Labels>,
     /// Side-channel for `useCallback` bindings: the body lives in the hook
     /// entry (`QueryContext::callback_body`), not the heap, so calls through
-    /// the variable can still be executed for side effects. Unioned at a
-    /// join, as the setters are.
+    /// the variable can still be executed for side effects. The same
+    /// invariant as the setters'.
     callback_bindings: Map<Var, Labels>,
     /// The names that are, at this point, the value a state slot was read
     /// as in this render: `a = StateVal(l)` and its renames. A primitive
@@ -199,35 +203,39 @@ fn agreed_slots(a: &Map<Var, HookLabel>, b: &Map<Var, HookLabel>) -> Map<Var, Ho
 /// The hooks a name may be bound to.
 pub type Labels = BTreeSet<HookLabel>;
 
-/// Every binding of either side, a name both bind holding the union.
-fn union_labels(a: &Map<Var, Labels>, b: &Map<Var, Labels>) -> Map<Var, Labels> {
+/// The labels of a join: a name both sides label holds the union; a name
+/// one side does not label may hold that side's binding, which is no such
+/// label (#327), so it holds none.
+fn join_labels(a: &Map<Var, Labels>, b: &Map<Var, Labels>) -> Map<Var, Labels> {
     let mut out = a.clone();
     for item in a.diff(b) {
         match item {
-            DiffItem::Add(k, v) => {
-                out.insert(k.clone(), v.clone());
-            }
             DiffItem::Update {
                 old: (k, x),
                 new: (_, y),
             } => {
                 out.insert(k.clone(), x.union(y).copied().collect());
             }
-            DiffItem::Remove(..) => {}
+            DiffItem::Remove(k, _) => {
+                out.remove(k);
+            }
+            DiffItem::Add(..) => {}
         }
     }
     out
 }
 
-/// `a ⊑ b` over label bindings: every name `a` binds, `b` binds to a superset.
-fn labels_leq(a: &Map<Var, Labels>, b: &Map<Var, Labels>) -> bool {
+/// `a ⊑ b` over label bindings, where a label is a claim and no label none:
+/// every name `b` labels, `a` labels with a subset, or does not bind at all
+/// (`a_names`).
+fn labels_leq<D>(a: &Map<Var, Labels>, b: &Map<Var, Labels>, a_names: &Map<Var, D>) -> bool {
     a.diff(b).all(|item| match item {
         DiffItem::Update {
             old: (_, x),
             new: (_, y),
         } => x.is_subset(y),
-        DiffItem::Remove(_, x) => x.is_empty(),
-        DiffItem::Add(..) => true,
+        DiffItem::Remove(..) => true,
+        DiffItem::Add(k, _) => !a_names.contains_key(k),
     })
 }
 
@@ -259,9 +267,13 @@ impl<D: AbstractDomain> AbstractEnv<D> {
     }
 
     /// Bind (or rebind) a variable to a domain value. Preserves any Loc;
-    /// drops the slot certificate, which the new binding must earn again.
+    /// drops the slot certificate and the setter and `useCallback` labels,
+    /// which the new binding must earn again (#327): they said what the
+    /// earlier binding was.
     pub fn extend(&mut self, var: Var, val: D) {
         self.slot_bindings.remove(&var);
+        self.setter_bindings.remove(&var);
+        self.callback_bindings.remove(&var);
         self.refine(var, val);
     }
 
@@ -311,6 +323,7 @@ impl<D: AbstractDomain> AbstractEnv<D> {
             .as_state_value()
             .map_or_else(D::top, D::from_state_value);
         let their_sites = from.locs.get(var);
+        let bound = self.stabs.contains_key(var);
         let (val, sites) = match self.stabs.get(var) {
             None => (theirs, their_sites.cloned()),
             Some(mine) => (
@@ -331,18 +344,24 @@ impl<D: AbstractDomain> AbstractEnv<D> {
             self.bind_locs(var.to_string(), sites);
             changed = true;
         }
+        // The labels as a join keeps them (#327): theirs whole where `self`
+        // had no binding, the union where both label the name, none where
+        // either binding carries none.
         for (mine, theirs) in [
             (&mut self.setter_bindings, &from.setter_bindings),
             (&mut self.callback_bindings, &from.callback_bindings),
         ] {
-            if let Some(labels) = theirs.get(var) {
-                let current = mine.get(var);
-                if current.is_none_or(|c| !labels.is_subset(c)) {
-                    let union = current
-                        .map_or_else(|| labels.clone(), |c| c.union(labels).copied().collect());
-                    mine.insert(var.to_string(), union);
-                    changed = true;
-                }
+            let joined = match (bound, mine.get(var), theirs.get(var)) {
+                (false, _, labels) => labels.cloned(),
+                (true, Some(c), Some(labels)) => Some(c.union(labels).copied().collect()),
+                (true, ..) => None,
+            };
+            if mine.get(var) != joined.as_ref() {
+                match joined {
+                    Some(labels) => mine.insert(var.to_string(), labels),
+                    None => mine.remove(var),
+                };
+                changed = true;
             }
         }
         changed
@@ -392,12 +411,6 @@ impl<D: AbstractDomain> AbstractEnv<D> {
     /// The hooks `var` may be the state-setter of; none for a non-setter.
     pub fn setter_labels(&self, var: &str) -> Option<&Labels> {
         self.setter_bindings.get(var)
-    }
-
-    /// `var` is not bound to a setter by name: what it may call is read off
-    /// its value.
-    pub fn unbind_setter(&mut self, var: &str) {
-        self.setter_bindings.remove(var);
     }
 
     /// The hook `var` is the state-setter of, when it is one setter.
@@ -478,8 +491,8 @@ impl<D: AbstractDomain> AbstractEnv<D> {
         AbstractEnv {
             stabs: Self::join_stabs(&self.stabs, &other.stabs),
             locs: Self::join_locs(&self.locs, &other.locs),
-            setter_bindings: union_labels(&self.setter_bindings, &other.setter_bindings),
-            callback_bindings: union_labels(&self.callback_bindings, &other.callback_bindings),
+            setter_bindings: join_labels(&self.setter_bindings, &other.setter_bindings),
+            callback_bindings: join_labels(&self.callback_bindings, &other.callback_bindings),
             slot_bindings: agreed_slots(&self.slot_bindings, &other.slot_bindings),
         }
     }
@@ -511,8 +524,8 @@ impl<D: AbstractDomain> AbstractEnv<D> {
         AbstractEnv {
             stabs,
             locs: Self::join_locs(&self.locs, &other.locs),
-            setter_bindings: union_labels(&self.setter_bindings, &other.setter_bindings),
-            callback_bindings: union_labels(&self.callback_bindings, &other.callback_bindings),
+            setter_bindings: join_labels(&self.setter_bindings, &other.setter_bindings),
+            callback_bindings: join_labels(&self.callback_bindings, &other.callback_bindings),
             slot_bindings: agreed_slots(&self.slot_bindings, &other.slot_bindings),
         }
     }
@@ -554,8 +567,12 @@ impl<D: AbstractDomain> AbstractEnv<D> {
                 return false;
             }
         }
-        labels_leq(&self.setter_bindings, &other.setter_bindings)
-            && labels_leq(&self.callback_bindings, &other.callback_bindings)
+        labels_leq(&self.setter_bindings, &other.setter_bindings, &self.stabs)
+            && labels_leq(
+                &self.callback_bindings,
+                &other.callback_bindings,
+                &self.stabs,
+            )
     }
 }
 
@@ -640,15 +657,84 @@ mod tests {
         assert_eq!(a.widen_to(&b, &[]).slot_label("y"), None);
     }
 
+    /// #327: a label says what the name's current binding is. A rebinding
+    /// drops it, a join with a binding that carries none drops it, and a
+    /// refinement (the same binding, narrowed) keeps it.
     #[test]
-    fn join_merges_setter_bindings() {
-        let mut a = Env::new();
-        a.bind_setter("setA".to_string(), 0);
+    fn a_label_is_the_label_of_the_current_binding() {
+        let labelled = |val| {
+            let mut env = Env::new();
+            env.extend("s".to_string(), val);
+            env.bind_setter("s".to_string(), 0);
+            env.bind_callback("s".to_string(), 2);
+            env
+        };
+        let mut env = labelled(Stability::Stable);
+        env.refine("s".to_string(), Stability::Stable);
+        assert_eq!(env.setter_label("s"), Some(0), "narrowing is not rebinding");
+        env.extend("s".to_string(), Stability::Unknown);
+        assert_eq!(
+            env.setter_labels("s"),
+            None,
+            "`s = onX` is no setter of ours"
+        );
+        assert_eq!(env.callback_labels("s"), None);
+
+        // The same value, so only the labels tell the two apart.
+        let a = labelled(Stability::Stable);
         let mut b = Env::new();
-        b.bind_setter("setB".to_string(), 1);
-        let joined = a.join(&b);
-        assert_eq!(joined.setter_label("setA"), Some(0));
-        assert_eq!(joined.setter_label("setB"), Some(1));
+        b.extend("s".to_string(), Stability::Stable);
+        for joined in [
+            a.join(&b),
+            b.join(&a),
+            a.widen_to(&b, &[]),
+            b.widen_to(&a, &[]),
+        ] {
+            assert_eq!(
+                joined.setter_labels("s"),
+                None,
+                "`s` may be the other binding"
+            );
+            assert_eq!(joined.callback_labels("s"), None);
+            assert!(a.leq(&joined) && b.leq(&joined));
+            assert!(
+                !joined.leq(&a),
+                "the label is a claim the join does not make"
+            );
+        }
+        // A name `self` does not bind at all is below any binding of it.
+        assert!(Env::bottom().leq(&a));
+    }
+
+    /// #258 joins one name's binding from another env: the labels follow
+    /// the join's rule (#327), and a name `self` does not bind takes the
+    /// other's binding whole.
+    #[test]
+    fn a_binding_joined_by_name_keeps_labels_only_both_carry() {
+        let mut theirs = Env::new();
+        theirs.extend("s".to_string(), Stability::Unknown);
+        let mut mine = Env::new();
+        mine.extend("s".to_string(), Stability::Stable);
+        mine.bind_setter("s".to_string(), 0);
+        assert!(mine.join_binding_from("s", &theirs));
+        assert_eq!(mine.setter_labels("s"), None, "`s` may be what they stored");
+
+        let mut labelled = Env::new();
+        labelled.extend("s".to_string(), Stability::Stable);
+        labelled.bind_setter("s".to_string(), 1);
+        let mut fresh = Env::new();
+        assert!(fresh.join_binding_from("s", &labelled));
+        assert_eq!(
+            fresh.setter_label("s"),
+            Some(1),
+            "no binding of ours: theirs whole"
+        );
+        let mut other = Env::new();
+        other.extend("s".to_string(), Stability::Stable);
+        other.bind_setter("s".to_string(), 0);
+        assert!(other.join_binding_from("s", &labelled));
+        assert_eq!(other.setter_labels("s"), Some(&Labels::from([0, 1])));
+        assert!(!other.join_binding_from("s", &labelled), "already holds it");
     }
 
     #[test]

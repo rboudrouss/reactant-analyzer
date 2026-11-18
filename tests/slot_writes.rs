@@ -12,7 +12,7 @@ use reactant::{
         RootStrategy, analyze_program,
     },
     lowering::{lower_program, lower_utilities},
-    rules::{InfiniteLoop, Rule, RuleCtx, Severity},
+    rules::{InfiniteLoop, Rule, RuleCtx, Severity, UnnecessaryRerender},
 };
 
 fn analyze(src: &str) -> ProgramAnalysisResult {
@@ -870,6 +870,107 @@ export function App() {
         holds(&result, "App", 3, 5.0),
         "the live value through a helper"
     );
+}
+
+// ── #327: a binding replaces the setter a name was ──────────────────────────
+
+/// A child whose mount effect binds `s` to `setA`, then runs `body`; the
+/// parent passes its own `setK` as `onX`, and loops once `k` moves off 0;
+/// `c` may be either.
+fn rebinding(body: &str) -> String {
+    format!(
+        r#"
+import {{ useState, useEffect }} from 'react';
+function Child({{ c, onX }}: {{ c: boolean; onX: (v: number) => void }}) {{
+  const [a, setA] = useState(0);
+  const [n, setN] = useState(0);
+  useEffect(() => {{
+    let s: any = setA;
+    {body}
+  }}, []);
+  return <div>{{a}}{{n}}</div>;
+}}
+export function App() {{
+  const [k, setK] = useState(0);
+  useEffect(() => {{ if (k > 0) setK(k + 1); }}, [k]);
+  return <Child c={{Math.random() < 0.5}} onX={{setK}} />;
+}}
+"#
+    )
+}
+
+/// `s = onX` replaces `setA`: the call writes the parent's `k`, never the
+/// child's `a`; on one branch only, it may write either; a number is no
+/// setter at all; a closure on one branch runs as well.
+#[test]
+fn a_rebinding_replaces_the_setter_a_name_was() {
+    let child_a = |result: &ProgramAnalysisResult| {
+        let id = result.component_named("Child").unwrap();
+        result.components[&id].state_store.get(0)
+    };
+    let zero = StateValue::number(Interval::point(0.0));
+
+    let result = analyze(&rebinding("s = onX; s(5);"));
+    assert!(holds(&result, "App", 0, 5.0), "the parent's slot takes it");
+    assert!(!loops(&result, "App").is_empty(), "the parent loops");
+    assert_eq!(child_a(&result), zero, "`s` is no longer `setA`");
+
+    let result = analyze(&rebinding("if (c) s = onX; s(5);"));
+    assert!(holds(&result, "App", 0, 5.0), "`s` may be `onX`");
+    assert!(holds(&result, "Child", 0, 5.0), "`s` may be `setA`");
+    assert!(!loops(&result, "App").is_empty(), "the parent loops");
+
+    let result = analyze(&rebinding("s = 0; try { s(5); } catch {}"));
+    assert_eq!(child_a(&result), zero, "a number writes no slot");
+
+    let result = analyze(&rebinding("if (c) s = (v: number) => setN(v); s(5);"));
+    assert!(holds(&result, "Child", 0, 5.0), "`s` may be `setA`");
+    assert!(holds(&result, "Child", 1, 5.0), "the closure runs");
+
+    let result = analyze(&rebinding("s(5);"));
+    assert!(holds(&result, "Child", 0, 5.0), "`s` is `setA`");
+}
+
+/// #258 shares a name's binding between the bodies that assign it: the
+/// render's `s = setA` joined with the effect's `s = onX` may be either, so
+/// the other effect's call writes the parent's slot as well.
+#[test]
+fn a_binding_another_body_stores_replaces_the_setter_label() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Child({ onX }: { onX: (v: number) => void }) {
+  const [a, setA] = useState(0);
+  let s = setA;
+  useEffect(() => { s = onX; }, []);
+  useEffect(() => { s(5); }, []);
+  return <div>{a}</div>;
+}
+export function App() {
+  const [k, setK] = useState(0);
+  useEffect(() => { if (k > 0) setK(k + 1); }, [k]);
+  return <Child onX={setK} />;
+}
+"#;
+    let result = analyze(src);
+    assert!(holds(&result, "App", 0, 5.0), "the parent's slot takes it");
+    assert!(!loops(&result, "App").is_empty(), "the parent loops");
+}
+
+/// `unnecessary-rerender` claims the mount effect's write of `a` only where
+/// the call may be `setA`: not once `s` is rebound to the parent's setter.
+#[test]
+fn unnecessary_rerender_reads_the_setter_the_name_holds_at_the_call() {
+    let claims_a = |body: &str| {
+        let result = analyze(&rebinding(body));
+        let child = result.component_named("Child").unwrap();
+        UnnecessaryRerender
+            .check(&RuleCtx::new(&result, child))
+            .iter()
+            .any(|d| d.message.contains("`a`"))
+    };
+    assert!(claims_a("s(5);"), "`s` is `setA`");
+    assert!(claims_a("if (c) s = onX; s(5);"), "`s` may be `setA`");
+    assert!(!claims_a("s = onX; s(5);"), "`s` is the parent's setter");
 }
 
 /// What an escaped closure writes is what the slot gets, nothing more: a

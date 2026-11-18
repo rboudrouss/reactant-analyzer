@@ -1814,8 +1814,8 @@ mod tests {
     fn functional_updater_increments_state() {
         let (mut env, mut state, memo) = empty();
         state.update(0, StateValue::number(Interval::point(5.0)));
-        env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
+        env.bind_setter("setN".to_string(), 0);
 
         let body_cfg = single_block_cfg(
             vec![],
@@ -1959,8 +1959,8 @@ mod tests {
     fn functional_updater_branch_joins() {
         let (mut env, mut state, memo) = empty();
         state.update(0, StateValue::number(Interval::point(3.0)));
-        env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
+        env.bind_setter("setN".to_string(), 0);
 
         let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
@@ -2165,8 +2165,8 @@ mod tests {
         // though the body has a back edge; the body's return value is Top.
         let (mut env, mut state, memo) = empty();
         state.update(0, StateValue::number(Interval::point(0.0)));
-        env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
+        env.bind_setter("setN".to_string(), 0);
 
         let body_cfg = while_loop_body(vec![setter_call(
             "setN",
@@ -2320,8 +2320,8 @@ mod tests {
         // The setter in the body block must fire despite the back edge.
         let (mut env, mut state, memo) = empty();
         state.update(0, StateValue::number(Interval::point(0.0)));
-        env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
+        env.bind_setter("setN".to_string(), 0);
 
         let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
@@ -2437,13 +2437,13 @@ mod tests {
         // state 1 fires.
         let (mut env, mut state, memo) = empty();
         state.update(0, StateValue::number(Interval::point(5.0)));
-        env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
-        env.bind_setter("setOther".to_string(), 1);
+        env.bind_setter("setN".to_string(), 0);
         env.extend(
             "setOther".to_string(),
             StateValue::reference(Stability::Stable),
         );
+        env.bind_setter("setOther".to_string(), 1);
 
         // Reuse the while shape but give block 3 (exit) a real `c + 1` return.
         let mut body_cfg = while_loop_body(vec![setter_call("setOther", Expr::Lit(Prim::Int(1)))]);
@@ -2494,11 +2494,11 @@ mod tests {
     fn then_callback_updates_state() {
         let (mut env, mut state, memo) = empty();
         state.update(0, StateValue::number(Interval::point(0.0)));
-        env.bind_setter("setUser".to_string(), 0);
         env.extend(
             "setUser".to_string(),
             StateValue::reference(Stability::Stable),
         );
+        env.bind_setter("setUser".to_string(), 0);
 
         let cb_body = single_block_cfg(
             vec![Stmt::ExprStmt(
@@ -2543,8 +2543,8 @@ mod tests {
     #[test]
     fn set_timeout_callback_updates_state() {
         let (mut env, mut state, memo) = empty();
-        env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
+        env.bind_setter("setN".to_string(), 0);
 
         let cb_body = single_block_cfg(
             vec![Stmt::ExprStmt(
@@ -2585,10 +2585,10 @@ mod tests {
     #[test]
     fn then_chain_descends_both_callbacks() {
         let (mut env, mut state, memo) = empty();
-        env.bind_setter("setA".to_string(), 0);
         env.extend("setA".to_string(), StateValue::reference(Stability::Stable));
-        env.bind_setter("setB".to_string(), 1);
+        env.bind_setter("setA".to_string(), 0);
         env.extend("setB".to_string(), StateValue::reference(Stability::Stable));
+        env.bind_setter("setB".to_string(), 1);
 
         let cb_a = single_block_cfg(
             vec![Stmt::ExprStmt(
@@ -2650,8 +2650,8 @@ mod tests {
     #[test]
     fn then_in_let_binding_descends() {
         let (mut env, mut state, memo) = empty();
-        env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
+        env.bind_setter("setN".to_string(), 0);
 
         let cb = single_block_cfg(
             vec![Stmt::ExprStmt(
@@ -2697,8 +2697,8 @@ mod tests {
     #[test]
     fn subscription_callback_not_descended() {
         let (mut env, mut state, memo) = empty();
-        env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
+        env.bind_setter("setN".to_string(), 0);
 
         let cb = single_block_cfg(
             vec![Stmt::ExprStmt(
@@ -2742,10 +2742,10 @@ mod tests {
     #[test]
     fn then_both_args_descended() {
         let (mut env, mut state, memo) = empty();
-        env.bind_setter("setA".to_string(), 0);
         env.extend("setA".to_string(), StateValue::reference(Stability::Stable));
-        env.bind_setter("setB".to_string(), 1);
+        env.bind_setter("setA".to_string(), 0);
         env.extend("setB".to_string(), StateValue::reference(Stability::Stable));
+        env.bind_setter("setB".to_string(), 1);
 
         let on_fulfilled = single_block_cfg(
             vec![Stmt::ExprStmt(
@@ -2805,8 +2805,8 @@ mod tests {
     #[test]
     fn promise_all_settled_then_cb_descended() {
         let (mut env, mut state, memo) = empty();
-        env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
+        env.bind_setter("setN".to_string(), 0);
 
         let cb = single_block_cfg(
             vec![Stmt::ExprStmt(
@@ -2862,11 +2862,11 @@ mod tests {
     /// label, and the setter as its value — what a closure that captures the
     /// name holds of it (#326).
     fn bind_setter_value(env: &mut AbstractEnv<StateValue>, name: &str) {
-        env.bind_setter(name.to_string(), 0);
         env.extend(
             name.to_string(),
             StateValue::component_setter(crate::test_support::C, 0),
         );
+        env.bind_setter(name.to_string(), 0);
     }
 
     #[test]
@@ -2921,8 +2921,8 @@ mod tests {
     #[test]
     fn var_callback_not_descended_without_loc() {
         let (mut env, mut state, memo) = empty();
-        env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
+        env.bind_setter("setN".to_string(), 0);
 
         let cb_body = single_block_cfg(
             vec![Stmt::ExprStmt(
@@ -3192,8 +3192,8 @@ mod tests {
     #[test]
     fn depth_limit_stops_deep_inlining() {
         let (mut env, mut state, memo) = empty();
-        env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
+        env.bind_setter("setN".to_string(), 0);
 
         let make_body = |callee: &str| -> Arc<CFG> {
             Arc::new(single_block_cfg(
@@ -3286,8 +3286,8 @@ mod tests {
         // terminates and (b) MAX_INLINE_DEPTH still caps the chain: setN at depth 4
         // is never reached → state stays Bottom.
         let (mut env, mut state, memo) = empty();
-        env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
+        env.bind_setter("setN".to_string(), 0);
 
         // A loop body whose single body-block statement calls `callee()`.
         let make_loop_wrapper = |callee: &str| -> Arc<CFG> {

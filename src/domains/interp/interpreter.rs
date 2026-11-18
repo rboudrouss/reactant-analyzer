@@ -582,6 +582,10 @@ fn havoc_members<T: Transfer>(
 /// heap object) propagate their loc/setter/callback binding to `var`; then the
 /// RHS is evaluated and stored. Keeping this in one place is what guarantees
 /// `let s = setX` and `s = setX` behave identically (see the call site).
+///
+/// The binding replaces everything `var` denoted (#327): its value, its
+/// sites, its slot certificate and its setter and `useCallback` labels,
+/// which only a right-hand side that carries some gives it again.
 fn bind_rhs<T: Transfer>(
     transfer: &T,
     var: &str,
@@ -589,12 +593,15 @@ fn bind_rhs<T: Transfer>(
     env: &mut AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
 ) {
-    if let Expr::StateSetter(label) = rhs {
-        env.bind_setter(var.to_string(), *label);
-    }
-    if let Expr::CallbackVal(label) = rhs {
-        env.bind_callback(var.to_string(), *label);
-    }
+    let (setters, callbacks) = match rhs {
+        Expr::StateSetter(label) => (Some(BTreeSet::from([*label])), None),
+        Expr::CallbackVal(label) => (None, Some(BTreeSet::from([*label]))),
+        Expr::Var(src) => (
+            env.setter_labels(src).cloned(),
+            env.callback_labels(src).cloned(),
+        ),
+        _ => (None, None),
+    };
     // A literal is allocated, and a name or member chain shares the sites it
     // points to (`let __obj = __p0`, `let f = props.onClick`). An object
     // literal is a fresh container whose members keep their own identities:
@@ -649,14 +656,6 @@ fn bind_rhs<T: Transfer>(
             .insert(*id, HeapValue::Obj(Members::at_least(fields)));
         env.bind_locs(var.to_string(), Some(Sites::closed([*id])));
     }
-    if let Expr::Var(src) = rhs {
-        if let Some(labels) = env.setter_labels(src).cloned() {
-            env.bind_setters(var.to_string(), labels);
-        }
-        if let Some(labels) = env.callback_labels(src).cloned() {
-            env.bind_callbacks(var.to_string(), labels);
-        }
-    }
     // A slot read, or a rename of one, certifies the name (#197); any
     // other right-hand side revokes what the name had.
     let slot = match rhs.peel_ts() {
@@ -668,6 +667,12 @@ fn bind_rhs<T: Transfer>(
     env.extend(var.to_string(), val);
     if let Some(label) = slot {
         env.bind_slot(var.to_string(), label);
+    }
+    if let Some(labels) = setters {
+        env.bind_setters(var.to_string(), labels);
+    }
+    if let Some(labels) = callbacks {
+        env.bind_callbacks(var.to_string(), labels);
     }
 }
 
@@ -1481,10 +1486,10 @@ fn exec_heap_fns<T: Transfer>(
 /// callbacks. A closure of another component starts from its captures
 /// alone: the caller's labels, mapped to the *calling* component, would
 /// resolve a parent's `setK` to a child's `setK`. What tells the two apart
-/// is the body's owner, not a name lookup. Either way a captured name is no
-/// setter by name: its value carries the setter with its owner, where a
-/// label — read before the value — would let a same-named binding of the
-/// caller replace it.
+/// is the body's owner, not a name lookup. Either way a captured name is a
+/// new binding, no setter by name: its value carries the setter with its
+/// owner, where a label — read before the value — would let a same-named
+/// binding of the caller replace it.
 pub(crate) fn closure_env<D: AbstractDomain>(
     closure: &HeapValue,
     env: &AbstractEnv<D>,
@@ -1522,9 +1527,15 @@ pub(crate) fn closure_env<D: AbstractDomain>(
             let at_call = env.lookup_env_val(var);
             sites = Sites::join_opt(sites.as_ref(), at_call.as_ref().and_then(EnvVal::sites));
         }
-        sub_env.unbind_setter(var);
         sub_env.bind_locs(var.clone(), sites);
         sub_env.extend(var.clone(), val);
+        // The binding the body reads at the call is the caller's: its
+        // `useCallback` labels are that binding's (#327).
+        if live.contains(var)
+            && let Some(labels) = env.callback_labels(var)
+        {
+            sub_env.bind_callbacks(var.clone(), labels.clone());
+        }
     }
     // The creation-time certificates, not the call site's: the body's `a` is
     // the one it closed over — and, for a name the call also reads, only
