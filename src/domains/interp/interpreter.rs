@@ -862,6 +862,8 @@ fn spread_into(members: &mut Members, source: Option<&Sites>, heap: &Heap) {
 ///   slot's current value (#168) — ⊤ for another component's slot, whose
 ///   value lives in its owner's fixpoint;
 /// - any other argument is stored as evaluated.
+///
+/// Returns each slot written, with the value it stored.
 fn exec_slot_write<T: Transfer>(
     transfer: &T,
     fn_: &Expr,
@@ -869,11 +871,18 @@ fn exec_slot_write<T: Transfer>(
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
-) {
-    for (owner, label) in call_targets(transfer, fn_, env, ctx) {
-        write_one_slot(transfer, owner, label, args, env, ctx, depth);
-    }
+) -> Vec<(Slot, T::Domain)> {
+    call_targets(transfer, fn_, env, ctx)
+        .into_iter()
+        .map(|(owner, label)| {
+            let next = write_one_slot(transfer, owner, label, args, env, ctx, depth);
+            ((owner, label), next)
+        })
+        .collect()
 }
+
+/// A state slot: its owner and its label there.
+type Slot = (crate::ir::ComponentId, crate::ir::types::HookLabel);
 
 /// A setter an in-cycle callee calls — an array method, a `then`, a timer —
 /// is called there (#291), with what the callee passes it (`given`: an array
@@ -886,9 +895,9 @@ fn apply_setter<T: Transfer>(
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
-) {
+) -> Vec<Slot> {
     if call_targets(transfer, arg, env, ctx).is_empty() {
-        return;
+        return Vec::new();
     }
     let supplied = [String::from("__supplied")];
     let mut scope = env.clone();
@@ -900,7 +909,10 @@ fn apply_setter<T: Transfer>(
         &scope,
         ctx,
         depth,
-    );
+    )
+    .into_iter()
+    .map(|(slot, _)| slot)
+    .collect()
 }
 
 /// The slots a call through `fn_` may write, in `env`: those a name is bound
@@ -930,6 +942,50 @@ pub(crate) fn call_targets<T: Transfer>(
     }
 }
 
+/// One evaluation of a call through `fn_`, for the call relation (ADR-047):
+/// the slots it wrote and what each stored, the bodies it ran (or stands
+/// for), whether the callee may be something neither names, and whether it
+/// surely is its one target — one setter (a label naming one, or a value
+/// that is surely that setter), or one body (a value that is surely a
+/// reference, every site of which is that closure). A ⊥ callee decides
+/// nothing.
+fn call_evaluation<T: Transfer>(
+    transfer: &T,
+    fn_: &Expr,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+    ran: Ran,
+    written: Vec<(Slot, T::Domain)>,
+) -> crate::engine::calls::Evaluation {
+    let labels = match fn_ {
+        Expr::Var(name) => env.setter_labels(name).map(|l| l.len()),
+        _ => None,
+    };
+    let value = transfer.eval_expr(fn_, env, ctx);
+    let unreached = labels.is_none() && value.is_bottom();
+    let sv = value.as_state_value();
+    let surely_setter = labels.is_some() || sv.as_ref().is_some_and(StateValue::surely_setter);
+    let one_setter = match labels {
+        Some(n) => n == 1,
+        None => surely_setter && sv.as_ref().is_some_and(|v| v.setters().len() == 1),
+    };
+    let one_body = written.is_empty()
+        && ran.bodies.len() == 1
+        && !ran.open
+        && sv.as_ref().is_some_and(StateValue::is_reference_only);
+    crate::engine::calls::Evaluation {
+        setters: written.iter().map(|(slot, _)| *slot).collect(),
+        bodies: ran.bodies,
+        open: ran.open && !surely_setter,
+        unreached,
+        one_target: one_setter || one_body,
+        written: written
+            .into_iter()
+            .map(|(slot, v)| (slot, v.as_state_value().unwrap_or_else(StateValue::top)))
+            .collect(),
+    }
+}
+
 /// [`exec_slot_write`] for one target slot.
 fn write_one_slot<T: Transfer>(
     transfer: &T,
@@ -939,7 +995,7 @@ fn write_one_slot<T: Transfer>(
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
-) {
+) -> T::Domain {
     // The pass's store, joined with the slot's value at the start of the
     // pass: a re-run from ⊥ would otherwise hand the updater ⊥, and a ⊥
     // write vanishes in the join with any other write of the slot.
@@ -978,7 +1034,8 @@ fn write_one_slot<T: Transfer>(
             None => T::Domain::top(),
         },
     };
-    ctx.write_slot(owner, label, next);
+    ctx.write_slot(owner, label, next.clone());
+    next
 }
 
 /// Per-expression effect walk: every call in `expr` runs its effects — the
@@ -1015,7 +1072,7 @@ fn exec_callbacks_depth<T: Transfer>(
             .insert(inter.component);
     }
     match expr {
-        Expr::Call { fn_, args, .. } => {
+        Expr::Call { id, fn_, args } => {
             let class = classify_callee(fn_, env, ctx.query.dispatches());
             // Descend the receiver: handles chains like `a.then(x).then(y)`.
             exec_callbacks_depth(transfer, fn_, env, ctx, depth);
@@ -1042,12 +1099,14 @@ fn exec_callbacks_depth<T: Transfer>(
                 // write of what it may call, whatever it binds it to.
                 if runs_args && i < positional {
                     let given = callback_args(transfer, fn_, i, env, ctx);
-                    let returned = exec_fn_value(transfer, arg, &given, env, ctx, depth);
+                    let mut ran = Ran::default();
+                    let returned = exec_fn_value(transfer, arg, &given, env, ctx, depth, &mut ran);
                     escape_returned(returned.as_ref(), ctx);
                     // A setter is run as a call of it (#291).
-                    apply_setter(transfer, arg, &given, env, ctx, depth);
+                    let applied = apply_setter(transfer, arg, &given, env, ctx, depth);
+                    ctx.record(|r| r.record_escape(*id, i, applied, ran.bodies));
                 } else {
-                    let sites = escape(transfer, arg, env, ctx);
+                    let sites = escape_at(transfer, arg, env, ctx, Some((*id, i)));
                     if binds_args && i < positional {
                         passed.push(EnvVal::located(sites, transfer.eval_expr(arg, env, ctx)));
                     }
@@ -1063,15 +1122,35 @@ fn exec_callbacks_depth<T: Transfer>(
             // callee is not run here: it escapes, and runs from the top of
             // the budget with the handlers (#254).
             let mut returned = None;
+            let mut ran = Ran::default();
             if class == TriggerClass::Unknown {
                 if capped {
-                    escape(transfer, fn_, env, ctx);
+                    if ctx.calls.is_some() {
+                        // What the call stands for, resolved without a run.
+                        ran = Ran::listing();
+                        exec_fn_value(transfer, fn_, &[], env, ctx, depth, &mut ran);
+                    }
+                    escape_at(
+                        transfer,
+                        fn_,
+                        env,
+                        ctx,
+                        Some((*id, crate::engine::calls::CALLEE)),
+                    );
                 } else {
-                    returned = exec_fn_value(transfer, fn_, &passed, env, ctx, depth);
+                    returned = exec_fn_value(transfer, fn_, &passed, env, ctx, depth, &mut ran);
                 }
+            } else {
+                // A builtin, a subscription, a setter: no body of the
+                // program, and `open` unless the callee is surely a setter.
+                ran.open = true;
             }
             // Arguments first, then the call itself.
-            exec_slot_write(transfer, fn_, args, env, ctx, depth);
+            let written = exec_slot_write(transfer, fn_, args, env, ctx, depth);
+            if ctx.calls.is_some() {
+                let eval = call_evaluation(transfer, fn_, env, ctx, ran, written);
+                ctx.record(|r| r.record_call(*id, eval));
+            }
             returned
         }
         Expr::CompApp { props, .. } => {
@@ -1080,17 +1159,25 @@ fn exec_callbacks_depth<T: Transfer>(
             if !capped {
                 transfer.eval_expr(expr, env, ctx);
             }
+            // What each prop the child may invoke holds (ADR-047).
+            if let Expr::ObjectLit { id, fields, .. } = props.peel_ts() {
+                for (i, (name, val)) in fields.iter().enumerate() {
+                    if crate::lowering::hook_extractor::invoked_prop(false, name) {
+                        hand_at(transfer, val, env, ctx, (*id, i));
+                    }
+                }
+            }
             None
         }
         Expr::TSAnnotated(inner) => exec_callbacks_depth(transfer, inner, env, ctx, depth),
         // `new X(…)` hands its arguments to a constructor the analysis does
         // not run — an observer's callback, a promise executor (#254).
-        Expr::New { args, .. } => {
+        Expr::New { id, args, .. } => {
             expr.for_each_child(&mut |c| {
                 exec_callbacks_depth(transfer, c, env, ctx, depth);
             });
-            for arg in args {
-                escape(transfer, arg, env, ctx);
+            for (i, arg) in args.iter().enumerate() {
+                escape_at(transfer, arg, env, ctx, Some((*id, i)));
             }
             None
         }
@@ -1098,8 +1185,9 @@ fn exec_callbacks_depth<T: Transfer>(
         // call (#254).
         Expr::HookMarker(label, _) => {
             let query = ctx.query;
-            for arg in query.hook_args(*label) {
-                escape(transfer, arg, env, ctx);
+            let site = ctx.component.hook_site(*label);
+            for (i, arg) in query.hook_args(*label).iter().enumerate() {
+                escape_at(transfer, arg, env, ctx, Some((site, i)));
             }
             None
         }
@@ -1109,10 +1197,10 @@ fn exec_callbacks_depth<T: Transfer>(
             expr.for_each_child(&mut |c| {
                 exec_callbacks_depth(transfer, c, env, ctx, depth);
             });
-            if let Expr::ObjectLit { fields, .. } = props.peel_ts() {
-                for (name, val) in fields {
+            if let Expr::ObjectLit { id, fields, .. } = props.peel_ts() {
+                for (i, (name, val)) in fields.iter().enumerate() {
                     if crate::lowering::hook_extractor::invoked_prop(true, name) {
-                        escape(transfer, val, env, ctx);
+                        escape_at(transfer, val, env, ctx, Some((*id, i)));
                     }
                 }
             }
@@ -1142,13 +1230,28 @@ pub(crate) fn escape<T: Transfer>(
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
 ) -> Option<Sites> {
+    escape_at(transfer, expr, env, ctx, None)
+}
+
+/// [`escape`], recording what the value reached at `at` — an anchor and a
+/// position of the call relation (ADR-047) — when the context records one.
+fn escape_at<T: Transfer>(
+    transfer: &T,
+    expr: &Expr,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+    at: Option<(ExprId, usize)>,
+) -> Option<Sites> {
     // A spread argument hands over the entries of its operand, which
     // escape with it.
     if let Expr::Spread(inner) = expr {
-        return escape(transfer, inner, env, ctx);
+        return escape_at(transfer, inner, env, ctx, at);
     }
     let sites = alloc_literal(transfer, expr, env, ctx);
     let mut setters = call_targets(transfer, expr, env, ctx);
+    if let Some(at) = at {
+        record_reach(at, sites.as_ref(), &setters, ctx);
+    }
     if let Some(sites) = &sites {
         setters.extend(ctx.heap.escape(sites));
     }
@@ -1156,6 +1259,58 @@ pub(crate) fn escape<T: Transfer>(
         ctx.write_slot(owner, label, T::Domain::top());
     }
     sites
+}
+
+/// What a value handed to a child component as a prop it may invoke
+/// reaches — the child runs it in its own analysis — recorded at `at`
+/// without escaping or allocating anything (ADR-047): a function literal
+/// (allocated by the element's evaluation, before this), or a name or a
+/// member chain read off the env and the heap. Any other expression is left
+/// unrecorded: its evaluation may analyse an element.
+fn hand_at<T: Transfer>(
+    transfer: &T,
+    expr: &Expr,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+    at: (ExprId, usize),
+) {
+    if ctx.calls.is_none() {
+        return;
+    }
+    let (sites, setters) = match expr.peel_ts() {
+        Expr::FnLit { id, .. } => (Some(Sites::closed([*id])), Vec::new()),
+        e @ (Expr::Var(_) | Expr::FieldAccess { .. } | Expr::IndexAccess { .. }) => (
+            resolve_locs(e, env, ctx.heap),
+            call_targets(transfer, e, env, ctx),
+        ),
+        _ => return,
+    };
+    record_reach(at, sites.as_ref(), &setters, ctx);
+}
+
+/// Record at `at` the setters `setters` and everything `sites` reaches
+/// ([`Heap::reach_of`]).
+fn record_reach<D: AbstractDomain>(
+    at: (ExprId, usize),
+    sites: Option<&Sites>,
+    setters: &[Slot],
+    ctx: &AnalysisCtx<D>,
+) {
+    if ctx.calls.is_none() {
+        return;
+    }
+    let (held, fns) = sites.map(|s| ctx.heap.reach_of(s)).unwrap_or_default();
+    ctx.record(|r| {
+        for (site, body) in &fns {
+            r.record_body(*site, body);
+        }
+        r.record_escape(
+            at.0,
+            at.1,
+            setters.iter().copied().chain(held),
+            fns.iter().map(|(s, _)| *s),
+        );
+    });
 }
 
 /// What a body returns to code the analysis does not see escapes with it.
@@ -1240,7 +1395,8 @@ pub(crate) fn run_escaped<T: Transfer>(
                 let owned = matches!(ctx.heap.get(id), Some(HeapValue::Fn { owner, .. }) if *owner == ctx.component);
                 crate::profile::escaped_run(owned);
             }
-            let returned = exec_heap_fns(transfer, Sites::closed([id]), &[], env, ctx, 0);
+            let mut ran = Ran::default();
+            let returned = exec_heap_fns(transfer, Sites::closed([id]), &[], env, ctx, 0, &mut ran);
             escape_returned(returned.as_ref(), ctx);
         }
     }
@@ -1386,11 +1542,18 @@ pub(crate) fn exec_fn_value<T: Transfer>(
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
+    ran: &mut Ran,
 ) -> Option<EnvVal<T::Domain>> {
     match callee.peel_ts() {
         Expr::FnLit {
-            params, body_cfg, ..
+            id,
+            params,
+            body_cfg,
         } => {
+            ran.body(*id, body_cfg, ctx);
+            if ran.listing {
+                return None;
+            }
             let mut sub_env = env.clone();
             bind_params(&mut sub_env, params, args);
             let run = run_body(transfer, body_cfg, sub_env, ctx, depth + 1);
@@ -1401,7 +1564,7 @@ pub(crate) fn exec_fn_value<T: Transfer>(
         }
         other => {
             if let Some(sites) = resolve_locs(other, env, ctx.heap) {
-                return exec_heap_fns(transfer, sites, args, env, ctx, depth);
+                return exec_heap_fns(transfer, sites, args, env, ctx, depth, ran);
             }
             // useCallback binding: the body lives in the hook entry, not the
             // heap (the rewrite to `CallbackVal` moved it out of the
@@ -1417,19 +1580,55 @@ pub(crate) fn exec_fn_value<T: Transfer>(
                 for label in labels {
                     match ctx.query.callback_body(label) {
                         Some(body_cfg) => {
+                            ran.body(ctx.component.hook_site(label), &body_cfg, ctx);
+                            if ran.listing {
+                                continue;
+                            }
                             let ret = exec_body_depth(transfer, &body_cfg, env, ctx, depth + 1);
                             returned = Some(returned.map_or(ret.clone(), |r| r.join(&ret)));
                         }
                         None => open = true,
                     }
                 }
+                ran.open |= open;
                 return returned
                     .map(|r| if open { T::Domain::top() } else { r })
                     .filter(|v| !v.is_bottom())
                     .map(EnvVal::Val);
             }
+            // No site and no body: nothing of the program the heap places.
+            ran.open = true;
             None
         }
+    }
+}
+
+/// What a call of a function value ran ([`exec_fn_value`]), for the call
+/// relation (ADR-047): the bodies, by allocation site, and whether the value
+/// may be something no body stands for — unplaced, open sites, a site that
+/// is no closure. A *listing* only resolves the value, running nothing: the
+/// bodies a callee stands for past the inlining budget, where it escapes
+/// instead.
+#[derive(Debug, Default)]
+pub(crate) struct Ran {
+    pub bodies: BTreeSet<ExprId>,
+    pub open: bool,
+    pub listing: bool,
+}
+
+impl Ran {
+    /// What [`exec_fn_value`] would run, resolved without running it.
+    pub fn listing() -> Self {
+        Ran {
+            listing: true,
+            ..Ran::default()
+        }
+    }
+
+    /// The body at `site` runs (or would).
+    fn body<D: AbstractDomain>(&mut self, site: ExprId, body: &Arc<CFG>, ctx: &AnalysisCtx<D>) {
+        self.bodies.insert(site);
+        ctx.record(|r| r.record_body(site, body));
     }
 }
 
@@ -1452,6 +1651,7 @@ fn exec_heap_fns<T: Transfer>(
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
+    ran: &mut Ran,
 ) -> Option<EnvVal<T::Domain>> {
     let mut ids: Vec<_> = sites.ids.into_iter().collect();
     ids.sort();
@@ -1465,6 +1665,10 @@ fn exec_heap_fns<T: Transfer>(
             .get(id)
             .and_then(|closure| closure_env(closure, env, ctx.component))
         {
+            ran.body(id, &body_cfg, ctx);
+            if ran.listing {
+                continue;
+            }
             bind_params(&mut sub_env, &params, args);
             let run = run_body(transfer, &body_cfg, sub_env, ctx, depth + 1);
             let sites = returned_sites(transfer, &body_cfg, &run.exits, ctx);
@@ -1477,6 +1681,7 @@ fn exec_heap_fns<T: Transfer>(
             open = true;
         }
     }
+    ran.open |= open;
     let placed = placed?;
     if open {
         return Some(EnvVal::located(placed.map(Sites::opened), T::Domain::top()));

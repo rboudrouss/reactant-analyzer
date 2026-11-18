@@ -435,6 +435,10 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     // The solver's tables of every closure a pass runs, computed once for
     // the whole fixpoint.
     let plans = crate::domains::interp::Plans::default();
+    // The call relation (ADR-047): every call the passes below evaluate,
+    // joined. A probe's input is below the kept one: it records nothing.
+    let calls = std::cell::RefCell::new(crate::engine::CallRelation::default());
+    let recording = inter.is_none_or(|i| !i.probe).then_some(&calls);
     let pass = |cfg: &CFG,
                 entry: AbstractEnv<StateValue>,
                 writes: &StateStore<StateValue>,
@@ -442,7 +446,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 memo: &MemoStore<StateValue>,
                 heap: &mut Heap,
                 children: bool,
-                effect: bool| {
+                effect: Option<HookLabel>| {
         let mut out = writes.clone();
         let envs = {
             let mut ac = AnalysisCtx {
@@ -455,14 +459,24 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 inter: inter.filter(|_| children),
                 widening,
                 plans: Some(&plans),
+                calls: recording,
             };
             let envs = analyze_cfg(transfer, cfg, entry, &mut ac);
-            if effect {
+            if let Some(label) = effect {
                 for (bid, block) in &cfg.blocks {
                     if let Terminator::Return(ret, _) = &block.term
                         && let Some(env) = envs.get(bid)
                     {
-                        let _ = exec_fn_value(transfer, ret, &[], env, &mut ac, 0);
+                        let mut ran = crate::domains::interp::Ran::default();
+                        let _ = exec_fn_value(transfer, ret, &[], env, &mut ac, 0, &mut ran);
+                        ac.record(|r| {
+                            r.record_escape(
+                                comp_id.hook_site(label),
+                                crate::engine::calls::CLEANUP,
+                                [],
+                                ran.bodies,
+                            )
+                        });
                     }
                 }
             }
@@ -538,7 +552,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             &memo_store,
             &mut heap,
             true,
-            false,
+            None,
         );
         block_states = bs;
         drop(profile);
@@ -562,6 +576,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 inter,
                 widening,
                 plans: Some(&plans),
+                calls: recording,
             };
             hooks
                 .iter()
@@ -597,6 +612,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 inter,
                 widening,
                 plans: Some(&plans),
+                calls: recording,
             };
             for hook in &hooks {
                 if let HookEntry::Ref { label, init, .. } = hook {
@@ -630,7 +646,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                     &memo_store,
                     &mut heap,
                     true,
-                    true,
+                    Some(*label),
                 );
                 effect_block_states.insert(*label, eff_bs);
                 for slot in eff_state.labels() {
@@ -668,7 +684,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                     &memo_store,
                     &mut heap,
                     true,
-                    false,
+                    None,
                 );
                 handler_block_states.insert(*label, h_bs);
                 state_from_handlers = state_from_handlers.join(&h_state);
@@ -693,6 +709,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 inter,
                 widening,
                 plans: Some(&plans),
+                calls: recording,
             };
             crate::domains::interp::run_escaped(transfer, &escaped_bodies, &env_exit, &mut ac);
             state_from_handlers = state_from_handlers.join(&out);
@@ -771,7 +788,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             &memo_store,
             &mut heap,
             false,
-            false,
+            None,
         );
         block_states = bs;
     }
@@ -817,6 +834,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         effect_props: Default::default(),
         iterations: iteration,
         heap,
+        calls: std::sync::Arc::new(calls.into_inner()),
         relations_pending: None,
     };
     // An inter-component analysis may be thrown away (a child re-analysed
@@ -1092,6 +1110,25 @@ pub fn analyze_program(
     // phase 1 `results` is read only by `flow_back` (its heap), an analysis
     // that is replaced is dropped unread, and a probe below is read only
     // through `SiteFacts::of` (exit env, stores, heap).
+    //
+    // The call relation of the program first (ADR-047): a call of a closure
+    // a child runs, or of one its owner runs after a child let it escape,
+    // is evaluated in another component's analysis than the one that writes
+    // it. Every kept analysis's evaluations join into one relation, which
+    // every result then holds.
+    {
+        let mut results = results.borrow_mut();
+        let mut ids: Vec<ComponentId> = results.keys().copied().collect();
+        ids.sort();
+        let mut program_calls = crate::engine::CallRelation::default();
+        for id in &ids {
+            program_calls.join(&results[id].calls);
+        }
+        let program_calls = std::sync::Arc::new(program_calls);
+        for result in results.values_mut() {
+            result.calls = std::sync::Arc::clone(&program_calls);
+        }
+    }
     for result in results.borrow_mut().values_mut() {
         if let Some(inputs) = result.relations_pending.take() {
             compute_relations(result, *inputs, Some(&reducers), &program);

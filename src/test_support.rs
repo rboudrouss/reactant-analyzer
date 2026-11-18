@@ -141,6 +141,7 @@ pub(crate) fn analysis_result(render_cfg: CFG) -> AnalysisResult<StateValue> {
         custom_arg_returns: HashMap::new(),
         iterations: 0,
         heap: Heap::new(),
+        calls: Default::default(),
         relations_pending: None,
     }
 }

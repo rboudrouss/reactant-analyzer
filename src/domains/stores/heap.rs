@@ -16,6 +16,9 @@ use crate::{
 
 use super::{AbstractEnv, EnvVal, Sites, map_get_or};
 
+/// A closure [`Heap::reach_of`] reached: its site and its body.
+pub type ReachedFn = (ExprId, Arc<CFG>);
+
 /// Value stored at a heap location (indexed by `ExprId` allocation site).
 #[derive(Debug, Clone)]
 pub enum HeapValue {
@@ -344,6 +347,38 @@ impl Heap {
             }
         }
         held
+    }
+
+    /// What a value at `sites` reaches, as [`Heap::escape`] and
+    /// [`Heap::escaped_fns`] walk it, without escaping anything: the
+    /// setters the objects on the way hold, and the closures (by site, with
+    /// their bodies) reached through members and captures. What the call
+    /// relation records of a value handed to a callee (ADR-047).
+    pub fn reach_of(&self, sites: &Sites) -> (Vec<(ComponentId, HookLabel)>, Vec<ReachedFn>) {
+        let mut stack: Vec<ExprId> = sites.ids.iter().copied().collect();
+        let mut seen = BTreeSet::new();
+        let (mut setters, mut fns) = (Vec::new(), Vec::new());
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            match self.get(id) {
+                Some(HeapValue::Obj(obj)) => {
+                    stack.extend(obj.values().filter_map(EnvVal::locs).flatten().copied());
+                    setters.extend(obj.values().flat_map(|ev| ev.as_val().setters()));
+                }
+                Some(HeapValue::Fn {
+                    body_cfg,
+                    captured_locs,
+                    ..
+                }) => {
+                    fns.push((id, Arc::clone(body_cfg)));
+                    stack.extend(captured_locs.values().flat_map(|s| s.ids.iter().copied()));
+                }
+                None => {}
+            }
+        }
+        (setters, fns)
     }
 
     /// The closures an escaped site reaches, through the members of the

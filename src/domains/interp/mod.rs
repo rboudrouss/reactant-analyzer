@@ -6,6 +6,7 @@ pub use callbacks::{TriggerClass, classify_callee};
 pub(crate) use cfg::{entry_env_of, exit_env_of, narrow_env_for_branch, narrowed_var};
 pub use interpreter::MAX_INLINE_DEPTH;
 pub use interpreter::Plans;
+pub(crate) use interpreter::Ran;
 pub(crate) use interpreter::alloc_literal;
 pub(crate) use interpreter::bind_params;
 pub(crate) use interpreter::call_targets;

@@ -162,6 +162,33 @@ variable maps to a may-set of sources (`Slot`, `Setter`, `Prop`, `AllProps`,
 
 Absence of a use is a proof here, so every unknown counts as a use.
 
+### `calls` — `CallRelation` (ADR-047)
+
+Recorded by the fixpoint itself, at every call it evaluates in a
+component's passes, not derived at convergence. One `Targets` row per
+**call id** (a call is an allocation site), joined over every evaluation of
+it: passes, iterations, inlining depths, and contexts — a parent's closure a
+child calls joins its child-side evaluations, and the program analysis joins
+every kept analysis's relation into one, shared by every result. A body
+spliced or inlined twice has two ids, so two rows. Every call of a block the
+fixpoint reached has a row; a call of a body no pass ran has none.
+
+| column | claim | polarity |
+|---|---|---|
+| `setters` | the slots a call of the callee may write, with their owner | may |
+| `bodies` | the function bodies the callee may be, by allocation site (`body(site)` gives the CFG); past the inlining budget, the ones it stands for | may |
+| `open` | the callee may be something neither list names — code the analysis does not see, a builtin; what such code may call escaped, so it adds no target | may |
+| `sure()` | every evaluation that reached the call saw exactly one target, surely — one setter, or one body of a value surely that function — and a closed callee | must |
+| `written` | per setter, the value the slot write stored | may (over-approximation) |
+
+`Escapes { setters, bodies }`, per (anchor, position): what the value handed
+there reaches — everything `escape` reached through members and captures, or
+what an in-cycle callee (an array method, a timer) ran it as. The anchor is
+the call's id (position `CALLEE` for a callee escaped past the inlining
+budget), a `new`'s id, the props object of a JSX element (position: the
+prop's index), a hook the expansion left (its hook site), or an effect's
+hook site (position `CLEANUP`: its returned cleanup). May.
+
 ## Per program, on `ProgramRelations`
 
 A relation that is a property of the whole program has no per-component

@@ -1,4 +1,5 @@
 pub mod analysis_result;
+pub mod calls;
 pub mod cfg_analyzer;
 pub mod churn;
 pub mod component_cache;
@@ -28,6 +29,7 @@ pub use analysis_result::{
     AnalysisResult, EffectInfo, HandlerInfo, HookCallInfo, HookKind, InlineKind, InlineOrigin,
     WidenEvent,
 };
+pub use calls::{CallRelation, Escapes, Targets};
 pub use cfg_analyzer::analyze_cfg;
 pub use churn::{Carrier, ChurnCycle, ChurnEdge, ChurnGraph, EdgeStrength, EveryRender};
 pub use component_cache::ComponentCache;

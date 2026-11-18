@@ -282,6 +282,13 @@ pub struct AnalysisResult<D: AbstractDomain> {
     /// variables in `block_states` to their function bodies and captured envs.
     /// Defaults to `Heap::new()` for components analyzed without initial heap context.
     pub heap: Heap,
+    /// The call relation (ADR-047): per call id, what the fixpoint's
+    /// evaluations of it may run — setters, bodies, escapes — joined over
+    /// passes and contexts. The program's whole relation, shared by every
+    /// result of a program analysis (a closure of this component may run in
+    /// another's analysis); this analysis's own for a component analysed
+    /// alone.
+    pub calls: std::sync::Arc<crate::engine::CallRelation>,
     /// What the relations above (`slot_writers` … `effect_props`) are
     /// computed from, while they are not: an inter-component analysis leaves
     /// them to the program analysis, which computes them for the result it

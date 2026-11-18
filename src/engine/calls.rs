@@ -1,0 +1,293 @@
+//! The call relation (ADR-047): what each call of the program may run, as
+//! the fixpoint evaluated it.
+//!
+//! The interpreter answers "what may this call run" with values — heap
+//! sites, setter values, parameters bound to arguments — and that answer is
+//! what writes the store. This relation records it, at every call the
+//! fixpoint evaluates, so that a reader asks the same question of the same
+//! answer instead of re-deriving it from names (design-walk §2).
+//!
+//! **Key.** A call is an allocation site ([`Expr::Call`](crate::ir::Expr)'s
+//! `id`, P5): one id per call the program performs at one place of one
+//! component. A body inlined twice (a custom hook, a utility, each spliced
+//! copy) has two ids, so two rows. A body run several times — in several
+//! passes of one fixpoint, under several contexts (a parent's closure a
+//! child calls, the owner's run of a closure a child let escape), at several
+//! inlining depths — evaluates the same id each time, and every evaluation
+//! joins into its one row.
+//!
+//! **Contract.** Every column is a *may* over-approximation of what the
+//! evaluations saw, except [`Targets::sure`], which is *must*: true only
+//! when every evaluation that reached the call saw exactly one target,
+//! surely — one setter, or one body — and nothing else the callee may be.
+//!
+//! **Coverage.** Every call of a block the fixpoint reached has a
+//! [`Targets`] row, whatever it found there; a call of a block no pass
+//! reached has none. An analysis that only probes (a per-site
+//! re-analysis) records nothing: its input is below the one kept.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
+
+use crate::{
+    domains::{AbstractDomain, StateValue},
+    ir::{
+        ComponentId,
+        cfg::CFG,
+        types::{ExprId, HookLabel},
+    },
+};
+
+/// A state slot: its owner and its label there.
+pub type Slot = (ComponentId, HookLabel);
+
+/// The position [`Escapes`] records for a call's callee itself, handed to
+/// code the analysis does not run (past the inlining budget).
+pub const CALLEE: usize = usize::MAX;
+
+/// The position [`Escapes`] records, at an effect's hook site, for the
+/// function the effect returns: its cleanup, which React calls.
+pub const CLEANUP: usize = usize::MAX - 1;
+
+/// What one call may run, joined over every evaluation of it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Targets {
+    /// The setters a call of the callee may be (`call_targets`): each is a
+    /// write of its slot at the call.
+    pub setters: BTreeSet<Slot>,
+    /// The function bodies the callee may be, by allocation site: a heap
+    /// closure, a literal called where it is written, a `useCallback` body
+    /// (at its hook's site). Each runs at the call.
+    pub bodies: BTreeSet<ExprId>,
+    /// The callee may be something neither list names: code the analysis
+    /// does not see (an import, a builtin, a value no site places), or a
+    /// value past the inlining budget. What such code may call has escaped
+    /// ([`Escapes`]), so `open` adds no target; it only rules out `sure`.
+    pub open: bool,
+    /// `Some(true)`: every evaluation that reached the call with a callee
+    /// saw exactly one target, surely — one setter, or one body of a value
+    /// that is surely that function — and a closed callee. `None`: no
+    /// evaluation decided (the callee was ⊥ each time).
+    sure: Option<bool>,
+    /// The value each setter target stored, as the slot write computed it
+    /// (an updater's return, a reducer's, the argument), joined.
+    pub written: BTreeMap<Slot, StateValue>,
+}
+
+impl Targets {
+    /// The call surely runs its one target at every evaluation that reached
+    /// it — writes its one setter, or runs its one body: the must column,
+    /// the only one an Error may read.
+    pub fn sure(&self) -> bool {
+        self.sure == Some(true) && self.setters.len() + self.bodies.len() == 1
+    }
+
+    /// Join one evaluation into the row. `sure` is `None` for an evaluation
+    /// whose callee was ⊥ (the call was not really reached), which decides
+    /// nothing.
+    fn join(&mut self, other: Targets) {
+        self.setters.extend(other.setters);
+        self.bodies.extend(other.bodies);
+        self.open |= other.open;
+        self.sure = match (self.sure, other.sure) {
+            (None, s) | (s, None) => s,
+            (Some(a), Some(b)) => Some(a && b),
+        };
+        for (slot, v) in other.written {
+            let joined = match self.written.get(&slot) {
+                Some(old) => old.join(&v),
+                None => v,
+            };
+            self.written.insert(slot, joined);
+        }
+    }
+}
+
+/// One evaluation of a call, as [`CallRelation::record_call`] takes it.
+#[derive(Debug, Clone, Default)]
+pub struct Evaluation {
+    pub setters: BTreeSet<Slot>,
+    pub bodies: BTreeSet<ExprId>,
+    pub open: bool,
+    /// The callee was ⊥: the evaluation decides nothing about `sure`.
+    pub unreached: bool,
+    /// Surely its one target: one setter (a label naming one, a value that
+    /// is surely that setter) or one body (a value surely that function).
+    pub one_target: bool,
+    pub written: BTreeMap<Slot, StateValue>,
+}
+
+/// What a value handed at one position may reach: every setter and every
+/// closure `escape` reached through its members, or what an in-cycle callee
+/// (an array method, a timer) ran it as.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Escapes {
+    pub setters: BTreeSet<Slot>,
+    pub bodies: BTreeSet<ExprId>,
+}
+
+/// The call relation of a program (or of one component analysed alone):
+/// [`Targets`] per call id, [`Escapes`] per (anchor, position).
+///
+/// An anchor is the allocation site the position belongs to: a call's id,
+/// a `new`'s, the props object of a JSX element (position: the prop's index
+/// among its fields), a hook the expansion left (its hook site; position:
+/// the argument's).
+#[derive(Debug, Clone, Default)]
+pub struct CallRelation {
+    calls: HashMap<ExprId, Targets>,
+    escapes: HashMap<(ExprId, usize), Escapes>,
+    /// The body each site in [`Targets::bodies`] / [`Escapes::bodies`] runs.
+    cfgs: HashMap<ExprId, Arc<CFG>>,
+}
+
+impl CallRelation {
+    /// The row of call `id`; `None` when no pass reached it.
+    pub fn targets(&self, id: ExprId) -> Option<&Targets> {
+        self.calls.get(&id)
+    }
+
+    /// What the value handed at `pos` of `anchor` may reach; `None` when
+    /// nothing was recorded there.
+    pub fn escapes(&self, anchor: ExprId, pos: usize) -> Option<&Escapes> {
+        self.escapes.get(&(anchor, pos))
+    }
+
+    /// The body of a site the relation lists.
+    pub fn body(&self, site: ExprId) -> Option<&Arc<CFG>> {
+        self.cfgs.get(&site)
+    }
+
+    /// Every call id with a row.
+    pub fn call_ids(&self) -> impl Iterator<Item = ExprId> + '_ {
+        self.calls.keys().copied()
+    }
+
+    /// Join one evaluation of call `id` into its row.
+    pub fn record_call(&mut self, id: ExprId, eval: Evaluation) {
+        let sure = (!eval.unreached)
+            .then(|| eval.one_target && !eval.open && eval.bodies.len() + eval.setters.len() == 1);
+        self.calls.entry(id).or_default().join(Targets {
+            setters: eval.setters,
+            bodies: eval.bodies,
+            open: eval.open,
+            sure,
+            written: eval.written,
+        });
+    }
+
+    /// Join what the value at `pos` of `anchor` reached into its row.
+    pub fn record_escape(
+        &mut self,
+        anchor: ExprId,
+        pos: usize,
+        setters: impl IntoIterator<Item = Slot>,
+        bodies: impl IntoIterator<Item = ExprId>,
+    ) {
+        let row = self.escapes.entry((anchor, pos)).or_default();
+        row.setters.extend(setters);
+        row.bodies.extend(bodies);
+    }
+
+    /// Remember the body run at `site`.
+    pub fn record_body(&mut self, site: ExprId, body: &Arc<CFG>) {
+        self.cfgs.entry(site).or_insert_with(|| Arc::clone(body));
+    }
+
+    /// The join of two relations: every row of either, a row of both joined.
+    pub fn join(&mut self, other: &CallRelation) {
+        for (id, t) in &other.calls {
+            self.calls.entry(*id).or_default().join(t.clone());
+        }
+        for (k, e) in &other.escapes {
+            let row = self.escapes.entry(*k).or_default();
+            row.setters.extend(e.setters.iter().copied());
+            row.bodies.extend(e.bodies.iter().copied());
+        }
+        for (site, body) in &other.cfgs {
+            self.cfgs.entry(*site).or_insert_with(|| Arc::clone(body));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn slot(l: usize) -> Slot {
+        (ComponentId::from_index(0), l)
+    }
+
+    #[test]
+    fn sure_is_a_must_over_every_reaching_evaluation() {
+        let mut rel = CallRelation::default();
+        let one = |l| Evaluation {
+            setters: BTreeSet::from([slot(l)]),
+            one_target: true,
+            ..Evaluation::default()
+        };
+        let id = ExprId(7);
+        rel.record_call(id, one(0));
+        assert!(rel.targets(id).unwrap().sure());
+        // A ⊥ callee decides nothing.
+        rel.record_call(
+            id,
+            Evaluation {
+                unreached: true,
+                ..Evaluation::default()
+            },
+        );
+        assert!(rel.targets(id).unwrap().sure());
+        // Another setter in another context: one of two, never sure.
+        rel.record_call(id, one(1));
+        let row = rel.targets(id).unwrap();
+        assert!(!row.sure());
+        assert_eq!(row.setters.len(), 2);
+    }
+
+    #[test]
+    fn an_open_evaluation_or_two_targets_are_never_sure() {
+        let mut rel = CallRelation::default();
+        let id = ExprId(3);
+        rel.record_call(
+            id,
+            Evaluation {
+                setters: BTreeSet::from([slot(0)]),
+                one_target: true,
+                open: true,
+                ..Evaluation::default()
+            },
+        );
+        assert!(!rel.targets(id).unwrap().sure());
+        let mut other = CallRelation::default();
+        other.record_call(
+            id,
+            Evaluation {
+                setters: BTreeSet::from([slot(0)]),
+                one_target: true,
+                ..Evaluation::default()
+            },
+        );
+        other.join(&rel);
+        assert!(!other.targets(id).unwrap().sure());
+        assert!(other.targets(id).unwrap().open);
+        // One body in one context, a setter in another: two targets.
+        let mut two = CallRelation::default();
+        let body = Evaluation {
+            bodies: BTreeSet::from([ExprId(9)]),
+            one_target: true,
+            ..Evaluation::default()
+        };
+        two.record_call(id, body.clone());
+        assert!(two.targets(id).unwrap().sure());
+        two.record_call(
+            id,
+            Evaluation {
+                setters: BTreeSet::from([slot(0)]),
+                one_target: true,
+                ..Evaluation::default()
+            },
+        );
+        assert!(!two.targets(id).unwrap().sure());
+    }
+}

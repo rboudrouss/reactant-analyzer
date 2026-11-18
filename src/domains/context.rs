@@ -283,6 +283,10 @@ pub struct AnalysisCtx<'a, D: AbstractDomain> {
     /// The solver's tables of the closures the fixpoint runs, kept across
     /// its passes; `None` computes them at each run.
     pub plans: Option<&'a crate::domains::interp::Plans>,
+    /// Where every call this context evaluates is recorded (ADR-047): the
+    /// fixpoint's passes. `None` records nothing: a probe, an evaluation
+    /// outside any fixpoint (a seed, a relation's replay).
+    pub calls: Option<&'a RefCell<crate::engine::CallRelation>>,
 }
 
 /// When a loop header stops joining and starts widening (ADR-014): after
@@ -321,6 +325,14 @@ impl<'a, D: AbstractDomain> AnalysisCtx<'a, D> {
             inter: None,
             widening: Widening::DEFAULT,
             plans: None,
+            calls: None,
+        }
+    }
+
+    /// Record into the call relation, when this context records one.
+    pub fn record(&self, f: impl FnOnce(&mut crate::engine::CallRelation)) {
+        if let Some(calls) = self.calls {
+            f(&mut calls.borrow_mut());
         }
     }
 
