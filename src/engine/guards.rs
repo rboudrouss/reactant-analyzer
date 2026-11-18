@@ -539,7 +539,7 @@ impl<'a> Invariance<'a> {
                 seen,
             ),
             Expr::UnaryOp { arg, .. } => self.read_into(arg, scopes, free, out, seen, next),
-            Expr::Call { fn_, args } => {
+            Expr::Call { fn_, args, .. } => {
                 // A name's kind: a global nothing binds, or what its one
                 // binding's right-hand side is, its own names left unknown.
                 let unbound = |v: &str| {
@@ -671,7 +671,7 @@ impl<'a> Invariance<'a> {
                 self.go(lhs, body, props_hold, next) && self.go(rhs, body, props_hold, next)
             }
             Expr::UnaryOp { arg, .. } => self.go(arg, body, props_hold, next),
-            Expr::Call { fn_, args } => {
+            Expr::Call { fn_, args, .. } => {
                 self.go(fn_, body, props_hold, next)
                     && args.iter().all(|a| self.go(a, body, props_hold, next))
             }
@@ -990,7 +990,7 @@ impl<'a> MemberWrites<'a> {
                         let path = vec![None];
                         writes.push((recv, MemberWrite { path, value: None }));
                     }
-                    if let Expr::Call { fn_, args } = e
+                    if let Expr::Call { fn_, args, .. } = e
                         && let Expr::Var(f) = fn_.peel_ts()
                         && let Some(updater) = args.first()
                     {

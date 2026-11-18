@@ -108,7 +108,7 @@ impl Rule for UnnecessaryRerender {
             // every block suffices (no need for control-flow ordering).
             for block in body_cfg.blocks.values() {
                 for stmt in &block.stmts {
-                    let Stmt::ExprStmt(Expr::Call { fn_, args }, _) = stmt else {
+                    let Stmt::ExprStmt(Expr::Call { fn_, args, .. }, _) = stmt else {
                         continue;
                     };
                     let Expr::Var(setter_name) = fn_.as_ref() else {
@@ -264,6 +264,7 @@ mod tests {
         // useState("light"), useEffect(() => { setX("dark") }, [])
         let eff_stmts = vec![Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setX".to_string())),
                 args: vec![Expr::Lit(Prim::String("dark".into()))],
             },
@@ -294,6 +295,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setter".to_string())),
                     args: vec![Expr::Lit(Prim::String("dark".into()))],
                 },
@@ -317,6 +319,7 @@ mod tests {
         // useState("light"), useEffect(() => { setX("light") }, []) → redundant, not this rule
         let eff_stmts = vec![Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setX".to_string())),
                 args: vec![Expr::Lit(Prim::String("light".into()))],
             },
@@ -340,6 +343,7 @@ mod tests {
         // deps: DepsArg::Absent = runs every render not a mount-only effect
         let eff_stmts = vec![Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setX".to_string())),
                 args: vec![Expr::Lit(Prim::String("dark".into()))],
             },
@@ -365,6 +369,7 @@ mod tests {
         // the target value", which would break hydration.
         let eff_stmts = vec![Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setX".to_string())),
                 args: vec![Expr::Lit(Prim::Bool(true))],
             },
@@ -397,6 +402,7 @@ mod tests {
         // gating needs false-first) — generic message stays.
         let eff_stmts = vec![Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setX".to_string())),
                 args: vec![Expr::Lit(Prim::Bool(false))],
             },
@@ -423,6 +429,7 @@ mod tests {
         // useState(0), useEffect(() => { setX(42) }, [])
         let eff_stmts = vec![Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setX".to_string())),
                 args: vec![Expr::Lit(Prim::Int(42))],
             },

@@ -1263,15 +1263,20 @@ pub fn analyze_program(
 pub(crate) struct SpliceIds {
     salt: u32,
     next_alloc: u64,
+    /// The call-site cursor, counted from [`crate::ir::expr::CALL_SITES`]:
+    /// a graft's calls land above every call already in the component.
+    next_call: u64,
 }
 
 impl SpliceIds {
     /// Grafts land above the component's own sites, inside its range
-    /// ([`ComponentId::site_base`]) even when it allocates nothing itself.
+    /// ([`ComponentId::site_base`]) even when it allocates nothing itself;
+    /// their calls above the component's own calls, in the same range.
     fn for_component(render_cfg: &CFG, hooks: &[HookEntry], component: ComponentId) -> Self {
         SpliceIds {
             salt: 0,
             next_alloc: alloc_span(render_cfg, hooks).max(component.site_base()),
+            next_call: call_span(render_cfg, hooks).max(component.site_base()),
         }
     }
 
@@ -1283,14 +1288,33 @@ impl SpliceIds {
         crate::ir::types::ExprId(id)
     }
 
-    /// The salt and allocation-id offset for one graft `span` ids wide,
-    /// advancing both supplies past it.
-    fn take(&mut self, span: u64) -> (u32, u64) {
+    /// One call site, for a call the source does not spell — React's call
+    /// of the callback an aliased effect hook is handed.
+    fn call_one(&mut self) -> crate::ir::types::ExprId {
+        let n = self.next_call;
+        self.next_call += 1;
+        crate::ir::types::ExprId(crate::ir::expr::CALL_SITES + n)
+    }
+
+    /// The salt and the offsets for one graft of `cfg` and its `hooks` —
+    /// its allocation sites and its call sites, its labels shifted by
+    /// `labels` — advancing every supply past it.
+    fn take(
+        &mut self,
+        cfg: &CFG,
+        hooks: &[HookEntry],
+        labels: HookLabel,
+    ) -> (u32, crate::ir::Offsets) {
         let salt = self.salt;
         self.salt += 1;
-        let ids = self.next_alloc;
-        self.next_alloc += span;
-        (salt, ids)
+        let off = crate::ir::Offsets {
+            labels,
+            ids: self.next_alloc,
+            calls: self.next_call,
+        };
+        self.next_alloc += alloc_span(cfg, hooks);
+        self.next_call += call_span(cfg, hooks);
+        (salt, off)
     }
 }
 
@@ -1304,6 +1328,20 @@ fn alloc_span(cfg: &CFG, hooks: &[HookEntry]) -> u64 {
                 .iter()
                 .filter_map(HookEntry::body_cfg)
                 .map(crate::ir::alloc_id_span),
+        )
+        .max()
+        .unwrap_or(0)
+}
+
+/// [`alloc_span`] for call sites: one file call counter numbered the body's
+/// and its hooks' calls.
+fn call_span(cfg: &CFG, hooks: &[HookEntry]) -> u64 {
+    std::iter::once(crate::ir::call_id_span(cfg))
+        .chain(
+            hooks
+                .iter()
+                .filter_map(HookEntry::body_cfg)
+                .map(crate::ir::call_id_span),
         )
         .max()
         .unwrap_or(0)
@@ -1449,6 +1487,7 @@ fn expand_custom_hooks(
                 custom_label,
                 call_args,
                 span,
+                salt.call_one(),
             ) {
                 hooks[i] = entry;
             }
@@ -1475,11 +1514,7 @@ fn expand_custom_hooks(
         // One alpha-rename map for this expansion, shared by the body splice and
         // by every sub-hook body that captures a render-scope local — otherwise
         // an effect capturing `x` would desync from the body's renamed `x`.
-        let (s, id_offset) = salt.take(alloc_span(&hook_ir.body_cfg, &hook_ir.hooks));
-        let off = crate::ir::Offsets {
-            labels: offset,
-            ids: id_offset,
-        };
+        let (s, off) = salt.take(&hook_ir.body_cfg, &hook_ir.hooks, offset);
         // The caller's own bindings, so a free name of the hook body cannot be
         // captured by one of them (#141).
         let caller_bound = crate::ir::bound_vars(render_cfg, &[]);
@@ -2232,19 +2267,13 @@ fn splice_one_call(
     let name = utility_call_target(&call_stmt)?;
     let utility = resolve_utility(registry, caller_file, &name)?.clone();
 
-    let (s, id_offset) = salt.take(alloc_span(&utility.body_cfg, &[]));
+    let (s, off) = salt.take(&utility.body_cfg, &[], 0);
     // The caller's own bindings, so a free name of the utility cannot be
     // captured by one of them (#141).
     let caller_bound = crate::ir::bound_vars(cfg, &[]);
     let rename =
         crate::ir::callee_rename_map(&utility.body_cfg, &[], &utility.params, s, &caller_bound);
-    let body = crate::ir::remap_cfg(
-        utility.body_cfg,
-        crate::ir::Offsets {
-            labels: 0,
-            ids: id_offset,
-        },
-    );
+    let body = crate::ir::remap_cfg(utility.body_cfg, off);
     let range = crate::ir::splice_callee_into_cfg(
         cfg,
         block_id,
@@ -2378,6 +2407,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::Lit(Prim::Int(42))],
                 },
@@ -2439,6 +2469,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::ObjectLit {
                         id: crate::ir::types::ExprId(0),
@@ -2485,6 +2516,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::ObjectLit {
                         id: crate::ir::types::ExprId(0),
@@ -2565,6 +2597,7 @@ mod tests {
         // Effect body uses "n" and "setN" both are free vars
         let eff_cfg = crate::test_support::single_block_cfg(vec![Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setN".to_string())),
                 args: vec![Expr::Var("n".to_string())],
             },
@@ -2646,6 +2679,7 @@ mod tests {
         // cb body CFG: ExprStmt(setN({}))
         let cb_body = Arc::new(crate::test_support::single_block_cfg(vec![Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setN".to_string())),
                 args: vec![Expr::ObjectLit {
                     id: ExprId(0),
@@ -2658,6 +2692,7 @@ mod tests {
         // Effect body CFG: ExprStmt(setTimeout(cb, 0))
         let eff_cfg = crate::test_support::single_block_cfg(vec![Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setTimeout".to_string())),
                 args: vec![Expr::Var("cb".to_string()), Expr::Lit(Prim::Int(0))],
             },
@@ -2730,6 +2765,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::Lit(Prim::Int(1))],
                 },
@@ -2785,6 +2821,7 @@ mod tests {
         // what the event or the child passes it, not the render's 5 (#314).
         let body = handler_cfg(vec![Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setS".to_string())),
                 args: vec![Expr::Var("v".to_string())],
             },
@@ -2840,6 +2877,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::BinOp {
                         op: crate::ir::expr::BinOp::Add,
@@ -2981,6 +3019,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::BinOp {
                         op: crate::ir::expr::BinOp::Add,
@@ -3055,6 +3094,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::Lit(Prim::Int(99))],
                 },
@@ -3145,6 +3185,7 @@ mod tests {
                 id: 1,
                 stmts: vec![Stmt::ExprStmt(
                     Expr::Call {
+                        id: crate::ir::expr::SYNTHETIC_CALL,
                         fn_: Box::new(Expr::Var("setCount".to_string())),
                         args: vec![Expr::BinOp {
                             op: crate::ir::expr::BinOp::Add,
@@ -3189,6 +3230,7 @@ mod tests {
 
         let h_cfg = handler_cfg(vec![Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setCount".to_string())),
                 args: vec![Expr::BinOp {
                     op: crate::ir::expr::BinOp::Add,
@@ -3247,6 +3289,7 @@ mod tests {
         // Handler reads "n" and calls setN both are free vars.
         let body = handler_cfg(vec![Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setN".to_string())),
                 args: vec![Expr::Var("n".to_string())],
             },
@@ -3311,6 +3354,7 @@ mod tests {
                 id: 1,
                 stmts: vec![Stmt::ExprStmt(
                     Expr::Call {
+                        id: crate::ir::expr::SYNTHETIC_CALL,
                         fn_: Box::new(Expr::Var("setN".to_string())),
                         args: vec![Expr::Lit(Prim::Int(1))],
                     },

@@ -267,7 +267,7 @@ impl<'a> Collector<'a> {
 
     fn walk_expr(&mut self, expr: &'a Expr, scopes: &mut Vec<Scope<'a>>, at: At<'a>) {
         match expr {
-            Expr::Call { fn_, args } => {
+            Expr::Call { fn_, args, .. } => {
                 // Which shapes are mutation sites is the one fact this rule
                 // shares with the Tier-A purity classifier (ADR-028 §2); what
                 // the receiver has to root at stays this rule's own question.

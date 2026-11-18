@@ -150,8 +150,11 @@ pub fn splice_callee_into_cfg(
         .collect();
     let unbound = &args[positional.len().min(renamed_params.len())..];
     if !unbound.is_empty() {
+        // A hand-off the source does not spell, whose value is discarded:
+        // the synthetic call site.
         param_lets.push(Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::SummaryVal(crate::ir::expr::SummaryValue::Top)),
                 args: unbound.to_vec(),
             },
@@ -683,7 +686,8 @@ fn rename_vars_expr(expr: Expr, ren: &HashMap<Var, Var>) -> Expr {
             op,
             arg: Box::new(rename_vars_expr(*arg, ren)),
         },
-        Expr::Call { fn_, args } => Expr::Call {
+        Expr::Call { id, fn_, args } => Expr::Call {
+            id,
             fn_: Box::new(rename_vars_expr(*fn_, ren)),
             args: args.into_iter().map(|a| rename_vars_expr(a, ren)).collect(),
         },
@@ -916,7 +920,8 @@ pub fn subst_vars_expr(expr: Expr, subst: &HashMap<Var, Expr>) -> Expr {
             op,
             arg: Box::new(subst_vars_expr(*arg, subst)),
         },
-        Expr::Call { fn_, args } => Expr::Call {
+        Expr::Call { id, fn_, args } => Expr::Call {
+            id,
             fn_: Box::new(subst_vars_expr(*fn_, subst)),
             args: args
                 .into_iter()
@@ -1326,6 +1331,7 @@ mod tests {
             fields: vec![(
                 "k".to_string(),
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("f".into())),
                     args: vec![Expr::Var("p".into())],
                 },

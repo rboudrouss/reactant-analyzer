@@ -383,6 +383,7 @@ mod tests {
         assert_eq!(names.name("__t4_10.x"), "(a ?? b).x");
         assert_eq!(
             names.describe(&Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("__t4_10".to_string())),
                 args: vec![],
             }),
@@ -405,6 +406,7 @@ mod tests {
         let outer = Stmt::Let {
             var: "__call_9".to_string(),
             rhs: Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("__call_5".to_string())),
                 args: vec![],
             },

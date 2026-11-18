@@ -36,14 +36,25 @@ use crate::{
 /// component registry each component its own
 /// ([`crate::ir::ComponentId::site_base`]): a child's heap holds its parents'
 /// sites too (#243).
+///
+/// Calls are numbered by a counter of their own, from just above
+/// [`crate::ir::expr::SYNTHETIC_CALL`] (see [`Expr::Call`]): a call site
+/// moves no literal's id, nor the temp names derived from them.
 #[derive(Debug, Clone, Default)]
-pub struct ExprIds(Rc<Cell<u64>>);
+pub struct ExprIds(Rc<Cell<u64>>, Rc<Cell<u64>>);
 
 impl ExprIds {
     pub(super) fn next(&self) -> ExprId {
         let id = self.0.get();
         self.0.set(id + 1);
         ExprId(id)
+    }
+
+    /// The next call site of the file.
+    pub(super) fn next_call(&self) -> ExprId {
+        let n = self.1.get() + 1;
+        self.1.set(n);
+        ExprId(crate::ir::expr::CALL_SITES + n)
     }
 }
 
@@ -192,6 +203,11 @@ impl BlockBuilder {
 
     pub(super) fn next_expr_id(&mut self) -> ExprId {
         self.ctx.ids.next()
+    }
+
+    /// The site of the next call this file lowers ([`Expr::Call`]).
+    pub(super) fn next_call_id(&mut self) -> ExprId {
+        self.ctx.ids.next_call()
     }
 
     pub(super) fn push_stmt(&mut self, stmt: Stmt) {
@@ -821,7 +837,7 @@ fn lower_iter_loop(
             idx: Box::new(Expr::SummaryVal(SummaryValue::Top)),
         };
         match awaits {
-            true => handed_out(element),
+            true => handed_out(builder.next_call_id(), element),
             false => element,
         }
     } else {
@@ -1195,8 +1211,9 @@ impl FnKind {
 /// the analysis models no promise and no iterator (#317). The value handed
 /// back is anything, a new object included: an awaited value may be new at
 /// any render.
-pub(super) fn handed_out(value: Expr) -> Expr {
+pub(super) fn handed_out(id: ExprId, value: Expr) -> Expr {
     Expr::Call {
+        id,
         fn_: Box::new(Expr::SummaryVal(SummaryValue::Top)),
         args: vec![value],
     }
@@ -1222,7 +1239,10 @@ fn hand_back(mut cfg: CFG, kind: FnKind, ctx: &LowerCtx) -> CFG {
         };
         let value = std::mem::replace(value, made);
         if !matches!(value, Expr::Lit(_)) {
-            block.stmts.push(Stmt::ExprStmt(handed_out(value), *span));
+            block.stmts.push(Stmt::ExprStmt(
+                handed_out(ctx.ids.next_call(), value),
+                *span,
+            ));
         }
     }
     cfg

@@ -391,6 +391,7 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
             }
         }
         Expression::TaggedTemplateExpression(t) => Expr::Call {
+            id: builder.next_call_id(),
             // Pass the `${…}` interpolations as call args so their reads survive
             // (the constant quasi strings carry none). The tag receives the
             // cooked-strings array in reality; only the interpolations read vars.
@@ -692,7 +693,7 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                 }
             };
             builder.split_at_await();
-            handed_out(value)
+            handed_out(builder.next_call_id(), value)
         }
         // A `yield` (or `yield*`, which yields every entry of its operand)
         // hands its operand to the generator's consumer, code the analysis
@@ -702,7 +703,8 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
             if let Some(e) = &y.argument {
                 let value = lower_expr(e, builder);
                 let span = builder.span_at(y.span.start);
-                builder.push_stmt(Stmt::ExprStmt(handed_out(value), span));
+                let call = handed_out(builder.next_call_id(), value);
+                builder.push_stmt(Stmt::ExprStmt(call, span));
             }
             builder.may_stop();
             opaque()
@@ -766,6 +768,7 @@ fn finish_call(call: &CallExpression, fn_: Expr, builder: &mut BlockBuilder) -> 
     let fn_ = bind_call_value(fn_, call.callee.span(), builder);
     let args = lower_arguments(&call.arguments, builder);
     let call_expr = Expr::Call {
+        id: builder.next_call_id(),
         fn_: Box::new(fn_),
         args,
     };
@@ -2195,7 +2198,7 @@ mod tests {
         assert!(tests_nullish(cond, "cb"), "{cond:?}");
         let rest_block = &cfg.blocks[&rest];
         assert!(
-            matches!(rest_block.stmts.first(), Some(Stmt::ExprStmt(Expr::Call { fn_, args }, _))
+            matches!(rest_block.stmts.first(), Some(Stmt::ExprStmt(Expr::Call { fn_, args, .. }, _))
                 if matches!(fn_.as_ref(), Expr::Var(v) if v == "cb")
                     && matches!(args.as_slice(), [Expr::Call { .. }])),
             "{rest_block:?}"

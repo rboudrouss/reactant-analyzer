@@ -246,7 +246,94 @@ fn an_inlined_hook_does_not_take_over_the_callers_allocation_sites() {
     );
 }
 
+/// A call is a site too ([`Expr::Call`]'s `id`): every call of a component,
+/// in its render body, its hook bodies and their nested functions, has its
+/// own id in the component's range, a hook and a utility inlined twice
+/// included — each copy performs its calls at a place of its own.
+#[test]
+fn call_sites_of_one_component_are_distinct_across_grafts() {
+    use reactant::engine::{
+        ComponentRegistry, Config, FunctionRegistry, HookRegistry, RootStrategy, analyze_program,
+    };
+    use reactant::lowering::{lower_custom_hooks, lower_utilities};
+
+    let src = r#"
+        import { useEffect, useState } from 'react';
+        import { g } from 'ext';
+        function useTwice(f) {
+          const [v, setV] = useState(0);
+          useEffect(() => { f(); setV(g(1)); }, []);
+          return v;
+        }
+        function helper(x) { return x.map((y) => g(y)); }
+        function C() {
+          const a = useTwice(() => g(2));
+          const b = useTwice(() => g(3));
+          const c = helper([1]);
+          const d = helper([2]);
+          return <div>{a}{b}{c}{d}</div>;
+        }
+    "#;
+    let alloc = Allocator::default();
+    let ret = Parser::new(&alloc, src, SourceType::tsx())
+        .with_options(ParseOptions::default())
+        .parse();
+    assert!(ret.diagnostics.is_empty(), "parse: {:?}", ret.diagnostics);
+    let path = std::path::Path::new("test.tsx");
+    let components = lower_program(&ret.program, src, path, &mut Default::default());
+    let hooks = lower_custom_hooks(&ret.program, src, path, &mut Default::default());
+    let utilities = lower_utilities(&ret.program, src, path, &mut Default::default());
+    let config = Config {
+        function_registry: FunctionRegistry::from_functions(utilities),
+        ..Default::default()
+    };
+    let prog = analyze_program(
+        ComponentRegistry::from_components(components),
+        HookRegistry::from_hooks(hooks),
+        RootStrategy::AllComponents,
+        &config,
+    );
+    let id = prog.component_named("C").unwrap();
+    let result = &prog.components[&id];
+    let mut ids = Vec::new();
+    call_ids(&result.render_cfg, &mut ids);
+    for h in &result.hooks {
+        if let Some(body) = h.body_cfg() {
+            call_ids(body, &mut ids);
+        }
+    }
+    // Each copy of `useTwice`'s effect calls `f`, `setV` and `g`; each copy
+    // of `helper` calls `map`, and its callback `g`.
+    assert!(ids.len() >= 10, "expected both grafts of each: {ids:?}");
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), ids.len(), "a call site is shared: {ids:?}");
+    for site in &ids {
+        assert_eq!(
+            reactant::ir::ComponentId::site_owner(*site),
+            Some(id),
+            "{site:?} is outside the component's range"
+        );
+    }
+}
+
 // ── The invariant itself ──────────────────────────────────────────────────────
+
+/// Every call id in `cfg`, nested function bodies included.
+fn call_ids(cfg: &CFG, out: &mut Vec<ExprId>) {
+    cfg.for_each_expr(&mut |e| {
+        let mut stack = vec![e];
+        while let Some(e) = stack.pop() {
+            match e {
+                Expr::Call { id, .. } => out.push(*id),
+                Expr::FnLit { body_cfg, .. } => call_ids(body_cfg, out),
+                _ => {}
+            }
+            e.for_each_child(&mut |c| stack.push(c));
+        }
+    });
+}
 
 fn alloc_ids(cfg: &CFG, out: &mut Vec<ExprId>) {
     cfg.for_each_expr(&mut |e| {

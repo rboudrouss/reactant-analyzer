@@ -3913,7 +3913,7 @@ impl<'a> SetterWalk<'a> {
         // `new X(cb)` runs its arguments through the same machinery: a
         // `Promise` executor runs synchronously, and a class the body binds
         // is a local helper like any other.
-        if let Expr::Call { fn_, args } | Expr::New { fn_, args, .. } = expr {
+        if let Expr::Call { fn_, args, .. } | Expr::New { fn_, args, .. } = expr {
             // A call through a name the walk bound, or a member of one, is a
             // call through what it may hold, never through the name (#316):
             // of one of them, placed at this call only when it surely holds
@@ -3993,7 +3993,7 @@ impl<'a> SetterWalk<'a> {
         // possible writes of this call, in its class (#277), as a registered
         // listener's are in a dispatching program (#250). Never placed: the
         // dispatch may reach none of them.
-        if let Expr::Call { fn_, args } | Expr::New { fn_, args, .. } = expr
+        if let Expr::Call { fn_, args, .. } | Expr::New { fn_, args, .. } = expr
             && let Some(event) = crate::engine::registrations::dispatched_event(fn_, args)
             && let Some(c) = self.converged
             && depth > 0
@@ -5066,7 +5066,7 @@ pub fn setter_escapes(render_cfg: &CFG, hooks: &[HookEntry], aliases: &HashSet<V
     fn in_expr(e: &Expr, aliases: &HashSet<Var>) -> bool {
         match e {
             Expr::Var(v) => aliases.contains(v),
-            Expr::Call { fn_, args } => {
+            Expr::Call { fn_, args, .. } => {
                 let callee_is_alias = matches!(fn_.peel_ts(), Expr::Var(v) if aliases.contains(v));
                 (!callee_is_alias && in_expr(fn_, aliases))
                     || args.iter().any(|a| in_expr(a, aliases))
@@ -5187,6 +5187,7 @@ mod tests {
 
     fn call(callee: &str, args: Vec<Expr>) -> Expr {
         Expr::Call {
+            id: crate::ir::expr::SYNTHETIC_CALL,
             fn_: Box::new(Expr::Var(callee.to_string())),
             args,
         }

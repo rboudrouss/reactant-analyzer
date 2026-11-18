@@ -602,7 +602,7 @@ fn setter_call_arg<'a>(
 ) -> Option<&'a Expr> {
     let block = cfg.blocks.get(&bid)?;
     for stmt in &block.stmts {
-        if let Stmt::ExprStmt(Expr::Call { fn_, args }, _) = stmt
+        if let Stmt::ExprStmt(Expr::Call { fn_, args, .. }, _) = stmt
             && matches!(fn_.as_ref(), Expr::Var(v) if v == setter)
         {
             return args.first();
@@ -677,6 +677,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::Lit(Prim::Int(1))],
                 },
@@ -707,6 +708,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("s".to_string())),
                     args: vec![Expr::Lit(Prim::Int(1))],
                 },
@@ -745,6 +747,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("s".to_string())),
                     args: vec![Expr::Lit(Prim::Int(1))],
                 },
@@ -786,6 +789,7 @@ mod tests {
                 id: 1,
                 stmts: vec![Stmt::ExprStmt(
                     Expr::Call {
+                        id: crate::ir::expr::SYNTHETIC_CALL,
                         fn_: Box::new(Expr::Var("setN".to_string())),
                         args: vec![Expr::Lit(Prim::Int(42))],
                     },
@@ -839,6 +843,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setA".to_string())),
                     args: vec![Expr::Lit(Prim::Int(1))],
                 },
@@ -846,6 +851,7 @@ mod tests {
             ),
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setB".to_string())),
                     args: vec![Expr::Lit(Prim::Int(2))],
                 },
@@ -880,6 +886,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setCount".to_string())),
                     args: vec![Expr::BinOp {
                         op: BinOp::Add,
@@ -925,6 +932,7 @@ mod tests {
         // someCall((u) => { setN(u) }) setter in FnLit arg → Warning
         let cb_cfg = crate::test_support::single_block_cfg(vec![Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setN".to_string())),
                 args: vec![Expr::Var("u".to_string())],
             },
@@ -939,6 +947,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("someCall".to_string())),
                     args: vec![Expr::FnLit {
                         id: crate::ir::types::ExprId(0),

@@ -410,7 +410,7 @@ pub(crate) fn dispatched_event(fn_: &Expr, args: &[Expr]) -> Option<Option<Strin
 
 fn expr_dispatches_events(e: &Expr) -> bool {
     match e {
-        Expr::Call { fn_, args } | Expr::New { fn_, args, .. }
+        Expr::Call { fn_, args, .. } | Expr::New { fn_, args, .. }
             if dispatched_event(fn_, args).is_some() =>
         {
             true
@@ -693,7 +693,7 @@ fn teardown_in_expr(
     fns: &HashMap<Var, Arc<CFG>>,
     depth: usize,
 ) -> bool {
-    if let Expr::Call { fn_, args } = expr {
+    if let Expr::Call { fn_, args, .. } = expr {
         let called = match fn_.peel_ts() {
             Expr::Var(n) => Some(n.as_str()),
             Expr::FieldAccess { field, .. } => Some(field.as_str()),
@@ -789,7 +789,7 @@ fn scan_expr(
     out: &mut Vec<Registration>,
 ) {
     match expr {
-        Expr::Call { fn_, args } => {
+        Expr::Call { fn_, args, .. } => {
             if let Some((reg, display)) = match_registrar(fn_)
                 && let Some(cb) = Expr::positional_args(args).get(reg.cb_arg)
             {

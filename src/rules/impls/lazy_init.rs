@@ -334,6 +334,7 @@ mod tests {
             label: 0,
             reducer: None,
             init: Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("compute".to_string())),
                 args: vec![],
             },
@@ -350,6 +351,7 @@ mod tests {
     fn ts_annotated_call_init_warns() {
         // useState<number>(Date.now()) → TSAnnotated(Call)
         let call = Expr::Call {
+            id: crate::ir::expr::SYNTHETIC_CALL,
             fn_: Box::new(Expr::FieldAccess {
                 obj: Box::new(Expr::Var("Date".to_string())),
                 field: "now".to_string(),
@@ -485,6 +487,7 @@ mod tests {
         let stmts = vec![Stmt::Let {
             var: "initial".to_string(),
             rhs: Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("buildTree".to_string())),
                 args: vec![Expr::Var("props".to_string())],
             },
@@ -515,6 +518,7 @@ mod tests {
             label: 0,
             reducer: None,
             init: Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("fetch".to_string())),
                 args: vec![Expr::Var("url".to_string())],
             },
@@ -535,6 +539,7 @@ mod tests {
             label: 0,
             reducer: None,
             init: Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::FieldAccess {
                     obj: Box::new(Expr::Var("Math".to_string())),
                     field: "random".to_string(),
@@ -559,6 +564,7 @@ mod tests {
                 op: crate::ir::expr::BinOp::Add,
                 lhs: Box::new(Expr::Lit(Prim::Int(1))),
                 rhs: Box::new(Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("compute".to_string())),
                     args: vec![],
                 }),
@@ -583,6 +589,7 @@ mod tests {
         let hooks = vec![HookEntry::Ref {
             label: 0,
             init: Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("Map".to_string())),
                 args: vec![],
             },
@@ -600,6 +607,7 @@ mod tests {
         let hooks = vec![HookEntry::Ref {
             label: 0,
             init: Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setInterval".to_string())),
                 args: vec![],
             },
@@ -628,6 +636,7 @@ mod tests {
             HookEntry::Ref {
                 label: 1,
                 init: Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::StateSetter(0)),
                     args: vec![Expr::Lit(Prim::Int(1))],
                 },
@@ -650,6 +659,7 @@ mod tests {
         let hooks = vec![HookEntry::Ref {
             label: 0,
             init: Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::FieldAccess {
                     obj: Box::new(Expr::Var("Date".to_string())),
                     field: "now".to_string(),

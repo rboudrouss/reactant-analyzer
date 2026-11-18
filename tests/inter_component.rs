@@ -202,6 +202,7 @@ fn setter_prop_propagates_to_shared_state() {
                     id: 0,
                     stmts: vec![Stmt::ExprStmt(
                         Expr::Call {
+                            id: reactant::ir::expr::SYNTHETIC_CALL,
                             fn_: Box::new(Expr::Var("onChange".to_string())),
                             args: vec![Expr::Lit(Prim::Int(42))],
                         },
@@ -841,6 +842,7 @@ fn prop_drilling_direct_ir() {
                     id: 0,
                     stmts: vec![Stmt::ExprStmt(
                         Expr::Call {
+                            id: reactant::ir::expr::SYNTHETIC_CALL,
                             fn_: Box::new(Expr::FieldAccess {
                                 obj: Box::new(Expr::Var("props".to_string())),
                                 field: "action".to_string(),

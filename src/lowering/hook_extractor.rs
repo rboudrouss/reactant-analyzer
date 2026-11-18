@@ -9,7 +9,7 @@ use crate::ir::{
     hooks::{DepsArg, HookEntry, HookProvenance},
     source_range::SourceRange,
     stmt::{MemberKey, Stmt},
-    types::{BlockId, HookLabel, Var},
+    types::{BlockId, ExprId, HookLabel, Var},
 };
 
 // ── Subscription extraction (addEventListener in effect bodies) ───────────────
@@ -51,7 +51,7 @@ fn collect_subscriptions_in_expr(
     // a subscription → emit a Handler. Recurse into the receiver and any extra
     // args, but NOT arg[1] (the handler FnLit — extracted as the Handler's CFG).
     if let Some((event_name, params, body_cfg)) = expr.subscription_listener() {
-        let Expr::Call { fn_, args } = expr else {
+        let Expr::Call { fn_, args, .. } = expr else {
             unreachable!("subscription_listener only matches calls")
         };
         let label = *next_label;
@@ -459,8 +459,8 @@ impl Extractor<'_, '_> {
                 rhs,
                 span: stmt_span,
             } => match try_consume_hook_call(rhs, self.imports) {
-                Ok((call, args)) => {
-                    let (lbl, entry) = self.hook_call(&call, args, stmt_span, out);
+                Ok((call, args, site)) => {
+                    let (lbl, entry) = self.hook_call(&call, args, site, stmt_span, out);
                     let is_state_like = call.is_react
                         && matches!(call.origin_name.as_str(), "useState" | "useReducer");
                     let is_arr_temp = var.starts_with("__arr_");
@@ -502,8 +502,8 @@ impl Extractor<'_, '_> {
                 }
             },
             Stmt::ExprStmt(expr, stmt_span) => match try_consume_hook_call(expr, self.imports) {
-                Ok((call, args)) => {
-                    let (lbl, entry) = self.hook_call(&call, args, stmt_span, out);
+                Ok((call, args, site)) => {
+                    let (lbl, entry) = self.hook_call(&call, args, site, stmt_span, out);
                     let marker = marker_val(entry.as_ref());
                     if let Some(entry) = entry {
                         self.hooks.push(entry);
@@ -597,18 +597,20 @@ impl Extractor<'_, '_> {
 
     /// Label one hook call and build its entry, once its arguments are
     /// staged in the render body.
+    /// The hook call at `site`: its label and entry.
     fn hook_call(
         &mut self,
         call: &ResolvedHookCall,
         args: Vec<Expr>,
+        site: ExprId,
         span: Option<SourceRange>,
         out: &mut BlockOut,
     ) -> (HookLabel, Option<HookEntry>) {
-        let staged = self.stage_args(call, &args, span, out);
+        let staged = self.stage_args(call, &args, site, span, out);
         let lbl = self.label;
         self.label += 1;
         self.provenance.push(call.provenance(lbl, span));
-        let mut entry = make_hook_entry(call, lbl, args, span);
+        let mut entry = make_hook_entry(call, lbl, args, span, site);
         if let Some(HookEntry::Custom { args, .. }) = &mut entry {
             *args = staged;
         }
@@ -636,11 +638,12 @@ impl Extractor<'_, '_> {
     ///
     /// A lazy initializer — a function handed to `useState`, or `useReducer`'s
     /// third argument — runs during the mount render only, which
-    /// [`BlockOut::push_on_mount`] models.
+    /// [`BlockOut::push_on_mount`] models, as a call at the hook's `site`.
     fn stage_args(
         &mut self,
         call: &ResolvedHookCall,
         args: &[Expr],
+        site: ExprId,
         span: Option<SourceRange>,
         out: &mut BlockOut,
     ) -> Vec<Expr> {
@@ -675,6 +678,7 @@ impl Extractor<'_, '_> {
             let args = lazy.args.iter().map(|&i| values[i].clone()).collect();
             out.push_on_mount(Stmt::ExprStmt(
                 Expr::Call {
+                    id: site,
                     fn_: Box::new(fn_),
                     args,
                 },
@@ -779,21 +783,21 @@ impl ResolvedHookCall {
 fn try_consume_hook_call(
     expr: Expr,
     imports: &ImportCtx<'_>,
-) -> Result<(ResolvedHookCall, Vec<Expr>), Expr> {
+) -> Result<(ResolvedHookCall, Vec<Expr>, ExprId), Expr> {
     match expr {
         Expr::TSAnnotated(inner) => {
-            if let Expr::Call { fn_, args } = *inner {
+            if let Expr::Call { id, fn_, args } = *inner {
                 match imports.classify_callee(&fn_) {
-                    Some(call) => Ok((call, args)),
-                    None => Err(Expr::TSAnnotated(Box::new(Expr::Call { fn_, args }))),
+                    Some(call) => Ok((call, args, id)),
+                    None => Err(Expr::TSAnnotated(Box::new(Expr::Call { id, fn_, args }))),
                 }
             } else {
                 Err(Expr::TSAnnotated(inner))
             }
         }
-        Expr::Call { fn_, args } => match imports.classify_callee(&fn_) {
-            Some(call) => Ok((call, args)),
-            None => Err(Expr::Call { fn_, args }),
+        Expr::Call { id, fn_, args } => match imports.classify_callee(&fn_) {
+            Some(call) => Ok((call, args, id)),
+            None => Err(Expr::Call { id, fn_, args }),
         },
         other => Err(other),
     }
@@ -937,6 +941,7 @@ pub fn react_hook_entry(
     label: HookLabel,
     args: Vec<Expr>,
     span: Option<SourceRange>,
+    site: ExprId,
 ) -> Option<HookEntry> {
     let call = ResolvedHookCall {
         origin_name: name.to_string(),
@@ -944,14 +949,17 @@ pub fn react_hook_entry(
         specifier: Some("react".to_string()),
         resolved_file: None,
     };
-    make_hook_entry(&call, label, args, span)
+    make_hook_entry(&call, label, args, span, site)
 }
 
+/// The entry of a hook call; `site` is the call's own site, where React's
+/// call of a callback argument the entry keeps as a body takes place.
 fn make_hook_entry(
     call: &ResolvedHookCall,
     label: HookLabel,
     args: Vec<Expr>,
     span: Option<SourceRange>,
+    site: ExprId,
 ) -> Option<HookEntry> {
     let name = call.origin_name.as_str();
     // A React hook reads its arguments by position, which a spread hides
@@ -987,7 +995,7 @@ fn make_hook_entry(
             })
         }
         _ if EFFECT_HOOKS.contains(&name) => {
-            let body_cfg = hook_body_cfg(it.next());
+            let body_cfg = hook_body_cfg(it.next(), site);
             let deps = it.next().map_or(DepsArg::Absent, DepsArg::from_expr);
             Some(HookEntry::Effect {
                 label,
@@ -997,7 +1005,7 @@ fn make_hook_entry(
             })
         }
         "useMemo" => {
-            let body_cfg = hook_body_cfg(it.next());
+            let body_cfg = hook_body_cfg(it.next(), site);
             let deps = it.next().map_or(DepsArg::Absent, DepsArg::from_expr);
             Some(HookEntry::Memo {
                 label,
@@ -1014,7 +1022,7 @@ fn make_hook_entry(
                 Some(Expr::FnLit {
                     params, body_cfg, ..
                 }) => (params, unwrap_body(body_cfg), true),
-                other => (vec![], hook_body_cfg(other), false),
+                other => (vec![], hook_body_cfg(other, site), false),
             };
             let deps = it.next().map_or(DepsArg::Absent, DepsArg::from_expr);
             Some(HookEntry::Callback {
@@ -1130,10 +1138,13 @@ fn unwrap_body(body_cfg: std::sync::Arc<CFG>) -> CFG {
 /// callback did nothing at all: ⊥ where ⊤ was required. `useEffect(handler)`
 /// came out clean *and certified* `verified infinite-loop`, while the same body
 /// written inline was reported.
-fn hook_body_cfg(arg: Option<Expr>) -> CFG {
+///
+/// That invocation takes place at the hook call, `site`.
+fn hook_body_cfg(arg: Option<Expr>, site: ExprId) -> CFG {
     let ret = match arg {
         Some(Expr::FnLit { body_cfg, .. }) => return unwrap_body(body_cfg),
         Some(callee) => Expr::Call {
+            id: site,
             fn_: Box::new(callee),
             args: vec![],
         },
@@ -1189,7 +1200,8 @@ fn rewrite_expr(expr: Expr, state_temps: &HashMap<String, HookLabel>) -> Expr {
             op,
             arg: Box::new(rewrite_expr(*arg, state_temps)),
         },
-        Expr::Call { fn_, args } => Expr::Call {
+        Expr::Call { id, fn_, args } => Expr::Call {
+            id,
             fn_: Box::new(rewrite_expr(*fn_, state_temps)),
             args: args
                 .into_iter()

@@ -7,6 +7,17 @@ use crate::ir::{
     types::{ExprId, HookLabel, Symbol, Var},
 };
 
+/// Where a file's call ids start ([`Expr::Call`]): the upper half of the
+/// file's id space, which its literals — numbered up from zero — do not
+/// reach, and below a component's hook sites, numbered down from the top of
+/// its range ([`crate::ir::ComponentId::hook_site`]).
+pub const CALL_SITES: u64 = 1 << 31;
+
+/// A call that is no source call — one the analysis builds to ask a
+/// question (a callee applied to a value, a rule's probe): the first call
+/// site, which no lowered call of a component's range is.
+pub const SYNTHETIC_CALL: ExprId = ExprId(CALL_SITES);
+
 #[derive(Debug, Clone)]
 pub enum Prim {
     String(String),
@@ -168,7 +179,7 @@ pub const MUTATING_METHODS: &[&str] = &[
 /// is its receiver; it has no expression to match, which is why it is not
 /// folded in here.
 pub fn mutation_receiver(expr: &Expr) -> Option<&Expr> {
-    let Expr::Call { fn_, args } = expr else {
+    let Expr::Call { fn_, args, .. } = expr else {
         return None;
     };
     match fn_.as_ref() {
@@ -255,7 +266,23 @@ pub enum Expr {
     },
 
     // Calls
+    /// `fn_(args)`. `id` is the call's site, as `ObjectLit`'s `id` is the
+    /// literal's: a call is an allocation site (what it returns lives
+    /// there). The lowering mints it from the file's call counter, from
+    /// [`CALL_SITES`] up, so a call id never meets a literal's and minting
+    /// one moves no other id; placement in a component's range and every
+    /// graft shift it by the [`crate::ir::Offsets`] they apply to sites.
+    ///
+    /// Invariant: one id per call the program performs at one place of one
+    /// component. A body inlined twice (a custom hook, a utility, each
+    /// salted copy) is two places, so its calls get two ids: each graft
+    /// draws its own range from the component's call cursor. A subtree
+    /// copied without a graft — an argument substituted for a parameter,
+    /// a body shared by its `Arc` — denotes the same evaluation and keeps
+    /// the id. Ids are deterministic: they follow the source order of one
+    /// lowering and the order of the grafts.
     Call {
+        id: ExprId,
         fn_: Box<Expr>,
         args: Vec<Expr>,
     },
@@ -440,7 +467,7 @@ impl Expr {
     /// double-count as a ⊤-phase nested write — ADR-027 §1). One predicate,
     /// so the two sides cannot drift.
     pub fn subscription_listener(&self) -> Option<(&str, &[Var], &Arc<CFG>)> {
-        if let Expr::Call { fn_, args } = self
+        if let Expr::Call { fn_, args, .. } = self
             && let Expr::FieldAccess { field, .. } = fn_.as_ref()
             && field == "addEventListener"
             && let (
@@ -543,7 +570,7 @@ impl Expr {
                 f(rhs);
             }
             Expr::UnaryOp { arg, .. } => f(arg),
-            Expr::Call { fn_, args } | Expr::New { fn_, args, .. } => {
+            Expr::Call { fn_, args, .. } | Expr::New { fn_, args, .. } => {
                 f(fn_);
                 for a in args {
                     f(a);
@@ -595,7 +622,7 @@ impl Expr {
                 f(rhs);
             }
             Expr::UnaryOp { arg, .. } => f(arg),
-            Expr::Call { fn_, args } | Expr::New { fn_, args, .. } => {
+            Expr::Call { fn_, args, .. } | Expr::New { fn_, args, .. } => {
                 f(fn_);
                 for a in args {
                     f(a);

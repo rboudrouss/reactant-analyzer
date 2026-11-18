@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::ir::{
     cfg::{BasicBlock, CFG, Terminator},
-    expr::Expr,
+    expr::{CALL_SITES, Expr},
     hooks::HookEntry,
     stmt::{MemberKey, Stmt},
     types::{ExprId, HookLabel},
@@ -22,18 +22,52 @@ pub struct Offsets {
     /// Added to every allocation-site [`ExprId`]. Unique per splice: the same
     /// callee inlined twice is two allocation sites, not one.
     pub ids: u64,
+    /// Added to every call site ([`Expr::Call`]'s `id`), for the same reason:
+    /// the same callee inlined twice performs its calls at two places. Calls
+    /// have a cursor of their own ([`call_id_span`]), so a graft's call
+    /// range moves no allocation site.
+    pub calls: u64,
 }
 
 impl Offsets {
     /// Shift labels only — for a remap that is not a graft (a hook table
     /// renumbered in place keeps its own allocation sites).
     pub fn labels(labels: HookLabel) -> Self {
-        Offsets { labels, ids: 0 }
+        Offsets {
+            labels,
+            ids: 0,
+            calls: 0,
+        }
     }
 
     fn is_identity(self) -> bool {
-        self.labels == 0 && self.ids == 0
+        self.labels == 0 && self.ids == 0 && self.calls == 0
     }
+}
+
+/// How many call sites a graft of `cfg` occupies: one past its largest call
+/// id above [`CALL_SITES`], nested function bodies included; 0 for a body
+/// that calls nothing. The call-site counterpart of [`alloc_id_span`].
+pub fn call_id_span(cfg: &CFG) -> u64 {
+    let mut max: Option<u64> = None;
+    fn walk(e: &Expr, max: &mut Option<u64>, depth: usize) {
+        if depth == 0 {
+            return;
+        }
+        match e {
+            Expr::Call { id, .. } => {
+                let n = id.0.saturating_sub(CALL_SITES);
+                *max = Some(max.map_or(n, |m| m.max(n)));
+            }
+            Expr::FnLit { body_cfg, .. } => {
+                body_cfg.for_each_expr(&mut |inner| walk(inner, max, depth - 1));
+            }
+            _ => {}
+        }
+        e.for_each_child(&mut |c| walk(c, max, depth));
+    }
+    cfg.for_each_expr(&mut |e| walk(e, &mut max, 64));
+    max.map_or(0, |m| m + 1)
 }
 
 /// One past the largest allocation-site `ExprId` in `cfg`, nested function
@@ -130,7 +164,8 @@ pub fn remap_expr(expr: Expr, off: Offsets) -> Expr {
             op,
             arg: Box::new(remap_expr(*arg, off)),
         },
-        Expr::Call { fn_, args } => Expr::Call {
+        Expr::Call { id, fn_, args } => Expr::Call {
+            id: ExprId(id.0 + off.calls),
             fn_: Box::new(remap_expr(*fn_, off)),
             args: args.into_iter().map(|a| remap_expr(a, off)).collect(),
         },

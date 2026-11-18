@@ -801,6 +801,7 @@ mod tests {
     /// `setN({})` as a statement.
     fn fresh_object_write() -> Expr {
         Expr::Call {
+            id: crate::ir::expr::SYNTHETIC_CALL,
             fn_: Box::new(Expr::Var("setN".to_string())),
             args: vec![Expr::ObjectLit {
                 id: crate::ir::types::ExprId(0),
@@ -906,6 +907,7 @@ mod tests {
     fn a_call_of_another_name_no_warning() {
         let eff_cfg = crate::test_support::single_block_cfg(vec![Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setOther".to_string())),
                 args: vec![Expr::ObjectLit {
                     id: crate::ir::types::ExprId(0),
@@ -932,6 +934,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::ObjectLit {
                         id: crate::ir::types::ExprId(0),
@@ -998,6 +1001,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setCount".to_string())),
                     args: vec![Expr::BinOp {
                         op: crate::ir::expr::BinOp::Add,
@@ -1076,6 +1080,7 @@ mod tests {
                 id: 1,
                 stmts: vec![Stmt::ExprStmt(
                     Expr::Call {
+                        id: crate::ir::expr::SYNTHETIC_CALL,
                         fn_: Box::new(Expr::Var("setN".to_string())),
                         args: vec![Expr::ObjectLit {
                             id: crate::ir::types::ExprId(0),
@@ -1180,6 +1185,7 @@ mod tests {
             body_cfg: std::sync::Arc::new(crate::test_support::single_block_cfg(vec![
                 Stmt::ExprStmt(
                     Expr::Call {
+                        id: crate::ir::expr::SYNTHETIC_CALL,
                         fn_: Box::new(Expr::Var(setter_name.to_string())),
                         args: vec![Expr::BinOp {
                             op: crate::ir::expr::BinOp::Add,
@@ -1197,6 +1203,7 @@ mod tests {
     fn then_callback_setter_triggers_infinite_loop() {
         // useEffect(() => { p.then(() => setN(n + 1)) }, [n])
         let call = Expr::Call {
+            id: crate::ir::expr::SYNTHETIC_CALL,
             fn_: Box::new(Expr::FieldAccess {
                 obj: Box::new(Expr::Var("p".to_string())),
                 field: "then".to_string(),
@@ -1232,6 +1239,7 @@ mod tests {
     fn add_event_listener_setter_does_not_loop() {
         // useEffect(() => { el.addEventListener('click', () => setN(n + 1)) })
         let call = Expr::Call {
+            id: crate::ir::expr::SYNTHETIC_CALL,
             fn_: Box::new(Expr::FieldAccess {
                 obj: Box::new(Expr::Var("el".to_string())),
                 field: "addEventListener".to_string(),
@@ -1269,6 +1277,7 @@ mod tests {
         // Its write moves `n` but is no in-cycle growth; `myHelper` may call
         // it at once, so the loop is possible: a Warning.
         let call = Expr::Call {
+            id: crate::ir::expr::SYNTHETIC_CALL,
             fn_: Box::new(Expr::Var("myHelper".to_string())),
             args: vec![incrementing_setter_cb("setN")],
         };
@@ -1299,6 +1308,7 @@ mod tests {
                 id: 0,
                 stmts: vec![Stmt::ExprStmt(
                     Expr::Call {
+                        id: crate::ir::expr::SYNTHETIC_CALL,
                         fn_: Box::new(Expr::Var("setN".to_string())),
                         args: vec![Expr::BinOp {
                             op: crate::ir::expr::BinOp::Add,
@@ -1325,6 +1335,7 @@ mod tests {
             }),
         };
         let call = Expr::Call {
+            id: crate::ir::expr::SYNTHETIC_CALL,
             fn_: Box::new(Expr::FieldAccess {
                 obj: Box::new(Expr::Var("p".to_string())),
                 field: "then".to_string(),
@@ -1384,6 +1395,7 @@ mod tests {
                 id: 2,
                 stmts: vec![Stmt::ExprStmt(
                     Expr::Call {
+                        id: crate::ir::expr::SYNTHETIC_CALL,
                         fn_: Box::new(Expr::Var("setN".to_string())),
                         args: vec![Expr::Lit(Prim::Int(0))],
                     },
@@ -1431,6 +1443,7 @@ mod tests {
             }),
         };
         let call = Expr::Call {
+            id: crate::ir::expr::SYNTHETIC_CALL,
             fn_: Box::new(Expr::FieldAccess {
                 obj: Box::new(Expr::Var("p".to_string())),
                 field: "then".to_string(),
@@ -1533,6 +1546,7 @@ mod tests {
         let cb_body_cfg = {
             crate::test_support::single_block_cfg(vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::BinOp {
                         op: crate::ir::expr::BinOp::Add,
@@ -1555,6 +1569,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setTimeout".to_string())),
                     args: vec![Expr::Var("cb".to_string()), Expr::Lit(Prim::Int(1000))],
                 },
@@ -1593,6 +1608,7 @@ mod tests {
         let cb_body_cfg = {
             crate::test_support::single_block_cfg(vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::BinOp {
                         op: crate::ir::expr::BinOp::Add,
@@ -1615,8 +1631,10 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::FieldAccess {
                         obj: Box::new(Expr::Call {
+                            id: crate::ir::expr::SYNTHETIC_CALL,
                             fn_: Box::new(Expr::Var("fetch".to_string())),
                             args: vec![],
                         }),
@@ -1659,6 +1677,7 @@ mod tests {
         let inner_body_cfg = {
             crate::test_support::single_block_cfg(vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::BinOp {
                         op: crate::ir::expr::BinOp::Add,
@@ -1672,6 +1691,7 @@ mod tests {
         let outer_body_cfg = {
             crate::test_support::single_block_cfg(vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setTimeout".to_string())),
                     args: vec![Expr::Var("inner".to_string()), Expr::Lit(Prim::Int(100))],
                 },
@@ -1699,6 +1719,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("outer".to_string())),
                     args: vec![],
                 },
@@ -1733,6 +1754,7 @@ mod tests {
     /// `setN(n + 1)`.
     fn growing_write() -> Expr {
         Expr::Call {
+            id: crate::ir::expr::SYNTHETIC_CALL,
             fn_: Box::new(Expr::Var("setN".to_string())),
             args: vec![Expr::BinOp {
                 op: crate::ir::expr::BinOp::Add,

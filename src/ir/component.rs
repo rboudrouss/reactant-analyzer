@@ -83,13 +83,15 @@ pub struct ComponentIR {
 }
 
 impl ComponentIR {
-    /// This component with every allocation site shifted by `base`: its
-    /// render body's and its hook bodies', which one file counter numbered
-    /// from zero ([`crate::ir::types::ExprId`]).
+    /// This component with every allocation site and every call site shifted
+    /// by `base`: its render body's and its hook bodies', which one file
+    /// counter numbered from zero ([`crate::ir::types::ExprId`]), and one
+    /// from [`crate::ir::expr::CALL_SITES`].
     pub fn placed_at(self, base: u64) -> Self {
         let off = crate::ir::Offsets {
             labels: 0,
             ids: base,
+            calls: base,
         };
         ComponentIR {
             render_cfg: crate::ir::remap_cfg(self.render_cfg, off),

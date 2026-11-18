@@ -377,7 +377,7 @@ pub fn body_holds(body: &CFG, params: &[Var], var: &dyn Fn(&str) -> Kind) -> boo
         match e {
             // Built, not run.
             Expr::FnLit { .. } => true,
-            Expr::Call { fn_, args } | Expr::New { fn_, args, .. } => {
+            Expr::Call { fn_, args, .. } | Expr::New { fn_, args, .. } => {
                 let callee = Callee::of(fn_, &mut |x| kind_of(x, var));
                 call(
                     callee,
@@ -412,7 +412,7 @@ pub fn kind_of(e: &Expr, var: &dyn Fn(&str) -> Kind) -> Kind {
         Expr::TSAnnotated(inner) => kind_of(inner, var),
         Expr::BinOp { op, lhs, rhs } => binop(op, kind_of(lhs, var), kind_of(rhs, var)),
         Expr::UnaryOp { op, .. } => unary(op),
-        Expr::Call { fn_, args } | Expr::New { fn_, args, .. } => {
+        Expr::Call { fn_, args, .. } | Expr::New { fn_, args, .. } => {
             let callee = Callee::of(fn_, &mut |x| kind_of(x, var));
             call(
                 callee,

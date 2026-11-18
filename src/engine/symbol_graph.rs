@@ -317,6 +317,7 @@ mod tests {
             .map(|c| {
                 Stmt::ExprStmt(
                     Expr::Call {
+                        id: crate::ir::expr::SYNTHETIC_CALL,
                         fn_: Box::new(Expr::Var((*c).to_string())),
                         args: vec![],
                     },

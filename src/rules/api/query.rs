@@ -1202,7 +1202,7 @@ fn try_extract_setter_call<'e>(
 ) -> Option<(Var, &'e Expr)> {
     // Through a name or a member path (`t[1]` is `t.1`), as the setter
     // walk matches a call.
-    if let Expr::Call { fn_, args } = expr
+    if let Expr::Call { fn_, args, .. } = expr
         && let Some(name) = crate::engine::setters::callee_path(fn_)
         && setter_vars.contains(&name)
     {
@@ -1330,6 +1330,7 @@ mod tests {
     fn set_call(line: u32) -> Stmt {
         Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setX".to_string())),
                 args: vec![Expr::Lit(Prim::Int(0))],
             },

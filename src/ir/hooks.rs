@@ -390,7 +390,9 @@ impl HookEntry {
             return None;
         };
         let mut returns = body_cfg.blocks.values().filter_map(|b| match &b.term {
-            crate::ir::cfg::Terminator::Return(Expr::Call { fn_, args }, _) if args.is_empty() => {
+            crate::ir::cfg::Terminator::Return(Expr::Call { fn_, args, .. }, _)
+                if args.is_empty() =>
+            {
                 Some(&**fn_)
             }
             _ => None,

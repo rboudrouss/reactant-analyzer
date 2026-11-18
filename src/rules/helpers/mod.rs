@@ -216,7 +216,7 @@ pub(in crate::rules) fn fn_lit_binding<'c>(
 /// primitive.
 pub(crate) fn collect_callees<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
     match e {
-        Expr::Call { fn_, args } | Expr::New { fn_, args, .. } => {
+        Expr::Call { fn_, args, .. } | Expr::New { fn_, args, .. } => {
             out.push(fn_);
             collect_callees(fn_, out);
             for a in args {

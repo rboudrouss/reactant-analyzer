@@ -306,7 +306,7 @@ fn eval_state_value(
         Expr::Call { fn_, .. } if matches!(fn_.as_ref(), Expr::SummaryVal(SummaryValue::Top)) => {
             StateValue::top().join(&StateValue::reference(Stability::PerRender))
         }
-        Expr::Call { fn_, args } => {
+        Expr::Call { fn_, args, .. } => {
             allocating_call(fn_, args, env, ctx).unwrap_or_else(StateValue::top)
         }
         // `new` allocates: a fresh reference, whose members stay ⊤ (#158).
@@ -1379,6 +1379,7 @@ mod tests {
         let mut heap = Heap::new();
         let mut ctx = AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap);
         let call = |fn_: Expr, args: Vec<Expr>| Expr::Call {
+            id: crate::ir::expr::SYNTHETIC_CALL,
             fn_: Box::new(fn_),
             args,
         };
@@ -1746,6 +1747,7 @@ mod tests {
         let call_setter = single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::StateSetter(0)),
                     args: vec![Expr::Lit(Prim::Int(1))],
                 },
@@ -1794,6 +1796,7 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::Lit(Prim::Int(42))],
                 },
@@ -1827,6 +1830,7 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::FnLit {
                         id: crate::ir::types::ExprId(0),
@@ -2010,6 +2014,7 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::FnLit {
                         id: crate::ir::types::ExprId(0),
@@ -2146,6 +2151,7 @@ mod tests {
     fn setter_call(name: &str, arg: Expr) -> Stmt {
         Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var(name.to_string())),
                 args: vec![arg],
             },
@@ -2454,6 +2460,7 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::FnLit {
                         id: crate::ir::types::ExprId(0),
@@ -2496,6 +2503,7 @@ mod tests {
         let cb_body = single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setUser".to_string())),
                     args: vec![Expr::Var("u".to_string())],
                 },
@@ -2505,8 +2513,10 @@ mod tests {
         );
         let stmt = Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::FieldAccess {
                     obj: Box::new(Expr::Call {
+                        id: crate::ir::expr::SYNTHETIC_CALL,
                         fn_: Box::new(Expr::Var("fetch".to_string())),
                         args: vec![],
                     }),
@@ -2539,6 +2549,7 @@ mod tests {
         let cb_body = single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::Lit(Prim::Int(42))],
                 },
@@ -2548,6 +2559,7 @@ mod tests {
         );
         let stmt = Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setTimeout".to_string())),
                 args: vec![
                     Expr::FnLit {
@@ -2581,6 +2593,7 @@ mod tests {
         let cb_a = single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setA".to_string())),
                     args: vec![Expr::Lit(Prim::Int(1))],
                 },
@@ -2591,6 +2604,7 @@ mod tests {
         let cb_b = single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setB".to_string())),
                     args: vec![Expr::Lit(Prim::Int(2))],
                 },
@@ -2599,6 +2613,7 @@ mod tests {
             Expr::Lit(Prim::Unit),
         );
         let inner = Expr::Call {
+            id: crate::ir::expr::SYNTHETIC_CALL,
             fn_: Box::new(Expr::FieldAccess {
                 obj: Box::new(Expr::Var("p".to_string())),
                 field: "then".to_string(),
@@ -2610,6 +2625,7 @@ mod tests {
             }],
         };
         let outer = Expr::Call {
+            id: crate::ir::expr::SYNTHETIC_CALL,
             fn_: Box::new(Expr::FieldAccess {
                 obj: Box::new(inner),
                 field: "then".to_string(),
@@ -2640,6 +2656,7 @@ mod tests {
         let cb = single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::Lit(Prim::Int(7))],
                 },
@@ -2650,8 +2667,10 @@ mod tests {
         let stmt = Stmt::Let {
             var: "p".to_string(),
             rhs: Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::FieldAccess {
                     obj: Box::new(Expr::Call {
+                        id: crate::ir::expr::SYNTHETIC_CALL,
                         fn_: Box::new(Expr::Var("fetch".to_string())),
                         args: vec![],
                     }),
@@ -2684,6 +2703,7 @@ mod tests {
         let cb = single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::Lit(Prim::Int(99))],
                 },
@@ -2693,6 +2713,7 @@ mod tests {
         );
         let stmt = Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::FieldAccess {
                     obj: Box::new(Expr::Var("el".to_string())),
                     field: "addEventListener".to_string(),
@@ -2729,6 +2750,7 @@ mod tests {
         let on_fulfilled = single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setA".to_string())),
                     args: vec![Expr::Lit(Prim::Int(1))],
                 },
@@ -2739,6 +2761,7 @@ mod tests {
         let on_rejected = single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setB".to_string())),
                     args: vec![Expr::Lit(Prim::Int(2))],
                 },
@@ -2748,6 +2771,7 @@ mod tests {
         );
         let stmt = Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::FieldAccess {
                     obj: Box::new(Expr::Var("p".to_string())),
                     field: "then".to_string(),
@@ -2787,6 +2811,7 @@ mod tests {
         let cb = single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::Lit(Prim::Int(42))],
                 },
@@ -2796,8 +2821,10 @@ mod tests {
         );
         let stmt = Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::FieldAccess {
                     obj: Box::new(Expr::Call {
+                        id: crate::ir::expr::SYNTHETIC_CALL,
                         fn_: Box::new(Expr::FieldAccess {
                             obj: Box::new(Expr::Var("Promise".to_string())),
                             field: "allSettled".to_string(),
@@ -2850,6 +2877,7 @@ mod tests {
         let cb_body = single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::Lit(Prim::Int(42))],
                 },
@@ -2868,6 +2896,7 @@ mod tests {
         };
         let call = Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setTimeout".to_string())),
                 args: vec![Expr::Var("cb".to_string()), Expr::Lit(Prim::Int(1000))],
             },
@@ -2898,6 +2927,7 @@ mod tests {
         let cb_body = single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::Lit(Prim::Int(99))],
                 },
@@ -2909,6 +2939,7 @@ mod tests {
 
         let call = Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("myHelper".to_string())),
                 args: vec![Expr::Var("cb".to_string())],
             },
@@ -2945,6 +2976,7 @@ mod tests {
         let load_body = single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setUser".to_string())),
                     args: vec![Expr::Lit(Prim::Int(7))],
                 },
@@ -2963,6 +2995,7 @@ mod tests {
         };
         let call_load = Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("load".to_string())),
                 args: vec![],
             },
@@ -2992,6 +3025,7 @@ mod tests {
         let cb_body = single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::Lit(Prim::Int(5))],
                 },
@@ -3010,6 +3044,7 @@ mod tests {
         };
         let call = Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setInterval".to_string())),
                 args: vec![Expr::Var("cb".to_string()), Expr::Lit(Prim::Int(1000))],
             },
@@ -3037,6 +3072,7 @@ mod tests {
         let cb_body = single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::Lit(Prim::Int(3))],
                 },
@@ -3055,6 +3091,7 @@ mod tests {
         };
         let call = Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::FieldAccess {
                     obj: Box::new(Expr::Var("arr".to_string())),
                     field: "forEach".to_string(),
@@ -3085,6 +3122,7 @@ mod tests {
         let inner_body = single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::Lit(Prim::Int(9))],
                 },
@@ -3105,6 +3143,7 @@ mod tests {
         let outer_body = single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setTimeout".to_string())),
                     args: vec![Expr::Var("inner".to_string()), Expr::Lit(Prim::Int(100))],
                 },
@@ -3124,6 +3163,7 @@ mod tests {
 
         let call_outer = Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("outer".to_string())),
                 args: vec![],
             },
@@ -3159,6 +3199,7 @@ mod tests {
             Arc::new(single_block_cfg(
                 vec![Stmt::ExprStmt(
                     Expr::Call {
+                        id: crate::ir::expr::SYNTHETIC_CALL,
                         fn_: Box::new(Expr::Var(callee.to_string())),
                         args: vec![],
                     },
@@ -3171,6 +3212,7 @@ mod tests {
         let setter_body = Arc::new(single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::Lit(Prim::Int(1))],
                 },
@@ -3218,6 +3260,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("f4".to_string())),
                     args: vec![],
                 },
@@ -3250,6 +3293,7 @@ mod tests {
         let make_loop_wrapper = |callee: &str| -> Arc<CFG> {
             Arc::new(while_loop_body(vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var(callee.to_string())),
                     args: vec![],
                 },
@@ -3299,6 +3343,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("f4".to_string())),
                     args: vec![],
                 },

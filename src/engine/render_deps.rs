@@ -927,7 +927,7 @@ impl<'a> Analyzer<'a> {
             }
             // `xs.push(v)`: a method call may store its arguments in the
             // receiver.
-            Stmt::ExprStmt(Expr::Call { fn_, args }, _) => {
+            Stmt::ExprStmt(Expr::Call { fn_, args, .. }, _) => {
                 if let Expr::FieldAccess { obj, .. } = fn_.peel_ts()
                     && let Some(root) = root_var(obj)
                     && !args.is_empty()
@@ -1069,7 +1069,7 @@ impl<'a> Analyzer<'a> {
             }
             // Entries of its operand, of no known kind.
             Expr::Spread(arg) => DVal::of(self.eval(arg, env).deps),
-            Expr::Call { fn_, args } | Expr::New { fn_, args, .. } => {
+            Expr::Call { fn_, args, .. } | Expr::New { fn_, args, .. } => {
                 let name = match fn_.peel_ts() {
                     Expr::Var(v) => Some(v.as_str()),
                     Expr::FieldAccess { field, .. } => Some(field.as_str()),
@@ -1209,7 +1209,7 @@ impl<'a> Analyzer<'a> {
                 };
                 self.collect(props, env, &inner);
             }
-            Expr::Call { fn_, args } | Expr::New { fn_, args, .. } => {
+            Expr::Call { fn_, args, .. } | Expr::New { fn_, args, .. } => {
                 self.collect(fn_, env, ctx);
                 // The callback's parameters come from the receiver and the
                 // other arguments (a synchronous higher-order call).

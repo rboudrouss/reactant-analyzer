@@ -621,7 +621,7 @@ fn reach_literals<'c>(
             Expr::FnLit {
                 params, body_cfg, ..
             } => out.push((params, body_cfg, at)),
-            Expr::Call { fn_, args } => {
+            Expr::Call { fn_, args, .. } => {
                 literals(fn_, None, out);
                 for (i, a) in args.iter().enumerate() {
                     literals(a, Some((&**fn_, i)), out);

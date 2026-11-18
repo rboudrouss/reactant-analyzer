@@ -487,7 +487,7 @@ fn canonical_key(e: &Expr, calls: bool) -> Option<String> {
             canonical_key(lhs, calls)?,
             canonical_key(rhs, calls)?
         ),
-        Expr::Call { fn_, args } if calls => {
+        Expr::Call { fn_, args, .. } if calls => {
             let mut s = format!("{}(", canonical_key(fn_, calls)?);
             for a in args {
                 s.push_str(&canonical_key(a, calls)?);
@@ -586,6 +586,7 @@ mod tests {
         assert!(dep_paths(&[Expr::Lit(Prim::Int(1))]).is_empty());
         assert!(
             dep_paths(&[Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("f".to_string())),
                 args: vec![],
             }])
@@ -704,6 +705,7 @@ mod tests {
     fn shadowing_is_per_lambda_not_global() {
         // f((open) => open, () => open) : second lambda's `open` is free.
         let call = Expr::Call {
+            id: crate::ir::expr::SYNTHETIC_CALL,
             fn_: Box::new(Expr::Var("f".to_string())),
             args: vec![
                 lambda(&["open"], Expr::Var("open".to_string())),

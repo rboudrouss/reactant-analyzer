@@ -258,6 +258,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::ObjectLit {
                         id: crate::ir::types::ExprId(0),
@@ -632,6 +633,7 @@ mod tests {
             Stmt::Let {
                 var: "v".to_string(),
                 rhs: Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("pick".to_string())),
                     args: vec![],
                 },
@@ -640,6 +642,7 @@ mod tests {
             Stmt::Let {
                 var: "w".to_string(),
                 rhs: Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("extern".to_string())),
                     args: vec![],
                 },
@@ -769,6 +772,7 @@ mod tests {
     fn set_n(v: i32) -> Stmt {
         Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setN".to_string())),
                 args: vec![Expr::Lit(Prim::Int(v))],
             },
@@ -894,6 +898,7 @@ mod tests {
                 stmts: vec![],
                 term: Terminator::Return(
                     Expr::Call {
+                        id: crate::ir::expr::SYNTHETIC_CALL,
                         fn_: Box::new(Expr::Var("setN".to_string())),
                         args: vec![Expr::Lit(Prim::Int(99))],
                     },
@@ -986,6 +991,7 @@ mod tests {
                 stmts: vec![],
                 term: Terminator::Return(
                     Expr::Call {
+                        id: crate::ir::expr::SYNTHETIC_CALL,
                         fn_: Box::new(Expr::Var("setN".to_string())),
                         args: vec![Expr::FnLit {
                             id: ExprId(0),
