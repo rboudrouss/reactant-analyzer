@@ -1357,31 +1357,18 @@ impl SpliceIds {
 
 /// The allocation-id width of a body together with the hook table grafted
 /// alongside it — they are numbered from one file counter, so they share a
-/// range and must be shifted by one offset.
+/// range and must be shifted by one offset. Every id the table holds counts,
+/// beside its bodies: a custom hook's argument, an initializer, a deps list
+/// (`crate::ir::graft_spans`); a graft landing on one would make two
+/// allocations, or two calls, one.
 fn alloc_span(cfg: &CFG, hooks: &[HookEntry]) -> u64 {
-    std::iter::once(crate::ir::alloc_id_span(cfg))
-        .chain(
-            hooks
-                .iter()
-                .filter_map(HookEntry::body_cfg)
-                .map(crate::ir::alloc_id_span),
-        )
-        .max()
-        .unwrap_or(0)
+    crate::ir::graft_spans(cfg, hooks).0
 }
 
 /// [`alloc_span`] for call sites: one file call counter numbered the body's
 /// and its hooks' calls.
 fn call_span(cfg: &CFG, hooks: &[HookEntry]) -> u64 {
-    std::iter::once(crate::ir::call_id_span(cfg))
-        .chain(
-            hooks
-                .iter()
-                .filter_map(HookEntry::body_cfg)
-                .map(crate::ir::call_id_span),
-        )
-        .max()
-        .unwrap_or(0)
+    crate::ir::graft_spans(cfg, hooks).1
 }
 
 /// The recursion guard both splices share (custom hooks, utilities): the

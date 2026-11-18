@@ -49,25 +49,104 @@ impl Offsets {
 /// id above [`CALL_SITES`], nested function bodies included; 0 for a body
 /// that calls nothing. The call-site counterpart of [`alloc_id_span`].
 pub fn call_id_span(cfg: &CFG) -> u64 {
-    let mut max: Option<u64> = None;
-    fn walk(e: &Expr, max: &mut Option<u64>, depth: usize) {
+    id_span(cfg_exprs(cfg), call_id)
+}
+
+/// A call's id above [`CALL_SITES`].
+fn call_id(e: &Expr) -> Option<u64> {
+    match e {
+        Expr::Call { id, .. } => Some(id.0.saturating_sub(CALL_SITES)),
+        _ => None,
+    }
+}
+
+/// An allocation site's id.
+fn alloc_id(e: &Expr) -> Option<u64> {
+    match e {
+        Expr::ObjectLit { id, .. }
+        | Expr::ArrayLit { id, .. }
+        | Expr::New { id, .. }
+        | Expr::FnLit { id, .. } => Some(id.0),
+        _ => None,
+    }
+}
+
+/// The top-level expressions of `cfg`.
+fn cfg_exprs(cfg: &CFG) -> Vec<&Expr> {
+    let mut out = Vec::new();
+    cfg.for_each_expr(&mut |e| out.push(e));
+    out
+}
+
+/// One past the largest id `pick` reads off `exprs`, their sub-expressions
+/// and their function literals' bodies.
+fn id_span<'a>(exprs: impl IntoIterator<Item = &'a Expr>, pick: fn(&Expr) -> Option<u64>) -> u64 {
+    fn walk(e: &Expr, pick: fn(&Expr) -> Option<u64>, max: &mut Option<u64>, depth: usize) {
         if depth == 0 {
             return;
         }
-        match e {
-            Expr::Call { id, .. } => {
-                let n = id.0.saturating_sub(CALL_SITES);
-                *max = Some(max.map_or(n, |m| m.max(n)));
-            }
-            Expr::FnLit { body_cfg, .. } => {
-                body_cfg.for_each_expr(&mut |inner| walk(inner, max, depth - 1));
-            }
-            _ => {}
+        if let Some(n) = pick(e) {
+            *max = Some(max.map_or(n, |m| m.max(n)));
         }
-        e.for_each_child(&mut |c| walk(c, max, depth));
+        if let Expr::FnLit { body_cfg, .. } = e {
+            body_cfg.for_each_expr(&mut |inner| walk(inner, pick, max, depth - 1));
+        }
+        e.for_each_child(&mut |c| walk(c, pick, max, depth));
     }
-    cfg.for_each_expr(&mut |e| walk(e, &mut max, 64));
+    let mut max: Option<u64> = None;
+    // A `FnLit` body is a CFG of its own; the bound keeps a pathological
+    // nesting from recursing without end, and no real body approaches it.
+    for e in exprs {
+        walk(e, pick, &mut max, 64);
+    }
     max.map_or(0, |m| m + 1)
+}
+
+/// Every expression a hook table holds: each body's, and what an entry holds
+/// beside its body — an initializer, a reducer, a deps list, a custom hook's
+/// arguments. What [`remap_hooks`] shifts.
+fn hook_exprs(hooks: &[HookEntry]) -> Vec<&Expr> {
+    fn deps(d: &crate::ir::hooks::DepsArg) -> Vec<&Expr> {
+        match d {
+            crate::ir::hooks::DepsArg::List(l) => l.as_slice().iter().collect(),
+            crate::ir::hooks::DepsArg::Opaque(e) => vec![e],
+            crate::ir::hooks::DepsArg::Absent => Vec::new(),
+        }
+    }
+    let mut out = Vec::new();
+    for h in hooks {
+        if let Some(body) = h.body_cfg() {
+            out.extend(cfg_exprs(body));
+        }
+        match h {
+            HookEntry::State { init, reducer, .. } => {
+                out.push(init);
+                out.extend(reducer.as_ref());
+            }
+            HookEntry::Ref { init, .. } => out.push(init),
+            HookEntry::Effect { deps: d, .. }
+            | HookEntry::Memo { deps: d, .. }
+            | HookEntry::Callback { deps: d, .. } => out.extend(deps(d)),
+            HookEntry::Custom { args, deps: d, .. } => {
+                out.extend(args);
+                out.extend(deps(d));
+            }
+            HookEntry::Handler { .. } => {}
+        }
+    }
+    out
+}
+
+/// The allocation-id and call-id widths of a body and the hook table grafted
+/// with it — every id [`remap_cfg`] and [`remap_hooks`] shift: a graft lands
+/// above all of them, an argument of a custom hook the table keeps included.
+pub fn graft_spans(cfg: &CFG, hooks: &[HookEntry]) -> (u64, u64) {
+    let mut exprs = cfg_exprs(cfg);
+    exprs.extend(hook_exprs(hooks));
+    (
+        id_span(exprs.iter().copied(), alloc_id),
+        id_span(exprs.iter().copied(), call_id),
+    )
 }
 
 /// One past the largest allocation-site `ExprId` in `cfg`, nested function
@@ -76,28 +155,7 @@ pub fn call_id_span(cfg: &CFG) -> u64 {
 /// A splice adds this to its running cursor so the next graft lands above it,
 /// which is what makes the *same* callee inlined twice two allocation sites.
 pub fn alloc_id_span(cfg: &CFG) -> u64 {
-    let mut max: Option<u64> = None;
-    let mut note = |id: ExprId| max = Some(max.map_or(id.0, |m: u64| m.max(id.0)));
-    fn walk(e: &Expr, note: &mut impl FnMut(ExprId), depth: usize) {
-        if depth == 0 {
-            return;
-        }
-        match e {
-            Expr::ObjectLit { id, .. } | Expr::ArrayLit { id, .. } | Expr::New { id, .. } => {
-                note(*id)
-            }
-            Expr::FnLit { id, body_cfg, .. } => {
-                note(*id);
-                body_cfg.for_each_expr(&mut |inner| walk(inner, note, depth - 1));
-            }
-            _ => {}
-        }
-        e.for_each_child(&mut |c| walk(c, note, depth));
-    }
-    // A `FnLit` body is a CFG of its own; the bound keeps a pathological
-    // nesting from recursing without end, and no real body approaches it.
-    cfg.for_each_expr(&mut |e| walk(e, &mut note, 64));
-    max.map_or(0, |m| m + 1)
+    id_span(cfg_exprs(cfg), alloc_id)
 }
 
 /// Add `off` to every `HookLabel` and every allocation-site `ExprId` embedded

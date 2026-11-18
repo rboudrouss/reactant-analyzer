@@ -260,6 +260,10 @@ on a program React settles; 323 oracle cases, none a known false negative.
 - A call of a value that may be any of more than eight setters
   (`const f = fs[i]; f(n + 1)` over nine setters) writes every one of them;
   it wrote none, and the loop it arms was silent (#329).
+- A custom hook's body inlined into a component no longer takes the
+  allocation and call sites of what the component hands the hook (an
+  argument, an initializer, a deps list): two closures, or two calls, were
+  read as one.
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error
