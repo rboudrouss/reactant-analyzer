@@ -1019,6 +1019,39 @@ export function Two({ c }: { c?: boolean }) {
     assert!(holds(&result, "Two", 1, 8.0), "`mk2`'s closure");
 }
 
+/// #329: a call of a value that may be any of nine setters writes each of
+/// them — the join keeps every name, there is no "some setter" past a bound.
+/// A parent's setters handed to a child as one prop land in the parent.
+#[test]
+fn a_call_of_many_setters_writes_every_one() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function App({ i = 0 }: { i?: number }) {
+  const [n, setN] = useState(0);
+  const [a1, s1] = useState(0);
+  const [a2, s2] = useState(0);
+  const [a3, s3] = useState(0);
+  const [a4, s4] = useState(0);
+  const [a5, s5] = useState(0);
+  const [a6, s6] = useState(0);
+  const [a7, s7] = useState(0);
+  const [a8, s8] = useState(0);
+  const fs = [setN, s1, s2, s3, s4, s5, s6, s7, s8];
+  useEffect(() => { fs[i](7); }, []);
+  return <div>{n}{a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8}<Child set={fs[i]} /></div>;
+}
+function Child({ set }: { set: (v: number) => void }) {
+  useEffect(() => { set(9); }, []);
+  return null;
+}
+"#;
+    let result = analyze(src);
+    for label in 0..9 {
+        assert!(holds(&result, "App", label, 7.0), "slot {label}: the call");
+        assert!(holds(&result, "App", label, 9.0), "slot {label}: the child");
+    }
+}
+
 /// What an escaped closure writes is what the slot gets, nothing more: a
 /// write of the value the slot holds leaves it exact.
 #[test]

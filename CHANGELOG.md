@@ -257,6 +257,9 @@ on a program React settles; 323 oracle cases, none a known false negative.
   analysis does not see (`const f = make ?? mk`, a prop, a setter) holds what
   the closure returns: `const g = f(); g()` runs the closure `mk` returns, and
   the loop it arms was silent (#328).
+- A call of a value that may be any of more than eight setters
+  (`const f = fs[i]; f(n + 1)` over nine setters) writes every one of them;
+  it wrote none, and the loop it arms was silent (#329).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error
