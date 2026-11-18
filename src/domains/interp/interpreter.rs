@@ -1252,8 +1252,7 @@ pub(crate) fn run_escaped<T: Transfer>(
 ///
 /// Soundness. Write f for the closure.
 /// - What f does to C: nothing, by the walk. A name f did not capture is not
-///   in its scope, so C's bindings are not either (f run here reads C's
-///   setter labels by name: an artefact, not a write).
+///   in its scope ([`closure_env`]), so C's bindings are not either.
 /// - What f does to P and everything else it reaches: P's run is above the
 ///   run here. Same body, every parameter ⊤ in both, its captures joined
 ///   with P's live values over P's converged stores where the run here had
@@ -1470,9 +1469,22 @@ fn exec_heap_fns<T: Transfer>(
 
 /// The parameters and body of `closure`, a heap `Fn`, and the env its body
 /// runs in when called from `env` in `component`, parameters not yet bound:
-/// `env` with each name the closure captured bound to what it captured — its
-/// value, its sites, its slot certificate. `None` when `closure` is no
-/// function.
+/// each name the closure captured bound to what it captured — its value, its
+/// sites, its slot certificate. `None` when `closure` is no function.
+///
+/// The scope is the closure's own (#326). Every free name of the body
+/// (nested functions' too) is a capture. The caller's env is the rest of the
+/// scope only for a closure of the calling component, whose every body is
+/// lexically inside the component's function: it holds the live bindings
+/// (#215) a closure called from this body reads, through its own captures,
+/// at the call, and its `useCallback` labels name this component's
+/// callbacks. A closure of another component starts from its captures
+/// alone: the caller's labels, mapped to the *calling* component, would
+/// resolve a parent's `setK` to a child's `setK`. What tells the two apart
+/// is the body's owner, not a name lookup. Either way a captured name is no
+/// setter by name: its value carries the setter with its owner, where a
+/// label — read before the value — would let a same-named binding of the
+/// caller replace it.
 pub(crate) fn closure_env<D: AbstractDomain>(
     closure: &HeapValue,
     env: &AbstractEnv<D>,
@@ -1498,7 +1510,10 @@ pub(crate) fn closure_env<D: AbstractDomain>(
     } else {
         HashSet::new()
     };
-    let mut sub_env = env.clone();
+    let mut sub_env = match *owner == component {
+        true => env.clone(),
+        false => AbstractEnv::new(),
+    };
     for (var, val) in captured {
         let mut val = D::from_state_value(val.clone());
         let mut sites = captured_locs.get(var).cloned();
@@ -1507,6 +1522,7 @@ pub(crate) fn closure_env<D: AbstractDomain>(
             let at_call = env.lookup_env_val(var);
             sites = Sites::join_opt(sites.as_ref(), at_call.as_ref().and_then(EnvVal::sites));
         }
+        sub_env.unbind_setter(var);
         sub_env.bind_locs(var.clone(), sites);
         sub_env.extend(var.clone(), val);
     }

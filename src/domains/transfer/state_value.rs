@@ -2831,11 +2831,21 @@ mod tests {
 
     // ── B5: variable callback resolution ─────────────────────────────────────
 
+    /// `name` bound as `let name = StateSetter(0)` binds it: the setter
+    /// label, and the setter as its value — what a closure that captures the
+    /// name holds of it (#326).
+    fn bind_setter_value(env: &mut AbstractEnv<StateValue>, name: &str) {
+        env.bind_setter(name.to_string(), 0);
+        env.extend(
+            name.to_string(),
+            StateValue::component_setter(crate::test_support::C, 0),
+        );
+    }
+
     #[test]
     fn var_callback_updates_state() {
         let (mut env, mut state, memo) = empty();
-        env.bind_setter("setN".to_string(), 0);
-        env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
+        bind_setter_value(&mut env, "setN");
 
         let cb_body = single_block_cfg(
             vec![Stmt::ExprStmt(
@@ -2930,11 +2940,7 @@ mod tests {
     #[test]
     fn direct_local_call_inlined() {
         let (mut env, mut state, memo) = empty();
-        env.bind_setter("setUser".to_string(), 0);
-        env.extend(
-            "setUser".to_string(),
-            StateValue::reference(Stability::Stable),
-        );
+        bind_setter_value(&mut env, "setUser");
 
         let load_body = single_block_cfg(
             vec![Stmt::ExprStmt(
@@ -2981,8 +2987,7 @@ mod tests {
     #[test]
     fn set_interval_var_callback_updates_state() {
         let (mut env, mut state, memo) = empty();
-        env.bind_setter("setN".to_string(), 0);
-        env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
+        bind_setter_value(&mut env, "setN");
 
         let cb_body = single_block_cfg(
             vec![Stmt::ExprStmt(
@@ -3027,8 +3032,7 @@ mod tests {
     #[test]
     fn for_each_var_callback_updates_state() {
         let (mut env, mut state, memo) = empty();
-        env.bind_setter("setN".to_string(), 0);
-        env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
+        bind_setter_value(&mut env, "setN");
 
         let cb_body = single_block_cfg(
             vec![Stmt::ExprStmt(
@@ -3076,8 +3080,7 @@ mod tests {
     #[test]
     fn nested_var_callbacks_both_executed() {
         let (mut env, mut state, memo) = empty();
-        env.bind_setter("setN".to_string(), 0);
-        env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
+        bind_setter_value(&mut env, "setN");
 
         let inner_body = single_block_cfg(
             vec![Stmt::ExprStmt(

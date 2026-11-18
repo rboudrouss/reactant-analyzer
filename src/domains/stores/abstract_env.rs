@@ -394,6 +394,12 @@ impl<D: AbstractDomain> AbstractEnv<D> {
         self.setter_bindings.get(var)
     }
 
+    /// `var` is not bound to a setter by name: what it may call is read off
+    /// its value.
+    pub fn unbind_setter(&mut self, var: &str) {
+        self.setter_bindings.remove(var);
+    }
+
     /// The hook `var` is the state-setter of, when it is one setter.
     pub fn setter_label(&self, var: &str) -> Option<HookLabel> {
         self.setter_labels(var)

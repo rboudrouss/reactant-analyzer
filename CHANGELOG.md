@@ -243,8 +243,11 @@ on a program React settles; 323 oracle cases, none a known false negative.
 - A parent's closure that a child lets escape (to an element's handler, an
   unknown callee, a generator) writes the parent's state, never a child's
   setter of the same name: the child's state no longer moves with it (a
-  false `missing-deps`, a missed `redundant-set-state`). A closure the child
-  calls itself still resolves that name in the child (#326).
+  false `missing-deps`, a missed `redundant-set-state`).
+- A parent's closure that a child calls (a prop, an object member) sees its
+  own scope: its setter is the parent's even where the child declares one of
+  the same name, so a loop it arms in the parent is reported and the child's
+  state no longer moves with it (#326).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

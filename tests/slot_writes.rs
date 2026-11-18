@@ -781,6 +781,97 @@ export function App() {
     assert!(holds(&result, "Child", 0, 7.0), "the child's write is lost");
 }
 
+/// A parent's closure that a child calls — through an object member or as a
+/// prop — sees its own scope (#326): its `setK` is the parent's, which takes
+/// the write and arms the parent's loop, and the child's `setK` of the same
+/// name, which the closure never sees, does not.
+#[test]
+fn a_parent_closure_a_child_calls_writes_the_parents_slot() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Member({ api }: { api: { f: (x: number) => void } }) {
+  const [k, setK] = useState(5);
+  useEffect(() => { api.f(9); }, []);
+  return <div>{k}</div>;
+}
+export function ViaMember() {
+  const [k, setK] = useState(0);
+  useEffect(() => { if (k > 0) setK(k + 1); }, [k]);
+  return <Member api={{ f: (x) => setK(x) }} />;
+}
+function Prop({ f }: { f: (x: number) => void }) {
+  const [k, setK] = useState(5);
+  useEffect(() => { f(9); }, []);
+  return <div>{k}</div>;
+}
+export function ViaProp() {
+  const [k, setK] = useState(0);
+  useEffect(() => { if (k > 0) setK(k + 1); }, [k]);
+  return <Prop f={(x) => setK(x)} />;
+}
+"#;
+    let result = analyze(src);
+    for (parent, child) in [("ViaMember", "Member"), ("ViaProp", "Prop")] {
+        assert!(
+            holds(&result, parent, 0, 9.0),
+            "{parent}: the write is lost"
+        );
+        assert!(
+            !loops(&result, parent).is_empty(),
+            "{parent}: no loop claim"
+        );
+        let id = result.component_named(child).unwrap();
+        assert_eq!(
+            result.components[&id].state_store.get(0),
+            StateValue::number(Interval::point(5.0)),
+            "{child}: the parent's closure wrote the child's slot"
+        );
+    }
+}
+
+/// A body of the caller's own component still reads the component's names:
+/// an inline callback, a closure called by name in an effect, one that calls
+/// a closure bound after it was created, and a closure called from a helper
+/// that does not capture `x`, assigned after the closure's creation (#215:
+/// the helper runs in the component's scope, where `x` is live at the call).
+#[test]
+fn a_closure_of_the_caller_reads_the_callers_names() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function App() {
+  const [a, setA] = useState(0);
+  const [b, setB] = useState(0);
+  const [c, setC] = useState(0);
+  const [d, setD] = useState(0);
+  const f = () => setB(3);
+  const g = () => h();
+  const h = () => setC(4);
+  let x = 0;
+  const k = () => setD(x);
+  const run = () => k();
+  x = 5;
+  useEffect(() => {
+    [1].forEach((y) => setA(y + 1));
+    f();
+    g();
+    run();
+  }, []);
+  return <div>{a}{b}{c}{d}</div>;
+}
+"#;
+    let result = analyze(src);
+    assert!(holds(&result, "App", 0, 2.0), "the inline callback's write");
+    assert!(holds(&result, "App", 1, 3.0), "the named closure's write");
+    assert!(
+        holds(&result, "App", 2, 4.0),
+        "the later-bound closure's write"
+    );
+    assert!(
+        holds(&result, "App", 3, 5.0),
+        "the live value through a helper"
+    );
+}
+
 /// What an escaped closure writes is what the slot gets, nothing more: a
 /// write of the value the slot holds leaves it exact.
 #[test]
