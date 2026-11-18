@@ -487,12 +487,12 @@ fn exec_stmt_core<T: Transfer>(
         // join, never replace.
         Stmt::MemberWrite { obj, key, rhs, .. } => {
             let rhs_sites = alloc_literal(transfer, rhs, env, ctx);
-            // An object the heap does not place (a parameter's member, a
-            // call's result) is one code the analysis does not see may
+            // An object the heap does not place (a parameter's member, the
+            // result of a call no body ran) is one code the analysis does not see may
             // read: what is written there escapes (#254). So is a ref: it
             // outlives the render, and a context value or a module binding
             // may hand it where no row follows (#268).
-            let placed = resolve_locs(obj, env, ctx.heap);
+            let placed = ctx.resolve_locs(obj, env);
             if placed
                 .as_ref()
                 .is_none_or(|s| s.open || ctx.heap.persists(s))
@@ -542,7 +542,7 @@ fn havoc_members<T: Transfer>(
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
 ) {
-    if let Some(sites) = resolve_locs(receiver, env, ctx.heap) {
+    if let Some(sites) = ctx.resolve_locs(receiver, env) {
         havoc_at(transfer, sites, receiver, args, env, ctx);
     }
 }
@@ -695,8 +695,10 @@ fn bind_rhs<T: Transfer>(
 /// members; an array literal an `Obj` of its elements under their indices
 /// (`"0"`, `"1"`…, the keys a constant index reads) — only when every
 /// position is known, i.e. no spread and no elision. A memo points where its
-/// body's returns do (#233). Anything else is what [`resolve_locs`] places, or
-/// `None`.
+/// body's returns do (#233), and so does a call the pass ran ([`Returns`],
+/// #333). Anything else is what [`resolve_locs`] places, or `None`.
+///
+/// [`Returns`]: crate::domains::context::Returns
 pub(crate) fn alloc_literal<T: Transfer>(
     transfer: &T,
     expr: &Expr,
@@ -796,14 +798,20 @@ pub(crate) fn alloc_literal<T: Transfer>(
                 .heap
                 .member_sites(&sites, member_key(idx, env).as_deref());
         }
-        // A builtin whose result is its receiver or one of its entries
-        // points where those do (#330).
-        Expr::Call { fn_, args, .. } => {
-            return match fn_.peel_ts() {
+        // A call the pass ran points where its bodies' returns do (#333); a
+        // builtin whose result is its receiver or one of its entries, where
+        // those do (#330); a callee that may be either, where both may.
+        Expr::Call { id, fn_, args } => {
+            let returned = ctx.returns.get(*id).and_then(|v| v.sites().cloned());
+            let builtin = match fn_.peel_ts() {
                 Expr::FieldAccess { obj, field } => {
                     method_result_sites(transfer, obj, field, args, env, ctx)
                 }
                 _ => None,
+            };
+            return match (returned, builtin) {
+                (Some(a), Some(b)) => Some(a.join(&b)),
+                (a, b) => a.or(b),
             };
         }
         other => return resolve_locs(other, env, ctx.heap),
@@ -1208,6 +1216,9 @@ fn exec_callbacks_depth<T: Transfer>(
                     };
                     returned = exec_fn_value(transfer, fn_, args, env, ctx, depth, &mut ran);
                 }
+                // What the call evaluates to wherever no `let` binds it: a
+                // member, an argument, a return (#333).
+                ctx.returns.record(*id, returned.as_ref());
             } else {
                 // A builtin, a subscription, a setter: no body of the
                 // program, and `open` unless the callee is surely a setter.
@@ -1348,8 +1359,9 @@ fn escape_at<T: Transfer>(
 /// What a value handed to a child component as a prop it may invoke
 /// reaches — the child runs it in its own analysis — recorded at `at`
 /// without escaping or allocating anything (ADR-047): a function literal
-/// (allocated by the element's evaluation, before this), or a name or a
-/// member chain read off the env and the heap. Any other expression is left
+/// (allocated by the element's evaluation, before this), or a name, a
+/// member chain or a call read off the env, the heap and what the pass
+/// recorded the call returning (#333). Any other expression is left
 /// unrecorded: its evaluation may analyse an element.
 fn hand_at<T: Transfer>(
     transfer: &T,
@@ -1363,8 +1375,11 @@ fn hand_at<T: Transfer>(
     }
     let (sites, setters) = match expr.peel_ts() {
         Expr::FnLit { id, .. } => (Some(Sites::closed([*id])), Vec::new()),
-        e @ (Expr::Var(_) | Expr::FieldAccess { .. } | Expr::IndexAccess { .. }) => (
-            resolve_locs(e, env, ctx.heap),
+        e @ (Expr::Var(_)
+        | Expr::FieldAccess { .. }
+        | Expr::IndexAccess { .. }
+        | Expr::Call { .. }) => (
+            ctx.resolve_locs(e, env),
             call_targets(transfer, e, env, ctx),
         ),
         _ => return,
@@ -1851,8 +1866,10 @@ pub(crate) fn exec_fn_value<T: Transfer>(
                 .filter(|v| !v.is_bottom())
                 .map(|v| EnvVal::located(sites, v))
         }
+        // Placed as any value is: a name, a member chain, a call the pass
+        // ran (#333), a literal (`[h][0]()`).
         other => {
-            if let Some(sites) = resolve_locs(other, env, ctx.heap) {
+            if let Some(sites) = alloc_literal(transfer, other, env, ctx) {
                 return exec_heap_fns(transfer, sites, args, env, ctx, depth, ran);
             }
             // useCallback binding: the body lives in the hook entry, not the
@@ -1890,10 +1907,9 @@ pub(crate) fn exec_fn_value<T: Transfer>(
                     .map(EnvVal::Val);
             }
             // No site and no body: nothing of the program the heap places.
-            // An object or array written there is an object all the same,
-            // which no call runs (`Array.from([setN], f)`).
+            // (An object or array literal is placed above, an object which
+            // no call runs: `Array.from([setN], f)`.)
             ran.open = true;
-            ran.objects |= matches!(other, Expr::ObjectLit { .. } | Expr::ArrayLit { .. });
             None
         }
     }

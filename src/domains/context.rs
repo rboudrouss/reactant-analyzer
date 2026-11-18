@@ -4,7 +4,8 @@ use crate::{
     domains::{
         AbstractDomain, StateValue,
         stores::{
-            AbstractEnv, EnvVal, Heap, HeapValue, Members, MemoStore, SharedStateStore, StateStore,
+            AbstractEnv, EnvVal, Heap, HeapValue, Members, MemoStore, SharedStateStore, Sites,
+            StateStore,
         },
     },
     engine::{
@@ -287,6 +288,59 @@ pub struct AnalysisCtx<'a, D: AbstractDomain> {
     /// fixpoint's passes. `None` records nothing: a probe, an evaluation
     /// outside any fixpoint (a seed, a relation's replay).
     pub calls: Option<&'a RefCell<crate::engine::CallRelation>>,
+    /// What each call of a local function this context ran returned (#333).
+    pub returns: Returns<D>,
+}
+
+/// What each call of a local function a pass ran returned, by call site
+/// (#333): the join over the call's evaluations of what its bodies returned
+/// and where it points, with ⊤ for an evaluation that ran no body. The value
+/// of the call in every position — a member, an argument, a callee, a return
+/// — where a `let` is not there to bind it.
+///
+/// Recorded by the effect walk, which runs the call before any reader of its
+/// value in the same statement; read, never recomputed. A call no evaluation
+/// of which ran a body has no entry: the evaluator's value stands.
+pub struct Returns<D> {
+    ran: std::collections::HashMap<crate::ir::types::ExprId, EnvVal<D>>,
+    unresolved: std::collections::HashSet<crate::ir::types::ExprId>,
+}
+
+impl<D> Default for Returns<D> {
+    fn default() -> Self {
+        Returns {
+            ran: Default::default(),
+            unresolved: Default::default(),
+        }
+    }
+}
+
+impl<D: AbstractDomain> Returns<D> {
+    /// One evaluation of the call at `id` returned `returned`; `None` when it
+    /// ran no body.
+    pub fn record(&mut self, id: crate::ir::types::ExprId, returned: Option<&EnvVal<D>>) {
+        match returned {
+            Some(v) => {
+                let joined = match self.ran.get(&id) {
+                    Some(old) => old.join(v),
+                    None => v.clone(),
+                };
+                self.ran.insert(id, joined);
+            }
+            None => {
+                self.unresolved.insert(id);
+            }
+        }
+    }
+
+    /// The value of the call at `id`, when some evaluation ran a body.
+    pub fn get(&self, id: crate::ir::types::ExprId) -> Option<EnvVal<D>> {
+        let ran = self.ran.get(&id)?;
+        Some(match self.unresolved.contains(&id) {
+            true => ran.join(&EnvVal::Val(D::top())),
+            false => ran.clone(),
+        })
+    }
 }
 
 /// When a loop header stops joining and starts widening (ADR-014): after
@@ -326,6 +380,7 @@ impl<'a, D: AbstractDomain> AnalysisCtx<'a, D> {
             widening: Widening::DEFAULT,
             plans: None,
             calls: None,
+            returns: Returns::default(),
         }
     }
 
@@ -334,6 +389,19 @@ impl<'a, D: AbstractDomain> AnalysisCtx<'a, D> {
         if let Some(calls) = self.calls {
             f(&mut calls.borrow_mut());
         }
+    }
+
+    /// The allocation sites `expr` may denote ([`resolve_locs`]), a call read
+    /// off what this pass recorded it returning ([`Returns`]).
+    ///
+    /// [`resolve_locs`]: crate::domains::stores::resolve_locs
+    pub fn resolve_locs(
+        &self,
+        expr: &crate::ir::expr::Expr,
+        env: &AbstractEnv<D>,
+    ) -> Option<Sites> {
+        let returned = |id| self.returns.get(id).and_then(|v| v.sites().cloned());
+        crate::domains::stores::resolve_locs_with(expr, env, self.heap, &returned)
     }
 
     /// Weakly store `val` into slot `(owner, label)`: the component's own slot

@@ -312,6 +312,11 @@ on a program React settles; 323 oracle cases, none a known false negative.
   `findLast`, `pop`, `shift` and `get` return one of the receiver's entries, `sort`,
   `reverse`, `fill` and `copyWithin` the receiver with its positions lost.
   Each call of such a closure, in the render or an effect, was silent (#330).
+- A call of a local function is what its bodies returned wherever it sits,
+  not only under a `let`: `const o = { f: mk() }; o.f()`, `[mk()][0]()`,
+  `mk().go()`, `someCall(mk())`, `<Child onX={mk()} />` run or hand over the
+  closure `mk` returns, and so does a callee written as a literal
+  (`[h][0]()`). Each was silent, in the render and in effects (#333).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

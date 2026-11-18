@@ -122,7 +122,11 @@ that writes it (see *Cross-file limits*).
   an effect or a handler [#46](https://github.com/rboudrouss/reactant-analyzer/issues/46), and off a
   run of the body by the fixpoint itself, at the call
   [#246](https://github.com/rboudrouss/reactant-analyzer/issues/246),
-  [#314](https://github.com/rboudrouss/reactant-analyzer/issues/314). A setter or `dispatch` *call* in any expression
+  [#314](https://github.com/rboudrouss/reactant-analyzer/issues/314). That value is the call's in
+  every position, not only under a `let` — a member, an element, an argument, a prop, a callee
+  ([#333](https://github.com/rboudrouss/reactant-analyzer/issues/333)) — joined over the call's
+  runs in the pass, and unknown where no body ran (a callee the analysis does not see, past the
+  inlining budget). A setter or `dispatch` *call* in any expression
   position, `wrap(setN(1))`, a `&&` or ternary arm, a branch condition, a JSX prop, writes its slot
   [#169](https://github.com/rboudrouss/reactant-analyzer/issues/169); it is the callee's *inlining* that is not.
 - **What a custom hook returns reaches the caller.** A setter, a slot value or a closure a hook

@@ -308,9 +308,11 @@ fn eval_state_value(
         Expr::Call { fn_, .. } if matches!(fn_.as_ref(), Expr::SummaryVal(SummaryValue::Top)) => {
             StateValue::top().join(&StateValue::reference(Stability::PerRender))
         }
-        Expr::Call { fn_, args, .. } => {
-            allocating_call(fn_, args, env, ctx).unwrap_or_else(StateValue::top)
-        }
+        // A call the pass ran is what its bodies returned (#333).
+        Expr::Call { id, fn_, args } => match ctx.returns.get(*id) {
+            Some(returned) => returned.as_val(),
+            None => allocating_call(fn_, args, env, ctx).unwrap_or_else(StateValue::top),
+        },
         // `new` allocates: a fresh reference, whose members stay ⊤ (#158).
         Expr::New { .. } => StateValue::reference(Stability::PerRender),
 

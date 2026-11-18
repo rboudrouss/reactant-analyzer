@@ -752,9 +752,21 @@ pub fn resolve_locs<D: AbstractDomain>(
     env: &AbstractEnv<D>,
     heap: &Heap,
 ) -> Option<Sites> {
+    resolve_locs_with(expr, env, heap, &|_| None)
+}
+
+/// [`resolve_locs`], a call placed where `returned` says its value points
+/// (#333): what a pass recorded its bodies returning.
+pub fn resolve_locs_with<D: AbstractDomain>(
+    expr: &Expr,
+    env: &AbstractEnv<D>,
+    heap: &Heap,
+    returned: &dyn Fn(ExprId) -> Option<Sites>,
+) -> Option<Sites> {
     let (obj, member) = match expr {
         Expr::Var(v) => return env.lookup_env_val(v).and_then(|ev| ev.sites().cloned()),
-        Expr::TSAnnotated(inner) => return resolve_locs(inner, env, heap),
+        Expr::TSAnnotated(inner) => return resolve_locs_with(inner, env, heap, returned),
+        Expr::Call { id, .. } => return returned(*id),
         Expr::FieldAccess { obj, field } => (obj, Some(field.clone())),
         // A constant index is a member read (`t[1]`, `o["k"]`, `o[k]` with
         // `k` one string); any other index may be any member (#307), as
@@ -762,7 +774,10 @@ pub fn resolve_locs<D: AbstractDomain>(
         Expr::IndexAccess { arr, idx } => (arr, member_key(idx, env)),
         _ => return None,
     };
-    heap.member_sites(&resolve_locs(obj, env, heap)?, member.as_deref())
+    heap.member_sites(
+        &resolve_locs_with(obj, env, heap, returned)?,
+        member.as_deref(),
+    )
 }
 
 /// The one member a key expression names, when it names one: a literal

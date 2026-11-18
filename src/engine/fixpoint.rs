@@ -448,7 +448,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 children: bool,
                 effect: Option<HookLabel>| {
         let mut out = writes.clone();
-        let envs = {
+        let (envs, returns) = {
             let mut ac = AnalysisCtx {
                 component: comp_id,
                 state: &mut out,
@@ -460,6 +460,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 widening,
                 plans: Some(&plans),
                 calls: recording,
+                returns: Default::default(),
             };
             let envs = analyze_cfg(transfer, cfg, entry, &mut ac);
             if let Some(label) = effect {
@@ -483,9 +484,9 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                     }
                 }
             }
-            envs
+            (envs, std::mem::take(&mut ac.returns))
         };
-        (envs, out)
+        (envs, out, returns)
     };
 
     // Fixpoint carrier: the product StateValue tracks every JS kind per label
@@ -547,7 +548,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         // ── Render pass ───────────────────────────────────────────────────────
         // Use initial_env as entry: child analyses start with props bound.
         let profile = crate::profile::pass("pass:render");
-        let (bs, state_from_render) = pass(
+        let (bs, state_from_render, render_returns) = pass(
             &render_cfg,
             initial_env.clone(),
             &state_store,
@@ -568,6 +569,10 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         // second pass so each recompute reads a consistent snapshot — the
         // fixpoint converges any memo-to-memo dependency across iterations.
         env_exit = exit_env(&render_cfg, &block_states);
+        // A memo's deps, a callback's argument and a ref's initial value are
+        // render expressions read in the render's exit env: a call among them
+        // is what the render pass recorded it returning (#333).
+        let mut returns = render_returns;
         let memo_updates: Vec<(HookLabel, crate::domains::EnvVal<StateValue>)> = {
             let mut memo_ctx = AnalysisCtx {
                 component: comp_id,
@@ -580,8 +585,9 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 widening,
                 plans: Some(&plans),
                 calls: recording,
+                returns: std::mem::take(&mut returns),
             };
-            hooks
+            let updates = hooks
                 .iter()
                 .filter_map(|hook| match hook {
                     HookEntry::Memo { label, .. } | HookEntry::Callback { label, .. } => Some((
@@ -596,7 +602,9 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                     )),
                     _ => None,
                 })
-                .collect()
+                .collect();
+            returns = memo_ctx.returns;
+            updates
         };
         let memo_before = memo_store.clone();
         for (label, val) in memo_updates {
@@ -616,6 +624,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 widening,
                 plans: Some(&plans),
                 calls: recording,
+                returns,
             };
             for hook in &hooks {
                 if let HookEntry::Ref { label, init, .. } = hook {
@@ -641,7 +650,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 label, body_cfg, ..
             } = hook
             {
-                let (eff_bs, eff_state) = pass(
+                let (eff_bs, eff_state, _) = pass(
                     body_cfg,
                     env_exit.clone(),
                     &state_store,
@@ -683,7 +692,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                     params,
                     crate::domains::interp::Args::unknown(),
                 );
-                let (h_bs, h_state) = pass(
+                let (h_bs, h_state, _) = pass(
                     body_cfg,
                     entry,
                     &state_store,
@@ -717,6 +726,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 widening,
                 plans: Some(&plans),
                 calls: recording,
+                returns: Default::default(),
             };
             crate::domains::interp::run_escaped(transfer, &escaped_bodies, &env_exit, &mut ac);
             state_from_handlers = state_from_handlers.join(&out);
@@ -787,7 +797,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     // re-analyze children (same choice as the effect re-run below).
     {
         let _profile = crate::profile::pass("pass:post-render");
-        let (bs, _) = pass(
+        let (bs, _, _) = pass(
             &render_cfg,
             initial_env.clone(),
             &state,
