@@ -1,6 +1,5 @@
 use crate::rules::RuleCtx;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
 
 use crate::{
     domains::impls::Stability,
@@ -18,9 +17,8 @@ use crate::ir::ComponentId;
 use crate::rules::helpers::eval_in_exit_env;
 use crate::rules::{
     Certified, Diagnostic, EffectClass, MustResult, Rule, Severity, StaleCapture, Step, ValueClass,
-    all_setter_labels, collect_fn_bindings, collect_setter_calls_with_extra, fn_lit_binding,
-    may_written_slots, memo_val_labels, must_stale_capture, resolve_setter_aliases,
-    setter_targets_with_paths, state_slot_name, state_val_labels,
+    all_setter_labels, fn_lit_binding, may_written_slots, memo_val_labels, must_stale_capture,
+    resolve_setter_aliases, setter_targets_with_paths, state_slot_name, state_val_labels,
 };
 
 /// Fires when a callback that **outlives the render** — handed to
@@ -256,7 +254,6 @@ impl Rule for StaleClosure {
         let named_setters = all_setter_labels(comp_result);
         let setter_labels = setter_targets_with_paths(comp_result);
         let written = may_written_slots(render_cfg, &comp_result.hooks, &setter_labels);
-        let render_fns = collect_fn_bindings(render_cfg);
         let callback_hooks: HashMap<HookLabel, (&[Var], &CFG)> = comp_result
             .hooks
             .iter()
@@ -301,10 +298,6 @@ impl Rule for StaleClosure {
                 .map_or_else(Vec::new, |l| dep_paths_indexed(&l.covering()));
             let mount_only = matches!(deps.list(), Some(l) if l.arity == Arity::Exact(0));
 
-            let mut fn_bodies = collect_fn_bindings(body_cfg);
-            for (k, v) in &render_fns {
-                fn_bodies.entry(k.clone()).or_insert_with(|| Arc::clone(v));
-            }
             // The engine's registration relation (ADR-034), not a second scan.
             let regs: Vec<_> = comp_result
                 .registrations
@@ -367,15 +360,18 @@ impl Rule for StaleClosure {
                         .filter(|v| setter_labels.targets(v).all(|l| live_local.contains(&l)))
                         .cloned()
                         .collect();
+                    // The callback's writes are the call relation's (ADR-047).
                     let self_write = if slot_setters.is_empty() {
                         None
                     } else {
-                        let mut calls =
-                            collect_setter_calls_with_extra(cb_body, &slot_setters, &fn_bodies);
-                        calls.sort_by_key(|c| c.span.map_or((u32::MAX, u32::MAX), |r| r.pos_key()));
-                        calls
-                            .first()
-                            .and_then(|c| setter_labels.targets(&c.var).next().map(|l| (l, c.span)))
+                        let mut writes: Vec<_> =
+                            crate::engine::setters::body_writes(comp_result, cb_body)
+                                .into_iter()
+                                .filter(|w| w.slot.0 == component && live_local.contains(&w.slot.1))
+                                .collect();
+                        writes
+                            .sort_by_key(|w| w.span.map_or((u32::MAX, u32::MAX), |r| r.pos_key()));
+                        writes.first().map(|w| (w.slot.1, w.span))
                     };
 
                     // The whole Error claim is one proof (#142): a proof of

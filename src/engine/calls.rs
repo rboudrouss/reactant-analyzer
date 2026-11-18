@@ -125,6 +125,19 @@ pub struct Evaluation {
 pub struct Escapes {
     pub setters: BTreeSet<Slot>,
     pub bodies: BTreeSet<ExprId>,
+    /// `Some(true)`: every evaluation handed a value surely the one setter
+    /// or function it lists to a callee that runs it (an array method).
+    /// `Some(false)` once code the analysis does not see took it.
+    sure: Option<bool>,
+}
+
+impl Escapes {
+    /// What is handed here is surely its one target — one setter or one
+    /// body — which the callee runs: the must column, as [`Targets::sure`]
+    /// is for a call.
+    pub fn sure(&self) -> bool {
+        self.sure == Some(true) && self.setters.len() + self.bodies.len() == 1
+    }
 }
 
 /// The call relation of a program (or of one component analysed alone):
@@ -252,12 +265,13 @@ impl CallRelation {
         pos: usize,
         setters: impl IntoIterator<Item = Slot>,
         bodies: impl IntoIterator<Item = ExprId>,
+        sure: bool,
     ) {
         let row = self.escapes.entry((anchor, pos)).or_default();
         row.setters.extend(setters);
         row.bodies.extend(bodies);
+        row.sure = Some(row.sure.unwrap_or(true) && sure);
     }
-
     /// Remember the body run at `site`.
     pub fn record_body(&mut self, site: ExprId, body: &Arc<CFG>) {
         self.cfgs.entry(site).or_insert_with(|| Arc::clone(body));
@@ -294,6 +308,10 @@ impl CallRelation {
             let row = self.escapes.entry(*k).or_default();
             row.setters.extend(e.setters.iter().copied());
             row.bodies.extend(e.bodies.iter().copied());
+            row.sure = match (row.sure, e.sure) {
+                (None, s) | (s, None) => s,
+                (Some(a), Some(b)) => Some(a && b),
+            };
         }
         for (site, body) in &other.cfgs {
             self.cfgs.entry(*site).or_insert_with(|| Arc::clone(body));

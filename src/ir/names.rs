@@ -85,8 +85,18 @@ pub struct SourceNames {
 /// Lowering names the value of a callee that is itself a call `__call_N`
 /// (`get()(x)`, #46), and the value of a hook call staged out of an
 /// expression `__hook_N` (`useThing().set(x)`, #233).
-fn is_call_temp(var: &str) -> bool {
+pub(crate) fn is_call_temp(var: &str) -> bool {
     var.starts_with("__call_") || var.starts_with("__hook_")
+}
+
+/// A temp a message names by what it holds: a call's value (`get(…)`), or an
+/// expression's whose source text lowering records (`a ? setN : setM`).
+pub(crate) fn is_named_temp(var: &str) -> bool {
+    is_call_temp(var)
+        || ["__t", "__sw", "__of"].iter().any(|p| {
+            var.strip_prefix(p)
+                .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+        })
 }
 
 /// The temp an inlined body's argument no parameter takes is bound to,

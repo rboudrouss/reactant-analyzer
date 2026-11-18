@@ -11,7 +11,6 @@ pub(crate) use interpreter::Ran;
 pub(crate) use interpreter::alloc_literal;
 pub(crate) use interpreter::bind_params;
 pub(crate) use interpreter::call_targets;
-pub(crate) use interpreter::callback_args;
 pub(crate) use interpreter::closure_env;
 pub(crate) use interpreter::escape;
 pub(crate) use interpreter::exec_body;

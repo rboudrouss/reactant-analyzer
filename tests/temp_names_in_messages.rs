@@ -114,7 +114,7 @@ fn a_temp_reads_as_the_expression_it_holds() {
         "setter-in-render",
         "setter `a ? setN : setM`",
     );
-    says("ChosenSetter", "setter-in-render", "setter `a || setN`");
+    says("HandedSetter", "setter-in-render", "setter `a || setN`");
     says("Child", "cross-setter-in-render", "prop `a ? onX : onX`");
     says(
         "MutatedInEffect",

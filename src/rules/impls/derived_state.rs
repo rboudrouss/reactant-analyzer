@@ -9,8 +9,8 @@ use crate::ir::{
 
 use crate::engine::setters::WriterRegion;
 use crate::rules::{
-    Diagnostic, MustResult, Rule, collect_setter_calls, must_setter_on_all_paths,
-    setter_targets_with_paths, state_val_labels,
+    Diagnostic, MustResult, Rule, must_setter_on_all_paths, setter_targets_with_paths,
+    state_val_labels,
 };
 
 /// Fires when a `useEffect` unconditionally sets a state variable whose value
@@ -52,12 +52,6 @@ impl Rule for DerivedState {
         let setter_label = setter_targets_with_paths(result);
         let state_val_label = state_val_labels(&result.render_cfg);
         let setter_vars: HashSet<Var> = setter_label.names().cloned().collect();
-
-        // Setters called in render body are not derived-state candidates.
-        let render_setters: HashSet<Var> = collect_setter_calls(&result.render_cfg, &setter_vars)
-            .into_iter()
-            .map(|c| c.var)
-            .collect();
 
         let mut diags = Vec::new();
 
@@ -133,9 +127,8 @@ impl Rule for DerivedState {
                 }) {
                     continue;
                 }
-            } else if render_setters.contains(&setter_name) {
-                // No label for this name — fall back to the old render scan
-                // rather than claiming anything.
+            } else {
+                // No label for this name: claim nothing.
                 continue;
             }
 

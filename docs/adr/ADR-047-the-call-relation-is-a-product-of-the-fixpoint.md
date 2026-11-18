@@ -48,6 +48,16 @@ spellings.
    runs: `CallRelation::writes_of` gives every slot it may write at any depth, unplaced. A row
    is keyed by (call site, slot, region) and prints the site's own spelling, else the slot's
    setter. The rules layer's own name walks (`setter-in-render`, body scans) are not readers yet.
+6. **Every reader of a setter call reads it** (P10, amends §4 and §5). `setter-in-render` reads
+   the writer rows; a rule's own body scan asks the engine's walk over that body
+   (`setters::body_writes`, `collect_body_calls`, `collect_slot_reads`), the writer walk
+   itself. The walk keeps the traversal, the phase classification, placement, provenance and
+   the spelling, and nothing else: no name is bound, no table of names resolves a call, and the
+   runs of closures the rules layer made for itself (`SiteEnvs::closure_envs`, #246) are gone
+   (#314.2: the fixpoint's own runs are the value source). An `Escapes` row is `sure` when every
+   evaluation handed an in-cycle callee a value surely its one setter or one function; a
+   handed write is then placed as a call's is. A rule reads `CallRelation::body` and
+   `slot_name` for a body's CFG and a slot's printed name, nothing else of the relation.
 
 ## Consequences
 

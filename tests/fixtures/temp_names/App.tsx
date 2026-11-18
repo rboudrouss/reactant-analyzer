@@ -46,13 +46,19 @@ export function ChosenSetter({ a }: any) {
   const [n, setN] = useState(0);
   const [m, setM] = useState(0);
   (a ? setN : setM)(1);
-  helper(a || setN);
   return (
     <div>
       {n}
       {m}
     </div>
   );
+}
+
+// A slot is one finding (#285): the hand-off sits in a component of its own.
+export function HandedSetter({ a }: any) {
+  const [n, setN] = useState(0);
+  helper(a || setN);
+  return <div>{n}</div>;
 }
 
 export function SwitchedSetter({ a }: any) {

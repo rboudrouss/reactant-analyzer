@@ -477,6 +477,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                                 crate::engine::calls::CLEANUP,
                                 [],
                                 ran.bodies,
+                                false,
                             )
                         });
                     }
@@ -892,7 +893,6 @@ fn compute_relations(
     // What every call writes and runs is the call relation's (ADR-047): a
     // write through a parent's setter prop is a row too, owner-qualified
     // (ADR-042 §2).
-    let render_params = std::slice::from_ref(&result.param);
     let calls = std::sync::Arc::clone(&result.calls);
     // The envs each row's argument is evaluated in: the converged stores, and
     // the per-block envs of the region the row sits in.
@@ -909,7 +909,6 @@ fn compute_relations(
     };
     let slot_writers = crate::engine::setters::collect_slot_writers(
         &result.render_cfg,
-        render_params,
         &result.hooks,
         &inline_regions,
         &result.hook_provenance,

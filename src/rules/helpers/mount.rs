@@ -38,7 +38,7 @@ use crate::{
 
 use super::local_bindings;
 use super::render_tree::RenderIndex;
-use super::setters::{all_setter_labels, collect_fn_bindings, collect_setter_calls_with_extra};
+use super::setters::all_setter_labels;
 use crate::ir::{CompOrigin, ComponentId};
 
 /// What the call sites prove about a consumer's mount lifetime, relative to
@@ -254,7 +254,6 @@ fn writes_move_together(
     if feeder_setters.is_empty() || guard_setters.is_empty() {
         return false;
     }
-    let render_fns = collect_fn_bindings(&comp.render_cfg);
     let mut scopes: Vec<&CFG> = Vec::new();
     collect_fn_bodies(&comp.render_cfg, &mut scopes);
     for hook in &comp.hooks {
@@ -263,12 +262,19 @@ fn writes_move_together(
             collect_fn_bodies(body, &mut scopes);
         }
     }
+    // What each scope writes is the call relation's (ADR-047): a write of
+    // the guard surely of its setter, a write of the feeder possibly.
+    let tables = crate::engine::setters::WriterTables::of_result(comp);
     let mut found = false;
     for scope in scopes {
-        if collect_setter_calls_with_extra(scope, &feeder_setters, &render_fns).is_empty() {
+        let (sites, _) = tables.write_sites(scope, &comp.calls, None, false);
+        if !sites.iter().any(|s| s.slot == (owner, slot)) {
             continue;
         }
-        if collect_setter_calls_with_extra(scope, &guard_setters, &render_fns).is_empty() {
+        if !sites
+            .iter()
+            .any(|s| s.slot == (owner, guard_slot) && s.sure)
+        {
             return false;
         }
         found = true;

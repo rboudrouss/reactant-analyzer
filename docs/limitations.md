@@ -96,20 +96,28 @@ that writes it (see *Cross-file limits*).
   setter. **A helper called with one setter in one place and another elsewhere writes either at
   every call of it**, so a write through it is a Warning, never an Error; an Error through a
   helper's parameter needs every call of the helper to pass the one setter. Past the walk's depth
-  the writes of a body still count, unplaced. `setter-in-render` and a few rules' own body scans
-  (`stale-closure`, the mount guards, `derived-state`, a pack's `body_setter_calls`) still read
-  setters by name through the older walk, which binds a parameter to what the call passes
-  (#316). A rest parameter (`(...fs)`) and `arguments` are the arrays of the call's arguments
+  the writes of a body still count, unplaced. `setter-in-render`, the cross-component arm of
+  `infinite-loop` and every rule's own body scan (`stale-closure`, the mount guards, a pack's
+  `body_setter_calls`, `calls` and `reads`) read the same relation: no rule matches a setter by
+  name. `setter-in-render` and the cross-component arm read a JSX prop's or a registered
+  listener's write as the event handler it is even in a program that dispatches events itself,
+  where the loop rules read it as ⊤ ([#219](https://github.com/rboudrouss/reactant-analyzer/issues/219)):
+  a render that dispatches an event to such a listener is not their finding. A child component
+  the analysis does not resolve is read as calling the props it is handed on an event only
+  [#325](https://github.com/rboudrouss/reactant-analyzer/issues/325). A guarded render write
+  settles when the guard dies once the written expression sits in the slot, read as holding
+  across the render passes even when it depends on the slot itself (`const x = n + 1; if (n !==
+  x) setN(x)`, a loop the analysis reports nothing on,
+  [#331](https://github.com/rboudrouss/reactant-analyzer/issues/331)). A rest parameter (`(...fs)`) and `arguments` are the arrays of the call's arguments
   [#324](https://github.com/rboudrouss/reactant-analyzer/issues/324); from a spread on an argument
   may sit at any position, and `fs.length` / `arguments.length` are not modelled, so a guard on
   them never rules a write out. Utility *inlining* is statement-position only [#52](https://github.com/rboudrouss/reactant-analyzer/issues/52). A setter
   or a closure called through a call that returns it (`get()(x)`, `makeSetter()(x)`,
   `api.get()(x)`) is written where the call's value is read: off the converged envs of the render,
   an effect or a handler [#46](https://github.com/rboudrouss/reactant-analyzer/issues/46), and off a
-  run of a body that keeps none — a memo or callback body, a closure nested in any body (a `forEach`
-  callback, a `.then` continuation) — from the env it is reached from
-  [#246](https://github.com/rboudrouss/reactant-analyzer/issues/246). `setter-in-render` still reads
-  the render's own names only: `xs.forEach(() => get()(x))` in render is not its finding. A setter or `dispatch` *call* in any expression
+  run of the body by the fixpoint itself, at the call
+  [#246](https://github.com/rboudrouss/reactant-analyzer/issues/246),
+  [#314](https://github.com/rboudrouss/reactant-analyzer/issues/314). A setter or `dispatch` *call* in any expression
   position, `wrap(setN(1))`, a `&&` or ternary arm, a branch condition, a JSX prop, writes its slot
   [#169](https://github.com/rboudrouss/reactant-analyzer/issues/169); it is the callee's *inlining* that is not.
 - **What a custom hook returns reaches the caller.** A setter, a slot value or a closure a hook

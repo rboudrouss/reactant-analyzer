@@ -285,6 +285,18 @@ on a program React settles; 323 oracle cases, none a known false negative.
   write placed where the call runs, as through a positional parameter, not
   only a setter handed to a callee; a rest parameter named like a binding of
   the enclosing scope no longer reads that binding (#324).
+- `setter-in-render` and every rule's own scan of a body read what the
+  fixpoint ran at each call (ADR-047), never a setter by name: an
+  unconditional render write through a helper, a returned closure, a member
+  of a literal or a callback a literal receiver surely runs (`[1].forEach(cb)`,
+  `[1].forEach(setN)`) is an Error, as the direct call is; a render write
+  through a filtered, sliced or mapped array of closures, a `for…in` over an
+  object of closures or a render-phase `reduce` is reported where it was
+  silent (#330); a closure that only carries a setter into an event handler
+  is no render write; one slot spelled two ways at one site is one finding;
+  a write in a concise `useMemo` body has a location (#314).
+- An array or object literal handed to a callee that runs callbacks
+  (`Array.from([setN], f)`) is handed on: a setter it holds may be written.
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

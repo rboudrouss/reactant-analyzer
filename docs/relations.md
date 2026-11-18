@@ -47,6 +47,9 @@ params included. Two `setX(…)` calls in one body are two rows.
 | `same_tick` | another write of the same slot in this region is CFG-reachable from this one | may, one-directional: `false` is not a promise |
 | `block` | the region block a write that runs synchronously, once per pass, sits in — what `must_on_all_paths` takes | exact; `None` for nested, deferred, cleanup and repeating sites, and for a call through a name with several setters, which writes one, or with a value that may be something else, which may write none |
 | `guard_block` | the region block whose dominating guards the write runs under: `block` for a synchronous write, the statement that scheduled it for a nested, deferred, cleanup or repeating one (#160) | exact; `None` for a row with no placeable block |
+| `placed` | the region block a write that surely runs at least once per pass of it sits in: `block`, or a repeating site the call relation is sure of (a callback a receiver surely runs, #248; `[1].forEach(setN)`, #291). What `setter-in-render` certifies with dominance | must; `None` otherwise |
+| `own` | the body a synchronous write sits in (its allocation site, `None` for the region's CFG) and its block there, never moved to the call that runs the body: where its own guards are (#269) | exact |
+| `listener` | the row is ⊤ only because it runs from a JSX prop or a registered listener in a program that dispatches events (#219); `setter-in-render` and the cross-component arm read it as a handler | exact |
 | `written.change` | the write may change its slot — store a value that fails `Object.is` against what the slot holds. `Must`: a new reference every call. `Never`: the slot's own state read (#155) or the updater's parameter. `Once`: a single value known in advance (`false`, `5`, `null`, a stable reference), which changes the slot again only if another write moves it away. `May`: everything else, a toggle and a bounded counter included | must for `Must`, must for `Never` |
 | `written.value` | the abstract value stored, evaluated in the env of the row's own statement | may (an over-approximation of the value) |
 | `written.expr` | argument 0 as written | exact |
@@ -187,7 +190,16 @@ what an in-cycle callee (an array method, a timer) ran it as. The anchor is
 the call's id (position `CALLEE` for a callee escaped past the inlining
 budget), a `new`'s id, the props object of a JSX element (position: the
 prop's index), a hook the expansion left (its hook site), or an effect's
-hook site (position `CLEANUP`: its returned cleanup). May.
+hook site (position `CLEANUP`: its returned cleanup). May, except
+`Escapes::sure()`: every evaluation handed a value surely its one setter or
+one function to an in-cycle callee that runs it (`[setN].forEach(cb)`), never
+code the analysis does not see — must.
+
+Readers (ADR-047 §4, amended by P10): the writer walk, and the walks the
+engine runs over a body for the rules (`setters::body_writes`,
+`collect_body_calls`, `collect_slot_reads`); a rule reads the rows they
+build, and `CallRelation::body` / `slot_name` for a body's CFG and a slot's
+printed name.
 
 ## Per program, on `ProgramRelations`
 

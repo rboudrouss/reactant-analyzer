@@ -200,10 +200,10 @@ fn a_sync_callback_write_is_placed_at_the_call_only_when_the_receiver_surely_run
         );
         let r = parse_and_analyze(&src);
         let c = comp(&r, "App");
-        let setters: HashSet<String> = c.slot_writers.iter().map(|w| w.setter.clone()).collect();
-        let calls = reactant::rules::collect_setter_calls(&c.render_cfg, &setters);
-        assert_eq!(calls.len(), 1, "{call}: {calls:?}");
-        match calls[0].block_id {
+        let rows: HashSet<Option<reactant::ir::types::BlockId>> =
+            c.slot_writers.iter().map(|w| w.placed).collect();
+        assert_eq!(rows.len(), 1, "{call}: {:?}", c.slot_writers);
+        match rows.into_iter().next().unwrap() {
             Some(b) => {
                 assert!(placed, "{call}: placed at {b:?}");
                 use reactant::ir::{expr::Expr, stmt::Stmt};
@@ -433,7 +433,8 @@ fn a_prop_called_through_the_props_object_is_an_owner_qualified_row_in_every_reg
     let regions: Vec<&WriterRegion> = child
         .slot_writers
         .iter()
-        .filter(|w| w.owner == Some(parent) && reactant::ir::source_name(&w.setter) == "setN")
+        // A write in the parent's closure is spelled as the child calls it.
+        .filter(|w| w.owner == Some(parent) && w.setter == "props.f")
         .map(|w| &w.region)
         .collect();
     assert!(

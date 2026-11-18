@@ -32,7 +32,7 @@ use crate::{
 
 use crate::rules::api::cache::ProgramCache;
 use crate::rules::helpers::mount::MountCoupling;
-use crate::rules::{ConvergedEval, Note, SetterCall, Step, arg_is_call_free, local_bindings};
+use crate::rules::{ConvergedEval, Note, Step, arg_is_call_free, local_bindings};
 
 /// Where a certified fact lives, and the witness chain that proves it (ADR-019).
 ///
@@ -537,6 +537,15 @@ fn cfg_hook_calls(
     comp.hook_calls.iter()
 }
 
+/// Evidence of a setter call written in a body's own statements: the name
+/// called, its position and its block there.
+#[derive(Debug, Clone)]
+pub struct SetterCall {
+    pub var: Var,
+    pub span: Option<SourceRange>,
+    pub block_id: Option<BlockId>,
+}
+
 /// The unconditional-setter must-forward, promoted from the private
 /// `derived_state::find_uncond_setter_call` (ADR-021 §3).
 ///
@@ -584,14 +593,12 @@ pub fn must_setter_on_all_paths(
     {
         return MustResult::None;
     }
+    // The scan above reads statements of `cfg` itself, never a nested body,
+    // so every site it can find runs when `cfg` runs.
     let evidence = SetterCall {
         var: target,
         span: target_span,
         block_id: Some(target_block),
-        // The scan above reads statements of `cfg` itself, never a nested
-        // body, so every site it can find runs when `cfg` runs.
-        class: crate::engine::setters::SetterCallPhase::Sync,
-        own: None,
     };
 
     // must_in[B] = ∧ must_out[preds]; must_out[B] = must_in[B] ∨ called_in[B].
@@ -738,40 +745,21 @@ pub struct RenderWrite {
     pub block: BlockId,
 }
 
-/// `All` iff the call through `var` at `block` of `render_cfg` writes on every
-/// render: its block dominates every exit, and the callee surely is the
-/// setter. Dominance proves the call runs, not that it writes (#279).
-///
-/// A name the render binds to a setter (`local`) must be bound to it on every
-/// path: the alias table is a may-map (first binding wins), and a name bound
-/// to the setter on one path and to anything else on another — `if (c) set =
-/// setV`, a hook returning `[v, setV]` or `[v, noop]`, a closure the render
-/// runs that rebinds it (#235) — writes on some renders only. So the binding
-/// is the must-alias one, read over `scopes` (`must_alias_scopes`). A name the
-/// converged values put a setter behind (`props`) must provably write: a
-/// helper that only carries a captured setter into a JSX handler writes
-/// nothing when called (`SetterProp::must_write`). A name neither table
-/// knows as a setter is not one.
+/// `All` iff a render write placed at `block` writes on every render: its
+/// block dominates every exit. The writer relation places a row
+/// ([`SlotWriter::placed`](crate::engine::SlotWriter::placed)) only where it
+/// runs synchronously in the render, at least once per pass of its block,
+/// through a call every evaluation of which was surely that one setter (the
+/// call relation's `sure`, ADR-047): dominance proves the call runs, the
+/// relation that it writes (#279). A name bound to the setter on one path
+/// and to anything else on another (#235), a helper that only carries a
+/// captured setter (#233), a call with several targets: none is placed.
 pub(in crate::rules) fn must_render_write(
     exit_dom: &ExitDominance,
-    render_cfg: &CFG,
-    scopes: &[(&[Var], &CFG)],
-    var: &Var,
     block: BlockId,
-    local: bool,
-    props: Option<&[crate::engine::setters::SetterProp]>,
 ) -> MustResult<RenderWrite> {
-    let bound = || {
-        matches!(
-            crate::ir::bindings::must_binding(&Expr::Var(var.clone()), render_cfg, scopes),
-            Some(Expr::StateSetter(_))
-        )
-    };
-    let surely_the_setter = (local || props.is_some())
-        && (!local || bound())
-        && props.is_none_or(|ps| ps.iter().all(|p| p.must_write));
     match exit_dom.certify(block) {
-        MustResult::All(_) if surely_the_setter => MustResult::All(Certified::mint(
+        MustResult::All(_) => MustResult::All(Certified::mint(
             RenderWrite { block },
             Provenance::default(),
         )),
@@ -912,12 +900,12 @@ fn slot_write_evidence(
     if !may.contains(&slot) {
         return (false, None);
     }
-    let setters: HashSet<Var> = setter_labels.aliases_of(slot);
-    let render_fns = crate::rules::collect_fn_bindings(&owner.render_cfg);
-    let mut spans: Vec<SourceRange> = std::iter::once(&owner.render_cfg)
-        .chain(owner.hooks.iter().filter_map(|h| h.body_cfg()))
-        .flat_map(|cfg| crate::rules::collect_setter_calls_with_extra(cfg, &setters, &render_fns))
-        .filter_map(|c| c.span)
+    // The first write site the writer relation lists for the slot.
+    let mut spans: Vec<SourceRange> = owner
+        .slot_writers
+        .iter()
+        .filter(|w| w.owner.is_none() && w.slot == slot)
+        .filter_map(|w| w.span)
         .collect();
     spans.sort_by_key(|r| r.pos_key());
     (true, spans.first().copied())

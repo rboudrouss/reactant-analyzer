@@ -136,16 +136,13 @@ fn a_components_own_setter_is_not_a_parents_when_its_name_was_salted() {
 
 #[test]
 fn a_setter_a_closure_only_carries_cannot_be_certified() {
+    // What the render's call runs is the call relation's (ADR-047): the
+    // closure's one write of `onPick` sits in a click handler, a write the
+    // render never runs. The capture is no row of the render.
     let out = report(CAPTURE);
-    let line = line_for(&out, "List");
     assert!(
-        line.contains("cross-setter-in-render"),
-        "the capture is still a may — the row stays:\n{out}"
-    );
-    assert!(
-        line.contains("warn"),
-        "`renderRows` puts `onPick` inside a JSX handler and never calls it: \
-         dominance cannot upgrade a may to a must:\n{out}"
+        !out.contains("cross-setter-in-render") && !out.contains("error"),
+        "`renderRows` puts `onPick` inside a JSX handler and never calls it:\n{out}"
     );
 }
 

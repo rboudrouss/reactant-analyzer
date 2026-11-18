@@ -1121,7 +1121,21 @@ fn exec_callbacks_depth<T: Transfer>(
                     escape_returned(returned.as_ref(), ctx);
                     // A setter is run as a call of it (#291).
                     let applied = apply_setter(transfer, arg, &given, env, ctx, depth);
-                    ctx.record(|r| r.record_escape(*id, i, applied, ran.bodies));
+                    // The callee runs what it is handed: surely its one body
+                    // when the value is surely that function, its one
+                    // setter when the value is surely that setter.
+                    let sure = ctx.calls.is_some() && !ran.objects && {
+                        let value = transfer.eval_expr(arg, env, ctx).as_state_value();
+                        let one_body = applied.is_empty()
+                            && ran.bodies.len() == 1
+                            && !ran.open
+                            && value.as_ref().is_some_and(StateValue::is_reference_only);
+                        let one_setter = applied.len() == 1
+                            && ran.bodies.is_empty()
+                            && value.as_ref().is_some_and(StateValue::surely_setter);
+                        one_body || one_setter
+                    };
+                    ctx.record(|r| r.record_escape(*id, i, applied, ran.bodies, sure));
                     // An object the callee is handed is no function it runs:
                     // it may return what the object holds (`Array.from(hs)`)
                     // or keep it, so it is handed to code the analysis does
@@ -1342,6 +1356,7 @@ fn record_reach<D: AbstractDomain>(
             at.1,
             setters.iter().copied().chain(held),
             fns.iter().map(|(s, _)| *s),
+            false,
         );
     });
 }
@@ -1770,7 +1785,10 @@ pub(crate) fn exec_fn_value<T: Transfer>(
                     .map(EnvVal::Val);
             }
             // No site and no body: nothing of the program the heap places.
+            // An object or array written there is an object all the same,
+            // which no call runs (`Array.from([setN], f)`).
             ran.open = true;
+            ran.objects |= matches!(other, Expr::ObjectLit { .. } | Expr::ArrayLit { .. });
             None
         }
     }

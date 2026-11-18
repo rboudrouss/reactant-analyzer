@@ -1,29 +1,25 @@
 use crate::rules::RuleCtx;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use crate::{
     engine::ProgramAnalysisResult,
     ir::{
         SourceRange,
-        cfg::CFG,
         hooks::HookEntry,
-        types::{BlockId, HookLabel, Var},
+        types::{BlockId, HookLabel},
     },
 };
 
-use crate::engine::setters::SetterCallPhase;
 use crate::engine::{
     Always, Carrier, Change, ChurnEdge, ChurnGraph, EdgeStrength, EveryRender, Rerun, STORE_SLOT,
-    WriterRegion,
+    WriterPhase, WriterRegion,
 };
 use crate::ir::ComponentId;
 use crate::rules::api::query::must_effect_cycle;
 use crate::rules::helpers::cycles::{NodeNames, cycle_path, node_display};
 use crate::rules::{
     Certified, Diagnostic, MustResult, OnAllPaths, Rule, Severity, all_deps_provably_stable,
-    all_setter_labels, collect_fn_bindings, collect_setter_calls_with_extra, must_on_all_paths,
-    resolve_setter_aliases, state_slot_name, state_val_labels,
+    must_on_all_paths, resolve_setter_aliases, state_slot_name, state_val_labels,
 };
 
 /// Fires when an effect causes an infinite render loop.
@@ -62,25 +58,6 @@ impl Rule for InfiniteLoop {
     fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic> {
         let (result, component) = (ctx.program(), ctx.component());
         let comp_result = &result.components[&component];
-
-        // Authoritative setter map: base setters plus alias chains
-        // (`const s1 = setX`, `s2 = s1`) resolved across the render and every
-        // hook body — a setter called in an effect through an alias must still
-        // be attributed to its state slot (else a real loop goes unflagged).
-        let local_setter_labels = all_setter_labels(comp_result);
-
-        // ComponentSetter props, excluding self-references.
-        let cs_vars: HashMap<Var, Vec<crate::engine::setters::SetterProp>> =
-            crate::rules::cross_component_setters(comp_result, component);
-
-        // No early return when this is empty: the churn arms below read the
-        // graph, whose rows also write through setters only a value holds
-        // (`t[1]` of a `useState` result kept whole, #283).
-        let mut all_setter_vars: HashSet<Var> = local_setter_labels.names().cloned().collect();
-        all_setter_vars.extend(cs_vars.keys().cloned());
-
-        let render_fn_bindings: HashMap<Var, Arc<CFG>> =
-            collect_fn_bindings(&comp_result.render_cfg);
         let mut diags = Vec::new();
         // Effects already reported by the cross arm — the churn cycle arm
         // skips them (same outage class, one report per effect).
@@ -92,7 +69,6 @@ impl Rule for InfiniteLoop {
         for hook in &comp_result.hooks {
             let HookEntry::Effect {
                 label: eff_label,
-                body_cfg,
                 deps,
                 ..
             } = hook
@@ -119,36 +95,36 @@ impl Rule for InfiniteLoop {
                 continue;
             }
 
-            let calls =
-                collect_setter_calls_with_extra(body_cfg, &all_setter_vars, &render_fn_bindings);
-
-            for call in &calls {
+            // The effect's writes of a parent's slot, as the writer relation
+            // reads them off the call relation (ADR-047).
+            let mut named: HashSet<(Option<(u32, u32)>, ComponentId)> = HashSet::new();
+            for w in &comp_result.slot_writers {
+                if w.region != WriterRegion::Effect(*eff_label) {
+                    continue;
+                }
                 // A write only a registered event listener reaches does not
                 // close the loop: it needs a user event per iteration, which
-                // is the churn graph's own reason for excluding handlers.
-                // Before ADR-034 §4 the walk computed this class and the
-                // collapse threw it away, so `addEventListener('keydown', h)`
-                // read as an effect-body write (#93).
-                if call.class == SetterCallPhase::Handler {
+                // is the churn graph's own reason for excluding handlers
+                // (#93). A listener ⊤ only because the program dispatches
+                // events (#219) is read as one, as this arm always did.
+                if w.phase == WriterPhase::Handler
+                    || (w.phase == WriterPhase::Unknown && w.listener)
+                {
                     continue;
                 }
                 // A write of this component's own slot is the churn graph's,
                 // whose arms below claim a loop unless they prove it settles
                 // (#265): what remains here is a parent's setter, reached
-                // through a prop.
-                if local_setter_labels.targets(&call.var).next().is_some() {
-                    continue;
-                }
-                let Some(props) = cs_vars.get(&call.var) else {
+                // through a prop. The store is no component's.
+                let Some(parent_comp) = w.owner.filter(|o| *o != ComponentId::STORE) else {
                     continue;
                 };
                 // ── Cross-component ────────────────────────────────────────────
-                // A prop several call sites bind to several parents'
-                // setters: one finding per parent a slot of which diverges.
-                let mut named: HashSet<ComponentId> = HashSet::new();
-                for prop in props {
-                    let (parent_comp, parent_label) = (prop.component, prop.label);
-                    if named.contains(&parent_comp) {
+                // One finding per call site and parent a slot of which
+                // diverges.
+                {
+                    let parent_label = w.slot;
+                    if !named.insert((w.span.map(|r| r.pos_key()), parent_comp)) {
                         continue;
                     }
                     let shared_write = result.shared_state.get(parent_comp, parent_label);
@@ -167,7 +143,7 @@ impl Rule for InfiniteLoop {
                     let msg = format!(
                         "this effect calls `{}`, a state setter of parent `{}`{}. \
                          Parent re-renders → child re-renders → effect fires again: infinite loop",
-                        ctx.source_names().name(&call.var),
+                        ctx.source_names().name(&w.setter),
                         result.display_name(parent_comp),
                         deps_note
                     );
@@ -177,7 +153,6 @@ impl Rule for InfiniteLoop {
                     if let Some(r) = comp_result.effect_info.get(eff_label).and_then(|i| i.span) {
                         diag = diag.with_range(r);
                     }
-                    named.insert(parent_comp);
                     reported_effects.insert(*eff_label);
                     diags.push(diag);
                 }
