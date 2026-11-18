@@ -712,6 +712,7 @@ fn eval_comp_app(
         &cache_key,
         abstract_props_full,
         props_heap,
+        span,
     );
     flow_back(inter, child, &passed, ctx);
 }
@@ -744,6 +745,7 @@ fn run_child(
     cache_key: &HashMap<Symbol, StateValue>,
     abstract_props_full: HashMap<Symbol, EnvVal<StateValue>>,
     props_heap: Heap,
+    span: Option<crate::ir::SourceRange>,
 ) {
     // Cache lookup (strict equality)
     if inter.cache.borrow().contains(child, cache_key) {
@@ -776,6 +778,10 @@ fn run_child(
         return;
     };
 
+    if crate::profile::on() {
+        let (line, col) = span.map_or((0, 0), |s| (s.line, s.col));
+        crate::profile::site(child, inter.component, line, col);
+    }
     let child_result = inter.child(child).analyze_under(child_ir, input);
 
     // Store result in the program-level results map and cache

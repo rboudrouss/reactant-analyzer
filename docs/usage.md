@@ -73,6 +73,13 @@ reactant check src/ --ignore-rule derived-state  # all but this one
 A missing or unparseable `tsconfig.json` is not an error: the run degrades
 to relative-only import resolution with a warning on stderr.
 
+### Environment
+
+| Variable | Effect |
+|----------|--------|
+| `NO_COLOR` | Non-empty: no ANSI colors, as `--no-color`. |
+| `REACTANT_PROFILE=1` | Prints on stderr where the time goes. At exit: the exclusive time of each phase (lowering, each fixpoint pass, closure-body runs, the writer and trigger relations, the churn graph, each rule), the body runs by nesting depth and by the pass that started them, the escaped closures run by their owner or by another component, the analyses by kind (root, child, probe, intra), the 15 heaviest (component, kind) entries with the closures and cells of the heap they were handed, and the 12 call sites that analysed a child most often. Every 30 s, one `[profile] live:` line (total runs, the top phases, the current analysis stack), so a run stopped by a time limit still says what it was doing. Off by default; the findings are the same either way. |
+
 ## `reactant.config.json` (ADR-022)
 
 Discovered at the project root (the first directory argument), or passed

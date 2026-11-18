@@ -37,6 +37,9 @@ impl<'a> ProgramRelations<'a> {
 
     /// The program's churn graph and its cycles, built on first request.
     pub fn churn(&self) -> &ChurnGraph {
-        self.churn.get_or_init(|| ChurnGraph::build(self.program))
+        self.churn.get_or_init(|| {
+            let _profile = crate::profile::phase("churn-graph");
+            ChurnGraph::build(self.program)
+        })
     }
 }

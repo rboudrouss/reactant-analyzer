@@ -49,6 +49,9 @@ on a program React settles; 323 oracle cases, none a known false negative.
 - Summaries: React's `useEffectEvent`, a callback timing table for common
   libraries (`useDebouncedCallback`, `useSWR`, `useMutation`, `useAction`,
   react-hook-form's `register`, `react-dropzone`).
+- `REACTANT_PROFILE=1` prints on stderr where the time goes: per phase, per
+  kind of analysis, the heaviest components and call sites, and a live line
+  every 30 s; the corpus workflow runs with it.
 - This changelog.
 
 ### Changed

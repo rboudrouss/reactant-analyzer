@@ -231,6 +231,7 @@ fn solve<T: Transfer>(
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
 ) -> Run<T::Domain> {
+    let _profile = crate::profile::body_run(depth);
     let Plan {
         back,
         selecting,
@@ -1229,6 +1230,10 @@ pub(crate) fn run_escaped<T: Transfer>(
             return;
         }
         for id in pending {
+            if crate::profile::on() {
+                let owned = matches!(ctx.heap.get(id), Some(HeapValue::Fn { owner, .. }) if *owner == ctx.component);
+                crate::profile::escaped_run(owned);
+            }
             let returned = exec_heap_fns(transfer, Sites::closed([id]), &[], env, ctx, 0);
             escape_returned(returned.as_ref(), ctx);
         }

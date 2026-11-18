@@ -73,7 +73,11 @@ jobs:
       # One process per repo: each repo is its own project (its own aliases
       # and import scopes), and the whole tree in one process does not fit
       # the runner's memory once those imports resolve.
+      # The profile goes to this log: where each repo's time went, and a live
+      # line every 30 s that says what a run stopped by the timeout was doing.
       - name: Run the analyzer over the corpus
+        env:
+          REACTANT_PROFILE: "1"
         run: |
           mkdir -p corpus-runs
           failed=0

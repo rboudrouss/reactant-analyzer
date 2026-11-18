@@ -198,6 +198,20 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     program: &ProgramFacts,
     hook_registry: Option<&HookRegistry>,
 ) -> AnalysisResult<StateValue> {
+    let _profile = crate::profile::on().then(|| {
+        let kind = match inter {
+            None => "intra",
+            Some(i) if i.probe => "probe",
+            Some(i) if i.call_stack.borrow().is_empty() => "root",
+            Some(_) => "child",
+        };
+        let closures = initial_heap
+            .iter()
+            .filter(|(_, v)| matches!(v, crate::domains::HeapValue::Fn { .. }))
+            .count();
+        let cells = initial_heap.iter().count();
+        crate::profile::analysis(comp_id, &comp.name, kind, cells as u64, closures as u64)
+    });
     let ComponentIR {
         file: comp_file,
         name: _,
@@ -515,6 +529,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
 
         // ── Render pass ───────────────────────────────────────────────────────
         // Use initial_env as entry: child analyses start with props bound.
+        let profile = crate::profile::pass("pass:render");
         let (bs, state_from_render) = pass(
             &render_cfg,
             initial_env.clone(),
@@ -526,6 +541,8 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             false,
         );
         block_states = bs;
+        drop(profile);
+        let profile = crate::profile::pass("pass:memo");
 
         // ── Recompute memo store from exit env ────────────────────────────────
         // Deps evaluate through the normal path against the real fixpoint stores
@@ -594,6 +611,9 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             }
         }
 
+        drop(profile);
+        let profile = crate::profile::pass("pass:effects");
+
         // ── Effect passes ─────────────────────────────────────────────────────
         let mut state_from_effects = StateStore::bottom();
         slot_writers.clear();
@@ -627,6 +647,8 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         // escaped closure does (#314): an event holds no function of the
         // component, and what a child passes back escaped when it was handed
         // down.
+        drop(profile);
+        let profile = crate::profile::pass("pass:handlers");
         let mut state_from_handlers = StateStore::bottom();
         for hook in &hooks {
             if let HookEntry::Handler {
@@ -657,7 +679,9 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         // stored where the heap does not follow — run as handlers do, from
         // the render's exit env (#254). Every pass above has run, so every
         // closure this iteration let escape runs in it.
+        drop(profile);
         {
+            let _profile = crate::profile::pass("pass:escaped");
             let mut out = state_store.clone();
             let mut ac = AnalysisCtx {
                 component: comp_id,
@@ -738,6 +762,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     // `inter` is `None`: this re-evaluates and re-allocates, it does not
     // re-analyze children (same choice as the effect re-run below).
     {
+        let _profile = crate::profile::pass("pass:post-render");
         let (bs, _) = pass(
             &render_cfg,
             initial_env.clone(),
@@ -835,6 +860,7 @@ fn compute_relations(
         dispatches,
     } = inputs;
     let comp_id = result.component;
+    let profile = crate::profile::pass("relations:writers");
     let reducers = crate::engine::Reducers::registered(comp_id, reducers, program_reducers);
     let env_exit = result.exit_env();
     // A write through a parent's setter prop is a row too, owner-qualified
@@ -892,6 +918,8 @@ fn compute_relations(
     result.slot_writers = slot_writers;
     result.slot_seeds = slot_seeds;
     result.registrations = registrations;
+    drop(profile);
+    let _profile = crate::profile::pass("relations:triggers");
     // The effect-trigger relation (ADR-042 §3): a dep evaluated in the render
     // exit env, the one every hook body starts from, and what it is computed
     // from where the effect is called. A module name some body of the
