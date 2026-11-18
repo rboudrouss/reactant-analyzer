@@ -305,6 +305,13 @@ on a program React settles; 323 oracle cases, none a known false negative.
   name a closure assigns. Each was a silent loop; a guard on a value an
   unseen function returns (`getSafeScale(value)`, a prop's `get`) is now a
   Warning (#331).
+- A closure reached through a builtin the analysis does not model is handed
+  to it with the call's receiver: `h.bind(null)`, `h.call(null)`,
+  `h.apply(…)`, `[h].slice()`, `[h].filter(f)`, `[h].concat(…)`,
+  `[h].values()`, `[h].reduce(…)` may run it. `[h].at(0)`, `find`,
+  `findLast`, `pop`, `shift` and `get` return one of the receiver's entries, `sort`,
+  `reverse`, `fill` and `copyWithin` the receiver with its positions lost.
+  Each call of such a closure, in the render or an effect, was silent (#330).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

@@ -542,9 +542,20 @@ fn havoc_members<T: Transfer>(
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
 ) {
-    let Some(Sites { ids, .. }) = resolve_locs(receiver, env, ctx.heap) else {
-        return;
-    };
+    if let Some(sites) = resolve_locs(receiver, env, ctx.heap) {
+        havoc_at(transfer, sites, receiver, args, env, ctx);
+    }
+}
+
+/// [`havoc_members`] of the objects at `sites`, which `receiver` denotes.
+fn havoc_at<T: Transfer>(
+    transfer: &T,
+    Sites { ids, .. }: Sites,
+    receiver: &Expr,
+    args: &[Expr],
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+) {
     let mut all = EnvVal::Val(StateValue::undefined());
     for arg in args {
         let sites = alloc_literal(transfer, arg, env, ctx);
@@ -784,6 +795,16 @@ pub(crate) fn alloc_literal<T: Transfer>(
             return ctx
                 .heap
                 .member_sites(&sites, member_key(idx, env).as_deref());
+        }
+        // A builtin whose result is its receiver or one of its entries
+        // points where those do (#330).
+        Expr::Call { fn_, args, .. } => {
+            return match fn_.peel_ts() {
+                Expr::FieldAccess { obj, field } => {
+                    method_result_sites(transfer, obj, field, args, env, ctx)
+                }
+                _ => None,
+            };
         }
         other => return resolve_locs(other, env, ctx.heap),
     };
@@ -1191,6 +1212,22 @@ fn exec_callbacks_depth<T: Transfer>(
                 // A builtin, a subscription, a setter: no body of the
                 // program, and `open` unless the callee is surely a setter.
                 ran.open = true;
+            }
+            // A builtin the value layer does not model is handed the call's
+            // receiver as well as its arguments (#330): it may return it, an
+            // entry of it or a function calling it (`h.bind(null)`), so what
+            // it holds escapes there ([`ReceiverUse`]).
+            if ran.open
+                && let Expr::FieldAccess { obj, field } = fn_.peel_ts()
+                && ReceiverUse::of(field) == ReceiverUse::Unmodelled
+            {
+                escape_at(
+                    transfer,
+                    obj,
+                    env,
+                    ctx,
+                    Some((*id, crate::engine::calls::CALLEE)),
+                );
             }
             // Arguments first, then the call itself.
             let written = exec_slot_write(transfer, fn_, args, env, ctx, depth);
@@ -1677,6 +1714,74 @@ fn entries_at<D: AbstractDomain>(sites: Option<&Sites>, ctx: &AnalysisCtx<D>) ->
         None => top,
     };
     EnvVal::located(entry.sites().cloned(), D::from_state_value(entry.as_val()))
+}
+
+/// What a builtin method `recv.m(…)` does with its receiver, as the value
+/// layer reads it (#330). A builtin is code the analysis does not run: the
+/// receiver escapes to it unless the method's use is one this table reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReceiverUse {
+    /// The result holds nothing of the receiver: a primitive, the callback
+    /// returns (which escape at the call), `undefined`. The callbacks it runs
+    /// get the receiver's entries ([`callback_args`]).
+    Nothing,
+    /// The result is the receiver itself: an in-place method.
+    Itself,
+    /// The result is one of the receiver's entries, or `undefined`.
+    Entry,
+    /// A builtin the value layer does not model: it may return the receiver,
+    /// some of its entries or a function calling it, so the receiver escapes.
+    Unmodelled,
+    /// No builtin: a method of code the analysis does not see (a prop, a
+    /// library object), handed its arguments only.
+    Unseen,
+}
+
+impl ReceiverUse {
+    pub(crate) fn of(method: &str) -> Self {
+        match method {
+            "forEach" | "map" | "flatMap" | "some" | "every" | "findIndex" | "findLastIndex"
+            | "indexOf" | "lastIndexOf" | "includes" | "push" | "unshift" | "join" => {
+                ReceiverUse::Nothing
+            }
+            "sort" | "reverse" | "fill" | "copyWithin" => ReceiverUse::Itself,
+            "at" | "find" | "findLast" | "pop" | "shift" | "get" => ReceiverUse::Entry,
+            "concat" | "entries" | "filter" | "flat" | "keys" | "reduce" | "reduceRight"
+            | "slice" | "splice" | "toReversed" | "toSorted" | "toSpliced" | "values" | "with"
+            | "bind" | "call" | "apply" | "then" | "catch" | "finally" => ReceiverUse::Unmodelled,
+            _ => ReceiverUse::Unseen,
+        }
+    }
+}
+
+/// The sites the result of `recv.method(args…)` points to when
+/// [`ReceiverUse`] reads it: the receiver's, or its entries' as
+/// [`callback_args`] reads them.
+fn method_result_sites<T: Transfer>(
+    transfer: &T,
+    obj: &Expr,
+    method: &str,
+    args: &[Expr],
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+) -> Option<Sites> {
+    match ReceiverUse::of(method) {
+        // Rearranged or filled in place: any entry, or an argument, may sit
+        // at any position — a literal receiver too, which only this
+        // allocation places.
+        ReceiverUse::Itself => {
+            let sites = alloc_literal(transfer, obj, env, ctx)?;
+            havoc_at(transfer, sites.clone(), obj, args, env, ctx);
+            Some(sites)
+        }
+        // An unplaced receiver has no entry the heap places either: what
+        // it holds escaped where it was handed over.
+        ReceiverUse::Entry => {
+            let receiver = alloc_literal(transfer, obj, env, ctx)?;
+            entries_at(Some(&receiver), ctx).sites().cloned()
+        }
+        ReceiverUse::Nothing | ReceiverUse::Unmodelled | ReceiverUse::Unseen => None,
+    }
 }
 
 /// What an in-cycle callee passes its function argument at `index` (#253).

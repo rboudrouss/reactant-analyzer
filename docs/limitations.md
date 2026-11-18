@@ -57,7 +57,16 @@ that writes it (see *Cross-file limits*).
   handlers, at an unknown time [#254](https://github.com/rboudrouss/reactant-analyzer/issues/254):
   its writes reach the state store as possible writes, never as writes of the body that handed it
   over. So a loop it closes in an effect is claimed only through the slot values it moves, as a
-  Warning [#19](https://github.com/rboudrouss/reactant-analyzer/issues/19). The writer relation reads one
+  Warning [#19](https://github.com/rboudrouss/reactant-analyzer/issues/19). A builtin method the
+  analysis does not model receives the call's receiver too
+  [#330](https://github.com/rboudrouss/reactant-analyzer/issues/330): `h.bind(null)`,
+  `h.call(null)`, `[h].slice()`, `[h].filter(f)`, `[h].values()` hand `h` over, so it runs at an
+  unknown time even when the result is never called (a Warning React may not confirm), and a
+  write through `bind`, `call` or `apply` is never an Error. Only `at`, `find`, `findLast`, `pop`,
+  `shift`, `get` (an entry of the receiver) and `sort`, `reverse`, `fill`, `copyWithin` (the
+  receiver, its positions lost) are read for what they return. The builtins are known by method
+  name; a method of code the analysis does not see (`props.onPick(x)`, a library object's) is
+  handed its arguments only, not the object it is called on. The writer relation reads one
   the render hands to such a callee or hook — a literal, or a name bound to one or to a
   `useCallback` value, or one held by an object or array it hands over — as a possible render write
   [#262](https://github.com/rboudrouss/reactant-analyzer/issues/262),
