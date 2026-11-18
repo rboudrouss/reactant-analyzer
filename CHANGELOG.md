@@ -72,6 +72,10 @@ on a program React settles; 323 oracle cases, none a known false negative.
   writer relation and the rules read the member paths of each value a name
   holds once, not once per block; `@mantine/form` 25 s → 15 s, findings
   unchanged.
+- Faster closure runs: the solver's tables of a closure body (block order,
+  back edges, selecting branches) are built once per fixpoint, not at each
+  run; `@mantine/form` 15 s → 14 s, chakra-ui 12 s → 8 s with the change
+  above, findings unchanged.
 - `always-unstable-deps` also reports a dep that is a new reference at every
   render where it holds an object and a primitive otherwise
   (`items?.filter(f)`, `items && items.map(f)`, `c ? [x] : undefined`), with

@@ -271,6 +271,9 @@ pub struct AnalysisCtx<'a, D: AbstractDomain> {
     /// every closure it executes share one policy, because they share one
     /// solver.
     pub widening: Widening<'a>,
+    /// The solver's tables of the closures the fixpoint runs, kept across
+    /// its passes; `None` computes them at each run.
+    pub plans: Option<&'a crate::domains::interp::Plans>,
 }
 
 /// When a loop header stops joining and starts widening (ADR-014): after
@@ -308,6 +311,7 @@ impl<'a, D: AbstractDomain> AnalysisCtx<'a, D> {
             query: &NULL,
             inter: None,
             widening: Widening::DEFAULT,
+            plans: None,
         }
     }
 

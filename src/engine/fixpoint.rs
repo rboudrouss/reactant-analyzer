@@ -418,6 +418,9 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         after: config.widen_threshold,
         thresholds: &thresholds,
     };
+    // The solver's tables of every closure a pass runs, computed once for
+    // the whole fixpoint.
+    let plans = crate::domains::interp::Plans::default();
     let pass = |cfg: &CFG,
                 entry: AbstractEnv<StateValue>,
                 writes: &StateStore<StateValue>,
@@ -437,6 +440,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 query: &query,
                 inter: inter.filter(|_| children),
                 widening,
+                plans: Some(&plans),
             };
             let envs = analyze_cfg(transfer, cfg, entry, &mut ac);
             if effect {
@@ -540,6 +544,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 query: &query,
                 inter,
                 widening,
+                plans: Some(&plans),
             };
             hooks
                 .iter()
@@ -574,6 +579,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 query: &query,
                 inter,
                 widening,
+                plans: Some(&plans),
             };
             for hook in &hooks {
                 if let HookEntry::Ref { label, init, .. } = hook {
@@ -662,6 +668,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 query: &query,
                 inter,
                 widening,
+                plans: Some(&plans),
             };
             crate::domains::interp::run_escaped(transfer, &escaped_bodies, &env_exit, &mut ac);
             state_from_handlers = state_from_handlers.join(&out);

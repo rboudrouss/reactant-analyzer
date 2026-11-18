@@ -61,12 +61,118 @@ pub(crate) fn exec_body<T: Transfer>(
 /// the inlining depth is preserved across body boundaries.
 pub(crate) fn exec_body_depth<T: Transfer>(
     transfer: &T,
-    cfg: &CFG,
+    body: &Arc<CFG>,
     entry_env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
 ) -> T::Domain {
-    run_cfg(transfer, cfg, entry_env.clone(), ctx, depth).ret
+    run_body(transfer, body, entry_env.clone(), ctx, depth).ret
+}
+
+/// What the solver reads off a body's CFG, whatever env it runs in: the
+/// blocks' reverse post-order, the back edges, the branches whose condition
+/// selects what a block assigns or returns (and the inverse), and the names
+/// the body declares. A function of the CFG alone.
+pub(crate) struct Plan {
+    order: HashMap<BlockId, usize>,
+    back: HashSet<(BlockId, BlockId)>,
+    selecting: HashMap<BlockId, Vec<BlockId>>,
+    returning: HashMap<BlockId, Vec<BlockId>>,
+    selected: HashMap<BlockId, Vec<BlockId>>,
+    declared: HashSet<Symbol>,
+}
+
+impl Plan {
+    fn of(cfg: &CFG) -> Self {
+        let order = cfg
+            .rpo()
+            .into_iter()
+            .enumerate()
+            .map(|(i, b)| (b, i))
+            .collect();
+        let back = cfg
+            .edges
+            .iter()
+            .filter(|e| matches!(e.kind, EdgeKind::Back))
+            .map(|e| (e.from, e.to))
+            .collect();
+        // Block → the branches whose condition selects what it assigns, or
+        // what it returns; and the inverse, for re-queueing when a
+        // condition's bound grows.
+        let selecting = selecting_branches(cfg);
+        let returning = returning_branches(cfg);
+        let mut selected: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+        for (b, branches) in selecting.iter().chain(&returning) {
+            for br in branches {
+                selected.entry(*br).or_default().push(*b);
+            }
+        }
+        // A name the body assigns without declaring it belongs to an
+        // enclosing scope, shared with every body that binds it (#258).
+        let declared = cfg
+            .blocks
+            .values()
+            .flat_map(|block| &block.stmts)
+            .filter_map(|s| match s {
+                Stmt::Let { var, .. } => Some(var.clone()),
+                _ => None,
+            })
+            .collect();
+        Plan {
+            order,
+            back,
+            selecting,
+            returning,
+            selected,
+            declared,
+        }
+    }
+
+    fn rank(&self, b: BlockId) -> usize {
+        self.order.get(&b).copied().unwrap_or(usize::MAX)
+    }
+}
+
+/// The solver's tables (`Plan`) of every body one fixpoint runs as a
+/// closure, computed at its first run. An entry is keyed by the body's
+/// address and holds its `Arc`: while the entry lives the CFG is neither
+/// freed — so its address names no other body — nor changed in place, since
+/// a shared `Arc` gives no `&mut`. A cached plan is therefore the plan
+/// `Plan::of` would compute again, and a run that reads it is the run that
+/// computes it.
+#[derive(Default)]
+pub struct Plans(std::cell::RefCell<HashMap<*const CFG, CachedPlan>>);
+
+/// A body, kept alive, and its plan.
+type CachedPlan = (Arc<CFG>, std::rc::Rc<Plan>);
+
+impl Plans {
+    fn of(&self, body: &Arc<CFG>) -> std::rc::Rc<Plan> {
+        let mut plans = self.0.borrow_mut();
+        let (_, plan) = plans
+            .entry(Arc::as_ptr(body))
+            .or_insert_with(|| (Arc::clone(body), std::rc::Rc::new(Plan::of(body))));
+        std::rc::Rc::clone(plan)
+    }
+}
+
+/// [`run_cfg`] for a body held behind an `Arc` — a closure, a `useCallback`
+/// body, an updater, a reducer — with its plan read off the fixpoint's
+/// [`Plans`] when the context has them.
+pub(crate) fn run_body<T: Transfer>(
+    transfer: &T,
+    body: &Arc<CFG>,
+    entry_env: AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+    depth: usize,
+) -> Run<T::Domain> {
+    match ctx.plans {
+        Some(plans) => {
+            let plan = plans.of(body);
+            solve(transfer, body, &plan, entry_env, ctx, depth)
+        }
+        None => run_cfg(transfer, body, entry_env, ctx, depth),
+    }
 }
 
 /// What one run of [`run_cfg`] over a body leaves behind, besides the writes
@@ -113,31 +219,27 @@ pub(crate) fn run_cfg<T: Transfer>(
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
 ) -> Run<T::Domain> {
-    let order: HashMap<BlockId, usize> = cfg
-        .rpo()
-        .into_iter()
-        .enumerate()
-        .map(|(i, b)| (b, i))
-        .collect();
-    let back: HashSet<(BlockId, BlockId)> = cfg
-        .edges
-        .iter()
-        .filter(|e| matches!(e.kind, EdgeKind::Back))
-        .map(|e| (e.from, e.to))
-        .collect();
-    let rank = |b: BlockId| order.get(&b).copied().unwrap_or(usize::MAX);
+    solve(transfer, cfg, &Plan::of(cfg), entry_env, ctx, depth)
+}
 
-    // Block → the branches whose condition selects what it assigns, or what
-    // it returns; and the inverse, for re-queueing when a condition's bound
-    // grows.
-    let selecting = selecting_branches(cfg);
-    let returning = returning_branches(cfg);
-    let mut selected: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
-    for (b, branches) in selecting.iter().chain(&returning) {
-        for br in branches {
-            selected.entry(*br).or_default().push(*b);
-        }
-    }
+/// [`run_cfg`] over `cfg` with `plan`, its [`Plan`].
+fn solve<T: Transfer>(
+    transfer: &T,
+    cfg: &CFG,
+    plan: &Plan,
+    entry_env: AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+    depth: usize,
+) -> Run<T::Domain> {
+    let Plan {
+        back,
+        selecting,
+        returning,
+        selected,
+        declared,
+        ..
+    } = plan;
+    let rank = |b: BlockId| plan.rank(b);
     let mut cond_bounds: HashMap<BlockId, Stability> = HashMap::new();
     // The join of the change bounds of `branches`, those not yet run
     // contributing nothing: they re-queue the block when they do.
@@ -160,18 +262,6 @@ pub(crate) fn run_cfg<T: Transfer>(
     let mut pending: BTreeSet<(usize, BlockId)> = BTreeSet::new();
     entries.insert(cfg.entry, entry_env);
     pending.insert((rank(cfg.entry), cfg.entry));
-
-    // A name the body assigns without declaring it belongs to an enclosing
-    // scope, shared with every body that binds it (#258).
-    let declared: HashSet<&Symbol> = cfg
-        .blocks
-        .values()
-        .flat_map(|block| &block.stmts)
-        .filter_map(|s| match s {
-            Stmt::Let { var, .. } => Some(var),
-            _ => None,
-        })
-        .collect();
 
     while let Some((_, b)) = pending.pop_first() {
         let mut env = entries[&b].clone();
@@ -1231,7 +1321,7 @@ pub(crate) fn exec_fn_value<T: Transfer>(
         } => {
             let mut sub_env = env.clone();
             bind_params(&mut sub_env, params, args);
-            let run = run_cfg(transfer, body_cfg, sub_env, ctx, depth + 1);
+            let run = run_body(transfer, body_cfg, sub_env, ctx, depth + 1);
             let sites = returned_sites(transfer, body_cfg, &run.exits, ctx);
             Some(run.ret)
                 .filter(|v| !v.is_bottom())
@@ -1295,7 +1385,7 @@ fn exec_heap_fns<T: Transfer>(
             .and_then(|closure| closure_env(closure, env, ctx.component))
         {
             bind_params(&mut sub_env, &params, args);
-            let run = run_cfg(transfer, &body_cfg, sub_env, ctx, depth + 1);
+            let run = run_body(transfer, &body_cfg, sub_env, ctx, depth + 1);
             let sites = returned_sites(transfer, &body_cfg, &run.exits, ctx);
             placed = Some(match placed {
                 None => sites,
