@@ -79,6 +79,9 @@ impl Foreign {
 #[derive(Debug, Clone)]
 pub(crate) struct WriteSite {
     pub var: Var,
+    /// `var` spells a value that reaches the setter, not the setter
+    /// ([`SlotWriter::carried`]).
+    pub carried: bool,
     /// The slot written, as the call relation names it.
     pub slot: Slot,
     pub span: Option<SourceRange>,
@@ -221,6 +224,7 @@ impl<'a> WriterTables<'a> {
             .into_iter()
             .map(|s| WriteSite {
                 var: s.var,
+                carried: s.carried,
                 slot: s.slot,
                 span: s.span,
                 class: s.class,
@@ -1145,6 +1149,12 @@ pub struct SlotWriter {
     /// The setter variable at the call site (an alias chain resolves it to
     /// `slot`; a spliced wrapper's `setter#salt` param resolves too).
     pub setter: Var,
+    /// `setter` spells a value that reaches the setter — an object or an
+    /// array holding it, handed to a callee; a closure of another component
+    /// calling it — not the setter itself. A message names the slot's
+    /// setter then, and `setter` as what the write went through
+    /// ([`SlotWriter::named`]).
+    pub carried: bool,
     /// Witness call-site span.
     pub span: Option<SourceRange>,
     pub region: WriterRegion,
@@ -1209,6 +1219,25 @@ impl SlotWriter {
     /// A write of the store (ADR-046), not of any component's slot.
     pub fn writes_store(&self) -> bool {
         self.owner == Some(ComponentId::STORE)
+    }
+
+    /// How a message names the setter this row writes through (D2), a row
+    /// of `component`: its spelling at the call when that is the setter;
+    /// else the slot's setter — `None` when the source binds it to no name
+    /// — and the spelling, what the write went through. Never a value that
+    /// is not a setter as one.
+    pub fn named(
+        &self,
+        calls: &CallRelation,
+        component: ComponentId,
+    ) -> (Option<Var>, Option<&Var>) {
+        match self.carried {
+            false => (Some(self.setter.clone()), None),
+            true => {
+                let slot = (self.owner.unwrap_or(component), self.slot);
+                (calls.slot_name(slot).cloned(), Some(&self.setter))
+            }
+        }
     }
 }
 
@@ -1751,6 +1780,7 @@ pub(crate) fn collect_slot_writers(
             out.push(SlotWriter {
                 slot,
                 via: via_of(site.prov_block, &site.through),
+                carried: site.carried && calls.slot_name(site.slot) != Some(&setter),
                 setter,
                 span: site.span,
                 region,
@@ -1779,6 +1809,7 @@ pub(crate) fn collect_slot_writers(
                 slot: STORE_SLOT.1,
                 via: via_of(site.prov_block, &site.through),
                 setter: site.callee,
+                carried: false,
                 span: site.span,
                 region,
                 phase: class_phase(site.class, region),
@@ -2121,6 +2152,8 @@ impl Found {
     fn spelled(&mut self, spelling: Option<&str>) {
         for site in &mut self.setters {
             site.var = spelling.unwrap_or_default().to_string();
+            // What was called or handed is that body, not the setter.
+            site.carried = !site.var.is_empty();
         }
     }
 
@@ -2214,6 +2247,10 @@ struct FoundCall {
 /// One raw call site the walk saw.
 struct FoundSite {
     var: Var,
+    /// `var` spells a value that reaches the setter — an object holding
+    /// it, a closure calling it — not the setter itself
+    /// ([`SlotWriter::carried`]).
+    carried: bool,
     /// The slot written, as the call relation names it (ADR-047): a row is
     /// keyed by its slot, never by the name it is spelled with.
     slot: Slot,
@@ -3060,6 +3097,7 @@ impl<'a> SetterWalk<'a> {
         for slot in slots {
             found.setters.push(FoundSite {
                 var: Var::new(),
+                carried: false,
                 slot,
                 sure: false,
                 listener: self.listening,
@@ -3113,6 +3151,7 @@ impl<'a> SetterWalk<'a> {
         for &slot in &row.setters {
             found.setters.push(FoundSite {
                 var: spelling.clone().unwrap_or_default(),
+                carried: false,
                 slot,
                 sure,
                 listener: self.listening,
@@ -3204,6 +3243,7 @@ impl<'a> SetterWalk<'a> {
         for &slot in &row.setters {
             found.setters.push(FoundSite {
                 var: spelling.clone().unwrap_or_default(),
+                carried: spelling.is_some() && !row.direct.contains(&slot),
                 slot,
                 sure: row.sure(),
                 listener: self.listening,
@@ -3338,6 +3378,7 @@ impl<'a> SetterWalk<'a> {
         for &slot in &row.setters {
             found.setters.push(FoundSite {
                 var: spelling.clone().unwrap_or_default(),
+                carried: spelling.is_some() && !row.direct.contains(&slot),
                 slot,
                 sure: false,
                 listener: self.listening,

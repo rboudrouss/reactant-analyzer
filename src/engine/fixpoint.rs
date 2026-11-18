@@ -477,6 +477,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                                 comp_id.hook_site(label),
                                 crate::engine::calls::CLEANUP,
                                 [],
+                                [],
                                 ran.bodies,
                                 false,
                             )

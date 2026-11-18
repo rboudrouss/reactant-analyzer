@@ -124,6 +124,11 @@ pub struct Evaluation {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Escapes {
     pub setters: BTreeSet<Slot>,
+    /// Those of `setters` the handed value may itself be (`setN`, `t[1]`),
+    /// not only hold — as a member of an object or an array it is, or
+    /// through a closure it is that calls it: what a row may call the
+    /// value's spelling a setter for.
+    pub direct: BTreeSet<Slot>,
     pub bodies: BTreeSet<ExprId>,
     /// `Some(true)`: every evaluation handed a value surely the one setter
     /// or function it lists to a callee that runs it (an array method).
@@ -258,17 +263,23 @@ impl CallRelation {
         });
     }
 
-    /// Join what the value at `pos` of `anchor` reached into its row.
+    /// Join what the value at `pos` of `anchor` reached into its row: the
+    /// setters it may be (`direct`), those it holds (`held`), the bodies.
     pub fn record_escape(
         &mut self,
         anchor: ExprId,
         pos: usize,
-        setters: impl IntoIterator<Item = Slot>,
+        direct: impl IntoIterator<Item = Slot>,
+        held: impl IntoIterator<Item = Slot>,
         bodies: impl IntoIterator<Item = ExprId>,
         sure: bool,
     ) {
         let row = self.escapes.entry((anchor, pos)).or_default();
-        row.setters.extend(setters);
+        for slot in direct {
+            row.direct.insert(slot);
+            row.setters.insert(slot);
+        }
+        row.setters.extend(held);
         row.bodies.extend(bodies);
         row.sure = Some(row.sure.unwrap_or(true) && sure);
     }
@@ -307,6 +318,7 @@ impl CallRelation {
         for (k, e) in &other.escapes {
             let row = self.escapes.entry(*k).or_default();
             row.setters.extend(e.setters.iter().copied());
+            row.direct.extend(e.direct.iter().copied());
             row.bodies.extend(e.bodies.iter().copied());
             row.sure = match (row.sure, e.sure) {
                 (None, s) | (s, None) => s,

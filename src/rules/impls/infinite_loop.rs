@@ -140,12 +140,23 @@ impl Rule for InfiniteLoop {
                     } else {
                         ""
                     };
+                    // The value it calls, when that is the setter; else the
+                    // setter and what reaches it (D2).
+                    let names = ctx.source_names();
+                    let parent = result.display_name(parent_comp);
+                    let called = match w.named(&comp_result.calls, comp_result.component) {
+                        (Some(n), None) => {
+                            format!("`{}`, a state setter of parent `{parent}`", names.name(&n))
+                        }
+                        (n, through) => format!(
+                            "the state setter {}of parent `{parent}` through `{}`",
+                            n.map_or_else(String::new, |n| format!("`{}` ", names.name(&n))),
+                            through.map_or_else(String::new, |t| names.name(t).into_owned())
+                        ),
+                    };
                     let msg = format!(
-                        "this effect calls `{}`, a state setter of parent `{}`{}. \
-                         Parent re-renders → child re-renders → effect fires again: infinite loop",
-                        ctx.source_names().name(&w.setter),
-                        result.display_name(parent_comp),
-                        deps_note
+                        "this effect calls {called}{deps_note}. \
+                         Parent re-renders → child re-renders → effect fires again: infinite loop"
                     );
                     let mut diag = Diagnostic::warn("cross-component-infinite-loop", msg)
                         .with_label(*eff_label);

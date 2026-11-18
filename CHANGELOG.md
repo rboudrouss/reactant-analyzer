@@ -67,6 +67,12 @@ on a program React settles; 323 oracle cases, none a known false negative.
 - Messages name a setter or a slot as the source writes it (`t[1]`,
   `useThing(…).set`, the name the `useState` destructuring declares), never
   with an inlined hook's rename salt.
+- A `setter-in-render`, `cross-setter-in-render` or
+  `cross-component-infinite-loop` message whose write goes through a value
+  that is not the setter names the slot's setter and that value: "setter
+  `setSubmitting` is handed to a callee through `payload`", "setter `setN` of
+  parent `App` called during render of `Child` through `onX`", where it called
+  `payload` and `onX` setters.
 - `setter-in-render` reports each setter once, at its strongest site;
   `infinite-loop`'s wording says what a proven loop rests on.
 - Analysis is slower on large monorepos now that cross-package imports

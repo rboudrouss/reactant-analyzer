@@ -197,35 +197,46 @@ impl SetterInRender {
                 let slot = (w.owner.unwrap_or(component), w.slot);
                 comp_result.calls.slot_name(slot).cloned()
             };
-            let shown = match shared.then(slot_name).flatten() {
-                Some(name) => names.name(&name).into_owned(),
-                None => names.name(&w.setter).into_owned(),
-            };
-            let (rule_name, message) = match w.owner {
-                None if sync => (
+            let mut wording = Wording::of(w, comp_result, names);
+            if let Some(name) = shared.then(slot_name).flatten() {
+                wording.name = Some(names.name(&name).into_owned());
+            }
+            let setter = wording.setter();
+            let (rule_name, message) = match (w.owner, &wording.through) {
+                (None, None) if sync => (
                     "setter-in-render",
                     format!(
-                        "setter `{shown}` called directly in the render body, \
+                        "{setter} called directly in the render body, \
                          move this call into a useEffect or an event handler"
                     ),
                 ),
-                None => ("setter-in-render", unknown_phase_message(names, &w.setter)),
-                Some(parent) if sync => (
-                    "cross-setter-in-render",
+                (None, Some(through)) if sync => (
+                    "setter-in-render",
                     format!(
-                        "prop `{shown}` (a state setter of parent `{}`) called during render \
-                         of `{}`, which triggers a parent re-render on every render",
-                        result.display_name(parent),
-                        result.display_name(component)
+                        "{setter} called in the render body through `{through}`, \
+                         move this call into a useEffect or an event handler"
                     ),
                 ),
-                Some(parent) => (
+                (None, _) => ("setter-in-render", unknown_phase_message(&wording)),
+                (Some(parent), through) if sync => (
                     "cross-setter-in-render",
                     format!(
-                        "prop `{shown}` (a state setter of parent `{}`) is handed to a callee \
-                         with no timing summary. If that callee runs it during render, \
-                         `{}` re-renders its parent on every render",
-                        result.display_name(parent),
+                        "{} called during render of `{}`{}, which triggers a parent \
+                         re-render on every render",
+                        wording.of_parent(&result.display_name(parent)),
+                        result.display_name(component),
+                        through
+                            .as_ref()
+                            .map_or_else(String::new, |t| format!(" through `{t}`"))
+                    ),
+                ),
+                (Some(parent), _) => (
+                    "cross-setter-in-render",
+                    format!(
+                        "{} is handed to a callee{} with no timing summary. If that callee \
+                         runs it during render, `{}` re-renders its parent on every render",
+                        wording.of_parent(&result.display_name(parent)),
+                        wording.through_clause(),
                         result.display_name(component)
                     ),
                 ),
@@ -243,10 +254,7 @@ impl SetterInRender {
             }
             // Witness (ADR-019): the render-time setter call itself.
             d = d.with_step(
-                crate::rules::Step::Call {
-                    callee: w.setter.clone(),
-                    class: crate::rules::EffectClass::Setter,
-                },
+                wording.step(w),
                 None,
                 w.span,
                 &ctx.names(&crate::rules::api::witness::fallback_name),
@@ -362,23 +370,31 @@ impl SetterInRender {
                         MustResult::All(c) => Some(c),
                         _ => None,
                     });
+                let wording = Wording::of(w, comp_result, names);
                 let (rule_name, message) = match w.owner {
                     None if sync => (
                         "setter-in-render",
                         format!(
-                            "setter `{}` called in a useMemo body, which runs during render: \
+                            "{} called in a useMemo body{}, which runs during render: \
                              move this call into a useEffect or an event handler",
-                            names.name(&w.setter)
+                            wording.setter(),
+                            wording
+                                .through
+                                .as_ref()
+                                .map_or_else(String::new, |t| format!(" through `{t}`"))
                         ),
                     ),
-                    None => ("setter-in-render", unknown_phase_message(names, &w.setter)),
+                    None => ("setter-in-render", unknown_phase_message(&wording)),
                     Some(parent) => (
                         "cross-setter-in-render",
                         format!(
-                            "prop `{}` (a state setter of parent `{}`) called in a useMemo body \
-                             during render of `{}`, which triggers a parent re-render",
-                            names.name(&w.setter),
-                            result.display_name(parent),
+                            "{} called in a useMemo body{} during render of `{}`, which \
+                             triggers a parent re-render",
+                            wording.of_parent(&result.display_name(parent)),
+                            wording
+                                .through
+                                .as_ref()
+                                .map_or_else(String::new, |t| format!(" through `{t}`")),
                             result.display_name(component)
                         ),
                     ),
@@ -395,10 +411,7 @@ impl SetterInRender {
                     d = d.with_range(r);
                 }
                 d = d.with_step(
-                    crate::rules::Step::Call {
-                        callee: w.setter.clone(),
-                        class: crate::rules::EffectClass::Setter,
-                    },
+                    wording.step(w),
                     None,
                     w.span,
                     &ctx.names(&crate::rules::api::witness::fallback_name),
@@ -414,12 +427,83 @@ impl SetterInRender {
 /// `composeEventHandlers(a, cb)`), so every phase is possible and the render
 /// pass is one of them. Saying "called directly in the render body" of that row
 /// would state as fact the one thing the walk could not establish.
-fn unknown_phase_message(names: &crate::ir::SourceNames, var: &Var) -> String {
+fn unknown_phase_message(wording: &Wording) -> String {
     format!(
-        "setter `{}` is handed to a callee with no timing summary. If that callee \
+        "{} is handed to a callee{} with no timing summary. If that callee \
          runs it during render, this re-renders on every render",
-        names.name(var)
+        wording.setter(),
+        wording.through_clause()
     )
+}
+
+/// How a message names the setter a row writes through (D2,
+/// [`SlotWriter::named`]): as the source spells it at the call when that is
+/// the setter, else the slot's setter and what the write went through — an
+/// object handed to a callee, a closure of another component. No message
+/// calls a value that is not a setter one.
+struct Wording {
+    /// The setter's name, printed; `None` for a slot the source binds to no
+    /// name.
+    name: Option<String>,
+    /// The same name, unprinted, for the witness step.
+    raw: Option<Var>,
+    /// What the write went through, printed, when that is not the setter.
+    through: Option<String>,
+}
+
+impl Wording {
+    fn of(
+        w: &SlotWriter,
+        comp: &crate::engine::AnalysisResult<StateValue>,
+        names: &crate::ir::SourceNames,
+    ) -> Self {
+        let (raw, through) = w.named(&comp.calls, comp.component);
+        Wording {
+            name: raw.as_ref().map(|n| names.name(n).into_owned()),
+            raw,
+            through: through.map(|t| names.name(t).into_owned()),
+        }
+    }
+
+    /// "setter `setN`", or "a state setter".
+    fn setter(&self) -> String {
+        match &self.name {
+            Some(n) => format!("setter `{n}`"),
+            None => "a state setter".to_string(),
+        }
+    }
+
+    /// A parent's setter: the prop this component calls when the prop is
+    /// that setter, else the setter.
+    fn of_parent(&self, parent: &str) -> String {
+        match (&self.name, &self.through) {
+            (Some(n), None) => format!("prop `{n}` (a state setter of parent `{parent}`)"),
+            _ => format!("{} of parent `{parent}`", self.setter()),
+        }
+    }
+
+    /// " through `payload`," when the write went through a value that is not
+    /// the setter.
+    fn through_clause(&self) -> String {
+        self.through
+            .as_ref()
+            .map_or_else(String::new, |t| format!(" through `{t}`,"))
+    }
+
+    /// The witness step of the row's call: a call of the setter, or, for a
+    /// slot no name binds, a call of the value it went through.
+    fn step(&self, w: &SlotWriter) -> crate::rules::Step {
+        match &self.raw {
+            Some(raw) => crate::rules::Step::Call {
+                callee: raw.clone(),
+                class: crate::rules::EffectClass::Setter,
+            },
+            None => crate::rules::Step::Call {
+                callee: w.setter.clone(),
+                class: crate::rules::EffectClass::Unknown,
+            },
+        }
+    }
 }
 
 /// The rows of the writer relation this rule judges in the render: the

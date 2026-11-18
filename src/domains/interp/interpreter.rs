@@ -1164,7 +1164,7 @@ fn exec_callbacks_depth<T: Transfer>(
                             && value.as_ref().is_some_and(StateValue::surely_setter);
                         one_body || one_setter
                     };
-                    ctx.record(|r| r.record_escape(*id, i, applied, ran.bodies, sure));
+                    ctx.record(|r| r.record_escape(*id, i, applied, [], ran.bodies, sure));
                     // An object the callee is handed is no function it runs:
                     // it may return what the object holds (`Array.from(hs)`)
                     // or keep it, so it is handed to code the analysis does
@@ -1387,8 +1387,8 @@ fn hand_at<T: Transfer>(
     record_reach(at, sites.as_ref(), &setters, ctx);
 }
 
-/// Record at `at` the setters `setters` and everything `sites` reaches
-/// ([`Heap::reach_of`]).
+/// Record at `at` the setters `setters` the value is, and everything `sites`
+/// reaches ([`Heap::reach_of`]), which it holds.
 fn record_reach<D: AbstractDomain>(
     at: (ExprId, usize),
     sites: Option<&Sites>,
@@ -1406,7 +1406,8 @@ fn record_reach<D: AbstractDomain>(
         r.record_escape(
             at.0,
             at.1,
-            setters.iter().copied().chain(held),
+            setters.iter().copied(),
+            held,
             fns.iter().map(|(s, _)| *s),
             false,
         );
