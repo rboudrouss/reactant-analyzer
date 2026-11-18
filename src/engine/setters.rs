@@ -828,6 +828,12 @@ fn path_root(path: &str) -> &str {
 /// order, names and members sorted (#120). A member the value may hold
 /// without a site saying so — the value is open, or one of its sites does not
 /// record the member — is also visited as ⊤ (#240).
+///
+/// A name is visited once per value it holds: the paths a value leads to,
+/// and their values, depend on that value and the heap alone, so a block
+/// where the name holds a value an earlier block gave it would repeat a
+/// visit already made. Each visitor only collects what it is shown, so what
+/// it collects is the same.
 fn for_each_converged_path(
     cfg: &CFG,
     params: &[Var],
@@ -850,11 +856,17 @@ fn for_each_converged_path(
     let mut var_names: Vec<Var> = var_names.into_iter().collect();
     var_names.sort();
 
+    let mut visited: HashMap<&Var, Vec<EnvVal<StateValue>>> = HashMap::new();
     for env in cfg.blocks.keys().filter_map(|b| block_states.get(b)) {
         for var in &var_names {
             let Some(ev) = env.lookup_env_val(var) else {
                 continue;
             };
+            let values = visited.entry(var).or_default();
+            if values.contains(&ev) {
+                continue;
+            }
+            values.push(ev.clone());
             let mut stack: Vec<(Var, EnvVal<StateValue>)> = vec![(var.clone(), ev)];
             let mut seen: HashSet<crate::ir::types::ExprId> = HashSet::new();
             while let Some((name, ev)) = stack.pop() {
