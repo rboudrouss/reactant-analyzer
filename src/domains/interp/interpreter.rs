@@ -1105,6 +1105,13 @@ fn exec_callbacks_depth<T: Transfer>(
                     // A setter is run as a call of it (#291).
                     let applied = apply_setter(transfer, arg, &given, env, ctx, depth);
                     ctx.record(|r| r.record_escape(*id, i, applied, ran.bodies));
+                    // An object the callee is handed is no function it runs:
+                    // it may return what the object holds (`Array.from(hs)`)
+                    // or keep it, so it is handed to code the analysis does
+                    // not run (#254).
+                    if ran.objects {
+                        escape_at(transfer, arg, env, ctx, Some((*id, i)));
+                    }
                 } else {
                     let sites = escape_at(transfer, arg, env, ctx, Some((*id, i)));
                     if binds_args && i < positional {
@@ -1613,6 +1620,8 @@ pub(crate) fn exec_fn_value<T: Transfer>(
 pub(crate) struct Ran {
     pub bodies: BTreeSet<ExprId>,
     pub open: bool,
+    /// The value may be an object, which no call runs.
+    pub objects: bool,
     pub listing: bool,
 }
 
@@ -1679,6 +1688,7 @@ fn exec_heap_fns<T: Transfer>(
             returned = returned.join(&run.ret);
         } else {
             open = true;
+            ran.objects |= matches!(ctx.heap.get(id), Some(HeapValue::Obj(_)));
         }
     }
     ran.open |= open;

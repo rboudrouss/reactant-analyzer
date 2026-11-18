@@ -264,6 +264,10 @@ on a program React settles; 323 oracle cases, none a known false negative.
   allocation and call sites of what the component hands the hook (an
   argument, an initializer, a deps list): two closures, or two calls, were
   read as one.
+- A closure in an object or array handed to a callee that runs callbacks
+  (`Array.from(hs)`, an array method) and cannot run the object itself is
+  handed to that callee: it may run, and its writes count — `Array.from(hs)
+  .forEach((h) => h())` was silent in the store.
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error
