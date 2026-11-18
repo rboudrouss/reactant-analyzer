@@ -253,6 +253,10 @@ on a program React settles; 323 oracle cases, none a known false negative.
   (the loop it arms was silent) and no longer `a` (a false
   `unnecessary-rerender`); a rebinding on one branch, or in another effect,
   may write either (#327).
+- A call whose callee may be a closure of the component or something the
+  analysis does not see (`const f = make ?? mk`, a prop, a setter) holds what
+  the closure returns: `const g = f(); g()` runs the closure `mk` returns, and
+  the loop it arms was silent (#328).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

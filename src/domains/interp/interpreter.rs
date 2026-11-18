@@ -994,10 +994,11 @@ fn write_one_slot<T: Transfer>(
 /// `exec_body_depth`; otherwise `run_cfg → exec_full_stmt → exec_callbacks_depth`
 /// would double-execute. Nesting is handled naturally by that recursion.
 ///
-/// Returns the value of `expr` when it is a call of a local function whose
-/// every body this walk ran (B6): the join of what they returned, and where
-/// it points. `None` for any other expression, and for a call the walk could
-/// not resolve whole or skipped at the depth cap — the evaluator's ⊤ stands.
+/// Returns the value of `expr` when it is a call of a local function some
+/// body of which this walk ran (B6): the join of what they returned, and
+/// where it points, with ⊤ for the part of the callee it could not resolve
+/// (#328). `None` for any other expression, for a call no body of which ran,
+/// and for one skipped at the depth cap — the evaluator's value stands.
 fn exec_callbacks_depth<T: Transfer>(
     transfer: &T,
     expr: &Expr,
@@ -1376,8 +1377,8 @@ pub(crate) fn callback_args<T: Transfer>(
 /// ([`exec_heap_fns`]), a `useCallback` name through its hook body.
 /// Parameters are bound to `args` ([`bind_params`]). Also how an effect's
 /// returned cleanup runs, which React calls (#171). Returns what the call
-/// returns, with the allocation sites its returns place (#46); `None` when no
-/// body ran whole.
+/// returns, with the allocation sites its returns place (#46), ⊤ for the
+/// part of the callee no body stands for (#328); `None` when no body ran.
 pub(crate) fn exec_fn_value<T: Transfer>(
     transfer: &T,
     callee: &Expr,
@@ -1407,21 +1408,25 @@ pub(crate) fn exec_fn_value<T: Transfer>(
             // expression tree). Params stay unbound → env-miss ⊤, captures
             // resolve in the live env. A name two paths bound to two
             // callbacks runs either: each runs, and the call returns the
-            // join when every body is in reach.
+            // join, ⊤ when a body is out of reach (#328).
             if let Expr::Var(name) = other
                 && let Some(labels) = env.callback_labels(name).cloned()
             {
-                let mut returned = Some(T::Domain::bottom());
+                let mut returned: Option<T::Domain> = None;
+                let mut open = false;
                 for label in labels {
                     match ctx.query.callback_body(label) {
                         Some(body_cfg) => {
                             let ret = exec_body_depth(transfer, &body_cfg, env, ctx, depth + 1);
-                            returned = returned.map(|r| r.join(&ret));
+                            returned = Some(returned.map_or(ret.clone(), |r| r.join(&ret)));
                         }
-                        None => returned = None,
+                        None => open = true,
                     }
                 }
-                return returned.filter(|v| !v.is_bottom()).map(EnvVal::Val);
+                return returned
+                    .map(|r| if open { T::Domain::top() } else { r })
+                    .filter(|v| !v.is_bottom())
+                    .map(EnvVal::Val);
             }
             None
         }
@@ -1432,10 +1437,14 @@ pub(crate) fn exec_fn_value<T: Transfer>(
 /// (callbacks: `setTimeout(cb)`) and B6 (direct calls: `load()`,
 /// `api.tick()`).
 ///
-/// Returns the join of what the bodies returned when every target was a
-/// body that ran, with the allocation sites those returns place (#46):
-/// locations that include anything else, or open ones that may be something
-/// no site places (#240), answer `None`; so does a body no run returns from.
+/// Returns the join of what the bodies that ran returned, with the
+/// allocation sites those returns place (#46), and of what the rest of the
+/// callee may return (#328): where the locations include something that is
+/// no closure, or are open — may be something no site places (#240) — that
+/// part returns anything, ⊤ and open sites. Never less because a part is
+/// unknown: a closure a body that ran returns is one the call's value
+/// holds, so a later call of it runs it. `None` when no body ran, or none
+/// returns.
 fn exec_heap_fns<T: Transfer>(
     transfer: &T,
     sites: Sites,
@@ -1446,7 +1455,8 @@ fn exec_heap_fns<T: Transfer>(
 ) -> Option<EnvVal<T::Domain>> {
     let mut ids: Vec<_> = sites.ids.into_iter().collect();
     ids.sort();
-    let mut returned = (!sites.open).then(T::Domain::bottom);
+    let mut open = sites.open;
+    let mut returned = T::Domain::bottom();
     // `None` until a body is run, as in [`returned_sites`].
     let mut placed: Option<Option<Sites>> = None;
     for id in ids {
@@ -1462,14 +1472,18 @@ fn exec_heap_fns<T: Transfer>(
                 None => sites,
                 Some(acc) => Sites::join_opt(acc.as_ref(), sites.as_ref()),
             });
-            returned = returned.map(|acc| acc.join(&run.ret));
+            returned = returned.join(&run.ret);
         } else {
-            returned = None;
+            open = true;
         }
     }
-    returned
+    let placed = placed?;
+    if open {
+        return Some(EnvVal::located(placed.map(Sites::opened), T::Domain::top()));
+    }
+    Some(returned)
         .filter(|v| !v.is_bottom())
-        .map(|v| EnvVal::located(placed.flatten(), v))
+        .map(|v| EnvVal::located(placed, v))
 }
 
 /// The parameters and body of `closure`, a heap `Fn`, and the env its body

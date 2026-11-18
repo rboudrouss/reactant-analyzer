@@ -973,6 +973,52 @@ fn unnecessary_rerender_reads_the_setter_the_name_holds_at_the_call() {
     assert!(!claims_a("s = onX; s(5);"), "`s` is the parent's setter");
 }
 
+// ── #328: a call's value joins what every run body returned ─────────────────
+
+/// A callee that is a closure of the component and something the heap does
+/// not place — a prop, a setter — runs the closure, and the call's value
+/// holds what it returns: the next call runs that closure. Two closures of
+/// the component each return theirs.
+#[test]
+fn a_call_holds_what_every_body_it_ran_returned() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function Open({ make }: { make?: () => () => void }) {
+  const [n, setN] = useState(0);
+  const mk = () => () => setN(7);
+  const f = make ?? mk;
+  useEffect(() => { const g = f(); g(); }, []);
+  return <div>{n}</div>;
+}
+export function OrSetter({ c }: { c?: boolean }) {
+  const [n, setN] = useState(0);
+  const [a, setA] = useState(0);
+  const mk = (_v: number) => () => setN(7);
+  const f: (v: number) => unknown = c ? mk : setA;
+  useEffect(() => { const r = f(3); if (typeof r === "function") r(); }, []);
+  return <div>{n}{a}</div>;
+}
+export function Two({ c }: { c?: boolean }) {
+  const [n, setN] = useState(0);
+  const [a, setA] = useState(0);
+  const mk1 = () => () => setN(7);
+  const mk2 = () => () => setA(8);
+  const f = c ? mk1 : mk2;
+  useEffect(() => { const g = f(); g(); }, []);
+  return <div>{n}{a}</div>;
+}
+"#;
+    let result = analyze(src);
+    assert!(
+        holds(&result, "Open", 0, 7.0),
+        "`make ?? mk`: `mk`'s closure"
+    );
+    assert!(holds(&result, "OrSetter", 0, 7.0), "`mk`'s closure");
+    assert!(holds(&result, "OrSetter", 1, 3.0), "the setter's write");
+    assert!(holds(&result, "Two", 0, 7.0), "`mk1`'s closure");
+    assert!(holds(&result, "Two", 1, 8.0), "`mk2`'s closure");
+}
+
 /// What an escaped closure writes is what the slot gets, nothing more: a
 /// write of the value the slot holds leaves it exact.
 #[test]
