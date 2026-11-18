@@ -158,3 +158,146 @@ fn a_hook_named_use_effect_event_from_elsewhere_stays_unknown() {
         vec![Severity::Warning]
     );
 }
+
+/// [`parse_and_analyze`] with the summaries the CLI loads, React's
+/// `useEffectEvent` among them.
+fn analyze_with_summaries(src: &str) -> ProgramAnalysisResult {
+    use oxc_allocator::Allocator;
+    use oxc_parser::{ParseOptions, Parser};
+    use oxc_span::SourceType;
+
+    let alloc = Allocator::default();
+    let ret = Parser::new(&alloc, src, SourceType::tsx())
+        .with_options(ParseOptions::default())
+        .parse();
+    assert!(ret.diagnostics.is_empty(), "{:?}", ret.diagnostics);
+    let path = std::path::Path::new("test.tsx");
+    let components = lower_program(&ret.program, src, path, &mut Default::default());
+    let hooks = lower_custom_hooks(&ret.program, src, path, &mut Default::default());
+    let config = Config {
+        summary_registry: reactant::registry::SummaryRegistry::new_with_common(),
+        ..Config::default()
+    };
+    analyze_program(
+        ComponentRegistry::from_components(components),
+        HookRegistry::from_hooks(hooks),
+        RootStrategy::AllComponents,
+        &config,
+    )
+}
+
+/// The severities of the findings named `rule` on `name`, whichever rule
+/// emits them (`setter-in-render` emits `cross-setter-in-render`).
+fn severities(r: &ProgramAnalysisResult, name: &str, rule: &str) -> Vec<Severity> {
+    let ctx = RuleCtx::new(r, r.component_named(name).unwrap());
+    all_rules()
+        .iter()
+        .flat_map(|x| x.check(&ctx))
+        .filter(|d| d.rule == rule)
+        .map(|d| d.severity())
+        .collect()
+}
+
+const CALLED: &str = r#"
+import { useState, useEffect, useEffectEvent } from "react";
+import { useEffectEvent as useForeignEvent } from "some-lib";
+
+export function InEffect() {
+  const [a, setA] = useState(0);
+  const bump = useEffectEvent(() => setA(a + 1));
+  useEffect(() => {
+    bump();
+  });
+  return <p>{a}</p>;
+}
+
+function useEveryCommit(cb: () => void) {
+  const stable = useEffectEvent(cb);
+  useEffect(() => {
+    stable();
+  });
+}
+
+export function ThroughHook() {
+  const [a, setA] = useState(0);
+  useEveryCommit(() => setA(a + 1));
+  return <p>{a}</p>;
+}
+
+export function ForeignInEffect() {
+  const [a, setA] = useState(0);
+  const bump = useForeignEvent(() => setA(a + 1));
+  useEffect(() => {
+    bump();
+  });
+  return <p>{a}</p>;
+}
+
+export function InRender() {
+  const [a, setA] = useState(0);
+  const bump = useEffectEvent(() => setA(a + 1));
+  bump();
+  return <p>{a}</p>;
+}
+
+export function InRenderCallback() {
+  const [a, setA] = useState(0);
+  const bump = useEffectEvent(() => setA(a + 1));
+  [1].forEach(bump);
+  return <p>{a}</p>;
+}
+
+export function Child({ onX }: { onX: () => void }) {
+  onX();
+  return <p />;
+}
+
+export function HandedToChild() {
+  const [a, setA] = useState(0);
+  const bump = useEffectEvent(() => setA(a + 1));
+  return (
+    <div>
+      {a}
+      <Child onX={bump} />
+    </div>
+  );
+}
+"#;
+
+/// React's `useEffectEvent` hands back a function whose call runs its
+/// argument outside a render: called in an effect with no deps, the write
+/// loops, and the whole proof holds (sure, Sync, placed, dominating).
+#[test]
+fn an_effect_event_called_in_an_effect_is_a_certain_loop() {
+    let r = analyze_with_summaries(CALLED);
+    for name in ["InEffect", "ThroughHook"] {
+        assert_eq!(
+            severities(&r, name, "infinite-loop"),
+            vec![Severity::Error],
+            "{name}"
+        );
+    }
+    // A package's hook of that name is code the analysis does not see: its
+    // argument is handed to it at the call, a possible write of unknown
+    // timing, never an Error.
+    assert_eq!(
+        severities(&r, "ForeignInEffect", "setter-in-render"),
+        vec![Severity::Warning]
+    );
+    assert!(severities(&r, "ForeignInEffect", "infinite-loop").is_empty());
+}
+
+/// During a render React throws instead of running the argument: no call of
+/// the function there is a certain write, whoever calls it.
+#[test]
+fn an_effect_event_called_during_a_render_is_never_a_certain_write() {
+    let r = analyze_with_summaries(CALLED);
+    for (name, rule) in [
+        ("InRender", "setter-in-render"),
+        ("InRenderCallback", "setter-in-render"),
+        ("Child", "cross-setter-in-render"),
+    ] {
+        let found = severities(&r, name, rule);
+        assert!(!found.contains(&Severity::Error), "{name}: {found:?}");
+    }
+}

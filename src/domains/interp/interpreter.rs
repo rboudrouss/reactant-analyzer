@@ -624,11 +624,21 @@ fn bind_rhs<T: Transfer>(
     let mut sites = alloc_literal(transfer, rhs, env, ctx);
     // A hook that hands back a function running its argument
     // (`useEffectEvent`): a call through the value runs that function, which
-    // is where it points for every reader (#320).
+    // is where it points for every reader (#320). A function of its own,
+    // at the hook's site, when the argument is one closure: what tells a
+    // call of it, which throws during a render, from a call of the closure
+    // ([`Heap::alloc_event`]).
     if let Expr::HookMarker(label, _) = rhs
         && let Some(arg) = ctx.query.hands_back(*label)
     {
         sites = alloc_literal(transfer, arg, env, ctx);
+        let site = ctx.component.hook_site(*label);
+        if let Some(Sites { ids, open: false }) = &sites
+            && let [closure] = ids.iter().copied().collect::<Vec<_>>()[..]
+            && ctx.heap.alloc_event(site, closure)
+        {
+            sites = Some(Sites::closed([site]));
+        }
     }
     env.bind_locs(var.to_string(), sites);
     // `useRef` returns the hook's one object (#268): the closures a body
@@ -1003,7 +1013,8 @@ fn call_evaluation<T: Transfer>(
     let one_body = written.is_empty()
         && ran.bodies.len() == 1
         && !ran.open
-        && sv.as_ref().is_some_and(StateValue::is_reference_only);
+        && sv.as_ref().is_some_and(StateValue::is_reference_only)
+        && runs_here(&ran, ctx);
     crate::engine::calls::Evaluation {
         setters: written.iter().map(|(slot, _)| *slot).collect(),
         bodies: ran.bodies,
@@ -1015,6 +1026,13 @@ fn call_evaluation<T: Transfer>(
             .map(|(slot, v)| (slot, v.as_state_value().unwrap_or_else(StateValue::top)))
             .collect(),
     }
+}
+
+/// The bodies `ran` lists surely run when called here: none is a function
+/// `useEffectEvent` hands back called in a render, where React throws
+/// instead ([`Heap::alloc_event`]).
+fn runs_here<D: AbstractDomain>(ran: &Ran, ctx: &AnalysisCtx<D>) -> bool {
+    !ctx.render || !ran.bodies.iter().any(|site| ctx.heap.is_event(*site))
 }
 
 /// [`exec_slot_write`] for one target slot.
@@ -1158,7 +1176,8 @@ fn exec_callbacks_depth<T: Transfer>(
                         let one_body = applied.is_empty()
                             && ran.bodies.len() == 1
                             && !ran.open
-                            && value.as_ref().is_some_and(StateValue::is_reference_only);
+                            && value.as_ref().is_some_and(StateValue::is_reference_only)
+                            && runs_here(&ran, ctx);
                         let one_setter = applied.len() == 1
                             && ran.bodies.is_empty()
                             && value.as_ref().is_some_and(StateValue::surely_setter);
@@ -2037,6 +2056,7 @@ pub(crate) fn closure_env<D: AbstractDomain>(
         captured_locs,
         owner,
         captured_slots,
+        ..
     } = closure
     else {
         return None;

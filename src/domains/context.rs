@@ -290,6 +290,11 @@ pub struct AnalysisCtx<'a, D: AbstractDomain> {
     pub calls: Option<&'a RefCell<crate::engine::CallRelation>>,
     /// What each call of a local function this context ran returned (#333).
     pub returns: Returns<D>,
+    /// This context evaluates a render: the render body and what it runs
+    /// synchronously, a memo's body, a ref's initial value. A function
+    /// `useEffectEvent` hands back throws when called there, so no call of
+    /// one is sure to run its body ([`Heap::is_event`]).
+    pub render: bool,
 }
 
 /// What each call of a local function a pass ran returned, by call site
@@ -381,6 +386,7 @@ impl<'a, D: AbstractDomain> AnalysisCtx<'a, D> {
             plans: None,
             calls: None,
             returns: Returns::default(),
+            render: false,
         }
     }
 

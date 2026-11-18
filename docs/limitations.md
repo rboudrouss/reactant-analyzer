@@ -73,12 +73,14 @@ that writes it (see *Cross-file limits*).
   [#264](https://github.com/rboudrouss/reactant-analyzer/issues/264). React's
   `useEffectEvent` is the exception: its argument — a literal, or a name bound to one or to a
   `useCallback` value — runs where a name bound once to the function it hands back is called, as a
-  `useCallback` value does, and a call through its value runs the argument, so a call React would
-  reject during render is still read as running it. A function a hook hands back is where every
+  `useCallback` value does, and a call through its value runs the argument: surely outside a
+  render, when the argument is one closure; during a render React throws instead, and such a call
+  is still read as possibly running it, never as a certain write. A function a hook hands back is where every
   reader finds a closure, wherever the value goes (a prop a child calls, #320): a `useCallback`
   literal's closure, `useCallback(f, deps)`'s `f`, what a memo returns, `useEffectEvent`'s
-  argument. A package's wrapper with no summary (`useCallbackRef`) is a hook the analysis does
-  not inline: its argument runs with the handlers. A few package hooks have a timing of their
+  argument. A package's wrapper with no summary (`useCallbackRef`, a library's `useEvent` or
+  `useEffectEvent`) is a hook the analysis does not inline: its argument runs with the handlers,
+  and a write through it is never an Error. A few package hooks have a timing of their
   own (`engine::timing`): `use-debounce`'s `useDebouncedCallback(fn, wait)` runs `fn` deferred
   when it gets no options and its result is only called, cancelled or listed in deps (a `flush`, a
   `leading` option or a result handed elsewhere keep it of unknown timing), and `usehooks-ts`'s

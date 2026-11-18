@@ -41,6 +41,10 @@ pub enum HeapValue {
         /// creation (`AbstractEnv::slot_label`): what the body's conditions
         /// on them change with (#197).
         captured_slots: HashMap<Symbol, HookLabel>,
+        /// The function React's `useEffectEvent` hands back, which runs this
+        /// body when called outside a render and throws when called during
+        /// one ([`Heap::alloc_event`]).
+        event: bool,
     },
     /// An abstract object: fields may be plain values or heap locations (for FnLit props).
     Obj(Members),
@@ -435,8 +439,48 @@ impl Heap {
                 captured_locs,
                 owner,
                 captured_slots,
+                event: false,
             },
         );
+    }
+
+    /// At `id`, the function React's `useEffectEvent` hands back for the
+    /// closure at `of`, when `of` is one: a function of its own — a new one
+    /// at every render — whose call runs the latest committed argument, with
+    /// the call's arguments, outside a render, and throws during one
+    /// (react-dom 19.3.1 `cjs/react-dom-client.development.js:9060-9082`,
+    /// `ref.impl` set at commit, :15817). Its body and captures are the
+    /// closure's. `false` when `of` is no closure.
+    pub fn alloc_event(&mut self, id: ExprId, of: ExprId) -> bool {
+        let Some(HeapValue::Fn {
+            params,
+            body_cfg,
+            captured,
+            captured_locs,
+            owner,
+            captured_slots,
+            ..
+        }) = self.cells.get(&of)
+        else {
+            return false;
+        };
+        let event = HeapValue::Fn {
+            params: params.clone(),
+            body_cfg: Arc::clone(body_cfg),
+            captured: captured.clone(),
+            captured_locs: captured_locs.clone(),
+            owner: *owner,
+            captured_slots: captured_slots.clone(),
+            event: true,
+        };
+        self.cells.insert(id, event);
+        true
+    }
+
+    /// The function at `id` is one `useEffectEvent` hands back
+    /// ([`Heap::alloc_event`]).
+    pub fn is_event(&self, id: ExprId) -> bool {
+        matches!(self.cells.get(&id), Some(HeapValue::Fn { event: true, .. }))
     }
 
     pub fn get(&self, id: ExprId) -> Option<&HeapValue> {
@@ -614,6 +658,7 @@ impl Heap {
                     captured_locs: locs_self,
                     owner,
                     captured_slots: slots_self,
+                    event,
                 }) => {
                     if let HeapValue::Fn {
                         captured: cap_other,
@@ -654,6 +699,7 @@ impl Heap {
                                 captured_locs: joined_locs,
                                 owner: *owner,
                                 captured_slots: joined_slots,
+                                event: *event,
                             },
                         );
                     }
@@ -875,6 +921,7 @@ mod tests {
                 captured_locs: HashMap::from([("o".to_string(), Sites::closed([o]))]),
                 owner: parent,
                 captured_slots: HashMap::new(),
+                event: false,
             },
         );
         (h, f)

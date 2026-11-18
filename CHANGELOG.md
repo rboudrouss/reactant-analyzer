@@ -323,6 +323,12 @@ on a program React settles; 323 oracle cases, none a known false negative.
   `mk().go()`, `someCall(mk())`, `<Child onX={mk()} />` run or hand over the
   closure `mk` returns, and so does a callee written as a literal
   (`[h][0]()`). Each was silent, in the render and in effects (#333).
+- React's `useEffectEvent` is a known hook again (no `analysis-limit` Info):
+  its result is a new function at every render whose call runs the argument.
+  Called in an effect with no deps, it is an `infinite-loop` Error again, as
+  before the writer walk read the call relation (#320); called during a
+  render, where React throws, it is never one. A library's `useEvent` or
+  `useEffectEvent` stays unknown.
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

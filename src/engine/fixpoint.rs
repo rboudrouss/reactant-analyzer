@@ -446,7 +446,8 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 memo: &MemoStore<StateValue>,
                 heap: &mut Heap,
                 children: bool,
-                effect: Option<HookLabel>| {
+                effect: Option<HookLabel>,
+                render: bool| {
         let mut out = writes.clone();
         let (envs, returns) = {
             let mut ac = AnalysisCtx {
@@ -461,6 +462,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 plans: Some(&plans),
                 calls: recording,
                 returns: Default::default(),
+                render,
             };
             let envs = analyze_cfg(transfer, cfg, entry, &mut ac);
             if let Some(label) = effect {
@@ -558,6 +560,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             &mut heap,
             true,
             None,
+            true,
         );
         block_states = bs;
         drop(profile);
@@ -587,6 +590,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 plans: Some(&plans),
                 calls: recording,
                 returns: std::mem::take(&mut returns),
+                render: true,
             };
             let updates = hooks
                 .iter()
@@ -626,6 +630,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 plans: Some(&plans),
                 calls: recording,
                 returns,
+                render: true,
             };
             for hook in &hooks {
                 if let HookEntry::Ref { label, init, .. } = hook {
@@ -660,6 +665,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                     &mut heap,
                     true,
                     Some(*label),
+                    false,
                 );
                 effect_block_states.insert(*label, eff_bs);
                 for slot in eff_state.labels() {
@@ -702,6 +708,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                     &mut heap,
                     true,
                     None,
+                    false,
                 );
                 handler_block_states.insert(*label, h_bs);
                 state_from_handlers = state_from_handlers.join(&h_state);
@@ -728,6 +735,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 plans: Some(&plans),
                 calls: recording,
                 returns: Default::default(),
+                render: false,
             };
             crate::domains::interp::run_escaped(transfer, &escaped_bodies, &env_exit, &mut ac);
             state_from_handlers = state_from_handlers.join(&out);
@@ -807,6 +815,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             &mut heap,
             false,
             None,
+            true,
         );
         block_states = bs;
     }

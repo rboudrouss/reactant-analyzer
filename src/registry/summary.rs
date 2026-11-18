@@ -76,6 +76,7 @@ impl SummaryRegistry {
     /// find this definition".
     pub fn new_with_common() -> Self {
         let mut r = Self::new();
+        r.register_for_package("react", Box::new(EffectEventSummary));
         r.register_many_for_package("@tanstack/react-query", TANSTACK_HOOKS);
         r.register_many_for_package("react-router-dom", REACT_ROUTER_HOOKS);
         r.register_many_for_package("react-router", REACT_ROUTER_HOOKS);
@@ -234,6 +235,22 @@ impl HookSummary for NavigatorSummary {
     }
     fn navigates(&self) -> bool {
         true
+    }
+}
+
+/// React's `useEffectEvent`: a new function at every render — `mountEvent`
+/// and `updateEvent` each return a fresh closure (react-dom 19.3.1
+/// `cjs/react-dom-client.development.js:9060-9082`). What a call of it runs,
+/// its argument, outside a render only, is the interpreter's
+/// (`QueryContext::hands_back`, `Heap::alloc_event`).
+struct EffectEventSummary;
+
+impl HookSummary for EffectEventSummary {
+    fn name(&self) -> &str {
+        "useEffectEvent"
+    }
+    fn summarize(&self, _args: &[StateValue]) -> StateValue {
+        StateValue::reference(crate::domains::impls::Stability::PerRender)
     }
 }
 

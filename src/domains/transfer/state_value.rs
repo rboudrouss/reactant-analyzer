@@ -2959,6 +2959,7 @@ mod tests {
                 captured_locs: std::collections::HashMap::new(),
                 owner: crate::test_support::C,
                 captured_slots: std::collections::HashMap::new(),
+                event: false,
             },
         );
         StateValueTransfer.exec_stmt(
