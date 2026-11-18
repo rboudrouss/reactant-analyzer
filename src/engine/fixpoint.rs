@@ -749,63 +749,18 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             false,
         );
         block_states = bs;
-        env_exit = exit_env(&render_cfg, &block_states);
     }
 
     let final_state = state;
     let hook_calls = collect_hook_calls(&hooks, &render_cfg);
     let effect_info = collect_effect_info(&hooks);
     let handler_info = collect_handler_info(&hooks);
-    // A write through a parent's setter prop is a row too, owner-qualified
-    // (ADR-042 §2) — the same resolution `setter-in-render` reads — and so is
-    // one through a name or member the converged values bind to an own setter.
-    let render_params = std::slice::from_ref(&comp_param);
-    let converged_setters = crate::engine::setters::collect_component_setter_vars(
-        &render_cfg,
-        render_params,
-        &block_states,
-        &heap,
-    );
-    // The envs each row's argument is evaluated in: the converged stores, and
-    // the per-block envs of the region the row sits in.
-    let site_envs = crate::engine::written::SiteEnvs {
-        component: comp_id,
-        state: &final_state,
-        memo: &memo_store,
-        heap: &heap,
-        render_entry: &initial_env,
-        render_exits: &block_states,
-        exit: &env_exit,
-        effect_exits: &effect_block_states,
-        handler_exits: &handler_block_states,
-    };
-    let slot_writers = crate::engine::setters::collect_slot_writers(
-        &render_cfg,
-        render_params,
-        &hooks,
-        &inline_regions,
-        &hook_provenance,
-        &converged_setters,
-        &site_envs,
-        &reducers,
-        dispatches,
-    );
-    // The seed relation rides the same slice: it folds `slot_writers` rows and
-    // the effects' declared deps, so it must come after both (#106, ADR-031).
-    let slot_seeds = crate::engine::seeds::collect_slot_seeds(
-        &render_cfg,
-        &hooks,
-        &comp_param,
-        &crate::engine::setters::setter_labels_of(&render_cfg, &hooks),
-        &slot_writers,
-        &effect_info,
-    );
-    // The registration relation rides the same slice (#111, ADR-034): one
-    // scan of the effect bodies, read by `stale-closure`, `missing-cleanup`
-    // and the Tier-A `registrations` anchor alike.
-    let registrations =
-        crate::engine::registrations::collect_registrations(&render_cfg, &hooks, dispatches);
     let hooks_clone = hooks.clone();
+    let pending = RelationInputs {
+        inline_regions,
+        reducers: reducers.into_own(),
+        dispatches,
+    };
 
     let mut result = AnalysisResult {
         component: comp_id,
@@ -829,22 +784,121 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         render_cfg,
         hooks: hooks_clone,
         hook_provenance,
-        slot_writers,
-        slot_seeds,
-        registrations,
+        slot_writers: Vec::new(),
+        slot_seeds: Vec::new(),
+        registrations: Vec::new(),
         effect_triggers: Vec::new(),
         effect_reruns: HashMap::new(),
         effect_props: Default::default(),
         iterations: iteration,
         heap,
+        relations_pending: None,
     };
+    // An inter-component analysis may be thrown away (a child re-analysed
+    // under a bigger join, a root rendered by a later root, a probe): its
+    // relations wait for `analyze_program` to know which result is kept.
+    match inter {
+        Some(_) => result.relations_pending = Some(Box::new(pending)),
+        None => compute_relations(&mut result, pending, None, program),
+    }
+    result
+}
+
+/// What [`compute_relations`] needs beyond the converged result: the splice
+/// regions, the component's own reducers and whether the program dispatches
+/// events. Kept on a result whose relations are not computed yet.
+#[derive(Debug, Clone)]
+pub(crate) struct RelationInputs {
+    inline_regions: crate::engine::setters::InlineRegions,
+    reducers: HashMap<HookLabel, crate::engine::reducers::Reducer>,
+    dispatches: bool,
+}
+
+/// The relations the rules read off a converged result: the writer rows, the
+/// seeds, the registrations and the effect triggers.
+///
+/// A pure function of the result: every body it runs, it runs through a null
+/// context, so it writes no shared state. `program_reducers` is the table the
+/// analysis registered its reducers in; it only grows, and with values a
+/// component's own hooks fix, so a slot the converged result can name was
+/// registered before the analysis ended (by the analysis that minted its
+/// setter) and reads the same entry at any later point.
+fn compute_relations(
+    result: &mut AnalysisResult<StateValue>,
+    inputs: RelationInputs,
+    program_reducers: Option<&crate::engine::ProgramReducers>,
+    program: &ProgramFacts,
+) {
+    let RelationInputs {
+        inline_regions,
+        reducers,
+        dispatches,
+    } = inputs;
+    let comp_id = result.component;
+    let reducers = crate::engine::Reducers::registered(comp_id, reducers, program_reducers);
+    let env_exit = result.exit_env();
+    // A write through a parent's setter prop is a row too, owner-qualified
+    // (ADR-042 §2) — the same resolution `setter-in-render` reads — and so is
+    // one through a name or member the converged values bind to an own setter.
+    let render_params = std::slice::from_ref(&result.param);
+    let converged_setters = crate::engine::setters::collect_component_setter_vars(
+        &result.render_cfg,
+        render_params,
+        &result.block_states,
+        &result.heap,
+    );
+    // The envs each row's argument is evaluated in: the converged stores, and
+    // the per-block envs of the region the row sits in.
+    let site_envs = crate::engine::written::SiteEnvs {
+        component: comp_id,
+        state: &result.state_store,
+        memo: &result.memo_store,
+        heap: &result.heap,
+        render_entry: &result.render_entry,
+        render_exits: &result.block_states,
+        exit: &env_exit,
+        effect_exits: &result.effect_block_states,
+        handler_exits: &result.handler_block_states,
+    };
+    let slot_writers = crate::engine::setters::collect_slot_writers(
+        &result.render_cfg,
+        render_params,
+        &result.hooks,
+        &inline_regions,
+        &result.hook_provenance,
+        &converged_setters,
+        &site_envs,
+        &reducers,
+        dispatches,
+    );
+    // The seed relation rides the same slice: it folds `slot_writers` rows and
+    // the effects' declared deps, so it must come after both (#106, ADR-031).
+    let slot_seeds = crate::engine::seeds::collect_slot_seeds(
+        &result.render_cfg,
+        &result.hooks,
+        &result.param,
+        &crate::engine::setters::setter_labels_of(&result.render_cfg, &result.hooks),
+        &slot_writers,
+        &result.effect_info,
+    );
+    // The registration relation rides the same slice (#111, ADR-034): one
+    // scan of the effect bodies, read by `stale-closure`, `missing-cleanup`
+    // and the Tier-A `registrations` anchor alike.
+    let registrations = crate::engine::registrations::collect_registrations(
+        &result.render_cfg,
+        &result.hooks,
+        dispatches,
+    );
+    result.slot_writers = slot_writers;
+    result.slot_seeds = slot_seeds;
+    result.registrations = registrations;
     // The effect-trigger relation (ADR-042 §3): a dep evaluated in the render
     // exit env, the one every hook body starts from, and what it is computed
     // from where the effect is called. A module name some body of the
     // program writes, this one's inlined bodies included, is a cell (#224).
-    let mut written = crate::engine::render_deps::written_names(&result);
+    let mut written = crate::engine::render_deps::written_names(result);
     written.extend(program.written.iter().cloned());
-    let sources = crate::engine::render_deps::render_deps(&result, &written).effect_deps;
+    let sources = crate::engine::render_deps::render_deps(result, &written).effect_deps;
     let relation = {
         let mut scratch = result.heap.clone();
         crate::engine::triggers::collect_effect_triggers(
@@ -868,7 +922,6 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     result.effect_triggers = relation.rows;
     result.effect_reruns = relation.reruns;
     result.effect_props = relation.props;
-    result
 }
 
 // ── Program-level analysis ────────────────────────────────────────────────────
@@ -1002,6 +1055,16 @@ pub fn analyze_program(
             stats.borrow_mut().components_analyzed += 1;
             results.borrow_mut().insert(root, result);
             analysed.insert(root);
+        }
+    }
+    // The results phase 1 kept: the last analysis of each component. Their
+    // relations are computed now, once. No other analysis needs them: during
+    // phase 1 `results` is read only by `flow_back` (its heap), an analysis
+    // that is replaced is dropped unread, and a probe below is read only
+    // through `SiteFacts::of` (exit env, stores, heap).
+    for result in results.borrow_mut().values_mut() {
+        if let Some(inputs) = result.relations_pending.take() {
+            compute_relations(result, *inputs, Some(&reducers), &program);
         }
     }
 

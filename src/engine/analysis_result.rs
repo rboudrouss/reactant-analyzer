@@ -282,6 +282,11 @@ pub struct AnalysisResult<D: AbstractDomain> {
     /// variables in `block_states` to their function bodies and captured envs.
     /// Defaults to `Heap::new()` for components analyzed without initial heap context.
     pub heap: Heap,
+    /// What the relations above (`slot_writers` … `effect_props`) are
+    /// computed from, while they are not: an inter-component analysis leaves
+    /// them to the program analysis, which computes them for the result it
+    /// keeps. `None` once they are.
+    pub(crate) relations_pending: Option<Box<crate::engine::fixpoint::RelationInputs>>,
 }
 
 impl<D: AbstractDomain> AnalysisResult<D> {

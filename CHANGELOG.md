@@ -79,6 +79,10 @@ on a program React settles; 323 oracle cases, none a known false negative.
 - Faster `infinite-loop` on programs with many effect cycles: a component
   renders only the cycles it carries an edge of; mantine 471 s → 416 s,
   findings unchanged.
+- Faster on components rendered from many places: the writer, seed,
+  registration and effect-trigger relations are computed once, for the
+  analysis of each component that is kept, not for every re-analysis of a
+  child or per-site probe; mantine 416 s → 365 s, findings unchanged.
 - `always-unstable-deps` also reports a dep that is a new reference at every
   render where it holds an object and a primitive otherwise
   (`items?.filter(f)`, `items && items.map(f)`, `c ? [x] : undefined`), with

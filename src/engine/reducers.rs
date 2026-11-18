@@ -68,6 +68,26 @@ impl<'a> Reducers<'a> {
         }
     }
 
+    /// The reducers of a component whose own were registered by
+    /// [`Reducers::new`] when it was analysed: the same table, registering
+    /// nothing.
+    pub fn registered(
+        component: ComponentId,
+        own: HashMap<HookLabel, Reducer>,
+        program: Option<&'a ProgramReducers>,
+    ) -> Self {
+        Reducers {
+            component,
+            own,
+            program,
+        }
+    }
+
+    /// The component's own reducers, for [`Reducers::registered`].
+    pub fn into_own(self) -> HashMap<HookLabel, Reducer> {
+        self.own
+    }
+
     /// The reducer of `(owner, label)`, `None` for a `useState` slot.
     pub fn get(&self, owner: ComponentId, label: HookLabel) -> Option<Reducer> {
         if owner == self.component {
