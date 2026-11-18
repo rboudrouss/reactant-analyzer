@@ -434,6 +434,19 @@ impl HookEntry {
         }
     }
 
+    /// The parameters [`Self::body_cfg`] binds: a callback's and a handler's,
+    /// none for an effect or a memo body. Exhaustive for the same reason.
+    pub fn body_params(&self) -> &[Var] {
+        match self {
+            HookEntry::Callback { params, .. } | HookEntry::Handler { params, .. } => params,
+            HookEntry::Effect { .. }
+            | HookEntry::Memo { .. }
+            | HookEntry::State { .. }
+            | HookEntry::Ref { .. }
+            | HookEntry::Custom { .. } => &[],
+        }
+    }
+
     /// The deps argument of the hook kinds that take one (`Effect`, `Memo`,
     /// `Callback`, `Custom`). Exhaustive for the reason [`Self::body_cfg`] is.
     pub fn deps_mut(&mut self) -> Option<&mut DepsArg> {

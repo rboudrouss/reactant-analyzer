@@ -1776,10 +1776,27 @@ function A() {
 /// React's documented "adjust state during render" idiom: the guard compares
 /// the slot against the very expression the write stores in it, so the two are
 /// equal on the next render and the branch is dead (twenty `CurrencyInput`).
+/// That holds only while the next pass computes the same value (#331): a pure
+/// builtin of the props does, a function the analysis does not see may not.
 #[test]
 fn a_write_that_settles_its_own_guard_is_not_a_render_setter() {
     let fired = rules_fired(
         r#"
+        function C({ value, decimals }) {
+          const [scale, setScale] = useState(0);
+          const scaleForCurrentValue = Math.max(decimals, String(value).length);
+          if (scale < scaleForCurrentValue) { setScale(scaleForCurrentValue); }
+          return <div>{scale}</div>;
+        }
+        "#,
+    );
+    assert!(
+        !fired.iter().any(|r| r == "setter-in-render"),
+        "the guard cannot hold again once the slot holds what it compares against: {fired:?}"
+    );
+    let fired = rules_fired(
+        r#"
+        import { getSafeScale } from "./scale";
         function C({ value, decimals }) {
           const [scale, setScale] = useState(0);
           const scaleForCurrentValue = getSafeScale(value, decimals);
@@ -1789,8 +1806,8 @@ fn a_write_that_settles_its_own_guard_is_not_a_render_setter() {
         "#,
     );
     assert!(
-        !fired.iter().any(|r| r == "setter-in-render"),
-        "the guard cannot hold again once the slot holds what it compares against: {fired:?}"
+        fired.iter().any(|r| r == "setter-in-render"),
+        "an unseen function may return another value at each pass: {fired:?}"
     );
 }
 
@@ -1965,30 +1982,84 @@ fn a_second_spread_proves_nothing_about_the_dep_member() {
     );
 }
 
-/// dub `submitted-lead-table.tsx:204`: the branch is reached only while
-/// `sheet.leadId` is truthy and leaves `null` there.
+/// dub `submitted-lead-table.tsx:204`: the `else` branch is reached only
+/// while `sheet.leadId` is truthy and leaves `null` there. The first branch
+/// settles only while `searchParams.get("leadId")` returns the same value at
+/// each run (#331): a router's search params do
+/// (`library_stores::a_guarded_copy_of_the_search_params_stays_silent`, dub's
+/// shape), a prop's `get` is code the analysis does not see.
 #[test]
 fn a_member_write_that_falsifies_its_own_guard_is_not_a_loop() {
-    let fired = rules_fired(
-        r#"
-        function C({ searchParams }) {
-          const [sheet, setSheet] = useState({ leadId: null, open: false });
-          useEffect(() => {
-            const urlLeadId = searchParams.get("leadId");
-            if (urlLeadId && urlLeadId !== sheet.leadId) {
-              setSheet({ leadId: urlLeadId, open: true });
-            } else if (!urlLeadId && sheet.leadId) {
-              setSheet({ leadId: null, open: false });
-            }
-          }, [searchParams, sheet.leadId]);
-          return <div>{sheet.leadId}</div>;
-        }
-        "#,
-    );
+    let program = |read: &str| {
+        format!(
+            r#"
+        function C({{ searchParams, leadId }}) {{
+          const [sheet, setSheet] = useState({{ leadId: null, open: false }});
+          useEffect(() => {{
+            const urlLeadId = {read};
+            if (urlLeadId && urlLeadId !== sheet.leadId) {{
+              setSheet({{ leadId: urlLeadId, open: true }});
+            }} else if (!urlLeadId && sheet.leadId) {{
+              setSheet({{ leadId: null, open: false }});
+            }}
+          }}, [searchParams, leadId, sheet.leadId]);
+          return <div>{{sheet.leadId}}</div>;
+        }}
+        "#
+        )
+    };
+    let fired = rules_fired(&program("leadId"));
     assert!(
         !fired.iter().any(|r| r == "infinite-loop"),
         "neither branch can hold again after its own write: {fired:?}"
     );
+    let fired = rules_fired(&program(r#"searchParams.get("leadId")"#));
+    assert!(
+        fired.iter().any(|r| r == "infinite-loop"),
+        "an unseen `get` may return another value at each run: {fired:?}"
+    );
+}
+
+/// #331: the relational arm kills `n !== x` only while the effect's next run
+/// computes the same `x`. `Math.random()` is another number at each run, and
+/// a name a closure assigns is what the closure last stored: React loops.
+#[test]
+fn an_effect_write_settles_only_on_a_value_its_next_run_computes_again() {
+    for src in [
+        r#"
+        function C() {
+          const [n, setN] = useState(0);
+          useEffect(() => { const x = Math.random(); if (n !== x) setN(x); }, [n]);
+          return <div>{n}</div>;
+        }
+        "#,
+        r#"
+        function C({ k }) {
+          const [n, setN] = useState(0);
+          let x = k;
+          const f = () => { x = n + 1; };
+          useEffect(() => { f(); if (n !== x) setN(x); }, [n]);
+          return <div>{n}</div>;
+        }
+        "#,
+    ] {
+        let fired = rules_fired(src);
+        assert!(
+            fired.iter().any(|r| r == "infinite-loop"),
+            "{src}: {fired:?}"
+        );
+    }
+    // A prop, or a pure builtin of one, holds.
+    let fired = rules_fired(
+        r#"
+        function C({ k }) {
+          const [n, setN] = useState(0);
+          useEffect(() => { const x = Math.max(k, 1); if (n !== x) setN(x); }, [n, k]);
+          return <div>{n}</div>;
+        }
+        "#,
+    );
+    assert!(!fired.iter().any(|r| r == "infinite-loop"), "{fired:?}");
 }
 
 /// The write leaves the member truthy, so the guard survives it.

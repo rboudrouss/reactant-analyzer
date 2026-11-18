@@ -104,11 +104,7 @@ that writes it (see *Cross-file limits*).
   where the loop rules read it as ⊤ ([#219](https://github.com/rboudrouss/reactant-analyzer/issues/219)):
   a render that dispatches an event to such a listener is not their finding. A child component
   the analysis does not resolve is read as calling the props it is handed on an event only
-  [#325](https://github.com/rboudrouss/reactant-analyzer/issues/325). A guarded render write
-  settles when the guard dies once the written expression sits in the slot, read as holding
-  across the render passes even when it depends on the slot itself (`const x = n + 1; if (n !==
-  x) setN(x)`, a loop the analysis reports nothing on,
-  [#331](https://github.com/rboudrouss/reactant-analyzer/issues/331)). A rest parameter (`(...fs)`) and `arguments` are the arrays of the call's arguments
+  [#325](https://github.com/rboudrouss/reactant-analyzer/issues/325). A rest parameter (`(...fs)`) and `arguments` are the arrays of the call's arguments
   [#324](https://github.com/rboudrouss/reactant-analyzer/issues/324); from a spread on an argument
   may sit at any position, and `fs.length` / `arguments.length` are not modelled, so a guard on
   them never rules a write out. Utility *inlining* is statement-position only [#52](https://github.com/rboudrouss/reactant-analyzer/issues/52). A setter
@@ -476,7 +472,11 @@ carries an Error.
   revive each other's guard — and reads a guard inside a callback the render runs synchronously
   (`[1].forEach(() => { if (n !== 1) setN(1); })`) in the env of the callback's run
   [#269](https://github.com/rboudrouss/reactant-analyzer/issues/269); a callback handed to a
-  callee with no timing summary keeps its Warning.
+  callee with no timing summary keeps its Warning. The compared expression must hold across the
+  passes: a literal, a prop, a slot no render write moves, or a builtin the purity table knows
+  over those; a call of a function the analysis does not see (an import, a `RegExp`'s `exec`, a
+  prop's method) keeps the Warning, and so does a name of a callback's own scope
+  [#331](https://github.com/rboudrouss/reactant-analyzer/issues/331).
 - **A library hook's per-member contract is a table, not an inference.** `useForm()`, `useRouter()`
   and SWR's `mutate` have their stable members listed by name. A member that is not listed reads ⊤, so
   a library that adds one, or a library with no entry at all, keeps firing. `formState`, `data` and

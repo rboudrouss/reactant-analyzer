@@ -297,6 +297,14 @@ on a program React settles; 323 oracle cases, none a known false negative.
   a write in a concise `useMemo` body has a location (#314).
 - An array or object literal handed to a callee that runs callbacks
   (`Array.from([setN], f)`) is handed on: a setter it holds may be written.
+- A guarded write settles only on a value the next pass computes again: in
+  the render, one that reads no slot a render write moves, no name a
+  function assigns, no memo of a moving slot and no call that may return
+  another value (`const x = n + 1; if (n !== x) setN(x)`, `Math.random()`,
+  two writes chasing each other's slot); in an effect, no impure call and no
+  name a closure assigns. Each was a silent loop; a guard on a value an
+  unseen function returns (`getSafeScale(value)`, a prop's `get`) is now a
+  Warning (#331).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

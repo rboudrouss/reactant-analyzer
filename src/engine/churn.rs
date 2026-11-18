@@ -102,15 +102,12 @@ use crate::{
         SlotWriter, WriterPhase, WriterRegion,
         dominance::on_all_paths,
         guards::{
-            Invariance, MemberWrites, SlotPath, WriteSite, call_may_differ,
-            converges_under_all_writes, let_bindings, must_slot_paths, mutated_roots, site_guards,
+            Invariance, LoopFacts, MemberWrites, SlotPath, WriteSite, call_may_differ,
+            converges_under_all_writes, let_bindings, must_slot_paths, site_guards,
         },
         registrations::dispatches_events,
         render_deps::written_names,
-        setters::{
-            memo_val_labels, must_alias_scopes, must_state_vals, resolve_setter_aliases,
-            state_val_labels,
-        },
+        setters::{must_alias_scopes, must_state_vals},
         store::{STORE_SLOT, body_writes},
         triggers::{Always, Rerun},
         triggers_of,
@@ -445,9 +442,8 @@ fn ancestors(c: ComponentId, tree: &ComponentTree<'_>) -> HashSet<ComponentId> {
 pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
     // Per-component facts the proofs read.
     struct CompCtx<'a> {
-        /// The names some render binding ties to a slot's read: a may
-        /// reading, for what may move.
-        state_vals: HashMap<Var, HookLabel>,
+        /// What the invariance proofs read ([`LoopFacts`]).
+        facts: LoopFacts<'a>,
         /// The names the render binds to a slot's read on every path, no
         /// other body rebinding them (`setters::must_state_vals`): what the
         /// proofs may read as the slot itself (#210, #222).
@@ -458,15 +454,9 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         slot_paths: HashMap<Var, SlotPath>,
         /// The member writes into each slot's object, in any body (#252).
         members: MemberWrites<'a>,
-        memo_vals: HashMap<Var, HookLabel>,
-        memo_deps: HashMap<HookLabel, &'a [Expr]>,
-        /// The render arguments of each hook call left to a summary.
-        hook_args: HashMap<HookLabel, &'a [Expr]>,
-        render_lets: HashMap<&'a str, Option<&'a Expr>>,
         /// Every body but the render, with its parameters
         /// (`setters::must_alias_scopes`).
         scopes: Vec<(&'a [Var], &'a CFG)>,
-        mutated: HashSet<Var>,
         /// The props hold across every loop the component's edges can be on:
         /// no write the loop can run moves a slot of an ancestor (#206), and
         /// no effect of the component reacts to another component's slot.
@@ -580,46 +570,17 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
 
     for (&comp, comp_result) in &result.components {
         let cfg = &comp_result.render_cfg;
-        let mut mutated = module_written.clone();
-        mutated.extend(mutated_roots(cfg));
-        for body in comp_result.hooks.iter().filter_map(HookEntry::body_cfg) {
-            mutated.extend(mutated_roots(body));
-        }
-        let state_vals = resolve_setter_aliases(cfg, &state_val_labels(cfg));
         let scopes = must_alias_scopes(cfg, &comp_result.hooks);
         let must_state_vals = must_state_vals(cfg, &scopes);
         let slot_paths = must_slot_paths(cfg, &scopes, &must_state_vals);
         ctxs.insert(
             comp,
             CompCtx {
-                state_vals,
+                facts: LoopFacts::of(comp_result, &module_written),
                 must_state_vals,
                 slot_paths,
                 members: MemberWrites::of(comp_result),
-                memo_vals: resolve_setter_aliases(cfg, &memo_val_labels(cfg)),
-                memo_deps: comp_result
-                    .hooks
-                    .iter()
-                    .filter_map(|h| match h {
-                        HookEntry::Memo { label, deps, .. }
-                        | HookEntry::Callback { label, deps, .. } => deps
-                            .list()
-                            .filter(|d| d.arity.exact().is_some())
-                            .map(|d| (*label, d.as_slice())),
-                        _ => None,
-                    })
-                    .collect(),
-                hook_args: comp_result
-                    .hooks
-                    .iter()
-                    .filter_map(|h| match h {
-                        HookEntry::Custom { label, args, .. } => Some((*label, args.as_slice())),
-                        _ => None,
-                    })
-                    .collect(),
-                render_lets: let_bindings(cfg),
                 scopes,
-                mutated,
                 // An effect's rows: a memo's write is a render-phase write,
                 // whose re-runs the render's own sites already stand for.
                 // The store is read here as the proofs read it before it
@@ -834,27 +795,19 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 HookEntry::Callback { label, .. } => Some((*label, None)),
                 _ => None,
             })
-            .filter_map(|(l, b)| ctx.memo_deps.get(&l).map(|d| (l, (b, *d))))
+            .filter_map(|(l, b)| ctx.facts.memo_deps.get(&l).map(|d| (l, (b, *d))))
             .collect();
         Allocated {
             render,
             elsewhere: &ctx.scopes,
-            mutated: &ctx.mutated,
+            mutated: &ctx.facts.mutated,
             memos,
             no_reference: &no_reference,
         }
         .fresh(e, body, 8)
     }
     fn invariance_of<'c>(ctx: &'c CompCtx<'_>, store_moves: bool) -> Invariance<'c> {
-        Invariance {
-            render: &ctx.render_lets,
-            state_vals: &ctx.state_vals,
-            memo_vals: &ctx.memo_vals,
-            memo_deps: &ctx.memo_deps,
-            mutated: &ctx.mutated,
-            store_moves,
-            hook_args: &ctx.hook_args,
-        }
+        ctx.facts.invariance(store_moves)
     }
     /// Does every element that mounts `c` keep it mounted across the loop,
     /// and is its parent kept mounted in turn (#213)? An element keeps its
@@ -883,7 +836,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     !e.closure
                         && e.held
                             .iter()
-                            .all(|x| invariance.holds(x, &ctx.render_lets, ctx.props_hold))
+                            .all(|x| invariance.holds(x, &ctx.facts.render_lets, ctx.props_hold))
                         && stays(e.parent, tree, result, ctxs, store_moves, memo)
                 })
             });

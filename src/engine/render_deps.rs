@@ -489,8 +489,12 @@ pub fn written_names(result: &AnalysisResult<impl AbstractDomain>) -> HashSet<Va
 /// it is an [`AnalysisResult`]: a component or a custom hook as lowered.
 pub(crate) fn written_in(params: &[Var], body: &CFG, hooks: &[HookEntry]) -> HashSet<Var> {
     let mut out = written_roots(params, body);
-    for body in hooks.iter().filter_map(HookEntry::body_cfg) {
-        out.extend(written_roots(&[], body));
+    // A callback's own parameter is bound in its body: a default it stores
+    // there (`({ a } = {}) => …` assigns its `__p0`) writes nothing outside.
+    for hook in hooks {
+        if let Some(body) = hook.body_cfg() {
+            out.extend(written_roots(hook.body_params(), body));
+        }
     }
     out
 }

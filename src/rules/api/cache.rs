@@ -13,9 +13,13 @@
 //! each entry is computed on first use. Adding a new program-level structure
 //! means one more lazily-initialized field — never a rebuild in `check`.
 
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
-use crate::engine::{ProgramAnalysisResult, ProgramRelations, churn::ChurnGraph};
+use crate::engine::{
+    ProgramAnalysisResult, ProgramRelations, churn::ChurnGraph, render_deps::written_names,
+};
+use crate::ir::types::Var;
 use crate::rules::helpers::context_flow::ContextConsumers;
 use crate::rules::helpers::mount::MountIndex;
 use crate::rules::helpers::render_tree::RenderIndex;
@@ -28,6 +32,7 @@ pub struct ProgramCache<'a> {
     mounts: OnceLock<MountIndex>,
     consumers: OnceLock<ContextConsumers>,
     render: OnceLock<RenderIndex>,
+    written: OnceLock<HashSet<Var>>,
 }
 
 impl<'a> ProgramCache<'a> {
@@ -37,7 +42,21 @@ impl<'a> ProgramCache<'a> {
             mounts: OnceLock::new(),
             consumers: OnceLock::new(),
             render: OnceLock::new(),
+            written: OnceLock::new(),
         }
+    }
+
+    /// The names some function of the program writes outside itself
+    /// ([`written_names`], joined over every component): a module binding
+    /// among them moves with no slot.
+    pub(in crate::rules) fn written(&self) -> &HashSet<Var> {
+        self.written.get_or_init(|| {
+            self.program()
+                .components
+                .values()
+                .flat_map(written_names)
+                .collect()
+        })
     }
 
     pub fn program(&self) -> &'a ProgramAnalysisResult {

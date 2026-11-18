@@ -1,14 +1,16 @@
 use crate::rules::RuleCtx;
 use std::collections::{HashMap, HashSet};
 
+use crate::domains::StateValue;
 use crate::ir::{
     ComponentId,
+    cfg::CFG,
     expr::Expr,
     stmt::Stmt,
     types::{BlockId, HookLabel, Var},
 };
 
-use crate::engine::guards::converges_once_written;
+use crate::engine::guards::{Invariance, LoopFacts, converges_once_written};
 use crate::engine::triggers::{Always, Rerun};
 use crate::engine::{Change, SlotWriter, WriterPhase, WriterRegion, triggers_of};
 use crate::ir::hooks::HookEntry;
@@ -102,6 +104,24 @@ impl SetterInRender {
         // The names some body of the component assigns, made once and only
         // when a closure's settling proof needs them.
         let assigned = std::cell::OnceCell::new();
+        // What a settling proof reads as held across the passes of the
+        // render loop (#331): only the writes that may run in a render pass
+        // run between two of them. Made once, when a proof needs it.
+        let facts = std::cell::OnceCell::new();
+        let moving = render_pass_slots(result, component);
+        let store_moves = comp_result
+            .slot_writers
+            .iter()
+            .any(|w| w.writes_store() && in_render_pass(w));
+        let free = |v: &str| v == comp_result.param || comp_result.module_consts.contains_key(v);
+        let between = || Between {
+            invariance: facts
+                .get_or_init(|| LoopFacts::of(comp_result, ctx.cache().written()))
+                .invariance(store_moves),
+            render: &comp_result.render_cfg,
+            moving: &moving,
+            free: &free,
+        };
         let all = rows.clone();
         let judge = |w: &SlotWriter| -> Option<Diagnostic> {
             let sync = w.phase == WriterPhase::Render;
@@ -132,15 +152,18 @@ impl SetterInRender {
                 && let Some((site, bid)) = w.own
                 && sole_render_writer(result, component, w.slot)
             {
+                let between = between();
+                let render = &comp_result.render_cfg;
                 let settles = match site {
                     None => converges_once_written(
-                        &comp_result.render_cfg,
+                        render,
                         bid,
                         &state_vals,
                         &members,
                         w.slot,
                         &eval_in_exit_env(arg, comp_result),
                         Some(arg),
+                        &|e| between.holds(e, render, &|x| eval_in_exit_env(x, comp_result)),
                         &comp_result.exit_env(),
                         &mut |e| eval_in_exit_env(e, comp_result),
                     ),
@@ -152,6 +175,7 @@ impl SetterInRender {
                         &state_vals,
                         &members,
                         assigned.get_or_init(|| assigned_names(comp_result)),
+                        &between,
                     ),
                 };
                 if settles {
@@ -461,6 +485,7 @@ fn settles_in_closure(
     slots: &HashMap<Var, crate::engine::guards::SlotPath>,
     members: &crate::engine::guards::MemberWrites<'_>,
     assigned: &HashSet<Var>,
+    between: &Between<'_>,
 ) -> bool {
     let Some(body) = comp.calls.body(site) else {
         return false;
@@ -492,18 +517,18 @@ fn settles_in_closure(
         .filter(|(v, _)| !hidden(v))
         .map(|(v, p)| (v.clone(), p.clone()))
         .collect();
-    let mut heap = comp.heap.clone();
-    let mut eval = |e: &Expr| {
+    let value = |e: &Expr, heap: &mut crate::domains::stores::Heap| {
         crate::engine::eval::eval_in_stores(
             e,
             &env,
             comp.component,
             &comp.state_store,
             &comp.memo_store,
-            &mut heap,
+            heap,
         )
     };
-    let written = eval(arg);
+    let mut heap = comp.heap.clone();
+    let written = value(arg, &mut heap);
     converges_once_written(
         body,
         block,
@@ -512,9 +537,59 @@ fn settles_in_closure(
         label,
         &written,
         Some(arg),
+        &|e| between.holds(e, body, &|x| value(x, &mut comp.heap.clone())),
         &env,
-        &mut eval,
+        &mut |e| value(e, &mut heap),
     )
+}
+
+/// What a settling proof reads as held across the passes of the render loop
+/// ([`Invariance::holds_between_passes`], #331).
+struct Between<'a> {
+    invariance: Invariance<'a>,
+    render: &'a CFG,
+    /// The slots a write that may run in a render pass writes.
+    moving: &'a HashSet<HookLabel>,
+    /// A name nothing in the component binds that holds: its props, a module
+    /// constant.
+    free: &'a dyn Fn(&str) -> bool,
+}
+
+impl Between<'_> {
+    /// Does `e`, read in `body`, denote one value on every pass? `value`
+    /// evaluates it where it is read.
+    fn holds(&self, e: &Expr, body: &CFG, value: &dyn Fn(&Expr) -> StateValue) -> bool {
+        self.invariance
+            .holds_between_passes(e, body, self.render, self.free, self.moving, value)
+    }
+}
+
+/// A write that may run in a render pass of the component whose slot it
+/// writes: of a render or memo body, synchronously or at an unknown time.
+fn in_render_pass(w: &SlotWriter) -> bool {
+    matches!(w.region, WriterRegion::Render | WriterRegion::Memo(_))
+        && matches!(
+            w.phase,
+            WriterPhase::Render | WriterPhase::Memo | WriterPhase::Unknown
+        )
+}
+
+/// The slots of `component` some write that may run in a render pass writes:
+/// its own, or another component's through a prop.
+fn render_pass_slots(
+    result: &crate::engine::ProgramAnalysisResult,
+    component: crate::ir::ComponentId,
+) -> HashSet<HookLabel> {
+    result
+        .components
+        .iter()
+        .flat_map(|(c, r)| {
+            r.slot_writers.iter().filter(move |w| {
+                in_render_pass(w) && w.owner.unwrap_or(*c) == component && !w.writes_store()
+            })
+        })
+        .map(|w| w.slot)
+        .collect()
 }
 
 /// Slot `label` of `component` has exactly one write that may run in a
@@ -525,14 +600,7 @@ fn sole_render_writer(
     component: crate::ir::ComponentId,
     label: HookLabel,
 ) -> bool {
-    let render_pass = |w: &&SlotWriter| {
-        w.slot == label
-            && matches!(w.region, WriterRegion::Render | WriterRegion::Memo(_))
-            && matches!(
-                w.phase,
-                WriterPhase::Render | WriterPhase::Memo | WriterPhase::Unknown
-            )
-    };
+    let render_pass = |w: &&SlotWriter| w.slot == label && in_render_pass(w);
     let own = result.components[&component]
         .slot_writers
         .iter()

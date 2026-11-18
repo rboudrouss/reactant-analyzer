@@ -103,7 +103,11 @@ pub(crate) fn must_slot_paths(
 /// of `cfg` itself (a render site); `eval` evaluates the literal the member
 /// arm reads, and nothing else. `slots` is the must table
 /// (`must_slot_paths`) and `members` the member writes of the slots'
-/// objects, as for [`converges_under_all_writes`] (#231, #252).
+/// objects, as for [`converges_under_all_writes`] (#231, #252). `held` says
+/// whether a part of `written_expr` denotes one value on every pass of the
+/// loop the caller judges (#331): `const x = n + 1; if (n !== x) setN(x)`
+/// stores a value the next pass recomputes from the slot, so the guard
+/// holds again.
 #[allow(clippy::too_many_arguments)]
 pub fn converges_once_written(
     cfg: &CFG,
@@ -113,6 +117,7 @@ pub fn converges_once_written(
     label: HookLabel,
     written: &StateValue,
     written_expr: Option<&Expr>,
+    held: &dyn Fn(&Expr) -> bool,
     exit_env: &AbstractEnv<StateValue>,
     eval: &mut dyn FnMut(&Expr) -> StateValue,
 ) -> bool {
@@ -120,15 +125,12 @@ pub fn converges_once_written(
     if guards.is_empty() {
         return false;
     }
-    // Between two passes of a render-phase loop only render writes run, and
-    // each of them is a site the caller judges on its own: the written
-    // expression is read as holding across the passes this site sees.
     let own = Rewrite {
         label,
         value: written.clone(),
         expr: written_expr,
         scope: Some(cfg),
-        held: &|_| true,
+        held,
     };
     // `exit_env` is this body's own env: nothing is shadowed.
     dead_once_written(&guards, None, slots, members, &[own], exit_env, eval)
@@ -369,11 +371,12 @@ fn names_unbound(
 /// the next is state, whatever is derived from it — a memo, a callback, a
 /// hook's result — a fresh allocation, and whatever a body mutates.
 /// Everything else holds: a literal; a name bound once, in the body or in the
-/// render, to something that holds; a name nothing binds — a prop, a module
-/// name — while props hold. A call over held inputs holds: the standard the
-/// relational arm has always applied to an effect-local const
-/// (`searchParams.get("leadId")`). So does a memo or a callback whose deps
-/// list is exact and holds: React hands back the cached value.
+/// render, to something that holds, and assigned by no function that does not
+/// bind it; a name nothing binds — a prop, a module name — while props hold.
+/// A call over held inputs holds when its callee is a function of them
+/// ([`purity`]): `searchParams.get("leadId")` on a router's search params
+/// does, `Math.random()` does not (#331). So does a memo or a callback whose
+/// deps list is exact and holds: React hands back the cached value.
 ///
 /// A hook whose summary says its result moves only on navigation — the
 /// router's `useSearchParams`, `useParams`, `usePathname`, `useLocation` —
@@ -393,15 +396,159 @@ pub struct Invariance<'a> {
     pub memo_deps: &'a HashMap<HookLabel, &'a [Expr]>,
     /// The names some body of the component writes or mutates.
     pub mutated: &'a HashSet<Var>,
+    /// The names a function assigns without binding them
+    /// ([`LoopFacts::assigned`]).
+    pub assigned: &'a HashSet<Var>,
     /// Some body of the program the loop can run writes the store
     /// (`churn::build_edges`), so a held value may move inside the loop.
     pub store_moves: bool,
     /// The render arguments of each hook call a summary answers for, by the
     /// marker's label: what a held result moves with besides the store.
     pub hook_args: &'a HashMap<HookLabel, &'a [Expr]>,
+    /// The documented kind of each library hook's result
+    /// ([`purity::hook_result`]).
+    pub hook_kinds: &'a HashMap<HookLabel, Kind>,
+    /// The names the file binds at module level: never a global.
+    pub module: &'a HashSet<Var>,
+}
+
+/// The per-component facts an [`Invariance`] reads, built once.
+pub struct LoopFacts<'a> {
+    /// The render's bindings ([`let_bindings`]).
+    pub render_lets: Bindings<'a>,
+    /// The names some render binding ties to a slot's read: a may reading,
+    /// for what may move.
+    pub state_vals: HashMap<Var, HookLabel>,
+    pub memo_vals: HashMap<Var, HookLabel>,
+    /// The deps of each memo and callback whose list is exact.
+    pub memo_deps: HashMap<HookLabel, &'a [Expr]>,
+    /// The render arguments of each hook call left to a summary.
+    pub hook_args: HashMap<HookLabel, &'a [Expr]>,
+    pub hook_kinds: HashMap<HookLabel, Kind>,
+    /// The names some body writes or mutates: `written` (the module names
+    /// some function of the program writes) and the receivers of every
+    /// body's member writes and mutating calls.
+    pub mutated: HashSet<Var>,
+    /// The names a function of the component assigns without binding them
+    /// itself: `let x = p; const f = () => { x = n + 1 }` leaves `x` bound
+    /// once in the render, yet `f()` moves it (#331).
+    pub assigned: HashSet<Var>,
+    pub module: HashSet<Var>,
+}
+
+impl<'a> LoopFacts<'a> {
+    pub fn of(comp: &'a crate::engine::AnalysisResult<StateValue>, written: &HashSet<Var>) -> Self {
+        use crate::engine::setters::{memo_val_labels, resolve_setter_aliases, state_val_labels};
+        let cfg = &comp.render_cfg;
+        let bodies = || comp.hooks.iter().filter_map(HookEntry::body_cfg);
+        let mut mutated = written.clone();
+        mutated.extend(mutated_roots(cfg));
+        for body in bodies() {
+            mutated.extend(mutated_roots(body));
+        }
+        // A hook body's own writes are `written`'s (`render_deps::written_in`).
+        let mut assigned = HashSet::new();
+        for root in std::iter::once(cfg).chain(bodies()) {
+            for (params, body) in nested_bodies(root) {
+                assigned.extend(crate::engine::render_deps::written_roots(params, body));
+            }
+        }
+        let custom = || {
+            comp.hooks.iter().filter_map(|h| match h {
+                HookEntry::Custom {
+                    label,
+                    args,
+                    name,
+                    import_source,
+                    ..
+                } => Some((*label, args.as_slice(), name, import_source)),
+                _ => None,
+            })
+        };
+        LoopFacts {
+            render_lets: let_bindings(cfg),
+            state_vals: resolve_setter_aliases(cfg, &state_val_labels(cfg)),
+            memo_vals: resolve_setter_aliases(cfg, &memo_val_labels(cfg)),
+            memo_deps: comp
+                .hooks
+                .iter()
+                .filter_map(|h| match h {
+                    HookEntry::Memo { label, deps, .. }
+                    | HookEntry::Callback { label, deps, .. } => deps
+                        .list()
+                        .filter(|d| d.arity.exact().is_some())
+                        .map(|d| (*label, d.as_slice())),
+                    _ => None,
+                })
+                .collect(),
+            hook_args: custom().map(|(l, args, ..)| (l, args)).collect(),
+            hook_kinds: custom()
+                .map(|(l, _, name, source)| (l, purity::hook_result(source.as_deref(), name)))
+                .filter(|(_, k)| *k != Kind::Unknown)
+                .collect(),
+            mutated,
+            assigned,
+            module: comp.module_consts.keys().cloned().collect(),
+        }
+    }
+
+    /// The [`Invariance`] these facts answer, `store_moves` as its field.
+    pub fn invariance(&self, store_moves: bool) -> Invariance<'_> {
+        Invariance {
+            render: &self.render_lets,
+            state_vals: &self.state_vals,
+            memo_vals: &self.memo_vals,
+            memo_deps: &self.memo_deps,
+            mutated: &self.mutated,
+            assigned: &self.assigned,
+            store_moves,
+            hook_args: &self.hook_args,
+            hook_kinds: &self.hook_kinds,
+            module: &self.module,
+        }
+    }
 }
 
 impl<'a> Invariance<'a> {
+    /// A name some body may move: it writes or mutates it, or a function
+    /// assigns it without binding it.
+    fn moves(&self, v: &str) -> bool {
+        self.mutated.contains(v) || self.assigned.contains(v)
+    }
+
+    /// The kind of `e` read in `body`, as the purity model names it: a name
+    /// through its one binding, a library hook's result by its documented
+    /// kind, a member of an object literal by the member's, a free name of
+    /// the language's global scope by its own.
+    fn kind(&self, e: &Expr, body: Option<&Bindings<'_>>, depth: usize) -> Kind {
+        if depth == 0 {
+            return Kind::Unknown;
+        }
+        let next = depth - 1;
+        match e.peel_ts() {
+            Expr::Var(v) => {
+                if self.moves(v)
+                    || self.state_vals.contains_key(v)
+                    || self.memo_vals.contains_key(v)
+                {
+                    return Kind::Unknown;
+                }
+                match self.binding(v, body) {
+                    Some((Some(rhs), scope)) => self.kind(rhs, scope, next),
+                    Some((None, _)) => Kind::Unknown,
+                    None if self.module.contains(v) => Kind::Unknown,
+                    None => purity::global(v),
+                }
+            }
+            Expr::HookMarker(l, _) => self.hook_kinds.get(l).copied().unwrap_or_default(),
+            Expr::FieldAccess { obj, field } => match self.member(obj, field, body) {
+                Some(Member::Expr(m, scope)) => self.kind(m, scope, next),
+                _ => Kind::Unknown,
+            },
+            other => purity::kind_of(other, &|v| self.kind(&Expr::Var(v.to_string()), body, next)),
+        }
+    }
+
     /// Does `e`, read in a body with `bindings`, denote the same value on
     /// every run? `props_hold` is false across an edge from another
     /// component's slot, whose change is what moves this component's props.
@@ -453,6 +600,29 @@ impl<'a> Invariance<'a> {
             .then_some(out)
     }
 
+    /// Does `e`, read in `body`, denote one value on every pass of a
+    /// render-phase loop (#331)? Between two passes only the writes that may
+    /// run in a render pass run, so `e` holds when it reads none of the slots
+    /// they write (`moving`), no name a body moves, and crosses no call that
+    /// may return another value on the same inputs: a pure builtin returning
+    /// a primitive does not; any other call only when `value`, what `e`
+    /// evaluates to, says it cannot ([`call_may_differ`]). A prop holds:
+    /// React re-runs the component with the same props.
+    pub fn holds_between_passes(
+        &self,
+        e: &Expr,
+        body: &CFG,
+        render: &CFG,
+        free: &dyn Fn(&str) -> bool,
+        moving: &HashSet<HookLabel>,
+        value: &dyn Fn(&Expr) -> StateValue,
+    ) -> bool {
+        self.reads(e, body, render, free).is_some_and(|r| {
+            r.slots.iter().all(|l| !moving.contains(l))
+                && !((r.impure || r.reference) && call_may_differ(&value(e), |_| false, r.impure))
+        })
+    }
+
     /// `scopes` innermost first: a name resolves in the first scope that
     /// binds it, and its right-hand side reads from that scope outwards.
     fn read_into<'e>(
@@ -492,7 +662,7 @@ impl<'a> Invariance<'a> {
                 // A state name reads the slot through its binding
                 // (`let s = StateVal(l)`), and every other binding with it.
                 if self.memo_vals.contains_key(v)
-                    || self.mutated.contains(v)
+                    || self.moves(v)
                     || scopes.iter().any(|s| s.nested.contains(v))
                 {
                     return false;
@@ -544,7 +714,7 @@ impl<'a> Invariance<'a> {
                 // binding's right-hand side is, its own names left unknown.
                 let unbound = |v: &str| {
                     !free(v)
-                        && !self.mutated.contains(v)
+                        && !self.moves(v)
                         && scopes
                             .iter()
                             .all(|s| !s.bindings.contains_key(v) && !s.nested.contains(v))
@@ -557,9 +727,12 @@ impl<'a> Invariance<'a> {
                     }
                 };
                 let var = |v: &str| match scopes.iter().find_map(|s| s.bindings.get(v)) {
-                    Some(rhs) if rhs.len() == 1 && !self.mutated.contains(v) => {
-                        purity::kind_of(rhs[0], &shallow)
-                    }
+                    Some(rhs) if rhs.len() == 1 && !self.moves(v) => match rhs[0].peel_ts() {
+                        Expr::HookMarker(l, _) => {
+                            self.hook_kinds.get(l).copied().unwrap_or_default()
+                        }
+                        r => purity::kind_of(r, &shallow),
+                    },
                     _ => shallow(v),
                 };
                 let callee = Callee::of(fn_, &mut |x| purity::kind_of(x, &var));
@@ -572,6 +745,7 @@ impl<'a> Invariance<'a> {
                 );
                 out.call = true;
                 out.impure |= known.is_none();
+                out.reference |= !matches!(known, Some(Kind::Str | Kind::Num | Kind::Bool));
                 // A global holds: nothing of it to read.
                 let global = matches!(
                     callee,
@@ -634,7 +808,7 @@ impl<'a> Invariance<'a> {
         match e.peel_ts() {
             Expr::Lit(_) => true,
             Expr::Var(v) => {
-                if self.state_vals.contains_key(v) || self.mutated.contains(v) {
+                if self.state_vals.contains_key(v) || self.moves(v) {
                     return false;
                 }
                 if let Some(&l) = self.memo_vals.get(v) {
@@ -672,7 +846,19 @@ impl<'a> Invariance<'a> {
             }
             Expr::UnaryOp { arg, .. } => self.go(arg, body, props_hold, next),
             Expr::Call { fn_, args, .. } => {
-                self.go(fn_, body, props_hold, next)
+                // Only a callee that is a function of its inputs: a global
+                // has nothing of its own to read.
+                let kind = |x: &Expr| self.kind(x, body, next);
+                let callee = Callee::of(fn_, &mut |x| kind(x));
+                let pure = purity::call(callee, false, args, &|i| kind(&args[i]), &|v| {
+                    kind(&Expr::Var(v.to_string()))
+                })
+                .is_some();
+                let global = matches!(
+                    callee,
+                    Callee::Value(Kind::Global(_)) | Callee::Method(Kind::Global(_), _)
+                );
+                pure && (global || self.go(fn_, body, props_hold, next))
                     && args.iter().all(|a| self.go(a, body, props_hold, next))
             }
             Expr::HookMarker(l, MarkerVal::Summary(sv)) => {
@@ -722,10 +908,7 @@ impl<'a> Invariance<'a> {
         let Expr::Var(v) = obj.peel_ts() else {
             return None;
         };
-        if self.state_vals.contains_key(v)
-            || self.memo_vals.contains_key(v)
-            || self.mutated.contains(v)
-        {
+        if self.state_vals.contains_key(v) || self.memo_vals.contains_key(v) || self.moves(v) {
             return None;
         }
         let (Some(rhs), scope) = self.binding(v, body)? else {
@@ -768,6 +951,9 @@ pub struct Reads {
     /// One of those calls is not known to compute the same content from the
     /// same inputs ([`purity`], #224).
     pub impure: bool,
+    /// One of those calls is not known to return a primitive: its result may
+    /// be a reference, new at each call.
+    pub reference: bool,
 }
 
 /// May a value that passed through a call differ between two runs over the
