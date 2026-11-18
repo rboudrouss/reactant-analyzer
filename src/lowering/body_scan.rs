@@ -68,6 +68,41 @@ impl<'a> Visit<'a> for Scan {
     }
 }
 
+/// Whether a function's parameters or body read its own `arguments` (#324):
+/// the name anywhere outside a nested `function`, which binds its own. An
+/// arrow binds none, so one nested here reads this function's.
+pub(crate) fn reads_arguments(params: &FormalParameters, body: &FunctionBody) -> bool {
+    let mut scan = ArgumentsScan::default();
+    scan.visit_formal_parameters(params);
+    scan.visit_function_body(body);
+    scan.found
+}
+
+#[derive(Default)]
+struct ArgumentsScan {
+    found: bool,
+    /// How many `function` bodies the walk is inside.
+    nested: usize,
+}
+
+impl<'a> Visit<'a> for ArgumentsScan {
+    fn enter_node(&mut self, kind: AstKind<'a>) {
+        match kind {
+            AstKind::Function(_) => self.nested += 1,
+            AstKind::IdentifierReference(id) if self.nested == 0 && id.name == "arguments" => {
+                self.found = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn leave_node(&mut self, kind: AstKind<'a>) {
+        if let AstKind::Function(_) = kind {
+            self.nested -= 1;
+        }
+    }
+}
+
 fn callee_is_hook(callee: &Expression) -> bool {
     match callee.without_parentheses() {
         Expression::Identifier(id) => is_hook_name(id.name.as_str()),

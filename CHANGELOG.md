@@ -278,6 +278,13 @@ on a program React settles; 323 oracle cases, none a known false negative.
   the source wrote there or the slot's own setter, never a lowering temp;
   a write through a helper called with different setters is a Warning
   (#292, #316, #322).
+- A rest parameter is the array of the call's arguments from its position
+  on, and a function's `arguments` the array of all of them; from a spread
+  on, an argument may sit at any position and the length is unknown. A
+  setter passed to `(...fs) => fs[0](x)` or read through `arguments[0]` is a
+  write placed where the call runs, as through a positional parameter, not
+  only a setter handed to a callee; a rest parameter named like a binding of
+  the enclosing scope no longer reads that binding (#324).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

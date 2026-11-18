@@ -65,6 +65,7 @@ fn alloc_id(e: &Expr) -> Option<u64> {
     match e {
         Expr::ObjectLit { id, .. }
         | Expr::ArrayLit { id, .. }
+        | Expr::Arguments { id, .. }
         | Expr::New { id, .. }
         | Expr::FnLit { id, .. } => Some(id.0),
         _ => None,
@@ -203,6 +204,11 @@ pub fn remap_expr(expr: Expr, off: Offsets) -> Expr {
             elems: elems.into_iter().map(|e| remap_expr(e, off)).collect(),
             arity,
             spread_at,
+        },
+
+        Expr::Arguments { id, from } => Expr::Arguments {
+            id: shift(id),
+            from,
         },
 
         Expr::FieldAccess { obj, field } => Expr::FieldAccess {

@@ -1144,6 +1144,9 @@ impl<'a> Analyzer<'a> {
                 }
                 DVal::of_kind(d, Kind::Array)
             }
+            // The arguments of a call of the body (#324): what a caller
+            // computed them from, which this body does not see.
+            Expr::Arguments { .. } => DVal::of_kind(Deps::top(), Kind::Array),
             // The element's props are the child's inputs, attributed to the
             // site: the element value itself is not a use.
             Expr::CompApp { .. } => DVal::empty(),

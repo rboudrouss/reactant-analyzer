@@ -99,9 +99,10 @@ that writes it (see *Cross-file limits*).
   the writes of a body still count, unplaced. `setter-in-render` and a few rules' own body scans
   (`stale-closure`, the mount guards, `derived-state`, a pack's `body_setter_calls`) still read
   setters by name through the older walk, which binds a parameter to what the call passes
-  (#316). A rest parameter (`(...fs)`) and `arguments` are not bound
-  [#324](https://github.com/rboudrouss/reactant-analyzer/issues/324): a setter passed to the call
-  is still a possible write of it (#291), never a placed one. Utility *inlining* is statement-position only [#52](https://github.com/rboudrouss/reactant-analyzer/issues/52). A setter
+  (#316). A rest parameter (`(...fs)`) and `arguments` are the arrays of the call's arguments
+  [#324](https://github.com/rboudrouss/reactant-analyzer/issues/324); from a spread on an argument
+  may sit at any position, and `fs.length` / `arguments.length` are not modelled, so a guard on
+  them never rules a write out. Utility *inlining* is statement-position only [#52](https://github.com/rboudrouss/reactant-analyzer/issues/52). A setter
   or a closure called through a call that returns it (`get()(x)`, `makeSetter()(x)`,
   `api.get()(x)`) is written where the call's value is read: off the converged envs of the render,
   an effect or a handler [#46](https://github.com/rboudrouss/reactant-analyzer/issues/46), and off a

@@ -146,7 +146,8 @@ pub(super) fn lower_class(class: &Class, builder: &mut BlockBuilder) -> Expr {
                 computed_key(&m.key, builder);
                 if let Some(body) = m.value.body.as_deref() {
                     let kind = FnKind::of(m.value.r#async, m.value.generator);
-                    let (params, body_cfg) = build_fn_body_cfg(&m.value.params, body, kind, &ctx);
+                    let (params, body_cfg) =
+                        build_fn_body_cfg(&m.value.params, body, kind, false, &ctx);
                     let fn_id = builder.next_expr_id();
                     fields.push((
                         synthetic_key(builder, "[method]"),
@@ -520,7 +521,7 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
             let (params, body_cfg) = if arrow.expression {
                 build_expr_fn_body_cfg(&arrow.params, &arrow.body, kind, &ctx)
             } else {
-                build_fn_body_cfg(&arrow.params, &arrow.body, kind, &ctx)
+                build_fn_body_cfg(&arrow.params, &arrow.body, kind, true, &ctx)
             };
             Expr::FnLit {
                 id,
@@ -533,7 +534,7 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
             let ctx = builder.ctx.clone();
             let kind = FnKind::of(func.r#async, func.generator);
             let (params, body_cfg) = if let Some(body) = func.body.as_deref() {
-                build_fn_body_cfg(&func.params, body, kind, &ctx)
+                build_fn_body_cfg(&func.params, body, kind, false, &ctx)
             } else {
                 (vec![], empty_cfg())
             };

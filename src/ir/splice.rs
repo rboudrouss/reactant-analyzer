@@ -37,7 +37,7 @@ use crate::ir::{
     expr::Expr,
     hooks::HookEntry,
     stmt::{MemberKey, Stmt},
-    types::{BlockId, Var},
+    types::{BlockId, ExprId, Var},
 };
 
 /// The callee side of a splice: what to graft in and how to bind it.
@@ -62,6 +62,93 @@ pub struct Splice<'a> {
     pub args: &'a [Expr],
     pub bound_var: Option<&'a Var>,
     pub rename: &'a HashMap<Var, Var>,
+}
+
+/// The first allocation site of an [`Expr::Arguments`] a body binds (a rest
+/// parameter, `arguments`), if it binds one: the lowering emits it only as a
+/// `let`'s right-hand side.
+fn arguments_of(blocks: &std::collections::BTreeMap<BlockId, BasicBlock>) -> Option<ExprId> {
+    blocks
+        .values()
+        .flat_map(|b| &b.stmts)
+        .filter_map(|s| match s {
+            Stmt::Let {
+                rhs: Expr::Arguments { id, .. },
+                ..
+            } => Some(*id),
+            _ => None,
+        })
+        .min()
+}
+
+/// The temp the splice binds the argument at `index` to, unique to the graft
+/// whose first [`Expr::Arguments`] is at `site`.
+fn argument_temp(site: ExprId, index: usize) -> Var {
+    format!("__arg{}_{index}", site.0)
+}
+
+/// Bind each argument no parameter takes (`unbound`, from position `first`)
+/// to its temp — a spread's source, whose entries the array literal spreads —
+/// and return the hand-off of them through the temps, each evaluated once.
+fn bind_unbound(
+    unbound: &[Expr],
+    first: usize,
+    site: ExprId,
+    span: Option<crate::ir::SourceRange>,
+) -> (Vec<Stmt>, Vec<Expr>) {
+    unbound
+        .iter()
+        .enumerate()
+        .map(|(k, arg)| {
+            let temp = argument_temp(site, first + k);
+            let (rhs, handed) = match arg {
+                Expr::Spread(inner) => (
+                    (**inner).clone(),
+                    Expr::Spread(Box::new(Expr::Var(temp.clone()))),
+                ),
+                other => (other.clone(), Expr::Var(temp.clone())),
+            };
+            let bind = Stmt::Let {
+                var: temp,
+                rhs,
+                span,
+            };
+            (bind, handed)
+        })
+        .unzip()
+}
+
+/// The array literal of the call's arguments from position `from` on, which
+/// an inlined body's [`Expr::Arguments`] is (#324): a parameter's argument
+/// read through the parameter, which holds it where the lowering binds the
+/// array, before any default; any other through its temp; a spread's
+/// entries at any position from there on. When a spread precedes `from`,
+/// every argument from the spread on may sit there. `id` is the array's
+/// allocation site, `site` the graft's temps'.
+fn arguments_literal(args: &[Expr], params: &[Var], from: usize, site: ExprId, id: ExprId) -> Expr {
+    let start = from.min(Expr::positional_args(args).len());
+    let mut elems = Vec::new();
+    let mut spread_at = Vec::new();
+    for (i, arg) in args.iter().enumerate().skip(start) {
+        if matches!(arg, Expr::Spread(_)) {
+            spread_at.push(elems.len());
+        }
+        elems.push(Expr::Var(match params.get(i) {
+            Some(p) => p.clone(),
+            None => argument_temp(site, i),
+        }));
+    }
+    let entries = elems.len() - spread_at.len();
+    let arity = match spread_at.is_empty() {
+        true => crate::ir::hooks::Arity::Exact(entries),
+        false => crate::ir::hooks::Arity::AtLeast(entries),
+    };
+    Expr::ArrayLit {
+        id,
+        elems,
+        arity,
+        spread_at,
+    }
 }
 
 /// Splice `splice.callee` into `caller`, replacing the call statement located
@@ -148,7 +235,29 @@ pub fn splice_callee_into_cfg(
             span: call_span,
         })
         .collect();
-    let unbound = &args[positional.len().min(renamed_params.len())..];
+    let bound = positional.len().min(renamed_params.len());
+    let mut callee_block_map = callee_block_map;
+    let unbound: Vec<Expr> = match arguments_of(&callee_block_map) {
+        // The callee binds its arguments (a rest parameter, `arguments`,
+        // #324): each unbound one is evaluated once, into a temp the array
+        // literals they stand for read, and handed off as before.
+        Some(id) => {
+            let (temps, unbound) = bind_unbound(&args[bound..], bound, id, call_span);
+            param_lets.extend(temps);
+            let params = &renamed_params[..bound];
+            for block in callee_block_map.values_mut() {
+                for stmt in &mut block.stmts {
+                    if let Stmt::Let { rhs, .. } = stmt
+                        && let Expr::Arguments { id: at, from } = *rhs
+                    {
+                        *rhs = arguments_literal(args, params, from, id, at);
+                    }
+                }
+            }
+            unbound
+        }
+        None => args[bound..].to_vec(),
+    };
     if !unbound.is_empty() {
         // A hand-off the source does not spell, whose value is discarded:
         // the synthetic call site.
@@ -156,7 +265,7 @@ pub fn splice_callee_into_cfg(
             Expr::Call {
                 id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::SummaryVal(crate::ir::expr::SummaryValue::Top)),
-                args: unbound.to_vec(),
+                args: unbound,
             },
             call_span,
         ));
@@ -726,6 +835,7 @@ fn rename_vars_expr(expr: Expr, ren: &HashMap<Var, Var>) -> Expr {
         Expr::TSAnnotated(inner) => Expr::TSAnnotated(Box::new(rename_vars_expr(*inner, ren))),
         Expr::Spread(inner) => Expr::Spread(Box::new(rename_vars_expr(*inner, ren))),
         leaf @ (Expr::Lit(_)
+        | Expr::Arguments { .. }
         | Expr::StateVal(_)
         | Expr::StateSetter(_)
         | Expr::MemoVal(_)
@@ -966,6 +1076,7 @@ pub fn subst_vars_expr(expr: Expr, subst: &HashMap<Var, Expr>) -> Expr {
         Expr::TSAnnotated(inner) => Expr::TSAnnotated(Box::new(subst_vars_expr(*inner, subst))),
         Expr::Spread(inner) => Expr::Spread(Box::new(subst_vars_expr(*inner, subst))),
         leaf @ (Expr::Lit(_)
+        | Expr::Arguments { .. }
         | Expr::StateVal(_)
         | Expr::StateSetter(_)
         | Expr::MemoVal(_)

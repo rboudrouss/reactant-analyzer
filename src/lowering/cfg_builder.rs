@@ -493,7 +493,7 @@ fn lower_stmt(stmt: &Statement, builder: &mut BlockBuilder) {
                 let ctx = builder.ctx.clone();
                 let kind = FnKind::of(func.r#async, func.generator);
                 let (params, body_cfg) = if let Some(body) = func.body.as_deref() {
-                    build_fn_body_cfg(&func.params, body, kind, &ctx)
+                    build_fn_body_cfg(&func.params, body, kind, false, &ctx)
                 } else {
                     (vec![], empty_cfg())
                 };
@@ -1088,10 +1088,32 @@ fn lower_binding_pattern(
 
 /// Emit Let stmts for every formal parameter; destructured params get temp name `__pN`.
 /// Returns param names for `FnLit.params`.
+///
+/// A rest parameter (`(a, ...fs)`) is no positional parameter: it is bound
+/// to a new array of the arguments from its position on
+/// ([`Expr::Arguments`], #324), destructured like any other parameter when
+/// it is a pattern (`(...[f, g])`). A non-arrow function whose parameters or
+/// body read `arguments` (`own_arguments`) binds it first, to the array of
+/// every argument: an arrow reads its enclosing function's. `own_arguments`
+/// is the body of a function that binds its own, `None` for an arrow.
 pub(super) fn inject_param_preamble(
     params: &FormalParameters,
+    own_arguments: Option<&FunctionBody>,
     builder: &mut BlockBuilder,
 ) -> Vec<String> {
+    if let Some(body) = own_arguments
+        && super::body_scan::reads_arguments(params, body)
+    {
+        let rhs = Expr::Arguments {
+            id: builder.next_expr_id(),
+            from: 0,
+        };
+        builder.push_stmt(Stmt::Let {
+            var: "arguments".to_string(),
+            rhs,
+            span: None,
+        });
+    }
     let mut names = Vec::new();
     for (i, p) in params.items.iter().enumerate() {
         let name = match &p.pattern {
@@ -1104,6 +1126,29 @@ pub(super) fn inject_param_preamble(
         }
         if !matches!(p.pattern, BindingPattern::BindingIdentifier(_)) {
             lower_binding_pattern(&p.pattern, Expr::Var(name), None, builder);
+        }
+    }
+    if let Some(rest) = &params.rest {
+        let rhs = Expr::Arguments {
+            id: builder.next_expr_id(),
+            from: params.items.len(),
+        };
+        let pattern = &rest.rest.argument;
+        match pattern {
+            BindingPattern::BindingIdentifier(id) => builder.push_stmt(Stmt::Let {
+                var: id.name.to_string(),
+                rhs,
+                span: None,
+            }),
+            _ => {
+                let temp = format!("__p{}", params.items.len());
+                builder.push_stmt(Stmt::Let {
+                    var: temp.clone(),
+                    rhs,
+                    span: None,
+                });
+                lower_binding_pattern(pattern, Expr::Var(temp), None, builder);
+            }
         }
     }
     names
@@ -1248,16 +1293,18 @@ fn hand_back(mut cfg: CFG, kind: FnKind, ctx: &LowerCtx) -> CFG {
     cfg
 }
 
-/// Build a function body CFG with param destructuring preamble.
+/// Build a function body CFG with param destructuring preamble. `arrow`: the
+/// function binds no `arguments` of its own.
 pub fn build_fn_body_cfg(
     params: &FormalParameters,
     body: &FunctionBody,
     kind: FnKind,
+    arrow: bool,
     ctx: &LowerCtx,
 ) -> (Vec<String>, CFG) {
     let mut builder = BlockBuilder::new(ctx);
     builder.start_block(0);
-    let param_names = inject_param_preamble(params, &mut builder);
+    let param_names = inject_param_preamble(params, (!arrow).then_some(body), &mut builder);
     if kind == FnKind::Generator {
         builder.may_stop();
     }
@@ -1275,7 +1322,7 @@ pub fn build_expr_fn_body_cfg(
 ) -> (Vec<String>, CFG) {
     let mut builder = BlockBuilder::new(ctx);
     builder.start_block(0);
-    let param_names = inject_param_preamble(params, &mut builder);
+    let param_names = inject_param_preamble(params, None, &mut builder);
     if let Some(Statement::ExpressionStatement(es)) = body.statements.first() {
         let expr = lower_expr(&es.expression, &mut builder);
         if !builder.is_terminated() {

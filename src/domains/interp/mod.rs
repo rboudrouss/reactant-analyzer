@@ -4,6 +4,7 @@ mod interpreter;
 
 pub use callbacks::{TriggerClass, classify_callee};
 pub(crate) use cfg::{entry_env_of, exit_env_of, narrow_env_for_branch, narrowed_var};
+pub(crate) use interpreter::Args;
 pub use interpreter::MAX_INLINE_DEPTH;
 pub use interpreter::Plans;
 pub(crate) use interpreter::Ran;

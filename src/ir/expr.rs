@@ -240,6 +240,20 @@ pub enum Expr {
         params: Vec<Var>,
         body_cfg: Arc<CFG>,
     },
+    /// A new array of the arguments the running call handed its body, from
+    /// position `from` on: the value of a rest parameter (`(a, ...fs)`,
+    /// `from` = 1) and of a function's `arguments` (`from` = 0), #324. The
+    /// lowering emits it only as the right-hand side of a body's first
+    /// statements, where the call's arguments are what the interpreter bound
+    /// with the parameters, and an inlined body's are the call's own
+    /// (`ir::splice`); it evaluates as the array literal of those arguments,
+    /// whose length is unknown when a spread or a caller the analysis does
+    /// not see hands them, an entry from a spread on at any position. `id` is
+    /// the allocation site, as for `ArrayLit`.
+    Arguments {
+        id: ExprId,
+        from: usize,
+    },
 
     // Vars
     Var(Symbol),
@@ -505,6 +519,7 @@ impl Expr {
             Expr::New { fn_, .. } => format!("new {}(…)", fn_.describe()),
             Expr::ObjectLit { .. } => "{…}".to_string(),
             Expr::ArrayLit { .. } => "[…]".to_string(),
+            Expr::Arguments { .. } => "the arguments".to_string(),
             Expr::FnLit { .. } => "() => …".to_string(),
             Expr::Lit(Prim::String(v)) => format!("\"{v}\""),
             Expr::Lit(Prim::Int(v)) => v.to_string(),
@@ -543,6 +558,7 @@ impl Expr {
         match self {
             Expr::Lit(_)
             | Expr::Var(_)
+            | Expr::Arguments { .. }
             | Expr::FnLit { .. }
             | Expr::StateVal(_)
             | Expr::StateSetter(_)
@@ -595,6 +611,7 @@ impl Expr {
         match self {
             Expr::Lit(_)
             | Expr::Var(_)
+            | Expr::Arguments { .. }
             | Expr::FnLit { .. }
             | Expr::StateVal(_)
             | Expr::StateSetter(_)

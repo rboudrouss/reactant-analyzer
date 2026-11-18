@@ -682,7 +682,11 @@ fn run_literal<'c>(
     mut env: AbstractEnv<StateValue>,
     out: &mut Vec<ClosureEnv<'c>>,
 ) {
-    bind_params(&mut env, params, args);
+    bind_params(
+        &mut env,
+        params,
+        crate::domains::interp::Args::at_least(args),
+    );
     let exits = run_cfg(&StateValueTransfer, body, env.clone(), ac, 0).exits;
     reach_literals(ac, body, &env, &exits, out);
     out.push(ClosureEnv { body, exits });

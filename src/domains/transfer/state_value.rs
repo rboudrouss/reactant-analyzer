@@ -273,6 +273,8 @@ fn eval_state_value(
 
         Expr::ObjectLit { .. } => StateValue::reference(Stability::PerRender),
         Expr::ArrayLit { .. } => StateValue::reference(Stability::PerRender),
+        // A new array at every call of the body (#324).
+        Expr::Arguments { .. } => StateValue::reference(Stability::PerRender),
         Expr::FnLit { .. } => StateValue::reference(Stability::PerRender),
         // An element is an object `createElement` allocates at every render
         // (#200); a component's is evaluated for what its child does.

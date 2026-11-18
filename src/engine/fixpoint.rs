@@ -468,7 +468,9 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                         && let Some(env) = envs.get(bid)
                     {
                         let mut ran = crate::domains::interp::Ran::default();
-                        let _ = exec_fn_value(transfer, ret, &[], env, &mut ac, 0, &mut ran);
+                        // React calls a cleanup with no argument.
+                        let none = crate::domains::interp::Args::exactly(&[]);
+                        let _ = exec_fn_value(transfer, ret, none, env, &mut ac, 0, &mut ran);
                         ac.record(|r| {
                             r.record_escape(
                                 comp_id.hook_site(label),
@@ -675,7 +677,11 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             } = hook
             {
                 let mut entry = env_exit.clone();
-                crate::domains::interp::bind_params(&mut entry, params, &[]);
+                crate::domains::interp::bind_params(
+                    &mut entry,
+                    params,
+                    crate::domains::interp::Args::unknown(),
+                );
                 let (h_bs, h_state) = pass(
                     body_cfg,
                     entry,

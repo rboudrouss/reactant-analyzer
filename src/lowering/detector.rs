@@ -27,6 +27,8 @@ pub(crate) struct FnItem<'a> {
     pub expression: bool,
     /// See [`Candidate::kind`](crate::lowering::Candidate::kind).
     pub kind: FnKind,
+    /// See [`Candidate::arrow`](crate::lowering::Candidate::arrow).
+    pub arrow: bool,
 }
 
 /// Predicate deciding whether a walked function is a candidate of this kind.
@@ -133,6 +135,7 @@ pub(crate) fn consider_fn<'a>(
             // A `function` never has a concise body.
             expression: false,
             kind: FnKind::of(func.r#async, func.generator),
+            arrow: false,
         },
         classify,
         out,
@@ -156,6 +159,7 @@ pub(crate) fn consider_arrow<'a>(
             return_type: arrow.return_type.as_deref().or(extra_type_ann),
             expression: arrow.expression,
             kind: FnKind::of(arrow.r#async, false),
+            arrow: true,
         },
         classify,
         out,
@@ -170,6 +174,7 @@ fn push_if<'a>(item: FnItem<'a>, classify: Classify, out: &mut Vec<Candidate<'a>
             body: item.body,
             expression: item.expression,
             kind: item.kind,
+            arrow: item.arrow,
         });
     }
 }

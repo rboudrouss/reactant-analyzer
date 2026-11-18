@@ -767,6 +767,8 @@ pub(crate) fn alloc_literal<T: Transfer>(
             }
             (*id, members)
         }
+        // A new array of the running call's arguments (#324).
+        Expr::Arguments { id, from } => (*id, arguments_members(transfer, *from, env, ctx)),
         // A memo, or a callback, points where its recompute's value does.
         Expr::MemoVal(label) | Expr::CallbackVal(label) => {
             return ctx.memo.sites(*label).cloned();
@@ -901,7 +903,7 @@ fn apply_setter<T: Transfer>(
     }
     let supplied = [String::from("__supplied")];
     let mut scope = env.clone();
-    bind_params(&mut scope, &supplied, given);
+    bind_params(&mut scope, &supplied, Args::at_least(given));
     exec_slot_write(
         transfer,
         arg,
@@ -1082,6 +1084,7 @@ fn exec_callbacks_depth<T: Transfer>(
             // arguments up to the first spread, whose entries may take any
             // position from there on — ⊤ past it, as past the last argument.
             let mut passed: Vec<EnvVal<T::Domain>> = Vec::new();
+            let mut tail: Option<EnvVal<T::Domain>> = None;
             let positional = Expr::positional_args(args).len();
             for (i, arg) in args.iter().enumerate() {
                 if !matches!(arg, Expr::FnLit { .. }) {
@@ -1100,7 +1103,16 @@ fn exec_callbacks_depth<T: Transfer>(
                 if runs_args && i < positional {
                     let given = callback_args(transfer, fn_, i, env, ctx);
                     let mut ran = Ran::default();
-                    let returned = exec_fn_value(transfer, arg, &given, env, ctx, depth, &mut ran);
+                    // What the callee passes past those may be more.
+                    let returned = exec_fn_value(
+                        transfer,
+                        arg,
+                        Args::at_least(&given),
+                        env,
+                        ctx,
+                        depth,
+                        &mut ran,
+                    );
                     // What it returns goes back to the callee: it escapes
                     // there, at the call (ADR-047).
                     if let Some(sites) = returned.as_ref().and_then(EnvVal::sites) {
@@ -1121,6 +1133,17 @@ fn exec_callbacks_depth<T: Transfer>(
                     let sites = escape_at(transfer, arg, env, ctx, Some((*id, i)));
                     if binds_args && i < positional {
                         passed.push(EnvVal::located(sites, transfer.eval_expr(arg, env, ctx)));
+                    } else if binds_args {
+                        // From a spread on, an argument or a spread source's
+                        // entry may sit at any position (#324).
+                        let value = match arg {
+                            Expr::Spread(source) => {
+                                let source = alloc_literal(transfer, source, env, ctx);
+                                entries_at(source.as_ref(), ctx)
+                            }
+                            _ => EnvVal::located(sites, transfer.eval_expr(arg, env, ctx)),
+                        };
+                        tail = Some(tail.map_or_else(|| value.clone(), |t| t.join(&value)));
                     }
                 }
             }
@@ -1140,11 +1163,15 @@ fn exec_callbacks_depth<T: Transfer>(
                     if ctx.calls.is_some() {
                         // What the call stands for, resolved without a run.
                         ran = Ran::listing();
-                        exec_fn_value(transfer, fn_, &[], env, ctx, depth, &mut ran);
+                        exec_fn_value(transfer, fn_, Args::unknown(), env, ctx, depth, &mut ran);
                     }
                     escape(transfer, fn_, env, ctx);
                 } else {
-                    returned = exec_fn_value(transfer, fn_, &passed, env, ctx, depth, &mut ran);
+                    let args = match &tail {
+                        Some(tail) => Args::then_any(&passed, tail),
+                        None => Args::exactly(&passed),
+                    };
+                    returned = exec_fn_value(transfer, fn_, args, env, ctx, depth, &mut ran);
                 }
             } else {
                 // A builtin, a subscription, a setter: no body of the
@@ -1370,7 +1397,7 @@ pub(crate) fn run_escaped<T: Transfer>(
 ) {
     for (params, body) in bodies {
         let mut sub_env = env.clone();
-        bind_params(&mut sub_env, params, &[]);
+        bind_params(&mut sub_env, params, Args::unknown());
         let run = run_cfg(transfer, body, sub_env, ctx, 1);
         if let Some(sites) = returned_sites(transfer, body, &run.exits, ctx) {
             ctx.heap.escape(&sites);
@@ -1402,7 +1429,15 @@ pub(crate) fn run_escaped<T: Transfer>(
                 crate::profile::escaped_run(owned);
             }
             let mut ran = Ran::default();
-            let returned = exec_heap_fns(transfer, Sites::closed([id]), &[], env, ctx, 0, &mut ran);
+            let returned = exec_heap_fns(
+                transfer,
+                Sites::closed([id]),
+                Args::unknown(),
+                env,
+                ctx,
+                0,
+                &mut ran,
+            );
             escape_returned(returned.as_ref(), ctx);
         }
     }
@@ -1455,23 +1490,178 @@ fn runs_in_owner<D: AbstractDomain>(id: ExprId, ctx: &AnalysisCtx<D>) -> bool {
     true
 }
 
+/// What a call hands the body it runs (#324): the arguments at known
+/// positions, and whether more may follow them — after a spread, or from a
+/// caller the analysis does not see (an event, an escaped closure's run).
+#[derive(Debug)]
+pub(crate) struct Args<'a, D> {
+    pub known: &'a [EnvVal<D>],
+    pub more: bool,
+    /// What the arguments past the known ones may be, at positions nothing
+    /// fixes: from a spread on, each later argument and every entry of each
+    /// spread source.
+    pub tail: Option<&'a EnvVal<D>>,
+}
+
+impl<D> Clone for Args<'_, D> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<D> Copy for Args<'_, D> {}
+
+impl<'a, D> Args<'a, D> {
+    /// These arguments and no other.
+    pub fn exactly(known: &'a [EnvVal<D>]) -> Self {
+        Args {
+            known,
+            more: false,
+            tail: None,
+        }
+    }
+
+    /// These arguments, then any number of unknown ones.
+    pub fn at_least(known: &'a [EnvVal<D>]) -> Self {
+        Args {
+            known,
+            more: true,
+            tail: None,
+        }
+    }
+
+    /// These arguments, then any number of `tail`'s.
+    pub fn then_any(known: &'a [EnvVal<D>], tail: &'a EnvVal<D>) -> Self {
+        Args {
+            known,
+            more: true,
+            tail: Some(tail),
+        }
+    }
+
+    /// Any arguments.
+    pub fn unknown() -> Self {
+        Args::at_least(&[])
+    }
+}
+
+/// The name the argument at `index` of the running call is bound to, which no
+/// source spells: what [`Expr::Arguments`] reads.
+fn argument_name(index: usize) -> Symbol {
+    format!("@{index}")
+}
+
+/// Bound when a call handed its arguments to the running body; unbound, the
+/// body ran with arguments the analysis does not know.
+const ARGUMENTS_BOUND: &str = "@args";
+/// Bound when more arguments than the bound ones may follow.
+const ARGUMENTS_MORE: &str = "@more";
+/// Bound to what those may be, when the call says ([`Args::tail`]).
+const ARGUMENTS_TAIL: &str = "@tail";
+
 /// Bind `params` in `env` to what a call passes them (#253): the argument at
 /// each position — its value and the sites it points to, so a closure passed
 /// in is the one a call of the parameter runs — and ⊤ past the arguments
 /// given. A parameter shadows a name of the enclosing scope, sites included.
+/// The arguments themselves are bound too, under names no source spells,
+/// for [`Expr::Arguments`] (a rest parameter, `arguments`, #324): each one,
+/// whether more may follow, and the first position past them unbound, so
+/// what an enclosing call bound there is not read as this call's.
 pub(crate) fn bind_params<D: AbstractDomain>(
     env: &mut AbstractEnv<D>,
     params: &[Symbol],
-    args: &[EnvVal<D>],
+    args: Args<'_, D>,
 ) {
     for (i, p) in params.iter().enumerate() {
-        let (sites, val) = match args.get(i) {
+        let (sites, val) = match args.known.get(i) {
             Some(arg) => (arg.sites().cloned(), arg.as_val()),
             None => (None, D::top()),
         };
         env.bind_locs(p.clone(), sites);
         env.extend(p.clone(), val);
     }
+    for (i, arg) in args.known.iter().enumerate() {
+        env.bind_locs(argument_name(i), arg.sites().cloned());
+        env.extend(argument_name(i), arg.as_val());
+    }
+    env.forget(&argument_name(args.known.len()));
+    env.extend(ARGUMENTS_BOUND.to_string(), D::top());
+    match args.more {
+        true => env.extend(ARGUMENTS_MORE.to_string(), D::top()),
+        false => env.forget(ARGUMENTS_MORE),
+    }
+    match args.tail {
+        Some(tail) => {
+            env.bind_locs(ARGUMENTS_TAIL.to_string(), tail.sites().cloned());
+            env.extend(ARGUMENTS_TAIL.to_string(), tail.as_val());
+        }
+        None => env.forget(ARGUMENTS_TAIL),
+    }
+}
+
+/// The members of the array an [`Expr::Arguments`] allocates in `env`: the
+/// arguments [`bind_params`] bound from position `from` on, at their
+/// positions; then, when more may follow or no call bound any, members
+/// nothing here says — the length unknown, any further entry anything —
+/// and what the call said they may be at positions nothing fixes.
+fn arguments_members<T: Transfer>(
+    transfer: &T,
+    from: usize,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+) -> Members {
+    if !env.contains(ARGUMENTS_BOUND) {
+        return Members::at_least(HashMap::new());
+    }
+    let count = (0..)
+        .take_while(|i| env.contains(&argument_name(*i)))
+        .count();
+    let named: HashMap<Symbol, EnvVal<StateValue>> = (from..count)
+        .enumerate()
+        .map(|(k, i)| {
+            let entry = member_entry(transfer, &Expr::Var(argument_name(i)), env, ctx);
+            (k.to_string(), entry)
+        })
+        .collect();
+    let mut members = match env.contains(ARGUMENTS_MORE) {
+        true => Members::at_least(named),
+        false => Members::exactly(named),
+    };
+    if env.contains(ARGUMENTS_TAIL) {
+        let tail = Expr::Var(ARGUMENTS_TAIL.to_string());
+        members.hold_unplaced(&member_entry(transfer, &tail, env, ctx));
+    }
+    members
+}
+
+/// What an entry of an iterable at `sites` may be: the join of the entries of
+/// every array the heap places it at, ⊤ joined in where it may be anything
+/// else; ⊥ when it has none — a callback over it never runs, a spread of it
+/// hands nothing.
+fn entries_at<D: AbstractDomain>(sites: Option<&Sites>, ctx: &AnalysisCtx<D>) -> EnvVal<D> {
+    let top = EnvVal::Val(StateValue::top());
+    let entry = match sites {
+        Some(sites) => {
+            let mut ids: Vec<_> = sites.ids.iter().copied().collect();
+            ids.sort();
+            let mut entry: Option<EnvVal<StateValue>> = sites.open.then(|| top.clone());
+            for id in ids {
+                let members: Vec<EnvVal<StateValue>> = match ctx.heap.get(id) {
+                    Some(HeapValue::Obj(o)) if o.is_open() => {
+                        o.values().cloned().chain([top.clone()]).collect()
+                    }
+                    Some(HeapValue::Obj(o)) => o.values().cloned().collect(),
+                    _ => vec![top.clone()],
+                };
+                for m in members {
+                    entry = Some(entry.map_or_else(|| m.clone(), |e| e.join(&m)));
+                }
+            }
+            entry.unwrap_or_else(|| EnvVal::Val(StateValue::bottom()))
+        }
+        None => top,
+    };
+    EnvVal::located(entry.sites().cloned(), D::from_state_value(entry.as_val()))
 }
 
 /// What an in-cycle callee passes its function argument at `index` (#253).
@@ -1494,37 +1684,10 @@ pub(crate) fn callback_args<T: Transfer>(
     if index != 0 || !crate::engine::setters::SYNC_HOF_METHODS.contains(&field.as_str()) {
         return Vec::new();
     }
-    let top = EnvVal::Val(StateValue::top());
     let receiver = alloc_literal(transfer, obj, env, ctx);
     // The array itself, after the index.
     let array = EnvVal::located(receiver.clone(), transfer.eval_expr(obj, env, ctx));
-    let entry = match receiver {
-        Some(sites) => {
-            let mut ids: Vec<_> = sites.ids.iter().copied().collect();
-            ids.sort();
-            let mut entry: Option<EnvVal<StateValue>> = sites.open.then(|| top.clone());
-            for id in ids {
-                let members: Vec<EnvVal<StateValue>> = match ctx.heap.get(id) {
-                    Some(HeapValue::Obj(o)) if o.is_open() => {
-                        o.values().cloned().chain([top.clone()]).collect()
-                    }
-                    Some(HeapValue::Obj(o)) => o.values().cloned().collect(),
-                    _ => vec![top.clone()],
-                };
-                for m in members {
-                    entry = Some(entry.map_or_else(|| m.clone(), |e| e.join(&m)));
-                }
-            }
-            // No entry: the callback never runs, and its parameter holds
-            // nothing.
-            entry.unwrap_or_else(|| EnvVal::Val(StateValue::bottom()))
-        }
-        None => top,
-    };
-    let entry = EnvVal::located(
-        entry.sites().cloned(),
-        T::Domain::from_state_value(entry.as_val()),
-    );
+    let entry = entries_at(receiver.as_ref(), ctx);
     let any = EnvVal::Val(T::Domain::top());
     match field.as_str() {
         "reduce" | "reduceRight" => vec![any.clone(), entry, any, array],
@@ -1544,7 +1707,7 @@ pub(crate) fn callback_args<T: Transfer>(
 pub(crate) fn exec_fn_value<T: Transfer>(
     transfer: &T,
     callee: &Expr,
-    args: &[EnvVal<T::Domain>],
+    args: Args<'_, T::Domain>,
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
@@ -1575,12 +1738,16 @@ pub(crate) fn exec_fn_value<T: Transfer>(
             // useCallback binding: the body lives in the hook entry, not the
             // heap (the rewrite to `CallbackVal` moved it out of the
             // expression tree). Params stay unbound → env-miss ⊤, captures
-            // resolve in the live env. A name two paths bound to two
+            // resolve in the live env; the arguments are bound for a rest
+            // parameter and `arguments` (#324). A name two paths bound to two
             // callbacks runs either: each runs, and the call returns the
             // join, ⊤ when a body is out of reach (#328).
             if let Expr::Var(name) = other
                 && let Some(labels) = env.callback_labels(name).cloned()
             {
+                let mut env = env.clone();
+                bind_params(&mut env, &[], args);
+                let env = &env;
                 let mut returned: Option<T::Domain> = None;
                 let mut open = false;
                 for label in labels {
@@ -1655,7 +1822,7 @@ impl Ran {
 fn exec_heap_fns<T: Transfer>(
     transfer: &T,
     sites: Sites,
-    args: &[EnvVal<T::Domain>],
+    args: Args<'_, T::Domain>,
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,

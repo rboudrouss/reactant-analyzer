@@ -143,6 +143,8 @@ pub struct Candidate<'a> {
     /// What a call of the function evaluates to: an `async` or generator
     /// function's call is not its `return` value (#317).
     pub kind: cfg_builder::FnKind,
+    /// An arrow function, which binds no `arguments` of its own (#324).
+    pub arrow: bool,
 }
 
 impl Candidate<'_> {
@@ -171,7 +173,7 @@ impl Candidate<'_> {
         if self.expression {
             cfg_builder::build_expr_fn_body_cfg(self.params, self.body, kind, ctx)
         } else {
-            cfg_builder::build_fn_body_cfg(self.params, self.body, kind, ctx)
+            cfg_builder::build_fn_body_cfg(self.params, self.body, kind, self.arrow, ctx)
         }
     }
 

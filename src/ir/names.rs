@@ -89,10 +89,17 @@ fn is_call_temp(var: &str) -> bool {
     var.starts_with("__call_") || var.starts_with("__hook_")
 }
 
+/// The temp an inlined body's argument no parameter takes is bound to,
+/// `__argN_K` (`ir::splice`, #324): it reads as the argument.
+pub(crate) fn is_argument_temp(var: &str) -> bool {
+    var.starts_with("__arg")
+}
+
 /// The prefixes of the names lowering mints: an expression's value (`__t`,
 /// `__sw`, `__of`), a call's (`__call_`, `__hook_`, `__hookarg_`), a
 /// destructured value, element or default (`__dstr_`, `__arr_`, `__obj_`,
-/// `__dflt_`), a destructured parameter (`__p`).
+/// `__dflt_`), a destructured parameter (`__p`), an inlined body's argument
+/// (`__arg`).
 const TEMP_PREFIXES: &[&str] = &[
     "__t",
     "__sw",
@@ -105,6 +112,7 @@ const TEMP_PREFIXES: &[&str] = &[
     "__obj_",
     "__dflt_",
     "__p",
+    "__arg",
 ];
 
 /// `true` for a name lowering minted, whatever salt or member path follows
@@ -218,6 +226,10 @@ impl SourceNames {
                     let unsalted = var.split_once(SPLICE_MARK).map_or(var.as_str(), |(v, _)| v);
                     if let Some(text) = span.and_then(|at| files.temp_text(at.file, unsalted)) {
                         texts.insert(var.clone(), excerpt(text));
+                        continue;
+                    }
+                    if is_argument_temp(var) {
+                        texts.insert(var.clone(), excerpt(&rhs.describe()));
                         continue;
                     }
                     if !is_call_temp(var) {
