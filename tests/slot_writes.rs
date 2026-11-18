@@ -659,6 +659,128 @@ export function Param() {
     }
 }
 
+/// A parent's closure a child lets escape runs in the parent, its owner: the
+/// parent's slot takes the write, however the child lets it go (a DOM
+/// handler, an unknown callee, a generator, a grandchild), and the child's
+/// slot of the same name, which the closure does not see, does not.
+#[test]
+fn a_parent_closure_a_child_lets_escape_writes_the_parents_slot() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+import { runNow, useRun } from 'ext';
+function Dom({ f }: { f: () => void }) {
+  const [k, setK] = useState(5);
+  return <button onClick={f}>{k}</button>;
+}
+export function ViaDom() {
+  const [k, setK] = useState(0);
+  return <Dom f={() => setK(1)} />;
+}
+function Callee({ f }: { f: () => void }) {
+  const [k, setK] = useState(5);
+  useEffect(() => { runNow(f); }, []);
+  return <div>{k}</div>;
+}
+export function ViaCallee() {
+  const [k, setK] = useState(0);
+  return <Callee f={() => setK(1)} />;
+}
+function* yieldIt(f: () => void) { yield f; }
+function Gen({ f }: { f: () => void }) {
+  const [k, setK] = useState(5);
+  useEffect(() => { for (const g of yieldIt(f)) g(); }, []);
+  return <div>{k}</div>;
+}
+export function ViaGenerator() {
+  const [k, setK] = useState(0);
+  return <Gen f={() => setK(1)} />;
+}
+function Leaf({ f }: { f: () => void }) {
+  const [k, setK] = useState(5);
+  useRun(f);
+  return <div>{k}</div>;
+}
+function Mid({ f }: { f: () => void }) {
+  return <Leaf f={f} />;
+}
+export function ViaGrandchild() {
+  const [k, setK] = useState(0);
+  return <Mid f={() => setK(1)} />;
+}
+"#;
+    let result = analyze(src);
+    for (parent, child) in [
+        ("ViaDom", "Dom"),
+        ("ViaCallee", "Callee"),
+        ("ViaGenerator", "Gen"),
+        ("ViaGrandchild", "Leaf"),
+    ] {
+        assert!(
+            holds(&result, parent, 0, 1.0),
+            "{parent}: the write is lost"
+        );
+        let id = result.component_named(child).unwrap();
+        assert_eq!(
+            result.components[&id].state_store.get(0),
+            StateValue::number(Interval::point(5.0)),
+            "{child}: the parent's closure wrote the child's slot"
+        );
+    }
+}
+
+/// Two parents render one child, which lets the closure it is handed escape.
+/// Its last analysis, under both inputs, runs neither: the first parent's
+/// ran in the first parent, the second's runs in the second.
+#[test]
+fn each_parent_runs_its_own_closure_a_shared_child_lets_escape() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+import { runNow } from 'ext';
+function Child({ f }: { f: () => void }) {
+  useEffect(() => { runNow(f); });
+  return <div />;
+}
+function First() {
+  const [a, setA] = useState(0);
+  return <Child f={() => setA(1)} />;
+}
+function Second() {
+  const [b, setB] = useState(0);
+  return <Child f={() => setB(2)} />;
+}
+export function App() {
+  return <div><First /><Second /></div>;
+}
+"#;
+    let result = analyze(src);
+    assert!(holds(&result, "First", 0, 1.0), "First's write is lost");
+    assert!(holds(&result, "Second", 0, 2.0), "Second's write is lost");
+}
+
+/// A parent's closure that reaches something of the child — here the child's
+/// setter, stored in a parent object — runs in the child where it escapes.
+#[test]
+fn a_parent_closure_reaching_the_child_runs_in_the_child() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+import { runNow } from 'ext';
+function Child({ register, f }: { register: (s: (v: number) => void) => void; f: () => void }) {
+  const [k, setK] = useState(0);
+  useEffect(() => {
+    register(setK);
+    runNow(f);
+  }, []);
+  return <div>{k}</div>;
+}
+export function App() {
+  const reg = { set: (v: number) => {} };
+  return <Child register={(s) => { reg.set = s; }} f={() => reg.set(7)} />;
+}
+"#;
+    let result = analyze(src);
+    assert!(holds(&result, "Child", 0, 7.0), "the child's write is lost");
+}
+
 /// What an escaped closure writes is what the slot gets, nothing more: a
 /// write of the value the slot holds leaves it exact.
 #[test]

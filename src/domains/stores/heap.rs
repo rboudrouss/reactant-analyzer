@@ -498,6 +498,49 @@ impl Heap {
         out
     }
 
+    /// Whether a run of the closure at `closure` may read or write something
+    /// of `component`, through what it captured and the members of the
+    /// objects on the way ([`Heap::reachable`]'s walk): a site of its range, a
+    /// closure it owns, one of its setters, or a site no component's range
+    /// holds — a props object, which the walk cannot attribute, so it counts.
+    /// A name the closure did not capture is not its own, so the caller's
+    /// scope is not among what it reaches.
+    pub fn may_touch(&self, closure: ExprId, component: ComponentId) -> bool {
+        let own = |v: &StateValue| v.setters().iter().any(|(o, _)| *o == component);
+        let mut stack = vec![closure];
+        let mut seen = BTreeSet::new();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            match ComponentId::site_owner(id) {
+                Some(owner) if owner != component => {}
+                _ => return true,
+            }
+            match self.get(id) {
+                Some(HeapValue::Fn {
+                    owner,
+                    captured,
+                    captured_locs,
+                    ..
+                }) => {
+                    if *owner == component || captured.values().any(own) {
+                        return true;
+                    }
+                    stack.extend(captured_locs.values().flat_map(|s| s.ids.iter().copied()));
+                }
+                Some(HeapValue::Obj(obj)) => {
+                    if obj.values().any(|ev| own(&ev.as_val())) {
+                        return true;
+                    }
+                    stack.extend(obj.values().filter_map(EnvVal::locs).flatten().copied());
+                }
+                None => {}
+            }
+        }
+        false
+    }
+
     pub fn get_mut(&mut self, id: ExprId) -> Option<&mut HeapValue> {
         self.cells.get_mut(&id)
     }
@@ -761,6 +804,50 @@ mod tests {
         let (entries, open) = h.members(&Sites::closed([ExprId(7)]), None);
         assert_eq!(entries.len(), 2, "`step` and the others: {entries:?}");
         assert!(open, "the key may name a member no entry says");
+    }
+
+    /// What a closure of `parent` reaches, as `may_touch` walks it: an object
+    /// of `parent` holding `member` under `m`, captured as `o`.
+    fn parent_closure(parent: ComponentId, member: EnvVal<StateValue>) -> (Heap, ExprId) {
+        let base = parent.site_base();
+        let (f, o) = (ExprId(base + 1), ExprId(base + 2));
+        let mut h = Heap::new();
+        h.insert(
+            o,
+            HeapValue::Obj(Members::exactly(HashMap::from([("m".to_string(), member)]))),
+        );
+        h.insert(
+            f,
+            HeapValue::Fn {
+                params: vec![],
+                body_cfg: Arc::new(crate::test_support::single_block_cfg(vec![])),
+                captured: HashMap::new(),
+                captured_locs: HashMap::from([("o".to_string(), Sites::closed([o]))]),
+                owner: parent,
+                captured_slots: HashMap::new(),
+            },
+        );
+        (h, f)
+    }
+
+    #[test]
+    fn a_closure_touches_a_component_through_its_sites_setters_and_unowned_sites() {
+        use crate::test_support::cid;
+        let (parent, child) = (cid(0), cid(1));
+        let located =
+            |id: u64| EnvVal::located(Some(Sites::closed([ExprId(id)])), StateValue::top());
+        // Only the parent's own: nothing of the child.
+        let (h, f) = parent_closure(parent, EnvVal::Val(StateValue::top()));
+        assert!(!h.may_touch(f, child));
+        // A site of the child's range.
+        let (h, f) = parent_closure(parent, located(child.site_base() + 3));
+        assert!(h.may_touch(f, child));
+        // A setter of the child.
+        let (h, f) = parent_closure(parent, EnvVal::Val(StateValue::component_setter(child, 0)));
+        assert!(h.may_touch(f, child));
+        // A site no range holds (a props object): not attributable, counted.
+        let (h, f) = parent_closure(parent, located(ExprId::fresh().0));
+        assert!(h.may_touch(f, child));
     }
 
     #[test]

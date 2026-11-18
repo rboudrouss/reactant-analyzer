@@ -18,7 +18,7 @@ use crate::{
             ACCESSOR_KEY_PREFIX, Expr, MarkerVal, SPREAD_KEY_PREFIX, SummaryValue, is_synthetic_key,
         },
         stmt::{MemberKey, Stmt},
-        types::{BlockId, Symbol},
+        types::{BlockId, ExprId, Symbol},
     },
 };
 
@@ -1189,6 +1189,11 @@ pub(crate) fn seed_ref<T: Transfer>(
 /// — at no time the analysis knows, from `env`, every parameter ⊤ — and what
 /// each returns goes back to that code, so it escapes in turn: the worklist
 /// runs until no new closure escapes.
+///
+/// A closure of another component runs in its owner when it can
+/// ([`runs_in_owner`]); the closures handed back to this component escape
+/// here, at each round, since a child analysed by a run of this worklist
+/// may hand one back.
 pub(crate) fn run_escaped<T: Transfer>(
     transfer: &T,
     bodies: &[(&[Symbol], &CFG)],
@@ -1205,11 +1210,20 @@ pub(crate) fn run_escaped<T: Transfer>(
     }
     let mut ran = HashSet::new();
     loop {
+        if let Some(inter) = ctx.inter {
+            let handed: Vec<ExprId> = inter
+                .handed
+                .borrow()
+                .get(&ctx.component)
+                .map(|ids| ids.iter().copied().collect())
+                .unwrap_or_default();
+            ctx.heap.escape(&Sites::closed(handed));
+        }
         let pending: Vec<_> = ctx
             .heap
             .escaped_fns()
             .into_iter()
-            .filter(|id| ran.insert(*id))
+            .filter(|id| ran.insert(*id) && !runs_in_owner(*id, ctx))
             .collect();
         if pending.is_empty() {
             return;
@@ -1219,6 +1233,54 @@ pub(crate) fn run_escaped<T: Transfer>(
             escape_returned(returned.as_ref(), ctx);
         }
     }
+}
+
+/// Whether the escaped closure at `id`, owned by another component P, runs
+/// in P instead of here, in C. It does when the run may touch nothing of C
+/// ([`Heap::may_touch`]) and P runs it: P is on the analysis stack (not a
+/// probe's), and the closure is handed back to P, which escapes it in its own
+/// heap at its next `run_escaped`, in the same iteration, after this child's
+/// analysis returns; or P already ran it, handed back earlier. Anything else
+/// runs here, as it always did: an owner off the stack that never ran the
+/// closure (it escapes only under a later, larger join of C's input, or P is
+/// a probe's caller) is not trusted to.
+///
+/// Soundness. Write f for the closure.
+/// - What f does to C: nothing, by the walk. A name f did not capture is not
+///   in its scope, so C's bindings are not either (f run here reads C's
+///   setter labels by name: an artefact, not a write).
+/// - What f does to P and everything else it reaches: P's run is above the
+///   run here. Same body, every parameter ⊤ in both, its captures joined
+///   with P's live values over P's converged stores where the run here had
+///   the copy C's input carried, which P's heap built. Its writes land in
+///   P's store, P's objects and the shared store, where P's own writes land;
+///   a write into an object C also reads reaches C in its next input, as P's
+///   heap grew and P iterates.
+/// - Every analysis of P after the hand-back runs f: the table only grows
+///   and `run_escaped` escapes all of it. f enters C's input only through an
+///   element P evaluates, in an analysis of P, on the stack then; so a P off
+///   the stack (a finished root, or a child of a third component that
+///   finished) has either run f since, or f escaped in none of P's analyses
+///   and runs here.
+fn runs_in_owner<D: AbstractDomain>(id: ExprId, ctx: &AnalysisCtx<D>) -> bool {
+    let Some(inter) = ctx.inter else {
+        return false;
+    };
+    let Some(HeapValue::Fn { owner, .. }) = ctx.heap.get(id) else {
+        return false;
+    };
+    if *owner == ctx.component || ctx.heap.may_touch(id, ctx.component) {
+        return false;
+    }
+    let mut handed = inter.handed.borrow_mut();
+    if handed.get(owner).is_some_and(|ids| ids.contains(&id)) {
+        return true;
+    }
+    if inter.probe || !inter.call_stack.borrow().contains(owner) {
+        return false;
+    }
+    handed.entry(*owner).or_default().insert(id);
+    true
 }
 
 /// Bind `params` in `env` to what a call passes them (#253): the argument at

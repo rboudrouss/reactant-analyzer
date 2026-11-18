@@ -70,6 +70,15 @@ impl ComponentId {
         (u64::from(self.0) + 1) << 32
     }
 
+    /// The component whose range holds site `id`; `None` below the first
+    /// range: a fresh id (a child's props object) is no component's.
+    pub fn site_owner(id: super::types::ExprId) -> Option<ComponentId> {
+        let range = id.0 >> 32;
+        (range > 0)
+            .then(|| u32::try_from(range - 1).ok().map(ComponentId))
+            .flatten()
+    }
+
     /// The site of the object the hook at `label` hands back: the container
     /// `useRef` returns, one per hook instance, the same on every render, as
     /// React keeps it (#268); the function a `useCallback` literal returns

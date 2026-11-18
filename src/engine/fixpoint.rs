@@ -1010,6 +1010,7 @@ pub fn analyze_program(
         RefCell::new(HashMap::new());
     let site_inputs: RefCell<HashMap<crate::domains::SiteKey, crate::domains::ChildInput>> =
         RefCell::new(HashMap::new());
+    let handed: RefCell<crate::domains::context::HandedBack> = RefCell::new(HashMap::new());
 
     let roots = strategy.detect(&registry);
     let mut analysed: std::collections::HashSet<ComponentId> = std::collections::HashSet::new();
@@ -1032,6 +1033,7 @@ pub fn analyze_program(
         analyze_child: analyze_component_inter as AnalyzeChildFn,
         hook_registry: Some(&hook_registry),
         program: &program,
+        handed: &handed,
     };
 
     // Phase 1: analyze roots top-down (children inlined via eval_comp_app).

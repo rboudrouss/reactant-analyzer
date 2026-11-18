@@ -37,7 +37,12 @@ their issue.
 
 These drop or falsify information the analysis then relies on.
 
-None known.
+- A parent's closure that a child calls (a prop, an object member) runs in the
+  child's scope, and a setter it calls is resolved there by name: when the
+  child declares a setter of the same name, the write lands on the child's
+  slot and the parent's slot misses it, so a loop it arms in the parent is not
+  claimed [#326](https://github.com/rboudrouss/reactant-analyzer/issues/326).
+  A closure the child lets escape runs in the parent and is not affected.
 
 **How to tell in general.** A run that read everything it was pointed at ends
 with `✓ … no issues found.`. A run that did not never prints that line, and lists

@@ -83,6 +83,10 @@ on a program React settles; 323 oracle cases, none a known false negative.
   registration and effect-trigger relations are computed once, for the
   analysis of each component that is kept, not for every re-analysis of a
   child or per-site probe; mantine 416 s → 365 s, findings unchanged.
+- Faster where many parents hand a child their hooks' closures: a parent's
+  closure the child lets escape runs once in the parent, not again in each
+  analysis of the child; `@mantine/form` 13.6 s → 9.8 s, mantine 365 s →
+  200 s, corpus findings unchanged.
 - `always-unstable-deps` also reports a dep that is a new reference at every
   render where it holds an object and a primitive otherwise
   (`items?.filter(f)`, `items && items.map(f)`, `c ? [x] : undefined`), with
@@ -233,6 +237,11 @@ on a program React settles; 323 oracle cases, none a known false negative.
 - A handler's parameter holds whatever the event or the child calling it
   passes, never the render's binding of the same name: `const v = 0; …
   onClick={(v) => setS(v)}` no longer stores `0` into `s` (#314).
+- A parent's closure that a child lets escape (to an element's handler, an
+  unknown callee, a generator) writes the parent's state, never a child's
+  setter of the same name: the child's state no longer moves with it (a
+  false `missing-deps`, a missed `redundant-set-state`). A closure the child
+  calls itself still resolves that name in the child (#326).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

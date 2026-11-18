@@ -122,7 +122,15 @@ pub struct InterCtx<'a> {
     /// What the bodies of the whole program do: whether one fires event
     /// listeners itself (#219), the names they write (#224).
     pub program: &'a crate::engine::ProgramFacts,
+    /// Per component, its closures a component below it let escape and left
+    /// for it to run (`interp::run_escaped`): from then on
+    /// they are escaped in every analysis of their owner.
+    pub handed: &'a RefCell<HandedBack>,
 }
+
+/// Per owner, the closures handed back to it ([`InterCtx::handed`]).
+pub type HandedBack =
+    std::collections::HashMap<ComponentId, std::collections::BTreeSet<crate::ir::types::ExprId>>;
 
 impl<'a> InterCtx<'a> {
     /// Create a child context for inlining a nested component.
@@ -147,6 +155,7 @@ impl<'a> InterCtx<'a> {
             analyze_child: self.analyze_child,
             hook_registry: self.hook_registry,
             program: self.program,
+            handed: self.handed,
         }
     }
 
