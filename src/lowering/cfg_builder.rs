@@ -87,14 +87,29 @@ pub struct LowerCtx {
     /// Shared with every other body of this file — see [`TempSpans`].
     pub temps: TempSpans,
     pub jsx: JsxOrigins,
-    /// The body being lowered is a class's instance member — a method, an
-    /// accessor, a field initializer, the constructor — or an arrow inside
-    /// one: `this` is the instance, the name [`THIS`](crate::ir::expr::THIS)
-    /// the construction body binds (#335). Anywhere else `this` is opaque.
-    pub this_instance: bool,
+    /// What `this` is in the body being lowered.
+    pub this: ThisScope,
     /// The body being lowered is a class's constructor (#335), not a
     /// function nested in it.
     pub ctor: Option<std::sync::Arc<CtorScope>>,
+}
+
+/// What `this` is where an expression is lowered. An arrow keeps its
+/// enclosing body's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThisScope {
+    /// Module scope, or a class's static block or field initializer: `this`
+    /// carries no tracked value, opaque ⊤.
+    Opaque,
+    /// A class's instance member — a method, an accessor, a field
+    /// initializer, the constructor: `this` is the instance, the name
+    /// [`THIS`](crate::ir::expr::THIS) the construction body binds (#335),
+    /// and `super.m` reads its member `m`.
+    Instance,
+    /// Any other non-arrow function: `this` is what the call binds it to,
+    /// the name [`THIS`](crate::ir::expr::THIS) its preamble binds to
+    /// [`RECEIVER`](crate::ir::expr::RECEIVER) (#338).
+    Receiver,
 }
 
 /// What lowering a constructor's statements needs of its class (#335).
@@ -115,17 +130,20 @@ impl LowerCtx {
             ids: ExprIds::default(),
             temps: TempSpans::default(),
             jsx,
-            this_instance: false,
+            this: ThisScope::Opaque,
             ctor: None,
         }
     }
 
     /// This context for a nested function's body: an arrow keeps the
-    /// enclosing `this`, any other function binds its own, which the
-    /// analysis does not follow. Neither is the constructor.
+    /// enclosing `this`, any other function binds its own, the receiver of
+    /// its call (#338). Neither is the constructor.
     pub(super) fn nested(&self, arrow: bool) -> Self {
         Self {
-            this_instance: self.this_instance && arrow,
+            this: match arrow {
+                true => self.this,
+                false => ThisScope::Receiver,
+            },
             ctor: None,
             ..self.clone()
         }
@@ -134,8 +152,18 @@ impl LowerCtx {
     /// This context for a class instance member's body (#335).
     pub(super) fn member(&self, ctor: Option<CtorScope>) -> Self {
         Self {
-            this_instance: true,
+            this: ThisScope::Instance,
             ctor: ctor.map(std::sync::Arc::new),
+            ..self.clone()
+        }
+    }
+
+    /// This context for a class's static block or static field
+    /// initializer: `this` is the class, which the analysis does not follow.
+    pub(super) fn static_member(&self) -> Self {
+        Self {
+            this: ThisScope::Opaque,
+            ctor: None,
             ..self.clone()
         }
     }
@@ -1362,6 +1390,14 @@ pub(super) fn build_member_body_cfg(
     build_body_cfg(params, body, kind, false, ctx)
 }
 
+/// A function body under `ctx`. A non-arrow function binds its own
+/// `arguments`, and its own `this` when `ctx` says the call binds it
+/// ([`ThisScope::Receiver`], #338): the first statement, when the
+/// parameters or the body read it, binds [`THIS`] to the call's
+/// [`RECEIVER`], before any parameter default reads it.
+///
+/// [`THIS`]: crate::ir::expr::THIS
+/// [`RECEIVER`]: crate::ir::expr::RECEIVER
 fn build_body_cfg(
     params: &FormalParameters,
     body: &FunctionBody,
@@ -1371,6 +1407,13 @@ fn build_body_cfg(
 ) -> (Vec<String>, CFG) {
     let mut builder = BlockBuilder::new(ctx);
     builder.start_block(0);
+    if !arrow && ctx.this == ThisScope::Receiver && super::body_scan::reads_this(params, body) {
+        builder.push_stmt(Stmt::Let {
+            var: crate::ir::expr::THIS.to_string(),
+            rhs: Expr::Var(crate::ir::expr::RECEIVER.to_string()),
+            span: None,
+        });
+    }
     let param_names = inject_param_preamble(params, (!arrow).then_some(body), &mut builder);
     if kind == FnKind::Generator {
         builder.may_stop();

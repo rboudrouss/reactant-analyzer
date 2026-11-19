@@ -128,6 +128,14 @@ pub const CONSTRUCT_KEY: &str = "[construct]";
 /// inside one does in turn.
 pub const THIS: &str = "this";
 
+/// The name a call binds its receiver under (#338): what `r` denotes in a
+/// method call `r.m(…)`, unbound for any other call — a plain one, a
+/// callback a builtin runs, a call by code the analysis does not see — so
+/// that it reads ⊤. A non-arrow function that reads `this`, other than a
+/// class's instance member, binds [`THIS`] to it first, and an arrow inside
+/// captures that binding. Never a source name: no identifier holds an `@`.
+pub const RECEIVER: &str = "@this";
+
 /// The name a construction body ([`CONSTRUCT_KEY`]) reads the object it
 /// builds by: bound by the `new` that runs it — a new object at the `new`'s
 /// site, or the instance a derived class's `super(…)` hands its parent.

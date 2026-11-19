@@ -237,6 +237,18 @@ pub fn splice_callee_into_cfg(
         .collect();
     let bound = positional.len().min(renamed_params.len());
     let mut callee_block_map = callee_block_map;
+    // A spliced call is a plain one (a utility, a hook, by name): it binds
+    // no receiver, so the `this` the callee's preamble binds is ⊤ (#338),
+    // not a receiver the body it lands in was called with.
+    for block in callee_block_map.values_mut() {
+        for stmt in &mut block.stmts {
+            if let Stmt::Let { rhs, .. } = stmt
+                && matches!(rhs, Expr::Var(v) if v == crate::ir::expr::RECEIVER)
+            {
+                *rhs = Expr::SummaryVal(crate::ir::expr::SummaryValue::Top);
+            }
+        }
+    }
     let unbound: Vec<Expr> = match arguments_of(&callee_block_map) {
         // The callee binds its arguments (a rest parameter, `arguments`,
         // #324): each unbound one is evaluated once, into a temp the array

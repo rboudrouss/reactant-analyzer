@@ -16,7 +16,7 @@ use crate::{
         bindings::binding_of,
         cfg::{CFG, EdgeKind, Terminator},
         expr::{
-            Accessor, CONSTRUCT_KEY, Expr, MarkerVal, NEW_INSTANCE, SPREAD_KEY_PREFIX,
+            Accessor, CONSTRUCT_KEY, Expr, MarkerVal, NEW_INSTANCE, RECEIVER, SPREAD_KEY_PREFIX,
             SummaryValue, THIS, accessor_of, is_synthetic_key,
         },
         module::AccessKey,
@@ -591,13 +591,15 @@ fn run_accessors<T: Transfer>(
         EnvVal::located(at, transfer.eval_expr(rhs, env, ctx))
     });
     let args = written.as_slice();
+    // The accessor's `this` is the object read or written (#338).
+    let receiver = EnvVal::located(Some(sites), transfer.eval_expr(obj, env, ctx));
     for site in accessors {
         let returned = match depth >= MAX_INLINE_DEPTH {
             true => None,
             false => exec_heap_fns(
                 transfer,
                 Sites::closed([site]),
-                Args::exactly(args),
+                Args::exactly(args).on(Some(&receiver)),
                 env,
                 ctx,
                 depth,
@@ -1310,13 +1312,13 @@ fn write_one_slot<T: Transfer>(
         }
         Some(Reducer::Opaque) => T::Domain::top(),
         None => match args.first() {
+            // React calls an updater plainly, with the slot's value.
             Some(Expr::FnLit {
                 params, body_cfg, ..
             }) => {
                 let mut sub_env = env.clone();
-                if let Some(param) = params.first() {
-                    sub_env.extend(param.clone(), current);
-                }
+                let given = [EnvVal::Val(current)];
+                bind_params(&mut sub_env, params, Args::exactly(&given));
                 exec_body_depth(transfer, body_cfg, &sub_env, ctx, depth + 1)
             }
             Some(a) => transfer.eval_expr(a, env, ctx),
@@ -1471,10 +1473,20 @@ fn exec_callbacks_depth<T: Transfer>(
                     }
                     escape(transfer, fn_, env, ctx);
                 } else {
+                    // A method call binds `this` to what its receiver
+                    // denotes (#338); any other call binds none.
+                    let receiver = match fn_.peel_ts() {
+                        Expr::FieldAccess { obj, .. } | Expr::IndexAccess { arr: obj, .. } => {
+                            let sites = alloc_literal(transfer, obj, env, ctx);
+                            Some(EnvVal::located(sites, transfer.eval_expr(obj, env, ctx)))
+                        }
+                        _ => None,
+                    };
                     let args = match &tail {
                         Some(tail) => Args::then_any(&passed, tail),
                         None => Args::exactly(&passed),
                     };
+                    let args = args.on(receiver.as_ref());
                     returned = exec_fn_value(transfer, fn_, args, env, ctx, depth, &mut ran);
                 }
                 // What the call evaluates to wherever no `let` binds it: a
@@ -2003,6 +2015,10 @@ pub(crate) struct Args<'a, D> {
     /// fixes: from a spread on, each later argument and every entry of each
     /// spread source.
     pub tail: Option<&'a EnvVal<D>>,
+    /// What the call binds `this` to (#338): the receiver of a method call
+    /// (`r.m(…)`, an accessor's read or write of `r`), `None` for any other
+    /// call, whose `this` is ⊤.
+    pub this: Option<&'a EnvVal<D>>,
 }
 
 impl<D> Clone for Args<'_, D> {
@@ -2020,6 +2036,7 @@ impl<'a, D> Args<'a, D> {
             known,
             more: false,
             tail: None,
+            this: None,
         }
     }
 
@@ -2029,6 +2046,7 @@ impl<'a, D> Args<'a, D> {
             known,
             more: true,
             tail: None,
+            this: None,
         }
     }
 
@@ -2038,12 +2056,21 @@ impl<'a, D> Args<'a, D> {
             known,
             more: true,
             tail: Some(tail),
+            this: None,
         }
     }
 
     /// Any arguments.
     pub fn unknown() -> Self {
         Args::at_least(&[])
+    }
+
+    /// These arguments, `this` bound to `receiver` (#338).
+    pub fn on(self, receiver: Option<&'a EnvVal<D>>) -> Self {
+        Args {
+            this: receiver,
+            ..self
+        }
     }
 }
 
@@ -2068,7 +2095,9 @@ const ARGUMENTS_TAIL: &str = "@tail";
 /// The arguments themselves are bound too, under names no source spells,
 /// for [`Expr::Arguments`] (a rest parameter, `arguments`, #324): each one,
 /// whether more may follow, and the first position past them unbound, so
-/// what an enclosing call bound there is not read as this call's.
+/// what an enclosing call bound there is not read as this call's. So is the
+/// receiver ([`RECEIVER`], #338): bound when the call has one, unbound —
+/// ⊤ — otherwise, never an enclosing call's or the creation's.
 pub(crate) fn bind_params<D: AbstractDomain>(
     env: &mut AbstractEnv<D>,
     params: &[Symbol],
@@ -2110,6 +2139,13 @@ pub(crate) fn bind_params<D: AbstractDomain>(
             env.extend(ARGUMENTS_TAIL.to_string(), tail.as_val());
         }
         None => env.forget(ARGUMENTS_TAIL),
+    }
+    match args.this {
+        Some(this) => {
+            env.bind_locs(RECEIVER.to_string(), this.sites().cloned());
+            env.extend(RECEIVER.to_string(), this.as_val());
+        }
+        None => env.forget(RECEIVER),
     }
 }
 
@@ -2195,7 +2231,8 @@ pub(crate) enum ReceiverUse {
     /// some of its entries or a function calling it, so the receiver escapes.
     Unmodelled,
     /// No builtin: a method of code the analysis does not see (a prop, a
-    /// library object), handed its arguments only.
+    /// library object), handed its arguments only. Not its receiver, though
+    /// that is its `this` (#340).
     Unseen,
 }
 

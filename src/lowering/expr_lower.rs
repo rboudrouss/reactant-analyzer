@@ -16,9 +16,9 @@ use crate::ir::{
 };
 
 use super::cfg_builder::{
-    BlockBuilder, CtorScope, FnKind, build_construct_cfg, build_expr_fn_body_cfg, build_fields_cfg,
-    build_fn_body_cfg, build_member_body_cfg, build_stmts_cfg, handed_out, lower_default,
-    super_call,
+    BlockBuilder, CtorScope, FnKind, ThisScope, build_construct_cfg, build_expr_fn_body_cfg,
+    build_fields_cfg, build_fn_body_cfg, build_member_body_cfg, build_stmts_cfg, handed_out,
+    lower_default, super_call,
 };
 
 /// An opaque value of unknown kind (⊤). Used for expressions the analysis does
@@ -192,7 +192,7 @@ pub(super) fn lower_class(class: &Class, builder: &mut BlockBuilder) -> Expr {
                 computed_key(&p.key, builder);
                 if p.r#static {
                     if let Some(value) = &p.value {
-                        let lowered = lower_expr(value, builder);
+                        let lowered = lower_static(value, builder);
                         fields.push((synthetic_key(builder, "[field]"), lowered));
                     }
                 } else {
@@ -205,7 +205,7 @@ pub(super) fn lower_class(class: &Class, builder: &mut BlockBuilder) -> Expr {
                 computed_key(&a.key, builder);
                 if a.r#static {
                     if let Some(value) = &a.value {
-                        let lowered = lower_expr(value, builder);
+                        let lowered = lower_static(value, builder);
                         fields.push((synthetic_key(builder, "[field]"), lowered));
                     }
                 } else {
@@ -223,7 +223,7 @@ pub(super) fn lower_class(class: &Class, builder: &mut BlockBuilder) -> Expr {
                     Expr::FnLit {
                         id: fn_id,
                         params: vec![],
-                        body_cfg: Arc::new(build_stmts_cfg(&b.body, &ctx)),
+                        body_cfg: Arc::new(build_stmts_cfg(&b.body, &ctx.static_member())),
                     },
                 ));
             }
@@ -274,6 +274,15 @@ pub(super) fn lower_class(class: &Class, builder: &mut BlockBuilder) -> Expr {
     ));
 
     Expr::ObjectLit { id, fields }
+}
+
+/// A class's static field initializer, where the class is defined: `this` is
+/// the class (`LowerCtx::static_member`), not the enclosing body's.
+fn lower_static(value: &Expression, builder: &mut BlockBuilder) -> Expr {
+    let outer = std::mem::replace(&mut builder.ctx.this, ThisScope::Opaque);
+    let lowered = lower_expr(value, builder);
+    builder.ctx.this = outer;
+    lowered
 }
 
 /// A name or a member chain off one (`Base`, `React.Component`).
@@ -384,9 +393,15 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
         }
         // `this` in a class's instance member is the instance, the name its
         // construction body binds (#335); `super.m` reads the parent's
-        // member, which that body wrote on the same instance. Anywhere else
-        // `this` and `super` carry no tracked value: opaque ⊤.
-        Expression::ThisExpression(_) | Expression::Super(_) if builder.ctx.this_instance => {
+        // member, which that body wrote on the same instance. In any other
+        // non-arrow function `this` is what the call bound, the same name
+        // its preamble binds (#338); an arrow reads its enclosing one's.
+        // Anywhere else — and `super` outside a class's instance member, a
+        // prototype the analysis does not follow — opaque ⊤.
+        Expression::ThisExpression(_) if builder.ctx.this != ThisScope::Opaque => {
+            Expr::Var(crate::ir::expr::THIS.to_string())
+        }
+        Expression::Super(_) if builder.ctx.this == ThisScope::Instance => {
             Expr::Var(crate::ir::expr::THIS.to_string())
         }
         Expression::ThisExpression(_) | Expression::Super(_) => opaque(),

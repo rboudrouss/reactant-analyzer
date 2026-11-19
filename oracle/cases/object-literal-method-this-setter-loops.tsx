@@ -1,7 +1,6 @@
 // oracle: react=loop
-// oracle: known=fn #338
-// `this` in an object literal's method is the receiver of the call, which
-// the analysis does not bind: the call through `this.set` runs nothing.
+// `this` in an object literal's method is the receiver of the call (#338):
+// the call through `this.set` runs the setter `o` holds.
 import { useState } from "react";
 
 export function App() {

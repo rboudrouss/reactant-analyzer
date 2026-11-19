@@ -374,6 +374,12 @@ on a program React settles; 323 oracle cases, none a known false negative.
   render is a `setter-in-render` Warning where it was silent, the same in two
   effects with no deps an `infinite-loop` Warning, and in a child's render a
   `cross-setter-in-render` Warning (#335).
+- `this` in a non-arrow function is what the call binds it to: the receiver
+  of a method call (`o.run()`), the object an accessor reads or writes,
+  unknown for any other call; an arrow reads its enclosing function's.
+  `{ set: setN, run() { this.set(…) } }.run()` in the render is a
+  `setter-in-render` Warning where it was silent, and so is a getter of the
+  same literal that calls `this.set` (#338).
 - False Errors: a component mounted only through an element the analysis
   cannot place (`<Comp/>` with `Comp = c ? A : B`, `<parts.C/>`, a mapped list
   of components, a default import under another name, itself) was read as a

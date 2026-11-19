@@ -242,8 +242,7 @@ that writes it (see *Cross-file limits*).
   is what the getter's runs returned, and a write runs the setter with the value. Its body also
   runs at an unknown time, since anything holding the object may read the member (a spread, a
   library): a write in it is a possible write of the render the literal is in, never an Error, and
-  a spread's copy holds what the getter may return, a new object included. `this` in an object
-  literal's accessor or method is not bound. A member read off an object the heap does not place —
+  a spread's copy holds what the getter may return, a new object included. A member read off an object the heap does not place —
   a module binding, an instance of a class the analysis does not see, what unknown code returns —
   or a member a placed object does not hold (its
   prototype's) is a call the analysis cannot see when some accessor of the analysed files defines
@@ -281,9 +280,25 @@ that writes it (see *Cross-file limits*).
   also reads as one on the instance. An accessor's body runs at an unknown time from where the
   instance is built, as an object literal's does (#321): built in a memo that runs once, a
   getter the render reads is not reported
-  [#337](https://github.com/rboudrouss/reactant-analyzer/issues/337). `this` in an object
-  literal's method is not the receiver
-  [#338](https://github.com/rboudrouss/reactant-analyzer/issues/338).
+  [#337](https://github.com/rboudrouss/reactant-analyzer/issues/337).
+- **`this`.** In a non-arrow function `this` is what the call binds it to
+  [#338](https://github.com/rboudrouss/reactant-analyzer/issues/338): the receiver of a method call
+  (`o.m()`, `o[k]()`), the object an accessor reads or writes, and
+  anything for any other call — a plain call, a callback a builtin runs, an inlined utility, a run
+  by code the analysis does not see; an arrow reads its enclosing function's. That last reading
+  is sound because a plain call's `this` is `undefined` in a module and the global object in
+  sloppy code, and what `call`, `apply`, `bind` or code the analysis does not see hand a function
+  as `this` escaped there — except a receiver: a method call the analysis does not resolve to a
+  body (a module function or a static method read as a member, a library's method) hands that
+  code its arguments, not its receiver, so a setter only the receiver holds is not reported
+  [#340](https://github.com/rboudrouss/reactant-analyzer/issues/340). Handing it would flood: a
+  hook's `useCallback` returned in an object reads as no body through the member. What stays as
+  before: a class's instance member keeps the instance as `this` wherever it is called
+  (`const f = k.run; f()` too); `super` outside a class's instance member is opaque; a setter
+  written into the global object does not escape
+  [#339](https://github.com/rboudrouss/reactant-analyzer/issues/339). A function component that
+  reads `this` reads a value that may change, so an effect reading it may get a `missing-deps`
+  Warning for `this`.
 - **Module bindings.** Every top-level binding of an analysed module is one slot shared by every
   render of every component [#335](https://github.com/rboudrouss/reactant-analyzer/issues/335):
   what a body stores there — the binding itself, or a member of the object it holds — joins
