@@ -232,13 +232,23 @@ impl SetterInRender {
                 ),
                 (Some(parent), _) => (
                     "cross-setter-in-render",
-                    format!(
-                        "{} is handed to a callee{} with no timing summary. If that callee \
-                         runs it during render, `{}` re-renders its parent on every render",
-                        wording.of_parent(&result.display_name(parent)),
-                        wording.through_clause(),
-                        result.display_name(component)
-                    ),
+                    match wording.accessor() {
+                        Some((accessor, verb)) => format!(
+                            "{} is called{} in {accessor}. If the render {verb} it, `{}` \
+                             re-renders its parent on every render",
+                            wording.of_parent(&result.display_name(parent)),
+                            wording.through_link(),
+                            result.display_name(component)
+                        ),
+                        None => format!(
+                            "{} is handed to a callee{} with no timing summary. If that \
+                             callee runs it during render, `{}` re-renders its parent on \
+                             every render",
+                            wording.of_parent(&result.display_name(parent)),
+                            wording.through_clause(),
+                            result.display_name(component)
+                        ),
+                    },
                 ),
             };
             let mut d = match proof {
@@ -428,6 +438,14 @@ impl SetterInRender {
 /// pass is one of them. Saying "called directly in the render body" of that row
 /// would state as fact the one thing the walk could not establish.
 fn unknown_phase_message(wording: &Wording) -> String {
+    if let Some((accessor, verb)) = wording.accessor() {
+        return format!(
+            "{} is called{} in {accessor}. If the render {verb} it, this re-renders on \
+             every render",
+            wording.setter(),
+            wording.through_link()
+        );
+    }
     format!(
         "{} is handed to a callee{} with no timing summary. If that callee \
          runs it during render, this re-renders on every render",
@@ -449,6 +467,8 @@ struct Wording {
     raw: Option<Var>,
     /// What the write went through, printed, when that is not the setter.
     through: Option<String>,
+    /// The accessor whose body the write sits in ([`SlotWriter::accessor`]).
+    accessor: Option<crate::engine::setters::AccessorOf>,
 }
 
 impl Wording {
@@ -462,7 +482,33 @@ impl Wording {
             name: raw.as_ref().map(|n| names.name(n).into_owned()),
             raw,
             through: through.map(|t| names.name(t).into_owned()),
+            accessor: w.accessor.clone(),
         }
+    }
+
+    /// Where a write in an accessor's body runs (#321), and what the render
+    /// does that would run it: "the getter of `p`, which runs at every read
+    /// of `p`", "reads".
+    fn accessor(&self) -> Option<(String, &'static str)> {
+        use crate::ir::expr::Accessor;
+        let (half, member) = self.accessor.as_ref()?;
+        let (kind, act, verb) = match half {
+            Accessor::Get => ("getter", "read", "reads"),
+            Accessor::Set => ("setter", "write", "writes"),
+        };
+        let place = match member {
+            Some(m) => format!("the {kind} of `{m}`, which runs at every {act} of `{m}`"),
+            None => format!("a {kind} of a computed member, which runs at every {act} of it"),
+        };
+        Some((place, verb))
+    }
+
+    /// " through `payload`" when the write went through a value that is not
+    /// the setter.
+    fn through_link(&self) -> String {
+        self.through
+            .as_ref()
+            .map_or_else(String::new, |t| format!(" through `{t}`"))
     }
 
     /// "setter `setN`", or "a state setter".

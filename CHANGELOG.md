@@ -101,6 +101,11 @@ on a program React settles; 323 oracle cases, none a known false negative.
   (`items?.filter(f)`, `items && items.map(f)`, `c ? [x] : undefined`), with
   that wording; the loop rules and their Errors still read only a dep that is
   a new reference at every render (#301).
+- A state write inside a getter or a setter accessor is worded as what it is
+  (`setter-in-render`, `cross-setter-in-render`): "setter `setN` is called in
+  the getter of `p`, which runs at every read of `p`. If the render reads it,
+  this re-renders on every render", where it said the setter was handed to a
+  callee with no timing summary. The level is unchanged (#321).
 
 ### Removed
 

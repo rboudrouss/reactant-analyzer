@@ -56,6 +56,55 @@ fn loops(src: &str) -> Vec<String> {
     found
 }
 
+/// The `setter-in-render` messages reactant prints for the oracle case
+/// `case`.
+fn setter_messages(case: &str) -> Vec<String> {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "reactant-accessor-case-{}-{case}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("oracle/cases/{case}.tsx")),
+    )
+    .unwrap();
+    std::fs::write(dir.join("a.tsx"), src).unwrap();
+    let out = reactant(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("JSON");
+    doc["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|d| d["rule"].as_str() == Some("setter-in-render"))
+        .map(|d| d["message"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn a_state_write_in_an_accessor_says_the_read_or_the_write_runs_it() {
+    for (case, says) in [
+        (
+            "getter-writes-state-in-render-loops",
+            "setter `setN` is called in the getter of `p`, which runs at every read of `p`. \
+             If the render reads it, this re-renders on every render",
+        ),
+        (
+            "setter-accessor-writes-state-in-render-loops",
+            "setter `setN` is called in the setter of `p`, which runs at every write of `p`. \
+             If the render writes it, this re-renders on every render",
+        ),
+        (
+            "setter-accessor-in-effect-loops",
+            "setter `setN` is called in the setter of `p`, which runs at every write of `p`. \
+             If the render writes it, this re-renders on every render",
+        ),
+    ] {
+        assert_eq!(setter_messages(case), [says], "{case}");
+    }
+}
+
 /// `App` with `decl` in its render and an effect on `[dep]` that bumps `n`.
 fn effect_on(decl: &str, dep: &str) -> Vec<String> {
     loops(&format!(

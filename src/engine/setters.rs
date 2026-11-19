@@ -112,6 +112,8 @@ pub(crate) struct WriteSite {
     pub own: Option<(Option<crate::ir::types::ExprId>, BlockId)>,
     /// [`SlotWriter::listener`].
     pub listener: bool,
+    /// [`SlotWriter::accessor`].
+    pub accessor: Option<AccessorOf>,
 }
 
 /// What every walk of a component's bodies reads besides the call relation
@@ -239,6 +241,7 @@ impl<'a> WriterTables<'a> {
                 sure: s.sure,
                 own: s.own,
                 listener: s.listener,
+                accessor: s.accessor,
             })
             .collect();
         (setters, found.stores)
@@ -303,6 +306,7 @@ impl<'a> WriterTables<'a> {
             handlers: &self.handlers,
             summaries: RefCell::default(),
             listening: false,
+            accessor: None,
         };
         walk.cfg(cfg, depth, &mut found, WalkClass::Sync, None, None);
         found
@@ -1185,9 +1189,17 @@ pub struct SlotWriter {
     /// registered listener in a program that dispatches events itself
     /// (#219): an event handler in a program that does not.
     pub listener: bool,
+    /// The write sits in the body of an accessor of a literal (#321): its
+    /// half and the member it defines (`None`: a computed name). It runs at
+    /// a read (a getter) or a write (a setter) of that member, wherever one
+    /// happens.
+    pub accessor: Option<AccessorOf>,
     /// What the write stores (ADR-042 §2).
     pub written: Written,
 }
+
+/// An accessor's half and the member it defines (`None`: a computed name).
+pub type AccessorOf = (crate::ir::expr::Accessor, Option<Var>);
 
 impl SlotWriter {
     /// A write of the store (ADR-046), not of any component's slot.
@@ -1770,6 +1782,7 @@ pub(crate) fn collect_slot_writers(
                     .map(|(b, _)| b),
                 own: site.own,
                 listener: site.listener,
+                accessor: site.accessor,
                 written,
             });
         }
@@ -1795,6 +1808,7 @@ pub(crate) fn collect_slot_writers(
                 placed: None,
                 own: None,
                 listener: false,
+                accessor: None,
                 written: written::carried(),
             });
         }
@@ -1934,6 +1948,10 @@ struct SetterWalk<'a> {
     /// only because the program dispatches events itself (#219): every site
     /// it finds is a listener's.
     listening: bool,
+    /// The walk is in the body of an accessor of a literal (#321), entered
+    /// where the literal is written: every site it finds runs at a read or a
+    /// write of that member.
+    accessor: Option<AccessorOf>,
 }
 
 /// A body on the walk's stack.
@@ -2266,6 +2284,8 @@ struct FoundSite {
     /// The function names the walk went through to reach the site
     /// ([`SetterWalk::path`]).
     through: Vec<Var>,
+    /// Found in an accessor's body ([`SetterWalk::accessor`]).
+    accessor: Option<AccessorOf>,
 }
 
 /// `Array.prototype` HOFs that call their function argument synchronously —
@@ -3058,7 +3078,8 @@ impl<'a> SetterWalk<'a> {
         // literal is written, at an unknown time (#321).
         if let Expr::ObjectLit { id, fields } = expr {
             for (i, (key, val)) in fields.iter().enumerate() {
-                if crate::ir::expr::accessor_of(key).is_some() {
+                if let Some((half, member)) = crate::ir::expr::accessor_of(key) {
+                    let outer = self.accessor.replace((half, member.map(str::to_string)));
                     self.relation_handed(
                         Some((*id, i)),
                         val,
@@ -3069,6 +3090,7 @@ impl<'a> SetterWalk<'a> {
                         prov,
                         stmt_span,
                     );
+                    self.accessor = outer;
                 }
             }
         }
@@ -3094,6 +3116,7 @@ impl<'a> SetterWalk<'a> {
                 slot,
                 sure: false,
                 listener: self.listening,
+                accessor: self.accessor.clone(),
                 class,
                 span: stmt_span,
                 at: None,
@@ -3148,6 +3171,7 @@ impl<'a> SetterWalk<'a> {
                 slot,
                 sure,
                 listener: self.listening,
+                accessor: self.accessor.clone(),
                 class: mode,
                 span: stmt_span,
                 at,
@@ -3240,6 +3264,7 @@ impl<'a> SetterWalk<'a> {
                 slot,
                 sure: row.sure(),
                 listener: self.listening,
+                accessor: self.accessor.clone(),
                 class: held_class,
                 span: stmt_span,
                 at: applied_at,
@@ -3375,6 +3400,7 @@ impl<'a> SetterWalk<'a> {
                 slot,
                 sure: false,
                 listener: self.listening,
+                accessor: self.accessor.clone(),
                 class: WalkClass::Unknown,
                 span: stmt_span,
                 at: None,
