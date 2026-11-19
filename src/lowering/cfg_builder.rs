@@ -44,6 +44,15 @@ use crate::{
 pub struct ExprIds(Rc<Cell<u64>>, Rc<Cell<u64>>);
 
 impl ExprIds {
+    /// The counter for ids minted in `cfg` after its file's lowering: every
+    /// one above the allocation and call sites `cfg` already holds.
+    pub(super) fn above(cfg: &crate::ir::cfg::CFG) -> Self {
+        ExprIds(
+            Rc::new(Cell::new(crate::ir::alloc_id_span(cfg))),
+            Rc::new(Cell::new(crate::ir::call_id_span(cfg))),
+        )
+    }
+
     pub(super) fn next(&self) -> ExprId {
         let id = self.0.get();
         self.0.set(id + 1);
