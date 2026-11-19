@@ -928,7 +928,8 @@ fn eval_member(
     // labels do not say. Neither do they when the member's name is one an
     // accessor of the program defines (#334): where the heap places nothing
     // the read may run it, a call the analysis cannot see, whose result may
-    // be new at any read.
+    // be new at any read; off a plain object React builds, only one its
+    // chain may hold (#336).
     let obj_val = eval_state_value(obj, env, ctx);
     let key = access_key(
         &StateValueTransfer,
@@ -941,7 +942,7 @@ fn eval_member(
     );
     let any = StateValue {
         reference: match member {
-            _ if ctx.heap.unseen_accessor(key) => Stability::MayBeFresh,
+            _ if ctx.heap.unseen_accessor(sites.as_ref(), key) => Stability::MayBeFresh,
             Some(_) => obj_val.versioned_reference().unwrap_or(Stability::Unknown),
             None => Stability::Unknown,
         },

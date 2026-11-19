@@ -957,7 +957,11 @@ impl<'a> Analyzer<'a> {
     /// The member `field` of a value.
     fn member(&self, base: &DVal, field: &str) -> DVal {
         match &base.shape {
-            Shape::Props => DVal::of(Deps::one(Source::Prop(field.to_string()))),
+            Shape::Props => self.read(
+                base,
+                Deps::one(Source::Prop(field.to_string())),
+                AccessKey::Named(field),
+            ),
             Shape::Members(m) => match m.get(field) {
                 Some(v) => v.clone(),
                 None => self.computed(base, AccessKey::Named(field)),
@@ -974,18 +978,27 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    /// A member of `base` no entry of it says (`key`), computed from it. A
-    /// value of no known kind may run an accessor of the program there
-    /// (#334): a call not known pure.
+    /// A member of `base` no entry of it says (`key`), computed from it.
     fn computed(&self, base: &DVal, key: AccessKey<'_>) -> DVal {
-        let mut deps = base.deps.clone();
-        if base.kind == Kind::Unknown && self.accessors.may_run(key) {
-            deps = Deps {
+        self.read(base, base.deps.clone(), key)
+    }
+
+    /// A read of `key` off `base`, of what `deps` says. A value of no known
+    /// kind may run an accessor of the program there (#334), and a plain
+    /// object React builds — the props object, a ref — one its chain may
+    /// hold (#336): a call not known pure.
+    fn read(&self, base: &DVal, deps: Deps, key: AccessKey<'_>) -> DVal {
+        let runs = match (&base.shape, base.kind) {
+            (Shape::Props, _) | (_, Kind::Plain) => self.accessors.may_run_off_plain(key),
+            (_, kind) => kind == Kind::Unknown && self.accessors.may_run(key),
+        };
+        match runs {
+            true => DVal::of(Deps {
                 impure: true,
                 ..deps.ungated()
-            };
+            }),
+            false => DVal::of(deps),
         }
-        DVal::of(deps)
     }
 
     fn eval(&self, e: &Expr, env: &Env) -> DVal {
@@ -996,7 +1009,7 @@ impl<'a> Analyzer<'a> {
             Expr::StateVal(l) => DVal::of(Deps::one(Source::Slot(*l))),
             Expr::StateSetter(l) => DVal::of(Deps::one(Source::Setter(*l))),
             Expr::HookMarker(l, marker) => match self.kinds.get(l) {
-                Some(HookKind::Ref) => DVal::of(Deps::one(Source::Ref(*l))),
+                Some(HookKind::Ref) => DVal::of_kind(Deps::one(Source::Ref(*l)), Kind::Plain),
                 // An opaque hook's result may be computed from its arguments,
                 // like any call's (`useContext(Ctx)` reads `Ctx`'s value).
                 Some(HookKind::Custom) | None => {

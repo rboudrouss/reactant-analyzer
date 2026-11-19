@@ -188,10 +188,12 @@ impl<'a> InterCtx<'a> {
         // A spread prop (`{...rest}`, kept under its synthetic key) may pass
         // any member.
         let spread = input.props.keys().any(|k| is_synthetic_key(k));
-        let props = match spread {
+        let mut props = match spread {
             true => Members::at_least(input.props),
             false => Members::exactly(input.props),
         };
+        // React builds it: a plain object (#336).
+        props.plain = true;
         heap.insert(input.props_id, HeapValue::Obj(props));
         env.bind_locs(
             ir.param.clone(),

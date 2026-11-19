@@ -56,6 +56,10 @@ pub enum Kind {
     ParamsPair,
     /// A `Map` or a `Set`.
     Keyed,
+    /// A plain object React builds — `useRef`'s, the props object — whose
+    /// reads run only an accessor its chain may hold (#336,
+    /// [`AccessorNames::may_run_off_plain`]).
+    Plain,
 }
 
 impl Kind {
@@ -376,6 +380,16 @@ pub fn access(receiver: Kind, key: Option<&str>, key_kind: Kind) -> AccessKey<'_
     }
 }
 
+/// May a read of `key` off a receiver of kind `receiver` run an accessor of
+/// the program (#334)? Off a plain object React builds, only one its chain
+/// may hold (#336).
+pub fn reads_accessor(accessors: &AccessorNames, receiver: Kind, key: AccessKey<'_>) -> bool {
+    match receiver {
+        Kind::Plain => accessors.may_run_off_plain(key),
+        _ => accessors.may_run(key),
+    }
+}
+
 /// The member a key spells when it is a constant: what a read `o[k]` reads.
 pub fn constant_key(idx: &Expr) -> Option<String> {
     match idx.peel_ts() {
@@ -427,17 +441,17 @@ pub fn body_holds(
                     && args.iter().all(|a| walk(a, var, accessors))
             }
             Expr::FieldAccess { obj, field } => {
-                let key = access(kind_of(obj, var, accessors), Some(field), Kind::Unknown);
-                !accessors.may_run(key) && walk(obj, var, accessors)
+                let receiver = kind_of(obj, var, accessors);
+                let key = access(receiver, Some(field), Kind::Unknown);
+                !reads_accessor(accessors, receiver, key) && walk(obj, var, accessors)
             }
             Expr::IndexAccess { arr, idx } => {
                 let constant = constant_key(idx);
-                let key = access(
-                    kind_of(arr, var, accessors),
-                    constant.as_deref(),
-                    kind_of(idx, var, accessors),
-                );
-                !accessors.may_run(key) && walk(arr, var, accessors) && walk(idx, var, accessors)
+                let receiver = kind_of(arr, var, accessors);
+                let key = access(receiver, constant.as_deref(), kind_of(idx, var, accessors));
+                !reads_accessor(accessors, receiver, key)
+                    && walk(arr, var, accessors)
+                    && walk(idx, var, accessors)
             }
             _ => {
                 let mut ok = true;

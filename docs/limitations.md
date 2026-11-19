@@ -264,10 +264,17 @@ that writes it (see *Cross-file limits*).
   nothing imports may be loaded beside it (a test setup file, a framework route) and an object
   reaches a render through a global or a store
   [#336](https://github.com/rboudrouss/reactant-analyzer/issues/336). Only the `length` of an
-  array literal or a string is never an accessor's. Not seen:
+  array literal or a string is never an accessor's. A read off the props object of a child the
+  analysis renders, or off a `useRef` object, both plain objects React builds, may run only an
+  accessor a descriptor installs (on it or on `Object.prototype`, whatever the target, since the
+  analysis does not know it) or one of a prototype the program sets: one descriptor installed
+  under a name no constant spells (a polyfill looping over property names) makes every such read
+  a possible call again. The props of a component no element of the analysis renders, the state
+  and context values and a callback's arguments keep the program-wide reading. Not seen:
   a getter defined by code the analysis does not read (a library, a skipped file), which is still
-  read as the receiver's member, and a state setter kept by unseen code past the point it escaped
-  and called later from an accessor or a method
+  read as the receiver's member, a prototype set under a key no constant spells (`o[k] = p`) or
+  by `Object.assign` from an object with an own `__proto__`, and a state setter kept by unseen
+  code past the point it escaped and called later from an accessor or a method
   [#335](https://github.com/rboudrouss/reactant-analyzer/issues/335).
 - **Classes.** A `new` of a class the program defines — in the body, at the top level of a module,
   or imported from one — runs its constructor with its arguments, on an instance placed at the

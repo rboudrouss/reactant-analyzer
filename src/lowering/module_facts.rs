@@ -126,6 +126,13 @@ pub fn collect_module_facts(
 /// constant spells may be any name. `accessor x` is left out: its getter and
 /// setter only read and write the field's own storage, a data member's
 /// behaviour.
+///
+/// Apart (#336): what may land on an object that exists before it — a
+/// descriptor of every one of those calls but `Object.create`, whose
+/// descriptors land on the object it creates — and a prototype the program
+/// sets (`Object.setPrototypeOf`, `Reflect.setPrototypeOf`, a write of
+/// `__proto__`): a literal brings its own accessors, `null` none, anything
+/// else any object of the program.
 pub(crate) fn accessor_names(program: &Program) -> AccessorNames {
     let mut scan = AccessorScan::default();
     scan.visit_program(program);
@@ -135,6 +142,35 @@ pub(crate) fn accessor_names(program: &Program) -> AccessorNames {
 #[derive(Default)]
 struct AccessorScan {
     found: AccessorNames,
+}
+
+impl AccessorScan {
+    /// `proto` (`None`: not written) is made an existing object's
+    /// prototype. A literal puts its own accessors on that object's chain,
+    /// and its own prototype's when it names one; `null` puts none; any other
+    /// value may be any object of the program.
+    fn prototype(&mut self, proto: Option<&Expression>) {
+        match proto.map(Expression::get_inner_expression) {
+            Some(Expression::NullLiteral(_)) => {}
+            Some(Expression::ObjectExpression(obj)) => {
+                for p in &obj.properties {
+                    let ObjectPropertyKind::ObjectProperty(p) = p else {
+                        continue;
+                    };
+                    if p.kind != PropertyKind::Init {
+                        self.found.install(key_name(&p.key).as_deref());
+                    } else if !p.computed
+                        && !p.shorthand
+                        && !p.method
+                        && key_name(&p.key).is_some_and(|k| k == "__proto__")
+                    {
+                        self.prototype(Some(&p.value));
+                    }
+                }
+            }
+            _ => self.found.reprototype(),
+        }
+    }
 }
 
 /// The member name `key` spells, the way lowering spells a read of it.
@@ -203,21 +239,24 @@ impl<'a> Visit<'a> for AccessorScan {
             match (on, m.property.name.as_str()) {
                 (Some("Object" | "Reflect"), "defineProperty") => {
                     if may_hold_accessor(arg(2)) {
-                        self.found.define(arg(1).and_then(const_name).as_deref());
+                        self.found.install(arg(1).and_then(const_name).as_deref());
                     }
                 }
-                // The descriptors are the second argument of both.
-                (Some("Object"), "defineProperties" | "create") => {
+                // The descriptors are the second argument of both;
+                // `Object.create`'s land on the object it creates only.
+                (Some("Object"), method @ ("defineProperties" | "create")) => {
+                    let mut add = |member: Option<&str>| match method {
+                        "create" => self.found.define(member),
+                        _ => self.found.install(member),
+                    };
                     match arg(1).map(Expression::get_inner_expression) {
                         Some(Expression::ObjectExpression(obj)) => {
                             for p in &obj.properties {
                                 match p {
-                                    ObjectPropertyKind::SpreadProperty(_) => {
-                                        self.found.define(None);
-                                    }
+                                    ObjectPropertyKind::SpreadProperty(_) => add(None),
                                     ObjectPropertyKind::ObjectProperty(p) => {
                                         if may_hold_accessor(Some(&p.value)) {
-                                            self.found.define(key_name(&p.key).as_deref());
+                                            add(key_name(&p.key).as_deref());
                                         }
                                     }
                                 }
@@ -225,16 +264,31 @@ impl<'a> Visit<'a> for AccessorScan {
                         }
                         // `Object.create(proto)` installs no member.
                         None => {}
-                        Some(_) => self.found.define(None),
+                        Some(_) => add(None),
                     }
                 }
+                (Some("Object" | "Reflect"), "setPrototypeOf") => self.prototype(arg(1)),
                 (_, "__defineGetter__" | "__defineSetter__") => {
-                    self.found.define(arg(0).and_then(const_name).as_deref());
+                    self.found.install(arg(0).and_then(const_name).as_deref());
                 }
                 _ => {}
             }
         }
         walk::walk_call_expression(self, it);
+    }
+
+    fn visit_assignment_expression(&mut self, it: &AssignmentExpression<'a>) {
+        let proto = match &it.left {
+            AssignmentTarget::StaticMemberExpression(m) => m.property.name == "__proto__",
+            AssignmentTarget::ComputedMemberExpression(m) => {
+                const_name(&m.expression).is_some_and(|k| k == "__proto__")
+            }
+            _ => false,
+        };
+        if proto {
+            self.prototype(Some(&it.right));
+        }
+        walk::walk_assignment_expression(self, it);
     }
 
     fn visit_new_expression(&mut self, it: &NewExpression<'a>) {
@@ -411,6 +465,51 @@ mod tests {
         }
         let (names, any) = accessors_of("const p = new Proxy(t, { apply: () => 1 });");
         assert!(names.is_empty() && !any);
+    }
+
+    /// What a read off a plain object React builds may run (#336): only an
+    /// accessor a descriptor installs, or the accessors of a prototype the
+    /// program sets.
+    #[test]
+    fn a_plain_object_reads_only_installed_accessors() {
+        use crate::ir::module::AccessKey;
+        let off_plain = |src: &str, name: &str| {
+            facts_of(src)
+                .accessors
+                .may_run_off_plain(AccessKey::Named(name))
+        };
+        // A literal's, a class's, a `Proxy`'s and `Object.create`'s land on
+        // another object.
+        for src in [
+            "const o = { get p() { return 1; } };",
+            "class K { get p() { return 1; } }",
+            "const t = new Proxy({}, { get: () => ({}) });",
+            "Object.create(null, { p: { get: () => 1 } });",
+            "Object.setPrototypeOf(o, null); o.__proto__ = { q: 1 };",
+        ] {
+            assert!(!off_plain(src, "p"), "{src}");
+        }
+        // A descriptor may install on `Object.prototype` or the object.
+        for src in [
+            "Object.defineProperty(Object.prototype, \"p\", { get: () => ({}) });",
+            "Reflect.defineProperty(t, \"p\", d);",
+            "Object.defineProperties(t, { p: { get: () => 1 } });",
+            "t.__defineGetter__(\"p\", () => 1);",
+            "Object.defineProperty(t, k, { get: () => 1 });",
+            "Object.setPrototypeOf(o, { get p() { return 1; } });",
+            "o.__proto__ = { __proto__: { set p(v) {} } };",
+        ] {
+            assert!(off_plain(src, "p"), "{src}");
+        }
+        assert!(!off_plain(
+            "Object.defineProperty(t, \"q\", { get: () => 1 });",
+            "p"
+        ));
+        // A prototype that may be any object brings every accessor.
+        let proxy = "const t = new Proxy({}, { get: () => ({}) });";
+        for set in ["Object.setPrototypeOf(o, t);", "o[\"__proto__\"] = t;"] {
+            assert!(off_plain(&format!("{proxy}\n{set}"), "p"), "{set}");
+        }
     }
 
     #[test]

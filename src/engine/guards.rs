@@ -493,6 +493,11 @@ impl<'a> LoopFacts<'a> {
             hook_kinds: custom()
                 .map(|(l, _, name, source)| (l, purity::hook_result(source.as_deref(), name)))
                 .filter(|(_, k)| *k != Kind::Unknown)
+                // `useRef`'s object, which React builds (#336).
+                .chain(comp.hooks.iter().filter_map(|h| match h {
+                    HookEntry::Ref { label, .. } => Some((*label, Kind::Plain)),
+                    _ => None,
+                }))
                 .collect(),
             mutated,
             assigned,
@@ -869,9 +874,10 @@ impl<'a> Invariance<'a> {
                 Some(Member::Expr(member, scope)) => self.go(member, scope, props_hold, next),
                 Some(Member::Summary(sv, l)) => self.summary_holds(sv, Some(l), props_hold, next),
                 None => {
-                    let key =
-                        purity::access(self.kind(obj, body, next), Some(field), Kind::Unknown);
-                    !self.accessors.may_run(key) && self.go(obj, body, props_hold, next)
+                    let receiver = self.kind(obj, body, next);
+                    let key = purity::access(receiver, Some(field), Kind::Unknown);
+                    !purity::reads_accessor(self.accessors, receiver, key)
+                        && self.go(obj, body, props_hold, next)
                 }
             },
             Expr::IndexAccess { arr, idx } => {
@@ -886,12 +892,13 @@ impl<'a> Invariance<'a> {
                     }
                     None => {
                         let constant = purity::constant_key(idx);
+                        let receiver = self.kind(arr, body, next);
                         let key = purity::access(
-                            self.kind(arr, body, next),
+                            receiver,
                             constant.as_deref(),
                             self.kind(idx, body, next),
                         );
-                        !self.accessors.may_run(key)
+                        !purity::reads_accessor(self.accessors, receiver, key)
                             && self.go(arr, body, props_hold, next)
                             && self.go(idx, body, props_hold, next)
                     }

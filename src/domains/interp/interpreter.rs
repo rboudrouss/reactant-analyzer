@@ -544,9 +544,11 @@ pub(crate) fn access_key<'k, T: Transfer>(
 /// placed one does not hold, which its prototype may — the read or the write
 /// may run an accessor the program defines (#334), with the receiver as
 /// `this` and the value written as its argument: a call the analysis cannot
-/// see, to which both escape.
+/// see, to which both escape. Off a plain object React builds, only an
+/// accessor its chain may hold ([`Heap::unseen_accessor`], #336).
 ///
 /// [`Heap::record_getter`]: crate::domains::stores::Heap::record_getter
+/// [`Heap::unseen_accessor`]: crate::domains::stores::Heap::unseen_accessor
 fn run_accessors<T: Transfer>(
     transfer: &T,
     obj: &Expr,
@@ -568,7 +570,7 @@ fn run_accessors<T: Transfer>(
     let unplaced = sites.as_ref().is_none_or(|s| ctx.heap.members(s, member).1);
     let unseen = unplaced && {
         let key = access_key(transfer, obj, sites.as_ref(), member, index, env, ctx);
-        ctx.heap.unseen_accessor(key)
+        ctx.heap.unseen_accessor(sites.as_ref(), key)
     };
     if unseen {
         escape(transfer, obj, env, ctx);
@@ -868,12 +870,14 @@ fn bind_rhs<T: Transfer>(
     env.bind_locs(var.to_string(), sites);
     // `useRef` returns the hook's one object (#268): the closures a body
     // writes into `current` are what a call through it runs. It persists
-    // across renders, so a value read through it stays unknown.
+    // across renders, so a value read through it stays unknown. React builds
+    // it, a plain object (#336).
     if let Expr::HookMarker(label, MarkerVal::StableRef) = rhs {
         let id = ctx.component.hook_site(*label);
         if ctx.heap.get(id).is_none() {
             let members = Members {
                 persists: true,
+                plain: true,
                 ..Members::default()
             };
             ctx.heap.insert(id, HeapValue::Obj(members));

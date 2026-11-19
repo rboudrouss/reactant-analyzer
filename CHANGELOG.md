@@ -113,6 +113,15 @@ on a program React settles; 323 oracle cases, none a known false negative.
   cases go from a false Warning to silent; the local corpus is unchanged
   (memos body runs 44 669 → 44 482, excalidraw and chakra-ui equal), since a
   `Proxy` still makes every other name an accessor's program-wide (#336).
+- A read off the props object or a `useRef` object, which React builds as
+  plain objects, runs only an accessor a descriptor (`Object.defineProperty`
+  and its kin) installed or one of a prototype the program sets: a `Proxy`,
+  a literal's or a class's accessor elsewhere no longer makes a prop the
+  parent does not pass, or `ref.current`, a possible call. The same read now
+  also counts such an installed accessor where it counted none. Two oracle
+  cases go from a false Warning to silent; locally excalidraw body runs
+  24 923 → 22 856, one Warning added (`props.elements`, a getter of that name
+  installed on `window.h`), the other small repos unchanged (#336).
 
 ### Removed
 

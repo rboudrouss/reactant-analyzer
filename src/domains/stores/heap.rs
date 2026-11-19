@@ -87,6 +87,12 @@ pub struct Members {
     /// An array literal's object, whose `length` is its own (#336). A
     /// property of the site, so a join keeps it from either side.
     pub array: bool,
+    /// A plain object the library builds — React's props object, `useRef`'s
+    /// — whose reads run no accessor but one a descriptor installed or a
+    /// prototype the program set (#336,
+    /// [`AccessorNames::may_run_off_plain`]). A property of the site, kept
+    /// from either side as `array` is.
+    pub plain: bool,
 }
 
 impl Members {
@@ -263,6 +269,7 @@ impl Members {
             unseen: self.unseen || other.unseen,
             persists: self.persists || other.persists,
             array: self.array || other.array,
+            plain: self.plain || other.plain,
         }
     }
 
@@ -280,6 +287,7 @@ impl Members {
             && (!self.unseen || other.unseen)
             && (!self.persists || other.persists)
             && (!self.array || other.array)
+            && (!self.plain || other.plain)
     }
 }
 
@@ -363,11 +371,27 @@ impl Heap {
         &self.defined
     }
 
-    /// May a read or a write of `key` run an accessor where the heap places
-    /// nothing: on an object no site places, or past the members a placed
-    /// one holds (#334)? A call the analysis cannot see, then.
-    pub fn unseen_accessor(&self, key: AccessKey<'_>) -> bool {
-        self.defined.may_run(key)
+    /// May a read or a write of `key` off what `sites` place (`None`:
+    /// nothing) run an accessor where the heap places nothing: on an object
+    /// no site places, or past the members a placed one holds (#334)? A call
+    /// the analysis cannot see, then. Off plain objects the library built
+    /// only, only an accessor such an object's chain may hold (#336).
+    pub fn unseen_accessor(&self, sites: Option<&Sites>, key: AccessKey<'_>) -> bool {
+        match sites.is_some_and(|s| self.plain(s)) {
+            true => self.defined.may_run_off_plain(key),
+            false => self.defined.may_run(key),
+        }
+    }
+
+    /// Is every object `sites` may name a plain object the library built,
+    /// and nothing else (#336)?
+    pub fn plain(&self, sites: &Sites) -> bool {
+        !sites.open
+            && !sites.ids.is_empty()
+            && sites
+                .ids
+                .iter()
+                .all(|id| matches!(self.get(*id), Some(HeapValue::Obj(m)) if m.plain))
     }
 
     /// Is every object `sites` may name an array literal's, and nothing

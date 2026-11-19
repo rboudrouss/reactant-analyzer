@@ -62,8 +62,35 @@ pub struct ModuleFacts {
 /// is the receiver, so on an object the heap does not place it is a call the
 /// analysis cannot see. A name no constant spells (a computed accessor key, a
 /// descriptor keyed by a variable) may be any name.
+///
+/// A plain object the library builds — React's props object, the object
+/// `useRef` returns — has `Object.prototype` as its prototype and only own
+/// data members (React 19.3.1: `jsxProd` keeps the compiler's literal or
+/// copies it into `{}`, `react-jsx-runtime.production.js:18-22`;
+/// `createElement` copies into `{}`, `react.production.js:455-463`; `useRef`
+/// returns `{ current }`, `react-dom-client.production.js:5855`). Neither a
+/// literal's or a class's accessor nor a `Proxy` can be on that chain, since
+/// `Object.prototype`'s own prototype is `null` and cannot change: a read
+/// off one runs only an accessor a descriptor installed, on it or on
+/// `Object.prototype`, or one of a prototype the program set on it
+/// ([`AccessorNames::may_run_off_plain`], #336).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AccessorNames {
+    /// Every name an accessor of the program may have.
+    all: NameSet,
+    /// The names a descriptor installs on an object that exists
+    /// (`Object.defineProperty` and its kin, `__defineGetter__`), and the
+    /// accessors of a literal the program makes another object's prototype.
+    installed: NameSet,
+    /// The program makes something other than a literal an object's
+    /// prototype (`Object.setPrototypeOf(o, p)`, `o.__proto__ = p`): any
+    /// object of the program, a `Proxy` included, may then be on any chain.
+    reprototyped: bool,
+}
+
+/// Member names, as far as which keys they may spell goes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct NameSet {
     names: std::collections::BTreeSet<String>,
     /// Some name of `names` may be a number's key ([`AccessKey::Number`]).
     numeric: bool,
@@ -110,9 +137,8 @@ fn spells_number(name: &str) -> bool {
     name.parse::<f64>().is_ok()
 }
 
-impl AccessorNames {
-    /// An accessor of `member` (`None`: a name no constant spells).
-    pub fn define(&mut self, member: Option<&str>) {
+impl NameSet {
+    fn add(&mut self, member: Option<&str>) {
         match member {
             Some(m) => {
                 self.numeric |= spells_number(m);
@@ -122,15 +148,13 @@ impl AccessorNames {
         }
     }
 
-    /// The names either defines.
-    pub fn extend(&mut self, other: &AccessorNames) {
+    fn extend(&mut self, other: &NameSet) {
         self.names.extend(other.names.iter().cloned());
         self.numeric |= other.numeric;
         self.any |= other.any;
     }
 
-    /// May a read or a write of `key` run an accessor of the program?
-    pub fn may_run(&self, key: AccessKey<'_>) -> bool {
+    fn may_name(&self, key: AccessKey<'_>) -> bool {
         match key {
             AccessKey::Own => false,
             _ if self.any => true,
@@ -139,15 +163,55 @@ impl AccessorNames {
             AccessKey::Any => !self.names.is_empty(),
         }
     }
+}
+
+impl AccessorNames {
+    /// An accessor of `member` (`None`: a name no constant spells).
+    pub fn define(&mut self, member: Option<&str>) {
+        self.all.add(member);
+    }
+
+    /// An accessor of `member` installed on an object that may exist before
+    /// it, `Object.prototype` included: by a descriptor, or as a member of a
+    /// literal made a prototype.
+    pub fn install(&mut self, member: Option<&str>) {
+        self.all.add(member);
+        self.installed.add(member);
+    }
+
+    /// The program makes something other than a literal an object's
+    /// prototype.
+    pub fn reprototype(&mut self) {
+        self.reprototyped = true;
+    }
+
+    /// The names either defines.
+    pub fn extend(&mut self, other: &AccessorNames) {
+        self.all.extend(&other.all);
+        self.installed.extend(&other.installed);
+        self.reprototyped |= other.reprototyped;
+    }
+
+    /// May a read or a write of `key` run an accessor of the program?
+    pub fn may_run(&self, key: AccessKey<'_>) -> bool {
+        self.all.may_name(key)
+    }
+
+    /// May a read or a write of `key` off a plain object the library builds
+    /// run an accessor of the program? Only one a descriptor installed, or
+    /// any when the program sets a prototype it may hand such an object to.
+    pub fn may_run_off_plain(&self, key: AccessKey<'_>) -> bool {
+        self.installed.may_name(key) || (self.reprototyped && self.may_run(key))
+    }
 
     /// No accessor of the program may run at any read.
     pub fn is_empty(&self) -> bool {
-        !self.any && self.names.is_empty()
+        !self.all.any && self.all.names.is_empty()
     }
 
     /// The names spelled, sorted, and whether any name may be one.
     pub fn names(&self) -> (impl Iterator<Item = &str>, bool) {
-        (self.names.iter().map(String::as_str), self.any)
+        (self.all.names.iter().map(String::as_str), self.all.any)
     }
 }
 
