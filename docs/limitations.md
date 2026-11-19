@@ -252,7 +252,14 @@ that writes it (see *Cross-file limits*).
   [#334](https://github.com/rboudrouss/reactant-analyzer/issues/334). Such a read may be a new
   value at any render (a Warning, never an Error) and the receiver escapes there. The names are
   program-wide: one getter named `length` in a test file makes every `x.length` off an unplaced
-  value a possible change, and a key no constant names (`xs[i]`) may be any accessor's. Not seen:
+  value a possible change, a key no constant names (`xs[i]`) may be any accessor's unless it is
+  known to be a number and no accessor's name spells one, and one `Proxy` (or computed accessor
+  key) anywhere makes every name an accessor's in every component, whether or not its module is
+  ever loaded with that component's: no narrowing by the import graph is sound, since a module
+  nothing imports may be loaded beside it (a test setup file, a framework route) and an object
+  reaches a render through a global or a store
+  [#336](https://github.com/rboudrouss/reactant-analyzer/issues/336). Only the `length` of an
+  array literal or a string is never an accessor's. Not seen:
   a getter defined by code the analysis does not read (a library, a skipped file), which is still
   read as the receiver's member, and a state setter kept by unseen code past the point it escaped
   and called later from an accessor or a method

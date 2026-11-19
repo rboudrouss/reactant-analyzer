@@ -10,7 +10,7 @@ use crate::{
         cfg::CFG,
         expr::{Accessor, Expr, accessor_of},
         free_vars::compute_free_vars,
-        module::AccessorNames,
+        module::{AccessKey, AccessorNames},
         types::{ExprId, HookLabel, Symbol, Var},
     },
 };
@@ -84,6 +84,9 @@ pub struct Members {
     pub open: bool,
     pub unseen: bool,
     pub persists: bool,
+    /// An array literal's object, whose `length` is its own (#336). A
+    /// property of the site, so a join keeps it from either side.
+    pub array: bool,
 }
 
 impl Members {
@@ -259,6 +262,7 @@ impl Members {
             open: self.open || other.open,
             unseen: self.unseen || other.unseen,
             persists: self.persists || other.persists,
+            array: self.array || other.array,
         }
     }
 
@@ -275,6 +279,7 @@ impl Members {
             && (!self.open || other.open)
             && (!self.unseen || other.unseen)
             && (!self.persists || other.persists)
+            && (!self.array || other.array)
     }
 }
 
@@ -358,12 +363,22 @@ impl Heap {
         &self.defined
     }
 
-    /// May a read or a write of `member` (`None`: a key no constant names)
-    /// run an accessor where the heap places nothing: on an object no site
-    /// places, or past the members a placed one holds (#334)? A call the
-    /// analysis cannot see, then.
-    pub fn unseen_accessor(&self, member: Option<&str>) -> bool {
-        self.defined.may_run(member)
+    /// May a read or a write of `key` run an accessor where the heap places
+    /// nothing: on an object no site places, or past the members a placed
+    /// one holds (#334)? A call the analysis cannot see, then.
+    pub fn unseen_accessor(&self, key: AccessKey<'_>) -> bool {
+        self.defined.may_run(key)
+    }
+
+    /// Is every object `sites` may name an array literal's, and nothing
+    /// else (#336)?
+    pub fn arrays(&self, sites: &Sites) -> bool {
+        !sites.open
+            && !sites.ids.is_empty()
+            && sites
+                .ids
+                .iter()
+                .all(|id| matches!(self.get(*id), Some(HeapValue::Obj(m)) if m.array))
     }
 
     /// One run of the getter at `site` returned `value` (`None`: it ran no

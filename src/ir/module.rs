@@ -65,7 +65,49 @@ pub struct ModuleFacts {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AccessorNames {
     names: std::collections::BTreeSet<String>,
+    /// Some name of `names` may be a number's key ([`AccessKey::Number`]).
+    numeric: bool,
     any: bool,
+}
+
+/// What a member read or write selects, as far as the accessors of the
+/// program it may run go (#336).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessKey<'a> {
+    /// The member a constant spells.
+    Named(&'a str),
+    /// A key known to be a number no constant spells (`xs[i]`, `i` an
+    /// interval): `ToPropertyKey` makes it the number's canonical string
+    /// (`"1"`, `"-0.5"`, `"NaN"`), so only a name that spells a number, or a
+    /// definition of any name, may be an accessor of it.
+    Number,
+    /// A key nothing is known of.
+    Any,
+    /// The `length` of an array or a string: an own data property the
+    /// language makes non-configurable, so no accessor defines it and a read
+    /// consults no prototype nor `Proxy` trap (`defineProperty` throws on it).
+    Own,
+}
+
+impl<'a> AccessKey<'a> {
+    /// A key a constant may spell (`None`: nothing is known of it).
+    pub fn of(member: Option<&'a str>) -> Self {
+        member.map_or(AccessKey::Any, AccessKey::Named)
+    }
+
+    /// `name` off a receiver known, or not, to be an array or a string.
+    pub fn member(name: &'a str, array_or_string: bool) -> Self {
+        match array_or_string && name == "length" {
+            true => AccessKey::Own,
+            false => AccessKey::Named(name),
+        }
+    }
+}
+
+/// May `name` be the key of a number? A superset of the canonical numeric
+/// strings `ToString(number)` gives: every one of them parses as a float.
+fn spells_number(name: &str) -> bool {
+    name.parse::<f64>().is_ok()
 }
 
 impl AccessorNames {
@@ -73,6 +115,7 @@ impl AccessorNames {
     pub fn define(&mut self, member: Option<&str>) {
         match member {
             Some(m) => {
+                self.numeric |= spells_number(m);
                 self.names.insert(m.to_string());
             }
             None => self.any = true,
@@ -82,17 +125,19 @@ impl AccessorNames {
     /// The names either defines.
     pub fn extend(&mut self, other: &AccessorNames) {
         self.names.extend(other.names.iter().cloned());
+        self.numeric |= other.numeric;
         self.any |= other.any;
     }
 
-    /// May a read or a write of `member` (`None`: a key no constant names)
-    /// run an accessor of the program?
-    pub fn may_run(&self, member: Option<&str>) -> bool {
-        self.any
-            || match member {
-                Some(m) => self.names.contains(m),
-                None => !self.names.is_empty(),
-            }
+    /// May a read or a write of `key` run an accessor of the program?
+    pub fn may_run(&self, key: AccessKey<'_>) -> bool {
+        match key {
+            AccessKey::Own => false,
+            _ if self.any => true,
+            AccessKey::Named(m) => self.names.contains(m),
+            AccessKey::Number => self.numeric,
+            AccessKey::Any => !self.names.is_empty(),
+        }
     }
 
     /// No accessor of the program may run at any read.
@@ -348,6 +393,48 @@ mod tests {
             star: from.iter().map(PathBuf::from).collect(),
             ..Default::default()
         }
+    }
+
+    fn defining(names: &[&str], any: bool) -> AccessorNames {
+        let mut out = AccessorNames::default();
+        for n in names {
+            out.define(Some(n));
+        }
+        if any {
+            out.define(None);
+        }
+        out
+    }
+
+    #[test]
+    fn a_number_key_may_run_only_a_numeric_name_or_any() {
+        let words = defining(&["length", "p"], false);
+        assert!(!words.may_run(AccessKey::Number));
+        assert!(words.may_run(AccessKey::Any));
+        for n in [
+            "0",
+            "12",
+            "-1",
+            "1.5",
+            "1e+21",
+            "NaN",
+            "Infinity",
+            "-Infinity",
+        ] {
+            assert!(defining(&[n], false).may_run(AccessKey::Number), "{n}");
+        }
+        assert!(defining(&["p"], true).may_run(AccessKey::Number));
+        let mut both = defining(&["p"], false);
+        both.extend(&defining(&["3"], false));
+        assert!(both.may_run(AccessKey::Number));
+    }
+
+    #[test]
+    fn the_length_of_an_array_or_a_string_is_never_an_accessor() {
+        let all = defining(&["length"], true);
+        assert!(!all.may_run(AccessKey::member("length", true)));
+        assert!(all.may_run(AccessKey::member("length", false)));
+        assert!(all.may_run(AccessKey::member("size", true)));
     }
 
     #[test]

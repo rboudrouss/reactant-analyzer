@@ -106,6 +106,13 @@ on a program React settles; 323 oracle cases, none a known false negative.
   the getter of `p`, which runs at every read of `p`. If the render reads it,
   this re-renders on every render", where it said the setter was handed to a
   callee with no timing summary. The level is unchanged (#321).
+- The accessor names of #334 leave out two reads no accessor can run: a key
+  known to be a number (`rows[i % 2]`), unless an accessor's name spells a
+  number or a computed key or a `Proxy` may define any name; and the `length`
+  of an array literal or a string, a `Proxy` anywhere or not. Two oracle
+  cases go from a false Warning to silent; the local corpus is unchanged
+  (memos body runs 44 669 → 44 482, excalidraw and chakra-ui equal), since a
+  `Proxy` still makes every other name an accessor's program-wide (#336).
 
 ### Removed
 

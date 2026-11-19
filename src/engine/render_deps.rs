@@ -51,7 +51,7 @@ use crate::ir::{
     },
     free_vars::{collect_used_vars, compute_free_vars},
     hooks::HookEntry,
-    module::AccessorNames,
+    module::{AccessKey, AccessorNames},
     source_range::SourceRange,
     stmt::{MemberKey, Stmt},
     types::{BlockId, HookLabel, Symbol, Var},
@@ -960,7 +960,7 @@ impl<'a> Analyzer<'a> {
             Shape::Props => DVal::of(Deps::one(Source::Prop(field.to_string()))),
             Shape::Members(m) => match m.get(field) {
                 Some(v) => v.clone(),
-                None => self.computed(base, Some(field)),
+                None => self.computed(base, AccessKey::Named(field)),
             },
             Shape::Spread { members, spreads } => match members.get(field) {
                 Some(v) => v.clone(),
@@ -968,18 +968,18 @@ impl<'a> Analyzer<'a> {
                     .iter()
                     .map(|s| self.member(s, field))
                     .reduce(|a, b| a.join(&b))
-                    .unwrap_or_else(|| self.computed(base, Some(field))),
+                    .unwrap_or_else(|| self.computed(base, AccessKey::Named(field))),
             },
-            Shape::None => self.computed(base, Some(field)),
+            Shape::None => self.computed(base, AccessKey::Named(field)),
         }
     }
 
-    /// A member of `base` no entry of it says (`None`: a key no constant
-    /// names), computed from it. A value of no known kind may run an
-    /// accessor of the program there (#334): a call not known pure.
-    fn computed(&self, base: &DVal, member: Option<&str>) -> DVal {
+    /// A member of `base` no entry of it says (`key`), computed from it. A
+    /// value of no known kind may run an accessor of the program there
+    /// (#334): a call not known pure.
+    fn computed(&self, base: &DVal, key: AccessKey<'_>) -> DVal {
         let mut deps = base.deps.clone();
-        if base.kind == Kind::Unknown && self.accessors.may_run(member) {
+        if base.kind == Kind::Unknown && self.accessors.may_run(key) {
             deps = Deps {
                 impure: true,
                 ..deps.ungated()
@@ -1076,10 +1076,12 @@ impl<'a> Analyzer<'a> {
             } => DVal::of(self.closure(params, body_cfg, env)),
             Expr::FieldAccess { obj, field } => self.member(&self.eval(obj, env), field),
             Expr::IndexAccess { arr, idx } => {
-                let a = self.eval(arr, env);
+                let (a, i) = (self.eval(arr, env), self.eval(idx, env));
                 let kind = purity::element(a.kind, idx);
-                let mut d = self.computed(&a, purity::constant_key(idx).as_deref()).deps;
-                d.union_with(&self.eval(idx, env).deps);
+                let constant = purity::constant_key(idx);
+                let key = purity::access(a.kind, constant.as_deref(), i.kind);
+                let mut d = self.computed(&a, key).deps;
+                d.union_with(&i.deps);
                 DVal::of_kind(d, kind)
             }
             Expr::BinOp { op, lhs, rhs } => {

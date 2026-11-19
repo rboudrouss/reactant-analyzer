@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -18,6 +19,7 @@ use crate::{
             Accessor, CONSTRUCT_KEY, Expr, MarkerVal, NEW_INSTANCE, SPREAD_KEY_PREFIX,
             SummaryValue, THIS, accessor_of, is_synthetic_key,
         },
+        module::AccessKey,
         stmt::{MemberKey, Stmt},
         types::{BlockId, ExprId, Symbol},
     },
@@ -438,11 +440,11 @@ fn exec_full_stmt<T: Transfer>(
             // A write through a setter runs its body with the value written
             // (#321).
             if ctx.heap.has_accessors() {
-                let member = match key {
-                    MemberKey::Field(field) => Some(field.clone()),
-                    MemberKey::Index(idx) => member_key(idx, env),
+                let key = match key {
+                    MemberKey::Field(field) => Key::Field(field),
+                    MemberKey::Index(idx) => Key::Index(idx),
                 };
-                run_accessors(transfer, obj, member.as_deref(), Some(rhs), env, ctx, depth);
+                run_accessors(transfer, obj, key, Some(rhs), env, ctx, depth);
             }
             exec_stmt_core(transfer, stmt, env, ctx);
         }
@@ -469,15 +471,59 @@ fn run_member_reads<T: Transfer>(
         Expr::FnLit { .. } => {}
         Expr::FieldAccess { obj, field } => {
             run_member_reads(transfer, obj, env, ctx, depth);
-            run_accessors(transfer, obj, Some(field), None, env, ctx, depth);
+            run_accessors(transfer, obj, Key::Field(field), None, env, ctx, depth);
         }
         Expr::IndexAccess { arr, idx } => {
             run_member_reads(transfer, arr, env, ctx, depth);
             run_member_reads(transfer, idx, env, ctx, depth);
-            let member = member_key(idx, env);
-            run_accessors(transfer, arr, member.as_deref(), None, env, ctx, depth);
+            run_accessors(transfer, arr, Key::Index(idx), None, env, ctx, depth);
         }
         other => other.for_each_child(&mut |c| run_member_reads(transfer, c, env, ctx, depth)),
+    }
+}
+
+/// The key of a member read or write, as written.
+#[derive(Clone, Copy)]
+enum Key<'a> {
+    Field(&'a str),
+    Index(&'a Expr),
+}
+
+/// What a read or a write of a member of `obj` (placed at `sites`) selects,
+/// for the accessors of the program it may run (#336): the name a constant
+/// spells (`member`), else a number's key when the key expression (`index`)
+/// is surely a number. `length` off a receiver that is surely an array
+/// literal's object or a string is the receiver's own data property.
+pub(crate) fn access_key<'k, T: Transfer>(
+    transfer: &T,
+    obj: &Expr,
+    sites: Option<&Sites>,
+    member: Option<&'k str>,
+    index: Option<&Expr>,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+) -> AccessKey<'k> {
+    fn surely<T: Transfer>(
+        transfer: &T,
+        e: &Expr,
+        kind: &str,
+        env: &AbstractEnv<T::Domain>,
+        ctx: &mut AnalysisCtx<T::Domain>,
+    ) -> bool {
+        transfer
+            .eval_expr(e, env, ctx)
+            .as_state_value()
+            .is_some_and(|v| v.typeof_name() == Some(kind))
+    }
+    match member {
+        Some(m) if m == "length" => {
+            let own = sites.is_some_and(|s| ctx.heap.arrays(s))
+                || surely(transfer, obj, "string", env, ctx);
+            AccessKey::member(m, own)
+        }
+        Some(m) => AccessKey::Named(m),
+        None if index.is_some_and(|i| surely(transfer, i, "number", env, ctx)) => AccessKey::Number,
+        None => AccessKey::Any,
     }
 }
 
@@ -498,7 +544,7 @@ fn run_member_reads<T: Transfer>(
 fn run_accessors<T: Transfer>(
     transfer: &T,
     obj: &Expr,
-    member: Option<&str>,
+    key: Key<'_>,
     written: Option<&Expr>,
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
@@ -507,9 +553,17 @@ fn run_accessors<T: Transfer>(
     if !ctx.heap.has_accessors() {
         return;
     }
+    let (constant, index) = match key {
+        Key::Field(field) => (Some(Cow::Borrowed(field)), None),
+        Key::Index(idx) => (member_key(idx, env).map(Cow::Owned), Some(idx)),
+    };
+    let member = constant.as_deref();
     let sites = alloc_literal(transfer, obj, env, ctx);
     let unplaced = sites.as_ref().is_none_or(|s| ctx.heap.members(s, member).1);
-    if unplaced && ctx.heap.unseen_accessor(member) {
+    if unplaced && {
+        let key = access_key(transfer, obj, sites.as_ref(), member, index, env, ctx);
+        ctx.heap.unseen_accessor(key)
+    } {
         escape(transfer, obj, env, ctx);
         if let Some(rhs) = written {
             escape(transfer, rhs, env, ctx);
@@ -921,6 +975,7 @@ pub(crate) fn alloc_literal<T: Transfer>(
                 true => Members::exactly(named),
                 false => Members::at_least(named),
             };
+            members.array = true;
             for (i, value) in elems.iter().enumerate().skip(prefix) {
                 if !spread_at.contains(&i) {
                     members.hold_unplaced(&member_entry(transfer, value, env, ctx));
@@ -1479,14 +1534,13 @@ fn exec_callbacks_depth<T: Transfer>(
         // any reader of the value, as a call is.
         Expr::FieldAccess { obj, field } => {
             exec_callbacks_depth(transfer, obj, env, ctx, depth);
-            run_accessors(transfer, obj, Some(field), None, env, ctx, depth);
+            run_accessors(transfer, obj, Key::Field(field), None, env, ctx, depth);
             None
         }
         Expr::IndexAccess { arr, idx } => {
             exec_callbacks_depth(transfer, arr, env, ctx, depth);
             exec_callbacks_depth(transfer, idx, env, ctx, depth);
-            let member = member_key(idx, env);
-            run_accessors(transfer, arr, member.as_deref(), None, env, ctx, depth);
+            run_accessors(transfer, arr, Key::Index(idx), None, env, ctx, depth);
             None
         }
         // `new K(…)` of a class the program defines runs its construction

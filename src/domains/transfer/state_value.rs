@@ -7,7 +7,7 @@ use crate::{
         AbstractDomain, AnalysisCtx, Transfer,
         impls::{BoolVal, Interval, SetterVal, Stability, StateValue, StrConst},
         interp::{
-            alloc_literal, call_targets, closure_env, escape, exec_stmt_with_callbacks,
+            access_key, alloc_literal, call_targets, closure_env, escape, exec_stmt_with_callbacks,
             returned_sites, run_cfg,
         },
         stores::{AbstractEnv, EnvVal, Heap, HeapValue, Sites, member_key},
@@ -867,7 +867,7 @@ fn eval_field_access(
     env: &AbstractEnv<StateValue>,
     ctx: &mut AnalysisCtx<StateValue>,
 ) -> StateValue {
-    eval_member(obj, Some(field), env, ctx)
+    eval_member(obj, Some(field), None, env, ctx)
 }
 
 /// A **constant** index is a member read, and the heap answers it exactly as it
@@ -890,23 +890,26 @@ fn eval_index_access(
     ctx: &mut AnalysisCtx<StateValue>,
 ) -> StateValue {
     let key = member_key(idx, env);
-    eval_member(arr, key.as_ref(), env, ctx)
+    eval_member(arr, key.as_ref(), Some(idx), env, ctx)
 }
 
-/// Read `member` (`None`: a key no constant names) off every heap object the
-/// receiver may denote — a whole member chain, a name, or a literal, placed
-/// as any literal is ([`alloc_literal`], #307) — and, when the receiver may
-/// also be something no site places or the key may select a member no entry
-/// records, join what the member of anything is (#240).
+/// Read `member` (`None`: a key no constant names, `index` the key
+/// expression) off every heap object the receiver may denote — a whole
+/// member chain, a name, or a literal, placed as any literal is
+/// ([`alloc_literal`], #307) — and, when the receiver may also be something
+/// no site places or the key may select a member no entry records, join what
+/// the member of anything is (#240).
 fn eval_member(
     obj: &Expr,
     member: Option<&Symbol>,
+    index: Option<&Expr>,
     env: &AbstractEnv<StateValue>,
     ctx: &mut AnalysisCtx<StateValue>,
 ) -> StateValue {
-    let (vals, open) = match alloc_literal(&StateValueTransfer, obj, env, ctx) {
+    let sites = alloc_literal(&StateValueTransfer, obj, env, ctx);
+    let (vals, open) = match &sites {
         Some(sites) => {
-            let (entries, open) = ctx.heap.members(&sites, member.map(String::as_str));
+            let (entries, open) = ctx.heap.members(sites, member.map(String::as_str));
             (entries.into_iter().map(EnvVal::as_val).collect(), open)
         }
         None => (Vec::new(), true),
@@ -927,9 +930,18 @@ fn eval_member(
     // the read may run it, a call the analysis cannot see, whose result may
     // be new at any read.
     let obj_val = eval_state_value(obj, env, ctx);
+    let key = access_key(
+        &StateValueTransfer,
+        obj,
+        sites.as_ref(),
+        member.map(String::as_str),
+        index,
+        env,
+        ctx,
+    );
     let any = StateValue {
         reference: match member {
-            _ if ctx.heap.unseen_accessor(member.map(String::as_str)) => Stability::MayBeFresh,
+            _ if ctx.heap.unseen_accessor(key) => Stability::MayBeFresh,
             Some(_) => obj_val.versioned_reference().unwrap_or(Stability::Unknown),
             None => Stability::Unknown,
         },

@@ -8,6 +8,7 @@ pub(crate) use interpreter::Args;
 pub use interpreter::MAX_INLINE_DEPTH;
 pub use interpreter::Plans;
 pub(crate) use interpreter::Ran;
+pub(crate) use interpreter::access_key;
 pub(crate) use interpreter::alloc_literal;
 pub(crate) use interpreter::bind_params;
 pub(crate) use interpreter::call_targets;

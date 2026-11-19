@@ -32,7 +32,7 @@ use crate::ir::{
     cfg::CFG,
     expr::{BinOp, Expr, Prim, UnaryOp},
     free_vars::compute_free_vars,
-    module::AccessorNames,
+    module::{AccessKey, AccessorNames},
     types::Var,
 };
 
@@ -364,6 +364,18 @@ pub fn call(
     runs_known.then_some(found.gives)
 }
 
+/// What a read off a receiver of kind `receiver` selects, for the accessors
+/// of the program it may run (#336): the member `key` a constant spells,
+/// else a number's key when the key is of kind `Num`. The `length` of an
+/// array or a string is the receiver's own.
+pub fn access(receiver: Kind, key: Option<&str>, key_kind: Kind) -> AccessKey<'_> {
+    match key {
+        Some(k) => AccessKey::member(k, matches!(receiver, Kind::Array | Kind::Str)),
+        None if key_kind == Kind::Num => AccessKey::Number,
+        None => AccessKey::Any,
+    }
+}
+
 /// The member a key spells when it is a constant: what a read `o[k]` reads.
 pub fn constant_key(idx: &Expr) -> Option<String> {
     match idx.peel_ts() {
@@ -415,12 +427,17 @@ pub fn body_holds(
                     && args.iter().all(|a| walk(a, var, accessors))
             }
             Expr::FieldAccess { obj, field } => {
-                !accessors.may_run(Some(field)) && walk(obj, var, accessors)
+                let key = access(kind_of(obj, var, accessors), Some(field), Kind::Unknown);
+                !accessors.may_run(key) && walk(obj, var, accessors)
             }
             Expr::IndexAccess { arr, idx } => {
-                !accessors.may_run(constant_key(idx).as_deref())
-                    && walk(arr, var, accessors)
-                    && walk(idx, var, accessors)
+                let constant = constant_key(idx);
+                let key = access(
+                    kind_of(arr, var, accessors),
+                    constant.as_deref(),
+                    kind_of(idx, var, accessors),
+                );
+                !accessors.may_run(key) && walk(arr, var, accessors) && walk(idx, var, accessors)
             }
             _ => {
                 let mut ok = true;

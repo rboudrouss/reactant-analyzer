@@ -61,7 +61,7 @@ use crate::{
         expr::{Expr, MarkerVal, Prim, SummaryValue, UnaryOp, mutation_receiver, object_member},
         free_vars::{call_free_key, collect_used_vars},
         hooks::HookEntry,
-        module::AccessorNames,
+        module::{AccessKey, AccessorNames},
         stmt::{MemberKey, Stmt},
         types::{BlockId, HookLabel, Var},
     },
@@ -563,12 +563,11 @@ impl<'a> Invariance<'a> {
         }
     }
 
-    /// A read of `member` (`None`: a key no constant names) this reader does
-    /// not resolve to a member as written may run an accessor of the program
-    /// (#334): a call it cannot see, of no known purity, whose result may be
-    /// a new reference.
-    fn unseen_call(&self, member: Option<&str>, out: &mut Reads) {
-        if self.accessors.may_run(member) {
+    /// A read of `key` this reader does not resolve to a member as written
+    /// may run an accessor of the program (#334): a call it cannot see, of no
+    /// known purity, whose result may be a new reference.
+    fn unseen_call(&self, key: AccessKey<'_>, out: &mut Reads) {
+        if self.accessors.may_run(key) {
             out.call = true;
             out.impure = true;
             out.reference = true;
@@ -721,12 +720,18 @@ impl<'a> Invariance<'a> {
                 seen.remove(key);
                 ok
             }
+            // The kinds as written: a name's, which the scopes resolve, is
+            // not known here.
             Expr::FieldAccess { obj, field } => {
-                self.unseen_call(Some(field), out);
+                let kind = purity::kind_of(obj, &|_| Kind::Unknown, self.accessors);
+                self.unseen_call(purity::access(kind, Some(field), Kind::Unknown), out);
                 self.read_into(obj, scopes, free, out, seen, next)
             }
             Expr::IndexAccess { arr, idx } => {
-                self.unseen_call(purity::constant_key(idx).as_deref(), out);
+                let constant = purity::constant_key(idx);
+                let kind = |e: &Expr| purity::kind_of(e, &|_| Kind::Unknown, self.accessors);
+                let key = purity::access(kind(arr), constant.as_deref(), kind(idx));
+                self.unseen_call(key, out);
                 all(
                     &mut [arr.as_ref(), idx.as_ref()].into_iter(),
                     scopes,
@@ -864,7 +869,9 @@ impl<'a> Invariance<'a> {
                 Some(Member::Expr(member, scope)) => self.go(member, scope, props_hold, next),
                 Some(Member::Summary(sv, l)) => self.summary_holds(sv, Some(l), props_hold, next),
                 None => {
-                    !self.accessors.may_run(Some(field)) && self.go(obj, body, props_hold, next)
+                    let key =
+                        purity::access(self.kind(obj, body, next), Some(field), Kind::Unknown);
+                    !self.accessors.may_run(key) && self.go(obj, body, props_hold, next)
                 }
             },
             Expr::IndexAccess { arr, idx } => {
@@ -878,7 +885,13 @@ impl<'a> Invariance<'a> {
                         self.summary_holds(sv, Some(l), props_hold, next)
                     }
                     None => {
-                        !self.accessors.may_run(purity::constant_key(idx).as_deref())
+                        let constant = purity::constant_key(idx);
+                        let key = purity::access(
+                            self.kind(arr, body, next),
+                            constant.as_deref(),
+                            self.kind(idx, body, next),
+                        );
+                        !self.accessors.may_run(key)
                             && self.go(arr, body, props_hold, next)
                             && self.go(idx, body, props_hold, next)
                     }
