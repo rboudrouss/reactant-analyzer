@@ -105,7 +105,6 @@ use crate::{
             Invariance, LoopFacts, MemberWrites, SlotPath, WriteSite, call_may_differ,
             converges_under_all_writes, let_bindings, must_slot_paths, site_guards,
         },
-        registrations::dispatches_events,
         render_deps::written_names,
         setters::{must_alias_scopes, must_state_vals},
         store::{STORE_SLOT, body_writes},
@@ -267,40 +266,25 @@ fn initial_only_slots(result: &ProgramAnalysisResult) -> HashSet<QualifiedSlot> 
         .collect()
 }
 
-/// The slots every write of which, in a run with no user input, moves the slot
-/// the same way at every call (#144, #280). The slot starts at an integer
-/// within ±2^50, its setter reaches nothing the rows do not describe, and each
-/// write of it program-wide either stores its own read plus an integer step
-/// `δ`, 1 ≤ |δ| ≤ 2^20, of one sign for all of them, once per run of its body;
-/// or runs only on a user's interaction (`HookEntry::runs_on_interaction`), in
-/// a program that dispatches no event: React with no input, the semantics an
-/// Error is judged by, never runs that one. Value steps start from the
-/// committed value and updaters add to the running one, so a batch moves the
-/// slot strictly one way and no write in it restores where it started; and the
-/// integers it holds stay exact, below 2^51, for 2^30 batches per write, far
-/// past the 50 nested updates React stops a loop at, the cutoff a loop claim
-/// rests on. A start the bound misses is not claimed: `n + 1` is `n` from 2^53
-/// on, and at ±∞.
+/// The slots every write of which moves the slot the same way at every call
+/// (#144, #280). The slot starts at an integer within ±2^50, its setter
+/// reaches nothing the rows do not describe, and each write of it
+/// program-wide, an event handler's included, stores its own read plus an
+/// integer step `δ`, 1 ≤ |δ| ≤ 2^20, of one sign for all of them, once per run
+/// of its body. A handler waits for no user when something dispatches its
+/// event, which code the analysis does not see may do (a computed `el[m]()`,
+/// a bound `click`, a library), so its write is in the batch it may restore
+/// (#313). Value steps start from the committed value and updaters add to the
+/// running one, so a batch moves the slot strictly one way and no write in it
+/// restores where it started; and the integers it holds stay exact, below
+/// 2^51, for 2^30 batches per write, far past the 50 nested updates React
+/// stops a loop at, the cutoff a loop claim rests on. A start the bound misses
+/// is not claimed: `n + 1` is `n` from 2^53 on, and at ±∞.
 fn stepping_slots(result: &ProgramAnalysisResult) -> HashSet<QualifiedSlot> {
     const START: f64 = (1u64 << 50) as f64;
     const STEP: f64 = (1u64 << 20) as f64;
     let within =
         |i: &Interval, lo: f64, hi: f64| i.is_int && !i.is_bottom() && lo <= i.lo && i.hi <= hi;
-    // A dispatch runs a handler before it returns, with no user: then none
-    // waits for one (#277 adds the rows of the dispatching component's own).
-    let dispatches = result.components.values().any(|c| {
-        dispatches_events(&c.render_cfg)
-            || c.hooks
-                .iter()
-                .filter_map(HookEntry::body_cfg)
-                .any(dispatches_events)
-    });
-    let user_only = |c: ComponentId, w: &SlotWriter| {
-        !dispatches
-            && matches!(w.region, WriterRegion::Handler(l)
-                if result.components[&c].hooks.iter()
-                    .any(|h| h.label() == l && h.runs_on_interaction()))
-    };
     let mut rows: HashMap<QualifiedSlot, Vec<(ComponentId, &SlotWriter)>> = HashMap::new();
     for (&c, r) in &result.components {
         for w in &r.slot_writers {
@@ -314,7 +298,6 @@ fn stepping_slots(result: &ProgramAnalysisResult) -> HashSet<QualifiedSlot> {
             };
             let steps: Option<Vec<Interval>> = ws
                 .iter()
-                .filter(|(c, w)| !user_only(*c, w))
                 .map(|(_, w)| w.written.step.filter(|_| !w.same_tick))
                 .collect();
             steps.is_some_and(|ds| {

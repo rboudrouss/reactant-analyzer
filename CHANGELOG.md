@@ -341,6 +341,11 @@ on a program React settles; 323 oracle cases, none a known false negative.
   of components, a default import under another name, itself) was read as a
   root that stays mounted, so its every-render loop was certain where the
   element may unmount it. It is a Warning now (#313).
+- False Errors: a counter loop whose slot an event handler also writes without
+  stepping it the same way (a reset button) was certain, on the reading that
+  no event fires without a user. Code the analysis does not see may click
+  (`el[m]()`, a bound `click`, a library) in the step's own batch and restore
+  the value: such a loop is a Warning now (#313).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

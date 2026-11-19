@@ -388,10 +388,12 @@ carries an Error.
   controlled input mirrored through two slots (`setLocal(value)`, then `onChange(local)`). Never an
   Error: the Error still needs a new reference stored on all paths
   [#157](https://github.com/rboudrouss/reactant-analyzer/issues/157), or every write of the
-  slot moving it the same way by a nonzero integer from an integer start within ±2^50, a
-  write only a click, key or submit runs aside
+  slot moving it the same way by a nonzero integer from an integer start within ±2^50, an event
+  handler's write included: a reset only a click runs is a possible loop, since code the analysis
+  does not see may click (a computed `el[m]()`, a bound `click`, a library) in the step's own batch
   [#144](https://github.com/rboudrouss/reactant-analyzer/issues/144),
-  [#280](https://github.com/rboudrouss/reactant-analyzer/issues/280). Each proof reads only what
+  [#280](https://github.com/rboudrouss/reactant-analyzer/issues/280),
+  [#313](https://github.com/rboudrouss/reactant-analyzer/issues/313). Each proof reads only what
   it can certify: a slot read through a name bound to it on one arm only, or bound in any other
   body of the component (a closure, a hook body, a parameter), is not the slot, nor is it for
   `setter-in-render`'s adjust-during-render proof
