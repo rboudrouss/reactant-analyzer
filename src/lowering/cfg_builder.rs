@@ -1297,6 +1297,34 @@ pub(super) fn param_defaults(params: &FormalParameters, ctx: &LowerCtx) -> Vec<O
         .collect()
 }
 
+/// The arguments of a call the module scope makes once (#342), each as what a
+/// body reading it at a render may take for it: a primitive literal, or a
+/// name and a member chain off one, as written; anything else is ⊤ — an
+/// allocation the call made once is not one a render makes again. `None`
+/// when a spread hides which parameter takes what.
+pub(super) fn module_args(args: &[Argument], ctx: &LowerCtx) -> Option<Vec<Expr>> {
+    fn read(e: &Expr) -> bool {
+        match e.peel_ts() {
+            Expr::Lit(_) | Expr::Var(_) => true,
+            Expr::FieldAccess { obj, .. } => read(obj),
+            _ => false,
+        }
+    }
+    args.iter()
+        .map(|arg| {
+            let arg = arg.as_expression()?;
+            let mut builder = BlockBuilder::new(ctx);
+            builder.start_block(0);
+            let value = lower_expr(arg, &mut builder);
+            let plain = builder.current_stmts.is_empty() && builder.blocks.is_empty();
+            Some(match plain && read(&value) {
+                true => value,
+                false => Expr::SummaryVal(SummaryValue::Top),
+            })
+        })
+        .collect()
+}
+
 /// What a call of a function evaluates to, which its kind decides (#317).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FnKind {
