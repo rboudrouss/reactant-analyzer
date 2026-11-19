@@ -309,9 +309,12 @@ that writes it (see *Cross-file limits*).
   [#340](https://github.com/rboudrouss/reactant-analyzer/issues/340). Handing it would flood: a
   hook's `useCallback` returned in an object reads as no body through the member. What stays as
   before: a class's instance member keeps the instance as `this` wherever it is called
-  (`const f = k.run; f()` too); `super` outside a class's instance member is opaque; a setter
-  written into the global object does not escape
-  [#339](https://github.com/rboudrouss/reactant-analyzer/issues/339). A function component that
+  (`const f = k.run; f()` too); `super` outside a class's instance member is opaque. A value
+  written into an object the heap does not place — the global object, a parameter's member, what
+  a call the analysis does not run returns — is handed there to code the analysis does not see,
+  which may call it at any time: a setter or a closure written there is reported at the write (a
+  Warning, never an Error), whether the program calls it back in the render or only from a
+  handler [#339](https://github.com/rboudrouss/reactant-analyzer/issues/339). A function component that
   reads `this` reads a value that may change, so an effect reading it may get a `missing-deps`
   Warning for `this`.
 - **Module bindings.** Every top-level binding of an analysed module is one slot shared by every

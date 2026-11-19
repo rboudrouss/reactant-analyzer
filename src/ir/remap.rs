@@ -46,19 +46,38 @@ impl Offsets {
 }
 
 /// How many call sites a graft of `cfg` occupies: one past its largest call
-/// id above [`CALL_SITES`], nested function bodies included; 0 for a body
-/// that calls nothing. The call-site counterpart of [`alloc_id_span`].
+/// id above [`CALL_SITES`], a member write's included, nested function
+/// bodies included; 0 for a body that calls nothing. The call-site
+/// counterpart of [`alloc_id_span`].
 pub fn call_id_span(cfg: &CFG) -> u64 {
-    id_span(cfg_exprs(cfg), call_id)
+    id_span([cfg], [], CALLS)
 }
 
-/// A call's id above [`CALL_SITES`].
-fn call_id(e: &Expr) -> Option<u64> {
-    match e {
+/// The ids a span reads: an expression's, and a statement's own.
+#[derive(Clone, Copy)]
+struct Pick {
+    expr: fn(&Expr) -> Option<u64>,
+    stmt: fn(&Stmt) -> Option<u64>,
+}
+
+/// The allocation sites.
+const ALLOCS: Pick = Pick {
+    expr: alloc_id,
+    stmt: |_| None,
+};
+
+/// The call sites: a call's, and a member write's (#339), both above
+/// [`CALL_SITES`].
+const CALLS: Pick = Pick {
+    expr: |e| match e {
         Expr::Call { id, .. } => Some(id.0.saturating_sub(CALL_SITES)),
         _ => None,
-    }
-}
+    },
+    stmt: |s| match s {
+        Stmt::MemberWrite { id, .. } => Some(id.0.saturating_sub(CALL_SITES)),
+        _ => None,
+    },
+};
 
 /// An allocation site's id.
 fn alloc_id(e: &Expr) -> Option<u64> {
@@ -72,41 +91,53 @@ fn alloc_id(e: &Expr) -> Option<u64> {
     }
 }
 
-/// The top-level expressions of `cfg`.
-fn cfg_exprs(cfg: &CFG) -> Vec<&Expr> {
-    let mut out = Vec::new();
-    cfg.for_each_expr(&mut |e| out.push(e));
-    out
-}
-
-/// One past the largest id `pick` reads off `exprs`, their sub-expressions
-/// and their function literals' bodies.
-fn id_span<'a>(exprs: impl IntoIterator<Item = &'a Expr>, pick: fn(&Expr) -> Option<u64>) -> u64 {
-    fn walk(e: &Expr, pick: fn(&Expr) -> Option<u64>, max: &mut Option<u64>, depth: usize) {
+/// One past the largest id `pick` reads off the statements and expressions
+/// of `bodies` and off `exprs`, their sub-expressions and their function
+/// literals' bodies.
+fn id_span<'a>(
+    bodies: impl IntoIterator<Item = &'a CFG>,
+    exprs: impl IntoIterator<Item = &'a Expr>,
+    pick: Pick,
+) -> u64 {
+    fn bump(max: &mut Option<u64>, n: Option<u64>) {
+        if let Some(n) = n {
+            *max = Some(max.map_or(n, |m| m.max(n)));
+        }
+    }
+    fn body(cfg: &CFG, pick: Pick, max: &mut Option<u64>, depth: usize) {
+        for block in cfg.blocks.values() {
+            for s in &block.stmts {
+                bump(max, (pick.stmt)(s));
+            }
+            block.for_each_expr(&mut |e| walk(e, pick, max, depth));
+        }
+    }
+    fn walk(e: &Expr, pick: Pick, max: &mut Option<u64>, depth: usize) {
         if depth == 0 {
             return;
         }
-        if let Some(n) = pick(e) {
-            *max = Some(max.map_or(n, |m| m.max(n)));
-        }
+        bump(max, (pick.expr)(e));
         if let Expr::FnLit { body_cfg, .. } = e {
-            body_cfg.for_each_expr(&mut |inner| walk(inner, pick, max, depth - 1));
+            body(body_cfg, pick, max, depth - 1);
         }
         e.for_each_child(&mut |c| walk(c, pick, max, depth));
     }
     let mut max: Option<u64> = None;
     // A `FnLit` body is a CFG of its own; the bound keeps a pathological
     // nesting from recursing without end, and no real body approaches it.
+    for cfg in bodies {
+        body(cfg, pick, &mut max, 64);
+    }
     for e in exprs {
         walk(e, pick, &mut max, 64);
     }
     max.map_or(0, |m| m + 1)
 }
 
-/// Every expression a hook table holds: each body's, and what an entry holds
-/// beside its body — an initializer, a reducer, a deps list, a custom hook's
-/// arguments. What [`remap_hooks`] shifts.
-fn hook_exprs(hooks: &[HookEntry]) -> Vec<&Expr> {
+/// Every body and expression a hook table holds: each entry's body, and
+/// what an entry holds beside it — an initializer, a reducer, a deps list, a
+/// custom hook's arguments. What [`remap_hooks`] shifts.
+fn hook_parts(hooks: &[HookEntry]) -> (Vec<&CFG>, Vec<&Expr>) {
     fn deps(d: &crate::ir::hooks::DepsArg) -> Vec<&Expr> {
         match d {
             crate::ir::hooks::DepsArg::List(l) => l.as_slice().iter().collect(),
@@ -114,11 +145,9 @@ fn hook_exprs(hooks: &[HookEntry]) -> Vec<&Expr> {
             crate::ir::hooks::DepsArg::Absent => Vec::new(),
         }
     }
-    let mut out = Vec::new();
+    let (mut bodies, mut out) = (Vec::new(), Vec::new());
     for h in hooks {
-        if let Some(body) = h.body_cfg() {
-            out.extend(cfg_exprs(body));
-        }
+        bodies.extend(h.body_cfg());
         match h {
             HookEntry::State { init, reducer, .. } => {
                 out.push(init);
@@ -135,18 +164,18 @@ fn hook_exprs(hooks: &[HookEntry]) -> Vec<&Expr> {
             HookEntry::Handler { .. } => {}
         }
     }
-    out
+    (bodies, out)
 }
 
 /// The allocation-id and call-id widths of a body and the hook table grafted
 /// with it — every id [`remap_cfg`] and [`remap_hooks`] shift: a graft lands
 /// above all of them, an argument of a custom hook the table keeps included.
 pub fn graft_spans(cfg: &CFG, hooks: &[HookEntry]) -> (u64, u64) {
-    let mut exprs = cfg_exprs(cfg);
-    exprs.extend(hook_exprs(hooks));
+    let (mut bodies, exprs) = hook_parts(hooks);
+    bodies.push(cfg);
     (
-        id_span(exprs.iter().copied(), alloc_id),
-        id_span(exprs.iter().copied(), call_id),
+        id_span(bodies.iter().copied(), exprs.iter().copied(), ALLOCS),
+        id_span(bodies.iter().copied(), exprs.iter().copied(), CALLS),
     )
 }
 
@@ -156,7 +185,7 @@ pub fn graft_spans(cfg: &CFG, hooks: &[HookEntry]) -> (u64, u64) {
 /// A splice adds this to its running cursor so the next graft lands above it,
 /// which is what makes the *same* callee inlined twice two allocation sites.
 pub fn alloc_id_span(cfg: &CFG) -> u64 {
-    id_span(cfg_exprs(cfg), alloc_id)
+    id_span([cfg], [], ALLOCS)
 }
 
 /// Add `off` to every `HookLabel` and every allocation-site `ExprId` embedded
@@ -291,11 +320,13 @@ fn remap_stmt(stmt: Stmt, off: Offsets) -> Stmt {
             span,
         },
         Stmt::MemberWrite {
+            id,
             obj,
             key,
             rhs,
             span,
         } => Stmt::MemberWrite {
+            id: ExprId(id.0 + off.calls),
             obj: remap_expr(obj, off),
             key: match key {
                 MemberKey::Field(f) => MemberKey::Field(f),

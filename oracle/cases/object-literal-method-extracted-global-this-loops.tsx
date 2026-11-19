@@ -1,9 +1,9 @@
 // oracle: react=loop
-// oracle: known=fn #339
 // A method called plainly binds no receiver: its `this` is the global object
 // in sloppy code (`undefined` in a module), which the analysis reads as ⊤
 // (#338). Here the global object holds the setter, so React loops; the write
-// into it is the gap (#339).
+// into it hands the setter to code the analysis does not see (#339): a Warning
+// at the write.
 import { useState } from "react";
 
 export function App() {
