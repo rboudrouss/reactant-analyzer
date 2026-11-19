@@ -21,11 +21,18 @@ fn reactant(dir: &std::path::Path) -> Output {
         .expect("run reactant binary")
 }
 
+/// One directory per call, so two tests running the same case never share
+/// (and remove) each other's directory.
+static RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// The findings (`rule:severity`) on the oracle case `case`, its `// @file`
 /// sections written as files of their own.
 fn findings(case: &str) -> Vec<String> {
-    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("reactant-class-{}-{case}", std::process::id()));
+    let run = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "reactant-class-{}-{run}-{case}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let src = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("oracle/cases/{case}.tsx")),
