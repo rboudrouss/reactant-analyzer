@@ -105,6 +105,7 @@ use crate::{
             Invariance, LoopFacts, MemberWrites, SlotPath, WriteSite, call_may_differ,
             converges_under_all_writes, let_bindings, must_slot_paths, site_guards,
         },
+        purity::{self, Kind},
         render_deps::written_names,
         setters::{must_alias_scopes, must_state_vals},
         store::{STORE_SLOT, body_writes},
@@ -1849,7 +1850,8 @@ fn find_cycle_from(
 /// never one a prop, a context, a hook's result, a slot or a memo holds? A
 /// positive proof, where the failure of [`Invariance::holds`] is none (#309):
 /// an object, array or function literal, an element, a builtin call that
-/// returns none of its inputs ([`returns_no_input`]), the member a constant
+/// returns none of its inputs ([`returns_no_input`], an array method off a
+/// receiver written as an array, #312), the member a constant
 /// names of such a literal; a memo or callback with a dep that is one, so it
 /// recomputes at every run, and (a memo) whose every return is one; or a name
 /// only its scope binds — no other body binds it — each binding of which is
@@ -1881,7 +1883,11 @@ impl<'a> Allocated<'a> {
             | Expr::FnLit { .. }
             | Expr::NativeElem { .. }
             | Expr::CompApp { .. } => true,
-            Expr::Call { fn_, .. } => returns_no_input(fn_),
+            // A string's `slice` or `concat` is a primitive, no reference.
+            Expr::Call { fn_, .. } => !matches!(
+                returns_no_input(fn_, &mut |o| self.kind(o, scope, next)),
+                None | Some(Kind::Str)
+            ),
             Expr::FieldAccess { obj, field } => self.read(obj, field, scope, next),
             Expr::IndexAccess { arr, idx } => {
                 let key = match idx.peel_ts() {
@@ -1904,6 +1910,50 @@ impl<'a> Allocated<'a> {
                     })
             }),
             _ => false,
+        }
+    }
+
+    /// The kind of an array method's receiver `e`, as written (#312): an
+    /// array literal, a string literal, a call [`returns_no_input`] reads as
+    /// one, a memo every return of which is one, or a name only its scope
+    /// binds, every binding of which is one, all of the same kind — but a
+    /// `null` or `undefined` one, off which no method returns (the call
+    /// throws, or `?.` skips it).
+    fn kind(&self, e: &'a Expr, scope: &'a CFG, depth: usize) -> Kind {
+        if depth == 0 {
+            return Kind::Unknown;
+        }
+        let next = depth - 1;
+        let all = |kinds: &mut dyn Iterator<Item = Kind>| kinds.reduce(Kind::join);
+        match e.peel_ts() {
+            Expr::ArrayLit { .. } => Kind::Array,
+            Expr::Lit(p) => purity::lit(p),
+            Expr::Call { fn_, .. } => {
+                returns_no_input(fn_, &mut |o| self.kind(o, scope, next)).unwrap_or_default()
+            }
+            Expr::MemoVal(l) => match self.memos.get(l) {
+                Some((Some(body), _)) => {
+                    all(&mut body.blocks.values().filter_map(|blk| match &blk.term {
+                        Terminator::Return(r, _) => Some(self.kind(r, body, next)),
+                        _ => None,
+                    }))
+                    .unwrap_or_default()
+                }
+                _ => Kind::Unknown,
+            },
+            Expr::Var(v) => match self.bindings(v, scope) {
+                Some((_, rhss)) => {
+                    all(
+                        &mut rhss.iter().filter_map(|&(_, rhs, s)| match rhs.peel_ts() {
+                            Expr::Lit(Prim::Null | Prim::Unit) => None,
+                            _ => Some(self.kind(rhs, s, next)),
+                        }),
+                    )
+                    .unwrap_or_default()
+                }
+                None => Kind::Unknown,
+            },
+            _ => Kind::Unknown,
         }
     }
 

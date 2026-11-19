@@ -8,11 +8,11 @@ use crate::{
         impls::{BoolVal, Interval, SetterVal, Stability, StateValue, StrConst},
         interp::{
             access_key, alloc_literal, call_targets, closure_env, escape, exec_stmt_with_callbacks,
-            returned_sites, run_cfg,
+            receiver_kind, returned_sites, run_cfg,
         },
         stores::{AbstractEnv, EnvVal, Heap, HeapValue, Sites, member_key},
     },
-    engine::component_registry::ChildLookup,
+    engine::{component_registry::ChildLookup, purity::Kind},
     ir::{
         ComponentId,
         bindings::binding_of,
@@ -376,13 +376,17 @@ fn summary_value(sv: &crate::ir::expr::SummaryValue) -> StateValue {
 /// (same seeding as `ArrayLit`), which lets `always-unstable-deps` *prove*
 /// that `const items = arr.map(f)` in a deps array defeats memoization.
 ///
-/// Three cases keep the proof honest (FP-averse):
+/// Four cases keep the proof honest:
+/// - **the receiver of an array method** (`map`, `filter`, `slice`, …) is
+///   an array only where [`receiver_kind`] knows it (#312): any other object
+///   may have a method of that name, which may return anything, the
+///   receiver included (`None.map(f)` returns `None`). Off a receiver of
+///   unknown kind the result is a new reference on some path and anything on
+///   the others, so it may be new at a render nothing moved (`MayBeFresh`).
 /// - **kind-ambiguous methods** (`slice`, `concat`): on a string receiver
 ///   they return a *primitive*, which `Object.is` value-compares — claiming
-///   a per-render reference for `id.slice(0, 8)` would be a false proof. So
-///   the receiver decides: one that can only be a reference is copied; any
-///   other leaves the result ⊤ (#22). A nullish receiver is excluded too:
-///   `xs?.slice()` lowers as `xs.slice()` and hands back `undefined`.
+///   a per-render reference for `id.slice(0, 8)` would be a false proof, so
+///   the result is ⊤ (#22).
 /// - **in-place methods** (`sort`, `reverse`, `fill`, `copyWithin`,
 ///   `Object.assign`): they return the receiver itself — same identity, the
 ///   opposite fact.
@@ -397,10 +401,14 @@ fn allocating_call(
     env: &AbstractEnv<StateValue>,
     ctx: &mut AnalysisCtx<StateValue>,
 ) -> Option<StateValue> {
-    if !returns_no_input(callee) {
-        return None;
-    }
+    let callee = callee.peel_ts();
     let fresh = StateValue::reference(Stability::PerRender);
+    let gives = returns_no_input(callee, &mut |obj| {
+        receiver_kind(&StateValueTransfer, obj, env, ctx)
+    });
+    let Some(gives) = gives else {
+        return array_method(callee).then(|| StateValue::top().join(&fresh));
+    };
     let allocates = match callee {
         // A deep copy of an object, the value itself of a primitive; a
         // function cannot be cloned (it throws).
@@ -420,53 +428,73 @@ fn allocating_call(
                 ..x
             });
         }
-        Expr::FieldAccess { obj, field } => match field.as_str() {
-            // Array methods returning a NEW array, array-only names (a
-            // string receiver has none of these).
-            "map" | "filter" | "flat" | "flatMap" | "toSorted" | "toReversed" | "toSpliced"
-            | "with" | "split" => true,
-            "slice" | "concat" => eval_state_value(obj, env, ctx).is_reference_only(),
-            // Static allocators — receiver-restricted: a bare `.from`/`.keys`
-            // on an unknown object could be anything.
-            "from" | "of" => matches!(obj.as_ref(), Expr::Var(v) if v == "Array"),
-            "keys" | "values" | "entries" | "fromEntries" => {
-                matches!(obj.as_ref(), Expr::Var(v) if v == "Object")
-            }
-            // Any JSON value, a new object or array where it is one; with a
-            // reviver, anything the reviver returns.
-            "parse" if matches!(obj.as_ref(), Expr::Var(v) if v == "JSON") => {
-                return Some(match args.len() {
-                    0 | 1 => StateValue::json_value(),
-                    _ => StateValue::top().join(&fresh),
-                });
-            }
-            _ => false,
-        },
-        Expr::TSAnnotated(inner) => return allocating_call(inner, args, env, ctx),
-        _ => false,
+        // Any JSON value, a new object or array where it is one; with a
+        // reviver, anything the reviver returns.
+        Expr::FieldAccess { field, .. } if field == "parse" => {
+            return Some(match args.len() {
+                0 | 1 => StateValue::json_value(),
+                _ => StateValue::top().join(&fresh),
+            });
+        }
+        // A string's `slice` or `concat` is a primitive (#22).
+        _ => gives != Kind::Str,
     };
     allocates.then_some(fresh)
 }
 
+/// Is `callee` a method an array (a string, for `split`) has that returns a
+/// new array, by its name alone?
+fn array_method(callee: &Expr) -> bool {
+    match callee.peel_ts() {
+        Expr::FieldAccess { field, .. } => matches!(
+            field.as_str(),
+            "map"
+                | "filter"
+                | "flat"
+                | "flatMap"
+                | "toSorted"
+                | "toReversed"
+                | "toSpliced"
+                | "with"
+                | "split"
+                | "slice"
+                | "concat"
+        ),
+        _ => false,
+    }
+}
+
 /// The callees [`allocating_call`] reads, the one list of them: each returns
 /// a new array or object, or a primitive, never one of its inputs — what a
-/// proof that a value is not an input's needs of a call (#309). Like that
-/// table, it takes an array method's receiver to be an array (#312).
-pub(crate) fn returns_no_input(callee: &Expr) -> bool {
-    match callee {
-        Expr::Var(v) => v == "structuredClone",
+/// proof that a value is not an input's needs of a call (#309). An array
+/// method is the builtin only off a receiver `receiver` gives the kind of
+/// (a string for `split`, an array or a string for `slice` and `concat`):
+/// off any other it may be a method of the program's or of a library's,
+/// which may return its receiver (#312). The kind of the result —
+/// `Kind::Unknown` for an object or a value of several kinds — or `None`
+/// for any other call.
+pub(crate) fn returns_no_input(
+    callee: &Expr,
+    receiver: &mut dyn FnMut(&Expr) -> Kind,
+) -> Option<Kind> {
+    let global = |obj: &Expr, name: &str| matches!(obj, Expr::Var(v) if v == name);
+    match callee.peel_ts() {
+        Expr::Var(v) if v == "structuredClone" => Some(Kind::Unknown),
         Expr::FieldAccess { obj, field } => match field.as_str() {
             "map" | "filter" | "flat" | "flatMap" | "toSorted" | "toReversed" | "toSpliced"
-            | "with" | "split" | "slice" | "concat" => true,
-            "from" | "of" => matches!(obj.as_ref(), Expr::Var(v) if v == "Array"),
-            "keys" | "values" | "entries" | "fromEntries" => {
-                matches!(obj.as_ref(), Expr::Var(v) if v == "Object")
-            }
-            "parse" => matches!(obj.as_ref(), Expr::Var(v) if v == "JSON"),
-            _ => false,
+            | "with" => (receiver(obj) == Kind::Array).then_some(Kind::Array),
+            "split" => (receiver(obj) == Kind::Str).then_some(Kind::Array),
+            "slice" | "concat" => match receiver(obj) {
+                kind @ (Kind::Array | Kind::Str) => Some(kind),
+                _ => None,
+            },
+            "from" | "of" if global(obj, "Array") => Some(Kind::Array),
+            "keys" | "values" | "entries" if global(obj, "Object") => Some(Kind::Array),
+            "fromEntries" if global(obj, "Object") => Some(Kind::Unknown),
+            "parse" if global(obj, "JSON") => Some(Kind::Unknown),
+            _ => None,
         },
-        Expr::TSAnnotated(inner) => returns_no_input(inner),
-        _ => false,
+        _ => None,
     }
 }
 
