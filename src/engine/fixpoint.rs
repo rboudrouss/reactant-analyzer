@@ -407,12 +407,38 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         })
         .collect();
     let hands_back = crate::engine::setters::effect_event_args(&hooks, &hook_provenance);
+    let hook_reads: HashMap<HookLabel, Vec<Expr>> = hooks
+        .iter()
+        .filter_map(|h| {
+            let (label, mut read, deps) = match h {
+                HookEntry::State { label, init, .. } | HookEntry::Ref { label, init, .. } => {
+                    (*label, vec![init.clone()], None)
+                }
+                HookEntry::Effect { label, deps, .. }
+                | HookEntry::Memo { label, deps, .. }
+                | HookEntry::Callback { label, deps, .. } => (*label, Vec::new(), Some(deps)),
+                HookEntry::Custom {
+                    label, args, deps, ..
+                } => (*label, args.clone(), Some(deps)),
+                HookEntry::Handler { .. } => return None,
+            };
+            match deps {
+                Some(crate::ir::hooks::DepsArg::List(list)) => {
+                    read.extend(list.elems.iter().cloned())
+                }
+                Some(crate::ir::hooks::DepsArg::Opaque(e)) => read.push(e.clone()),
+                _ => {}
+            }
+            Some((label, read))
+        })
+        .collect();
     let query = FixpointCtx {
         callbacks: &callback_bodies,
         reducers: &reducers,
         dispatches,
         hook_args: &hook_args,
         hands_back: &hands_back,
+        hook_reads: &hook_reads,
     };
     // A `useCallback` value is placed where its recompute hands it back (a
     // literal's closure at the hook's site, or the argument's sites, #320),

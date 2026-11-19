@@ -7,8 +7,8 @@ use std::sync::Arc;
 use crate::ir::{
     cfg::{BasicBlock, CFG, EdgeKind, Terminator},
     expr::{
-        ACCESSOR_KEY_PREFIX, BinOp as IrBinOp, COMPUTED_KEY_PREFIX, Expr, Prim, SPREAD_KEY_PREFIX,
-        SummaryValue, UnaryOp as IrUnaryOp,
+        Accessor, BinOp as IrBinOp, COMPUTED_KEY_PREFIX, Expr, Prim, SPREAD_KEY_PREFIX,
+        SummaryValue, UnaryOp as IrUnaryOp, accessor_key,
     },
     hooks::Arity,
     stmt::{MemberKey, Stmt},
@@ -169,11 +169,13 @@ pub(super) fn lower_class(class: &Class, builder: &mut BlockBuilder) -> Expr {
                     fields.push((synthetic_key(builder, "[field]"), lowered));
                 }
             }
+            // `accessor x = v`: a field whose getter and setter the language
+            // writes; its initializer is an ordinary expression, as a field's.
             ClassElement::AccessorProperty(a) => {
                 computed_key(&a.key, builder);
                 if let Some(value) = &a.value {
                     let lowered = lower_expr(value, builder);
-                    fields.push((synthetic_key(builder, ACCESSOR_KEY_PREFIX), lowered));
+                    fields.push((synthetic_key(builder, "[field]"), lowered));
                 }
             }
             // `static { … }` runs at definition time. Kept as a zero-arg body
@@ -429,13 +431,23 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                     ObjectPropertyKind::ObjectProperty(p) => {
                         let named = property_name(&p.key);
                         let key = match named {
-                            // A getter/setter runs code on every read: `o.x`
-                            // is whatever the body returns, not the function
-                            // literal sitting in the property. Kept under a
-                            // synthetic key, like a spread — the body stays
-                            // visible, the name resolves to nothing.
+                            // A getter/setter runs code on every read (write):
+                            // `o.x` is whatever the body returns, not the
+                            // function literal sitting in the property. Kept
+                            // under a synthetic key that says which half and
+                            // which member (#321): the body stays visible, a
+                            // name lookup resolves the member to nothing.
                             _ if p.kind != PropertyKind::Init => {
-                                synthetic_key(builder, ACCESSOR_KEY_PREFIX)
+                                if named.is_none()
+                                    && let Some(e) = p.key.as_expression()
+                                {
+                                    lower_for_effect(e, builder);
+                                }
+                                let kind = match p.kind {
+                                    PropertyKind::Set => Accessor::Set,
+                                    _ => Accessor::Get,
+                                };
+                                accessor_key(builder.next_expr_id().0, kind, named.as_deref())
                             }
                             Some(name) => name,
                             // Computed key (`{ [k]: v }`): the key expression

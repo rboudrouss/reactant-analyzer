@@ -3079,6 +3079,25 @@ impl<'a> SetterWalk<'a> {
                 }
             }
         }
+        // An accessor of a literal runs at any read or write of its member,
+        // which the walk does not place: what it reaches runs where the
+        // literal is written, at an unknown time (#321).
+        if let Expr::ObjectLit { id, fields } = expr {
+            for (i, (key, val)) in fields.iter().enumerate() {
+                if crate::ir::expr::accessor_of(key).is_some() {
+                    self.relation_handed(
+                        Some((*id, i)),
+                        val,
+                        WalkClass::Unknown,
+                        None,
+                        depth,
+                        found,
+                        prov,
+                        stmt_span,
+                    );
+                }
+            }
+        }
     }
 
     /// A body at `site` the walk has no budget left to enter still runs

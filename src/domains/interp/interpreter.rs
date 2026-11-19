@@ -15,7 +15,8 @@ use crate::{
         bindings::binding_of,
         cfg::{CFG, EdgeKind, Terminator},
         expr::{
-            ACCESSOR_KEY_PREFIX, Expr, MarkerVal, SPREAD_KEY_PREFIX, SummaryValue, is_synthetic_key,
+            Accessor, Expr, MarkerVal, SPREAD_KEY_PREFIX, SummaryValue, accessor_of,
+            is_synthetic_key,
         },
         stmt::{MemberKey, Stmt},
         types::{BlockId, ExprId, Symbol},
@@ -428,7 +429,118 @@ fn exec_full_stmt<T: Transfer>(
                 exec_callbacks_depth(transfer, idx, env, ctx, depth);
             }
             exec_callbacks_depth(transfer, rhs, env, ctx, depth);
+            // A write through a setter runs its body with the value written
+            // (#321).
+            if ctx.heap.has_accessors() {
+                let member = match key {
+                    MemberKey::Field(field) => Some(field.clone()),
+                    MemberKey::Index(idx) => member_key(idx, env),
+                };
+                let sites = alloc_literal(transfer, rhs, env, ctx);
+                let written = EnvVal::located(sites, transfer.eval_expr(rhs, env, ctx));
+                run_accessors(
+                    transfer,
+                    obj,
+                    member.as_deref(),
+                    Some(&written),
+                    env,
+                    ctx,
+                    depth,
+                );
+            }
             exec_stmt_core(transfer, stmt, env, ctx);
+        }
+    }
+}
+
+/// Run the getters the member reads of `expr` run, and nothing else (#321):
+/// what a hook's entry keeps as written, whose calls run in render
+/// statements of their own ([`QueryContext::hook_reads`]). A function
+/// literal is not entered: its reads run when it is called.
+///
+/// [`QueryContext::hook_reads`]: crate::domains::context::QueryContext::hook_reads
+fn run_member_reads<T: Transfer>(
+    transfer: &T,
+    expr: &Expr,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+    depth: usize,
+) {
+    if !ctx.heap.has_accessors() {
+        return;
+    }
+    match expr {
+        Expr::FnLit { .. } => {}
+        Expr::FieldAccess { obj, field } => {
+            run_member_reads(transfer, obj, env, ctx, depth);
+            run_accessors(transfer, obj, Some(field), None, env, ctx, depth);
+        }
+        Expr::IndexAccess { arr, idx } => {
+            run_member_reads(transfer, arr, env, ctx, depth);
+            run_member_reads(transfer, idx, env, ctx, depth);
+            let member = member_key(idx, env);
+            run_accessors(transfer, arr, member.as_deref(), None, env, ctx, depth);
+        }
+        other => other.for_each_child(&mut |c| run_member_reads(transfer, c, env, ctx, depth)),
+    }
+}
+
+/// Run the accessors a read (`written: None`) or a write (`Some`: the value
+/// written) of `member` of what `obj` denotes runs (#321): its getters,
+/// whose returns the heap keeps as what the read is
+/// ([`Heap::record_getter`]), or its setters, handed the value. Past the
+/// inlining budget none runs, and the read may be anything; every accessor
+/// escaped at its literal, so its body still runs, at an unknown time.
+///
+/// [`Heap::record_getter`]: crate::domains::stores::Heap::record_getter
+fn run_accessors<T: Transfer>(
+    transfer: &T,
+    obj: &Expr,
+    member: Option<&str>,
+    written: Option<&EnvVal<T::Domain>>,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+    depth: usize,
+) {
+    if !ctx.heap.has_accessors() {
+        return;
+    }
+    let Some(sites) = alloc_literal(transfer, obj, env, ctx) else {
+        return;
+    };
+    let kind = match written {
+        Some(_) => Accessor::Set,
+        None => Accessor::Get,
+    };
+    let mut accessors: Vec<ExprId> = ctx
+        .heap
+        .accessors(&sites, kind, member)
+        .ids
+        .into_iter()
+        .collect();
+    accessors.sort();
+    let args = written.map(std::slice::from_ref).unwrap_or_default();
+    for site in accessors {
+        let returned = match depth >= MAX_INLINE_DEPTH {
+            true => None,
+            false => exec_heap_fns(
+                transfer,
+                Sites::closed([site]),
+                Args::exactly(args),
+                env,
+                ctx,
+                depth,
+                &mut Ran::default(),
+            ),
+        };
+        if written.is_none() {
+            let read = returned.and_then(|r| {
+                let sites = r.sites().cloned();
+                r.as_val()
+                    .as_state_value()
+                    .map(|v| EnvVal::located(sites, v))
+            });
+            ctx.heap.record_getter(site, read.as_ref());
         }
     }
 }
@@ -726,19 +838,35 @@ pub(crate) fn alloc_literal<T: Transfer>(
         }
         Expr::ObjectLit { id, fields } => {
             let mut members = Members::default();
-            for (key, value) in fields {
+            for (i, (key, value)) in fields.iter().enumerate() {
                 if key.starts_with(SPREAD_KEY_PREFIX) {
                     let source = alloc_literal(transfer, value, env, ctx);
                     spread_into(&mut members, source.as_ref(), ctx.heap);
-                } else if key.starts_with(ACCESSOR_KEY_PREFIX) {
-                    // A getter's member is what its body returns, under a
-                    // name the key does not keep.
-                    members.write_unknown();
+                } else if let Some((_, member)) = accessor_of(key) {
+                    // An accessor runs at every read (a getter) or write (a
+                    // setter) of its member, by whoever makes it, code the
+                    // analysis does not see included, at any time: its closure
+                    // escapes here, at the literal's field (ADR-047), and a read
+                    // or a write the analysis evaluates runs it (#321). A
+                    // computed name may be any member.
+                    let sites = escape_at(transfer, value, env, ctx, Some((*id, i)));
+                    let val = transfer
+                        .eval_expr(value, env, ctx)
+                        .as_state_value()
+                        .unwrap_or_else(StateValue::top);
+                    match member {
+                        Some(m) => members.define(m),
+                        None => members.write_unknown(),
+                    }
+                    members
+                        .named
+                        .insert(key.clone(), EnvVal::located(sites, val));
                 } else if is_synthetic_key(key) {
                     // A computed key no constant names: any member may be it.
                     members.write_any(&member_entry(transfer, value, env, ctx));
                 } else {
                     let entry = member_entry(transfer, value, env, ctx);
+                    members.define(key);
                     members.named.insert(key.clone(), entry);
                 }
             }
@@ -878,7 +1006,14 @@ fn spread_into(members: &mut Members, source: Option<&Sites>, heap: &Heap) {
     if let Some(others) = &copied.others {
         members.write_any(others);
     }
+    // A spread reads each member through its getter, and the copy holds what
+    // the read returned as a value (#321); an accessor itself is not copied.
+    let mut read: Vec<Symbol> = Vec::new();
     for (m, ev) in copied.named {
+        if let Some((_, name)) = accessor_of(&m) {
+            read.extend(name.map(str::to_string));
+            continue;
+        }
         // A member some object lacks was joined with `undefined`, its value
         // there; the spread then leaves the member before it in place.
         let lacks = objs.iter().any(|o| !o.named.contains_key(&m));
@@ -886,7 +1021,25 @@ fn spread_into(members: &mut Members, source: Option<&Sites>, heap: &Heap) {
             Some(before) if lacks => before.join(&ev),
             _ => ev,
         };
+        members.define(&m);
         members.named.insert(m, entry);
+    }
+    for name in read {
+        let (entries, open) = source.map_or((Vec::new(), true), |s| heap.members(s, Some(&name)));
+        let mut value = entries
+            .into_iter()
+            .cloned()
+            .reduce(|a, b| a.join(&b))
+            .unwrap_or_else(|| EnvVal::Val(StateValue::top()));
+        if open {
+            value = value.join(&EnvVal::Val(StateValue::top()));
+        }
+        let entry = match members.named.get(&name) {
+            Some(before) => before.join(&value),
+            None => value,
+        };
+        members.define(&name);
+        members.named.insert(name, entry);
     }
 }
 
@@ -1284,6 +1437,20 @@ fn exec_callbacks_depth<T: Transfer>(
             None
         }
         Expr::TSAnnotated(inner) => exec_callbacks_depth(transfer, inner, env, ctx, depth),
+        // A read through a getter is a call of its body (#321), run before
+        // any reader of the value, as a call is.
+        Expr::FieldAccess { obj, field } => {
+            exec_callbacks_depth(transfer, obj, env, ctx, depth);
+            run_accessors(transfer, obj, Some(field), None, env, ctx, depth);
+            None
+        }
+        Expr::IndexAccess { arr, idx } => {
+            exec_callbacks_depth(transfer, arr, env, ctx, depth);
+            exec_callbacks_depth(transfer, idx, env, ctx, depth);
+            let member = member_key(idx, env);
+            run_accessors(transfer, arr, member.as_deref(), None, env, ctx, depth);
+            None
+        }
         // `new X(…)` hands its arguments to a constructor the analysis does
         // not run — an observer's callback, a promise executor (#254).
         Expr::New { id, args, .. } => {
@@ -1299,6 +1466,9 @@ fn exec_callbacks_depth<T: Transfer>(
         // call (#254).
         Expr::HookMarker(label, _) => {
             let query = ctx.query;
+            for read in query.hook_reads(*label) {
+                run_member_reads(transfer, read, env, ctx, depth);
+            }
             let site = ctx.component.hook_site(*label);
             for (i, arg) in query.hook_args(*label).iter().enumerate() {
                 escape_at(transfer, arg, env, ctx, Some((site, i)));

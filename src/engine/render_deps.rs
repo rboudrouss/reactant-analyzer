@@ -45,7 +45,10 @@ use crate::engine::{
 };
 use crate::ir::{
     cfg::{CFG, Terminator},
-    expr::{CompOrigin, Expr, MarkerVal, Prim, SPREAD_KEY_PREFIX, SummaryValue, mutation_receiver},
+    expr::{
+        Accessor, CompOrigin, Expr, MarkerVal, Prim, SPREAD_KEY_PREFIX, SummaryValue, accessor_of,
+        mutation_receiver,
+    },
     free_vars::{collect_used_vars, compute_free_vars},
     hooks::HookEntry,
     source_range::SourceRange,
@@ -1124,6 +1127,28 @@ impl<'a> Analyzer<'a> {
                             *m = m.join(&Self::member(&val, name));
                         }
                         spreads.push(val);
+                    } else if let Some((half, name)) = accessor_of(k) {
+                        // A read of the member a getter defines is a call of
+                        // it (#321): what its body reads, through a call not
+                        // known pure. A setter defines no value to read.
+                        if half != Accessor::Get {
+                            continue;
+                        }
+                        let call = DVal::of(Deps {
+                            impure: true,
+                            ..val.deps.ungated()
+                        });
+                        match name {
+                            Some(name) => {
+                                members.insert(name.to_string(), call);
+                            }
+                            None => {
+                                for m in members.values_mut() {
+                                    *m = m.join(&call);
+                                }
+                                spreads.push(call);
+                            }
+                        }
                     } else {
                         members.insert(k.clone(), val);
                     }

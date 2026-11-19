@@ -8,7 +8,7 @@ use crate::{
     ir::{
         ComponentId,
         cfg::CFG,
-        expr::Expr,
+        expr::{Accessor, Expr, accessor_of},
         free_vars::compute_free_vars,
         types::{ExprId, HookLabel, Symbol, Var},
     },
@@ -69,6 +69,13 @@ pub enum HeapValue {
 /// member keeps the sites written there, so a call through it runs what was
 /// stored, and no value: a literal stored there was fresh in the render that
 /// built it, not in the one reading it, so a read through it is unknown.
+///
+/// An accessor (#321) is an entry under its [`accessor_key`]: the closure a
+/// read (a getter) or a write (a setter) of the member it defines runs. A
+/// read of that member is what the getter returned
+/// ([`Heap::members`]), never the closure.
+///
+/// [`accessor_key`]: crate::ir::expr::accessor_key
 #[derive(Debug, Clone, Default)]
 pub struct Members {
     pub named: HashMap<Symbol, EnvVal<StateValue>>,
@@ -153,6 +160,31 @@ impl Members {
     /// Every value an entry says a member may hold.
     pub fn values(&self) -> impl Iterator<Item = &EnvVal<StateValue>> {
         self.named.values().chain(&self.others)
+    }
+
+    /// The closures a read (`Get`) or a write (`Set`) of `member` runs: the
+    /// accessors of that member, and of a computed name, which may be it.
+    /// `None` is a key no constant names: every accessor of the half.
+    pub fn accessors(&self, kind: Accessor, member: Option<&str>) -> BTreeSet<ExprId> {
+        self.named
+            .iter()
+            .filter(|(k, _)| {
+                accessor_of(k).is_some_and(|(half, m)| {
+                    half == kind && (m.is_none() || member.is_none() || m == member)
+                })
+            })
+            .filter_map(|(_, ev)| ev.locs())
+            .flatten()
+            .copied()
+            .collect()
+    }
+
+    /// A member a literal writes as a value (`p: v`) or as an accessor
+    /// replaces what it defined for that member before.
+    pub fn define(&mut self, member: &str) {
+        self.named.remove(member);
+        self.named
+            .retain(|k, _| accessor_of(k).is_none_or(|(_, m)| m != Some(member)));
     }
 
     /// Join into this object the writes `written` records: a member before
@@ -266,17 +298,72 @@ impl Members {
 /// after the read, a later effect. The next object the site allocates
 /// starts from it as well ([`Heap::alloc_obj`]), so a write the order of a
 /// pass put after the read is seen by the read of the next pass (#258).
+///
+/// `returned` is, per getter (#321), the join of what every run of it at a
+/// read returned, kept across passes: what a read of its member is. A getter
+/// no run of which is recorded may return anything, a new object included.
 #[derive(Debug, Clone, Default)]
 pub struct Heap {
     cells: HashMap<ExprId, HeapValue>,
     escaped: BTreeSet<ExprId>,
     assigned: AbstractEnv<StateValue>,
     written: HashMap<ExprId, Members>,
+    returned: HashMap<ExprId, EnvVal<StateValue>>,
+    /// Some object of the heap may hold an accessor: when not, no read or
+    /// write runs one, which [`Heap::has_accessors`] lets a caller skip.
+    accessors: bool,
 }
+
+/// What a getter no recorded run bounds returns: anything, a new object
+/// included, and never a must-fresh one.
+static UNRUN: std::sync::LazyLock<EnvVal<StateValue>> = std::sync::LazyLock::new(|| {
+    EnvVal::Val(
+        StateValue::top().join(&StateValue::reference(crate::domains::Stability::PerRender)),
+    )
+});
 
 impl Heap {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Some object may hold an accessor (#321).
+    pub fn has_accessors(&self) -> bool {
+        self.accessors
+    }
+
+    /// One run of the getter at `site` returned `value` (`None`: it ran no
+    /// body, so it may return anything).
+    pub fn record_getter(&mut self, site: ExprId, value: Option<&EnvVal<StateValue>>) {
+        let value = value.unwrap_or(&UNRUN);
+        let joined = match self.returned.get(&site) {
+            Some(old) => old.join(value),
+            None => value.clone(),
+        };
+        self.returned.insert(site, joined);
+    }
+
+    /// What a read through the getter at `site` is, and whether a recorded
+    /// run bounds it.
+    fn getter_returned(&self, site: ExprId) -> (&EnvVal<StateValue>, bool) {
+        match self.returned.get(&site) {
+            Some(v) => (v, true),
+            None => (&UNRUN, false),
+        }
+    }
+
+    /// The closures a read (`Get`) or write (`Set`) of `member` of a value
+    /// pointing to `sites` runs ([`Members::accessors`]).
+    pub fn accessors(&self, sites: &Sites, kind: Accessor, member: Option<&str>) -> Sites {
+        let ids = sites
+            .ids
+            .iter()
+            .filter_map(|id| match self.get(*id) {
+                Some(HeapValue::Obj(obj)) => Some(obj.accessors(kind, member)),
+                _ => None,
+            })
+            .flatten();
+        Sites::closed(ids)
     }
 
     /// A body that does not declare `var` assigned it what `env` binds it
@@ -317,6 +404,7 @@ impl Heap {
         if let Some(written) = self.written.get(&id) {
             members.overlay(written);
         }
+        self.accessors |= members.named.keys().any(|k| accessor_of(k).is_some());
         self.cells.insert(id, HeapValue::Obj(members));
     }
 
@@ -499,20 +587,23 @@ impl Heap {
     pub fn members(&self, sites: &Sites, member: Option<&str>) -> (Vec<&EnvVal<StateValue>>, bool) {
         let mut ids: Vec<_> = sites.ids.iter().copied().collect();
         ids.sort();
-        let Some(member) = member else {
-            let entries = ids
-                .into_iter()
-                .filter_map(|id| match self.get(id) {
-                    Some(HeapValue::Obj(obj)) => Some(obj.values()),
-                    _ => None,
-                })
-                .flatten()
-                .collect();
-            return (entries, true);
-        };
+        // A read through a getter is what its runs returned (#321).
         let mut open = sites.open;
         let mut entries = Vec::new();
+        let Some(member) = member else {
+            for id in ids {
+                if let Some(HeapValue::Obj(obj)) = self.get(id) {
+                    entries.extend(obj.values());
+                    self.through(obj.accessors(Accessor::Get, None), &mut entries);
+                }
+            }
+            return (entries, true);
+        };
         for id in ids {
+            let getters = match self.get(id) {
+                Some(HeapValue::Obj(obj)) => obj.accessors(Accessor::Get, Some(member)),
+                _ => BTreeSet::new(),
+            };
             match self.get(id) {
                 Some(HeapValue::Obj(obj)) if obj.named.contains_key(member) => {
                     entries.push(&obj.named[member]);
@@ -525,10 +616,30 @@ impl Heap {
                     entries.push(others);
                     open = true;
                 }
+                Some(HeapValue::Obj(obj)) if !getters.is_empty() => {
+                    open |= obj.is_open() || obj.persists;
+                }
                 _ => open = true,
             }
+            open |= self.through(getters, &mut entries);
         }
         (entries, open)
+    }
+
+    /// Push what a read through each of `getters` is; `true` when a getter
+    /// no recorded run bounds is among them.
+    fn through<'h>(
+        &'h self,
+        getters: BTreeSet<ExprId>,
+        entries: &mut Vec<&'h EnvVal<StateValue>>,
+    ) -> bool {
+        let mut unbounded = false;
+        for g in getters {
+            let (returned, bounded) = self.getter_returned(g);
+            entries.push(returned);
+            unbounded |= !bounded;
+        }
+        unbounded
     }
 
     /// The allocation sites `member` of a value pointing to `sites` may be
@@ -574,6 +685,7 @@ impl Heap {
             }
             out.insert(id, hv.clone());
         }
+        out.accessors = self.accessors;
         out
     }
 
@@ -731,11 +843,22 @@ impl Heap {
             };
             written.insert(*id, merged);
         }
+        let mut returned = self.returned.clone();
+        for (id, theirs) in &other.returned {
+            let merged = match (returned.get(id), widen) {
+                (None, _) => theirs.clone(),
+                (Some(mine), true) => mine.widen(&mine.join(theirs)),
+                (Some(mine), false) => mine.join(theirs),
+            };
+            returned.insert(*id, merged);
+        }
         Heap {
             cells: result,
             escaped: self.escaped.union(&other.escaped).copied().collect(),
             assigned,
             written,
+            returned,
+            accessors: self.accessors || other.accessors,
         }
     }
 
@@ -775,6 +898,10 @@ impl Heap {
                 .written
                 .iter()
                 .all(|(id, w)| other.written.get(id).is_some_and(|o| w.leq(o)))
+            && self
+                .returned
+                .iter()
+                .all(|(id, r)| other.returned.get(id).is_some_and(|o| r.leq(o)))
             && {
                 let mut theirs = other.assigned.clone();
                 self.assigned

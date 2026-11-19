@@ -230,6 +230,17 @@ that writes it (see *Cross-file limits*).
   is a possible write there, as the store already had it
   [#322](https://github.com/rboudrouss/reactant-analyzer/issues/322). A parameter's default is its value when the argument is omitted or
   `undefined`, as JavaScript stores it.
+- A getter or a setter of an object literal runs at every read or write of its member
+  [#321](https://github.com/rboudrouss/reactant-analyzer/issues/321): where the heap places the
+  object (a literal of the render, a memo's or a call's returned literal, a prop literal), the read
+  is what the getter's runs returned, and a write runs the setter with the value. Its body also
+  runs at an unknown time, since anything holding the object may read the member (a spread, a
+  library): a write in it is a possible write of the render the literal is in, never an Error, and
+  a spread's copy holds what the getter may return, a new object included. `this` in an accessor
+  is not bound. A member read off an object the heap does not place — a module binding, a class
+  instance, what unknown code returns — is still a read of the receiver, which holds while the
+  receiver does: a getter reached that way is missed
+  [#334](https://github.com/rboudrouss/reactant-analyzer/issues/334).
 - **Mount-coupled seeds.** `frozen-initial-state` drops to Info, hidden without `--info`, when every
   call site renders the consumer under a `key` built from the seeding prop, or under a guard built
   from it (`{msg && <Toast msg={msg}/>}`). Neither shape is a proof: a `msg` moving between two

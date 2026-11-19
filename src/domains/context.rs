@@ -62,6 +62,14 @@ pub trait QueryContext {
         &[]
     }
 
+    /// What the call of hook `label` reads in the render as its entry keeps
+    /// it written, outside any function: a deps list, an initial value, a
+    /// custom hook's arguments. Its calls run in render statements ahead of
+    /// the hook (#193), its member reads only at the hook's call (#321).
+    fn hook_reads(&self, _label: crate::ir::types::HookLabel) -> &[crate::ir::expr::Expr] {
+        &[]
+    }
+
     /// The function the value of the hook `label` the fixpoint did not
     /// inline calls, when it hands back one that runs its argument: React's
     /// `useEffectEvent` (#320). A call through the value runs that function.
@@ -449,6 +457,9 @@ pub struct FixpointCtx<'a> {
     /// See `QueryContext::hands_back`.
     pub hands_back:
         &'a std::collections::HashMap<crate::ir::types::HookLabel, &'a crate::ir::expr::Expr>,
+    /// See `QueryContext::hook_reads`.
+    pub hook_reads:
+        &'a std::collections::HashMap<crate::ir::types::HookLabel, Vec<crate::ir::expr::Expr>>,
 }
 
 impl QueryContext for FixpointCtx<'_> {
@@ -469,6 +480,10 @@ impl QueryContext for FixpointCtx<'_> {
 
     fn hook_args(&self, label: crate::ir::types::HookLabel) -> &[crate::ir::expr::Expr] {
         self.hook_args.get(&label).map_or(&[], Vec::as_slice)
+    }
+
+    fn hook_reads(&self, label: crate::ir::types::HookLabel) -> &[crate::ir::expr::Expr] {
+        self.hook_reads.get(&label).map_or(&[], Vec::as_slice)
     }
 
     fn hands_back(&self, label: crate::ir::types::HookLabel) -> Option<&crate::ir::expr::Expr> {

@@ -110,8 +110,62 @@ pub const SPREAD_KEY_PREFIX: &str = "...";
 pub const COMPUTED_KEY_PREFIX: &str = "[computed]";
 
 /// Key prefix of a getter or setter (`{ get x() {…} }`): reading the member
-/// runs the body, so the function literal is not the member's value.
+/// runs the body, so the function literal is not the member's value. The key
+/// says which, and the member it defines ([`accessor_key`], #321).
 pub const ACCESSOR_KEY_PREFIX: &str = "[accessor]";
+
+/// The two halves of an accessor: a getter runs at every read of its member,
+/// a setter at every write, with the value written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Accessor {
+    Get,
+    Set,
+}
+
+/// The key of an accessor of `member` (`None`: a computed name, which may be
+/// any member), unique by `n`: `[accessor]<n>:get:<member>`.
+pub fn accessor_key(n: impl std::fmt::Display, kind: Accessor, member: Option<&str>) -> Symbol {
+    let kind = match kind {
+        Accessor::Get => "get",
+        Accessor::Set => "set",
+    };
+    match member {
+        Some(m) => format!("{ACCESSOR_KEY_PREFIX}{n}:{kind}:{m}"),
+        None => format!("{ACCESSOR_KEY_PREFIX}{n}:{kind}"),
+    }
+}
+
+/// What an [`accessor_key`] defines: its half, and the member (`None`: any).
+pub fn accessor_of(key: &str) -> Option<(Accessor, Option<&str>)> {
+    let mut parts = key.strip_prefix(ACCESSOR_KEY_PREFIX)?.splitn(3, ':');
+    parts.next()?;
+    let kind = match parts.next()? {
+        "get" => Accessor::Get,
+        "set" => Accessor::Set,
+        _ => return None,
+    };
+    Some((kind, parts.next()))
+}
+
+/// The getter an object literal's `key` is read through, as written: the
+/// last entry that defines `key` is a getter of it, with no entry after it
+/// that may define any member (a spread, a computed key, an accessor of a
+/// computed name). A setter of `key` alone defines no getter, so the search
+/// goes on past it; a member written as a value ends it with `None`.
+pub fn object_getter<'e>(fields: &'e [(Symbol, Expr)], key: &str) -> Option<&'e Expr> {
+    for (k, v) in fields.iter().rev() {
+        if k == key {
+            return None;
+        }
+        match accessor_of(k) {
+            Some((Accessor::Get, Some(m))) if m == key => return Some(v),
+            Some((_, Some(_))) => {}
+            _ if is_synthetic_key(k) => return None,
+            _ => {}
+        }
+    }
+    None
+}
 
 /// Is `key` one lowering made up — a spread, a computed key, an accessor —
 /// rather than a member's name? Such an entry may write any member.
@@ -729,5 +783,54 @@ impl Expr {
             },
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod accessor_tests {
+    use super::*;
+
+    fn getter(id: u64) -> Expr {
+        Expr::FnLit {
+            id: ExprId(id),
+            params: vec![],
+            body_cfg: std::sync::Arc::new(crate::ir::cfg::CFG {
+                entry: 0,
+                blocks: Default::default(),
+                edges: Vec::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn an_accessor_key_says_its_half_and_its_member() {
+        let k = accessor_key(7, Accessor::Get, Some("a:b"));
+        assert!(is_synthetic_key(&k));
+        assert_eq!(accessor_of(&k), Some((Accessor::Get, Some("a:b"))));
+        let k = accessor_key(8, Accessor::Set, None);
+        assert_eq!(accessor_of(&k), Some((Accessor::Set, None)));
+        assert_eq!(accessor_of("[computed]3"), None);
+        assert_eq!(accessor_of("p"), None);
+    }
+
+    #[test]
+    fn the_last_definition_of_a_member_says_whether_a_getter_reads_it() {
+        let get = |n| (accessor_key(n, Accessor::Get, Some("p")), getter(n));
+        let set = (accessor_key(9, Accessor::Set, Some("p")), getter(9));
+        let data = ("p".to_string(), Expr::Lit(Prim::Int(1)));
+        let other = (accessor_key(10, Accessor::Get, Some("q")), getter(10));
+        let spread = (format!("{SPREAD_KEY_PREFIX}11"), Expr::Var("x".into()));
+        let found = |fields: Vec<(Symbol, Expr)>| {
+            object_getter(&fields, "p").map(|e| match e {
+                Expr::FnLit { id, .. } => id.0,
+                _ => 0,
+            })
+        };
+        assert_eq!(found(vec![data.clone(), get(1)]), Some(1));
+        assert_eq!(found(vec![get(1), data.clone()]), None);
+        assert_eq!(found(vec![get(1), set.clone(), other.clone()]), Some(1));
+        assert_eq!(found(vec![get(1), spread]), None);
+        assert_eq!(found(vec![data, set]), None);
+        assert_eq!(found(vec![other]), None);
     }
 }

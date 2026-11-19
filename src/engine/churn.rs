@@ -117,7 +117,7 @@ use crate::{
         ComponentId, QualifiedSlot, SourceRange,
         bindings::{binds, local_bindings, must_param, nested_bodies},
         cfg::{CFG, Terminator},
-        expr::{Expr, Prim, SPREAD_KEY_PREFIX, object_member},
+        expr::{Expr, Prim, SPREAD_KEY_PREFIX, object_getter, object_member},
         hooks::HookEntry,
         stmt::Stmt,
         types::{BlockId, HookLabel, Symbol, Var},
@@ -1779,28 +1779,19 @@ impl<'a> Allocated<'a> {
             | Expr::NativeElem { .. }
             | Expr::CompApp { .. } => true,
             Expr::Call { fn_, .. } => returns_no_input(fn_),
-            Expr::FieldAccess { obj, field } => self
-                .member(obj, field, scope, next)
-                .is_some_and(|(m, s)| self.fresh(m, s, next)),
+            Expr::FieldAccess { obj, field } => self.read(obj, field, scope, next),
             Expr::IndexAccess { arr, idx } => {
                 let key = match idx.peel_ts() {
                     Expr::Lit(Prim::Int(i)) => i.to_string(),
                     Expr::Lit(Prim::String(s)) => s.to_string(),
                     _ => return false,
                 };
-                self.member(arr, &key, scope, next)
-                    .is_some_and(|(m, s)| self.fresh(m, s, next))
+                self.read(arr, &key, scope, next)
             }
             Expr::MemoVal(l) | Expr::CallbackVal(l) => {
                 self.memos.get(l).is_some_and(|(body, deps)| {
                     deps.iter().any(|d| self.fresh(d, self.render, next))
-                        && body.is_none_or(|b| {
-                            let mut returns = b.blocks.values().filter_map(|blk| match &blk.term {
-                                Terminator::Return(r, _) => Some(r),
-                                _ => None,
-                            });
-                            returns.all(|r| self.fresh(r, b, next))
-                        })
+                        && body.is_none_or(|b| self.returns_fresh(b, next))
                 })
             }
             Expr::Var(v) => self.bindings(v, scope).is_some_and(|(in_render, rhss)| {
@@ -1810,6 +1801,58 @@ impl<'a> Allocated<'a> {
                     })
             }),
             _ => false,
+        }
+    }
+
+    /// Is the read of a constant `key` of `e` allocated afresh: the member as
+    /// written, or a call of the getter it is read through (#321), every
+    /// return of which is.
+    fn read(&self, e: &'a Expr, key: &str, scope: &'a CFG, depth: usize) -> bool {
+        self.member(e, key, scope, depth)
+            .is_some_and(|(m, s)| self.fresh(m, s, depth))
+            || self
+                .getter(e, key, scope, depth)
+                .is_some_and(|body| self.returns_fresh(body, depth))
+    }
+
+    /// Does `body` return, and is every value it returns allocated afresh?
+    /// A body that only throws returns nothing to prove.
+    fn returns_fresh(&self, body: &'a CFG, depth: usize) -> bool {
+        let mut returns = body
+            .blocks
+            .values()
+            .filter_map(|blk| match &blk.term {
+                Terminator::Return(r, _) => Some(r),
+                _ => None,
+            })
+            .peekable();
+        returns.peek().is_some() && returns.all(|r| self.fresh(r, body, depth))
+    }
+
+    /// The body of the getter a constant `key` of `e` is read through, as
+    /// written ([`object_getter`]): of an object literal, of a member of one,
+    /// or of a name bound once to one that no body mutates.
+    fn getter(&self, e: &'a Expr, key: &str, scope: &'a CFG, depth: usize) -> Option<&'a CFG> {
+        if depth == 0 {
+            return None;
+        }
+        match e.peel_ts() {
+            Expr::ObjectLit { fields, .. } => match object_getter(fields, key)?.peel_ts() {
+                Expr::FnLit { body_cfg, .. } => Some(body_cfg),
+                _ => None,
+            },
+            Expr::FieldAccess { obj, field } => {
+                let (inner, s) = self.member(obj, field, scope, depth - 1)?;
+                self.getter(inner, key, s, depth - 1)
+            }
+            Expr::Var(v) if !self.mutated.contains(v) => match self.bindings(v, scope)? {
+                (_, rhss) if rhss.len() == 1 => {
+                    let (_, rhs, s) = rhss[0];
+                    self.getter(rhs, key, s, depth - 1)
+                }
+                _ => None,
+            },
+            _ => None,
         }
     }
 
