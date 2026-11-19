@@ -255,6 +255,12 @@ pub struct LoweredProgram {
     /// at a lowered utility. Consumed by
     /// [`crate::engine::FunctionRegistry::from_functions_and_imports`].
     pub utility_imports: Vec<((PathBuf, String), (PathBuf, String))>,
+    /// The construction body of every class a module defines at top level
+    /// (#335), named by the class.
+    pub classes: Vec<FunctionIR>,
+    /// The import edges that point at one of `classes`, as
+    /// [`Self::utility_imports`] for utilities.
+    pub class_imports: Vec<((PathBuf, String), (PathBuf, String))>,
 }
 
 /// Parse and lower an explicit list of files with the given `ImportResolver`.
@@ -286,6 +292,8 @@ pub fn lower_files_with(
         file_table: FileTable::default(),
         module_table: ModuleTable::default(),
         utility_imports: Vec::new(),
+        classes: Vec::new(),
+        class_imports: Vec::new(),
     };
     // Per-file context bindings and resolved imports, for the cross-file pass
     // below: a context is only provable once every file has been scanned.
@@ -356,6 +364,15 @@ pub fn lower_files_with(
             &mut lowered.file_table,
             resolver,
         ));
+        lowered
+            .classes
+            .extend(crate::lowering::lower_classes_with_resolver(
+                &ret.program,
+                &source,
+                path,
+                &mut lowered.file_table,
+                resolver,
+            ));
         lowered.module_table.insert(
             path.clone(),
             crate::lowering::collect_module_facts(&ret.program, path, resolver),
@@ -381,15 +398,24 @@ fn resolve_imported_utilities(
     lowered: &mut LoweredProgram,
     file_imports: &[(PathBuf, HashMap<String, ResolvedImport>)],
 ) {
-    let defined: HashSet<(&PathBuf, &String)> = lowered
-        .utilities
-        .iter()
-        .map(|f| (&f.file, &f.name))
-        .collect();
+    lowered.utility_imports = import_edges(&lowered.utilities, file_imports);
+    // A class is reached by name as a utility is (#335).
+    lowered.class_imports = import_edges(&lowered.classes, file_imports);
+}
+
+/// The resolved imports that point at one of `defined`: `(importing file,
+/// local name) → (defining file, exported name)`.
+fn import_edges(
+    defined: &[FunctionIR],
+    file_imports: &[(PathBuf, HashMap<String, ResolvedImport>)],
+) -> Vec<((PathBuf, String), (PathBuf, String))> {
+    let defined: HashSet<(&PathBuf, &String)> =
+        defined.iter().map(|f| (&f.file, &f.name)).collect();
+    let mut edges = Vec::new();
     for (file, imports) in file_imports {
         for (local, origin) in imports {
             if defined.contains(&(&origin.file, &origin.imported)) {
-                lowered.utility_imports.push((
+                edges.push((
                     (file.clone(), local.clone()),
                     (origin.file.clone(), origin.imported.clone()),
                 ));
@@ -398,7 +424,8 @@ fn resolve_imported_utilities(
     }
     // HashMap iteration order is seed-dependent; the registry map is
     // order-insensitive but the stored Vec should not be.
-    lowered.utility_imports.sort();
+    edges.sort();
+    edges
 }
 
 /// Mark a context imported from another analyzed file as a context *here*.
@@ -468,6 +495,8 @@ pub fn analyze_lowered(
 ) -> ProgramAnalysisResult {
     config.function_registry =
         FunctionRegistry::from_functions_and_imports(lowered.utilities, lowered.utility_imports);
+    config.class_registry =
+        FunctionRegistry::from_functions_and_imports(lowered.classes, lowered.class_imports);
     let registry = ComponentRegistry::from_components(lowered.components);
     let hook_registry = HookRegistry::from_hooks(lowered.hooks)
         .with_re_exports(lowered.module_table.re_export_graph());

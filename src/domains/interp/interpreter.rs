@@ -15,8 +15,8 @@ use crate::{
         bindings::binding_of,
         cfg::{CFG, EdgeKind, Terminator},
         expr::{
-            Accessor, Expr, MarkerVal, SPREAD_KEY_PREFIX, SummaryValue, accessor_of,
-            is_synthetic_key,
+            Accessor, CONSTRUCT_KEY, Expr, MarkerVal, NEW_INSTANCE, SPREAD_KEY_PREFIX,
+            SummaryValue, THIS, accessor_of, is_synthetic_key,
         },
         stmt::{MemberKey, Stmt},
         types::{BlockId, ExprId, Symbol},
@@ -609,7 +609,16 @@ fn exec_stmt_core<T: Transfer>(
         // among several and the Loc set may name several allocation sites, so
         // join, never replace.
         Stmt::MemberWrite { obj, key, rhs, .. } => {
-            let rhs_sites = alloc_literal(transfer, rhs, env, ctx);
+            // An accessor a class defines on its instance (#335) runs at any
+            // read or write of its member, by whoever makes it, as a
+            // literal's does: its closure escapes where it is defined,
+            // anchored at its own site, since a write has no anchor.
+            let rhs_sites = match (key, rhs) {
+                (MemberKey::Field(k), Expr::FnLit { id, .. }) if accessor_of(k).is_some() => {
+                    escape_at(transfer, rhs, env, ctx, Some((*id, 0)))
+                }
+                _ => alloc_literal(transfer, rhs, env, ctx),
+            };
             // An object the heap does not place (a parameter's member, the
             // result of a call no body ran) is one code the analysis does not see may
             // read: what is written there escapes (#254). So is a ref: it
@@ -963,6 +972,9 @@ pub(crate) fn alloc_literal<T: Transfer>(
                 (a, b) => a.or(b),
             };
         }
+        // A `new` of a program class points where its construction body's
+        // returns do (#335).
+        Expr::New { id, .. } => return ctx.returns.get(*id).and_then(|v| v.sites().cloned()),
         other => return resolve_locs(other, env, ctx.heap),
     };
     ctx.heap.alloc_obj(id, members);
@@ -1465,16 +1477,40 @@ fn exec_callbacks_depth<T: Transfer>(
             run_accessors(transfer, arr, member.as_deref(), None, env, ctx, depth);
             None
         }
-        // `new X(…)` hands its arguments to a constructor the analysis does
-        // not run — an observer's callback, a promise executor (#254).
-        Expr::New { id, args, .. } => {
-            expr.for_each_child(&mut |c| {
-                exec_callbacks_depth(transfer, c, env, ctx, depth);
-            });
-            for (i, arg) in args.iter().enumerate() {
-                escape_at(transfer, arg, env, ctx, Some((*id, i)));
-            }
-            None
+        // `new K(…)` of a class the program defines runs its construction
+        // body (#335) as a call of it, the object it builds bound: a new one
+        // at the `new`'s site, or for `super(…)` the instance `this` holds.
+        // What the call returns is what the `new` evaluates to.
+        Expr::New {
+            id,
+            fn_,
+            args,
+            ctor,
+            on_this,
+        } => {
+            let Some(body) = construction(fn_, ctor.as_deref(), env, ctx) else {
+                return exec_unseen_new(transfer, *id, args, *on_this, expr, env, ctx, depth);
+            };
+            let instance = match on_this {
+                true => env
+                    .lookup_env_val(THIS)
+                    .unwrap_or_else(|| EnvVal::Val(T::Domain::top())),
+                false => {
+                    ctx.heap.alloc_obj(*id, Members::default());
+                    let fresh =
+                        T::Domain::from_state_value(StateValue::reference(Stability::PerRender));
+                    EnvVal::located(Some(Sites::closed([*id])), fresh)
+                }
+            };
+            let mut scope = env.clone();
+            scope.bind_locs(NEW_INSTANCE.to_string(), instance.sites().cloned());
+            scope.extend(NEW_INSTANCE.to_string(), instance.as_val());
+            let call = Expr::Call {
+                id: *id,
+                fn_: Box::new(body),
+                args: args.clone(),
+            };
+            exec_callbacks_depth(transfer, &call, &scope, ctx, depth)
         }
         // A hook the fixpoint did not inline receives its arguments at its
         // call (#254).
@@ -1513,6 +1549,72 @@ fn exec_callbacks_depth<T: Transfer>(
             None
         }
     }
+}
+
+/// The construction body a `new` of `class` runs (#335), as a callee: the
+/// body the engine resolved for a class of the program's modules (`ctor`),
+/// or the [`CONSTRUCT_KEY`] member of a class value the heap places — a
+/// class written in a body, or inline. `None` for a class the analysis does
+/// not see.
+fn construction<D: AbstractDomain>(
+    class: &Expr,
+    ctor: Option<&Expr>,
+    env: &AbstractEnv<D>,
+    ctx: &AnalysisCtx<D>,
+) -> Option<Expr> {
+    if let Some(body) = ctor {
+        return Some(body.clone());
+    }
+    let defines = match class.peel_ts() {
+        Expr::ObjectLit { fields, .. } => fields.iter().any(|(k, _)| k == CONSTRUCT_KEY),
+        other => ctx.resolve_locs(other, env).is_some_and(|sites| {
+            sites.ids.iter().any(|id| {
+                matches!(ctx.heap.get(*id), Some(HeapValue::Obj(o)) if o.named.contains_key(CONSTRUCT_KEY))
+            })
+        }),
+    };
+    defines.then(|| Expr::FieldAccess {
+        obj: Box::new(class.clone()),
+        field: CONSTRUCT_KEY.to_string(),
+    })
+}
+
+/// `new X(…)` of a class the analysis does not see hands its arguments to a
+/// constructor it does not run — an observer's callback, a promise executor
+/// (#254). A `super(…)` of such a class hands it the instance as well
+/// (#335): the instance may hold any member that class puts there, and that
+/// code holds it. The `super` evaluates to the instance.
+#[allow(clippy::too_many_arguments)]
+fn exec_unseen_new<T: Transfer>(
+    transfer: &T,
+    id: ExprId,
+    args: &[Expr],
+    on_this: bool,
+    expr: &Expr,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+    depth: usize,
+) -> Option<EnvVal<T::Domain>> {
+    expr.for_each_child(&mut |c| {
+        exec_callbacks_depth(transfer, c, env, ctx, depth);
+    });
+    for (i, arg) in args.iter().enumerate() {
+        escape_at(transfer, arg, env, ctx, Some((id, i)));
+    }
+    if !on_this {
+        return None;
+    }
+    let this = env.lookup_env_val(THIS);
+    if let Some(sites) = this.as_ref().and_then(EnvVal::sites).cloned() {
+        for site in &sites.ids {
+            ctx.heap.write_after(*site, |obj| obj.open = true);
+        }
+        for (owner, label) in ctx.heap.escape(&sites) {
+            ctx.write_slot(owner, label, T::Domain::top());
+        }
+    }
+    ctx.returns.record(id, this.as_ref());
+    this
 }
 
 /// Code the analysis does not see receives the value of `expr` (#254): a
@@ -1859,10 +1961,22 @@ pub(crate) fn bind_params<D: AbstractDomain>(
     params: &[Symbol],
     args: Args<'_, D>,
 ) {
+    // A parameter past the known arguments takes what an argument from the
+    // spread on may be, or `undefined` past the last one: `super(...args)`
+    // hands the parent the setter it was given (#335). Without a tail, any
+    // value.
+    let past = args.tail.map(|t| {
+        (
+            t.sites().cloned(),
+            t.as_val()
+                .join(&D::from_state_value(StateValue::undefined())),
+        )
+    });
     for (i, p) in params.iter().enumerate() {
-        let (sites, val) = match args.known.get(i) {
-            Some(arg) => (arg.sites().cloned(), arg.as_val()),
-            None => (None, D::top()),
+        let (sites, val) = match (args.known.get(i), &past) {
+            (Some(arg), _) => (arg.sites().cloned(), arg.as_val()),
+            (None, Some((sites, val))) => (sites.clone(), val.clone()),
+            (None, None) => (None, D::top()),
         };
         env.bind_locs(p.clone(), sites);
         env.extend(p.clone(), val);

@@ -2851,6 +2851,28 @@ impl<'a> SetterWalk<'a> {
             if let crate::ir::stmt::MemberKey::Index(idx) = key {
                 self.expr(idx, span, at, depth, found, mode, at_root, prov);
             }
+            // An accessor a class defines on its instance (#335) runs at any
+            // read or write of its member, as a literal's does: what it
+            // reaches runs here, at an unknown time, anchored at its own
+            // site ([`crate::domains::interp`]'s accessor definition).
+            if let crate::ir::stmt::MemberKey::Field(k) = key
+                && let Some((half, member)) = crate::ir::expr::accessor_of(k)
+                && let Expr::FnLit { id, .. } = expr
+            {
+                let outer = self.accessor.replace((half, member.map(str::to_string)));
+                self.relation_handed(
+                    Some((*id, 0)),
+                    expr,
+                    WalkClass::Unknown,
+                    None,
+                    depth,
+                    found,
+                    prov,
+                    span,
+                );
+                self.accessor = outer;
+                return;
+            }
         }
         self.expr(expr, span, at, depth, found, mode, at_root, prov);
     }
@@ -2908,9 +2930,13 @@ impl<'a> SetterWalk<'a> {
         // `new X(cb)` runs its arguments through the same machinery: a
         // `Promise` executor runs synchronously, and a class the body binds
         // is a local helper like any other.
-        if let Expr::Call { id, fn_, args } | Expr::New { id, fn_, args } = expr {
+        if let Expr::Call { id, fn_, args } | Expr::New { id, fn_, args, .. } = expr {
             // A call writes and runs what its row lists (ADR-047): nothing
-            // is read off a name.
+            // is read off a name. So does a `new` of a program class, whose
+            // construction body the row lists (#335).
+            if matches!(expr, Expr::New { .. }) {
+                self.relation_call(*id, fn_, args, at, depth, found, mode, prov, stmt_span);
+            }
             if matches!(expr, Expr::Call { .. }) {
                 self.relation_call(*id, fn_, args, at, depth, found, mode, prov, stmt_span);
                 // What the callee's callbacks returned to it escaped there:

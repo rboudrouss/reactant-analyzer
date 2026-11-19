@@ -800,10 +800,20 @@ fn rename_vars_expr(expr: Expr, ren: &HashMap<Var, Var>) -> Expr {
             fn_: Box::new(rename_vars_expr(*fn_, ren)),
             args: args.into_iter().map(|a| rename_vars_expr(a, ren)).collect(),
         },
-        Expr::New { id, fn_, args } => Expr::New {
+        // A class's construction body reads the names of the class's own
+        // scope, which no splice renames.
+        Expr::New {
+            id,
+            fn_,
+            args,
+            ctor,
+            on_this,
+        } => Expr::New {
             id,
             fn_: Box::new(rename_vars_expr(*fn_, ren)),
             args: args.into_iter().map(|a| rename_vars_expr(a, ren)).collect(),
+            ctor,
+            on_this,
         },
         Expr::CompApp {
             name,
@@ -1038,13 +1048,21 @@ pub fn subst_vars_expr(expr: Expr, subst: &HashMap<Var, Expr>) -> Expr {
                 .map(|a| subst_vars_expr(a, subst))
                 .collect(),
         },
-        Expr::New { id, fn_, args } => Expr::New {
+        Expr::New {
+            id,
+            fn_,
+            args,
+            ctor,
+            on_this,
+        } => Expr::New {
             id,
             fn_: Box::new(subst_vars_expr(*fn_, subst)),
             args: args
                 .into_iter()
                 .map(|a| subst_vars_expr(a, subst))
                 .collect(),
+            ctor,
+            on_this,
         },
         Expr::CompApp {
             name,

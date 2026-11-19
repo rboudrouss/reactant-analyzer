@@ -109,11 +109,12 @@ pub(crate) fn is_argument_temp(var: &str) -> bool {
 /// `__sw`, `__of`), a call's (`__call_`, `__hook_`, `__hookarg_`), a
 /// destructured value, element or default (`__dstr_`, `__arr_`, `__obj_`,
 /// `__dflt_`), a destructured parameter (`__p`), an inlined body's argument
-/// (`__arg`).
+/// (`__arg`), what a constructor's `return` names (`__ret`, #335).
 const TEMP_PREFIXES: &[&str] = &[
     "__t",
     "__sw",
     "__of",
+    "__ret",
     "__call_",
     "__hookarg_",
     "__hook_",

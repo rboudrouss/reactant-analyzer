@@ -444,9 +444,11 @@ impl Heap {
 
     /// Apply `write` to the object at site `id`, and keep it for the
     /// objects the site allocates next.
+    /// A write may define an accessor: a class's, on its instance (#335).
     pub fn write_after(&mut self, id: ExprId, write: impl Fn(&mut Members)) {
         if let Some(HeapValue::Obj(obj)) = self.cells.get_mut(&id) {
             write(obj);
+            self.accessors |= obj.named.keys().any(|k| accessor_of(k).is_some());
             write(self.written.entry(id).or_default());
         }
     }
@@ -982,7 +984,7 @@ pub fn resolve_locs_with<D: AbstractDomain>(
     let (obj, member) = match expr {
         Expr::Var(v) => return env.lookup_env_val(v).and_then(|ev| ev.sites().cloned()),
         Expr::TSAnnotated(inner) => return resolve_locs_with(inner, env, heap, returned),
-        Expr::Call { id, .. } => return returned(*id),
+        Expr::Call { id, .. } | Expr::New { id, .. } => return returned(*id),
         Expr::FieldAccess { obj, field } => (obj, Some(field.clone())),
         // A constant index is a member read (`t[1]`, `o["k"]`, `o[k]` with
         // `k` one string); any other index may be any member (#307), as

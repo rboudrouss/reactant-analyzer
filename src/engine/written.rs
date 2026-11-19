@@ -608,6 +608,8 @@ mod tests {
                 id: ExprId::fresh(),
                 fn_: Box::new(Expr::Var("Map".into())),
                 args: vec![Expr::Var("p".into())],
+                ctor: None,
+                on_this: false,
             },
             "p",
         );

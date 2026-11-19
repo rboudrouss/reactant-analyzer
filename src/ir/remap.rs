@@ -233,10 +233,18 @@ pub fn remap_expr(expr: Expr, off: Offsets) -> Expr {
             fn_: Box::new(remap_expr(*fn_, off)),
             args: args.into_iter().map(|a| remap_expr(a, off)).collect(),
         },
-        Expr::New { id, fn_, args } => Expr::New {
+        Expr::New {
+            id,
+            fn_,
+            args,
+            ctor,
+            on_this,
+        } => Expr::New {
             id: shift(id),
             fn_: Box::new(remap_expr(*fn_, off)),
             args: args.into_iter().map(|a| remap_expr(a, off)).collect(),
+            ctor: ctor.map(|c| Box::new(remap_expr(*c, off))),
+            on_this,
         },
         Expr::CompApp {
             name,

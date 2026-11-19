@@ -16,8 +16,9 @@ use crate::ir::{
 };
 
 use super::cfg_builder::{
-    BlockBuilder, FnKind, build_expr_fn_body_cfg, build_fn_body_cfg, build_stmts_cfg, handed_out,
-    lower_default,
+    BlockBuilder, CtorScope, FnKind, build_construct_cfg, build_expr_fn_body_cfg, build_fields_cfg,
+    build_fn_body_cfg, build_member_body_cfg, build_stmts_cfg, handed_out, lower_default,
+    super_call,
 };
 
 /// An opaque value of unknown kind (⊤). Used for expressions the analysis does
@@ -112,22 +113,31 @@ pub(super) fn property_name(key: &PropertyKey) -> Option<String> {
     }
 }
 
-/// Lower a class into an `ObjectLit` holding its member bodies under synthetic
-/// keys.
+/// Lower a class into an `ObjectLit`: its value, whose
+/// [`CONSTRUCT_KEY`](crate::ir::expr::CONSTRUCT_KEY) member is its
+/// construction body ([`build_construct_cfg`]), the one a `new` of it runs
+/// (#335), and whose static members are kept under synthetic keys.
 ///
-/// A class binds nothing the env models — `new X()` and `X.m()` are both ⊤, and
-/// the synthetic keys make sure no real `FieldAccess` ever resolves to a member.
-/// But its **bodies are code**: dropping the whole declaration lost every setter
-/// call and every capture inside it, so `class X { m() { setC(1) } }` read as a
-/// component that never writes `c` — a path the fixpoint never explores, not a
-/// widened one. Same device as an object spread: the value is kept for its
-/// reads, under a name nothing can ask for.
+/// An instance is a placed object whose methods and accessors are the
+/// class's bodies, `this` bound to it: they are written on it by the
+/// construction body, and a member read or call of the instance runs them
+/// as any closure the heap places. A static member is code too — dropping
+/// the declaration lost every setter call and every capture inside it, so
+/// `class X { static m() { setC(1) } }` read as a component that never
+/// writes `c` — kept for its reads under a name no real `FieldAccess`
+/// resolves to, as an object spread is.
 ///
 /// Shared by the declaration and the expression form so neither can drift.
 pub(super) fn lower_class(class: &Class, builder: &mut BlockBuilder) -> Expr {
     let id = builder.next_expr_id();
     let mut fields: Vec<(String, Expr)> = vec![];
     let ctx = builder.ctx.clone();
+    // Instance members: `this` is the instance.
+    let instance = ctx.member(None);
+    let mut methods: Vec<Stmt> = vec![];
+    let mut inits: Vec<(MemberKey, Option<&Expression>, oxc_span::Span)> = vec![];
+    let mut ctor: Option<&Function> = None;
+    let this = || Expr::Var(crate::ir::expr::THIS.to_string());
 
     // A computed member name (`class X { [k]() {} }`) is an expression that
     // runs where the class is defined — its reads have to survive.
@@ -142,40 +152,64 @@ pub(super) fn lower_class(class: &Class, builder: &mut BlockBuilder) -> Expr {
 
     for elem in &class.body.body {
         match elem {
+            ClassElement::MethodDefinition(m) if m.kind == MethodDefinitionKind::Constructor => {
+                ctor = Some(&m.value);
+            }
             ClassElement::MethodDefinition(m) => {
                 computed_key(&m.key, builder);
                 if let Some(body) = m.value.body.as_deref() {
                     let kind = FnKind::of(m.value.r#async, m.value.generator);
-                    let (params, body_cfg) =
-                        build_fn_body_cfg(&m.value.params, body, kind, false, &ctx);
+                    let (params, body_cfg) = if m.r#static {
+                        build_fn_body_cfg(&m.value.params, body, kind, false, &ctx)
+                    } else {
+                        build_member_body_cfg(&m.value.params, body, kind, &instance)
+                    };
                     let fn_id = builder.next_expr_id();
-                    fields.push((
-                        synthetic_key(builder, "[method]"),
-                        Expr::FnLit {
-                            id: fn_id,
-                            params,
-                            body_cfg: Arc::new(body_cfg),
-                        },
-                    ));
+                    let body = Expr::FnLit {
+                        id: fn_id,
+                        params,
+                        body_cfg: Arc::new(body_cfg),
+                    };
+                    if m.r#static {
+                        fields.push((synthetic_key(builder, "[method]"), body));
+                    } else {
+                        let key = method_key(&m.key, m.kind, builder);
+                        methods.push(Stmt::MemberWrite {
+                            obj: this(),
+                            key,
+                            rhs: body,
+                            span: builder.span_at(m.span.start),
+                        });
+                    }
                 }
             }
             // `handle = () => setC(1)` — a field initializer is an ordinary
             // expression, and the arrow-bound-method form is the one React
-            // class components use everywhere.
+            // class components use everywhere. An instance field's runs at
+            // each construction, on the instance; a static one's where the
+            // class is defined.
             ClassElement::PropertyDefinition(p) => {
                 computed_key(&p.key, builder);
-                if let Some(value) = &p.value {
-                    let lowered = lower_expr(value, builder);
-                    fields.push((synthetic_key(builder, "[field]"), lowered));
+                if p.r#static {
+                    if let Some(value) = &p.value {
+                        let lowered = lower_expr(value, builder);
+                        fields.push((synthetic_key(builder, "[field]"), lowered));
+                    }
+                } else {
+                    inits.push((field_key(&p.key), p.value.as_ref(), p.span));
                 }
             }
             // `accessor x = v`: a field whose getter and setter the language
             // writes; its initializer is an ordinary expression, as a field's.
             ClassElement::AccessorProperty(a) => {
                 computed_key(&a.key, builder);
-                if let Some(value) = &a.value {
-                    let lowered = lower_expr(value, builder);
-                    fields.push((synthetic_key(builder, "[field]"), lowered));
+                if a.r#static {
+                    if let Some(value) = &a.value {
+                        let lowered = lower_expr(value, builder);
+                        fields.push((synthetic_key(builder, "[field]"), lowered));
+                    }
+                } else {
+                    inits.push((field_key(&a.key), a.value.as_ref(), a.span));
                 }
             }
             // `static { … }` runs at definition time. Kept as a zero-arg body
@@ -198,13 +232,97 @@ pub(super) fn lower_class(class: &Class, builder: &mut BlockBuilder) -> Expr {
         }
     }
 
-    // `class X extends base()` — the superclass expression runs too.
-    if let Some(super_class) = &class.super_class {
+    // `class X extends base()` — the superclass expression runs too, where
+    // the class is defined; a `super(…)` constructs the class it names, read
+    // as written when that is a name or a member chain, and as a class the
+    // analysis does not see otherwise.
+    let parent = class.super_class.as_ref().map(|super_class| {
         let lowered = lower_expr(super_class, builder);
+        let parent = if is_name_chain(&lowered) {
+            lowered.clone()
+        } else {
+            opaque()
+        };
         fields.push((synthetic_key(builder, "[extends]"), lowered));
-    }
+        parent
+    });
+
+    let init = (!inits.is_empty()).then(|| {
+        let body_cfg = build_fields_cfg(&inits, &instance);
+        Expr::Call {
+            id: builder.next_call_id(),
+            fn_: Box::new(Expr::FnLit {
+                id: builder.next_expr_id(),
+                params: vec![],
+                body_cfg: Arc::new(body_cfg),
+            }),
+            args: vec![],
+        }
+    });
+    let scope = CtorScope {
+        parent,
+        fields: init,
+    };
+    let (params, body_cfg) = build_construct_cfg(ctor, methods, &ctx.member(Some(scope)));
+    fields.push((
+        crate::ir::expr::CONSTRUCT_KEY.to_string(),
+        Expr::FnLit {
+            id: builder.next_expr_id(),
+            params,
+            body_cfg: Arc::new(body_cfg),
+        },
+    ));
 
     Expr::ObjectLit { id, fields }
+}
+
+/// A name or a member chain off one (`Base`, `React.Component`).
+fn is_name_chain(e: &Expr) -> bool {
+    match e {
+        Expr::Var(_) => true,
+        Expr::FieldAccess { obj, .. } => is_name_chain(obj),
+        _ => false,
+    }
+}
+
+/// The member an instance method or accessor is written under (#335): its
+/// name, or the [`accessor_key`] of a getter or a setter. A name no constant
+/// spells may be any member.
+fn method_key(
+    key: &PropertyKey,
+    kind: MethodDefinitionKind,
+    builder: &mut BlockBuilder,
+) -> MemberKey {
+    let name = class_member_name(key);
+    let half = match kind {
+        MethodDefinitionKind::Get => Accessor::Get,
+        MethodDefinitionKind::Set => Accessor::Set,
+        MethodDefinitionKind::Method | MethodDefinitionKind::Constructor => {
+            return match name {
+                Some(n) => MemberKey::Field(n),
+                None => MemberKey::Index(opaque()),
+            };
+        }
+    };
+    let n = builder.next_expr_id().0;
+    MemberKey::Field(accessor_key(n, half, name.as_deref()))
+}
+
+/// The member an instance field is written under: its name, or any member.
+fn field_key(key: &PropertyKey) -> MemberKey {
+    match class_member_name(key) {
+        Some(n) => MemberKey::Field(n),
+        None => MemberKey::Index(opaque()),
+    }
+}
+
+/// A class member's name: a property's, or `#x` for a private one, as
+/// `this.#x` reads it.
+fn class_member_name(key: &PropertyKey) -> Option<String> {
+    match key {
+        PropertyKey::PrivateIdentifier(p) => Some(format!("#{}", p.name)),
+        key => property_name(key),
+    }
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -264,8 +382,13 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                 Expr::Var(id.name.to_string())
             }
         }
-        // `this`/`super` carry no tracked value in a function component; model
-        // them as an opaque ⊤ rather than a magic `Var("this")` binding.
+        // `this` in a class's instance member is the instance, the name its
+        // construction body binds (#335); `super.m` reads the parent's
+        // member, which that body wrote on the same instance. Anywhere else
+        // `this` and `super` carry no tracked value: opaque ⊤.
+        Expression::ThisExpression(_) | Expression::Super(_) if builder.ctx.this_instance => {
+            Expr::Var(crate::ir::expr::THIS.to_string())
+        }
         Expression::ThisExpression(_) | Expression::Super(_) => opaque(),
 
         // ── Arithmetic / comparison ───────────────────────────────────────────
@@ -391,6 +514,8 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                 id,
                 fn_: Box::new(fn_),
                 args,
+                ctor: None,
+                on_this: false,
             }
         }
         Expression::TaggedTemplateExpression(t) => Expr::Call {
@@ -755,6 +880,12 @@ fn lower_arguments(arguments: &[Argument], builder: &mut BlockBuilder) -> Vec<Ex
 /// no other body of the component binds it — the offset alone is shared by
 /// `get()` and `get()()`, whose temps would be one name bound twice.
 fn lower_call(call: &CallExpression, builder: &mut BlockBuilder) -> Expr {
+    // `super(…)` in a constructor constructs the parent on `this` (#335).
+    if matches!(call.callee, Expression::Super(_)) && builder.ctx.ctor.is_some() {
+        let args = lower_arguments(&call.arguments, builder);
+        let span = builder.span_at(call.span.start);
+        return super_call(args, span, builder);
+    }
     let fn_ = lower_expr(&call.callee, builder);
     finish_call(call, fn_, builder)
 }

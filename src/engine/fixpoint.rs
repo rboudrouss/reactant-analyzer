@@ -44,6 +44,10 @@ pub struct Config {
     /// Utility-function inlining registry. When non-empty, statement-level calls
     /// to known utilities are spliced into the caller's CFG instead of opaque `Top`.
     pub function_registry: FunctionRegistry,
+    /// The construction body of every class the program's modules define at
+    /// top level, by `(file, class name)` and resolved as a utility is
+    /// (#335): what a `new` of one runs.
+    pub class_registry: FunctionRegistry,
     /// Cap on transitive utility-inlining depth, to bound CFG growth when
     /// utilities chain or recurse.
     pub max_inline_depth: usize,
@@ -55,6 +59,7 @@ impl Default for Config {
             widen_threshold: 3,
             summary_registry: SummaryRegistry::new(),
             function_registry: FunctionRegistry::new(),
+            class_registry: FunctionRegistry::new(),
             max_inline_depth: 8,
         }
     }
@@ -317,6 +322,25 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         &mut inline_regions,
         &mut splice_salt,
     );
+
+    // Every `new` of a class a module of the program defines runs its
+    // construction body (#335), resolved once every splice has landed.
+    if expand_class_constructions(
+        &mut render_cfg,
+        &mut hooks,
+        &config.class_registry,
+        &comp_file,
+        &inline_regions,
+        config.max_inline_depth,
+        &mut splice_salt,
+    ) && let Some(inter) = inter
+    {
+        inter
+            .stats
+            .borrow_mut()
+            .inline_budget_exhausted
+            .insert(comp_id);
+    }
 
     // Returns-verdict of inline `FnLit` args of the custom hooks that survived
     // expansion — the opaque/summarized library calls (`useStore(s => …)`),
@@ -2207,6 +2231,167 @@ fn expand_utility_calls(
         }
     }
     ctx.truncated
+}
+
+/// Resolve each `new K(…)` of the component whose `K` names a class a module
+/// of the program defines (#335): its [`Expr::New`] `ctor` is that class's
+/// construction body, copied onto sites of the component's own
+/// ([`SpliceIds`]), so every `new` is an allocation site of its own as a
+/// spliced utility is, and the `new`s inside it are resolved in turn from
+/// the class's file. A name the component binds anywhere is its own, not
+/// the module's; a class already on the way (`m() { return new K() }`)
+/// is left as written, as is every `new` past `budget` expansions — read
+/// as a class the analysis does not see. Returns whether the budget ran
+/// out.
+fn expand_class_constructions(
+    render_cfg: &mut CFG,
+    hooks: &mut [HookEntry],
+    registry: &FunctionRegistry,
+    caller_file: &std::path::Path,
+    regions: &crate::engine::setters::InlineRegions,
+    budget: usize,
+    salt: &mut SpliceIds,
+) -> bool {
+    if registry.is_empty() {
+        return false;
+    }
+    let mut bound = HashSet::new();
+    bound_names(render_cfg, &mut bound);
+    for hook in hooks.iter() {
+        if let Some(body) = hook.body_cfg() {
+            bound_names(body, &mut bound);
+        }
+    }
+    let mut pass = ClassPass {
+        registry,
+        bound,
+        salt,
+        budget: budget * 8,
+        truncated: false,
+        within: Vec::new(),
+    };
+    pass.cfg(render_cfg, &regions.render, caller_file);
+    for hook in hooks.iter_mut() {
+        let label = hook.label();
+        let none = Vec::new();
+        let body_regions = regions.bodies.get(&label).unwrap_or(&none);
+        match hook {
+            HookEntry::Effect { body_cfg, .. }
+            | HookEntry::Memo { body_cfg, .. }
+            | HookEntry::Callback { body_cfg, .. }
+            | HookEntry::Handler { body_cfg, .. } => {
+                pass.cfg(body_cfg, body_regions, caller_file);
+            }
+            HookEntry::State { init, reducer, .. } => {
+                pass.expr(init, caller_file);
+                if let Some(r) = reducer {
+                    pass.expr(r, caller_file);
+                }
+            }
+            HookEntry::Ref { init, .. } => pass.expr(init, caller_file),
+            HookEntry::Custom { args, .. } => {
+                for a in args {
+                    pass.expr(a, caller_file);
+                }
+            }
+        }
+    }
+    pass.truncated
+}
+
+/// Every name a body binds — a `let`, an assignment, a parameter — nested
+/// bodies included.
+fn bound_names(cfg: &CFG, out: &mut HashSet<crate::ir::types::Var>) {
+    fn expr(e: &Expr, out: &mut HashSet<crate::ir::types::Var>) {
+        if let Expr::FnLit {
+            params, body_cfg, ..
+        } = e
+        {
+            out.extend(params.iter().cloned());
+            bound_names(body_cfg, out);
+        }
+        e.for_each_child(&mut |c| expr(c, out));
+    }
+    for block in cfg.blocks.values() {
+        for stmt in &block.stmts {
+            if let Stmt::Let { var, .. } | Stmt::Assign { var, .. } = stmt {
+                out.insert(var.clone());
+            }
+        }
+        block.for_each_expr(&mut |e| expr(e, out));
+    }
+}
+
+/// [`expand_class_constructions`]'s walk.
+struct ClassPass<'r, 's> {
+    registry: &'r FunctionRegistry,
+    bound: HashSet<crate::ir::types::Var>,
+    salt: &'s mut SpliceIds,
+    budget: usize,
+    truncated: bool,
+    /// The classes whose bodies the walk is in.
+    within: Vec<crate::engine::FunctionKey>,
+}
+
+impl ClassPass<'_, '_> {
+    /// Every block of `cfg`; one inside a spliced region resolves through
+    /// the file its body came from (ADR-027 §3–§4).
+    fn cfg(
+        &mut self,
+        cfg: &mut CFG,
+        regions: &[crate::engine::setters::InlineRegion],
+        file: &std::path::Path,
+    ) {
+        for (&bid, block) in cfg.blocks.iter_mut() {
+            let from = regions
+                .iter()
+                .find(|r| r.start <= bid && bid < r.end)
+                .map(|r| r.from.clone())
+                .unwrap_or_else(|| file.to_path_buf());
+            block.for_each_expr_mut(&mut |e| self.expr(e, &from));
+        }
+    }
+
+    fn expr(&mut self, e: &mut Expr, file: &std::path::Path) {
+        if let Expr::FnLit { body_cfg, .. } = e {
+            self.cfg(std::sync::Arc::make_mut(body_cfg), &[], file);
+            return;
+        }
+        e.for_each_child_mut(&mut |c| self.expr(c, file));
+        let Expr::New { fn_, ctor, .. } = e else {
+            return;
+        };
+        let Expr::Var(name) = fn_.peel_ts() else {
+            return;
+        };
+        if ctor.is_some() || self.bound.contains(name) {
+            return;
+        }
+        let Some(class) = self.registry.resolve(file, name) else {
+            return;
+        };
+        let key = (class.file.clone(), class.name.clone());
+        if self.within.contains(&key) {
+            return;
+        }
+        if self.budget == 0 {
+            self.truncated = true;
+            return;
+        }
+        self.budget -= 1;
+        let (_, off) = self.salt.take(&class.body_cfg, &[], 0);
+        let mut body = crate::ir::remap_cfg(class.body_cfg.clone(), off);
+        let params = class.params.clone();
+        let from = class.file.clone();
+        self.within.push(key);
+        self.cfg(&mut body, &[], &from);
+        self.within.pop();
+        *ctor = Some(Box::new(Expr::FnLit {
+            id: self.salt.alloc_one(),
+            params,
+            body_cfg: std::sync::Arc::new(body),
+        }));
+    }
 }
 
 /// Splice utility calls in `cfg`. The recursion guard is each block's

@@ -313,8 +313,14 @@ fn eval_state_value(
             Some(returned) => returned.as_val(),
             None => allocating_call(fn_, args, env, ctx).unwrap_or_else(StateValue::top),
         },
-        // `new` allocates: a fresh reference, whose members stay ⊤ (#158).
-        Expr::New { .. } => StateValue::reference(Stability::PerRender),
+        // `new` of a program class is what its construction body returned
+        // (#335): the instance, or the object its constructor returns. Any
+        // other `new` allocates: a fresh reference, whose members stay ⊤
+        // (#158).
+        Expr::New { id, .. } => match ctx.returns.get(*id) {
+            Some(returned) => returned.as_val(),
+            None => StateValue::reference(Stability::PerRender),
+        },
 
         Expr::FieldAccess { obj, field } => eval_field_access(obj, field, env, ctx),
         Expr::IndexAccess { arr, idx } => eval_index_access(arr, idx, env, ctx),

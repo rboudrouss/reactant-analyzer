@@ -242,9 +242,10 @@ that writes it (see *Cross-file limits*).
   is what the getter's runs returned, and a write runs the setter with the value. Its body also
   runs at an unknown time, since anything holding the object may read the member (a spread, a
   library): a write in it is a possible write of the render the literal is in, never an Error, and
-  a spread's copy holds what the getter may return, a new object included. `this` in an accessor
-  is not bound. A member read off an object the heap does not place — a module binding, a class
-  instance, what unknown code returns — or a member a placed object does not hold (its
+  a spread's copy holds what the getter may return, a new object included. `this` in an object
+  literal's accessor or method is not bound. A member read off an object the heap does not place —
+  a module binding, an instance of a class the analysis does not see, what unknown code returns —
+  or a member a placed object does not hold (its
   prototype's) is a call the analysis cannot see when some accessor of the analysed files defines
   that name: a getter or setter of a literal or a class, a descriptor of `Object.defineProperty`
   and its kin, any name under a computed accessor key or a `Proxy` trap
@@ -256,6 +257,23 @@ that writes it (see *Cross-file limits*).
   read as the receiver's member, and a state setter kept by unseen code past the point it escaped
   and called later from an accessor or a method
   [#335](https://github.com/rboudrouss/reactant-analyzer/issues/335).
+- **Classes.** A `new` of a class the program defines — in the body, at the top level of a module,
+  or imported from one — runs its constructor with its arguments, on an instance placed at the
+  `new` whose methods, accessors and field initializers are the class's bodies, `this` bound to the
+  instance; a parent the program defines constructs the same instance through `super(…)`, and a
+  constructor's `return` of an object is what the `new` evaluates to
+  [#335](https://github.com/rboudrouss/reactant-analyzer/issues/335). What stays as before:
+  a `new` of a class the analysis does not see (a library's, a global's) is a new reference whose
+  members are ⊤, handed its arguments [#311](https://github.com/rboudrouss/reactant-analyzer/issues/311);
+  a class that extends one is open (any member) and that parent holds the instance; a static
+  member called off a module's class (`K.create()`) is code the analysis does not run; a module
+  class reached through a `let` binding or a name the component rebinds is not resolved. Every
+  instance gets its own copy of the methods, so two `new`s of a class give `k1.run !== k2.run`
+  where the language shares one function; a parent's constructor that calls a method the child
+  overrides runs both bodies, and a method named like a mutating builtin (`set`, `add`, `push`)
+  also reads as one on the instance. An accessor's body runs at an unknown time from where the
+  instance is built, as an object literal's does (#321): built in a memo that runs once, a
+  getter the render reads is not reported.
 - **Mount-coupled seeds.** `frozen-initial-state` drops to Info, hidden without `--info`, when every
   call site renders the consumer under a `key` built from the seeding prop, or under a guard built
   from it (`{msg && <Toast msg={msg}/>}`). Neither shape is a proof: a `msg` moving between two

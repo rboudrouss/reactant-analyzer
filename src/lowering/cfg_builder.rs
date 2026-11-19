@@ -87,6 +87,25 @@ pub struct LowerCtx {
     /// Shared with every other body of this file — see [`TempSpans`].
     pub temps: TempSpans,
     pub jsx: JsxOrigins,
+    /// The body being lowered is a class's instance member — a method, an
+    /// accessor, a field initializer, the constructor — or an arrow inside
+    /// one: `this` is the instance, the name [`THIS`](crate::ir::expr::THIS)
+    /// the construction body binds (#335). Anywhere else `this` is opaque.
+    pub this_instance: bool,
+    /// The body being lowered is a class's constructor (#335), not a
+    /// function nested in it.
+    pub ctor: Option<std::sync::Arc<CtorScope>>,
+}
+
+/// What lowering a constructor's statements needs of its class (#335).
+#[derive(Debug, Clone)]
+pub struct CtorScope {
+    /// The superclass a `super(…)` constructs on `this`, as an expression of
+    /// the class's scope; `None` for a base class.
+    pub parent: Option<Expr>,
+    /// The call that initializes the instance fields on `this`, which a
+    /// derived class runs when its `super(…)` returns.
+    pub fields: Option<Expr>,
 }
 
 impl LowerCtx {
@@ -96,6 +115,28 @@ impl LowerCtx {
             ids: ExprIds::default(),
             temps: TempSpans::default(),
             jsx,
+            this_instance: false,
+            ctor: None,
+        }
+    }
+
+    /// This context for a nested function's body: an arrow keeps the
+    /// enclosing `this`, any other function binds its own, which the
+    /// analysis does not follow. Neither is the constructor.
+    pub(super) fn nested(&self, arrow: bool) -> Self {
+        Self {
+            this_instance: self.this_instance && arrow,
+            ctor: None,
+            ..self.clone()
+        }
+    }
+
+    /// This context for a class instance member's body (#335).
+    pub(super) fn member(&self, ctor: Option<CtorScope>) -> Self {
+        Self {
+            this_instance: true,
+            ctor: ctor.map(std::sync::Arc::new),
+            ..self.clone()
         }
     }
 
@@ -331,7 +372,7 @@ impl BlockBuilder {
         self.temp_at("__of", at)
     }
 
-    fn temp_at(&mut self, prefix: &str, at: oxc_span::Span) -> String {
+    pub(super) fn temp_at(&mut self, prefix: &str, at: oxc_span::Span) -> String {
         let t = format!("{prefix}{}_{}", at.start, at.end);
         self.ctx.temps.record(&t, at);
         t
@@ -377,6 +418,9 @@ fn lower_stmt(stmt: &Statement, builder: &mut BlockBuilder) {
         }
         Statement::ExpressionStatement(es) => {
             lower_expr_stmt(&es.expression, builder.span_at(es.span.start), builder);
+        }
+        Statement::ReturnStatement(ret) if builder.ctx.ctor.is_some() => {
+            lower_ctor_return(ret, builder);
         }
         Statement::ReturnStatement(ret) => {
             let expr = ret
@@ -1281,6 +1325,8 @@ fn hand_back(mut cfg: CFG, kind: FnKind, ctx: &LowerCtx) -> CFG {
             id,
             fn_: Box::new(Expr::SummaryVal(SummaryValue::Top)),
             args: vec![],
+            ctor: None,
+            on_this: false,
         };
         let value = std::mem::replace(value, made);
         if !matches!(value, Expr::Lit(_)) {
@@ -1302,6 +1348,27 @@ pub fn build_fn_body_cfg(
     arrow: bool,
     ctx: &LowerCtx,
 ) -> (Vec<String>, CFG) {
+    build_body_cfg(params, body, kind, arrow, &ctx.nested(arrow))
+}
+
+/// [`build_fn_body_cfg`] for a class's instance method or accessor (#335):
+/// `this` is the instance, which `ctx` ([`LowerCtx::member`]) says.
+pub(super) fn build_member_body_cfg(
+    params: &FormalParameters,
+    body: &FunctionBody,
+    kind: FnKind,
+    ctx: &LowerCtx,
+) -> (Vec<String>, CFG) {
+    build_body_cfg(params, body, kind, false, ctx)
+}
+
+fn build_body_cfg(
+    params: &FormalParameters,
+    body: &FunctionBody,
+    kind: FnKind,
+    arrow: bool,
+    ctx: &LowerCtx,
+) -> (Vec<String>, CFG) {
     let mut builder = BlockBuilder::new(ctx);
     builder.start_block(0);
     let param_names = inject_param_preamble(params, (!arrow).then_some(body), &mut builder);
@@ -1312,6 +1379,165 @@ pub fn build_fn_body_cfg(
     (param_names, hand_back(builder.into_cfg(0), kind, ctx))
 }
 
+/// The construction body of a class (#335), under `ctx`
+/// ([`LowerCtx::member`] with the class's [`CtorScope`]): `this` is the
+/// object the `new` hands it ([`NEW_INSTANCE`]); the instance methods and
+/// accessors are written on it (`methods`), so each captures `this` as an
+/// arrow captures a name, and a parent's constructor that calls one runs
+/// it; a base class then initializes its fields, a derived one does so
+/// when its `super(…)` returns; then the constructor's statements run, and
+/// the body returns `this`, or what a `return` of the constructor names
+/// when that is an object ([`lower_ctor_return`]). A derived class without
+/// a constructor hands every argument to `super`, as the language's
+/// implicit one does.
+///
+/// [`NEW_INSTANCE`]: crate::ir::expr::NEW_INSTANCE
+pub(super) fn build_construct_cfg(
+    ctor: Option<&Function>,
+    methods: Vec<Stmt>,
+    ctx: &LowerCtx,
+) -> (Vec<String>, CFG) {
+    use crate::ir::expr::{NEW_INSTANCE, THIS};
+    let mut builder = BlockBuilder::new(ctx);
+    builder.start_block(0);
+    let body = ctor.and_then(|f| f.body.as_deref());
+    let params = match (ctor, body) {
+        (Some(f), Some(body)) => inject_param_preamble(&f.params, Some(body), &mut builder),
+        _ => Vec::new(),
+    };
+    builder.push_stmt(Stmt::Let {
+        var: THIS.to_string(),
+        rhs: Expr::Var(NEW_INSTANCE.to_string()),
+        span: None,
+    });
+    for m in methods {
+        builder.push_stmt(m);
+    }
+    let scope = ctx.ctor.clone();
+    let derived = scope.as_ref().is_some_and(|s| s.parent.is_some());
+    if !derived && let Some(fields) = scope.as_ref().and_then(|s| s.fields.clone()) {
+        builder.push_stmt(Stmt::ExprStmt(fields, None));
+    }
+    match body {
+        Some(body) => lower_stmts(&body.statements, &mut builder),
+        None if derived => {
+            let id = builder.next_expr_id();
+            let all = Expr::Spread(Box::new(Expr::Arguments { id, from: 0 }));
+            super_call(vec![all], None, &mut builder);
+        }
+        None => {}
+    }
+    if !builder.is_terminated() {
+        builder.seal_with(Terminator::Return(Expr::Var(THIS.to_string()), None));
+    }
+    (params, builder.into_cfg(0))
+}
+
+/// The body that initializes a class's instance fields on `this`, in order
+/// (#335): `fields` are each field's member and initializer, `None` for a
+/// field declared without one, which holds `undefined`.
+pub(super) fn build_fields_cfg(
+    fields: &[(
+        crate::ir::stmt::MemberKey,
+        Option<&Expression>,
+        oxc_span::Span,
+    )],
+    ctx: &LowerCtx,
+) -> CFG {
+    use crate::ir::expr::THIS;
+    let mut builder = BlockBuilder::new(ctx);
+    builder.start_block(0);
+    for (key, init, span) in fields {
+        let rhs = match init {
+            Some(e) => lower_expr(e, &mut builder),
+            None => Expr::Lit(Prim::Unit),
+        };
+        let span = builder.span_at(span.start);
+        builder.push_stmt(Stmt::MemberWrite {
+            obj: Expr::Var(THIS.to_string()),
+            key: key.clone(),
+            rhs,
+            span,
+        });
+    }
+    builder.into_cfg(0)
+}
+
+/// `super(args)` in a constructor (#335): the parent's construction runs on
+/// `this`, which then holds what it returns, and the class's own fields are
+/// initialized. The expression's value is `this`.
+pub(super) fn super_call(
+    args: Vec<Expr>,
+    span: Option<crate::ir::SourceRange>,
+    builder: &mut BlockBuilder,
+) -> Expr {
+    use crate::ir::expr::THIS;
+    let scope = builder.ctx.ctor.clone();
+    let parent = scope
+        .as_ref()
+        .and_then(|s| s.parent.clone())
+        .unwrap_or(Expr::SummaryVal(SummaryValue::Top));
+    let id = builder.next_expr_id();
+    builder.push_stmt(Stmt::Assign {
+        var: THIS.to_string(),
+        rhs: Expr::New {
+            id,
+            fn_: Box::new(parent),
+            args,
+            ctor: None,
+            on_this: true,
+        },
+        span,
+    });
+    if let Some(fields) = scope.and_then(|s| s.fields.clone()) {
+        builder.push_stmt(Stmt::ExprStmt(fields, span));
+    }
+    Expr::Var(THIS.to_string())
+}
+
+/// `return e;` in a constructor (#335): `new` evaluates to `e` when it is an
+/// object, to `this` otherwise — a choice the analysis does not make, so
+/// both are returned. A bare `return;` returns `this`.
+fn lower_ctor_return(ret: &ReturnStatement, builder: &mut BlockBuilder) {
+    use crate::ir::expr::THIS;
+    let span = builder.span_at(ret.span.start);
+    let Some(arg) = &ret.argument else {
+        builder.seal_with(Terminator::Return(Expr::Var(THIS.to_string()), span));
+        return;
+    };
+    let value = lower_expr(arg, builder);
+    if builder.is_terminated() {
+        return;
+    }
+    let returned = match value {
+        Expr::Var(v) => v,
+        value => {
+            let tmp = builder.temp_at("__ret", arg.span());
+            builder.push_stmt(Stmt::Let {
+                var: tmp.clone(),
+                rhs: value,
+                span,
+            });
+            tmp
+        }
+    };
+    let other = builder.new_block();
+    let itself = builder.new_block();
+    let from = builder.seal_with(Terminator::Branch {
+        cond: Expr::SummaryVal(SummaryValue::Top),
+        then_: other,
+        else_: itself,
+        span: None,
+        chain_link: false,
+    });
+    builder.add_edge(from, other, EdgeKind::IfTrue);
+    builder.add_edge(from, itself, EdgeKind::IfFalse);
+    builder.start_block(other);
+    builder.seal_with(Terminator::Return(Expr::Var(returned), span));
+    builder.start_block(itself);
+    builder.seal_with(Terminator::Return(Expr::Var(THIS.to_string()), span));
+}
+
 /// Like [`build_fn_body_cfg`] for concise arrow bodies (`x => expr`), which
 /// no generator has.
 pub fn build_expr_fn_body_cfg(
@@ -1320,6 +1546,7 @@ pub fn build_expr_fn_body_cfg(
     kind: FnKind,
     ctx: &LowerCtx,
 ) -> (Vec<String>, CFG) {
+    let ctx = &ctx.nested(true);
     let mut builder = BlockBuilder::new(ctx);
     builder.start_block(0);
     let param_names = inject_param_preamble(params, None, &mut builder);

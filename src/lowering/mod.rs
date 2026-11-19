@@ -1,5 +1,6 @@
 mod body_scan;
 pub mod cfg_builder;
+pub mod class_lowerer;
 pub mod component_detector;
 mod detector;
 pub mod expr_lower;
@@ -12,6 +13,7 @@ pub mod utility_lowerer;
 
 pub use crate::ir::{FileId, FileTable, SourceMap, compute_line_starts, offset_to_range};
 pub use cfg_builder::{LowerCtx, build_cfg, build_fn_body_cfg};
+pub use class_lowerer::lower_classes_with_resolver;
 pub use component_detector::{ComponentCandidate, detect_components};
 pub use hook_detector::{HookCandidate, detect_custom_hooks};
 pub use hook_extractor::{extract_handlers, extract_hooks, extract_subscriptions};

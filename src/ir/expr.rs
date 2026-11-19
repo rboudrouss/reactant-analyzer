@@ -114,6 +114,26 @@ pub const COMPUTED_KEY_PREFIX: &str = "[computed]";
 /// says which, and the member it defines ([`accessor_key`], #321).
 pub const ACCESSOR_KEY_PREFIX: &str = "[accessor]";
 
+/// The member of a class's value (its lowered `ObjectLit`) that holds its
+/// construction body (#335): a function whose parameters are the
+/// constructor's and whose body builds the instance [`NEW_INSTANCE`] binds —
+/// the class's methods and accessors, its fields, the constructor's
+/// statements — and returns it, or what the constructor returns.
+pub const CONSTRUCT_KEY: &str = "[construct]";
+
+/// The name a class's member bodies read the instance by: `this`, which no
+/// source binding can spell, so it never meets a program name. The
+/// construction body declares it; a method, an accessor or a field
+/// initializer captures it as any closure captures a name, and an arrow
+/// inside one does in turn.
+pub const THIS: &str = "this";
+
+/// The name a construction body ([`CONSTRUCT_KEY`]) reads the object it
+/// builds by: bound by the `new` that runs it — a new object at the `new`'s
+/// site, or the instance a derived class's `super(…)` hands its parent.
+/// Never a source name: no identifier holds a `.`.
+pub const NEW_INSTANCE: &str = "new.instance";
+
 /// The two halves of an accessor: a getter runs at every read of its member,
 /// a setter at every write, with the value written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -365,10 +385,24 @@ pub enum Expr {
     /// reads it where it reads an object literal — lowered to a plain `Call`
     /// it was a value that "holds still" and that no freshness check could
     /// see (#158). `id` is the allocation site, as for `ObjectLit`.
+    ///
+    /// `ctor` is the construction body ([`CONSTRUCT_KEY`]) of the program
+    /// class `fn_` names at module level, which the engine resolves before
+    /// the fixpoint (#335): the `new` runs it. A class bound in a body is
+    /// read off its value instead, and `None` is any other `new` — of a
+    /// class the analysis does not see, or not resolved yet. Not a child:
+    /// the class's code is where the class is written, and a reader of this
+    /// body's syntax does not walk it.
+    ///
+    /// `on_this` is a derived class's `super(…)`: the parent's construction
+    /// runs on the instance the body's `this` holds, and the expression is
+    /// what it returns, `this` unless the parent returns another object.
     New {
         id: ExprId,
         fn_: Box<Expr>,
         args: Vec<Expr>,
+        ctor: Option<Box<Expr>>,
+        on_this: bool,
     },
     CompApp {
         name: Symbol,
