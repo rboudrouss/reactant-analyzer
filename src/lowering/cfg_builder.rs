@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
@@ -7,14 +7,16 @@ use oxc_span::GetSpan;
 
 use crate::{
     ir::{
-        SourceMap,
+        FileTable, SourceMap,
         cfg::{BasicBlock, CFG, Edge, EdgeKind, Terminator},
-        expr::{Expr, Prim},
+        expr::{Expr, Prim, SummaryValue},
         stmt::Stmt,
         types::{BlockId, ExprId},
     },
     lowering::JsxOrigins,
-    lowering::expr_lower::{assign_target_ident, empty_cfg, lower_expr, property_name, rest_copy},
+    lowering::expr_lower::{
+        assign_target_ident, empty_cfg, lower_expr, lower_expr_stmt, property_name, rest_copy,
+    },
 };
 
 // ── Allocation-site ids ───────────────────────────────────────────────────────
@@ -34,8 +36,12 @@ use crate::{
 /// component registry each component its own
 /// ([`crate::ir::ComponentId::site_base`]): a child's heap holds its parents'
 /// sites too (#243).
+///
+/// Calls are numbered by a counter of their own, from just above
+/// [`crate::ir::expr::SYNTHETIC_CALL`] (see [`Expr::Call`]): a call site
+/// moves no literal's id, nor the temp names derived from them.
 #[derive(Debug, Clone, Default)]
-pub struct ExprIds(Rc<Cell<u64>>);
+pub struct ExprIds(Rc<Cell<u64>>, Rc<Cell<u64>>);
 
 impl ExprIds {
     pub(super) fn next(&self) -> ExprId {
@@ -43,10 +49,31 @@ impl ExprIds {
         self.0.set(id + 1);
         ExprId(id)
     }
+
+    /// The next call site of the file.
+    pub(super) fn next_call(&self) -> ExprId {
+        let n = self.1.get() + 1;
+        self.1.set(n);
+        ExprId(crate::ir::expr::CALL_SITES + n)
+    }
+}
+
+/// The temps a file's lowering mints for an expression's value
+/// (`BlockBuilder::fresh_temp`), with the span each stands for. Shared by
+/// every body of the file, as [`ExprIds`] is; read back into the
+/// [`FileTable`] once the file is lowered ([`LowerCtx::name_temps`]).
+#[derive(Debug, Clone, Default)]
+pub struct TempSpans(Rc<RefCell<Vec<(String, oxc_span::Span)>>>);
+
+impl TempSpans {
+    fn record(&self, var: &str, at: oxc_span::Span) {
+        self.0.borrow_mut().push((var.to_string(), at));
+    }
 }
 
 /// Everything one file's lowering shares with every body it builds: the span
-/// table, the allocation-site counter, and the JSX callee origins.
+/// table, the allocation-site counter, the temps it mints, and the JSX callee
+/// origins.
 ///
 /// One carrier rather than three parameters. Nested bodies are lowered through
 /// their own `BlockBuilder`, so a per-file fact only reaches a `FnLit` body if
@@ -57,7 +84,43 @@ pub struct LowerCtx {
     pub smap: SourceMap,
     /// Shared with every other body of this file — see [`ExprIds`].
     pub ids: ExprIds,
+    /// Shared with every other body of this file — see [`TempSpans`].
+    pub temps: TempSpans,
     pub jsx: JsxOrigins,
+    /// What `this` is in the body being lowered.
+    pub this: ThisScope,
+    /// The body being lowered is a class's constructor (#335), not a
+    /// function nested in it.
+    pub ctor: Option<std::sync::Arc<CtorScope>>,
+}
+
+/// What `this` is where an expression is lowered. An arrow keeps its
+/// enclosing body's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThisScope {
+    /// Module scope, or a class's static block or field initializer: `this`
+    /// carries no tracked value, opaque ⊤.
+    Opaque,
+    /// A class's instance member — a method, an accessor, a field
+    /// initializer, the constructor: `this` is the instance, the name
+    /// [`THIS`](crate::ir::expr::THIS) the construction body binds (#335),
+    /// and `super.m` reads its member `m`.
+    Instance,
+    /// Any other non-arrow function: `this` is what the call binds it to,
+    /// the name [`THIS`](crate::ir::expr::THIS) its preamble binds to
+    /// [`RECEIVER`](crate::ir::expr::RECEIVER) (#338).
+    Receiver,
+}
+
+/// What lowering a constructor's statements needs of its class (#335).
+#[derive(Debug, Clone)]
+pub struct CtorScope {
+    /// The superclass a `super(…)` constructs on `this`, as an expression of
+    /// the class's scope; `None` for a base class.
+    pub parent: Option<Expr>,
+    /// The call that initializes the instance fields on `this`, which a
+    /// derived class runs when its `super(…)` returns.
+    pub fields: Option<Expr>,
 }
 
 impl LowerCtx {
@@ -65,7 +128,54 @@ impl LowerCtx {
         Self {
             smap,
             ids: ExprIds::default(),
+            temps: TempSpans::default(),
             jsx,
+            this: ThisScope::Opaque,
+            ctor: None,
+        }
+    }
+
+    /// This context for a nested function's body: an arrow keeps the
+    /// enclosing `this`, any other function binds its own, the receiver of
+    /// its call (#338). Neither is the constructor.
+    pub(super) fn nested(&self, arrow: bool) -> Self {
+        Self {
+            this: match arrow {
+                true => self.this,
+                false => ThisScope::Receiver,
+            },
+            ctor: None,
+            ..self.clone()
+        }
+    }
+
+    /// This context for a class instance member's body (#335).
+    pub(super) fn member(&self, ctor: Option<CtorScope>) -> Self {
+        Self {
+            this: ThisScope::Instance,
+            ctor: ctor.map(std::sync::Arc::new),
+            ..self.clone()
+        }
+    }
+
+    /// This context for a class's static block or static field
+    /// initializer: `this` is the class, which the analysis does not follow.
+    pub(super) fn static_member(&self) -> Self {
+        Self {
+            this: ThisScope::Opaque,
+            ctor: None,
+            ..self.clone()
+        }
+    }
+
+    /// Record in `files` what each temp minted so far stands for: the text of
+    /// `source` at its span. Called once a file's bodies are lowered.
+    pub fn name_temps(&self, source: &str, files: &mut FileTable) {
+        let file = self.smap.file();
+        for (var, at) in self.temps.0.borrow_mut().drain(..) {
+            if let Some(text) = source.get(at.start as usize..at.end as usize) {
+                files.name_temp(file, var, text);
+            }
         }
     }
 
@@ -85,7 +195,6 @@ pub(super) struct BlockBuilder {
     counter: usize,
     current_stmts: Vec<Stmt>,
     terminated: bool,
-    temp_counter: usize,
     /// Enclosing breakables, innermost last. A `switch` is breakable but not
     /// continuable, so `continue_to` is `None` there.
     loop_stack: Vec<LoopFrame>,
@@ -111,7 +220,6 @@ impl BlockBuilder {
             counter: 1, // block 0 is entry
             current_stmts: Vec::new(),
             terminated: false,
-            temp_counter: 0,
             loop_stack: Vec::new(),
             pending_label: None,
             ctx: ctx.clone(),
@@ -166,6 +274,11 @@ impl BlockBuilder {
         self.ctx.ids.next()
     }
 
+    /// The site of the next call this file lowers ([`Expr::Call`]).
+    pub(super) fn next_call_id(&mut self) -> ExprId {
+        self.ctx.ids.next_call()
+    }
+
     pub(super) fn push_stmt(&mut self, stmt: Stmt) {
         if !self.terminated {
             self.current_stmts.push(stmt);
@@ -186,6 +299,30 @@ impl BlockBuilder {
     pub(super) fn start_block(&mut self, id: BlockId) {
         self.current = id;
         self.terminated = false;
+    }
+
+    /// The consumer of a generator may stop driving it here, for good (#317):
+    /// before its first step and at every `yield`. Sealed as a branch on a
+    /// condition nothing knows, one arm returning, so nothing past this point
+    /// is certain to run. A no-op on a terminated block, as for an `await`.
+    pub(super) fn may_stop(&mut self) {
+        if self.terminated {
+            return;
+        }
+        let go = self.new_block();
+        let stop = self.new_block();
+        let from = self.seal_with(Terminator::Branch {
+            cond: Expr::SummaryVal(SummaryValue::Top),
+            then_: go,
+            else_: stop,
+            span: None,
+            chain_link: false,
+        });
+        self.add_edge(from, go, EdgeKind::IfTrue);
+        self.add_edge(from, stop, EdgeKind::IfFalse);
+        self.start_block(stop);
+        self.seal_with(Terminator::Return(Expr::Lit(Prim::Unit), None));
+        self.start_block(go);
     }
 
     /// Seal the current block and continue in a fresh one across an `Await`
@@ -242,9 +379,30 @@ impl BlockBuilder {
         }
     }
 
-    pub(super) fn fresh_temp(&mut self) -> String {
-        let t = format!("__t{}", self.temp_counter);
-        self.temp_counter += 1;
+    /// The temp that holds the value of the expression at `at` (`a ?? b`,
+    /// `c ? x : y`, `a?.f()`): named by its source span, as a call temp is
+    /// (`__call_`), so no other body of the file binds the same name, and the
+    /// span's text is what a message prints for it ([`LowerCtx::name_temps`]).
+    pub(super) fn fresh_temp(&mut self, at: oxc_span::Span) -> String {
+        self.temp_at("__t", at)
+    }
+
+    /// The temp a `switch` evaluates its discriminant `at` into once. Apart
+    /// from [`Self::fresh_temp`]: a discriminant `a ?? b` already has a temp
+    /// at that span.
+    pub(super) fn switch_temp(&mut self, at: oxc_span::Span) -> String {
+        self.temp_at("__sw", at)
+    }
+
+    /// The temp a `for…of` reads the iterated value `at` into once, apart
+    /// from [`Self::fresh_temp`] for the reason [`Self::switch_temp`] is.
+    pub(super) fn iter_temp(&mut self, at: oxc_span::Span) -> String {
+        self.temp_at("__of", at)
+    }
+
+    pub(super) fn temp_at(&mut self, prefix: &str, at: oxc_span::Span) -> String {
+        let t = format!("{prefix}{}_{}", at.start, at.end);
+        self.ctx.temps.record(&t, at);
         t
     }
 
@@ -287,8 +445,10 @@ fn lower_stmt(stmt: &Statement, builder: &mut BlockBuilder) {
             }
         }
         Statement::ExpressionStatement(es) => {
-            let expr = lower_expr(&es.expression, builder);
-            builder.push_stmt(Stmt::ExprStmt(expr, builder.span_at(es.span.start)));
+            lower_expr_stmt(&es.expression, builder.span_at(es.span.start), builder);
+        }
+        Statement::ReturnStatement(ret) if builder.ctx.ctor.is_some() => {
+            lower_ctor_return(ret, builder);
         }
         Statement::ReturnStatement(ret) => {
             let expr = ret
@@ -317,10 +477,10 @@ fn lower_stmt(stmt: &Statement, builder: &mut BlockBuilder) {
             );
         }
         Statement::ForInStatement(f) => {
-            lower_iter_loop(&f.left, &f.right, &f.body, builder);
+            lower_iter_loop(&f.left, &f.right, &f.body, None, builder);
         }
         Statement::ForOfStatement(f) => {
-            lower_iter_loop(&f.left, &f.right, &f.body, builder);
+            lower_iter_loop(&f.left, &f.right, &f.body, Some(f.r#await), builder);
         }
         Statement::DoWhileStatement(dw) => {
             // The test gets its own block: `continue` in a `do…while` runs it,
@@ -349,6 +509,7 @@ fn lower_stmt(stmt: &Statement, builder: &mut BlockBuilder) {
                 then_: body_block,
                 else_: exit_block,
                 span,
+                chain_link: false,
             });
             builder.add_edge(t, body_block, EdgeKind::Back);
             builder.add_edge(t, exit_block, EdgeKind::IfFalse);
@@ -402,8 +563,9 @@ fn lower_stmt(stmt: &Statement, builder: &mut BlockBuilder) {
         Statement::FunctionDeclaration(func) => {
             if let Some(id) = &func.id {
                 let ctx = builder.ctx.clone();
+                let kind = FnKind::of(func.r#async, func.generator);
                 let (params, body_cfg) = if let Some(body) = func.body.as_deref() {
-                    build_fn_body_cfg(&func.params, body, &ctx)
+                    build_fn_body_cfg(&func.params, body, kind, false, &ctx)
                 } else {
                     (vec![], empty_cfg())
                 };
@@ -505,6 +667,7 @@ fn lower_try(tr: &TryStatement, builder: &mut BlockBuilder) {
         then_: try_block,
         else_: catch_block,
         span,
+        chain_link: false,
     });
     builder.add_edge(branch, try_block, EdgeKind::IfTrue);
     builder.add_edge(branch, catch_block, EdgeKind::IfFalse);
@@ -561,6 +724,7 @@ fn lower_if(
         then_: then_block,
         else_: else_block,
         span,
+        chain_link: false,
     });
     builder.add_edge(branch_id, then_block, EdgeKind::IfTrue);
     builder.add_edge(branch_id, else_block, EdgeKind::IfFalse);
@@ -619,6 +783,7 @@ fn lower_while(test: &Expression, body: &Statement, builder: &mut BlockBuilder) 
         then_: body_block,
         else_: exit_block,
         span,
+        chain_link: false,
     });
     builder.add_edge(h, body_block, EdgeKind::IfTrue);
     builder.add_edge(h, exit_block, EdgeKind::IfFalse);
@@ -679,6 +844,7 @@ fn lower_for(
         then_: body_block,
         else_: exit_block,
         span,
+        chain_link: false,
     });
     builder.add_edge(h, body_block, EdgeKind::IfTrue);
     builder.add_edge(h, exit_block, EdgeKind::IfFalse);
@@ -707,22 +873,49 @@ fn lower_for(
 /// Simplified for-in / for-of: single loop with unknown bound.
 ///
 /// The head is lowered in full (TODO.md loop-head FP/FN):
-/// - the iterated expression is evaluated in the preheader, so
+/// - the iterated expression is evaluated once, in the preheader, so
 ///   `for (const x of foo)` registers a read of `foo` (dep soundness);
-/// - the loop variable is bound at the top of the body to `Top` — the
-///   per-iteration element/key is unknowable, same treatment as HOF
-///   callback params and catch params — so a loop var shadowing an outer
-///   binding is not read as a capture of it.
+/// - the loop variable is bound at the top of the body, so a loop var
+///   shadowing an outer binding is not read as a capture of it. A `for…of`
+///   variable is an element of the iterated value, `iterated[⊤]`: the join
+///   of the entries of every array the heap places it at, ⊤ wherever it may
+///   be something else — what an array method passes its callback, so
+///   `for (const set of [setN]) set(x)` writes as `[setN].forEach(set =>
+///   set(x))` does. A `for await…of` variable is that element awaited
+///   ([`handed_out`], #317). A `for…in` key is a string the analysis does
+///   not know: `Top`.
+///
+/// `of` is `None` for a `for…in`, else whether the `for…of` awaits.
 fn lower_iter_loop(
     left: &ForStatementLeft,
     right: &Expression,
     body: &Statement,
+    of: Option<bool>,
     builder: &mut BlockBuilder,
 ) {
-    // Preheader: the iterated expression is read once at loop entry.
+    // Preheader: the iterated expression is read once at loop entry, into
+    // the temp every iteration reads its element off.
     let iterated = lower_expr(right, builder);
     let iter_span = builder.span_at(right.span().start);
-    builder.push_stmt(Stmt::ExprStmt(iterated, iter_span));
+    let element = if let Some(awaits) = of {
+        let held = builder.iter_temp(right.span());
+        builder.push_stmt(Stmt::Let {
+            var: held.clone(),
+            rhs: iterated,
+            span: iter_span,
+        });
+        let element = Expr::IndexAccess {
+            arr: Box::new(Expr::Var(held)),
+            idx: Box::new(Expr::SummaryVal(SummaryValue::Top)),
+        };
+        match awaits {
+            true => handed_out(builder.next_call_id(), element),
+            false => element,
+        }
+    } else {
+        builder.push_stmt(Stmt::ExprStmt(iterated, iter_span));
+        Expr::SummaryVal(crate::ir::expr::SummaryValue::Top)
+    };
 
     let header = builder.new_block();
     let body_block = builder.new_block();
@@ -737,17 +930,17 @@ fn lower_iter_loop(
         then_: body_block,
         else_: exit_block,
         span: None,
+        chain_link: false,
     });
     builder.add_edge(h, body_block, EdgeKind::IfTrue);
     builder.add_edge(h, exit_block, EdgeKind::IfFalse);
 
     builder.start_block(body_block);
-    let top = Expr::SummaryVal(crate::ir::expr::SummaryValue::Top);
     match left {
         ForStatementLeft::VariableDeclaration(decl) => {
             for d in &decl.declarations {
                 let span = builder.span_at(d.span.start);
-                lower_binding_pattern(&d.id, top.clone(), span, builder);
+                lower_binding_pattern(&d.id, element.clone(), span, builder);
             }
         }
         // Pre-declared target (`for (x of arr)`): re-assign the outer var.
@@ -757,7 +950,7 @@ fn lower_iter_loop(
                 let span = builder.span_at(other.span().start);
                 builder.push_stmt(Stmt::Assign {
                     var,
-                    rhs: top,
+                    rhs: element,
                     span,
                 });
             }
@@ -778,11 +971,11 @@ fn lower_switch(sw: &SwitchStatement, builder: &mut BlockBuilder) {
     let exit_block = builder.new_block();
     let disc = lower_expr(&sw.discriminant, builder);
     // Evaluated once, then compared against each case's test.
-    let disc_var = builder.fresh_temp();
+    let disc_var = builder.switch_temp(sw.discriminant.span());
     builder.push_stmt(Stmt::Let {
         var: disc_var.clone(),
         rhs: disc,
-        span: None,
+        span: builder.span_at(sw.discriminant.span().start),
     });
 
     if sw.cases.is_empty() {
@@ -826,6 +1019,7 @@ fn lower_switch(sw: &SwitchStatement, builder: &mut BlockBuilder) {
             then_: case_block,
             else_: skip_to,
             span: None,
+            chain_link: false,
         });
         builder.add_edge(d, case_block, EdgeKind::IfTrue);
         builder.add_edge(d, skip_to, EdgeKind::IfFalse);
@@ -966,10 +1160,32 @@ fn lower_binding_pattern(
 
 /// Emit Let stmts for every formal parameter; destructured params get temp name `__pN`.
 /// Returns param names for `FnLit.params`.
+///
+/// A rest parameter (`(a, ...fs)`) is no positional parameter: it is bound
+/// to a new array of the arguments from its position on
+/// ([`Expr::Arguments`], #324), destructured like any other parameter when
+/// it is a pattern (`(...[f, g])`). A non-arrow function whose parameters or
+/// body read `arguments` (`own_arguments`) binds it first, to the array of
+/// every argument: an arrow reads its enclosing function's. `own_arguments`
+/// is the body of a function that binds its own, `None` for an arrow.
 pub(super) fn inject_param_preamble(
     params: &FormalParameters,
+    own_arguments: Option<&FunctionBody>,
     builder: &mut BlockBuilder,
 ) -> Vec<String> {
+    if let Some(body) = own_arguments
+        && super::body_scan::reads_arguments(params, body)
+    {
+        let rhs = Expr::Arguments {
+            id: builder.next_expr_id(),
+            from: 0,
+        };
+        builder.push_stmt(Stmt::Let {
+            var: "arguments".to_string(),
+            rhs,
+            span: None,
+        });
+    }
     let mut names = Vec::new();
     for (i, p) in params.items.iter().enumerate() {
         let name = match &p.pattern {
@@ -978,10 +1194,33 @@ pub(super) fn inject_param_preamble(
         };
         names.push(name.clone());
         if let Some(init) = p.initializer.as_deref() {
-            lower_default(&name, init, false, builder);
+            lower_default(&name, init, true, builder);
         }
         if !matches!(p.pattern, BindingPattern::BindingIdentifier(_)) {
             lower_binding_pattern(&p.pattern, Expr::Var(name), None, builder);
+        }
+    }
+    if let Some(rest) = &params.rest {
+        let rhs = Expr::Arguments {
+            id: builder.next_expr_id(),
+            from: params.items.len(),
+        };
+        let pattern = &rest.rest.argument;
+        match pattern {
+            BindingPattern::BindingIdentifier(id) => builder.push_stmt(Stmt::Let {
+                var: id.name.to_string(),
+                rhs,
+                span: None,
+            }),
+            _ => {
+                let temp = format!("__p{}", params.items.len());
+                builder.push_stmt(Stmt::Let {
+                    var: temp.clone(),
+                    rhs,
+                    span: None,
+                });
+                lower_binding_pattern(pattern, Expr::Var(temp), None, builder);
+            }
         }
     }
     names
@@ -995,10 +1234,11 @@ pub(super) fn inject_param_preamble(
 ///
 /// `store`: the default's value is assigned to `source`, which then is the
 /// member or the default (#256); the solver drops the side of the test no
-/// value of `source` takes (#255). A parameter's default is not stored: its
-/// omitted argument is bound where the call is inlined (`param_defaults`,
-/// #230), and a parameter assigned in its body is no longer one a deps
-/// argument can name.
+/// value of `source` takes (#255). A parameter's default is stored too, as
+/// JavaScript does: what the parameter holds is its argument or its default,
+/// for every reader of the body (a call that omits the argument, or passes
+/// `undefined`). A deps argument naming it is still the parameter
+/// ([`must_param`](crate::ir::bindings::must_param)).
 pub(super) fn lower_default(
     source: &str,
     init: &Expression,
@@ -1017,6 +1257,7 @@ pub(super) fn lower_default(
         then_,
         else_: join,
         span,
+        chain_link: false,
     });
     builder.add_edge(test, then_, EdgeKind::IfTrue);
     builder.add_edge(test, join, EdgeKind::IfFalse);
@@ -1056,35 +1297,309 @@ pub(super) fn param_defaults(params: &FormalParameters, ctx: &LowerCtx) -> Vec<O
         .collect()
 }
 
-/// Build a function body CFG with param destructuring preamble.
+/// What a call of a function evaluates to, which its kind decides (#317).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FnKind {
+    /// The call evaluates to what the body returns.
+    Plain,
+    /// `async`: the call runs the body up to its first `await` and evaluates
+    /// to a new promise, which the body's `return` settles.
+    Async,
+    /// `function*`, `async function*`: the call evaluates to a new iterator
+    /// and runs nothing; the body runs as far as the consumer drives it.
+    Generator,
+}
+
+impl FnKind {
+    pub fn of(is_async: bool, generator: bool) -> Self {
+        match (is_async, generator) {
+            (_, true) => FnKind::Generator,
+            (true, false) => FnKind::Async,
+            (false, false) => FnKind::Plain,
+        }
+    }
+}
+
+/// `value` handed to code the analysis does not see, which hands back a
+/// value it does not know: the call of an unknown function with `value` as
+/// its argument, so every setter or closure it holds escapes (#254). What a
+/// `yield` or a `return` gives a generator's consumer, what a `return` gives
+/// an async function's awaiter, and what an `await` makes of its operand —
+/// the analysis models no promise and no iterator (#317). The value handed
+/// back is anything, a new object included: an awaited value may be new at
+/// any render.
+pub(super) fn handed_out(id: ExprId, value: Expr) -> Expr {
+    Expr::Call {
+        id,
+        fn_: Box::new(Expr::SummaryVal(SummaryValue::Top)),
+        args: vec![value],
+    }
+}
+
+/// Seal `cfg`, a body of `kind`, so each `return` hands the caller what the
+/// call evaluates to (#317): for an async function or a generator, one new
+/// object the analysis does not model (a promise, an iterator), the returned
+/// value handed out to the code that consumes it.
+fn hand_back(mut cfg: CFG, kind: FnKind, ctx: &LowerCtx) -> CFG {
+    if kind == FnKind::Plain {
+        return cfg;
+    }
+    let id = ctx.ids.next();
+    for block in cfg.blocks.values_mut() {
+        let Terminator::Return(value, span) = &mut block.term else {
+            continue;
+        };
+        let made = Expr::New {
+            id,
+            fn_: Box::new(Expr::SummaryVal(SummaryValue::Top)),
+            args: vec![],
+            ctor: None,
+            on_this: false,
+        };
+        let value = std::mem::replace(value, made);
+        if !matches!(value, Expr::Lit(_)) {
+            block.stmts.push(Stmt::ExprStmt(
+                handed_out(ctx.ids.next_call(), value),
+                *span,
+            ));
+        }
+    }
+    cfg
+}
+
+/// Build a function body CFG with param destructuring preamble. `arrow`: the
+/// function binds no `arguments` of its own.
 pub fn build_fn_body_cfg(
     params: &FormalParameters,
     body: &FunctionBody,
+    kind: FnKind,
+    arrow: bool,
+    ctx: &LowerCtx,
+) -> (Vec<String>, CFG) {
+    build_body_cfg(params, body, kind, arrow, &ctx.nested(arrow))
+}
+
+/// [`build_fn_body_cfg`] for a class's instance method or accessor (#335):
+/// `this` is the instance, which `ctx` ([`LowerCtx::member`]) says.
+pub(super) fn build_member_body_cfg(
+    params: &FormalParameters,
+    body: &FunctionBody,
+    kind: FnKind,
+    ctx: &LowerCtx,
+) -> (Vec<String>, CFG) {
+    build_body_cfg(params, body, kind, false, ctx)
+}
+
+/// A function body under `ctx`. A non-arrow function binds its own
+/// `arguments`, and its own `this` when `ctx` says the call binds it
+/// ([`ThisScope::Receiver`], #338): the first statement, when the
+/// parameters or the body read it, binds [`THIS`] to the call's
+/// [`RECEIVER`], before any parameter default reads it.
+///
+/// [`THIS`]: crate::ir::expr::THIS
+/// [`RECEIVER`]: crate::ir::expr::RECEIVER
+fn build_body_cfg(
+    params: &FormalParameters,
+    body: &FunctionBody,
+    kind: FnKind,
+    arrow: bool,
     ctx: &LowerCtx,
 ) -> (Vec<String>, CFG) {
     let mut builder = BlockBuilder::new(ctx);
     builder.start_block(0);
-    let param_names = inject_param_preamble(params, &mut builder);
+    if !arrow && ctx.this == ThisScope::Receiver && super::body_scan::reads_this(params, body) {
+        builder.push_stmt(Stmt::Let {
+            var: crate::ir::expr::THIS.to_string(),
+            rhs: Expr::Var(crate::ir::expr::RECEIVER.to_string()),
+            span: None,
+        });
+    }
+    let param_names = inject_param_preamble(params, (!arrow).then_some(body), &mut builder);
+    if kind == FnKind::Generator {
+        builder.may_stop();
+    }
     lower_stmts(&body.statements, &mut builder);
-    (param_names, builder.into_cfg(0))
+    (param_names, hand_back(builder.into_cfg(0), kind, ctx))
 }
 
-/// Like [`build_fn_body_cfg`] for concise arrow bodies (`x => expr`).
+/// The construction body of a class (#335), under `ctx`
+/// ([`LowerCtx::member`] with the class's [`CtorScope`]): `this` is the
+/// object the `new` hands it ([`NEW_INSTANCE`]); the instance methods and
+/// accessors are written on it (`methods`), so each captures `this` as an
+/// arrow captures a name, and a parent's constructor that calls one runs
+/// it; a base class then initializes its fields, a derived one does so
+/// when its `super(…)` returns; then the constructor's statements run, and
+/// the body returns `this`, or what a `return` of the constructor names
+/// when that is an object ([`lower_ctor_return`]). A derived class without
+/// a constructor hands every argument to `super`, as the language's
+/// implicit one does.
+///
+/// [`NEW_INSTANCE`]: crate::ir::expr::NEW_INSTANCE
+pub(super) fn build_construct_cfg(
+    ctor: Option<&Function>,
+    methods: Vec<Stmt>,
+    ctx: &LowerCtx,
+) -> (Vec<String>, CFG) {
+    use crate::ir::expr::{NEW_INSTANCE, THIS};
+    let mut builder = BlockBuilder::new(ctx);
+    builder.start_block(0);
+    let body = ctor.and_then(|f| f.body.as_deref());
+    let params = match (ctor, body) {
+        (Some(f), Some(body)) => inject_param_preamble(&f.params, Some(body), &mut builder),
+        _ => Vec::new(),
+    };
+    builder.push_stmt(Stmt::Let {
+        var: THIS.to_string(),
+        rhs: Expr::Var(NEW_INSTANCE.to_string()),
+        span: None,
+    });
+    for m in methods {
+        builder.push_stmt(m);
+    }
+    let scope = ctx.ctor.clone();
+    let derived = scope.as_ref().is_some_and(|s| s.parent.is_some());
+    if !derived && let Some(fields) = scope.as_ref().and_then(|s| s.fields.clone()) {
+        builder.push_stmt(Stmt::ExprStmt(fields, None));
+    }
+    match body {
+        Some(body) => lower_stmts(&body.statements, &mut builder),
+        None if derived => {
+            let id = builder.next_expr_id();
+            let all = Expr::Spread(Box::new(Expr::Arguments { id, from: 0 }));
+            super_call(vec![all], None, &mut builder);
+        }
+        None => {}
+    }
+    if !builder.is_terminated() {
+        builder.seal_with(Terminator::Return(Expr::Var(THIS.to_string()), None));
+    }
+    (params, builder.into_cfg(0))
+}
+
+/// The body that initializes a class's instance fields on `this`, in order
+/// (#335): `fields` are each field's member and initializer, `None` for a
+/// field declared without one, which holds `undefined`.
+pub(super) fn build_fields_cfg(
+    fields: &[(
+        crate::ir::stmt::MemberKey,
+        Option<&Expression>,
+        oxc_span::Span,
+    )],
+    ctx: &LowerCtx,
+) -> CFG {
+    use crate::ir::expr::THIS;
+    let mut builder = BlockBuilder::new(ctx);
+    builder.start_block(0);
+    for (key, init, span) in fields {
+        let rhs = match init {
+            Some(e) => lower_expr(e, &mut builder),
+            None => Expr::Lit(Prim::Unit),
+        };
+        let span = builder.span_at(span.start);
+        builder.push_stmt(Stmt::MemberWrite {
+            obj: Expr::Var(THIS.to_string()),
+            key: key.clone(),
+            rhs,
+            span,
+        });
+    }
+    builder.into_cfg(0)
+}
+
+/// `super(args)` in a constructor (#335): the parent's construction runs on
+/// `this`, which then holds what it returns, and the class's own fields are
+/// initialized. The expression's value is `this`.
+pub(super) fn super_call(
+    args: Vec<Expr>,
+    span: Option<crate::ir::SourceRange>,
+    builder: &mut BlockBuilder,
+) -> Expr {
+    use crate::ir::expr::THIS;
+    let scope = builder.ctx.ctor.clone();
+    let parent = scope
+        .as_ref()
+        .and_then(|s| s.parent.clone())
+        .unwrap_or(Expr::SummaryVal(SummaryValue::Top));
+    let id = builder.next_expr_id();
+    builder.push_stmt(Stmt::Assign {
+        var: THIS.to_string(),
+        rhs: Expr::New {
+            id,
+            fn_: Box::new(parent),
+            args,
+            ctor: None,
+            on_this: true,
+        },
+        span,
+    });
+    if let Some(fields) = scope.and_then(|s| s.fields.clone()) {
+        builder.push_stmt(Stmt::ExprStmt(fields, span));
+    }
+    Expr::Var(THIS.to_string())
+}
+
+/// `return e;` in a constructor (#335): `new` evaluates to `e` when it is an
+/// object, to `this` otherwise — a choice the analysis does not make, so
+/// both are returned. A bare `return;` returns `this`.
+fn lower_ctor_return(ret: &ReturnStatement, builder: &mut BlockBuilder) {
+    use crate::ir::expr::THIS;
+    let span = builder.span_at(ret.span.start);
+    let Some(arg) = &ret.argument else {
+        builder.seal_with(Terminator::Return(Expr::Var(THIS.to_string()), span));
+        return;
+    };
+    let value = lower_expr(arg, builder);
+    if builder.is_terminated() {
+        return;
+    }
+    let returned = match value {
+        Expr::Var(v) => v,
+        value => {
+            let tmp = builder.temp_at("__ret", arg.span());
+            builder.push_stmt(Stmt::Let {
+                var: tmp.clone(),
+                rhs: value,
+                span,
+            });
+            tmp
+        }
+    };
+    let other = builder.new_block();
+    let itself = builder.new_block();
+    let from = builder.seal_with(Terminator::Branch {
+        cond: Expr::SummaryVal(SummaryValue::Top),
+        then_: other,
+        else_: itself,
+        span: None,
+        chain_link: false,
+    });
+    builder.add_edge(from, other, EdgeKind::IfTrue);
+    builder.add_edge(from, itself, EdgeKind::IfFalse);
+    builder.start_block(other);
+    builder.seal_with(Terminator::Return(Expr::Var(returned), span));
+    builder.start_block(itself);
+    builder.seal_with(Terminator::Return(Expr::Var(THIS.to_string()), span));
+}
+
+/// Like [`build_fn_body_cfg`] for concise arrow bodies (`x => expr`), which
+/// no generator has.
 pub fn build_expr_fn_body_cfg(
     params: &FormalParameters,
     body: &FunctionBody,
+    kind: FnKind,
     ctx: &LowerCtx,
 ) -> (Vec<String>, CFG) {
+    let ctx = &ctx.nested(true);
     let mut builder = BlockBuilder::new(ctx);
     builder.start_block(0);
-    let param_names = inject_param_preamble(params, &mut builder);
+    let param_names = inject_param_preamble(params, None, &mut builder);
     if let Some(Statement::ExpressionStatement(es)) = body.statements.first() {
         let expr = lower_expr(&es.expression, &mut builder);
         if !builder.is_terminated() {
             builder.seal_with(Terminator::Return(expr, builder.span_at(es.span.start)));
         }
     }
-    (param_names, builder.into_cfg(0))
+    (param_names, hand_back(builder.into_cfg(0), kind, ctx))
 }
 
 #[cfg(test)]

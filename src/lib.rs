@@ -4,6 +4,7 @@ pub mod driver;
 pub mod engine;
 pub mod ir;
 pub mod lowering;
+pub mod profile;
 pub mod project;
 pub mod registry;
 pub mod resolver;

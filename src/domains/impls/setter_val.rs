@@ -2,11 +2,11 @@ use std::collections::BTreeSet;
 
 use crate::ir::{ComponentId, types::HookLabel};
 
-/// The setters a value may be: a bounded powerset of setter identities,
-/// open or closed to the setters the analysis cannot name.
+/// The setters a value may be: the powerset of the program's setter
+/// identities, open or closed to the setters the analysis cannot name.
 ///
 /// ```text
-///                         Top   (some setter, more than MAX candidates)
+///                         Top   (any setter: the bound, no transfer yields it)
 ///                          |
 ///       Open{ a, b }  Open{ a, c } ...
 ///            |      ×      |
@@ -24,24 +24,32 @@ use crate::ir::{ComponentId, types::HookLabel};
 /// not erase the ones it does: `setV` joined with ⊤ is `Open{setV}`, still a
 /// possible write of `setV` (#238). React guarantees setter identity across
 /// renders, so any non-bottom value maps to `Stability::Stable`.
+///
+/// **No cap on the names (#329).** A join keeps every name, however many: a
+/// call of the value writes each, and a name dropped would be a write the
+/// analysis misses (a 9-setter `fs[i](n + 1)` used to widen to ⊤ and write
+/// nothing). The height stays finite without a cap: every setter is born
+/// named (`StateSetter` → [`SetterVal::one`]), one per `useState` /
+/// `useReducer` slot of the program, so a set holds at most the program's
+/// slots.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SetterVal {
     /// ⊥ — no setter value possible.
     Bottom,
-    /// One of these setters — never empty, at most [`SetterVal::MAX`].
+    /// One of these setters — never empty.
     Some(BTreeSet<(ComponentId, HookLabel)>),
-    /// One of these setters or one the analysis does not name — at most
-    /// [`SetterVal::MAX`], empty for a value nothing named.
+    /// One of these setters or one the analysis does not name — empty for a
+    /// value nothing named.
     Open(BTreeSet<(ComponentId, HookLabel)>),
-    /// ⊤ — some setter, which ones the analysis no longer tracks.
+    /// ⊤ — any setter of the program. The lattice's bound for
+    /// [`AbstractDomain::top`](crate::domains::AbstractDomain::top) only: no
+    /// transfer produces it (an unknown value is [`SetterVal::unnamed`], a
+    /// join of named setters keeps the names), and a call of it would have
+    /// to write every slot of the program, which nothing enumerates.
     Top,
 }
 
 impl SetterVal {
-    /// Past this many candidates a join answers ⊤: the lattice keeps a
-    /// finite height.
-    pub const MAX: usize = 8;
-
     /// Exactly this component's setter for this hook label.
     pub fn one(component: ComponentId, label: HookLabel) -> Self {
         SetterVal::Some(BTreeSet::from([(component, label)]))
@@ -62,8 +70,12 @@ impl SetterVal {
     }
 
     /// Every setter the value may be that the analysis names; empty for ⊥
-    /// and ⊤.
+    /// and for ⊤, which no transfer produces ([`SetterVal::Top`]).
     pub fn candidates(&self) -> impl Iterator<Item = (ComponentId, HookLabel)> + '_ {
+        debug_assert!(
+            *self != SetterVal::Top,
+            "no transfer produces the setter ⊤: its names are what a call writes"
+        );
         match self {
             SetterVal::Some(s) | SetterVal::Open(s) => Some(s.iter().copied()),
             _ => None,
@@ -88,10 +100,9 @@ impl SetterVal {
         }
     }
 
-    /// The element with these names, open or not; ⊤ past [`Self::MAX`].
+    /// The element with these names, open or not.
     fn of(names: BTreeSet<(ComponentId, HookLabel)>, open: bool) -> Self {
         match (names.len(), open) {
-            (n, _) if n > Self::MAX => SetterVal::Top,
             (_, true) => SetterVal::Open(names),
             (0, false) => SetterVal::Bottom,
             (_, false) => SetterVal::Some(names),
@@ -151,7 +162,8 @@ impl crate::domains::AbstractDomain for SetterVal {
             }
         }
     }
-    /// The lattice has finite height: widening is the join.
+    /// The lattice has finite height (the program's slots are finite):
+    /// widening is the join.
     fn widen(&self, other: &Self) -> Self {
         self.join(other)
     }
@@ -181,13 +193,19 @@ mod tests {
         assert!(one("Foo", 0) < j && one("Bar", 0) < j);
     }
 
+    /// #329: a join of any number of setters names every one of them — a
+    /// call of it may write each.
     #[test]
-    fn join_past_the_bound_is_top() {
-        let j = (0..=SetterVal::MAX)
+    fn join_of_many_setters_keeps_every_name() {
+        let j = (0..12)
             .map(|l| one("Foo", l))
             .reduce(|a, b| a.join(&b))
             .unwrap();
-        assert_eq!(j, SetterVal::Top);
+        assert_eq!(j.candidates().count(), 12);
+        assert!(j.is_closed() && j < SetterVal::Top);
+        let open = j.join(&SetterVal::unnamed());
+        assert_eq!(open.candidates().count(), 12);
+        assert!(!open.is_closed());
     }
 
     /// #238: a setter joined with a value the analysis cannot name stays a

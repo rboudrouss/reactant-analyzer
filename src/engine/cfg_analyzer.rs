@@ -119,6 +119,7 @@ mod tests {
                 stmts: vec![],
                 term: Terminator::Branch {
                     span: None,
+                    chain_link: false,
                     cond: Expr::BinOp {
                         op: crate::ir::expr::BinOp::Lt,
                         lhs: Box::new(Expr::Var("i".to_string())),
@@ -257,6 +258,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::ObjectLit {
                         id: crate::ir::types::ExprId(0),
@@ -334,6 +336,7 @@ mod tests {
                 stmts: vec![],
                 term: Terminator::Branch {
                     span: None,
+                    chain_link: false,
                     cond: Expr::Lit(Prim::Bool(true)),
                     then_: 1,
                     else_: 2,
@@ -433,6 +436,7 @@ mod tests {
                 }],
                 term: Terminator::Branch {
                     span: None,
+                    chain_link: false,
                     cond: Expr::Var("a".to_string()),
                     then_: 1,
                     else_: 2,
@@ -555,6 +559,7 @@ mod tests {
                 }],
                 term: Terminator::Branch {
                     span: None,
+                    chain_link: false,
                     cond: Expr::Var("a".to_string()),
                     then_: 1,
                     else_: 2,
@@ -628,6 +633,7 @@ mod tests {
             Stmt::Let {
                 var: "v".to_string(),
                 rhs: Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("pick".to_string())),
                     args: vec![],
                 },
@@ -636,6 +642,7 @@ mod tests {
             Stmt::Let {
                 var: "w".to_string(),
                 rhs: Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("extern".to_string())),
                     args: vec![],
                 },
@@ -668,6 +675,7 @@ mod tests {
                 }],
                 term: Terminator::Branch {
                     span: None,
+                    chain_link: false,
                     cond: Expr::BinOp {
                         op: BinOp::Lt,
                         lhs: Box::new(Expr::Var("x".to_string())),
@@ -764,6 +772,7 @@ mod tests {
     fn set_n(v: i32) -> Stmt {
         Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setN".to_string())),
                 args: vec![Expr::Lit(Prim::Int(v))],
             },
@@ -777,6 +786,7 @@ mod tests {
             then_,
             else_,
             span: None,
+            chain_link: false,
         }
     }
 
@@ -888,6 +898,7 @@ mod tests {
                 stmts: vec![],
                 term: Terminator::Return(
                     Expr::Call {
+                        id: crate::ir::expr::SYNTHETIC_CALL,
                         fn_: Box::new(Expr::Var("setN".to_string())),
                         args: vec![Expr::Lit(Prim::Int(99))],
                     },
@@ -980,6 +991,7 @@ mod tests {
                 stmts: vec![],
                 term: Terminator::Return(
                     Expr::Call {
+                        id: crate::ir::expr::SYNTHETIC_CALL,
                         fn_: Box::new(Expr::Var("setN".to_string())),
                         args: vec![Expr::FnLit {
                             id: ExprId(0),

@@ -4,6 +4,7 @@
 //! alias chains, the may-written slot proof — and the slot-writer relation
 //! (`collect_slot_writers`) the fixpoint stores on `AnalysisResult`.
 
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -15,9 +16,11 @@ use crate::{
     },
     engine::{
         AnalysisResult,
+        calls::{CallRelation, Slot},
         dominance::on_all_paths,
+        store::STORE_SLOT,
         timing::ArgTiming,
-        written::{self, ClosureEnv, SiteEnvs, Written},
+        written::{self, SiteEnvs, Written},
     },
     ir::{
         SourceRange,
@@ -30,244 +33,44 @@ use crate::{
     },
 };
 
-/// A setter call found by `collect_setter_calls`.
-#[derive(Debug, Clone)]
-pub struct SetterCall {
-    pub var: Var,
-    pub span: Option<SourceRange>,
-    /// Block in the top-level CFG where the call was found.
-    /// `None` when the call is inside a nested `FnLit` body dominance unknowable.
-    pub block_id: Option<BlockId>,
-    /// Phase class of the retained site. The collapse below keeps the most
-    /// synchronous site per variable, so this is the strongest reading of
-    /// "when does this setter run" the walk found — and the reason a consumer
-    /// can now tell an effect-body write from one only a keydown reaches
-    /// (ADR-034 §4, #93). It used to be computed and thrown away.
-    pub class: SetterCallPhase,
-    /// The body the call sits in (pointer identity) and its block there,
-    /// when that body runs it synchronously: the render CFG for a direct
-    /// call, a callback's for one the render runs (#269). `None` from the
-    /// collapsed walks.
-    pub(crate) own: Option<(usize, BlockId)>,
-}
-
-/// The externally-visible half of the walk's phase classification. A subset:
-/// only the distinction consumers of the collapsed row are allowed to make.
-///
-/// `Deferred` and `Unknown` were one variant (`Other`) until #130, and the
-/// collapse cost a consumer the one thing it needs: `Deferred` is a *proof*
-/// that the write does not happen in the body's own pass — a known registrar
-/// took the callback — while `Unknown` is ⊤, and ⊤ includes the body's pass.
-/// A rule that must not report a proven-deferred write, but must still report
-/// a ⊤ one, could not tell them apart.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SetterCallPhase {
-    /// Runs when the enclosing body runs.
-    Sync,
-    /// Runs only on an external event — a registered DOM listener, a reified
-    /// JSX handler. A user event stands between the body and this write.
-    Handler,
-    /// A later tick of the same mount: a known deferring registrar took the
-    /// callback (`setTimeout`, `queueMicrotask`), or it is an effect cleanup.
-    /// Proven *not* to run in the enclosing body's own pass.
-    Deferred,
-    /// ⊤ — the callee that received the callback has no summary, so every
-    /// phase is possible, the enclosing body's own pass included.
-    Unknown,
-}
-
-impl SetterCallPhase {
-    /// Can this write run during the pass of the body it was found in? True
-    /// for `Sync` (it does) and `Unknown` (⊤, so it may); false for the two
-    /// classes the walk proved otherwise.
-    pub fn may_run_in_body(self) -> bool {
-        matches!(self, SetterCallPhase::Sync | SetterCallPhase::Unknown)
-    }
-}
-
-impl From<WalkClass> for SetterCallPhase {
-    fn from(c: WalkClass) -> Self {
-        match c {
-            WalkClass::Sync => SetterCallPhase::Sync,
-            WalkClass::Handler => SetterCallPhase::Handler,
-            WalkClass::Deferred | WalkClass::Cleanup => SetterCallPhase::Deferred,
-            WalkClass::Unknown => SetterCallPhase::Unknown,
-        }
-    }
-}
-
-/// Collect all setter variable names called in `cfg` together with their
-/// call-site span and block ID, descending into FnLit argument bodies and
-/// variable-bound FnLits as deep as the fixpoint inlines ([`WALK_DEPTH`]).
-pub fn collect_setter_calls(cfg: &CFG, setter_vars: &HashSet<Var>) -> Vec<SetterCall> {
-    collect_setter_calls_with_extra(cfg, setter_vars, &HashMap::new())
-}
-
 /// How many nested function bodies every walk of this module descends: as
 /// many as the fixpoint inlines, so a write the store holds is a write some
 /// walk finds, whatever rule asks (#266, #267). Past it, both stop and the
 /// component reports the `analysis-limit`.
 pub const WALK_DEPTH: usize = crate::domains::interp::MAX_INLINE_DEPTH;
 
-/// Like `collect_setter_calls` but merges `extra_fn_bindings` so that variable
-/// callbacks defined outside `cfg` are resolved. `cfg`-local entries take precedence.
-pub fn collect_setter_calls_with_extra(
-    cfg: &CFG,
-    setter_vars: &HashSet<Var>,
-    extra_fn_bindings: &HashMap<Var, Arc<CFG>>,
-) -> Vec<SetterCall> {
-    setter_calls(cfg, setter_vars, extra_fn_bindings, None, true)
+/// The names a write's argument may read from a body whose bindings the
+/// region's env does not hold (#310). A write in a body the walk entered — an
+/// IIFE, a helper, a callback — is read at the call that runs that body, in
+/// the region's env; a name that body binds (a local, a parameter, a lowering
+/// temp) is its own there, whatever the region binds under the same name, and
+/// so is a name a body reached by name captures where it is written. Such a
+/// name holds nothing the env knows: its value is ⊤, and no proof reads the
+/// argument's spelling in the region's scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Foreign {
+    /// These names: none for a write in the walked body itself, else every
+    /// name a body on the way binds, and the region's own names when a body
+    /// on the way is written in the render, where they do not reach.
+    Names(BTreeSet<Var>),
+    /// Any name a body other than the render binds: a body on the way was
+    /// reached through a value, and may be written anywhere.
+    Any,
+    /// Every name: a body on the way is another component's (a parent's
+    /// closure a child calls), none of whose names is the region's.
+    All,
 }
 
-/// `collect_setter_calls` that also runs the closures the converged values
-/// put behind a called path (`api.inc()`, #233): a write in one is a write of
-/// the call — the same table the writer relation walks. One row per call
-/// site, in walk order: a setter written at two sites is two facts, and a
-/// consumer that clears one site has not cleared the other.
-pub(crate) fn collect_setter_sites_converged(
-    cfg: &CFG,
-    setter_vars: &HashSet<Var>,
-    converged: &ConvergedFns<'_>,
-) -> Vec<SetterCall> {
-    setter_calls(cfg, setter_vars, &HashMap::new(), Some(converged), false)
-}
-
-/// The setter call sites of a component's render, as the converged values see
-/// them (#281): every call the setter walk finds there through a name a body
-/// of the component binds to a setter, or a name or member path the converged
-/// values put one behind (`t.1`, `api.setV`, a parent's setter prop), a
-/// closure such a path holds included. `setter-in-render` judges these sites
-/// and the Tier-A `render_setter_calls` relation lists them: both frontends
-/// see one set.
-pub(crate) struct RenderSetterSites {
-    /// The names a body of the component binds to a setter, through aliases
-    /// (the may table, [`all_setter_labels`]).
-    pub local: SetterTargets,
-    /// The setters the converged values put behind a name or member path.
-    pub converged: HashMap<Var, Vec<SetterProp>>,
-    /// Every name or path either table holds.
-    pub names: HashSet<Var>,
-    /// One row per call site, in walk order, each with its phase class: a
-    /// handler's or a deferred call is a site that does not run in the render.
-    pub sites: Vec<SetterCall>,
-}
-
-impl RenderSetterSites {
-    pub(crate) fn of(comp: &AnalysisResult<StateValue>) -> Self {
-        let params = std::slice::from_ref(&comp.param);
-        let local = all_setter_labels(comp);
-        let converged = converged_call_targets(
-            &collect_component_setter_vars(
-                &comp.render_cfg,
-                params,
-                &comp.block_states,
-                &comp.heap,
-            ),
-            comp.component,
-        );
-        let mut names: HashSet<Var> = local.names().cloned().collect();
-        names.extend(converged.keys().cloned());
-        let sites = if names.is_empty() {
-            Vec::new()
-        } else {
-            let fns = ConvergedFns::of(
-                &comp.render_cfg,
-                params,
-                &comp.hooks,
-                &comp.hook_provenance,
-                &comp.block_states,
-                &comp.heap,
-                comp.component,
-            );
-            collect_setter_sites_converged(&comp.render_cfg, &names, &fns)
-        };
-        RenderSetterSites {
-            local,
-            converged,
-            names,
-            sites,
+impl Foreign {
+    /// Is `v` one of the names, given `bound_elsewhere` — every name a body
+    /// other than the render binds — for [`Foreign::Any`]?
+    pub fn hides(&self, v: &str, bound_elsewhere: &HashSet<Var>) -> bool {
+        match self {
+            Foreign::Names(names) => names.contains(v),
+            Foreign::Any => bound_elsewhere.contains(v),
+            Foreign::All => true,
         }
     }
-}
-
-fn setter_calls(
-    cfg: &CFG,
-    setter_vars: &HashSet<Var>,
-    extra_fn_bindings: &HashMap<Var, Arc<CFG>>,
-    converged: Option<&ConvergedFns<'_>>,
-    collapse: bool,
-) -> Vec<SetterCall> {
-    let mut fn_bindings = collect_fn_bindings(cfg);
-    let callback_fns = converged
-        .filter(|c| std::ptr::eq(cfg, c.render))
-        .map(ConvergedFns::callback_fns);
-    for (k, v) in extra_fn_bindings
-        .iter()
-        .chain(callback_fns.into_iter().flatten())
-    {
-        fn_bindings
-            .entry(k.clone())
-            .or_insert_with(|| Arc::clone(v));
-    }
-    let converged = converged.map(|c| c.seen_from(cfg, None));
-    let mut found = Found::default();
-    let empty = HashSet::new();
-    let wrappers = wrapper_callees(cfg);
-    let certified = certified_fn_names(cfg, &fn_bindings);
-    let mut walk = SetterWalk {
-        setter_vars,
-        fn_bindings: &fn_bindings,
-        converged: converged.as_ref(),
-        walking: HashSet::new(),
-        root: cfg as *const CFG as usize,
-        body: cfg as *const CFG as usize,
-        effect_body: false,
-        dispatches: false,
-        shadowed: &empty,
-        repeating: false,
-        callback_bodies: &HashMap::new(),
-        certified_fns: &certified,
-        collect_calls: false,
-        read_vars: &NO_VARS,
-        wrappers: &wrappers,
-        path: Vec::new(),
-    };
-    walk.cfg(cfg, WALK_DEPTH, &mut found, WalkClass::Sync, None, None);
-    let mut found = found.setters;
-    if !collapse {
-        return found
-            .into_iter()
-            .map(|site| SetterCall {
-                var: site.var,
-                span: site.span,
-                block_id: site.at.map(|(b, _)| b),
-                class: site.class.into(),
-                own: site.own,
-            })
-            .collect();
-    }
-    // Collapse to the historical one-row-per-var shape, preferring the sync
-    // site: its block id serves dominance, where any other class records
-    // `None`. The walk itself no longer collapses, so this is the one place
-    // the old granularity still exists.
-    found.sort_by_key(|s| s.class); // WalkClass derives Ord with Sync first
-    let mut by_var: HashMap<Var, (Option<SourceRange>, Option<BlockId>, WalkClass)> =
-        HashMap::new();
-    for site in &found {
-        by_var
-            .entry(site.var.clone())
-            .or_insert((site.span, site.at.map(|(b, _)| b), site.class));
-    }
-    by_var
-        .into_iter()
-        .map(|(var, (span, block_id, class))| SetterCall {
-            var,
-            span,
-            block_id,
-            class: class.into(),
-            own: None,
-        })
-        .collect()
 }
 
 /// One raw write site: the setter variable, a witness span, the phase class
@@ -276,6 +79,11 @@ fn setter_calls(
 #[derive(Debug, Clone)]
 pub(crate) struct WriteSite {
     pub var: Var,
+    /// `var` spells a value that reaches the setter, not the setter
+    /// ([`SlotWriter::carried`]).
+    pub carried: bool,
+    /// The slot written, as the call relation names it.
+    pub slot: Slot,
     pub span: Option<SourceRange>,
     pub class: WalkClass,
     pub prov_block: Option<BlockId>,
@@ -288,152 +96,275 @@ pub(crate) struct WriteSite {
     pub updater: Updater,
     /// Argument 0 as written, `None` for a bare `setX()`.
     pub arg: Option<Expr>,
+    /// The names `arg` may read from a body whose bindings the region's env
+    /// does not hold ([`Foreign`]).
+    pub foreign: Foreign,
     /// The setter is handed to a callee that calls it (`xs.forEach(setV)`,
     /// #291): it stores what the callee passes, which no expression here is.
     pub applied: bool,
     /// The function names the walk went through to reach the site, outermost
     /// first — where the write is authored is where they are defined.
     pub through: Vec<Var>,
+    /// The call is surely of the one setter it writes: its relation row is
+    /// `sure` (ADR-047). A handed value never is.
+    pub sure: bool,
+    /// The body the site sits in and its block there ([`SlotWriter::own`]).
+    pub own: Option<(Option<crate::ir::types::ExprId>, BlockId)>,
+    /// [`SlotWriter::listener`].
+    pub listener: bool,
+    /// [`SlotWriter::accessor`].
+    pub accessor: Option<AccessorOf>,
 }
 
-/// Every write site in `cfg`, one row per call site — no collapse of any
-/// kind. The slot-writer relation needs the distinct rows: a slot written
-/// twice in one body is a different fact from a slot written once.
-///
-/// `outer_fns` carries function bindings certified in an enclosing scope — a
-/// handler body is extracted out of the render CFG, so a `set(inc)` whose
-/// `inc` was defined in render is invisible to a walk of the body alone. A
-/// name the walked body binds itself drops out of the set, fail-closed, the
-/// same device as `shadowed`; the render binds them. `converged` are the
-/// closures the converged values put behind a name or member path
-/// ([`ConvergedFns`]), as seen from `cfg` ([`ConvergedFns::seen_from`]).
-///
-/// `dispatches`: some body of the program fires event listeners itself
-/// ([`SetterWalk::dispatches`]).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn collect_write_sites(
-    cfg: &CFG,
-    setter_vars: &HashSet<Var>,
-    effect_body: bool,
-    dispatches: bool,
-    shadowed: &HashSet<Var>,
-    outer_fns: &HashMap<Var, Arc<CFG>>,
-    converged: &ConvergedFns<'_>,
-    callback_bodies: &HashMap<HookLabel, Arc<CFG>>,
-) -> Vec<WriteSite> {
-    let mut found = Found::default();
-    let wrappers = wrapper_callees(cfg);
-    let mut fn_bindings = collect_fn_bindings(cfg);
-    let mut certified = certified_fn_names(cfg, &fn_bindings);
-    // The render binds the names `outer_fns` are about: a `useCallback` value
-    // the render hands out is its body there too (#262).
-    let mut local_binders: HashSet<Var> = HashSet::new();
-    if !std::ptr::eq(cfg, converged.render) {
-        collect_binders(cfg, &mut local_binders);
-    }
-    for (v, body) in outer_fns {
-        if local_binders.contains(v) {
-            continue;
+/// What every walk of a component's bodies reads besides the call relation
+/// (ADR-047), built once per component: its syntax tables, the names a
+/// local binding takes from a deferring global, the function bindings an
+/// updater is proven by, and the JSX props the lowering made handler
+/// regions of their own.
+pub(crate) struct WriterTables<'a> {
+    tables: WalkTables<'a>,
+    /// Any local binding of a deferring global's name disables its summary,
+    /// wherever the call sits (fail-closed across every body, nested `FnLit`
+    /// scopes included).
+    shadowed: HashSet<Var>,
+    /// Render-scope function bindings that clear the single-binding bar
+    /// across every body below (ADR-023 §3, #103), `useCallback` values
+    /// included: what proves an updater a function (`set(inc)`).
+    outer_fns: HashMap<Var, Arc<CFG>>,
+    callback_bodies: HashMap<HookLabel, Arc<CFG>>,
+    handlers: HashSet<Var>,
+}
+
+/// What one walk records besides the setter sites.
+#[derive(Clone, Copy)]
+struct Channels<'v> {
+    /// The writes of the store (ADR-046).
+    stores: bool,
+    /// Every non-setter call site (#126).
+    calls: bool,
+    /// The reads of these names (#127).
+    reads: &'v HashSet<Var>,
+}
+
+impl<'a> WriterTables<'a> {
+    pub(crate) fn of(
+        render: &'a CFG,
+        hooks: &'a [HookEntry],
+        provenance: &[HookProvenance],
+        component: ComponentId,
+    ) -> Self {
+        let mut shadowed: HashSet<Var> = HashSet::new();
+        for cfg in std::iter::once(render).chain(hooks.iter().filter_map(|h| h.body_cfg())) {
+            collect_binders(cfg, &mut shadowed);
         }
-        fn_bindings
-            .entry(v.clone())
-            .or_insert_with(|| Arc::clone(body));
-        certified.insert(v.clone());
+        let hook_bodies: Vec<&CFG> = hooks.iter().filter_map(|h| h.body_cfg()).collect();
+        let tables = WalkTables::of(render, hooks, provenance, component);
+        let mut outer_fns: HashMap<Var, Arc<CFG>> = collect_fn_bindings(render)
+            .into_iter()
+            .filter(|(v, _)| {
+                crate::ir::bindings::certified_fn_binding(v, render, &hook_bodies).is_some()
+            })
+            .collect();
+        // `const inc = useCallback(…)` binds a `CallbackVal`, not an `FnLit`,
+        // so the literal certificate never sees it — and a memoized updater
+        // read as ⊤ fired the non-functional rules on correct code.
+        outer_fns.extend(
+            tables
+                .callback_fns()
+                .iter()
+                .map(|(v, b)| (v.clone(), Arc::clone(b))),
+        );
+        WriterTables {
+            tables,
+            shadowed,
+            outer_fns,
+            callback_bodies: callback_bodies(hooks),
+            handlers: crate::lowering::hook_extractor::handler_names(render, hooks),
+        }
     }
-    // A body's own rename of an outer function (`const run = inc` in an
-    // effect) only resolves once the outer names are in.
-    let fn_bindings = resolve_aliases(cfg, &fn_bindings);
-    let mut walk = SetterWalk {
-        setter_vars,
-        fn_bindings: &fn_bindings,
-        converged: Some(converged),
-        walking: HashSet::new(),
-        root: cfg as *const CFG as usize,
-        body: cfg as *const CFG as usize,
-        effect_body,
-        dispatches,
-        shadowed,
-        repeating: false,
-        callback_bodies,
-        certified_fns: &certified,
-        collect_calls: false,
-        read_vars: &NO_VARS,
-        wrappers: &wrappers,
-        path: Vec::new(),
-    };
-    walk.cfg(cfg, WALK_DEPTH, &mut found, WalkClass::Sync, None, None);
-    found
-        .setters
-        .into_iter()
-        .map(|s| WriteSite {
-            var: s.var,
-            span: s.span,
-            class: s.class,
-            prov_block: s.prov_block,
-            at: s.at,
-            repeats: s.repeats,
-            updater: s.updater,
-            arg: s.arg,
-            applied: s.applied,
-            through: s.through,
-        })
-        .collect()
+
+    /// The tables of a converged component's result.
+    pub(crate) fn of_result(comp: &'a AnalysisResult<StateValue>) -> Self {
+        WriterTables::of(
+            &comp.render_cfg,
+            &comp.hooks,
+            &comp.hook_provenance,
+            comp.component,
+        )
+    }
+
+    /// Every write site in `cfg`, one row per (call site, slot) — no
+    /// collapse of any kind. The slot-writer relation needs the distinct
+    /// rows: a slot written twice in one body is a different fact from a
+    /// slot written once.
+    ///
+    /// What a call writes and runs, what a handed value reaches and what an
+    /// effect returns are read off the call relation `calls` (ADR-047), by
+    /// call id and position: the walk binds nothing. It keeps what is about
+    /// the syntax: the traversal, the phase of each position, placement, the
+    /// spelling. `cleanup` is the walked effect's hook site. `dispatches`:
+    /// some body of the program fires event listeners itself
+    /// ([`SetterWalk::dispatches`]).
+    ///
+    /// The same walk places the writes of the store (ADR-046), the second
+    /// list.
+    pub(crate) fn write_sites(
+        &self,
+        cfg: &CFG,
+        calls: &CallRelation,
+        cleanup: Option<crate::ir::types::ExprId>,
+        dispatches: bool,
+    ) -> (Vec<WriteSite>, Vec<StoreSite>) {
+        let channels = Channels {
+            stores: true,
+            calls: false,
+            reads: &NO_VARS,
+        };
+        let found = self.walk(cfg, calls, cleanup, dispatches, channels, WALK_DEPTH);
+        let setters = found
+            .setters
+            .into_iter()
+            .map(|s| WriteSite {
+                var: s.var,
+                carried: s.carried,
+                slot: s.slot,
+                span: s.span,
+                class: s.class,
+                prov_block: s.prov_block,
+                at: s.at,
+                repeats: s.repeats,
+                updater: s.updater,
+                arg: s.arg,
+                foreign: s.foreign,
+                applied: s.applied,
+                through: s.through,
+                sure: s.sure,
+                own: s.own,
+                listener: s.listener,
+                accessor: s.accessor,
+            })
+            .collect();
+        (setters, found.stores)
+    }
+
+    /// One walk of `cfg`, recording what `channels` asks besides the setter
+    /// sites, `depth` bodies deep.
+    fn walk(
+        &self,
+        cfg: &CFG,
+        calls: &CallRelation,
+        cleanup: Option<crate::ir::types::ExprId>,
+        dispatches: bool,
+        channels: Channels<'_>,
+        depth: usize,
+    ) -> Found {
+        let mut found = Found::default();
+        let wrappers = wrapper_callees(cfg);
+        let mut fn_bindings = collect_fn_bindings(cfg);
+        let mut certified = certified_fn_names(cfg, &fn_bindings);
+        // The render binds the names `outer_fns` are about: a `useCallback`
+        // value the render hands out is its body there too (#262).
+        let mut local_binders: HashSet<Var> = HashSet::new();
+        if !std::ptr::eq(cfg, self.tables.render) {
+            collect_binders(cfg, &mut local_binders);
+        }
+        for (v, body) in &self.outer_fns {
+            if local_binders.contains(v) {
+                continue;
+            }
+            fn_bindings
+                .entry(v.clone())
+                .or_insert_with(|| Arc::clone(body));
+            certified.insert(v.clone());
+        }
+        // A body's own rename of an outer function (`const run = inc` in an
+        // effect) only resolves once the outer names are in.
+        let fn_bindings = resolve_aliases(cfg, &fn_bindings);
+        let mut walk = SetterWalk {
+            fn_bindings: &fn_bindings,
+            tables: &self.tables,
+            walking: HashSet::new(),
+            root: cfg as *const CFG as usize,
+            body: cfg as *const CFG as usize,
+            body_site: Some(None),
+            effect_body: cleanup.is_some(),
+            dispatches,
+            shadowed: &self.shadowed,
+            repeating: false,
+            callback_bodies: &self.callback_bodies,
+            certified_fns: &certified,
+            collect_calls: channels.calls,
+            read_vars: channels.reads,
+            wrappers: &wrappers,
+            path: Vec::new(),
+            store_scopes: channels
+                .stores
+                .then(|| vec![crate::ir::bindings::local_bindings(self.tables.render)]),
+            scopes: vec![Scope::root(cfg)],
+            calls,
+            cleanup,
+            handlers: &self.handlers,
+            summaries: RefCell::default(),
+            listening: false,
+            accessor: None,
+        };
+        walk.cfg(cfg, depth, &mut found, WalkClass::Sync, None, None);
+        found
+    }
 }
 
-/// One variable that denotes a state setter, and how surely.
+/// The name a write of `slot` spelled `var` at its site prints: what the
+/// source wrote there — a call's value included (`get()(x)`,
+/// `useCounter().set(x)`), whose temp a message names by its call — else the
+/// slot's name: never another lowering temp or a splice's salt (D2).
+pub(crate) fn row_name(calls: &CallRelation, slot: Slot, var: Var) -> Var {
+    let mut segs = var.split('.');
+    let root = segs.next().unwrap_or("");
+    let call_value =
+        crate::ir::names::is_named_temp(root) && !segs.any(|seg| seg.starts_with("__"));
+    let written_here = !var.is_empty()
+        && (call_value || !var.contains('#') && !var.split('.').any(|seg| seg.starts_with("__")));
+    match written_here {
+        true => var,
+        false => calls.slot_name(slot).cloned().unwrap_or(var),
+    }
+}
+
+/// The writes of `body`, a body of the converged component `comp` — its
+/// render, a hook body, a function literal nested in either — as the call
+/// relation answers them (ADR-047): the body scans of the rules read this,
+/// keyed by slot, never a name table.
+pub(crate) fn body_writes(comp: &AnalysisResult<StateValue>, body: &CFG) -> Vec<WriteSite> {
+    WriterTables::of_result(comp)
+        .write_sites(body, &comp.calls, None, false)
+        .0
+}
+
+/// One setter a variable may denote. A may fact only: whether a call through
+/// the variable surely writes is the call relation's `sure` (ADR-047), never
+/// read here (#313).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SetterProp {
     /// The component that owns the slot.
     pub component: ComponentId,
     pub label: HookLabel,
-    /// Calling the variable provably writes the slot — a must.
-    ///
-    /// True when the variable *is* the setter, and when it is a closure whose
-    /// own body calls the setter it captured (`reset={() => setCount(0)}`).
-    /// False when the capture is only carried: `renderFileTree`, a local render
-    /// helper closing over an `onFileClick` prop it merely puts inside a JSX
-    /// handler, writes nothing when called. Both are still writes for a *may*
-    /// reader — ⊤ over what the callee does — but only a must may be certified.
-    pub must_write: bool,
-    /// Reached through a closure that captured the setter: calling the name
-    /// runs the closure, whose argument is not the one the setter stores.
-    pub closure: bool,
-    /// The component whose closure it is, when `closure`: a child's closure
-    /// a prop ref brings back (#270) names the child's bindings, so a walk
-    /// of this component cannot enter it.
-    pub closure_owner: Option<ComponentId>,
 }
 
-/// One slot a write through a name may land in ([`collect_slot_writers`]).
-#[derive(Debug, Clone, Copy)]
-struct Target {
-    /// `None`: this component's slot.
-    owner: Option<ComponentId>,
-    slot: HookLabel,
-    /// Through a closure that captured the setter: the call's argument is
-    /// not the stored value.
-    carried: bool,
-    /// A call through the name surely writes: [`SetterProp::must_write`] for
-    /// a converged value, which may also be something else (#233).
-    sure: bool,
-}
-
-/// Collect variables in `cfg` whose abstract value at any block exit is
-/// `ComponentSetter { component, label }`, or whose Loc in the heap points to a
-/// FnLit that captures a ComponentSetter (e.g. `() => setCount(0)` passed as prop).
+/// Collect the names and member paths in `cfg` whose abstract value at some
+/// block exit is a setter (`ComponentSetter { component, label }`): what a
+/// call by that spelling writes is the call relation's (ADR-047); this table
+/// names a slot a stored pair or an object holds (`t.1`, `api.setV`, #288).
 ///
 /// Returns `var` → every [`SetterProp`] it may be, sorted, never empty: a
 /// prop two call sites bind to two setters is both (#175).
 ///
 /// Used by cross-component rules to find props that are parent setters.
 ///
-/// No block wins: a name's row is every setter some block exit binds it to
-/// (the may side), and a setter is a `must_write` only when every exit
-/// binding the name to anything but ⊥ surely writes it (the must side, #233).
-/// A member path is visited once per object its root may point to, so
-/// `t[1]` of `c ? [v, setV] : [v, noop]` is the setter at one visit and a
-/// closure at the other — a possible write, never a certain one. Blocks are
-/// visited in `CFG::blocks` order, so the rows are deterministic (#120).
+/// No block wins: a name's row is every setter some block exit binds it to,
+/// the may side, and the only one (#233, #313). A member path is visited once
+/// per object its root may point to, so `t[1]` of `c ? [v, setV] : [v, noop]`
+/// is the setter at one visit. Blocks are visited in `CFG::blocks` order, so
+/// the rows are deterministic (#120).
 /// `params` are the body's parameters: the props object, whose members
 /// (`props.f`) are the parent's props literal's (#243).
 pub(crate) fn collect_component_setter_vars(
@@ -458,72 +389,51 @@ fn setter_vars_over<'b>(
     heap: &Heap,
 ) -> HashMap<Var, Vec<SetterProp>> {
     let mut result: HashMap<Var, Vec<SetterProp>> = HashMap::new();
-    let mut unsure: HashSet<Var> = HashSet::new();
     for (cfg, params, block_states) in bodies {
         for_each_converged_path(cfg, params, block_states, heap, |name, ev| {
-            let props = setter_of(ev, heap);
+            let props = setter_of(ev);
             if props.is_empty() {
-                if !ev.as_val().is_bottom_value() {
-                    unsure.insert(name.clone());
-                }
                 return;
             }
             let row = result.entry(name.clone()).or_default();
             for p in props {
-                match row.iter_mut().find(|q| {
-                    (q.component, q.label, q.closure) == (p.component, p.label, p.closure)
-                }) {
-                    Some(q) => q.must_write &= p.must_write,
-                    None => row.push(p),
+                if !row.contains(&p) {
+                    row.push(p);
                 }
             }
         });
     }
-    for (name, row) in &mut result {
-        row.sort_by_key(|p| (p.component, p.label, p.closure));
-        if row.len() > 1 || unsure.contains(name) {
-            for p in row.iter_mut() {
-                p.must_write = false;
-            }
-        }
+    for row in result.values_mut() {
+        row.sort_by_key(|p| (p.component, p.label));
     }
     result
 }
 
-/// The closures a call through a name or member path may run, read off the
-/// converged values ([`collect_converged_fns`]), with what certifies that a
-/// call runs one of them for sure: the render CFG and the other bodies a
-/// [`must_member_binding`](crate::ir::bindings::must_member_binding) is
-/// checked against. The table the writer relation and `setter-in-render`
-/// walk (#233).
-pub(crate) struct ConvergedFns<'a> {
-    fns: HashMap<Var, Vec<Arc<CFG>>>,
-    /// The closures the names of a body with no per-block envs of its own
-    /// may point to ([`ConvergedFns::with_closures`]).
-    closures: HashMap<Var, Vec<Arc<CFG>>>,
+/// The syntax tables of a component the setter walk reads besides the call
+/// relation: its render and hooks, the bodies a
+/// [`must_binding`](crate::ir::bindings::must_binding) is checked against,
+/// the timing the package-hook table gives what a left hook is handed.
+/// Nothing in it is a value: what a call runs is the relation's (ADR-047).
+pub(crate) struct WalkTables<'a> {
     render: &'a CFG,
     scopes: Vec<(&'a [Var], &'a CFG)>,
-    heap: &'a Heap,
     component: ComponentId,
     hooks: &'a [HookEntry],
     /// [`callback_bound_vars`] of the render and the hook bodies.
-    callback_fns: Arc<HashMap<Var, Arc<CFG>>>,
+    callback_fns: HashMap<Var, Arc<CFG>>,
     /// The `useEffectEvent` hooks whose value is bound to a name
     /// `callback_fns` holds: their argument runs where that name is called.
-    called_events: Arc<HashSet<HookLabel>>,
+    called_events: HashSet<HookLabel>,
     /// The timing the package-hook table gives a left hook's arguments
     /// ([`crate::engine::timing`]).
-    arg_timings: Arc<HashMap<HookLabel, Vec<Option<ArgTiming>>>>,
+    arg_timings: HashMap<HookLabel, Vec<Option<ArgTiming>>>,
 }
 
-impl<'a> ConvergedFns<'a> {
+impl<'a> WalkTables<'a> {
     pub(crate) fn of(
         render: &'a CFG,
-        params: &[Var],
         hooks: &'a [HookEntry],
         provenance: &[HookProvenance],
-        block_states: &HashMap<BlockId, AbstractEnv<StateValue>>,
-        heap: &'a Heap,
         component: ComponentId,
     ) -> Self {
         let bodies: Vec<&CFG> = hooks.iter().filter_map(HookEntry::body_cfg).collect();
@@ -540,87 +450,17 @@ impl<'a> ConvergedFns<'a> {
                 _ => None,
             })
             .collect();
-        ConvergedFns {
-            fns: collect_converged_fns(render, params, block_states, heap, component),
-            closures: HashMap::new(),
+        WalkTables {
             render,
             scopes: must_alias_scopes(render, hooks),
-            heap,
             component,
             hooks,
-            callback_fns: Arc::new(callback_fns),
-            called_events: Arc::new(called_events),
-            arg_timings: Arc::new(crate::engine::timing::left_hook_args(render, hooks)),
+            callback_fns,
+            called_events,
+            arg_timings: crate::engine::timing::left_hook_args(render, hooks),
         }
     }
 
-    /// The same table, with the closures the names of a memo or callback
-    /// body, or of a function literal, may point to, read off the envs of a
-    /// run of each ([`SiteEnvs::closure_envs`], #246). A body no stored env
-    /// covers is reached from any body of the component, so the table is
-    /// every body's.
-    fn with_closures(self, closures: &[ClosureEnv<'_>], heap: &Heap) -> Self {
-        let mut table = HashMap::new();
-        for c in closures {
-            add_converged_fns(&mut table, c.body, c.params, &c.exits, heap, self.component);
-        }
-        ConvergedFns {
-            closures: table,
-            ..self
-        }
-    }
-
-    /// The same table, without the paths whose root `body` binds: there the
-    /// name is the body's own (fail-closed, as `shadowed`) — read off the
-    /// body's converged envs instead, when it has them (`exits`, an effect's
-    /// or a handler's blocks: `get()(x)` in an effect, #46), and off the runs
-    /// of the bodies that keep none (a closure nested in it, #246). The
-    /// render binds the roots the table is about, so it keeps them all.
-    fn seen_from(
-        &self,
-        body: &CFG,
-        exits: Option<&HashMap<BlockId, AbstractEnv<StateValue>>>,
-    ) -> Self {
-        let mut binders = HashSet::new();
-        if !std::ptr::eq(body, self.render) {
-            collect_binders(body, &mut binders);
-        }
-        let mut fns: HashMap<Var, Vec<Arc<CFG>>> = self
-            .fns
-            .iter()
-            .filter(|(path, _)| !binders.contains(path_root(path)))
-            .map(|(path, bodies)| (path.clone(), bodies.clone()))
-            .collect();
-        if let Some(exits) = exits.filter(|_| !binders.is_empty()) {
-            fns.extend(collect_converged_fns(
-                body,
-                &[],
-                exits,
-                self.heap,
-                self.component,
-            ));
-        }
-        for (path, bodies) in &self.closures {
-            let known = fns.entry(path.clone()).or_default();
-            for b in bodies {
-                if !known.iter().any(|k| Arc::ptr_eq(k, b)) {
-                    known.push(Arc::clone(b));
-                }
-            }
-        }
-        ConvergedFns {
-            fns,
-            closures: self.closures.clone(),
-            render: self.render,
-            scopes: self.scopes.clone(),
-            heap: self.heap,
-            component: self.component,
-            hooks: self.hooks,
-            callback_fns: Arc::clone(&self.callback_fns),
-            called_events: Arc::clone(&self.called_events),
-            arg_timings: Arc::clone(&self.arg_timings),
-        }
-    }
     /// The arguments of the hook at `label` when the expansion left it: the
     /// fixpoint hands them, at the hook's marker, to code it does not see
     /// (#254), as a call of an unknown callee hands its own (#262). React
@@ -680,101 +520,12 @@ impl<'a> ConvergedFns<'a> {
     fn callback_fns(&self) -> &HashMap<Var, Arc<CFG>> {
         &self.callback_fns
     }
-
-    /// The closures a call through `path` may run: those at the path, or,
-    /// when its object names no such member, those its members no constant
-    /// names may hold (#76).
-    fn bodies(&self, path: &str) -> Option<&[Arc<CFG>]> {
-        let any = path
-            .rsplit_once('.')
-            .map(|(obj, _)| format!("{obj}.{ANY_MEMBER}"));
-        self.fns
-            .get(path)
-            .or_else(|| self.fns.get(any.as_deref()?))
-            .map(Vec::as_slice)
-    }
-
-    /// The closures held under the members of the object at `path`, at any
-    /// depth (`opts.onRun`, `opts.cbs.0`): what handing that object over
-    /// hands along with it (#264).
-    fn member_bodies(&self, path: &str) -> Vec<&Arc<CFG>> {
-        let prefix = format!("{path}.");
-        let mut paths: Vec<&Var> = self.fns.keys().filter(|p| p.starts_with(&prefix)).collect();
-        paths.sort();
-        let mut bodies: Vec<&Arc<CFG>> = Vec::new();
-        for b in paths.into_iter().flat_map(|p| &self.fns[p]) {
-            if !bodies.iter().any(|k| Arc::ptr_eq(k, b)) {
-                bodies.push(b);
-            }
-        }
-        bodies
-    }
-
-    /// A call of `fn_` surely runs `body`: the table has no other closure
-    /// for it, and the callee is certainly bound to that literal.
-    fn certain(&self, fn_: &Expr, body: &Arc<CFG>) -> bool {
-        matches!(
-            crate::ir::bindings::must_member_binding(fn_, self.render, &self.scopes),
-            Some(Expr::FnLit { body_cfg, .. }) if Arc::ptr_eq(body_cfg, body)
-        )
-    }
-}
-
-/// Every closure of `component` a name or member path of `cfg` may point to
-/// in some block's converged env (#233): `api.inc` for a hook's or a memo's
-/// returned object, `inc` destructured off a memo. A call through the path
-/// may run any of them — the writer relation walks each body
-/// ([`ConvergedFns`]). Another component's closure stays a carried setter
-/// prop: its body names that component's bindings.
-fn collect_converged_fns(
-    cfg: &CFG,
-    params: &[Var],
-    block_states: &HashMap<BlockId, AbstractEnv<StateValue>>,
-    heap: &Heap,
-    component: ComponentId,
-) -> HashMap<Var, Vec<Arc<CFG>>> {
-    let mut result: HashMap<Var, Vec<Arc<CFG>>> = HashMap::new();
-    add_converged_fns(&mut result, cfg, params, block_states, heap, component);
-    result
-}
-
-/// [`collect_converged_fns`] into `result`, beside what other bodies put
-/// there.
-fn add_converged_fns(
-    result: &mut HashMap<Var, Vec<Arc<CFG>>>,
-    cfg: &CFG,
-    params: &[Var],
-    block_states: &HashMap<BlockId, AbstractEnv<StateValue>>,
-    heap: &Heap,
-    component: ComponentId,
-) {
-    for_each_converged_path(cfg, params, block_states, heap, |name, ev| {
-        let mut ids: Vec<_> = ev.locs().into_iter().flatten().copied().collect();
-        ids.sort();
-        for id in ids {
-            if let Some(HeapValue::Fn {
-                body_cfg, owner, ..
-            }) = heap.get(id)
-                && *owner == component
-            {
-                let bodies = result.entry(name.clone()).or_default();
-                if !bodies.iter().any(|b| Arc::ptr_eq(b, body_cfg)) {
-                    bodies.push(Arc::clone(body_cfg));
-                }
-            }
-        }
-    });
 }
 
 /// The last segment of the member path that stands for every member an
 /// object holds under no constant name (`api.*`). No identifier is `*`, so
 /// no callee path ends with it.
 const ANY_MEMBER: &str = "*";
-
-/// The variable a member path is rooted at: `api` for `api.inc`.
-fn path_root(path: &str) -> &str {
-    path.split('.').next().unwrap_or(path)
-}
 
 /// Visit every name `cfg` binds — its `params`, and every name a statement
 /// binds — then every member path of the objects it points to (`api.tick`,
@@ -783,6 +534,12 @@ fn path_root(path: &str) -> &str {
 /// order, names and members sorted (#120). A member the value may hold
 /// without a site saying so — the value is open, or one of its sites does not
 /// record the member — is also visited as ⊤ (#240).
+///
+/// A name is visited once per value it holds: the paths a value leads to,
+/// and their values, depend on that value and the heap alone, so a block
+/// where the name holds a value an earlier block gave it would repeat a
+/// visit already made. Each visitor only collects what it is shown, so what
+/// it collects is the same.
 fn for_each_converged_path(
     cfg: &CFG,
     params: &[Var],
@@ -805,11 +562,17 @@ fn for_each_converged_path(
     let mut var_names: Vec<Var> = var_names.into_iter().collect();
     var_names.sort();
 
+    let mut visited: HashMap<&Var, Vec<EnvVal<StateValue>>> = HashMap::new();
     for env in cfg.blocks.keys().filter_map(|b| block_states.get(b)) {
         for var in &var_names {
             let Some(ev) = env.lookup_env_val(var) else {
                 continue;
             };
+            let values = visited.entry(var).or_default();
+            if values.contains(&ev) {
+                continue;
+            }
+            values.push(ev.clone());
             let mut stack: Vec<(Var, EnvVal<StateValue>)> = vec![(var.clone(), ev)];
             let mut seen: HashSet<crate::ir::types::ExprId> = HashSet::new();
             while let Some((name, ev)) = stack.pop() {
@@ -837,7 +600,7 @@ fn for_each_converged_path(
                     .collect();
                 for m in members.into_iter().rev() {
                     let path = format!("{name}.{m}");
-                    let (entries, open) = heap.members(&fresh, m);
+                    let (entries, open) = heap.members(&fresh, Some(m));
                     if open {
                         stack.push((path.clone(), EnvVal::Val(StateValue::top())));
                     }
@@ -877,189 +640,18 @@ pub(crate) fn callee_path(fn_: &Expr) -> Option<Var> {
     }
 }
 
-/// The setters calling a value with these contents may write: the value
-/// itself, or the closures it may point to that captured one (the parent
-/// passed `() => setCount(0)` as a prop) — one per closure, the first setter
-/// it captured, as before. A value that may be several (two call sites, two
-/// setters) is each of them, and provably none: `must_write` needs one, and a
-/// value that may be something else than a setter (#233) writes none surely,
-/// nor does one that may be a function no site places (#240).
-/// Allocation sites and captures are hash sets/maps, so both are walked in
-/// sorted order (#120).
-fn setter_of(ev: &EnvVal<StateValue>, heap: &Heap) -> Vec<SetterProp> {
-    let open = ev.sites().is_some_and(|s| s.open);
-    let val = ev.as_val();
-    let mut out: Vec<SetterProp> = val
+/// The setters a value with these contents may be: a value that may be
+/// several (two call sites, two setters) is each of them.
+fn setter_of(ev: &EnvVal<StateValue>) -> Vec<SetterProp> {
+    let mut out: Vec<SetterProp> = ev
+        .as_val()
         .setters()
         .into_iter()
-        .map(|(component, label)| SetterProp {
-            component,
-            label,
-            must_write: val.surely_setter(),
-            closure: false,
-            closure_owner: None,
-        })
+        .map(|(component, label)| SetterProp { component, label })
         .collect();
-    let mut ids: Vec<_> = ev.locs().into_iter().flatten().copied().collect();
-    ids.sort();
-    for id in ids {
-        if let Some(HeapValue::Fn {
-            captured,
-            body_cfg,
-            owner,
-            ..
-        }) = heap.get(id)
-        {
-            let mut caps: Vec<_> = captured.iter().collect();
-            caps.sort_by_key(|(k, _)| *k);
-            if let Some((name, (component, label))) = caps
-                .into_iter()
-                .find_map(|(name, val)| val.as_setter().map(|s| (name, s)))
-            {
-                out.push(SetterProp {
-                    component: *component,
-                    label: *label,
-                    must_write: !open && body_writes(body_cfg, name),
-                    closure: true,
-                    closure_owner: Some(*owner),
-                });
-            }
-        }
-    }
-    out.sort_by_key(|p| (p.component, p.label, p.closure));
-    out.dedup_by_key(|p| (p.component, p.label, p.closure));
-    if out.len() > 1 {
-        for p in &mut out {
-            p.must_write = false;
-        }
-    }
+    out.sort_by_key(|p| (p.component, p.label));
+    out.dedup();
     out
-}
-
-/// Does `var` still denote a component setter **at this call**?
-///
-/// [`collect_component_setter_vars`] is an existential over program points: it
-/// answers "somewhere in this body, `var` held a parent's setter". For a *call
-/// site* that is the wrong question, and the gap is not academic — a variable
-/// reassigned to a plain function before the call was still reported as a write
-/// into the parent's slot, at **Error** (#119):
-///
-/// ```jsx
-/// let f = () => {};
-/// if (cond) { f = onUpdate; }
-/// f = () => {};   // at the call below, `f` is definitely not the setter
-/// f();            // reported as a cross-component write anyway
-/// ```
-///
-/// **The abstract env cannot answer this.** At the call block of
-/// `if (cond) { f = onUpdate; } f();` the env holds the *join* of the arrow and
-/// the setter, and that join drops setter-ness — which is precisely why the
-/// existential map exists. So "the env says non-setter" is not a proof; it is
-/// what a lossy join looks like, and refuting on it deletes true findings.
-///
-/// What *is* a proof is local and syntactic: an assignment to `var`, in this
-/// same block, textually before the call, whose right-hand side is a function
-/// literal that mentions no setter. It dominates the call trivially, no
-/// dataflow needed, and it is the only shape this refutes.
-pub(crate) fn setter_reassigned_before_call(
-    block: &crate::ir::cfg::BasicBlock,
-    var: &Var,
-    call_span: Option<SourceRange>,
-    setter_vars: &HashSet<Var>,
-) -> bool {
-    let mut refuted = false;
-    for stmt in &block.stmts {
-        // Stop at the call itself: what happens after it cannot refute it.
-        if let Stmt::ExprStmt(_, span) = stmt
-            && call_span.is_some()
-            && *span == call_span
-        {
-            break;
-        }
-        let (Stmt::Assign { var: v, rhs, .. } | Stmt::Let { var: v, rhs, .. }) = stmt else {
-            continue;
-        };
-        if v != var {
-            continue;
-        }
-        // Only a function literal that mentions no setter refutes. Anything
-        // else — another setter, an opaque call, a name this walk cannot see
-        // through — puts the variable back to unknown, and unknown keeps the
-        // existential.
-        refuted = match rhs.peel_ts() {
-            Expr::FnLit { body_cfg, .. } => {
-                let mut used: HashSet<Var> = HashSet::new();
-                body_cfg.for_each_expr(&mut |e| collect_used_vars(e, &mut used));
-                setter_vars.iter().all(|s| !used.contains(s))
-            }
-            _ => false,
-        };
-    }
-    refuted
-}
-
-/// Does calling this function body write `setter`, in the body's own pass?
-///
-/// The distinction a capture alone cannot make: `() => setCount(0)` calls what
-/// it captured, `(nodes) => nodes.map(n => <b onClick={() => onFileClick(n)}/>)`
-/// only hands it on. The walk already answers exactly this question, so ask it
-/// rather than guess from the shape of the binding.
-fn body_writes(body_cfg: &CFG, setter: &Symbol) -> bool {
-    let vars: HashSet<Var> = std::iter::once(setter.clone()).collect();
-    collect_setter_calls(body_cfg, &vars)
-        .iter()
-        .any(|c| c.class == SetterCallPhase::Sync)
-}
-
-/// Cross-component setter props: the [`collect_component_setter_vars`] result
-/// restricted to setters owned by a component *other* than `component`. A
-/// component passing its own setter down as a prop is not a cross-component
-/// write, so self-owned entries are filtered out. Shared by the two rules that
-/// reason about parent setters called in render (`infinite-loop`,
-/// `setter-in-render`).
-pub(crate) fn cross_component_setters(
-    comp: &AnalysisResult<StateValue>,
-    component: ComponentId,
-) -> HashMap<Var, Vec<SetterProp>> {
-    collect_component_setter_vars(
-        &comp.render_cfg,
-        std::slice::from_ref(&comp.param),
-        &comp.block_states,
-        &comp.heap,
-    )
-    .into_iter()
-    .filter_map(|(v, props)| {
-        let foreign: Vec<SetterProp> = props
-            .into_iter()
-            .filter(|p| p.component != component)
-            .collect();
-        (!foreign.is_empty()).then_some((v, foreign))
-    })
-    .collect()
-}
-
-/// The setters a call through each name or member path of `comp` may write,
-/// read off the converged values: another component's setter, or this one's
-/// when the value is the setter itself — `t[1]`, `api.setV`, a member a
-/// nested or memoized destructuring reads (#216, #233). A closure of this
-/// component over an own setter is not one: its body is walked instead. A
-/// child's closure over it, which a prop ref brings back, is (#270). The
-/// writer relation and `setter-in-render` read the same table.
-pub(crate) fn converged_call_targets(
-    converged: &HashMap<Var, Vec<SetterProp>>,
-    component: ComponentId,
-) -> HashMap<Var, Vec<SetterProp>> {
-    converged
-        .iter()
-        .filter_map(|(v, props)| {
-            let targets: Vec<SetterProp> = props
-                .iter()
-                .filter(|p| p.component != component || p.closure_owner != Some(component))
-                .cloned()
-                .collect();
-            (!targets.is_empty()).then(|| (v.clone(), targets))
-        })
-        .collect()
 }
 
 /// The subset of `bindings` whose name is bound exactly once, to a function
@@ -1390,6 +982,34 @@ pub(crate) fn all_setter_labels(comp: &AnalysisResult<StateValue>) -> SetterTarg
     setter_labels_of(&comp.render_cfg, &comp.hooks)
 }
 
+/// [`all_setter_labels`], with the member paths the converged values put one
+/// of the component's own setters behind: `t.1` of a stored pair (`const t =
+/// useState(0)`, `const t = [v, setV]`), `api.setV` (#288). The reading the
+/// writer relation and `setter-in-render` make of a call through a path
+/// ([`RenderSetterSites`]), for a rule that matches setter calls by name: a
+/// path holding a closure over a setter is not one, its body is walked.
+pub(crate) fn setter_targets_with_paths(comp: &AnalysisResult<StateValue>) -> SetterTargets {
+    let mut targets = all_setter_labels(comp);
+    let converged = collect_component_setter_vars(
+        &comp.render_cfg,
+        std::slice::from_ref(&comp.param),
+        &comp.block_states,
+        &comp.heap,
+    );
+    for (path, props) in converged {
+        // A name is the may table's: only a member path is added.
+        if !path.contains('.') {
+            continue;
+        }
+        for p in props {
+            if p.component == comp.component {
+                targets.0.entry(path.clone()).or_default().insert(p.label);
+            }
+        }
+    }
+    targets
+}
+
 /// [`all_setter_labels`] over a render body and its hook table, before they
 /// are an [`AnalysisResult`] — what the fixpoint reads to store its relations.
 pub(crate) fn setter_labels_of(render_cfg: &CFG, hooks: &[HookEntry]) -> SetterTargets {
@@ -1507,6 +1127,12 @@ pub struct SlotWriter {
     /// The setter variable at the call site (an alias chain resolves it to
     /// `slot`; a spliced wrapper's `setter#salt` param resolves too).
     pub setter: Var,
+    /// `setter` spells a value that reaches the setter — an object or an
+    /// array holding it, handed to a callee; a closure of another component
+    /// calling it — not the setter itself. A message names the slot's
+    /// setter then, and `setter` as what the write went through
+    /// ([`SlotWriter::named`]).
+    pub carried: bool,
     /// Witness call-site span.
     pub span: Option<SourceRange>,
     pub region: WriterRegion,
@@ -1534,7 +1160,8 @@ pub struct SlotWriter {
     /// so a reader that resolves it against this component's tables names an
     /// unrelated slot (ADR-030 §3); every native reader filters on `owner`.
     /// A foreign row is a may-write: the prop may be a closure that merely
-    /// carries the setter.
+    /// carries the setter. `Some(ComponentId::STORE)`: a write of the store
+    /// (ADR-046), whose `setter` is how the source spells the mover.
     pub owner: Option<ComponentId>,
     /// The block of the region's CFG the write runs in, for a write that runs
     /// synchronously in the region, once per pass — what `must_on_all_paths`
@@ -1548,8 +1175,56 @@ pub struct SlotWriter {
     /// scheduling statement (#160). `None` for a row with no placeable
     /// block.
     pub guard_block: Option<BlockId>,
+    /// The block of the region's CFG a write that surely runs at least once
+    /// per pass of it sits in: `block`, or a repeating site the call relation
+    /// is sure of — a callback a receiver surely runs (#248), a block in a
+    /// loop. What `setter-in-render` certifies with dominance, which a loop
+    /// body that may run no time never has: one run of the write is the loop.
+    pub placed: Option<BlockId>,
+    /// The body a synchronous write sits in — its allocation site, `None`
+    /// for the region's own CFG — and its block there, never moved to the
+    /// call that runs the body: where the write's own guards are (#269).
+    pub own: Option<(Option<crate::ir::types::ExprId>, BlockId)>,
+    /// The write's phase is ⊤ only because it runs from a JSX prop or a
+    /// registered listener in a program that dispatches events itself
+    /// (#219): an event handler in a program that does not.
+    pub listener: bool,
+    /// The write sits in the body of an accessor of a literal (#321): its
+    /// half and the member it defines (`None`: a computed name). It runs at
+    /// a read (a getter) or a write (a setter) of that member, wherever one
+    /// happens.
+    pub accessor: Option<AccessorOf>,
     /// What the write stores (ADR-042 §2).
     pub written: Written,
+}
+
+/// An accessor's half and the member it defines (`None`: a computed name).
+pub type AccessorOf = (crate::ir::expr::Accessor, Option<Var>);
+
+impl SlotWriter {
+    /// A write of the store (ADR-046), not of any component's slot.
+    pub fn writes_store(&self) -> bool {
+        self.owner == Some(ComponentId::STORE)
+    }
+
+    /// How a message names the setter this row writes through (D2), a row
+    /// of `component`: its spelling at the call when that is the setter;
+    /// else the slot's setter — `None` when the source binds it to no name
+    /// — and the spelling, what the write went through. Never a value that
+    /// is not a setter as one.
+    pub fn named(
+        &self,
+        calls: &CallRelation,
+        component: ComponentId,
+    ) -> (Option<Var>, Option<&Var>) {
+        match self.carried {
+            false => (Some(self.setter.clone()), None),
+            true => {
+                let slot = (self.owner.unwrap_or(component), self.slot);
+                (calls.slot_name(slot).cloned(), Some(&self.setter))
+            }
+        }
+    }
 }
 
 /// Provenance of one write site (ADR-027 §4).
@@ -1643,7 +1318,7 @@ fn callback_bodies(hooks: &[HookEntry]) -> HashMap<HookLabel, Arc<CFG>> {
 /// React hands back a function that runs it, and runs it nowhere else: the
 /// returned function calls the latest render's argument, and throws when
 /// called during a render.
-fn effect_event_args<'a>(
+pub(crate) fn effect_event_args<'a>(
     hooks: &'a [HookEntry],
     provenance: &[HookProvenance],
 ) -> HashMap<HookLabel, &'a Expr> {
@@ -1771,7 +1446,10 @@ fn callback_bound_vars(
 /// a fact that must survive the collapse: being reached from two call sites is
 /// co-execution.
 fn dedup_source_sites(sites: &mut Vec<WriteSite>) {
-    let mut seen: HashMap<(Var, SourceRange, WalkClass), usize> = HashMap::new();
+    // A site the relation keys by its slot is that slot's, however spelled.
+    type Key = (Slot, SourceRange, WalkClass);
+    let key = |site: &WriteSite, span: SourceRange| -> Key { (site.slot, span, site.class) };
+    let mut seen: HashMap<Key, usize> = HashMap::new();
     let mut out: Vec<WriteSite> = Vec::with_capacity(sites.len());
     for site in std::mem::take(sites) {
         // A site with no span cannot be identified with another; keep it.
@@ -1779,10 +1457,14 @@ fn dedup_source_sites(sites: &mut Vec<WriteSite>) {
             out.push(site);
             continue;
         };
-        match seen.get(&(site.var.clone(), span, site.class)) {
-            Some(&i) => out[i].repeats = true,
+        let k = key(&site, span);
+        match seen.get(&k) {
+            Some(&i) => {
+                out[i].repeats = true;
+                out[i].listener &= site.listener;
+            }
             None => {
-                seen.insert((site.var.clone(), span, site.class), out.len());
+                seen.insert(k, out.len());
                 out.push(site);
             }
         }
@@ -1860,82 +1542,34 @@ fn class_phase(class: WalkClass, region: WriterRegion) -> WriterPhase {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_slot_writers(
     render_cfg: &CFG,
-    params: &[Var],
     hooks: &[HookEntry],
     regions: &InlineRegions,
     hook_provenance: &[crate::ir::hooks::HookProvenance],
-    converged: &HashMap<Var, Vec<SetterProp>>,
+    calls: &CallRelation,
     envs: &SiteEnvs<'_>,
     reducers: &crate::engine::Reducers<'_>,
     dispatches: bool,
 ) -> Vec<SlotWriter> {
-    // Every name a write can go through, with the slots it may write and their
-    // owner — a local name bound to two setters on two paths writes one of
-    // them (#202). A local binding wins a tie (ADR-030 §1). The converged values
-    // (`collect_component_setter_vars`) are read beside the syntactic alias
-    // map: every render binding and member path holding a setter, so an
-    // alias holds the same setter value. An own slot is taken only from a
-    // name that IS the setter — `t[1](0)`, `api.setV(0)` on a hook's result
-    // (#233); a closure over one is walked through its body instead.
-    // A name a converged value binds to several setters (a prop two call
-    // sites pass, #175) writes one of them: a row per candidate. `carried`:
-    // the write runs a closure that captured the setter (`bump={() =>
-    // setN(n + 1)}`), and the call's own argument is not what it stores.
-    let mut targets: HashMap<Var, Vec<Target>> = HashMap::new();
-    for (v, slot) in setter_labels_of(render_cfg, hooks).pairs() {
-        targets.entry(v.clone()).or_default().push(Target {
-            owner: None,
-            slot,
-            carried: false,
-            sure: true,
-        });
-    }
-    let add_converged = |targets: &mut HashMap<Var, Vec<Target>>,
-                         converged: &HashMap<Var, Vec<SetterProp>>| {
-        for (v, props) in converged_call_targets(converged, envs.component) {
-            if targets.contains_key(&v) {
-                continue;
-            }
-            let candidates: Vec<Target> = props
-                .iter()
-                .map(|p| Target {
-                    owner: (p.component != envs.component).then_some(p.component),
-                    slot: p.label,
-                    carried: p.closure,
-                    sure: p.must_write,
-                })
-                .collect();
-            targets.insert(v, candidates);
-        }
-    };
-    add_converged(&mut targets, converged);
-    // A name a body with no per-block envs binds — a memo's or a callback's,
-    // a closure's nested in any body, `get()`'s temp in a `forEach` callback
-    // — is read off a run of that body from the env it is reached from
-    // (#246). Any body may reach such a body (a callback called in an
-    // effect, a memo's closure run by one), so the names are every region's.
-    let (closures, closure_heap) = envs.closure_envs(render_cfg, hooks);
-    add_converged(
-        &mut targets,
-        &setter_vars_over(
-            closures.iter().map(|c| (c.body, c.params, &c.exits)),
-            &closure_heap,
-        ),
-    );
+    // What every call writes and runs is the call relation's (ADR-047): a
+    // site is keyed by the slot it writes, with its owner, whatever name it
+    // is spelled with, and a call through a value two contexts bind to two
+    // setters writes either (#175, #202) — a row per slot, placed only where
+    // the relation is sure. No name table: a name another body binds is
+    // never read as this one's (#287), and one slot spelled two ways is one
+    // row (D2).
     // A write of the slot's own read stores its content (`written::classify`),
     // a must fact: the name is bound once, in render, to the read, and no
     // other body — a hook body, a closure, a callback's parameter — binds it
     // (#210). The alias map above stays the may reading that finds writes.
     let elsewhere = must_alias_scopes(render_cfg, hooks);
     let must_read = |e: &Expr| crate::ir::bindings::must_slot_read(e, render_cfg, &elsewhere);
-    // Any local binding of a deferring global's name disables its summary,
-    // wherever the call sits (fail-closed across every body, nested `FnLit`
-    // scopes included).
-    let mut shadowed: HashSet<Var> = HashSet::new();
-    for cfg in std::iter::once(render_cfg).chain(hooks.iter().filter_map(|h| h.body_cfg())) {
-        collect_binders(cfg, &mut shadowed);
-    }
-
+    // Every name a body other than the render binds: what a write in a body
+    // reached through a value may read from outside the region ([`Foreign`]).
+    let bound_elsewhere: HashSet<Var> = elsewhere
+        .iter()
+        .flat_map(|(params, body)| crate::ir::bindings::own_names(params, body))
+        .map(str::to_string)
+        .collect();
     // A hook body's rows carry the hook's own origin first when the hook was
     // inlined — the body arrived through `expand_custom_hooks`, so every
     // write in it is wrapper-mediated.
@@ -1946,38 +1580,8 @@ pub(crate) fn collect_slot_writers(
             .map(|p| &p.origin_hook)
     };
 
-    // Render-scope function bindings that clear the single-binding bar across
-    // every body below — the same certificate a consumer needs before it may
-    // treat a name as the function it was bound to (ADR-023 §3, #103).
-    let hook_bodies: Vec<&CFG> = hooks.iter().filter_map(|h| h.body_cfg()).collect();
-    let callback_bodies = callback_bodies(hooks);
-    let mut outer_fns: HashMap<Var, Arc<CFG>> = collect_fn_bindings(render_cfg)
-        .into_iter()
-        .filter(|(v, _)| {
-            crate::ir::bindings::certified_fn_binding(v, render_cfg, &hook_bodies).is_some()
-        })
-        .collect();
-    // What no single binding certifies, the converged values may still point
-    // at: a closure behind a member path (`api.inc()`) or a memo's member.
-    let converged_fns = ConvergedFns::of(
-        render_cfg,
-        params,
-        hooks,
-        hook_provenance,
-        envs.render_exits,
-        envs.heap,
-        envs.component,
-    )
-    .with_closures(&closures, &closure_heap);
-    // `const inc = useCallback(…)` binds a `CallbackVal`, not an `FnLit`, so
-    // the literal certificate never sees it — and a memoized updater read as ⊤
-    // fired the non-functional rules on correct code.
-    outer_fns.extend(
-        converged_fns
-            .callback_fns()
-            .iter()
-            .map(|(v, b)| (v.clone(), Arc::clone(b))),
-    );
+    // The syntax tables every walk of the component reads.
+    let tables = WriterTables::of(render_cfg, hooks, hook_provenance, envs.component);
 
     // A write reached through a function name is authored where that function
     // is defined, and a name can carry a closure out of the region it was
@@ -2008,7 +1612,12 @@ pub(crate) fn collect_slot_writers(
     };
 
     let mut out: Vec<SlotWriter> = Vec::new();
-    let push_sites = |region: WriterRegion, cfg: &CFG, out: &mut Vec<SlotWriter>| {
+    // `params`: the body's parameters (a callback's), which no env binds.
+    let push_sites = |region: WriterRegion,
+                      cfg: &CFG,
+                      params: &[Var],
+                      out: &mut Vec<SlotWriter>,
+                      stores: &mut Vec<SlotWriter>| {
         let (cfg_key, hook_origin) = match region {
             WriterRegion::Render => (None, None),
             WriterRegion::Effect(l)
@@ -2016,31 +1625,13 @@ pub(crate) fn collect_slot_writers(
             | WriterRegion::Callback(l)
             | WriterRegion::Handler(l) => (Some(l), inlined_origin(l)),
         };
-        let effect_body = matches!(region, WriterRegion::Effect(_));
-        // A name the body binds is read in the body's own converged envs,
-        // where it has them — an effect's or a handler's blocks: the value
-        // `get()` returns in `get()(x)` is a name no render env holds (#46).
-        let exits = match region {
-            WriterRegion::Effect(l) => envs.effect_exits.get(&l),
-            WriterRegion::Handler(l) => envs.handler_exits.get(&l),
+        // An effect returns its cleanup, which the relation keeps at the
+        // effect's hook site.
+        let cleanup = match region {
+            WriterRegion::Effect(l) => Some(envs.component.hook_site(l)),
             _ => None,
         };
-        let mut targets = targets.clone();
-        if let Some(exits) = exits {
-            let own = collect_component_setter_vars(cfg, &[], exits, envs.heap);
-            add_converged(&mut targets, &own);
-        }
-        let setter_vars: HashSet<Var> = targets.keys().cloned().collect();
-        let mut sites = collect_write_sites(
-            cfg,
-            &setter_vars,
-            effect_body,
-            dispatches,
-            &shadowed,
-            &outer_fns,
-            &converged_fns.seen_from(cfg, exits),
-            &callback_bodies,
-        );
+        let (mut sites, store_sites) = tables.write_sites(cfg, calls, cleanup, dispatches);
         // One source site is one row. A local helper called twice pulls its
         // inner write in twice, and both copies name the same source span —
         // the same write, not two. They collapse, but their facts join first:
@@ -2053,15 +1644,12 @@ pub(crate) fn collect_slot_writers(
         // resolving one in the region CFG answers about an unrelated block.
         // Only sync sites can co-execute within a tick — a deferred or handler
         // write is a separate turn by construction.
-        let mut sync_blocks: HashMap<(Option<ComponentId>, HookLabel), Vec<BlockId>> =
-            HashMap::new();
+        let mut sync_blocks: HashMap<Slot, Vec<BlockId>> = HashMap::new();
         for s in &sites {
             if s.class == WalkClass::Sync
-                && let (Some(ts), Some(b)) = (targets.get(&s.var), s.prov_block)
+                && let Some(b) = s.prov_block
             {
-                for t in ts {
-                    sync_blocks.entry((t.owner, t.slot)).or_default().push(b);
-                }
+                sync_blocks.entry(s.slot).or_default().push(b);
             }
         }
         let reach = Reachability::of(cfg);
@@ -2091,22 +1679,35 @@ pub(crate) fn collect_slot_writers(
                 None
             }
         };
-        for (site, target, sole) in sites.into_iter().flat_map(|s| {
-            let ts = targets.get(&s.var).cloned().unwrap_or_default();
-            let sole = matches!(ts.as_slice(), [t] if t.sure);
-            ts.into_iter().map(move |t| (s.clone(), t, sole))
-        }) {
-            let Target {
-                owner,
-                slot,
-                carried,
-                ..
-            } = target;
+        // Where a site is authored (ADR-027 §4): the inlined hook's origin and
+        // the splice regions its block sits in, else where the names it went
+        // through are defined. A site with no placeable block, and none of
+        // those, never claims Direct; the defensive entry-graft poisons Direct
+        // in the render CFG (fail-closed).
+        let via_of = |prov: Option<BlockId>, through: &[Var]| {
+            let mut chain: Vec<Symbol> = hook_origin.into_iter().cloned().collect();
+            match prov {
+                Some(b) => chain.extend(regions.chain(cfg_key, b)),
+                None if chain.is_empty() => return WriteProvenance::Unknown,
+                None => {}
+            }
+            if !chain.is_empty() {
+                WriteProvenance::Via(chain)
+            } else if cfg_key.is_none() && regions.render_poisoned {
+                WriteProvenance::Unknown
+            } else {
+                authored(cfg, cfg_key, through)
+            }
+        };
+        for site in sites {
+            // Every site of this walk is the relation's, keyed by its slot.
+            let (target_owner, slot) = site.slot;
+            let owner = (target_owner != envs.component).then_some(target_owner);
             let same_tick = site.repeats
                 || match (site.class, site.prov_block) {
                     (WalkClass::Sync, Some(b)) => {
                         let blocks = sync_blocks
-                            .get(&(owner, slot))
+                            .get(&(target_owner, slot))
                             .map_or(&[][..], Vec::as_slice);
                         // Co-execution is symmetric — "these two land in the
                         // same tick" does not care which runs first — so the
@@ -2120,116 +1721,136 @@ pub(crate) fn collect_slot_writers(
                     }
                     _ => false,
                 };
-            let updater = site.updater.clone();
+            // A name the argument reads from another body holds nothing this
+            // region knows (#310): ⊤ in the value, no binding certificate, no
+            // updater body resolved by that name, and no spelling a proof may
+            // read in this region's scope.
+            let hides =
+                |v: &str| site.foreign.hides(v, &bound_elsewhere) || params.iter().any(|p| p == v);
+            let reads_hidden = |e: &Expr| {
+                let mut read = HashSet::new();
+                crate::ir::free_vars::collect_used_vars(e, &mut read);
+                read.iter().any(|v| hides(v))
+            };
+            let updater = match (&site.updater, site.arg.as_ref().map(Expr::peel_ts)) {
+                (Updater::Functional(_), Some(Expr::Var(v))) if hides(v) => Updater::Unknown,
+                (u, _) => u.clone(),
+            };
             // A position only a write that runs synchronously in this region,
             // once per pass, can claim: a repeating site runs 0..N times and
             // every other class runs on another turn or in another CFG.
             let at = (site.class == WalkClass::Sync && !site.repeats)
                 .then_some(site.at)
                 .flatten();
-            // A call through a name with several targets writes one of them,
-            // and one through a name that may be something else may write
-            // none: no slot is surely written there.
-            let block = at.map(|(b, _)| b).filter(|_| sole);
-            let target = (owner.unwrap_or(envs.component), slot);
-            let written = match reducers.get(target.0, target.1) {
+            // A call with several targets writes one of them, and one through
+            // a value that may be something else may write none: the walk
+            // placed a site only where the relation is sure of its one slot.
+            let block = at.map(|(b, _)| b);
+            let mut written = match reducers.get(target_owner, slot) {
                 Some(reducer) => written::dispatched(&reducer),
-                None if carried || site.applied => written::carried(),
+                None if site.applied => written::carried(),
                 None => written::classify(
                     site.arg.as_ref(),
-                    &site.updater,
+                    &updater,
                     owner.is_none().then_some(slot),
                     class_phase(site.class, region),
-                    must_read,
-                    |e| envs.eval(region, cfg, at, e),
-                    |e| bound(e, at),
+                    |e| (!reads_hidden(e)).then(|| must_read(e)).flatten(),
+                    |e| envs.eval(region, cfg, at, e, &hides),
+                    |e| (!reads_hidden(e)).then(|| bound(e, at)).flatten(),
                 ),
             };
-            let via = {
-                let mut chain: Vec<Symbol> = hook_origin.into_iter().cloned().collect();
-                match site.prov_block {
-                    Some(b) => chain.extend(regions.chain(cfg_key, b)),
-                    // No placeable block — never claim Direct on it.
-                    None if chain.is_empty() => {
-                        out.push(SlotWriter {
-                            slot,
-                            setter: site.var,
-                            span: site.span,
-                            region,
-                            phase: class_phase(site.class, region),
-                            via: WriteProvenance::Unknown,
-                            updater,
-                            same_tick,
-                            owner,
-                            block,
-                            guard_block: site.prov_block,
-                            written,
-                        });
-                        continue;
-                    }
-                    None => {}
-                }
-                if chain.is_empty() {
-                    // The defensive entry-graft poisons Direct in the render
-                    // CFG (fail-closed).
-                    if cfg_key.is_none() && regions.render_poisoned {
-                        WriteProvenance::Unknown
-                    } else {
-                        authored(cfg, cfg_key, &site.through)
-                    }
-                } else {
-                    WriteProvenance::Via(chain)
-                }
-            };
+            if written.expr.as_ref().is_some_and(reads_hidden) {
+                written.expr = None;
+            }
+            let setter = row_name(calls, site.slot, site.var);
             out.push(SlotWriter {
                 slot,
-                setter: site.var,
+                via: via_of(site.prov_block, &site.through),
+                carried: site.carried && calls.slot_name(site.slot) != Some(&setter),
+                setter,
                 span: site.span,
                 region,
                 phase: class_phase(site.class, region),
-                via,
                 updater,
                 same_tick,
                 owner,
                 block,
                 guard_block: site.prov_block,
+                placed: (site.class == WalkClass::Sync)
+                    .then_some(site.at)
+                    .flatten()
+                    .map(|(b, _)| b),
+                own: site.own,
+                listener: site.listener,
+                accessor: site.accessor,
                 written,
+            });
+        }
+        // A write of the store is a may-write of a slot no component owns
+        // (ADR-046): ⊤ value, never `Must`, never killed — a foreign row.
+        for site in store_sites {
+            let at = (site.class == WalkClass::Sync && !site.repeats)
+                .then_some(site.at)
+                .flatten();
+            stores.push(SlotWriter {
+                slot: STORE_SLOT.1,
+                via: via_of(site.prov_block, &site.through),
+                setter: site.callee,
+                carried: false,
+                span: site.span,
+                region,
+                phase: class_phase(site.class, region),
+                updater: Updater::Unknown,
+                same_tick: false,
+                owner: Some(ComponentId::STORE),
+                block: at.map(|(b, _)| b),
+                guard_block: site.prov_block,
+                placed: None,
+                own: None,
+                listener: false,
+                accessor: None,
+                written: written::carried(),
             });
         }
     };
 
-    push_sites(WriterRegion::Render, render_cfg, &mut out);
+    let mut stores: Vec<SlotWriter> = Vec::new();
+    push_sites(WriterRegion::Render, render_cfg, &[], &mut out, &mut stores);
     for hook in hooks {
-        let (region, body) = match hook {
+        let (region, body, params) = match hook {
             HookEntry::Effect {
                 label, body_cfg, ..
-            } => (WriterRegion::Effect(*label), body_cfg),
+            } => (WriterRegion::Effect(*label), body_cfg, &[][..]),
             HookEntry::Memo {
                 label, body_cfg, ..
-            } => (WriterRegion::Memo(*label), body_cfg),
+            } => (WriterRegion::Memo(*label), body_cfg, &[][..]),
             HookEntry::Callback {
-                label, body_cfg, ..
-            } => (WriterRegion::Callback(*label), body_cfg),
+                label,
+                body_cfg,
+                params,
+                ..
+            } => (WriterRegion::Callback(*label), body_cfg, &params[..]),
             HookEntry::Handler {
                 label, body_cfg, ..
-            } => (WriterRegion::Handler(*label), body_cfg),
+            } => (WriterRegion::Handler(*label), body_cfg, &[][..]),
             _ => continue,
         };
-        push_sites(region, body, &mut out);
+        push_sites(region, body, params, &mut out, &mut stores);
     }
-
-    out.sort_by(|a, b| {
-        let key = |w: &SlotWriter| {
-            (
-                w.slot,
-                w.region,
-                w.phase,
-                w.span.map_or((u32::MAX, u32::MAX), |s| s.pos_key()),
-                w.setter.clone(),
-            )
-        };
-        key(a).cmp(&key(b))
-    });
+    let key = |w: &SlotWriter| {
+        (
+            w.slot,
+            w.region,
+            w.phase,
+            w.span.map_or((u32::MAX, u32::MAX), |s| s.pos_key()),
+            w.setter.clone(),
+        )
+    };
+    out.sort_by_key(key);
+    // The store's rows come after every slot's, in the same order.
+    stores.sort_by_key(key);
+    stores.dedup_by(|a, b| key(a) == key(b) && a.via == b.via && a.block == b.block);
+    out.extend(stores);
     out
 }
 
@@ -2245,12 +1866,12 @@ pub(crate) fn collect_slot_writers(
 /// budget no larger than the one it is already being walked at, so the spliced
 /// cycle-free path reaches the same CFGs and `found` only ever grows.
 struct SetterWalk<'a> {
-    setter_vars: &'a HashSet<Var>,
+    /// The names bound to a function literal (a `useCallback` value
+    /// included), read only to prove an updater a function (`set(inc)`).
     fn_bindings: &'a HashMap<Var, Arc<CFG>>,
-    /// Names and member paths the converged values point at closures of this
-    /// component ([`ConvergedFns`]): a call through one may run each body.
-    /// `None` for every consumer without converged values.
-    converged: Option<&'a ConvergedFns<'a>>,
+    /// The component's syntax tables the walk reads ([`WalkTables`]): its
+    /// render, its hooks, the timing of the hooks the expansion left.
+    tables: &'a WalkTables<'a>,
     walking: HashSet<usize>,
     /// The walk's outermost CFG (pointer identity) — where effect cleanup
     /// returns and reified listeners are recognized.
@@ -2258,6 +1879,9 @@ struct SetterWalk<'a> {
     /// The CFG the walk is in (pointer identity), the root or a body it
     /// descended into.
     body: usize,
+    /// The allocation site of the body the walk is in: `Some(None)` for the
+    /// root, `None` for a body reached with no site (a dispatched handler).
+    body_site: Option<Option<crate::ir::types::ExprId>>,
     /// The walked root is an effect body: its top-level `addEventListener`
     /// listeners were reified as Handler entries (`extract_subscriptions`),
     /// and its returned function is its cleanup.
@@ -2300,13 +1924,133 @@ struct SetterWalk<'a> {
     /// it. Each site keeps a copy: a write inside a closure is authored where
     /// the closure is defined, which a name can carry out of its region.
     path: Vec<Var>,
+    /// Also record the writes of the store (ADR-046): the bindings of every
+    /// body on the walk's stack, the render's first, which a mover's name is
+    /// resolved through. `None` for every consumer that does not ask.
+    store_scopes: Option<Vec<HashMap<&'a str, Vec<&'a Expr>>>>,
+    /// Every body on the walk's stack, the root's first ([`Scope`]).
+    scopes: Vec<Scope<'a>>,
+    /// The call relation (ADR-047): what a call runs, what a value handed
+    /// by position holds and what an effect returns are read off it, by
+    /// call id and position — the walk binds nothing and matches no name,
+    /// and a write is keyed by its slot.
+    calls: &'a CallRelation,
+    /// The walked effect's hook site: where the relation keeps what it
+    /// returns ([`crate::engine::calls::CLEANUP`]).
+    cleanup: Option<crate::ir::types::ExprId>,
+    /// The render's names a JSX prop is reified through as a `Handler`
+    /// region ([`handler_names`](crate::lowering::hook_extractor::handler_names)).
+    handlers: &'a HashSet<Var>,
+    /// What each body the walk had no budget to enter may write
+    /// ([`SetterWalk::past_budget`]), computed once.
+    summaries: RefCell<HashMap<crate::ir::types::ExprId, BTreeSet<Slot>>>,
+    /// The walk is below a JSX prop or a registered listener it reads as ⊤
+    /// only because the program dispatches events itself (#219): every site
+    /// it finds is a listener's.
+    listening: bool,
+    /// The walk is in the body of an accessor of a literal (#321), entered
+    /// where the literal is written: every site it finds runs at a read or a
+    /// write of that member.
+    accessor: Option<AccessorOf>,
+}
+
+/// A body on the walk's stack.
+struct Scope<'a> {
+    body: &'a CFG,
+    /// The names a write in or below it reads from outside the region's env
+    /// ([`Foreign`]; `None` is [`Foreign::Any`]).
+    names: Option<BTreeSet<Var>>,
+    /// The body is another component's: every name it reads is foreign.
+    other_component: bool,
+}
+
+impl<'a> Scope<'a> {
+    /// The walk's outermost body, which binds nothing the region's env does
+    /// not hold.
+    fn root(body: &'a CFG) -> Self {
+        Scope {
+            body,
+            names: Some(BTreeSet::new()),
+            other_component: false,
+        }
+    }
+}
+
+/// What a call hands the body it runs, which binds its parameters, as the
+/// interpreter binds them (#253): `state-mutation`'s receivers (#318), until
+/// that rule reads allocation sites (#323).
+#[derive(Clone, Copy)]
+pub(crate) enum Passed<'a> {
+    /// Nothing the walk follows: a cleanup, a handler, a callee's argument.
+    Nothing,
+    /// The call's arguments, by position up to the first spread
+    /// ([`Expr::positional_args`]): an IIFE, a helper called by name.
+    Args(&'a [Expr]),
+    /// What a synchronous array method passes its callback
+    /// ([`callback_args`](crate::domains::interp::interpreter::callback_args)):
+    /// the receiver's entries, an index, and the receiver itself — `reduce`'s
+    /// accumulator first, which is its initial value or what the callback
+    /// returned.
+    Entries { receiver: &'a Expr, method: &'a str },
+}
+
+impl<'a> Passed<'a> {
+    /// What a call through `fn_` with `args` passes the function it is
+    /// handed as argument `index`: the receiver's entries for a synchronous
+    /// array method's callback, nothing the walk follows otherwise.
+    pub(crate) fn to_callback(fn_: &'a Expr, args: &'a [Expr], index: usize) -> Self {
+        match fn_ {
+            Expr::FieldAccess { obj, field }
+                if index == 0
+                    && SYNC_HOF_METHODS.contains(&field.as_str())
+                    && !matches!(args.first(), Some(Expr::Spread(_))) =>
+            {
+                Passed::Entries {
+                    receiver: obj,
+                    method: field,
+                }
+            }
+            _ => Passed::Nothing,
+        }
+    }
+
+    /// The parameters an array method passes an entry to: `reduce`'s
+    /// second, both of `sort`'s, the first of every other.
+    pub(crate) fn entry_positions(method: &str) -> &'static [usize] {
+        match method {
+            "reduce" | "reduceRight" => &[1],
+            "sort" => &[0, 1],
+            _ => &[0],
+        }
+    }
+
+    /// The parameter an array method passes its receiver to: `reduce`'s
+    /// fourth, none of `sort`'s, the third of every other.
+    pub(crate) fn receiver_position(method: &str) -> Option<usize> {
+        match method {
+            "reduce" | "reduceRight" => Some(3),
+            "sort" => None,
+            _ => Some(2),
+        }
+    }
+}
+
+/// How the walk reaches a body ([`SetterWalk::enter`]).
+#[derive(Clone, Copy)]
+enum Reached<'a> {
+    /// A function literal written in the body the walk is in, with its
+    /// parameters: an IIFE, a callback argument, an inline cleanup.
+    Inline(&'a [Var]),
+    /// Through a name or a value: a helper, a `useCallback` body, a closure
+    /// the converged values point at.
+    Named,
+    /// A closure of another component the call relation lists (a parent's
+    /// a child calls): every name it reads is that component's.
+    Other,
 }
 
 /// No bindings to record reads for — every setter consumer.
 static NO_VARS: std::sync::LazyLock<HashSet<Var>> = std::sync::LazyLock::new(HashSet::new);
-
-/// No proven wrappers — every consumer that walks without resolving summaries.
-static NO_WRAPPERS: std::sync::LazyLock<HashSet<String>> = std::sync::LazyLock::new(HashSet::new);
 
 impl SetterWalk<'_> {
     fn collect_reads(&self) -> bool {
@@ -2388,9 +2132,23 @@ struct Found {
     setters: Vec<FoundSite>,
     calls: Vec<FoundCall>,
     reads: Vec<FoundRead>,
+    /// The writes of the store (ADR-046), filled only when the walk carries
+    /// [`SetterWalk::store_scopes`].
+    stores: Vec<StoreSite>,
 }
 
 impl Found {
+    /// Spell every setter site found in a body of another component as
+    /// `spelling`, how this component wrote the value it called or handed:
+    /// a name of that body is no name here (#310), and no message names one.
+    fn spelled(&mut self, spelling: Option<&str>) {
+        for site in &mut self.setters {
+            site.var = spelling.unwrap_or_default().to_string();
+            // What was called or handed is that body, not the setter.
+            site.carried = !site.var.is_empty();
+        }
+    }
+
     /// Splice in the rows of `body`, which runs AT a call site — a directly
     /// called local helper (B6) or an IIFE. A row the inner walk classified
     /// `Sync` runs at that site, so it takes the site's class; it takes the
@@ -2431,7 +2189,36 @@ impl Found {
                 ..read
             });
         }
+        for store in inner.stores {
+            let sync = store.class == WalkClass::Sync;
+            let every_call = store
+                .at
+                .is_some_and(|(b, _)| on_all_paths(body, &HashSet::from([b])));
+            self.stores.push(StoreSite {
+                class: if sync { mode } else { store.class },
+                at: if sync && every_call { at } else { None },
+                prov_block: prov,
+                ..store
+            });
+        }
     }
+}
+
+/// One write of the store the walk saw (ADR-046): a call
+/// [`store::call_writes`](crate::engine::store::call_writes) says writes it,
+/// a `<Navigate/>`, a `location` member write. Its fields mean what a setter
+/// site's do ([`WriteSite`]).
+#[derive(Debug, Clone)]
+pub(crate) struct StoreSite {
+    /// How the source spells the write (`router.push(…)`, `<Navigate/>`,
+    /// `location.href = …`).
+    pub callee: String,
+    pub span: Option<SourceRange>,
+    pub class: WalkClass,
+    pub prov_block: Option<BlockId>,
+    pub at: Option<(BlockId, usize)>,
+    pub repeats: bool,
+    pub through: Vec<Var>,
 }
 
 /// One raw read site of a tracked binding the walk saw (#127).
@@ -2452,6 +2239,18 @@ struct FoundCall {
 /// One raw call site the walk saw.
 struct FoundSite {
     var: Var,
+    /// `var` spells a value that reaches the setter — an object holding
+    /// it, a closure calling it — not the setter itself
+    /// ([`SlotWriter::carried`]).
+    carried: bool,
+    /// The slot written, as the call relation names it (ADR-047): a row is
+    /// keyed by its slot, never by the name it is spelled with.
+    slot: Slot,
+    /// The call is surely of that one setter ([`WriteSite::sure`]).
+    sure: bool,
+    /// Found below a JSX prop read as ⊤ only because the program dispatches
+    /// events ([`SetterWalk::listening`]).
+    listener: bool,
     class: WalkClass,
     span: Option<SourceRange>,
     /// The statement the site runs in — block and statement index — `Some`
@@ -2460,10 +2259,10 @@ struct FoundSite {
     /// site inside a nested body records a block of *that* body's CFG, and
     /// `BlockId` is per-CFG.
     at: Option<(BlockId, usize)>,
-    /// The body the call sits in (pointer identity) and its block there, for
-    /// a site its own body runs synchronously; unlike `at`, never moved to
-    /// the call that runs the body.
-    own: Option<(usize, BlockId)>,
+    /// The body the call sits in (its allocation site, `None` for the walked
+    /// root) and its block there, for a site its own body runs synchronously;
+    /// unlike `at`, never moved to the call that runs the body.
+    own: Option<(Option<crate::ir::types::ExprId>, BlockId)>,
     /// The top-level block the walk descended from — always a block of the
     /// walked root, which makes it the only id that means anything in the
     /// region's CFG. Region membership reads it (a nested callback defined
@@ -2478,11 +2277,15 @@ struct FoundSite {
     updater: Updater,
     /// Argument 0 as written, for the value the row stores (ADR-042 §2).
     arg: Option<Expr>,
+    /// The names `arg` may read from a body the region's env does not hold.
+    foreign: Foreign,
     /// The setter is handed to a callee that calls it ([`WriteSite::applied`]).
     applied: bool,
     /// The function names the walk went through to reach the site
     /// ([`SetterWalk::path`]).
     through: Vec<Var>,
+    /// Found in an accessor's body ([`SetterWalk::accessor`]).
+    accessor: Option<AccessorOf>,
 }
 
 /// `Array.prototype` HOFs that call their function argument synchronously —
@@ -2536,7 +2339,7 @@ fn runs_at_least_once(fn_: &Expr, args: &[Expr]) -> bool {
     match field.as_str() {
         "map" | "forEach" | "filter" | "flatMap" | "find" | "findIndex" | "findLast"
         | "findLastIndex" | "some" | "every" => n >= 1,
-        "reduce" | "reduceRight" => n >= 2 || (n >= 1 && args.len() >= 2),
+        "reduce" | "reduceRight" => n >= 2 || (n >= 1 && Expr::positional_args(args).len() >= 2),
         _ => false,
     }
 }
@@ -2742,8 +2545,125 @@ impl<'a> SetterWalk<'a> {
         witness: Option<SourceRange>,
     ) {
         let outer = std::mem::replace(&mut self.body, cfg as *const CFG as usize);
+        if let Some(scopes) = &mut self.store_scopes {
+            scopes.push(crate::ir::bindings::local_bindings(cfg));
+        }
         self.cfg_body(cfg, depth, found, mode, prov, witness);
+        if let Some(scopes) = &mut self.store_scopes {
+            scopes.pop();
+        }
         self.body = outer;
+    }
+
+    /// [`Self::cfg`] for a body the walk enters from the one it is in. A
+    /// write below reads the names `body` binds as its own, never the
+    /// region's ([`Foreign`], #310). A body reached by name captures where
+    /// it is written: in a body on the stack, whose own names the stack
+    /// already accounts for; in the render, which the region's env holds
+    /// except under the names the root rebinds; anywhere else, unknown.
+    ///
+    /// The walk binds nothing: what a call in the body runs is the call
+    /// relation's row for it. `site` is the body's allocation site, `None`
+    /// for a body reached without one (a dispatched handler).
+    #[allow(clippy::too_many_arguments)]
+    fn enter(
+        &mut self,
+        body: &'a CFG,
+        site: Option<crate::ir::types::ExprId>,
+        reached: Reached<'a>,
+        depth: usize,
+        found: &mut Found,
+        mode: WalkClass,
+        prov: Option<BlockId>,
+        witness: Option<SourceRange>,
+    ) {
+        use crate::ir::bindings::{literal_params, own_names};
+        let root = self.scopes[0].body;
+        let render = self.tables.render;
+        let names: Option<BTreeSet<Var>> = match reached {
+            Reached::Other => None,
+            Reached::Inline(params) => Some(own_names(params, body).map(str::to_string).collect()),
+            Reached::Named => {
+                if let Some(params) = self
+                    .scopes
+                    .iter()
+                    .rev()
+                    .find_map(|scope| literal_params(scope.body, body))
+                {
+                    Some(own_names(params, body).map(str::to_string).collect())
+                } else if let Some(params) = literal_params(render, body) {
+                    let mut names: BTreeSet<Var> =
+                        own_names(params, body).map(str::to_string).collect();
+                    names.extend(own_names(&[], root).map(str::to_string));
+                    Some(names)
+                } else {
+                    None
+                }
+            }
+        };
+        self.scopes.push(Scope {
+            body,
+            names,
+            other_component: matches!(reached, Reached::Other),
+        });
+        let outer = std::mem::replace(&mut self.body_site, site.map(Some));
+        self.cfg(body, depth, found, mode, prov, witness);
+        self.body_site = outer;
+        self.scopes.pop();
+    }
+
+    /// The names a write found here reads from outside the region's env.
+    fn foreign(&self) -> Foreign {
+        if self.scopes.iter().any(|s| s.other_component) {
+            return Foreign::All;
+        }
+        let mut out = BTreeSet::new();
+        for scope in &self.scopes {
+            match &scope.names {
+                Some(names) => out.extend(names.iter().cloned()),
+                None => return Foreign::Any,
+            }
+        }
+        Foreign::Names(out)
+    }
+
+    /// Record a write of the store at this site, when the walk records them.
+    #[allow(clippy::too_many_arguments)]
+    fn store_site(
+        &self,
+        callee: String,
+        found: &mut Found,
+        mode: WalkClass,
+        span: Option<SourceRange>,
+        at: Option<(BlockId, usize)>,
+        prov: Option<BlockId>,
+    ) {
+        found.stores.push(StoreSite {
+            callee,
+            span,
+            class: mode,
+            prov_block: prov,
+            at,
+            repeats: self.repeating,
+            through: self.path.clone(),
+        });
+    }
+
+    /// Does calling `fn_` write the store, its names resolved through every
+    /// body on the walk's stack? `false` when the walk does not record them.
+    fn writes_store(&self, fn_: &'a Expr) -> bool {
+        let Some(scopes) = &self.store_scopes else {
+            return false;
+        };
+        let bound = |v: &str| -> Vec<&'a Expr> {
+            scopes
+                .iter()
+                .filter_map(|s| s.get(v))
+                .flatten()
+                .copied()
+                .collect()
+        };
+        crate::engine::store::call_writes(fn_, &bound, crate::engine::store::Forms::Row)
     }
 
     /// [`Self::cfg`], with `self.body` set to `cfg`.
@@ -2801,49 +2721,41 @@ impl<'a> SetterWalk<'a> {
                 // The terminator runs after every statement of the block.
                 let at = block_id.map(|b| (b, block.stmts.len()));
                 match &block.term {
-                    Terminator::Return(expr, _) => {
+                    Terminator::Return(expr, span) => {
+                        // A concise body (`useMemo(() => setV(1))`) is one
+                        // `Return`: with no position to inherit, a row in it
+                        // takes the return's own, never none.
+                        let witness = witness.or(*span);
                         // An effect body's returned function is its cleanup
                         // (ADR-027 §2) — descend it as such, whether inline
                         // or bound to a variable. Without this the cleanup's
                         // writes are invisible to the relation.
-                        if self.effect_body && at_root && mode == WalkClass::Sync {
-                            let (body, name) = match expr {
-                                Expr::FnLit { body_cfg, .. } => (Some(&**body_cfg), None),
-                                Expr::Var(name) => {
-                                    (self.fn_bindings.get(name).map(|b| &**b), Some(name))
-                                }
-                                _ => (None, None),
-                            };
-                            if let Some(body) = body
-                                && depth > 0
-                            {
-                                self.path.extend(name.cloned());
-                                self.cfg(
-                                    body,
-                                    depth - 1,
-                                    found,
-                                    WalkClass::Cleanup,
-                                    prov_block,
-                                    witness,
-                                );
-                                if name.is_some() {
-                                    self.path.pop();
-                                }
-                            }
+                        if self.effect_body && at_root && mode == WalkClass::Sync && depth > 0 {
+                            let anchor = self
+                                .cleanup
+                                .map(|site| (site, crate::engine::calls::CLEANUP));
+                            self.relation_handed(
+                                anchor,
+                                expr,
+                                WalkClass::Cleanup,
+                                None,
+                                depth,
+                                found,
+                                prov_block,
+                                witness,
+                            );
                         }
+                        self.relation_accesses(
+                            *span, expr, depth, found, mode, prov_block, witness,
+                        );
                         self.expr(expr, witness, at, depth, found, mode, at_root, prov_block);
                     }
                     Terminator::Branch { cond, span, .. } => {
-                        self.expr(
-                            cond,
-                            span.or(witness),
-                            at,
-                            depth,
-                            found,
-                            mode,
-                            at_root,
-                            prov_block,
+                        let witness = span.or(witness);
+                        self.relation_accesses(
+                            *span, cond, depth, found, mode, prov_block, witness,
                         );
+                        self.expr(cond, witness, at, depth, found, mode, at_root, prov_block);
                     }
                     _ => {}
                 }
@@ -2917,12 +2829,48 @@ impl<'a> SetterWalk<'a> {
             Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } | Stmt::MemberWrite { rhs, .. } => rhs,
         };
         let span = stmt.span().or(witness);
+        self.relation_accesses(stmt.span(), expr, depth, found, mode, prov, span);
         // `state.items.push(x)` reads `state`: the receiver of a member write
         // is the one read position the rhs does not carry.
         if let Stmt::MemberWrite { obj, key, .. } = stmt {
+            if self.store_scopes.is_some()
+                && crate::engine::store::member_write_writes(
+                    obj,
+                    key,
+                    crate::engine::store::Forms::Row,
+                )
+            {
+                let target = match key {
+                    crate::ir::stmt::MemberKey::Field(f) => format!("{}.{f}", obj.describe()),
+                    crate::ir::stmt::MemberKey::Index(_) => format!("{}[…]", obj.describe()),
+                };
+                self.store_site(format!("{target} = …"), found, mode, span, at, prov);
+            }
             self.expr(obj, span, at, depth, found, mode, at_root, prov);
             if let crate::ir::stmt::MemberKey::Index(idx) = key {
                 self.expr(idx, span, at, depth, found, mode, at_root, prov);
+            }
+            // An accessor a class defines on its instance (#335) runs at any
+            // read or write of its member, as a literal's does: what it
+            // reaches runs here, at an unknown time, anchored at its own
+            // site ([`crate::domains::interp`]'s accessor definition).
+            if let crate::ir::stmt::MemberKey::Field(k) = key
+                && let Some((half, member)) = crate::ir::expr::accessor_of(k)
+                && let Expr::FnLit { id, .. } = expr
+            {
+                let outer = self.accessor.replace((half, member.map(str::to_string)));
+                self.relation_handed(
+                    Some((*id, 0)),
+                    expr,
+                    WalkClass::Unknown,
+                    None,
+                    depth,
+                    found,
+                    prov,
+                    span,
+                );
+                self.accessor = outer;
+                return;
             }
         }
         self.expr(expr, span, at, depth, found, mode, at_root, prov);
@@ -2966,80 +2914,42 @@ impl<'a> SetterWalk<'a> {
         for child in children {
             self.expr(child, stmt_span, at, depth, found, mode, at_root, prov);
         }
+        // A visible mover writes the store wherever it is written (ADR-046).
+        match expr {
+            Expr::Call { fn_, .. } if self.writes_store(fn_) => {
+                self.store_site(expr.describe(), found, mode, stmt_span, at, prov);
+            }
+            Expr::CompApp { name, .. }
+                if self.store_scopes.is_some() && crate::engine::store::element_writes(name) =>
+            {
+                self.store_site(format!("<{name}/>"), found, mode, stmt_span, at, prov);
+            }
+            _ => {}
+        }
         // `new X(cb)` runs its arguments through the same machinery: a
         // `Promise` executor runs synchronously, and a class the body binds
         // is a local helper like any other.
-        if let Expr::Call { fn_, args } | Expr::New { fn_, args, .. } = expr {
-            if let Some(name) = callee_path(fn_)
-                && self.setter_vars.contains(&name)
-            {
-                found.setters.push(FoundSite {
-                    var: name,
-                    class: mode,
-                    span: stmt_span,
-                    at,
-                    own: at.map(|(b, _)| (self.body, b)),
-                    prov_block: prov,
-                    repeats: self.repeating,
-                    updater: self.updater_of(args),
-                    arg: args.first().map(|a| a.peel_ts().clone()),
-                    applied: false,
-                    through: self.path.clone(),
-                });
+        if let Expr::Call { id, fn_, args } | Expr::New { id, fn_, args, .. } = expr {
+            // A call writes and runs what its row lists (ADR-047): nothing
+            // is read off a name. So does a `new` of a program class, whose
+            // construction body the row lists (#335).
+            if matches!(expr, Expr::New { .. }) {
+                self.relation_call(*id, fn_, args, at, depth, found, mode, prov, stmt_span);
             }
-            if let Expr::Var(name) = fn_.as_ref() {
-                // B6: direct call to a locally-bound function — its body runs
-                // in the CURRENT mode, so sync-in-helper writes take this call
-                // site's class and block id; writes the helper defers or
-                // nests keep their own class (a `setTimeout` inside a sync
-                // helper is not a sync write — lifting it was an
-                // under-approximation).
-                if depth > 0
-                    && let Some(body) = self.fn_bindings.get(name)
-                {
-                    // Inner rows' provenance block is this call site. Where
-                    // the helper is *defined* is the relation's question: an
-                    // alias can carry a name out of its region (a hook's
-                    // returned closure), so the name rides on `path`.
-                    let mut inner = Found::default();
-                    self.path.push(name.clone());
-                    self.cfg(
-                        body,
-                        depth - 1,
-                        &mut inner,
-                        WalkClass::Sync,
-                        prov,
-                        stmt_span,
-                    );
-                    self.path.pop();
-                    found.absorb(inner, body, mode, at, prov);
-                }
-            }
-            // A call through a name or member path no binding certifies, which
-            // the converged values point at closures of this component
-            // (`api.inc()`, #233): each body may run here, so its writes are
-            // the call's.
-            self.converged_bodies(fn_, mode, at, depth, found, prov, stmt_span);
-            // An immediately-invoked function expression runs NOW, at this
-            // call site, in this mode — `(async () => { … })()` is how an
-            // effect awaits, and it is the standard shape. The walk descended a
-            // *named* local helper (B6 above) and not this one, so every write
-            // inside an IIFE was invisible to the relation: a false negative,
-            // and the reason #117's await split bought nothing on the shape it
-            // was aimed at.
-            if depth > 0
-                && let Expr::FnLit { body_cfg, .. } = fn_.peel_ts()
-            {
-                let mut inner = Found::default();
-                self.cfg(
-                    body_cfg,
-                    depth - 1,
-                    &mut inner,
-                    WalkClass::Sync,
+            if matches!(expr, Expr::Call { .. }) {
+                self.relation_call(*id, fn_, args, at, depth, found, mode, prov, stmt_span);
+                // What the callee's callbacks returned to it escaped there:
+                // it may run at any time.
+                self.relation_handed(
+                    Some((*id, crate::engine::calls::CALLEE)),
+                    expr,
+                    WalkClass::Unknown,
+                    None,
+                    depth,
+                    found,
                     prov,
                     stmt_span,
                 );
-                found.absorb(inner, body_cfg, mode, at, prov);
             }
             // The listener `FnLit` of an effect-top-level `addEventListener`
             // is exactly what `extract_subscriptions` reified as a Handler
@@ -3064,13 +2974,13 @@ impl<'a> SetterWalk<'a> {
             }
             // A member of a package hook's result the timing table knows
             // (`register(name, { onChange })`) runs that argument at its time.
-            let member = self.converged.and_then(|c| c.result_member_timing(fn_));
+            let member = self.tables.result_member_timing(fn_);
             for (i, arg) in args.iter().enumerate() {
                 if reified && i == 1 {
                     continue;
                 }
                 if let Some((_, timing)) = member.filter(|(at, _)| *at == i) {
-                    self.timed_arg(arg, Some(timing), depth, found, prov, stmt_span);
+                    self.relation_timed((*id, i), arg, Some(timing), depth, found, prov, stmt_span);
                     continue;
                 }
                 let class = if listener && i == 1 {
@@ -3087,7 +2997,22 @@ impl<'a> SetterWalk<'a> {
                 // rows run at this call, and are placed here only when the
                 // receiver surely runs it, as an IIFE is (#248).
                 let placed = at.filter(|_| i == 0 && runs_at_least_once(fn_, args));
-                self.callback_arg(arg, class, placed, depth, found, prov, stmt_span);
+                // A listener is ⊤ only because the program dispatches
+                // events (#219): its rows say so.
+                let outer_listening = self.listening;
+                self.listening |=
+                    self.dispatches && (listener && i == 1 || self.registers_listener(fn_));
+                self.relation_handed(
+                    Some((*id, i)),
+                    arg,
+                    class,
+                    placed,
+                    depth,
+                    found,
+                    prov,
+                    stmt_span,
+                );
+                self.listening = outer_listening;
                 self.repeating = outer_repeating;
             }
         }
@@ -3097,19 +3022,27 @@ impl<'a> SetterWalk<'a> {
         // possible writes of this call, in its class (#277), as a registered
         // listener's are in a dispatching program (#250). Never placed: the
         // dispatch may reach none of them.
-        if let Expr::Call { fn_, args } | Expr::New { fn_, args, .. } = expr
+        if let Expr::Call { fn_, args, .. } | Expr::New { fn_, args, .. } = expr
             && let Some(event) = crate::engine::registrations::dispatched_event(fn_, args)
-            && let Some(c) = self.converged
             && depth > 0
         {
-            for hook in c.hooks {
+            for hook in self.tables.hooks {
                 if let HookEntry::Handler {
                     event: e, body_cfg, ..
                 } = hook
                     && event.as_deref().is_none_or(|n| n == e)
                 {
                     let mut inner = Found::default();
-                    self.cfg(body_cfg, depth - 1, &mut inner, mode, prov, stmt_span);
+                    self.enter(
+                        body_cfg,
+                        None,
+                        Reached::Named,
+                        depth - 1,
+                        &mut inner,
+                        mode,
+                        prov,
+                        stmt_span,
+                    );
                     found.absorb(inner, body_cfg, mode, None, prov);
                 }
             }
@@ -3119,36 +3052,316 @@ impl<'a> SetterWalk<'a> {
         // a closure among them may run at any time (#262). What evaluating
         // one runs is a render statement ahead of the marker already (#193).
         // A package hook the timing table knows runs it at that time instead.
-        if let Expr::HookMarker(label, _) = expr
-            && let Some(c) = self.converged
-        {
-            for (i, arg) in c.left_args(*label).iter().enumerate() {
-                let timing = c.arg_timing(*label, i);
-                self.timed_arg(arg, timing, depth, found, prov, stmt_span);
+        if let Expr::HookMarker(label, _) = expr {
+            let tables = self.tables;
+            for (i, arg) in tables.left_args(*label).iter().enumerate() {
+                let timing = tables.arg_timing(*label, i);
+                let anchor = (tables.component.hook_site(*label), i);
+                self.relation_timed(anchor, arg, timing, depth, found, prov, stmt_span);
             }
         }
         // A JSX prop React or the child may invoke runs as a listener, the
-        // class extraction gives a literal there (`extract_handlers`); a path
-        // the converged values resolve is walked the same way (#239).
+        // class extraction gives a literal there (`extract_handlers`); what
+        // any other value there holds is walked the same way (#239).
         if let Expr::NativeElem { props, .. } | Expr::CompApp { props, .. } = expr
-            && let Expr::ObjectLit { fields, .. } = props.peel_ts()
+            && let Expr::ObjectLit { id, fields, .. } = props.peel_ts()
         {
             let native = matches!(expr, Expr::NativeElem { .. });
             let class = self.listener_class();
-            for (name, val) in fields {
-                if crate::lowering::hook_extractor::invoked_prop(native, name) {
-                    self.converged_bodies(val, class, None, depth, found, prov, stmt_span);
+            for (i, (name, val)) in fields.iter().enumerate() {
+                if !crate::lowering::hook_extractor::invoked_prop(native, name) {
+                    continue;
+                }
+                // A literal there, or a name the render binds to one or to a
+                // `useCallback`, is a handler region of its own
+                // (`extract_handlers`): only what anything else holds.
+                let reified = match val.peel_ts() {
+                    Expr::FnLit { .. } => true,
+                    Expr::Var(v) => self.handlers.contains(v),
+                    _ => false,
+                };
+                if !reified {
+                    // ⊤ here only because the program dispatches events
+                    // (#219): the rows say so.
+                    let outer = std::mem::replace(&mut self.listening, self.dispatches);
+                    self.relation_handed(
+                        Some((*id, i)),
+                        val,
+                        class,
+                        None,
+                        depth,
+                        found,
+                        prov,
+                        stmt_span,
+                    );
+                    self.listening = outer;
+                }
+            }
+        }
+        // An accessor of a literal runs at any read or write of its member,
+        // which the walk does not place: what it reaches runs where the
+        // literal is written, at an unknown time (#321).
+        if let Expr::ObjectLit { id, fields } = expr {
+            for (i, (key, val)) in fields.iter().enumerate() {
+                if let Some((half, member)) = crate::ir::expr::accessor_of(key) {
+                    let outer = self.accessor.replace((half, member.map(str::to_string)));
+                    self.relation_handed(
+                        Some((*id, i)),
+                        val,
+                        WalkClass::Unknown,
+                        None,
+                        depth,
+                        found,
+                        prov,
+                        stmt_span,
+                    );
+                    self.accessor = outer;
                 }
             }
         }
     }
 
-    /// Walk the function a call hands its callee as `arg`, in `class`;
-    /// `placed` is where its rows run in this CFG, when the callee surely
-    /// runs it there.
-    #[allow(clippy::too_many_arguments)]
-    fn callback_arg(
+    /// A body at `site` the walk has no budget left to enter still runs
+    /// here: every slot it may write at any depth
+    /// ([`CallRelation::writes_of`]) is a write of this position, in
+    /// `class`, never placed, its value what the body passes (⊤).
+    fn past_budget(
         &mut self,
+        site: crate::ir::types::ExprId,
+        class: WalkClass,
+        found: &mut Found,
+        prov: Option<BlockId>,
+        stmt_span: Option<SourceRange>,
+    ) {
+        let slots = self.calls.writes_of(site, &mut self.summaries.borrow_mut());
+        for slot in slots {
+            found.setters.push(FoundSite {
+                var: Var::new(),
+                carried: false,
+                slot,
+                sure: false,
+                listener: self.listening,
+                accessor: self.accessor.clone(),
+                class,
+                span: stmt_span,
+                at: None,
+                own: None,
+                prov_block: prov,
+                repeats: self.repeating,
+                updater: Updater::Unknown,
+                arg: None,
+                foreign: Foreign::All,
+                applied: true,
+                through: self.path.clone(),
+            });
+        }
+    }
+
+    /// The body at `site` is a closure of another component than the one
+    /// walked: its site lies in that component's range.
+    fn of_other_component(&self, site: crate::ir::types::ExprId) -> bool {
+        let own = self.tables.component;
+        ComponentId::site_owner(site).is_some_and(|o| o != own)
+    }
+
+    /// Call `id`, as the call relation answers it (ADR-047): a write of each
+    /// slot its row lists, and a run of each body, in `mode`, at this call.
+    /// Placed at `at` only when the row is `sure` — every evaluation ran
+    /// exactly that one target. A call no pass reached has no row, and runs
+    /// nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn relation_call(
+        &mut self,
+        id: crate::ir::types::ExprId,
+        fn_: &'a Expr,
+        args: &'a [Expr],
+        at: Option<(BlockId, usize)>,
+        depth: usize,
+        found: &mut Found,
+        mode: WalkClass,
+        prov: Option<BlockId>,
+        stmt_span: Option<SourceRange>,
+    ) {
+        let calls = self.calls;
+        let Some(row) = calls.targets(id) else {
+            return;
+        };
+        let sure = row.sure();
+        let at = at.filter(|_| sure);
+        let spelling = callee_path(fn_);
+        for &slot in &row.setters {
+            found.setters.push(FoundSite {
+                var: spelling.clone().unwrap_or_default(),
+                carried: false,
+                slot,
+                sure,
+                listener: self.listening,
+                accessor: self.accessor.clone(),
+                class: mode,
+                span: stmt_span,
+                at,
+                own: self.body_site.and_then(|site| at.map(|(b, _)| (site, b))),
+                prov_block: prov,
+                repeats: self.repeating,
+                updater: self.updater_of(args),
+                arg: args.first().map(|a| a.peel_ts().clone()),
+                foreign: self.foreign(),
+                applied: false,
+                through: self.path.clone(),
+            });
+        }
+        for &site in &row.bodies {
+            let Some(body) = calls.body(site) else {
+                continue;
+            };
+            if depth == 0 {
+                self.past_budget(site, mode, found, prov, stmt_span);
+                continue;
+            }
+            let reached = match fn_.peel_ts() {
+                Expr::FnLit { id, params, .. } if *id == site => Reached::Inline(params),
+                _ if self.of_other_component(site) => Reached::Other,
+                _ => Reached::Named,
+            };
+            // Where the body is authored is where the name it is called by
+            // is defined (ADR-027 §4).
+            let name = spelling
+                .clone()
+                .filter(|_| matches!(reached, Reached::Named));
+            let mut inner = Found::default();
+            self.path.extend(name.clone());
+            self.enter(
+                body,
+                Some(site),
+                reached,
+                depth - 1,
+                &mut inner,
+                WalkClass::Sync,
+                prov,
+                stmt_span,
+            );
+            if name.is_some() {
+                self.path.pop();
+            }
+            if matches!(reached, Reached::Other) {
+                inner.spelled(spelling.as_deref());
+            }
+            found.absorb(inner, body, mode, at, prov);
+        }
+        if row.module {
+            self.module_rows(fn_, mode, depth, found, prov, stmt_span);
+        }
+    }
+
+    /// What the member reads and writes of the statement at `at` run (#337),
+    /// as the call relation answers it: each accessor body the heap placed
+    /// runs here, in `mode` — a read is a call of the getters it runs, in
+    /// the read's region and phase, wherever the accessor was defined —
+    /// never placed; and module code the analysis does not run, when the
+    /// receiver is read off a module binding (`via`, the statement's
+    /// expression), may call what the module scope holds.
+    #[allow(clippy::too_many_arguments)]
+    fn relation_accesses(
+        &mut self,
+        at: Option<SourceRange>,
+        via: &'a Expr,
+        depth: usize,
+        found: &mut Found,
+        mode: WalkClass,
+        prov: Option<BlockId>,
+        stmt_span: Option<SourceRange>,
+    ) {
+        let calls = self.calls;
+        let Some(row) = calls.accesses(at) else {
+            return;
+        };
+        // What the bodies are reached through, as a call's are: the read.
+        let name = callee_path(via);
+        for &site in &row.bodies {
+            let Some(body) = calls.body(site) else {
+                continue;
+            };
+            if depth == 0 {
+                self.past_budget(site, mode, found, prov, stmt_span);
+                continue;
+            }
+            let reached = match self.of_other_component(site) {
+                true => Reached::Other,
+                false => Reached::Named,
+            };
+            let named = name.clone().filter(|_| matches!(reached, Reached::Named));
+            let mut inner = Found::default();
+            self.path.extend(named.clone());
+            let outer = match calls.accessor(site) {
+                Some(accessor) => self.accessor.replace(accessor.clone()),
+                None => self.accessor.clone(),
+            };
+            self.enter(
+                body,
+                Some(site),
+                reached,
+                depth - 1,
+                &mut inner,
+                WalkClass::Sync,
+                prov,
+                stmt_span,
+            );
+            self.accessor = outer;
+            if named.is_some() {
+                self.path.pop();
+            }
+            if matches!(reached, Reached::Other) {
+                inner.spelled(name.as_deref());
+            }
+            found.absorb(inner, body, mode, None, prov);
+        }
+        if row.module {
+            self.module_rows(via, mode, depth, found, prov, stmt_span);
+        }
+    }
+
+    /// What the module scope holds (#335), reached at a call of module code
+    /// the analysis does not run, or through a value read off a module
+    /// binding (`via`): every setter and closure some write of the program
+    /// stored in a module binding ([`CallRelation::module_anchors`]) may be
+    /// called there, in `class`.
+    #[allow(clippy::too_many_arguments)]
+    fn module_rows(
+        &mut self,
+        via: &'a Expr,
+        class: WalkClass,
+        depth: usize,
+        found: &mut Found,
+        prov: Option<BlockId>,
+        stmt_span: Option<SourceRange>,
+    ) {
+        let anchors: Vec<crate::ir::types::ExprId> = self.calls.module_anchors().collect();
+        for anchor in anchors {
+            self.relation_handed(
+                Some((anchor, 0)),
+                via,
+                class,
+                None,
+                depth,
+                found,
+                prov,
+                stmt_span,
+            );
+        }
+    }
+
+    /// The value `arg` handed at `anchor` (a call's argument, a `new`'s, a
+    /// JSX prop, a hook argument, an effect's cleanup), as the call relation
+    /// answers it (ADR-047): every setter it reaches is called by the code it
+    /// is handed to, with what that code passes (#291), and every body it
+    /// reaches runs there, in `class`. A literal or an array or object of
+    /// them is the code's to call at any time (#254, #264): ⊤ for what the
+    /// literal holds. Placed at `placed` (a callback the receiver surely
+    /// runs, #248) only for the one literal written there.
+    #[allow(clippy::too_many_arguments)]
+    fn relation_handed(
+        &mut self,
+        anchor: Option<(crate::ir::types::ExprId, usize)>,
         arg: &'a Expr,
         class: WalkClass,
         placed: Option<(BlockId, usize)>,
@@ -3157,118 +3370,107 @@ impl<'a> SetterWalk<'a> {
         prov: Option<BlockId>,
         stmt_span: Option<SourceRange>,
     ) {
-        // A setter handed to the callee is called by it, with what it passes
-        // (#291): a write of its slot in the argument's class, placed where a
-        // closure's rows would be.
-        if let Some(name) = callee_path(arg)
-            && self.setter_vars.contains(&name)
-        {
+        let calls = self.calls;
+        let Some(row) = anchor.and_then(|(a, pos)| calls.escapes(a, pos)) else {
+            return;
+        };
+        let held_class = match arg.peel_ts() {
+            Expr::ObjectLit { .. } | Expr::ArrayLit { .. } | Expr::Spread(_) => WalkClass::Unknown,
+            _ => class,
+        };
+        // A value read off a module binding may be anything the module scope
+        // holds (#335); a module binding's own row is one of those, which
+        // what `arg` spells reaches, never is.
+        let module = anchor.is_some_and(|(a, _)| crate::engine::ModuleScope::is_anchor(a));
+        if row.module && !module {
+            self.module_rows(arg, held_class, depth, found, prov, stmt_span);
+        }
+        let spelling = callee_path(arg);
+        // A setter the callee surely calls, where it surely runs its
+        // callback (`[1].forEach(setN)`, #291), is placed there.
+        let applied_at = placed.filter(|_| row.sure());
+        for &slot in &row.setters {
             found.setters.push(FoundSite {
-                var: name,
-                class,
+                var: spelling.clone().unwrap_or_default(),
+                carried: spelling.is_some() && (module || !row.direct.contains(&slot)),
+                slot,
+                sure: row.sure(),
+                listener: self.listening,
+                accessor: self.accessor.clone(),
+                class: held_class,
                 span: stmt_span,
-                at: placed,
-                own: placed.map(|(b, _)| (self.body, b)),
+                at: applied_at,
+                own: self
+                    .body_site
+                    .and_then(|site| applied_at.map(|(b, _)| (site, b))),
                 prov_block: prov,
                 repeats: self.repeating,
                 updater: Updater::Unknown,
                 arg: None,
+                foreign: self.foreign(),
                 applied: true,
                 through: self.path.clone(),
             });
         }
-        match arg {
-            // Inline FnLit arg descend body, costs one depth level.
-            Expr::FnLit { body_cfg, .. } if depth > 0 => {
-                let mut inner = Found::default();
-                self.cfg(body_cfg, depth - 1, &mut inner, class, prov, stmt_span);
-                found.absorb(inner, body_cfg, class, placed, prov);
+        for &site in &row.bodies {
+            let Some(body) = calls.body(site) else {
+                continue;
+            };
+            // Every body costs a level: a value may reach many, each of
+            // which hands on more. Past the budget, what it writes is read
+            // off the relation ([`Self::past_budget`]).
+            let cost = 1;
+            let (reached, here) = match arg.peel_ts() {
+                Expr::FnLit { id, params, .. } if *id == site => (Reached::Inline(params), true),
+                _ if self.of_other_component(site) => (Reached::Other, false),
+                _ => (Reached::Named, false),
+            };
+            if depth < cost {
+                let class = if here { class } else { held_class };
+                self.past_budget(site, class, found, prov, stmt_span);
+                continue;
             }
-            // B5: variable arg name resolution, no depth cost — so this is
-            // the arm that can cycle (`const tick = t => raf(tick)`); the
-            // `walking` stack is what terminates it.
-            Expr::Var(name) if self.fn_bindings.contains_key(name) => {
-                let body = &self.fn_bindings[name];
-                let mut inner = Found::default();
-                self.path.push(name.clone());
-                self.cfg(body, depth, &mut inner, class, prov, stmt_span);
-                self.path.pop();
-                found.absorb(inner, body, class, placed, prov);
-            }
-            // A function inside an argument object or array escapes with it
-            // (#254): the callee may call it at any time, or never (#264).
-            Expr::ObjectLit { fields, .. } => {
-                for (_, val) in fields {
-                    self.callback_arg(val, WalkClass::Unknown, None, depth, found, prov, stmt_span);
-                }
-            }
-            Expr::ArrayLit { elems, .. } => {
-                for elem in elems {
-                    self.callback_arg(
-                        elem,
-                        WalkClass::Unknown,
-                        None,
-                        depth,
-                        found,
-                        prov,
-                        stmt_span,
-                    );
-                }
-            }
-            // A path the converged values point at closures of this
-            // component (`setTimeout(api.inc)`, #239): each runs in the
-            // argument's class, at this call only when it is a callback the
-            // receiver surely runs. The closures the object at that path
-            // holds escape with it, as an argument literal's do.
-            _ => {
-                self.converged_bodies(arg, class, placed, depth, found, prov, stmt_span);
-                self.member_bodies(arg, depth, found, prov, stmt_span);
-            }
-        }
-    }
-
-    /// Walk the closures of this component held under the members of the
-    /// object the converged values put behind `arg`, a name or member path
-    /// handed to a callee (`useRun(opts)`, #264): it may call any of them, at
-    /// any time.
-    fn member_bodies(
-        &mut self,
-        arg: &Expr,
-        depth: usize,
-        found: &mut Found,
-        prov: Option<BlockId>,
-        stmt_span: Option<SourceRange>,
-    ) {
-        let Some(converged) = self.converged.filter(|_| depth > 0) else {
-            return;
-        };
-        let Some(name) = callee_path(arg).filter(|n| !self.fn_bindings.contains_key(n)) else {
-            return;
-        };
-        for body in converged.member_bodies(&name) {
+            let name = spelling.clone().filter(|_| !here);
             let mut inner = Found::default();
-            self.path.push(name.clone());
-            self.cfg(
+            self.path.extend(name.clone());
+            self.enter(
                 body,
-                depth - 1,
+                Some(site),
+                reached,
+                depth - cost,
                 &mut inner,
-                WalkClass::Sync,
+                if here { class } else { held_class },
                 prov,
                 stmt_span,
             );
-            self.path.pop();
-            found.absorb(inner, body, WalkClass::Unknown, None, prov);
+            if name.is_some() {
+                self.path.pop();
+            }
+            if matches!(reached, Reached::Other) {
+                inner.spelled(spelling.as_deref());
+            }
+            // Placed only for the one literal written there, or the one
+            // function every evaluation surely handed (ADR-047's `sure`).
+            let placed = placed.filter(|_| {
+                (here || row.sure()) && row.bodies.len() == 1 && row.setters.is_empty()
+            });
+            found.absorb(
+                inner,
+                body,
+                if here { class } else { held_class },
+                placed,
+                prov,
+            );
         }
     }
 
-    /// A listener's class: `Handler`, or ⊤ in a program that dispatches
-    /// events itself, where it may run synchronously in the dispatching body
-    /// ([`Timing::in_program`](crate::engine::registrations::Timing::in_program), #219).
-    /// Walk an argument the timing table times `timing` (⊤ when `None`): an
-    /// options literal member by member, each at the time the table gives
-    /// it, ⊤ for the rest.
-    fn timed_arg(
+    /// [`Self::relation_handed`] for an argument the timing table times
+    /// `timing` (⊤ when `None`): an options literal's own function members
+    /// each at the time the table gives it, everything else it reaches ⊤.
+    #[allow(clippy::too_many_arguments)]
+    fn relation_timed(
         &mut self,
+        anchor: (crate::ir::types::ExprId, usize),
         arg: &'a Expr,
         timing: Option<ArgTiming>,
         depth: usize,
@@ -3276,17 +3478,99 @@ impl<'a> SetterWalk<'a> {
         prov: Option<BlockId>,
         stmt_span: Option<SourceRange>,
     ) {
-        if let Some(t @ ArgTiming::Members(_)) = timing
-            && let Expr::ObjectLit { fields, .. } = arg.peel_ts()
-        {
-            for (name, val) in fields {
-                let class = self.timing_class(t.member(name));
-                self.callback_arg(val, class, None, depth, found, prov, stmt_span);
-            }
+        let (Some(t @ ArgTiming::Members(_)), Expr::ObjectLit { fields, .. }) =
+            (timing, arg.peel_ts())
+        else {
+            let class = self.timing_class(timing);
+            self.relation_handed(
+                Some(anchor),
+                arg,
+                class,
+                None,
+                depth,
+                found,
+                prov,
+                stmt_span,
+            );
             return;
+        };
+        let calls = self.calls;
+        let Some(row) = calls.escapes(anchor.0, anchor.1) else {
+            return;
+        };
+        let mut timed: HashSet<crate::ir::types::ExprId> = HashSet::new();
+        for (name, val) in fields {
+            if let Expr::FnLit {
+                id,
+                params,
+                body_cfg,
+            } = val.peel_ts()
+                && row.bodies.contains(id)
+                && depth > 0
+            {
+                timed.insert(*id);
+                let class = self.timing_class(t.member(name));
+                let mut inner = Found::default();
+                self.enter(
+                    body_cfg,
+                    Some(*id),
+                    Reached::Inline(params),
+                    depth - 1,
+                    &mut inner,
+                    class,
+                    prov,
+                    stmt_span,
+                );
+                found.absorb(inner, body_cfg, class, None, prov);
+            }
         }
-        let class = self.timing_class(timing);
-        self.callback_arg(arg, class, None, depth, found, prov, stmt_span);
+        let spelling = callee_path(arg);
+        for &slot in &row.setters {
+            found.setters.push(FoundSite {
+                var: spelling.clone().unwrap_or_default(),
+                carried: spelling.is_some() && !row.direct.contains(&slot),
+                slot,
+                sure: false,
+                listener: self.listening,
+                accessor: self.accessor.clone(),
+                class: WalkClass::Unknown,
+                span: stmt_span,
+                at: None,
+                own: None,
+                prov_block: prov,
+                repeats: self.repeating,
+                updater: Updater::Unknown,
+                arg: None,
+                foreign: self.foreign(),
+                applied: true,
+                through: self.path.clone(),
+            });
+        }
+        for &site in row.bodies.iter().filter(|s| !timed.contains(s)) {
+            let Some(body) = calls.body(site) else {
+                continue;
+            };
+            if depth == 0 {
+                self.past_budget(site, WalkClass::Unknown, found, prov, stmt_span);
+                continue;
+            }
+            let reached = match self.of_other_component(site) {
+                true => Reached::Other,
+                false => Reached::Named,
+            };
+            let mut inner = Found::default();
+            self.enter(
+                body,
+                Some(site),
+                reached,
+                depth - 1,
+                &mut inner,
+                WalkClass::Unknown,
+                prov,
+                stmt_span,
+            );
+            found.absorb(inner, body, WalkClass::Unknown, None, prov);
+        }
     }
 
     /// The class a package hook's argument timed `timing` runs in
@@ -3300,54 +3584,26 @@ impl<'a> SetterWalk<'a> {
         }
     }
 
+    /// `fn_` is a registrar whose callbacks are event listeners
+    /// ([`Self::arg_class`]'s `Handler`, before a dispatching program makes
+    /// them ⊤).
+    fn registers_listener(&self, fn_: &Expr) -> bool {
+        use crate::engine::registrations::Timing;
+        crate::engine::registrations::match_registrar(fn_).is_some_and(|(reg, _)| {
+            let shadowed = !reg.method_only
+                && matches!(fn_.peel_ts(), Expr::Var(n) if self.shadowed.contains(n.as_str()));
+            !shadowed && reg.timing.in_program(false) == Timing::Handler
+        })
+    }
+
+    /// A listener's class: `Handler`, or ⊤ in a program that dispatches
+    /// events itself, where it may run synchronously in the dispatching body
+    /// ([`Timing::in_program`](crate::engine::registrations::Timing::in_program), #219).
     fn listener_class(&self) -> WalkClass {
         if self.dispatches {
             WalkClass::Unknown
         } else {
             WalkClass::Handler
-        }
-    }
-
-    /// Walk the closures of this component the converged values put behind
-    /// `e`, a name or member path no binding certifies ([`ConvergedFns`]):
-    /// called (`api.inc()`, #233) or handed to a callee or a JSX prop
-    /// (`setTimeout(api.inc)`, `onClick={api.inc}`, #239). Each body may run,
-    /// in `class`; its rows are placed at `at` only when `e` certainly names
-    /// that one closure — otherwise it may run another.
-    #[allow(clippy::too_many_arguments)]
-    fn converged_bodies(
-        &mut self,
-        e: &Expr,
-        class: WalkClass,
-        at: Option<(BlockId, usize)>,
-        depth: usize,
-        found: &mut Found,
-        prov: Option<BlockId>,
-        stmt_span: Option<SourceRange>,
-    ) {
-        let Some(converged) = self.converged.filter(|_| depth > 0) else {
-            return;
-        };
-        let Some(name) = callee_path(e).filter(|n| !self.fn_bindings.contains_key(n)) else {
-            return;
-        };
-        let Some(bodies) = converged.bodies(&name) else {
-            return;
-        };
-        let sure = matches!(bodies, [only] if converged.certain(e, only));
-        for body in bodies {
-            let mut inner = Found::default();
-            self.path.push(name.clone());
-            self.cfg(
-                body,
-                depth - 1,
-                &mut inner,
-                WalkClass::Sync,
-                prov,
-                stmt_span,
-            );
-            self.path.pop();
-            found.absorb(inner, body, class, at.filter(|_| sure), prov);
         }
     }
 }
@@ -3415,7 +3671,8 @@ pub struct SlotRead {
 /// the walk never enters therefore contributes no row: this is a relation over
 /// the reads the analysis can *see*, which is why nothing may read the absence
 /// of a row as a proof that the slot is unread.
-pub fn collect_slot_reads(render_cfg: &CFG, hooks: &[HookEntry]) -> Vec<SlotRead> {
+pub fn collect_slot_reads(comp: &AnalysisResult<StateValue>) -> Vec<SlotRead> {
+    let (render_cfg, hooks) = (&comp.render_cfg, &comp.hooks);
     // The naming table for slots: the value binding of every `useState`, plus
     // the aliases of it, exactly as the writer relation resolves setters.
     let mut labels = resolve_setter_aliases(render_cfg, &state_val_labels(render_cfg));
@@ -3428,31 +3685,19 @@ pub fn collect_slot_reads(render_cfg: &CFG, hooks: &[HookEntry]) -> Vec<SlotRead
     if vars.is_empty() {
         return vec![];
     }
+    let tables = WriterTables::of_result(comp);
+    let channels = Channels {
+        stores: false,
+        calls: false,
+        reads: &vars,
+    };
     let mut out: Vec<SlotRead> = Vec::new();
     let push = |region: WriterRegion, cfg: &CFG, out: &mut Vec<SlotRead>| {
-        let fn_bindings = collect_fn_bindings(cfg);
-        let certified = certified_fn_names(cfg, &fn_bindings);
-        let no_shadow = HashSet::new();
-        let mut found = Found::default();
-        let mut walk = SetterWalk {
-            setter_vars: &NO_VARS,
-            fn_bindings: &fn_bindings,
-            converged: None,
-            walking: HashSet::new(),
-            root: cfg as *const CFG as usize,
-            body: cfg as *const CFG as usize,
-            effect_body: matches!(region, WriterRegion::Effect(_)),
-            dispatches: false,
-            shadowed: &no_shadow,
-            repeating: false,
-            callback_bodies: &HashMap::new(),
-            certified_fns: &certified,
-            collect_calls: false,
-            read_vars: &vars,
-            wrappers: &NO_WRAPPERS,
-            path: Vec::new(),
+        let cleanup = match region {
+            WriterRegion::Effect(l) => Some(comp.component.hook_site(l)),
+            _ => None,
         };
-        walk.cfg(cfg, 2, &mut found, WalkClass::Sync, None, None);
+        let found = tables.walk(cfg, &comp.calls, cleanup, false, channels, 2);
         for r in found.reads {
             let Some(&slot) = labels.get(&r.var) else {
                 continue;
@@ -3509,32 +3754,24 @@ pub fn collect_slot_reads(render_cfg: &CFG, hooks: &[HookEntry]) -> Vec<SlotRead
 /// the local-helper and IIFE descent, the `await` split and the cleanup
 /// descent are all the walk's, so the relation inherits them instead of
 /// re-deriving them. `region` is the lexical body — exact — and decides what
-/// a synchronous call's phase is called.
-pub fn collect_body_calls(cfg: &CFG, region: WriterRegion) -> Vec<BodyCall> {
-    let fn_bindings = collect_fn_bindings(cfg);
-    let certified = certified_fn_names(cfg, &fn_bindings);
-    let empty_vars = HashSet::new();
-    let empty_shadow = HashSet::new();
-    let mut found = Found::default();
-    let mut walk = SetterWalk {
-        setter_vars: &empty_vars,
-        fn_bindings: &fn_bindings,
-        converged: None,
-        walking: HashSet::new(),
-        root: cfg as *const CFG as usize,
-        body: cfg as *const CFG as usize,
-        effect_body: matches!(region, WriterRegion::Effect(_)),
-        dispatches: false,
-        shadowed: &empty_shadow,
-        repeating: false,
-        callback_bodies: &HashMap::new(),
-        certified_fns: &certified,
-        collect_calls: true,
-        read_vars: &NO_VARS,
-        wrappers: &NO_WRAPPERS,
-        path: Vec::new(),
+/// a synchronous call's phase is called. What a call in it runs is the call
+/// relation's (ADR-047), as for the writer rows.
+pub fn collect_body_calls(
+    comp: &AnalysisResult<StateValue>,
+    cfg: &CFG,
+    region: WriterRegion,
+) -> Vec<BodyCall> {
+    let channels = Channels {
+        stores: false,
+        calls: true,
+        reads: &NO_VARS,
     };
-    walk.cfg(cfg, WALK_DEPTH, &mut found, WalkClass::Sync, None, None);
+    let cleanup = match region {
+        WriterRegion::Effect(l) => Some(comp.component.hook_site(l)),
+        _ => None,
+    };
+    let found =
+        WriterTables::of_result(comp).walk(cfg, &comp.calls, cleanup, false, channels, WALK_DEPTH);
     let mut rows: Vec<BodyCall> = found
         .calls
         .into_iter()
@@ -3591,9 +3828,11 @@ pub(crate) fn may_written_slots(
             _ => {}
         }
     }
+    // A member path (`t.1`, [`setter_targets_with_paths`]) is referenced
+    // where its root is.
     setter_labels
         .pairs()
-        .filter(|(v, _)| used.contains(*v))
+        .filter(|(v, _)| used.contains(v.split('.').next().unwrap_or(v)))
         .map(|(_, l)| l)
         .collect()
 }
@@ -3614,7 +3853,7 @@ pub fn setter_escapes(render_cfg: &CFG, hooks: &[HookEntry], aliases: &HashSet<V
     fn in_expr(e: &Expr, aliases: &HashSet<Var>) -> bool {
         match e {
             Expr::Var(v) => aliases.contains(v),
-            Expr::Call { fn_, args } => {
+            Expr::Call { fn_, args, .. } => {
                 let callee_is_alias = matches!(fn_.peel_ts(), Expr::Var(v) if aliases.contains(v));
                 (!callee_is_alias && in_expr(fn_, aliases))
                     || args.iter().any(|a| in_expr(a, aliases))
@@ -3723,96 +3962,5 @@ impl AnalysisResult<StateValue> {
                 !aliases.is_empty() && setter_escapes(&self.render_cfg, &self.hooks, &aliases)
             })
             .collect()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ir::expr::Prim;
-    use crate::ir::types::ExprId;
-    use crate::test_support::single_block_cfg;
-
-    fn call(callee: &str, args: Vec<Expr>) -> Expr {
-        Expr::Call {
-            fn_: Box::new(Expr::Var(callee.to_string())),
-            args,
-        }
-    }
-
-    /// A self-referential local closure — `const tick = t => { setN(t); raf(tick) }`
-    /// — used to make the "B5" variable-argument arm recurse forever, because it
-    /// resolves the argument to its bound body without spending depth. The walk
-    /// must terminate *and* still report the setter it contains.
-    #[test]
-    fn self_referential_callback_terminates_and_is_still_scanned() {
-        let tick_body = single_block_cfg(vec![
-            Stmt::ExprStmt(call("setN", vec![Expr::Lit(Prim::Int(1))]), None),
-            Stmt::ExprStmt(call("raf", vec![Expr::Var("tick".to_string())]), None),
-        ]);
-        let cfg = single_block_cfg(vec![
-            Stmt::Let {
-                var: "tick".to_string(),
-                rhs: Expr::FnLit {
-                    id: ExprId(0),
-                    params: vec!["t".to_string()],
-                    body_cfg: Arc::new(tick_body),
-                },
-                span: None,
-            },
-            Stmt::ExprStmt(call("raf", vec![Expr::Var("tick".to_string())]), None),
-        ]);
-
-        let setters: HashSet<Var> = ["setN".to_string()].into_iter().collect();
-        let found = collect_setter_calls(&cfg, &setters);
-
-        assert_eq!(
-            found.iter().map(|c| c.var.as_str()).collect::<Vec<_>>(),
-            vec!["setN"],
-            "the cycle guard must not hide the setter inside the recursive closure"
-        );
-    }
-
-    /// Mutual recursion between two bound closures — the same hazard one hop
-    /// further out, which a self-reference-only guard would miss.
-    #[test]
-    fn mutually_recursive_callbacks_terminate() {
-        let a_body = single_block_cfg(vec![Stmt::ExprStmt(
-            call("raf", vec![Expr::Var("b".to_string())]),
-            None,
-        )]);
-        let b_body = single_block_cfg(vec![
-            Stmt::ExprStmt(call("setN", vec![]), None),
-            Stmt::ExprStmt(call("raf", vec![Expr::Var("a".to_string())]), None),
-        ]);
-        let cfg = single_block_cfg(vec![
-            Stmt::Let {
-                var: "a".to_string(),
-                rhs: Expr::FnLit {
-                    id: ExprId(0),
-                    params: vec![],
-                    body_cfg: Arc::new(a_body),
-                },
-                span: None,
-            },
-            Stmt::Let {
-                var: "b".to_string(),
-                rhs: Expr::FnLit {
-                    id: ExprId(1),
-                    params: vec![],
-                    body_cfg: Arc::new(b_body),
-                },
-                span: None,
-            },
-            Stmt::ExprStmt(call("raf", vec![Expr::Var("a".to_string())]), None),
-        ]);
-
-        let setters: HashSet<Var> = ["setN".to_string()].into_iter().collect();
-        let found = collect_setter_calls(&cfg, &setters);
-
-        assert_eq!(
-            found.iter().map(|c| c.var.as_str()).collect::<Vec<_>>(),
-            vec!["setN"]
-        );
     }
 }

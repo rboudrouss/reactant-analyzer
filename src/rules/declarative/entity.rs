@@ -36,8 +36,8 @@ use crate::rules::helpers::jsx::{
 use crate::rules::helpers::local_bindings;
 use crate::rules::helpers::providers::{ProviderSite, ValueIdentity, collect_provider_sites};
 use crate::rules::{
-    ReturnsVerdict, SetterCall, StabilityVerdict, all_setter_labels, collect_setter_calls,
-    hook_kind_word, hook_val_labels, must_alias_scopes, resolve_setter_aliases, state_val_labels,
+    ReturnsVerdict, StabilityVerdict, all_setter_labels, hook_kind_word, hook_val_labels,
+    resolve_setter_aliases, state_val_labels,
 };
 
 use super::schema::{
@@ -139,9 +139,6 @@ pub(crate) struct EntityCtx<'a> {
     /// Index into `comp.hook_provenance` by label (indices, not references:
     /// `OnceCell` is invariant, so a borrowed map would freeze `'a`).
     provenance: OnceCell<HashMap<HookLabel, usize>>,
-    /// The render's setter call sites, the ones `setter-in-render` judges
-    /// (#281), resolved on first use by the render-setter enumeration.
-    render_sites: OnceCell<crate::engine::setters::RenderSetterSites>,
     /// The slot → readers relation (#127), computed on first use: unlike the
     /// writers, it is not needed by any native rule, so a component no pack
     /// asks about never walks for it.
@@ -169,7 +166,6 @@ impl<'a> EntityCtx<'a> {
             exit_dom: OnceCell::new(),
             conditional: OnceCell::new(),
             provenance: OnceCell::new(),
-            render_sites: OnceCell::new(),
             slot_reads: OnceCell::new(),
             body_calls: OnceCell::new(),
         }
@@ -208,20 +204,15 @@ impl<'a> EntityCtx<'a> {
     /// shipped sort binds changes which findings fire (the ADR-027 §2
     /// sequencing argument).
     pub fn render_setters(&self, foreign: bool) -> Vec<SetterEntity> {
-        let found = self.render_sites();
-        self.sorted_setters(
-            found.sites.iter().filter(|c| c.class.may_run_in_body()),
-            &found.local,
-            &found.converged,
-            foreign,
-        )
-    }
-
-    /// The render's setter call sites and the tables they resolve through,
-    /// built once per component, shared with `setter-in-render` (#281).
-    fn render_sites(&self) -> &crate::engine::setters::RenderSetterSites {
-        self.render_sites
-            .get_or_init(|| crate::engine::setters::RenderSetterSites::of(self.comp))
+        let rows =
+            crate::rules::impls::setter_in_render::render_rows(self.comp).map(|w| SetterEntity {
+                var: w.setter.clone(),
+                slot: Some(w.slot),
+                span: w.span,
+                block_id: w.placed,
+                owner: w.owner,
+            });
+        sorted(rows.filter(|s| foreign || s.owner.is_none()).collect())
     }
 
     /// `hook_origins` rows in label order (labels are unique after the
@@ -254,7 +245,7 @@ impl<'a> EntityCtx<'a> {
         else {
             return ValueIdentity::Unknown;
         };
-        let Some(expr) = args.get(arg.index) else {
+        let Some(expr) = Expr::positional_args(args).get(arg.index) else {
             return ValueIdentity::Unknown;
         };
         let Some(info) = self.comp.hook_calls.iter().find(|i| i.label == arg.label) else {
@@ -379,17 +370,32 @@ impl<'a> EntityCtx<'a> {
         )
     }
 
-    /// `body_setter_calls`: setter calls in the anchor's body CFG.
+    /// `body_setter_calls`: the writes of the component's own slots the
+    /// anchor's body CFG runs, as the call relation answers them (ADR-047):
+    /// one row per slot, at its most synchronous site.
     pub fn body_setters(&self, row: &HookRow<'a>) -> Vec<SetterEntity> {
         let Some(body) = row.entry.and_then(|e| e.body_cfg()) else {
             return vec![];
         };
-        self.sorted_setters(
-            &collect_setter_calls(body, &self.setter_vars),
-            &self.setter_labels,
-            &HashMap::new(),
-            false,
-        )
+        let cleanup = matches!(region_of(row), WriterRegion::Effect(_))
+            .then(|| self.comp.component.hook_site(row.info.label));
+        let (mut sites, _) = crate::engine::setters::WriterTables::of_result(self.comp)
+            .write_sites(body, &self.comp.calls, cleanup, false);
+        sites.retain(|s| s.slot.0 == self.comp.component);
+        sites.sort_by_key(|s| s.class);
+        let mut seen: HashSet<HookLabel> = HashSet::new();
+        let rows = sites
+            .into_iter()
+            .filter(|s| seen.insert(s.slot.1))
+            .map(|s| SetterEntity {
+                var: crate::engine::setters::row_name(&self.comp.calls, s.slot, s.var),
+                slot: Some(s.slot.1),
+                span: s.span,
+                block_id: s.at.map(|(b, _)| b),
+                owner: None,
+            })
+            .collect();
+        sorted(rows)
     }
 
     /// `calls`: non-hook call sites in the anchor's body CFG (#126, ADR-036).
@@ -413,7 +419,7 @@ impl<'a> EntityCtx<'a> {
                         };
                         Some((
                             info.label,
-                            crate::engine::collect_body_calls(body, region_of(&row)),
+                            crate::engine::collect_body_calls(self.comp, body, region_of(&row)),
                         ))
                     })
                     .collect()
@@ -424,7 +430,7 @@ impl<'a> EntityCtx<'a> {
 
     /// `render_calls`: non-hook call sites in the render body (#126).
     pub fn render_call_rows(&self) -> Vec<crate::engine::BodyCall> {
-        crate::engine::collect_body_calls(&self.comp.render_cfg, WriterRegion::Render)
+        crate::engine::collect_body_calls(self.comp, &self.comp.render_cfg, WriterRegion::Render)
     }
 
     /// `deps`: declared deps-array entries, in declared order. An effect with
@@ -462,9 +468,7 @@ impl<'a> EntityCtx<'a> {
     /// deterministic order.
     pub fn reads(&self, row: &HookRow<'a>) -> Vec<&crate::engine::SlotRead> {
         self.slot_reads
-            .get_or_init(|| {
-                crate::engine::collect_slot_reads(&self.comp.render_cfg, &self.comp.hooks)
-            })
+            .get_or_init(|| crate::engine::collect_slot_reads(self.comp))
             .iter()
             .filter(|r| r.slot == row.info.label)
             .collect()
@@ -502,23 +506,12 @@ impl<'a> EntityCtx<'a> {
     }
 
     /// Does this render-setter row's call write its slot on every render
-    /// (#279)? Its block dominates every exit, and its callee surely is the
-    /// setter: a local name by its must-alias binding, a name or path the
-    /// converged values put a setter behind by those values — the native
-    /// rule's test, over the native rule's tables (`must_render_write`).
+    /// (#279)? It is placed — the call relation is sure of its one setter —
+    /// and its block dominates every exit: the native rule's test
+    /// (`must_render_write`).
     pub fn render_write(&self, s: &SetterEntity) -> Option<Certified<RenderWrite>> {
         let block = s.block_id?;
-        let found = self.render_sites();
-        let scopes = must_alias_scopes(&self.comp.render_cfg, &self.comp.hooks);
-        match must_render_write(
-            self.exit_dom(),
-            &self.comp.render_cfg,
-            &scopes,
-            &s.var,
-            block,
-            found.local.contains(&s.var),
-            found.converged.get(&s.var).map(Vec::as_slice),
-        ) {
+        match must_render_write(self.exit_dom(), block) {
             MustResult::All(c) => Some(c),
             _ => None,
         }
@@ -1015,54 +1008,15 @@ impl<'a> EntityCtx<'a> {
     fn slot_source_name(&self, label: HookLabel) -> Option<String> {
         pick_name(&self.state_names, label)
     }
+}
 
-    /// One entity per call and slot it may write, deterministically sorted
-    /// (the walks return HashMap order). A local binding wins: a component
-    /// passing its own setter down is not a foreign write. A name bound to
-    /// several setters is one entity per candidate (#202), and so is a name
-    /// or path the converged values put several setters behind; `foreign`
-    /// keeps the entities of another component's slot (#107).
-    fn sorted_setters<'c>(
-        &self,
-        calls: impl IntoIterator<Item = &'c SetterCall>,
-        local: &crate::engine::setters::SetterTargets,
-        converged: &HashMap<Var, Vec<crate::engine::setters::SetterProp>>,
-        foreign: bool,
-    ) -> Vec<SetterEntity> {
-        let me = self.ctx.component();
-        let mut setters: Vec<SetterEntity> = calls
-            .into_iter()
-            .flat_map(|c| {
-                let bound: Vec<_> = local.targets(&c.var).collect();
-                let targets: Vec<(Option<HookLabel>, Option<ComponentId>)> = match bound.is_empty()
-                {
-                    false => bound.into_iter().map(|l| (Some(l), None)).collect(),
-                    true => match converged.get(&c.var) {
-                        Some(props) => props
-                            .iter()
-                            .map(|p| (Some(p.label), (p.component != me).then_some(p.component)))
-                            .collect(),
-                        None => vec![(None, None)],
-                    },
-                };
-                targets
-                    .into_iter()
-                    .filter(move |(_, owner)| foreign || owner.is_none())
-                    .map(move |(slot, owner)| SetterEntity {
-                        slot,
-                        owner,
-                        var: c.var.clone(),
-                        span: c.span,
-                        block_id: c.block_id,
-                    })
-            })
-            .collect();
-        setters.sort_by(|a, b| {
-            let pos = |s: &SetterEntity| s.span.map_or((u32::MAX, u32::MAX), |r| r.pos_key());
-            (pos(a), &a.var).cmp(&(pos(b), &b.var))
-        });
-        setters
-    }
+/// Setter entities in source order, then by name (deterministic).
+fn sorted(mut setters: Vec<SetterEntity>) -> Vec<SetterEntity> {
+    setters.sort_by(|a, b| {
+        let pos = |s: &SetterEntity| s.span.map_or((u32::MAX, u32::MAX), |r| r.pos_key());
+        (pos(a), &a.var, a.slot).cmp(&(pos(b), &b.var, b.slot))
+    });
+    setters
 }
 
 /// The lexical region a body anchor's calls sit in — what decides the phase
@@ -1090,7 +1044,7 @@ fn anonymous(v: &EntityVal<'_, '_>, names: &crate::ir::SourceNames) -> String {
         // The dependency as written, never its position: an index into `elems`
         // stops being an index into the source array once lowering drops an
         // elision or flattens a spread (#118).
-        EntityVal::Dep(d) => format!("`{}`", d.expr.describe()),
+        EntityVal::Dep(d) => format!("`{}`", names.describe(d.expr)),
         EntityVal::Arg(a) => format!("argument #{}", a.index),
         EntityVal::Origin(p) => format!("`{}`", p.origin_hook),
         EntityVal::Writer(w) => format!("`{}`", names.name(&w.setter)),
@@ -1105,7 +1059,7 @@ fn anonymous(v: &EntityVal<'_, '_>, names: &crate::ir::SourceNames) -> String {
         },
         EntityVal::Seed(s) => format!("`{}`", s.path),
         EntityVal::Consumer(c) => format!("`{}`", names.name(&c.name)),
-        EntityVal::Registration(r) => format!("`{}`", r.display),
+        EntityVal::Registration(r) => format!("`{}`", r.shown(names)),
     }
 }
 

@@ -12,7 +12,7 @@ use reactant::{
         RootStrategy, analyze_program,
     },
     lowering::{lower_program, lower_utilities},
-    rules::{InfiniteLoop, Rule, RuleCtx, Severity},
+    rules::{InfiniteLoop, Rule, RuleCtx, Severity, UnnecessaryRerender},
 };
 
 fn analyze(src: &str) -> ProgramAnalysisResult {
@@ -178,6 +178,103 @@ export function Opaque() {
     let opaque = result.component_named("Opaque").unwrap();
     let slot = result.components[&opaque].state_store.get(0);
     assert_eq!(slot, StateValue::top());
+}
+
+// ── #214: a nested body's return is its parameter only when never rebound ──
+
+/// The reducer and updater programs of #214: React loops on each (303
+/// renders, `oracle/cases/reducer-branch-assign-loops.tsx`,
+/// `updater-branch-assign-loops.tsx`). The return names the parameter, but a
+/// branch rebound it: the write may change the slot.
+#[test]
+fn a_reducer_or_updater_that_rebinds_its_parameter_may_change_the_slot() {
+    let src = r#"
+import { useReducer, useState, useEffect } from 'react';
+function reducer(s: number, a: string) { if (a === "x") { s = s + 1; } return s; }
+export function Reducer() {
+  const [n, dispatch] = useReducer(reducer, 0);
+  useEffect(() => { dispatch("x"); });
+  return <div>{n}</div>;
+}
+export function Updater() {
+  const [n, setN] = useState(0);
+  useEffect(() => { setN((c) => { if (c >= 0) { c = c + 1; } return c; }); });
+  return <div>{n}</div>;
+}
+"#;
+    let result = analyze(src);
+    assert_eq!(loops(&result, "Reducer"), vec![Severity::Warning]);
+    assert_eq!(loops(&result, "Updater"), vec![Severity::Warning]);
+}
+
+/// The neighbour that settles: every return is the parameter as React hands
+/// it, so the write never changes the slot.
+#[test]
+fn a_reducer_that_returns_its_untouched_parameter_on_every_path_settles() {
+    let src = r#"
+import { useReducer, useEffect } from 'react';
+function keep(s: number, a: string) { if (a === "x") { return s; } const t = s; return t; }
+export function Keeps() {
+  const [n, dispatch] = useReducer(keep, 0);
+  useEffect(() => { dispatch("x"); });
+  return <div>{n}</div>;
+}
+"#;
+    assert_eq!(loops(&analyze(src), "Keeps"), vec![]);
+}
+
+/// A spread of the parameter preserves its members only when the parameter
+/// is the slot's object: rebound to a literal whose `a` moves, the dep `s.a`
+/// changes at every write (React loops).
+#[test]
+fn a_spread_of_a_rebound_parameter_preserves_nothing() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function Rebound() {
+  const [s, setS] = useState({ a: 0, b: 0 });
+  useEffect(() => {
+    setS((prev) => { prev = { a: prev.a + 1, b: prev.b }; return { ...prev, b: 1 }; });
+  }, [s.a]);
+  return <div>{s.a}</div>;
+}
+"#;
+    assert_eq!(loops(&analyze(src), "Rebound"), vec![Severity::Warning]);
+}
+
+/// The branch assignment of #214 in the other nested bodies — a timer and a
+/// promise callback, a local function — reaches the write as in the inline
+/// form: each is a finding.
+#[test]
+fn a_branch_assignment_in_a_nested_body_reaches_the_write() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function Timer() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    setTimeout(() => { let step = 0; if (n >= 0) { step = 1; } setN(n + step); });
+  }, [n]);
+  return <div>{n}</div>;
+}
+export function Then() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    Promise.resolve().then(() => { let step = 0; if (n >= 0) { step = 1; } setN(n + step); });
+  }, [n]);
+  return <div>{n}</div>;
+}
+export function Local() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    const next = (v: number) => { let w = v; if (v >= 0) { w = v + 1; } return w; };
+    setN(next(n));
+  }, [n]);
+  return <div>{n}</div>;
+}
+"#;
+    let result = analyze(src);
+    for c in ["Timer", "Then", "Local"] {
+        assert_eq!(loops(&result, c), vec![Severity::Warning], "{c}");
+    }
 }
 
 // ── Another component's slot ────────────────────────────────────────────────
@@ -559,6 +656,399 @@ export function Param() {
         let comp = &result.components[&result.component_named(c).unwrap()];
         // Only an effect write grows `n` past the widening threshold.
         assert!(comp.widen_trace.contains_key(&0), "{c}: `n` did not widen");
+    }
+}
+
+/// A parent's closure a child lets escape runs in the parent, its owner: the
+/// parent's slot takes the write, however the child lets it go (a DOM
+/// handler, an unknown callee, a generator, a grandchild), and the child's
+/// slot of the same name, which the closure does not see, does not.
+#[test]
+fn a_parent_closure_a_child_lets_escape_writes_the_parents_slot() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+import { runNow, useRun } from 'ext';
+function Dom({ f }: { f: () => void }) {
+  const [k, setK] = useState(5);
+  return <button onClick={f}>{k}</button>;
+}
+export function ViaDom() {
+  const [k, setK] = useState(0);
+  return <Dom f={() => setK(1)} />;
+}
+function Callee({ f }: { f: () => void }) {
+  const [k, setK] = useState(5);
+  useEffect(() => { runNow(f); }, []);
+  return <div>{k}</div>;
+}
+export function ViaCallee() {
+  const [k, setK] = useState(0);
+  return <Callee f={() => setK(1)} />;
+}
+function* yieldIt(f: () => void) { yield f; }
+function Gen({ f }: { f: () => void }) {
+  const [k, setK] = useState(5);
+  useEffect(() => { for (const g of yieldIt(f)) g(); }, []);
+  return <div>{k}</div>;
+}
+export function ViaGenerator() {
+  const [k, setK] = useState(0);
+  return <Gen f={() => setK(1)} />;
+}
+function Leaf({ f }: { f: () => void }) {
+  const [k, setK] = useState(5);
+  useRun(f);
+  return <div>{k}</div>;
+}
+function Mid({ f }: { f: () => void }) {
+  return <Leaf f={f} />;
+}
+export function ViaGrandchild() {
+  const [k, setK] = useState(0);
+  return <Mid f={() => setK(1)} />;
+}
+"#;
+    let result = analyze(src);
+    for (parent, child) in [
+        ("ViaDom", "Dom"),
+        ("ViaCallee", "Callee"),
+        ("ViaGenerator", "Gen"),
+        ("ViaGrandchild", "Leaf"),
+    ] {
+        assert!(
+            holds(&result, parent, 0, 1.0),
+            "{parent}: the write is lost"
+        );
+        let id = result.component_named(child).unwrap();
+        assert_eq!(
+            result.components[&id].state_store.get(0),
+            StateValue::number(Interval::point(5.0)),
+            "{child}: the parent's closure wrote the child's slot"
+        );
+    }
+}
+
+/// Two parents render one child, which lets the closure it is handed escape.
+/// Its last analysis, under both inputs, runs neither: the first parent's
+/// ran in the first parent, the second's runs in the second.
+#[test]
+fn each_parent_runs_its_own_closure_a_shared_child_lets_escape() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+import { runNow } from 'ext';
+function Child({ f }: { f: () => void }) {
+  useEffect(() => { runNow(f); });
+  return <div />;
+}
+function First() {
+  const [a, setA] = useState(0);
+  return <Child f={() => setA(1)} />;
+}
+function Second() {
+  const [b, setB] = useState(0);
+  return <Child f={() => setB(2)} />;
+}
+export function App() {
+  return <div><First /><Second /></div>;
+}
+"#;
+    let result = analyze(src);
+    assert!(holds(&result, "First", 0, 1.0), "First's write is lost");
+    assert!(holds(&result, "Second", 0, 2.0), "Second's write is lost");
+}
+
+/// A parent's closure that reaches something of the child — here the child's
+/// setter, stored in a parent object — runs in the child where it escapes.
+#[test]
+fn a_parent_closure_reaching_the_child_runs_in_the_child() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+import { runNow } from 'ext';
+function Child({ register, f }: { register: (s: (v: number) => void) => void; f: () => void }) {
+  const [k, setK] = useState(0);
+  useEffect(() => {
+    register(setK);
+    runNow(f);
+  }, []);
+  return <div>{k}</div>;
+}
+export function App() {
+  const reg = { set: (v: number) => {} };
+  return <Child register={(s) => { reg.set = s; }} f={() => reg.set(7)} />;
+}
+"#;
+    let result = analyze(src);
+    assert!(holds(&result, "Child", 0, 7.0), "the child's write is lost");
+}
+
+/// A parent's closure that a child calls — through an object member or as a
+/// prop — sees its own scope (#326): its `setK` is the parent's, which takes
+/// the write and arms the parent's loop, and the child's `setK` of the same
+/// name, which the closure never sees, does not.
+#[test]
+fn a_parent_closure_a_child_calls_writes_the_parents_slot() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Member({ api }: { api: { f: (x: number) => void } }) {
+  const [k, setK] = useState(5);
+  useEffect(() => { api.f(9); }, []);
+  return <div>{k}</div>;
+}
+export function ViaMember() {
+  const [k, setK] = useState(0);
+  useEffect(() => { if (k > 0) setK(k + 1); }, [k]);
+  return <Member api={{ f: (x) => setK(x) }} />;
+}
+function Prop({ f }: { f: (x: number) => void }) {
+  const [k, setK] = useState(5);
+  useEffect(() => { f(9); }, []);
+  return <div>{k}</div>;
+}
+export function ViaProp() {
+  const [k, setK] = useState(0);
+  useEffect(() => { if (k > 0) setK(k + 1); }, [k]);
+  return <Prop f={(x) => setK(x)} />;
+}
+"#;
+    let result = analyze(src);
+    for (parent, child) in [("ViaMember", "Member"), ("ViaProp", "Prop")] {
+        assert!(
+            holds(&result, parent, 0, 9.0),
+            "{parent}: the write is lost"
+        );
+        assert!(
+            !loops(&result, parent).is_empty(),
+            "{parent}: no loop claim"
+        );
+        let id = result.component_named(child).unwrap();
+        assert_eq!(
+            result.components[&id].state_store.get(0),
+            StateValue::number(Interval::point(5.0)),
+            "{child}: the parent's closure wrote the child's slot"
+        );
+    }
+}
+
+/// A body of the caller's own component still reads the component's names:
+/// an inline callback, a closure called by name in an effect, one that calls
+/// a closure bound after it was created, and a closure called from a helper
+/// that does not capture `x`, assigned after the closure's creation (#215:
+/// the helper runs in the component's scope, where `x` is live at the call).
+#[test]
+fn a_closure_of_the_caller_reads_the_callers_names() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function App() {
+  const [a, setA] = useState(0);
+  const [b, setB] = useState(0);
+  const [c, setC] = useState(0);
+  const [d, setD] = useState(0);
+  const f = () => setB(3);
+  const g = () => h();
+  const h = () => setC(4);
+  let x = 0;
+  const k = () => setD(x);
+  const run = () => k();
+  x = 5;
+  useEffect(() => {
+    [1].forEach((y) => setA(y + 1));
+    f();
+    g();
+    run();
+  }, []);
+  return <div>{a}{b}{c}{d}</div>;
+}
+"#;
+    let result = analyze(src);
+    assert!(holds(&result, "App", 0, 2.0), "the inline callback's write");
+    assert!(holds(&result, "App", 1, 3.0), "the named closure's write");
+    assert!(
+        holds(&result, "App", 2, 4.0),
+        "the later-bound closure's write"
+    );
+    assert!(
+        holds(&result, "App", 3, 5.0),
+        "the live value through a helper"
+    );
+}
+
+// ── #327: a binding replaces the setter a name was ──────────────────────────
+
+/// A child whose mount effect binds `s` to `setA`, then runs `body`; the
+/// parent passes its own `setK` as `onX`, and loops once `k` moves off 0;
+/// `c` may be either.
+fn rebinding(body: &str) -> String {
+    format!(
+        r#"
+import {{ useState, useEffect }} from 'react';
+function Child({{ c, onX }}: {{ c: boolean; onX: (v: number) => void }}) {{
+  const [a, setA] = useState(0);
+  const [n, setN] = useState(0);
+  useEffect(() => {{
+    let s: any = setA;
+    {body}
+  }}, []);
+  return <div>{{a}}{{n}}</div>;
+}}
+export function App() {{
+  const [k, setK] = useState(0);
+  useEffect(() => {{ if (k > 0) setK(k + 1); }}, [k]);
+  return <Child c={{Math.random() < 0.5}} onX={{setK}} />;
+}}
+"#
+    )
+}
+
+/// `s = onX` replaces `setA`: the call writes the parent's `k`, never the
+/// child's `a`; on one branch only, it may write either; a number is no
+/// setter at all; a closure on one branch runs as well.
+#[test]
+fn a_rebinding_replaces_the_setter_a_name_was() {
+    let child_a = |result: &ProgramAnalysisResult| {
+        let id = result.component_named("Child").unwrap();
+        result.components[&id].state_store.get(0)
+    };
+    let zero = StateValue::number(Interval::point(0.0));
+
+    let result = analyze(&rebinding("s = onX; s(5);"));
+    assert!(holds(&result, "App", 0, 5.0), "the parent's slot takes it");
+    assert!(!loops(&result, "App").is_empty(), "the parent loops");
+    assert_eq!(child_a(&result), zero, "`s` is no longer `setA`");
+
+    let result = analyze(&rebinding("if (c) s = onX; s(5);"));
+    assert!(holds(&result, "App", 0, 5.0), "`s` may be `onX`");
+    assert!(holds(&result, "Child", 0, 5.0), "`s` may be `setA`");
+    assert!(!loops(&result, "App").is_empty(), "the parent loops");
+
+    let result = analyze(&rebinding("s = 0; try { s(5); } catch {}"));
+    assert_eq!(child_a(&result), zero, "a number writes no slot");
+
+    let result = analyze(&rebinding("if (c) s = (v: number) => setN(v); s(5);"));
+    assert!(holds(&result, "Child", 0, 5.0), "`s` may be `setA`");
+    assert!(holds(&result, "Child", 1, 5.0), "the closure runs");
+
+    let result = analyze(&rebinding("s(5);"));
+    assert!(holds(&result, "Child", 0, 5.0), "`s` is `setA`");
+}
+
+/// #258 shares a name's binding between the bodies that assign it: the
+/// render's `s = setA` joined with the effect's `s = onX` may be either, so
+/// the other effect's call writes the parent's slot as well.
+#[test]
+fn a_binding_another_body_stores_replaces_the_setter_label() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Child({ onX }: { onX: (v: number) => void }) {
+  const [a, setA] = useState(0);
+  let s = setA;
+  useEffect(() => { s = onX; }, []);
+  useEffect(() => { s(5); }, []);
+  return <div>{a}</div>;
+}
+export function App() {
+  const [k, setK] = useState(0);
+  useEffect(() => { if (k > 0) setK(k + 1); }, [k]);
+  return <Child onX={setK} />;
+}
+"#;
+    let result = analyze(src);
+    assert!(holds(&result, "App", 0, 5.0), "the parent's slot takes it");
+    assert!(!loops(&result, "App").is_empty(), "the parent loops");
+}
+
+/// `unnecessary-rerender` claims the mount effect's write of `a` only where
+/// the call may be `setA`: not once `s` is rebound to the parent's setter.
+#[test]
+fn unnecessary_rerender_reads_the_setter_the_name_holds_at_the_call() {
+    let claims_a = |body: &str| {
+        let result = analyze(&rebinding(body));
+        let child = result.component_named("Child").unwrap();
+        UnnecessaryRerender
+            .check(&RuleCtx::new(&result, child))
+            .iter()
+            .any(|d| d.message.contains("`a`"))
+    };
+    assert!(claims_a("s(5);"), "`s` is `setA`");
+    assert!(claims_a("if (c) s = onX; s(5);"), "`s` may be `setA`");
+    assert!(!claims_a("s = onX; s(5);"), "`s` is the parent's setter");
+}
+
+// ── #328: a call's value joins what every run body returned ─────────────────
+
+/// A callee that is a closure of the component and something the heap does
+/// not place — a prop, a setter — runs the closure, and the call's value
+/// holds what it returns: the next call runs that closure. Two closures of
+/// the component each return theirs.
+#[test]
+fn a_call_holds_what_every_body_it_ran_returned() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function Open({ make }: { make?: () => () => void }) {
+  const [n, setN] = useState(0);
+  const mk = () => () => setN(7);
+  const f = make ?? mk;
+  useEffect(() => { const g = f(); g(); }, []);
+  return <div>{n}</div>;
+}
+export function OrSetter({ c }: { c?: boolean }) {
+  const [n, setN] = useState(0);
+  const [a, setA] = useState(0);
+  const mk = (_v: number) => () => setN(7);
+  const f: (v: number) => unknown = c ? mk : setA;
+  useEffect(() => { const r = f(3); if (typeof r === "function") r(); }, []);
+  return <div>{n}{a}</div>;
+}
+export function Two({ c }: { c?: boolean }) {
+  const [n, setN] = useState(0);
+  const [a, setA] = useState(0);
+  const mk1 = () => () => setN(7);
+  const mk2 = () => () => setA(8);
+  const f = c ? mk1 : mk2;
+  useEffect(() => { const g = f(); g(); }, []);
+  return <div>{n}{a}</div>;
+}
+"#;
+    let result = analyze(src);
+    assert!(
+        holds(&result, "Open", 0, 7.0),
+        "`make ?? mk`: `mk`'s closure"
+    );
+    assert!(holds(&result, "OrSetter", 0, 7.0), "`mk`'s closure");
+    assert!(holds(&result, "OrSetter", 1, 3.0), "the setter's write");
+    assert!(holds(&result, "Two", 0, 7.0), "`mk1`'s closure");
+    assert!(holds(&result, "Two", 1, 8.0), "`mk2`'s closure");
+}
+
+/// #329: a call of a value that may be any of nine setters writes each of
+/// them — the join keeps every name, there is no "some setter" past a bound.
+/// A parent's setters handed to a child as one prop land in the parent.
+#[test]
+fn a_call_of_many_setters_writes_every_one() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function App({ i = 0 }: { i?: number }) {
+  const [n, setN] = useState(0);
+  const [a1, s1] = useState(0);
+  const [a2, s2] = useState(0);
+  const [a3, s3] = useState(0);
+  const [a4, s4] = useState(0);
+  const [a5, s5] = useState(0);
+  const [a6, s6] = useState(0);
+  const [a7, s7] = useState(0);
+  const [a8, s8] = useState(0);
+  const fs = [setN, s1, s2, s3, s4, s5, s6, s7, s8];
+  useEffect(() => { fs[i](7); }, []);
+  return <div>{n}{a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8}<Child set={fs[i]} /></div>;
+}
+function Child({ set }: { set: (v: number) => void }) {
+  useEffect(() => { set(9); }, []);
+  return null;
+}
+"#;
+    let result = analyze(src);
+    for label in 0..9 {
+        assert!(holds(&result, "App", label, 7.0), "slot {label}: the call");
+        assert!(holds(&result, "App", label, 9.0), "slot {label}: the child");
     }
 }
 

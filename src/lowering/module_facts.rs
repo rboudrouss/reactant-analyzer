@@ -1,12 +1,14 @@
 //! Collect the per-file [`ModuleFacts`] — directive prologue and resolved
 //! import edges (ADR-026 §1).
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use oxc_ast::ast::{ImportOrExportKind, Program, Statement};
+use oxc_ast::ast::*;
+use oxc_ast_visit::{Visit, walk};
 
 use crate::ir::ModuleFacts;
-use crate::ir::module::ReExports;
+use crate::ir::module::{AccessorNames, ReExports, ValueRef};
 use crate::resolver::ImportResolver;
 
 /// Read `file`'s directive prologue and its resolved module edges.
@@ -97,12 +99,299 @@ pub fn collect_module_facts(
             .collect();
     }
 
+    let mut imported: Vec<(String, PathBuf, String)> = bindings
+        .into_iter()
+        .map(|(local, origin)| (local, origin.file, origin.imported))
+        .collect();
+    imported.sort();
     ModuleFacts {
         directives,
         imports,
         compiled_entries,
         re_exports,
+        value_refs: value_refs(program, file, resolver),
+        accessors: accessor_names(program),
+        bindings: super::top_level_binding_names(program),
+        imported,
     }
+}
+
+/// The member names `program` defines an accessor of, anywhere in it (#334):
+/// a `get` or `set` of an object literal or a class, static or not; a
+/// descriptor `Object.defineProperty`, `Reflect.defineProperty`,
+/// `Object.defineProperties`, `Object.create` or `__defineGetter__` /
+/// `__defineSetter__` may install one with; a `Proxy` whose handler may trap
+/// `get` or `set`, which runs at a read of any name. A descriptor is an
+/// accessor unless it is a literal with no `get` nor `set` member. A key no
+/// constant spells may be any name. `accessor x` is left out: its getter and
+/// setter only read and write the field's own storage, a data member's
+/// behaviour.
+///
+/// Apart (#336): what may land on an object that exists before it — a
+/// descriptor of every one of those calls but `Object.create`, whose
+/// descriptors land on the object it creates — and a prototype the program
+/// sets (`Object.setPrototypeOf`, `Reflect.setPrototypeOf`, a write of
+/// `__proto__`): a literal brings its own accessors, `null` none, anything
+/// else any object of the program.
+pub(crate) fn accessor_names(program: &Program) -> AccessorNames {
+    let mut scan = AccessorScan::default();
+    scan.visit_program(program);
+    scan.found
+}
+
+#[derive(Default)]
+struct AccessorScan {
+    found: AccessorNames,
+}
+
+impl AccessorScan {
+    /// `proto` (`None`: not written) is made an existing object's
+    /// prototype. A literal puts its own accessors on that object's chain,
+    /// and its own prototype's when it names one; `null` puts none; any other
+    /// value may be any object of the program.
+    fn prototype(&mut self, proto: Option<&Expression>) {
+        match proto.map(Expression::get_inner_expression) {
+            Some(Expression::NullLiteral(_)) => {}
+            Some(Expression::ObjectExpression(obj)) => {
+                for p in &obj.properties {
+                    let ObjectPropertyKind::ObjectProperty(p) = p else {
+                        continue;
+                    };
+                    if p.kind != PropertyKind::Init {
+                        self.found.install(key_name(&p.key).as_deref());
+                    } else if !p.computed
+                        && !p.shorthand
+                        && !p.method
+                        && key_name(&p.key).is_some_and(|k| k == "__proto__")
+                    {
+                        self.prototype(Some(&p.value));
+                    }
+                }
+            }
+            _ => self.found.reprototype(),
+        }
+    }
+}
+
+/// The member name `key` spells, the way lowering spells a read of it.
+fn key_name(key: &PropertyKey) -> Option<String> {
+    match key {
+        PropertyKey::PrivateIdentifier(p) => Some(format!("#{}", p.name)),
+        other => super::expr_lower::property_name(other),
+    }
+}
+
+/// A constant string `e` is, as a member name.
+fn const_name(e: &Expression) -> Option<String> {
+    match e.get_inner_expression() {
+        Expression::StringLiteral(s) => Some(s.value.to_string()),
+        Expression::TemplateLiteral(t) if t.expressions.is_empty() => t
+            .quasis
+            .first()
+            .and_then(|q| q.value.cooked.as_ref())
+            .map(|c| c.to_string()),
+        Expression::NumericLiteral(n) if n.value >= 0.0 && n.value.fract() == 0.0 => {
+            Some(format!("{}", n.value as u64))
+        }
+        _ => None,
+    }
+}
+
+/// May the descriptor (or the handler) `e` hold a `get` or a `set`? Only a
+/// literal whose members are all named, none of them those two, holds none.
+fn may_hold_accessor(e: Option<&Expression>) -> bool {
+    let Some(Expression::ObjectExpression(obj)) = e.map(Expression::get_inner_expression) else {
+        return true;
+    };
+    obj.properties.iter().any(|p| match p {
+        ObjectPropertyKind::SpreadProperty(_) => true,
+        ObjectPropertyKind::ObjectProperty(p) => {
+            key_name(&p.key).is_none_or(|k| k == "get" || k == "set")
+        }
+    })
+}
+
+impl<'a> Visit<'a> for AccessorScan {
+    fn visit_object_property(&mut self, it: &ObjectProperty<'a>) {
+        if it.kind != PropertyKind::Init {
+            self.found.define(key_name(&it.key).as_deref());
+        }
+        walk::walk_object_property(self, it);
+    }
+
+    fn visit_method_definition(&mut self, it: &MethodDefinition<'a>) {
+        if matches!(
+            it.kind,
+            MethodDefinitionKind::Get | MethodDefinitionKind::Set
+        ) {
+            self.found.define(key_name(&it.key).as_deref());
+        }
+        walk::walk_method_definition(self, it);
+    }
+
+    fn visit_call_expression(&mut self, it: &CallExpression<'a>) {
+        let arg = |i: usize| it.arguments.get(i).and_then(Argument::as_expression);
+        if let Expression::StaticMemberExpression(m) = it.callee.get_inner_expression() {
+            let on = match m.object.get_inner_expression() {
+                Expression::Identifier(id) => Some(id.name.as_str()),
+                _ => None,
+            };
+            match (on, m.property.name.as_str()) {
+                (Some("Object" | "Reflect"), "defineProperty") => {
+                    if may_hold_accessor(arg(2)) {
+                        self.found.install(arg(1).and_then(const_name).as_deref());
+                    }
+                }
+                // The descriptors are the second argument of both;
+                // `Object.create`'s land on the object it creates only.
+                (Some("Object"), method @ ("defineProperties" | "create")) => {
+                    let mut add = |member: Option<&str>| match method {
+                        "create" => self.found.define(member),
+                        _ => self.found.install(member),
+                    };
+                    match arg(1).map(Expression::get_inner_expression) {
+                        Some(Expression::ObjectExpression(obj)) => {
+                            for p in &obj.properties {
+                                match p {
+                                    ObjectPropertyKind::SpreadProperty(_) => add(None),
+                                    ObjectPropertyKind::ObjectProperty(p) => {
+                                        if may_hold_accessor(Some(&p.value)) {
+                                            add(key_name(&p.key).as_deref());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // `Object.create(proto)` installs no member.
+                        None => {}
+                        Some(_) => add(None),
+                    }
+                }
+                (Some("Object" | "Reflect"), "setPrototypeOf") => self.prototype(arg(1)),
+                (_, "__defineGetter__" | "__defineSetter__") => {
+                    self.found.install(arg(0).and_then(const_name).as_deref());
+                }
+                _ => {}
+            }
+        }
+        walk::walk_call_expression(self, it);
+    }
+
+    fn visit_assignment_expression(&mut self, it: &AssignmentExpression<'a>) {
+        let proto = match &it.left {
+            AssignmentTarget::StaticMemberExpression(m) => m.property.name == "__proto__",
+            AssignmentTarget::ComputedMemberExpression(m) => {
+                const_name(&m.expression).is_some_and(|k| k == "__proto__")
+            }
+            _ => false,
+        };
+        if proto {
+            self.prototype(Some(&it.right));
+        }
+        walk::walk_assignment_expression(self, it);
+    }
+
+    fn visit_new_expression(&mut self, it: &NewExpression<'a>) {
+        if let Expression::Identifier(id) = it.callee.get_inner_expression()
+            && id.name == "Proxy"
+            && may_hold_accessor(it.arguments.get(1).and_then(Argument::as_expression))
+        {
+            self.found.define(None);
+        }
+        walk::walk_new_expression(self, it);
+    }
+}
+
+/// The definitions `program` reads as a value (#313): every identifier read
+/// outside a JSX element's tag, an `export` clause and a type, resolved to
+/// this file's own top-level name or through an import; a default or
+/// namespace import, and a dynamic `import()` of a file, stand for any
+/// definition of that file. A name bound nowhere at the top level and
+/// imported from no analyzed file names no definition of the program.
+fn value_refs(program: &Program, file: &Path, resolver: &dyn ImportResolver) -> Vec<ValueRef> {
+    let mut bindings: HashMap<String, ValueRef> = HashMap::new();
+    for name in super::top_level_binding_names(program) {
+        bindings.insert(name.clone(), ValueRef::Named(file.to_path_buf(), name));
+    }
+    for stmt in &program.body {
+        let Statement::ImportDeclaration(decl) = stmt else {
+            continue;
+        };
+        let Some(from) = resolver.resolve(file, decl.source.value.as_str()) else {
+            continue;
+        };
+        for spec in decl.specifiers.iter().flatten() {
+            let (local, r) = match spec {
+                ImportDeclarationSpecifier::ImportSpecifier(s) => (
+                    s.local.name.to_string(),
+                    ValueRef::Named(from.clone(), s.imported.name().to_string()),
+                ),
+                ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => {
+                    (s.local.name.to_string(), ValueRef::File(from.clone()))
+                }
+                ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => {
+                    (s.local.name.to_string(), ValueRef::File(from.clone()))
+                }
+            };
+            bindings.insert(local, r);
+        }
+    }
+    let mut scan = ValueScan {
+        bindings: &bindings,
+        file,
+        resolver,
+        found: HashSet::new(),
+    };
+    scan.visit_program(program);
+    let mut found: Vec<ValueRef> = scan.found.into_iter().collect();
+    found.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+    found
+}
+
+struct ValueScan<'r> {
+    bindings: &'r HashMap<String, ValueRef>,
+    file: &'r Path,
+    resolver: &'r dyn ImportResolver,
+    found: HashSet<ValueRef>,
+}
+
+impl<'a> Visit<'a> for ValueScan<'_> {
+    fn visit_identifier_reference(&mut self, it: &IdentifierReference<'a>) {
+        if let Some(r) = self.bindings.get(it.name.as_str()) {
+            self.found.insert(r.clone());
+        }
+    }
+
+    // `<C/>`: the element tree places it. A member tag (`<parts.C/>`) reads
+    // its object.
+    fn visit_jsx_element_name(&mut self, it: &JSXElementName<'a>) {
+        if !matches!(it, JSXElementName::IdentifierReference(_)) {
+            walk::walk_jsx_element_name(self, it);
+        }
+    }
+
+    // An export hands the name to importers, whose reads are theirs.
+    fn visit_export_specifier(&mut self, _it: &ExportSpecifier<'a>) {}
+
+    fn visit_export_default_declaration_kind(&mut self, it: &ExportDefaultDeclarationKind<'a>) {
+        if !matches!(it, ExportDefaultDeclarationKind::Identifier(_)) {
+            walk::walk_export_default_declaration_kind(self, it);
+        }
+    }
+
+    fn visit_import_expression(&mut self, it: &ImportExpression<'a>) {
+        if let Expression::StringLiteral(s) = &it.source
+            && let Some(from) = self.resolver.resolve(self.file, s.value.as_str())
+        {
+            self.found.insert(ValueRef::File(from));
+        }
+        walk::walk_import_expression(self, it);
+    }
+
+    // Types are erased before anything runs.
+    fn visit_ts_type(&mut self, _it: &TSType<'a>) {}
+    fn visit_ts_type_annotation(&mut self, _it: &TSTypeAnnotation<'a>) {}
+    fn visit_ts_type_parameter_instantiation(&mut self, _it: &TSTypeParameterInstantiation<'a>) {}
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -135,6 +424,92 @@ mod tests {
             ret.diagnostics
         );
         collect_module_facts(&ret.program, Path::new("/root/a.tsx"), &FakeResolver)
+    }
+
+    /// The names spelled, and whether any name may be an accessor's.
+    fn accessors_of(source: &str) -> (Vec<String>, bool) {
+        let f = facts_of(source);
+        let (names, any) = f.accessors.names();
+        (names.map(str::to_string).collect(), any)
+    }
+
+    #[test]
+    fn every_accessor_spelling_defines_its_name() {
+        let (names, any) = accessors_of(
+            r#"
+            const o = { get a() { return 1; }, set b(v) {}, c: 1, d() {} };
+            class K { get e() { return 1; } static set f(v) {} get #g() { return 1; } h() {} accessor i = 1; }
+            Object.defineProperty(o, "j", { get() { return 1; } });
+            Object.defineProperty(o, "k", { value: 1, writable: true });
+            Reflect.defineProperty(o, "l", descriptor);
+            Object.defineProperties(o, { m: { get: () => 1 }, n: { value: 2 } });
+            Object.create(null, { p: { set(v) {} } });
+            o.__defineGetter__("q", () => 1);
+        "#,
+        );
+        assert_eq!(names, ["#g", "a", "b", "e", "f", "j", "l", "m", "p", "q"]);
+        assert!(!any);
+    }
+
+    #[test]
+    fn an_accessor_no_constant_names_may_be_any() {
+        for src in [
+            "const o = { get [k]() { return 1; } };",
+            "class K { set [k](v) {} }",
+            "Object.defineProperty(o, k, { get() { return 1; } });",
+            "Object.defineProperties(o, props);",
+            "const p = new Proxy(t, { get: () => 1 });",
+            "const p = new Proxy(t, handler);",
+        ] {
+            assert!(accessors_of(src).1, "{src}");
+        }
+        let (names, any) = accessors_of("const p = new Proxy(t, { apply: () => 1 });");
+        assert!(names.is_empty() && !any);
+    }
+
+    /// What a read off a plain object React builds may run (#336): only an
+    /// accessor a descriptor installs, or the accessors of a prototype the
+    /// program sets.
+    #[test]
+    fn a_plain_object_reads_only_installed_accessors() {
+        use crate::ir::module::AccessKey;
+        let off_plain = |src: &str, name: &str| {
+            facts_of(src)
+                .accessors
+                .may_run_off_plain(AccessKey::Named(name))
+        };
+        // A literal's, a class's, a `Proxy`'s and `Object.create`'s land on
+        // another object.
+        for src in [
+            "const o = { get p() { return 1; } };",
+            "class K { get p() { return 1; } }",
+            "const t = new Proxy({}, { get: () => ({}) });",
+            "Object.create(null, { p: { get: () => 1 } });",
+            "Object.setPrototypeOf(o, null); o.__proto__ = { q: 1 };",
+        ] {
+            assert!(!off_plain(src, "p"), "{src}");
+        }
+        // A descriptor may install on `Object.prototype` or the object.
+        for src in [
+            "Object.defineProperty(Object.prototype, \"p\", { get: () => ({}) });",
+            "Reflect.defineProperty(t, \"p\", d);",
+            "Object.defineProperties(t, { p: { get: () => 1 } });",
+            "t.__defineGetter__(\"p\", () => 1);",
+            "Object.defineProperty(t, k, { get: () => 1 });",
+            "Object.setPrototypeOf(o, { get p() { return 1; } });",
+            "o.__proto__ = { __proto__: { set p(v) {} } };",
+        ] {
+            assert!(off_plain(src, "p"), "{src}");
+        }
+        assert!(!off_plain(
+            "Object.defineProperty(t, \"q\", { get: () => 1 });",
+            "p"
+        ));
+        // A prototype that may be any object brings every accessor.
+        let proxy = "const t = new Proxy({}, { get: () => ({}) });";
+        for set in ["Object.setPrototypeOf(o, t);", "o[\"__proto__\"] = t;"] {
+            assert!(off_plain(&format!("{proxy}\n{set}"), "p"), "{set}");
+        }
     }
 
     #[test]

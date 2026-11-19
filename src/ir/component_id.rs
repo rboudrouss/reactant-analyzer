@@ -37,6 +37,18 @@ impl ComponentId {
     /// to the name the IR carries.
     pub const SYNTHETIC: ComponentId = ComponentId(u32::MAX);
 
+    /// The owner of the store slot (`engine::store::STORE_SLOT`, ADR-046):
+    /// every library store and the URL, which no component of the program
+    /// owns. A table never interns it, so it names no component, and a row
+    /// it owns is a foreign write wherever it sits.
+    pub const STORE: ComponentId = ComponentId(u32::MAX - 1);
+
+    /// The owner of the module scope (#335): the top-level bindings of the
+    /// program's modules, which no component owns either. Its site range
+    /// holds one anchor per binding ([`crate::engine::module_scope`]), where
+    /// the call relation keeps what every write of it stores.
+    pub const MODULE: ComponentId = ComponentId(u32::MAX - 2);
+
     /// A raw id, for a unit-test fixture that needs several distinct
     /// components without building a table. Production ids come only from
     /// [`ComponentTable::intern`], which is what keeps an id and the table
@@ -64,11 +76,21 @@ impl ComponentId {
         (u64::from(self.0) + 1) << 32
     }
 
-    /// The site of the object `useRef` at hook `label` returns: one per hook
-    /// instance, the same on every render, as React keeps it (#268). Ref
-    /// sites count down from the top of the component's range, which lowered
-    /// sites, numbered up from its base, do not reach.
-    pub fn ref_site(self, label: super::types::HookLabel) -> super::types::ExprId {
+    /// The component whose range holds site `id`; `None` below the first
+    /// range: a fresh id (a child's props object) is no component's.
+    pub fn site_owner(id: super::types::ExprId) -> Option<ComponentId> {
+        let range = id.0 >> 32;
+        (range > 0)
+            .then(|| u32::try_from(range - 1).ok().map(ComponentId))
+            .flatten()
+    }
+
+    /// The site of the object the hook at `label` hands back: the container
+    /// `useRef` returns, one per hook instance, the same on every render, as
+    /// React keeps it (#268); the function a `useCallback` literal returns
+    /// (#320). Hook sites count down from the top of the component's range,
+    /// which lowered sites, numbered up from its base, do not reach.
+    pub fn hook_site(self, label: super::types::HookLabel) -> super::types::ExprId {
         let top = self.site_base() + u64::from(u32::MAX);
         super::types::ExprId(top - label as u64)
     }

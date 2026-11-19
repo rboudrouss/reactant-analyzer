@@ -45,9 +45,13 @@ use crate::engine::{
 };
 use crate::ir::{
     cfg::{CFG, Terminator},
-    expr::{CompOrigin, Expr, Prim, SPREAD_KEY_PREFIX, mutation_receiver},
+    expr::{
+        Accessor, CompOrigin, Expr, MarkerVal, Prim, SPREAD_KEY_PREFIX, SummaryValue, accessor_of,
+        mutation_receiver,
+    },
     free_vars::{collect_used_vars, compute_free_vars},
     hooks::HookEntry,
+    module::{AccessKey, AccessorNames},
     source_range::SourceRange,
     stmt::{MemberKey, Stmt},
     types::{BlockId, HookLabel, Symbol, Var},
@@ -87,6 +91,11 @@ pub enum Source {
     /// every component, which is what lets it be carried down the element
     /// tree untranslated.
     Module(Var),
+    /// A whole held hook result (`SummaryValue::Held`): a read of the store
+    /// slot, which moves only when a body writes it (ADR-046). Frame-free like
+    /// `Module`; every reader but the trigger relation reads it as a source
+    /// outside the model, as it reads `Hook`.
+    Store,
 }
 
 /// The module names a function value may write when called: an assignment,
@@ -484,8 +493,12 @@ pub fn written_names(result: &AnalysisResult<impl AbstractDomain>) -> HashSet<Va
 /// it is an [`AnalysisResult`]: a component or a custom hook as lowered.
 pub(crate) fn written_in(params: &[Var], body: &CFG, hooks: &[HookEntry]) -> HashSet<Var> {
     let mut out = written_roots(params, body);
-    for body in hooks.iter().filter_map(HookEntry::body_cfg) {
-        out.extend(written_roots(&[], body));
+    // A callback's own parameter is bound in its body: a default it stores
+    // there (`({ a } = {}) => …` assigns its `__p0`) writes nothing outside.
+    for hook in hooks {
+        if let Some(body) = hook.body_cfg() {
+            out.extend(written_roots(hook.body_params(), body));
+        }
     }
     out
 }
@@ -522,6 +535,7 @@ pub fn render_deps(
         gated: Default::default(),
         written: Default::default(),
         inline_hook: Default::default(),
+        accessors: result.heap.defined(),
     };
     let mut entry = Env::new();
     entry.insert(
@@ -616,6 +630,8 @@ struct Analyzer<'a> {
     /// The render calls a hook where lowering records none
     /// (`<p>{useTheme()}</p>`): it may read any context.
     inline_hook: std::cell::Cell<bool>,
+    /// The member names some accessor of the program defines (#334).
+    accessors: &'a AccessorNames,
 }
 
 struct Run {
@@ -922,7 +938,7 @@ impl<'a> Analyzer<'a> {
             }
             // `xs.push(v)`: a method call may store its arguments in the
             // receiver.
-            Stmt::ExprStmt(Expr::Call { fn_, args }, _) => {
+            Stmt::ExprStmt(Expr::Call { fn_, args, .. }, _) => {
                 if let Expr::FieldAccess { obj, .. } = fn_.peel_ts()
                     && let Some(root) = root_var(obj)
                     && !args.is_empty()
@@ -939,22 +955,49 @@ impl<'a> Analyzer<'a> {
     }
 
     /// The member `field` of a value.
-    fn member(base: &DVal, field: &str) -> DVal {
+    fn member(&self, base: &DVal, field: &str) -> DVal {
         match &base.shape {
-            Shape::Props => DVal::of(Deps::one(Source::Prop(field.to_string()))),
+            Shape::Props => self.read(
+                base,
+                Deps::one(Source::Prop(field.to_string())),
+                AccessKey::Named(field),
+            ),
             Shape::Members(m) => match m.get(field) {
                 Some(v) => v.clone(),
-                None => DVal::of(base.deps.clone()),
+                None => self.computed(base, AccessKey::Named(field)),
             },
             Shape::Spread { members, spreads } => match members.get(field) {
                 Some(v) => v.clone(),
                 None => spreads
                     .iter()
-                    .map(|s| Self::member(s, field))
+                    .map(|s| self.member(s, field))
                     .reduce(|a, b| a.join(&b))
-                    .unwrap_or_else(|| DVal::of(base.deps.clone())),
+                    .unwrap_or_else(|| self.computed(base, AccessKey::Named(field))),
             },
-            Shape::None => DVal::of(base.deps.clone()),
+            Shape::None => self.computed(base, AccessKey::Named(field)),
+        }
+    }
+
+    /// A member of `base` no entry of it says (`key`), computed from it.
+    fn computed(&self, base: &DVal, key: AccessKey<'_>) -> DVal {
+        self.read(base, base.deps.clone(), key)
+    }
+
+    /// A read of `key` off `base`, of what `deps` says. A value of no known
+    /// kind may run an accessor of the program there (#334), and a plain
+    /// object React builds — the props object, a ref — one its chain may
+    /// hold (#336): a call not known pure.
+    fn read(&self, base: &DVal, deps: Deps, key: AccessKey<'_>) -> DVal {
+        let runs = match (&base.shape, base.kind) {
+            (Shape::Props, _) | (_, Kind::Plain) => self.accessors.may_run_off_plain(key),
+            (_, kind) => kind == Kind::Unknown && self.accessors.may_run(key),
+        };
+        match runs {
+            true => DVal::of(Deps {
+                impure: true,
+                ..deps.ungated()
+            }),
+            false => DVal::of(deps),
         }
     }
 
@@ -965,12 +1008,20 @@ impl<'a> Analyzer<'a> {
             Expr::Var(v) => self.var(env, v),
             Expr::StateVal(l) => DVal::of(Deps::one(Source::Slot(*l))),
             Expr::StateSetter(l) => DVal::of(Deps::one(Source::Setter(*l))),
-            Expr::HookMarker(l, _) => match self.kinds.get(l) {
-                Some(HookKind::Ref) => DVal::of(Deps::one(Source::Ref(*l))),
+            Expr::HookMarker(l, marker) => match self.kinds.get(l) {
+                Some(HookKind::Ref) => DVal::of_kind(Deps::one(Source::Ref(*l)), Kind::Plain),
                 // An opaque hook's result may be computed from its arguments,
                 // like any call's (`useContext(Ctx)` reads `Ctx`'s value).
                 Some(HookKind::Custom) | None => {
-                    let mut d = Deps::one(Source::Hook(*l));
+                    // A held result reads the store, and moves with its
+                    // arguments too: an argument computed through an unknown
+                    // call may move it at every render (ADR-046).
+                    let held = matches!(marker, MarkerVal::Summary(SummaryValue::Held));
+                    let mut d = Deps::one(if held {
+                        Source::Store
+                    } else {
+                        Source::Hook(*l)
+                    });
                     let mut kind = Kind::Unknown;
                     if let Some(HookEntry::Custom {
                         args,
@@ -988,7 +1039,9 @@ impl<'a> Analyzer<'a> {
                     // an argument computed through an unknown call adds
                     // nothing to that, and nothing to a function that only
                     // captures the result (#161).
-                    d.impure = false;
+                    if !held {
+                        d.impure = false;
+                    }
                     DVal::of_kind(d, kind)
                 }
                 _ => DVal::empty(),
@@ -1034,12 +1087,15 @@ impl<'a> Analyzer<'a> {
             Expr::FnLit {
                 params, body_cfg, ..
             } => DVal::of(self.closure(params, body_cfg, env)),
-            Expr::FieldAccess { obj, field } => Self::member(&self.eval(obj, env), field),
+            Expr::FieldAccess { obj, field } => self.member(&self.eval(obj, env), field),
             Expr::IndexAccess { arr, idx } => {
-                let a = self.eval(arr, env);
-                let mut d = a.deps;
-                d.union_with(&self.eval(idx, env).deps);
-                DVal::of_kind(d, purity::element(a.kind, idx))
+                let (a, i) = (self.eval(arr, env), self.eval(idx, env));
+                let kind = purity::element(a.kind, idx);
+                let constant = purity::constant_key(idx);
+                let key = purity::access(a.kind, constant.as_deref(), i.kind);
+                let mut d = self.computed(&a, key).deps;
+                d.union_with(&i.deps);
+                DVal::of_kind(d, kind)
             }
             Expr::BinOp { op, lhs, rhs } => {
                 let (l, r) = (self.eval(lhs, env), self.eval(rhs, env));
@@ -1052,7 +1108,9 @@ impl<'a> Analyzer<'a> {
                 let v = self.eval(arg, env);
                 DVal::of_kind(v.deps, v.kind)
             }
-            Expr::Call { fn_, args } | Expr::New { fn_, args, .. } => {
+            // Entries of its operand, of no known kind.
+            Expr::Spread(arg) => DVal::of(self.eval(arg, env).deps),
+            Expr::Call { fn_, args, .. } | Expr::New { fn_, args, .. } => {
                 let name = match fn_.peel_ts() {
                     Expr::Var(v) => Some(v.as_str()),
                     Expr::FieldAccess { field, .. } => Some(field.as_str()),
@@ -1065,7 +1123,7 @@ impl<'a> Analyzer<'a> {
                     Expr::FieldAccess { obj, field } => {
                         let recv = self.eval(obj, env);
                         let kind = recv.kind;
-                        (Self::member(&recv, field), Callee::Method(kind, field))
+                        (self.member(&recv, field), Callee::Method(kind, field))
                     }
                     other => {
                         let f = self.eval(other, env);
@@ -1086,6 +1144,7 @@ impl<'a> Analyzer<'a> {
                     args,
                     &|i| vals[i].kind,
                     &|v| self.var_kind(env, v),
+                    self.accessors,
                 );
                 d.impure |= known.is_none();
                 DVal::of_kind(d, known.unwrap_or_default())
@@ -1100,9 +1159,31 @@ impl<'a> Analyzer<'a> {
                     if k.starts_with(SPREAD_KEY_PREFIX) {
                         // What it may put over every member written so far.
                         for (name, m) in members.iter_mut() {
-                            *m = m.join(&Self::member(&val, name));
+                            *m = m.join(&self.member(&val, name));
                         }
                         spreads.push(val);
+                    } else if let Some((half, name)) = accessor_of(k) {
+                        // A read of the member a getter defines is a call of
+                        // it (#321): what its body reads, through a call not
+                        // known pure. A setter defines no value to read.
+                        if half != Accessor::Get {
+                            continue;
+                        }
+                        let call = DVal::of(Deps {
+                            impure: true,
+                            ..val.deps.ungated()
+                        });
+                        match name {
+                            Some(name) => {
+                                members.insert(name.to_string(), call);
+                            }
+                            None => {
+                                for m in members.values_mut() {
+                                    *m = m.join(&call);
+                                }
+                                spreads.push(call);
+                            }
+                        }
                     } else {
                         members.insert(k.clone(), val);
                     }
@@ -1127,6 +1208,9 @@ impl<'a> Analyzer<'a> {
                 }
                 DVal::of_kind(d, Kind::Array)
             }
+            // The arguments of a call of the body (#324): what a caller
+            // computed them from, which this body does not see.
+            Expr::Arguments { .. } => DVal::of_kind(Deps::top(), Kind::Array),
             // The element's props are the child's inputs, attributed to the
             // site: the element value itself is not a use.
             Expr::CompApp { .. } => DVal::empty(),
@@ -1192,7 +1276,7 @@ impl<'a> Analyzer<'a> {
                 };
                 self.collect(props, env, &inner);
             }
-            Expr::Call { fn_, args } | Expr::New { fn_, args, .. } => {
+            Expr::Call { fn_, args, .. } | Expr::New { fn_, args, .. } => {
                 self.collect(fn_, env, ctx);
                 // The callback's parameters come from the receiver and the
                 // other arguments (a synchronous higher-order call).

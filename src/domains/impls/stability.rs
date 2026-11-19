@@ -18,20 +18,24 @@ pub const VERSIONED_LABELS_THRESHOLD: usize = 4;
 /// - **must** bound (under-approx): used by rules to *fire* without FPs.
 ///
 /// ```text
-///               Unknown  (⊤)
-///              /         \
-///      VersionedTop    PerRender
-///           |              |
-///    Versioned(S) ⊆-chains |
-///           |              |
-///        Stable            |
-///              \          /
-///               Bottom  (⊥)
+///                 MayBeFresh  (⊤)
+///                /           \
+///            Unknown          |
+///               |             |
+///         VersionedTop     PerRender
+///               |             |
+///    Versioned(S) ⊆-chains    |
+///               |             |
+///            Stable           |
+///                \           /
+///                 Bottom  (⊥)
 /// ```
 ///
-/// `Versioned`/`VersionedTop` and `PerRender` are incomparable — not
-/// opposites, different bounds: `join = Unknown` (guarantees nothing in
-/// either direction).
+/// `PerRender` is incomparable with every other point but the ends — not an
+/// opposite, a different bound. What separates `Unknown` from `MayBeFresh`
+/// is not the change trace (neither bounds it) but its cause (#304): the
+/// re-run class reads an `Unknown` value through what it is computed from
+/// (`render_deps`), and an allocation has no source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stability {
     /// ⊥ no information (unreachable path / uninitialized).
@@ -47,8 +51,15 @@ pub enum Stability {
     /// A fresh reference every render, guaranteed (must bound).
     /// For non-reference kinds via `to_stability`: "may change every render".
     PerRender,
-    /// ⊤ no bound in either direction.
+    /// No bound in either direction, on a value no allocation of this render
+    /// reaches: what an opaque value hands back (a free name, an input, a
+    /// call, a member read), which changes with what it is computed from.
+    /// `top()`: what a name, a slot or a memo nothing binds reads as.
     Unknown,
+    /// ⊤: a reference this render may have allocated on some path, anything
+    /// on the others (`x ?? {}`, `c ? D : {}`): it may be new at a render
+    /// where nothing it is computed from moved (#304).
+    MayBeFresh,
 }
 
 impl Stability {
@@ -76,6 +87,11 @@ impl PartialOrd for Stability {
             (a, b) if a == b => Some(Ordering::Equal),
             (Bottom, _) => Some(Ordering::Less),
             (_, Bottom) => Some(Ordering::Greater),
+            (_, MayBeFresh) => Some(Ordering::Less),
+            (MayBeFresh, _) => Some(Ordering::Greater),
+            // PerRender vs every point between the ends: incomparable
+            // (different bounds — may vs must; an allocation vs an input).
+            (PerRender, _) | (_, PerRender) => None,
             (_, Unknown) => Some(Ordering::Less),
             (Unknown, _) => Some(Ordering::Greater),
             // Stable ⊑ Versioned ⊑ VersionedTop (behaviour-set inclusion:
@@ -93,8 +109,6 @@ impl PartialOrd for Stability {
             }
             (Versioned(_), VersionedTop) => Some(Ordering::Less),
             (VersionedTop, Versioned(_)) => Some(Ordering::Greater),
-            // PerRender vs Stable/Versioned/VersionedTop: incomparable
-            // (different bounds — may vs must).
             _ => None,
         }
     }
@@ -111,13 +125,16 @@ impl Stability {
         match (self, other) {
             (a, b) if a == b => a.clone(),
             (Bottom, x) | (x, Bottom) => x.clone(),
+            // A fresh arm joined with anything else may be new at a render
+            // nothing it is computed from moved: `x ?? {}` (#304).
+            (MayBeFresh, _) | (_, MayBeFresh) | (PerRender, _) | (_, PerRender) => MayBeFresh,
             (Unknown, _) | (_, Unknown) => Unknown,
             (Stable, v @ (Versioned(_) | VersionedTop))
             | (v @ (Versioned(_) | VersionedTop), Stable) => v.clone(),
             (Versioned(s), Versioned(t)) => Stability::versioned(s.union(t).cloned().collect()),
             (VersionedTop, Versioned(_)) | (Versioned(_), VersionedTop) => VersionedTop,
-            // {Stable, Versioned, VersionedTop} ⊔ PerRender = Unknown
-            _ => Unknown,
+            (Stable, Stable) => Stable,
+            (VersionedTop, VersionedTop) => VersionedTop,
         }
     }
 
@@ -126,21 +143,24 @@ impl Stability {
         use Stability::*;
         match (self, other) {
             (a, b) if a == b => a.clone(),
-            (Unknown, x) | (x, Unknown) => x.clone(),
+            (MayBeFresh, x) | (x, MayBeFresh) => x.clone(),
             (Bottom, _) | (_, Bottom) => Bottom,
+            // PerRender ⊓ anything between the ends = Bottom
+            (PerRender, _) | (_, PerRender) => Bottom,
+            (Unknown, x) | (x, Unknown) => x.clone(),
             (Stable, Versioned(_) | VersionedTop) | (Versioned(_) | VersionedTop, Stable) => Stable,
             (Versioned(s), Versioned(t)) => {
                 let inter: BTreeSet<_> = s.intersection(t).cloned().collect();
                 Stability::versioned(inter) // ∅ canonicalises to Stable
             }
             (VersionedTop, v @ Versioned(_)) | (v @ Versioned(_), VersionedTop) => v.clone(),
-            // {Stable, Versioned, VersionedTop} ⊓ PerRender = Bottom
-            _ => Bottom,
+            (Stable, Stable) => Stable,
+            (VersionedTop, VersionedTop) => VersionedTop,
         }
     }
 
     /// Widening: join, whose `Versioned` union is already threshold-bounded —
-    /// chains have height ≤ threshold + 4.
+    /// chains have height ≤ threshold + 5.
     pub fn widen(&self, other: &Self) -> Self {
         self.join(other)
     }
@@ -154,11 +174,15 @@ impl Stability {
     /// state boolean are `Versioned` by that state, not `Stable`. The must
     /// side is that of `a ⊔ b` alone: two arms that are each fresh every
     /// render give a fresh selection, so `PerRender` stays `PerRender`
-    /// (a plain join with `may(c)` would weaken it to `Unknown`). `Unknown`
-    /// cannot grow and `Bottom` is unreachable code.
+    /// (a plain join with `may(c)` would weaken it to `MayBeFresh`). `Unknown`
+    /// and `MayBeFresh` cannot grow by a condition's bound and `Bottom` is
+    /// unreachable code.
     pub fn under_condition(&self, cond: &Self) -> Self {
         match self {
-            Stability::Bottom | Stability::PerRender | Stability::Unknown => self.clone(),
+            Stability::Bottom
+            | Stability::PerRender
+            | Stability::Unknown
+            | Stability::MayBeFresh => self.clone(),
             _ => self.join(cond),
         }
     }
@@ -168,6 +192,9 @@ impl AbstractDomain for Stability {
     fn bottom() -> Self {
         Stability::Bottom
     }
+    /// What nothing binds reads as: an opaque value, `Unknown`, as
+    /// [`StateValue::top`](crate::domains::StateValue) — not the lattice's ⊤,
+    /// which only a join with an allocation reaches.
     fn top() -> Self {
         Stability::Unknown
     }
@@ -209,32 +236,50 @@ mod tests {
             Stability::VersionedTop,
             Stability::PerRender,
             Stability::Unknown,
+            Stability::MayBeFresh,
         ]
     }
 
     // ── join ──────────────────────────────────────────────────────────────────
 
     #[test]
-    fn join_stable_perrender_is_unknown() {
+    fn join_stable_perrender_may_be_fresh() {
         assert_eq!(
             Stability::Stable.join(&Stability::PerRender),
-            Stability::Unknown
+            Stability::MayBeFresh
         );
         assert_eq!(
             Stability::PerRender.join(&Stability::Stable),
-            Stability::Unknown
+            Stability::MayBeFresh
         );
     }
 
     #[test]
-    fn join_versioned_perrender_is_unknown() {
+    fn join_versioned_perrender_may_be_fresh() {
         assert_eq!(
             v(&[("A", 0)]).join(&Stability::PerRender),
-            Stability::Unknown
+            Stability::MayBeFresh
         );
         assert_eq!(
             Stability::VersionedTop.join(&Stability::PerRender),
+            Stability::MayBeFresh
+        );
+    }
+
+    /// #304: an opaque value or a fresh allocation (`absent ?? {}`) may be new
+    /// at a render nothing it is computed from moved: the join must not
+    /// collapse into `Unknown`, which the re-run class reads through sources.
+    #[test]
+    fn join_unknown_perrender_may_be_fresh() {
+        assert_eq!(
+            Stability::Unknown.join(&Stability::PerRender),
+            Stability::MayBeFresh
+        );
+        assert!(Stability::Unknown < Stability::MayBeFresh);
+        assert!(
             Stability::Unknown
+                .partial_cmp(&Stability::PerRender)
+                .is_none()
         );
     }
 
@@ -267,9 +312,18 @@ mod tests {
     }
 
     #[test]
-    fn join_with_unknown_is_unknown() {
+    fn join_with_unknown_is_unknown_unless_fresh() {
         for x in all_points() {
-            assert_eq!(x.join(&Stability::Unknown), Stability::Unknown);
+            let fresh = matches!(x, Stability::PerRender | Stability::MayBeFresh);
+            assert_eq!(
+                x.join(&Stability::Unknown),
+                if fresh {
+                    Stability::MayBeFresh
+                } else {
+                    Stability::Unknown
+                }
+            );
+            assert_eq!(x.join(&Stability::MayBeFresh), Stability::MayBeFresh);
         }
     }
 
@@ -322,6 +376,10 @@ mod tests {
                 Stability::PerRender
             );
             assert_eq!(Stability::Unknown.under_condition(&c), Stability::Unknown);
+            assert_eq!(
+                Stability::MayBeFresh.under_condition(&c),
+                Stability::MayBeFresh
+            );
             assert_eq!(Stability::Bottom.under_condition(&c), Stability::Bottom);
         }
     }
@@ -370,9 +428,9 @@ mod tests {
     }
 
     #[test]
-    fn meet_with_unknown_is_identity() {
+    fn meet_with_the_top_is_identity() {
         for x in all_points() {
-            assert_eq!(x.meet(&Stability::Unknown), x);
+            assert_eq!(x.meet(&Stability::MayBeFresh), x);
         }
     }
 
@@ -390,10 +448,10 @@ mod tests {
     // ── partial order ─────────────────────────────────────────────────────────
 
     #[test]
-    fn bottom_least_unknown_greatest() {
+    fn bottom_least_may_be_fresh_greatest() {
         for x in all_points() {
             assert!(Stability::Bottom <= x);
-            assert!(x <= Stability::Unknown);
+            assert!(x <= Stability::MayBeFresh);
         }
     }
 

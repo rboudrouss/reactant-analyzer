@@ -1,4 +1,5 @@
 pub mod analysis_result;
+pub mod calls;
 pub mod cfg_analyzer;
 pub mod churn;
 pub mod component_cache;
@@ -9,6 +10,7 @@ pub mod fixpoint;
 pub mod function_registry;
 pub mod guards;
 pub mod hook_registry;
+pub mod module_scope;
 pub mod program_relations;
 pub mod program_result;
 pub mod purity;
@@ -18,6 +20,7 @@ pub mod render_deps;
 pub mod root_detector;
 pub mod seeds;
 pub mod setters;
+pub mod store;
 pub mod symbol_graph;
 pub mod timing;
 pub mod triggers;
@@ -27,18 +30,20 @@ pub use analysis_result::{
     AnalysisResult, EffectInfo, HandlerInfo, HookCallInfo, HookKind, InlineKind, InlineOrigin,
     WidenEvent,
 };
+pub use calls::{CallRelation, Escapes, Targets};
 pub use cfg_analyzer::analyze_cfg;
-pub use churn::{ChurnCycle, ChurnEdge, ChurnGraph, EdgeStrength, EveryRender};
+pub use churn::{Carrier, ChurnCycle, ChurnEdge, ChurnGraph, EdgeStrength, EveryRender};
 pub use component_cache::ComponentCache;
 pub use component_registry::{ComponentKey, ComponentRegistry};
 pub use dominance::{DominatorTree, compute_dominators, dominates, on_all_paths};
 pub use eval::{ConvergedEval, Eval, eval_in_stores};
 pub use fixpoint::{
     Config, ProgramFacts, analyze_component, analyze_component_as, analyze_component_inter,
-    analyze_program,
+    analyze_program, analyze_program_defining,
 };
 pub use function_registry::{FunctionKey, FunctionRegistry};
 pub use hook_registry::{HookKey, HookRegistry};
+pub use module_scope::ModuleScope;
 pub use program_relations::ProgramRelations;
 pub use program_result::{
     AnalysisStats, CallSite, ComponentCallGraph, FreshDeps, ProgramAnalysisResult, SiteFacts,
@@ -51,6 +56,9 @@ pub use setters::{
     BodyCall, SlotRead, SlotWriter, WriterPhase, WriterRegion, collect_body_calls,
     collect_slot_reads,
 };
+pub use store::STORE_SLOT;
 pub use symbol_graph::{SymbolGraph, SymbolKind, SymbolNode};
-pub use triggers::{Always, EffectTrigger, Rerun, dep_is_fresh, fresh_deps, triggers_of};
+pub use triggers::{
+    Always, EffectTrigger, Rerun, dep_is_fresh, fresh_deps, fresh_deps_when_object, triggers_of,
+};
 pub use written::{Change, SiteEnvs, Written};

@@ -9,7 +9,7 @@ use crate::ir::{
     hooks::{DepsArg, HookEntry, HookProvenance},
     source_range::SourceRange,
     stmt::{MemberKey, Stmt},
-    types::{BlockId, HookLabel},
+    types::{BlockId, ExprId, HookLabel, Var},
 };
 
 // ── Subscription extraction (addEventListener in effect bodies) ───────────────
@@ -50,8 +50,8 @@ fn collect_subscriptions_in_expr(
     // `target.addEventListener("event", handlerFn)` in an effect body registers
     // a subscription → emit a Handler. Recurse into the receiver and any extra
     // args, but NOT arg[1] (the handler FnLit — extracted as the Handler's CFG).
-    if let Some((event_name, body_cfg)) = expr.subscription_listener() {
-        let Expr::Call { fn_, args } = expr else {
+    if let Some((event_name, params, body_cfg)) = expr.subscription_listener() {
+        let Expr::Call { fn_, args, .. } = expr else {
             unreachable!("subscription_listener only matches calls")
         };
         let label = *next_label;
@@ -60,6 +60,7 @@ fn collect_subscriptions_in_expr(
             label,
             event: event_name.to_string(),
             body_cfg: (**body_cfg).clone(),
+            params: params.to_vec(),
             span: stmt_span,
             dom_event: false,
         });
@@ -103,60 +104,94 @@ pub fn extract_handlers(cfg: &CFG, hooks: &mut Vec<HookEntry>, next_label: &mut 
     // Pre-pass: resolvable handler bodies by variable name.
     // `let cb = () => …` and `let cb = useCallback(…)` (rewritten to
     // `CallbackVal(l)` by extract_hooks, which runs before us).
-    let callback_bodies: HashMap<HookLabel, &CFG> = hooks
+    let callback_bodies: HashMap<HookLabel, Handler> = hooks
         .iter()
         .filter_map(|h| match h {
             HookEntry::Callback {
-                label, body_cfg, ..
-            } => Some((*label, body_cfg)),
+                label,
+                body_cfg,
+                params,
+                ..
+            } => Some((*label, (params.clone(), body_cfg.clone()))),
             _ => None,
         })
         .collect();
-    let mut var_bodies: HashMap<&str, CFG> = HashMap::new();
-    for block in cfg.blocks.values() {
-        for stmt in &block.stmts {
-            if let Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. } = stmt {
-                match rhs {
-                    Expr::FnLit { body_cfg, .. } => {
-                        var_bodies.insert(var.as_str(), (**body_cfg).clone());
-                    }
-                    Expr::CallbackVal(l) => {
-                        if let Some(body) = callback_bodies.get(l) {
-                            var_bodies.insert(var.as_str(), (*body).clone());
-                        }
-                    }
-                    // Bare setters (`onOpenChange={setOpen}`) are NOT handled
-                    // here: whether the receiver may call them with arbitrary
-                    // args depends on whether the child is analyzable, which
-                    // only the engine knows (see eval_comp_app's unknown-child
-                    // havoc). Synthesizing a ⊤-write at lowering time would
-                    // clobber the precise inter-component analysis of known
-                    // children (e.g. `onChange={setN}` between two analyzed
-                    // components).
-                    _ => {}
-                }
-            }
-        }
-    }
+    let var_bodies = bound_handlers(cfg, |rhs| match rhs {
+        Expr::FnLit {
+            params, body_cfg, ..
+        } => Some((params.clone(), (**body_cfg).clone())),
+        Expr::CallbackVal(l) => callback_bodies.get(l).cloned(),
+        // Bare setters (`onOpenChange={setOpen}`) are NOT handled here:
+        // whether the receiver may call them with arbitrary args depends on
+        // whether the child is analyzable, which only the engine knows (see
+        // eval_comp_app's unknown-child havoc). Synthesizing a ⊤-write at
+        // lowering time would clobber the precise inter-component analysis
+        // of known children (e.g. `onChange={setN}` between two analyzed
+        // components).
+        _ => None,
+    });
 
     let mut found: Vec<HookEntry> = Vec::new();
     cfg.for_each_expr(&mut |e| collect_handlers_in_expr(e, &var_bodies, &mut found, next_label));
     hooks.extend(found);
 }
 
+/// The names [`extract_handlers`] resolves a handler prop through: every
+/// `let`/assignment of `cfg` whose right-hand side `pick` takes.
+fn bound_handlers<T>(cfg: &CFG, pick: impl Fn(&Expr) -> Option<T>) -> HashMap<&str, T> {
+    let mut out = HashMap::new();
+    for block in cfg.blocks.values() {
+        for stmt in &block.stmts {
+            if let Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. } = stmt
+                && let Some(t) = pick(rhs)
+            {
+                out.insert(var.as_str(), t);
+            }
+        }
+    }
+    out
+}
+
+/// The render's names a handler prop written as one is reified through
+/// ([`extract_handlers`]): a prop `onClick={h}` with `h` among them, or a
+/// literal, is a `Handler` region of its own — a walk of the render does not
+/// run it again.
+pub(crate) fn handler_names(cfg: &CFG, hooks: &[HookEntry]) -> HashSet<String> {
+    let callbacks: HashSet<HookLabel> = hooks
+        .iter()
+        .filter_map(|h| match h {
+            HookEntry::Callback { label, .. } => Some(*label),
+            _ => None,
+        })
+        .collect();
+    bound_handlers(cfg, |rhs| match rhs {
+        Expr::FnLit { .. } => Some(()),
+        Expr::CallbackVal(l) => callbacks.contains(l).then_some(()),
+        _ => None,
+    })
+    .into_keys()
+    .map(str::to_string)
+    .collect()
+}
+
 /// Resolve one event-prop value to a handler body, if analyzable.
-fn handler_body(val: &Expr, var_bodies: &HashMap<&str, CFG>) -> Option<CFG> {
+fn handler_body(val: &Expr, var_bodies: &HashMap<&str, Handler>) -> Option<Handler> {
     match val {
-        Expr::FnLit { body_cfg, .. } => Some((**body_cfg).clone()),
+        Expr::FnLit {
+            params, body_cfg, ..
+        } => Some((params.clone(), (**body_cfg).clone())),
         Expr::Var(v) => var_bodies.get(v.as_str()).cloned(),
         Expr::TSAnnotated(e) => handler_body(e, var_bodies),
         _ => None,
     }
 }
 
+/// A handler's parameters and body.
+type Handler = (Vec<Var>, CFG);
+
 fn collect_handlers_in_expr(
     expr: &Expr,
-    var_bodies: &HashMap<&str, CFG>,
+    var_bodies: &HashMap<&str, Handler>,
     found: &mut Vec<HookEntry>,
     next_label: &mut HookLabel,
 ) {
@@ -174,13 +209,14 @@ fn collect_handlers_in_expr(
                     // (events / mount-unmount). Other native props are DOM
                     // data, never invoked.
                     if invoked_prop(true, name) {
-                        if let Some(body_cfg) = handler_body(val, var_bodies) {
+                        if let Some((params, body_cfg)) = handler_body(val, var_bodies) {
                             let label = *next_label;
                             *next_label += 1;
                             found.push(HookEntry::Handler {
                                 label,
                                 event: prop_to_event(name),
                                 body_cfg,
+                                params,
                                 span: prop_spans
                                     .iter()
                                     .find(|(k, _)| k == name)
@@ -208,13 +244,14 @@ fn collect_handlers_in_expr(
         Expr::CompApp { props, span, .. } => {
             if let Expr::ObjectLit { fields, .. } = props.as_ref() {
                 for (name, val) in fields {
-                    if let Some(body_cfg) = handler_body(val, var_bodies) {
+                    if let Some((params, body_cfg)) = handler_body(val, var_bodies) {
                         let label = *next_label;
                         *next_label += 1;
                         found.push(HookEntry::Handler {
                             label,
                             event: prop_to_event(name),
                             body_cfg,
+                            params,
                             // `CompApp` carries no per-prop spans, unlike
                             // `NativeElem`; the element's own position is the
                             // nearest true one, and beats no position at all.
@@ -387,6 +424,7 @@ impl BlockOut {
                 then_,
                 else_: join,
                 span: None,
+                chain_link: false,
             };
             cfg.blocks.insert(
                 then_,
@@ -445,8 +483,8 @@ impl Extractor<'_, '_> {
                 rhs,
                 span: stmt_span,
             } => match try_consume_hook_call(rhs, self.imports) {
-                Ok((call, args)) => {
-                    let (lbl, entry) = self.hook_call(&call, args, stmt_span, out);
+                Ok((call, args, site)) => {
+                    let (lbl, entry) = self.hook_call(&call, args, site, stmt_span, out);
                     let is_state_like = call.is_react
                         && matches!(call.origin_name.as_str(), "useState" | "useReducer");
                     let is_arr_temp = var.starts_with("__arr_");
@@ -488,8 +526,8 @@ impl Extractor<'_, '_> {
                 }
             },
             Stmt::ExprStmt(expr, stmt_span) => match try_consume_hook_call(expr, self.imports) {
-                Ok((call, args)) => {
-                    let (lbl, entry) = self.hook_call(&call, args, stmt_span, out);
+                Ok((call, args, site)) => {
+                    let (lbl, entry) = self.hook_call(&call, args, site, stmt_span, out);
                     let marker = marker_val(entry.as_ref());
                     if let Some(entry) = entry {
                         self.hooks.push(entry);
@@ -583,18 +621,20 @@ impl Extractor<'_, '_> {
 
     /// Label one hook call and build its entry, once its arguments are
     /// staged in the render body.
+    /// The hook call at `site`: its label and entry.
     fn hook_call(
         &mut self,
         call: &ResolvedHookCall,
         args: Vec<Expr>,
+        site: ExprId,
         span: Option<SourceRange>,
         out: &mut BlockOut,
     ) -> (HookLabel, Option<HookEntry>) {
-        let staged = self.stage_args(call, &args, span, out);
+        let staged = self.stage_args(call, &args, site, span, out);
         let lbl = self.label;
         self.label += 1;
         self.provenance.push(call.provenance(lbl, span));
-        let mut entry = make_hook_entry(call, lbl, args, span);
+        let mut entry = make_hook_entry(call, lbl, args, span, site);
         if let Some(HookEntry::Custom { args, .. }) = &mut entry {
             *args = staged;
         }
@@ -622,11 +662,12 @@ impl Extractor<'_, '_> {
     ///
     /// A lazy initializer — a function handed to `useState`, or `useReducer`'s
     /// third argument — runs during the mount render only, which
-    /// [`BlockOut::push_on_mount`] models.
+    /// [`BlockOut::push_on_mount`] models, as a call at the hook's `site`.
     fn stage_args(
         &mut self,
         call: &ResolvedHookCall,
         args: &[Expr],
+        site: ExprId,
         span: Option<SourceRange>,
         out: &mut BlockOut,
     ) -> Vec<Expr> {
@@ -636,23 +677,32 @@ impl Extractor<'_, '_> {
                 values.push(arg.clone());
                 continue;
             }
+            // A spread's operand is what runs; the argument stays a spread.
+            let (operand, spread) = match arg {
+                Expr::Spread(inner) => (&**inner, true),
+                other => (other, false),
+            };
             let var = format!("__hookarg_{}", self.staged);
             self.staged += 1;
             self.stmt(
                 Stmt::Let {
                     var: var.clone(),
-                    rhs: arg.clone(),
+                    rhs: operand.clone(),
                     span,
                 },
                 out,
             );
-            values.push(Expr::Var(var));
+            values.push(match spread {
+                true => Expr::Spread(Box::new(Expr::Var(var))),
+                false => Expr::Var(var),
+            });
         }
         if let Some(lazy) = lazy_initializer(call, args) {
             let fn_ = values[lazy.callee].clone();
             let args = lazy.args.iter().map(|&i| values[i].clone()).collect();
             out.push_on_mount(Stmt::ExprStmt(
                 Expr::Call {
+                    id: site,
                     fn_: Box::new(fn_),
                     args,
                 },
@@ -757,21 +807,21 @@ impl ResolvedHookCall {
 fn try_consume_hook_call(
     expr: Expr,
     imports: &ImportCtx<'_>,
-) -> Result<(ResolvedHookCall, Vec<Expr>), Expr> {
+) -> Result<(ResolvedHookCall, Vec<Expr>, ExprId), Expr> {
     match expr {
         Expr::TSAnnotated(inner) => {
-            if let Expr::Call { fn_, args } = *inner {
+            if let Expr::Call { id, fn_, args } = *inner {
                 match imports.classify_callee(&fn_) {
-                    Some(call) => Ok((call, args)),
-                    None => Err(Expr::TSAnnotated(Box::new(Expr::Call { fn_, args }))),
+                    Some(call) => Ok((call, args, id)),
+                    None => Err(Expr::TSAnnotated(Box::new(Expr::Call { id, fn_, args }))),
                 }
             } else {
                 Err(Expr::TSAnnotated(inner))
             }
         }
-        Expr::Call { fn_, args } => match imports.classify_callee(&fn_) {
-            Some(call) => Ok((call, args)),
-            None => Err(Expr::Call { fn_, args }),
+        Expr::Call { id, fn_, args } => match imports.classify_callee(&fn_) {
+            Some(call) => Ok((call, args, id)),
+            None => Err(Expr::Call { id, fn_, args }),
         },
         other => Err(other),
     }
@@ -915,6 +965,7 @@ pub fn react_hook_entry(
     label: HookLabel,
     args: Vec<Expr>,
     span: Option<SourceRange>,
+    site: ExprId,
 ) -> Option<HookEntry> {
     let call = ResolvedHookCall {
         origin_name: name.to_string(),
@@ -922,18 +973,25 @@ pub fn react_hook_entry(
         specifier: Some("react".to_string()),
         resolved_file: None,
     };
-    make_hook_entry(&call, label, args, span)
+    make_hook_entry(&call, label, args, span, site)
 }
 
+/// The entry of a hook call; `site` is the call's own site, where React's
+/// call of a callback argument the entry keeps as a body takes place.
 fn make_hook_entry(
     call: &ResolvedHookCall,
     label: HookLabel,
     args: Vec<Expr>,
     span: Option<SourceRange>,
+    site: ExprId,
 ) -> Option<HookEntry> {
     let name = call.origin_name.as_str();
+    // A React hook reads its arguments by position, which a spread hides
+    // (`useEffect(...args)`): the call is a hook the analysis does not model,
+    // whose arguments its marker hands out (#254).
+    let spread = Expr::positional_args(&args).len() < args.len();
     let mut it = args.into_iter();
-    if !call.is_react {
+    if !call.is_react || spread {
         // A hook, but not React's (defined locally, or imported from a
         // package or a local file): a Custom hook like any other, resolved
         // through the HookRegistry / SummaryRegistry. `name` is the origin's
@@ -961,7 +1019,7 @@ fn make_hook_entry(
             })
         }
         _ if EFFECT_HOOKS.contains(&name) => {
-            let body_cfg = hook_body_cfg(it.next());
+            let body_cfg = hook_body_cfg(it.next(), site);
             let deps = it.next().map_or(DepsArg::Absent, DepsArg::from_expr);
             Some(HookEntry::Effect {
                 label,
@@ -971,7 +1029,7 @@ fn make_hook_entry(
             })
         }
         "useMemo" => {
-            let body_cfg = hook_body_cfg(it.next());
+            let body_cfg = hook_body_cfg(it.next(), site);
             let deps = it.next().map_or(DepsArg::Absent, DepsArg::from_expr);
             Some(HookEntry::Memo {
                 label,
@@ -988,7 +1046,7 @@ fn make_hook_entry(
                 Some(Expr::FnLit {
                     params, body_cfg, ..
                 }) => (params, unwrap_body(body_cfg), true),
-                other => (vec![], hook_body_cfg(other), false),
+                other => (vec![], hook_body_cfg(other, site), false),
             };
             let deps = it.next().map_or(DepsArg::Absent, DepsArg::from_expr);
             Some(HookEntry::Callback {
@@ -1104,10 +1162,13 @@ fn unwrap_body(body_cfg: std::sync::Arc<CFG>) -> CFG {
 /// callback did nothing at all: ⊥ where ⊤ was required. `useEffect(handler)`
 /// came out clean *and certified* `verified infinite-loop`, while the same body
 /// written inline was reported.
-fn hook_body_cfg(arg: Option<Expr>) -> CFG {
+///
+/// That invocation takes place at the hook call, `site`.
+fn hook_body_cfg(arg: Option<Expr>, site: ExprId) -> CFG {
     let ret = match arg {
         Some(Expr::FnLit { body_cfg, .. }) => return unwrap_body(body_cfg),
         Some(callee) => Expr::Call {
+            id: site,
             fn_: Box::new(callee),
             args: vec![],
         },
@@ -1163,20 +1224,29 @@ fn rewrite_expr(expr: Expr, state_temps: &HashMap<String, HookLabel>) -> Expr {
             op,
             arg: Box::new(rewrite_expr(*arg, state_temps)),
         },
-        Expr::Call { fn_, args } => Expr::Call {
-            fn_: Box::new(rewrite_expr(*fn_, state_temps)),
-            args: args
-                .into_iter()
-                .map(|a| rewrite_expr(a, state_temps))
-                .collect(),
-        },
-        Expr::New { id, fn_, args } => Expr::New {
+        Expr::Call { id, fn_, args } => Expr::Call {
             id,
             fn_: Box::new(rewrite_expr(*fn_, state_temps)),
             args: args
                 .into_iter()
                 .map(|a| rewrite_expr(a, state_temps))
                 .collect(),
+        },
+        Expr::New {
+            id,
+            fn_,
+            args,
+            ctor,
+            on_this,
+        } => Expr::New {
+            id,
+            fn_: Box::new(rewrite_expr(*fn_, state_temps)),
+            args: args
+                .into_iter()
+                .map(|a| rewrite_expr(a, state_temps))
+                .collect(),
+            ctor,
+            on_this,
         },
         Expr::ArrayLit {
             id,

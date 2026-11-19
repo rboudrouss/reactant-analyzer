@@ -275,7 +275,8 @@ fn a_memo_with_an_unreadable_deps_argument_is_not_pinned_stable() {
     // The truncation fed `recompute_memo` an empty deps slice, whose answer is
     // "this memo never recomputes" — a *must* claim minted from a list the IR
     // never saw. A memo keyed on deps we cannot enumerate may recompute on any
-    // render, so the only sound answer is ⊤.
+    // render, so the only sound answer is ⊤: a new object then, since the
+    // body allocates one (#304).
     let src = r#"
         function C({ deps }) {
             const v = useMemo(() => ({}), deps);
@@ -294,7 +295,7 @@ fn a_memo_with_an_unreadable_deps_argument_is_not_pinned_stable() {
     let val: StateValue = comp.memo_store.get(label);
     assert_eq!(
         val.to_stability(),
-        Stability::Unknown,
+        Stability::MayBeFresh,
         "an unreadable deps list bounds nothing — it must not read as Stable"
     );
 }

@@ -36,8 +36,15 @@ pub fn classify_callee<D: AbstractDomain>(
     dispatches: bool,
 ) -> TriggerClass {
     match fn_ {
+        // A setter is a name bound to one, or one whose value can only be a
+        // setter: a closure's captured `setK` carries no label (#326).
         Expr::Var(name) => {
-            if env.setter_labels(name).is_some() {
+            let surely_setter = || {
+                env.lookup(name)
+                    .as_state_value()
+                    .is_some_and(|v| v.surely_setter())
+            };
+            if env.setter_labels(name).is_some() || surely_setter() {
                 TriggerClass::Setter
             } else {
                 match name.as_str() {

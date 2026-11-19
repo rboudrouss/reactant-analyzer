@@ -38,7 +38,7 @@ use crate::{
 
 use super::local_bindings;
 use super::render_tree::RenderIndex;
-use super::setters::{all_setter_labels, collect_fn_bindings, collect_setter_calls_with_extra};
+use super::setters::all_setter_labels;
 use crate::ir::{CompOrigin, ComponentId};
 
 /// What the call sites prove about a consumer's mount lifetime, relative to
@@ -69,7 +69,17 @@ pub enum MountCoupling {
     /// there never sees them move, so the freeze is not certain wherever the
     /// component runs. It costs the Error tier its certainty.
     Unfed,
-    /// Nothing proven — a mounted instance may observe the change.
+    /// No call site is proven to keep an instance mounted while a seeding prop
+    /// moves (#313): none is visible, the seed reads the whole props object,
+    /// or each one's `key` or guard reads what a seeding prop is read from
+    /// without covering it (`key={user.name}` for a seed `user`), so a move
+    /// may arrive on a fresh instance. Not a proof of remounting; it costs
+    /// the Error tier its certainty.
+    Unobserved,
+    /// Some call site keeps an instance mounted across the move: its `key`
+    /// and guards read nothing a seeding prop is read from, and not every
+    /// write of a feeder writes a slot its guards read. The positive proof
+    /// the Error tier needs.
     Free,
 }
 
@@ -87,6 +97,9 @@ struct MountSite {
     /// State slots of the caller the element's mount condition may depend
     /// on, from its render dependence summary (`ElementSite::guard`).
     guard_slots: HashSet<HookLabel>,
+    /// The element sits in a block of the caller's render, not in a closure
+    /// whose control flow `guards` cannot see.
+    placed: bool,
 }
 
 /// A branch the element only renders under one side of.
@@ -136,10 +149,10 @@ impl MountIndex {
     ) -> MountCoupling {
         let sites = match self.sites.get(&consumer) {
             Some(s) if !s.is_empty() => s,
-            _ => return MountCoupling::Free,
+            _ => return MountCoupling::Unobserved,
         };
         if seed_props.is_empty() {
-            return MountCoupling::Free;
+            return MountCoupling::Unobserved;
         }
         if sites.iter().all(|s| s.reseeds(seed_props)) {
             return MountCoupling::Reseeds;
@@ -161,9 +174,17 @@ impl MountIndex {
                     .any(|(owner, slot)| s.writer_coupled(*owner, *slot, program))
             });
         if coupled {
-            MountCoupling::WriterCoupled
-        } else {
-            MountCoupling::Free
+            return MountCoupling::WriterCoupled;
+        }
+        let observes = sites.iter().any(|s| {
+            s.keeps_mounted(seed_props, feeders)
+                && !feeders
+                    .iter()
+                    .any(|(owner, slot)| s.writer_coupled(*owner, *slot, program))
+        });
+        match observes {
+            true => MountCoupling::Free,
+            false => MountCoupling::Unobserved,
         }
     }
 }
@@ -191,6 +212,25 @@ impl MountSite {
             props.get("key").is_some_and(|k| covered_by(k))
                 || self.guards.iter().any(|g| covered_by(&g.paths))
         })
+    }
+
+    /// `true` when this element keeps its instance across a write of a
+    /// feeder (#313): it sits in the render of the feeder's owner — where the
+    /// write runs, on a mounted instance — outside any closure, under no
+    /// guard and with no `key`, and passes every seeding prop. The owner's
+    /// re-render then reconciles the same element in place. A guard or a key
+    /// may read what the prop is computed from through names no chase here
+    /// follows, and an element in another component is mounted by elements
+    /// this site does not see, so neither proves anything.
+    fn keeps_mounted(&self, seed_props: &[Symbol], feeders: &[(ComponentId, HookLabel)]) -> bool {
+        let Some(props) = &self.prop_paths else {
+            return false;
+        };
+        self.placed
+            && self.guards.is_empty()
+            && !props.contains_key("key")
+            && feeders.iter().any(|(owner, _)| *owner == self.caller)
+            && seed_props.iter().all(|name| props.contains_key(name))
     }
 
     /// `true` when some guard of this element reads a state slot of `owner`
@@ -227,7 +267,7 @@ fn carries(
     seed_props.iter().any(|name| match row.props.get(name) {
         Some(val) => match &val.reference {
             Stability::Versioned(labels) => feeders.iter().any(|f| labels.contains(f)),
-            Stability::VersionedTop | Stability::Unknown => true,
+            Stability::VersionedTop | Stability::Unknown | Stability::MayBeFresh => true,
             _ => false,
         },
         None => spreads,
@@ -254,7 +294,6 @@ fn writes_move_together(
     if feeder_setters.is_empty() || guard_setters.is_empty() {
         return false;
     }
-    let render_fns = collect_fn_bindings(&comp.render_cfg);
     let mut scopes: Vec<&CFG> = Vec::new();
     collect_fn_bodies(&comp.render_cfg, &mut scopes);
     for hook in &comp.hooks {
@@ -263,12 +302,19 @@ fn writes_move_together(
             collect_fn_bodies(body, &mut scopes);
         }
     }
+    // What each scope writes is the call relation's (ADR-047): a write of
+    // the guard surely of its setter, a write of the feeder possibly.
+    let tables = crate::engine::setters::WriterTables::of_result(comp);
     let mut found = false;
     for scope in scopes {
-        if collect_setter_calls_with_extra(scope, &feeder_setters, &render_fns).is_empty() {
+        let (sites, _) = tables.write_sites(scope, &comp.calls, None, false);
+        if !sites.iter().any(|s| s.slot == (owner, slot)) {
             continue;
         }
-        if collect_setter_calls_with_extra(scope, &guard_setters, &render_fns).is_empty() {
+        if !sites
+            .iter()
+            .any(|s| s.slot == (owner, guard_slot) && s.sure)
+        {
             return false;
         }
         found = true;
@@ -329,6 +375,7 @@ fn collect_sites(
                 .and_then(|s| guard_slots.get(&s))
                 .cloned()
                 .unwrap_or_default(),
+            placed: block.is_some(),
         };
         // A resolved callee is one component; an unresolved one may be any
         // component of that name, and every candidate has to carry the site.

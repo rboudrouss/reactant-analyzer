@@ -7,17 +7,17 @@ use crate::{
         AbstractDomain, AnalysisCtx, Transfer,
         impls::{BoolVal, Interval, SetterVal, Stability, StateValue, StrConst},
         interp::{
-            alloc_literal, call_targets, closure_env, escape, exec_stmt_with_callbacks,
+            access_key, alloc_literal, call_targets, closure_env, escape, exec_stmt_with_callbacks,
             returned_sites, run_cfg,
         },
-        stores::{AbstractEnv, EnvVal, Heap, HeapValue, Sites, member_key, resolve_locs},
+        stores::{AbstractEnv, EnvVal, Heap, HeapValue, Sites, member_key},
     },
     engine::component_registry::ChildLookup,
     ir::{
         ComponentId,
         bindings::binding_of,
         cfg::CFG,
-        expr::{BinOp, CompOrigin, Expr, MarkerVal, Prim, UnaryOp},
+        expr::{BinOp, CompOrigin, Expr, MarkerVal, Prim, SummaryValue, UnaryOp},
         hooks::{Arity, DepsArg, HookEntry},
         stmt::Stmt,
         types::{ExprId, Symbol},
@@ -66,9 +66,12 @@ impl Transfer for StateValueTransfer {
         ctx: &mut AnalysisCtx<StateValue>,
     ) -> EnvVal<StateValue> {
         // One recompute: a memo's body, run against the real stores (ADR-020
-        // item 8), with the sites it returns; a new function for a callback
-        // literal; for any other callback, its argument, which nothing here
-        // reads. A body no run returns from bounds nothing.
+        // item 8), with the sites it returns; for a callback, the function it
+        // hands back (#320) — a literal's closure, allocated at the hook's
+        // site with what it captures here, as an inline arrow is, or the
+        // argument itself. Every reader of a closure (a call through a name,
+        // a prop, an escape) then finds the callback where it finds an arrow.
+        // A body no run returns from bounds nothing.
         let (deps, value, sites) = match memo {
             HookEntry::Memo { body_cfg, deps, .. } => {
                 let run = run_cfg(self, body_cfg, env.clone(), ctx, 0);
@@ -76,11 +79,29 @@ impl Transfer for StateValueTransfer {
                 (deps, run.ret, sites)
             }
             HookEntry::Callback {
+                label,
+                body_cfg,
+                params,
                 literal: true,
                 deps,
                 ..
-            } => (deps, StateValue::reference(Stability::PerRender), None),
-            HookEntry::Callback { deps, .. } => (deps, StateValue::top(), None),
+            } => {
+                let body = ctx
+                    .query
+                    .callback_body(*label)
+                    .unwrap_or_else(|| std::sync::Arc::new(body_cfg.clone()));
+                let id = ctx.component.hook_site(*label);
+                ctx.heap.alloc_fn(id, params, &body, env, ctx.component);
+                let sites = Some(Sites::closed([id]));
+                (deps, StateValue::reference(Stability::PerRender), sites)
+            }
+            HookEntry::Callback { deps, .. } => match memo.callback_argument() {
+                Some(arg) => {
+                    let sites = alloc_literal(self, arg, env, ctx);
+                    (deps, eval_state_value(arg, env, ctx), sites)
+                }
+                None => (deps, StateValue::top(), None),
+            },
             _ => return EnvVal::Val(StateValue::top()),
         };
         let value = memo_value(component, deps, value, render_cfg, env, ctx);
@@ -115,8 +136,17 @@ fn memo_value(
     if value.reference.is_bottom() {
         return value;
     }
+    // Recomputed at a render nothing moved, the memo is new there only if
+    // its body may allocate; otherwise it is what its body reads (#304).
+    let may_allocate = matches!(
+        value.reference,
+        Stability::PerRender | Stability::MayBeFresh
+    );
     StateValue {
-        reference: may,
+        reference: match may {
+            Stability::MayBeFresh if !may_allocate => Stability::Unknown,
+            may => may,
+        },
         ..value
     }
 }
@@ -128,6 +158,7 @@ fn memo_value(
 /// No readable list bounds nothing: `Stable` would be a *must* claim about a
 /// list the IR never saw, which is how `useMemo(fn, deps)` used to read as
 /// pinned forever; `[]` pins the hook, but only an array *known* to be empty.
+/// Such a list may hold a new reference at every render: `MayBeFresh`.
 fn deps_change(
     component: ComponentId,
     deps: &DepsArg,
@@ -136,14 +167,14 @@ fn deps_change(
     ctx: &mut AnalysisCtx<StateValue>,
 ) -> (Stability, bool) {
     let Some(list) = deps.list() else {
-        return (Stability::Unknown, false);
+        return (Stability::MayBeFresh, false);
     };
     if list.arity == Arity::Exact(0) {
         return (Stability::Stable, false);
     }
     if list.is_empty() {
         // Every entry is a spread whose source the fold cannot reach.
-        return (Stability::Unknown, false);
+        return (Stability::MayBeFresh, false);
     }
     let mut may = Stability::Bottom;
     let mut fresh = false;
@@ -164,7 +195,7 @@ fn deps_change(
             may = may.join(&if held {
                 val.reference.clone()
             } else {
-                Stability::Unknown
+                Stability::Unknown.join(&val.reference)
             });
             continue;
         }
@@ -177,11 +208,13 @@ fn deps_change(
         fresh |= bound_once && val.is_unstable_reference_only();
         // A dep whose reference is versioned keeps its labels (`to_stability`
         // would erase them if another slot is ⊤); a dep in motion may move at
-        // any render, which is the may side of `PerRender`.
+        // any render, which is the may side of `PerRender`: a number with
+        // what it is computed from, a reference that may be new with nothing
+        // moving (#304).
         may = may.join(&match val.versioned_reference() {
             Some(v) => v,
             None => match val.to_stability() {
-                Stability::PerRender => Stability::Unknown,
+                Stability::PerRender => Stability::Unknown.join(&val.reference),
                 s => s,
             },
         });
@@ -240,6 +273,8 @@ fn eval_state_value(
 
         Expr::ObjectLit { .. } => StateValue::reference(Stability::PerRender),
         Expr::ArrayLit { .. } => StateValue::reference(Stability::PerRender),
+        // A new array at every call of the body (#324).
+        Expr::Arguments { .. } => StateValue::reference(Stability::PerRender),
         Expr::FnLit { .. } => StateValue::reference(Stability::PerRender),
         // An element is an object `createElement` allocates at every render
         // (#200); a component's is evaluated for what its child does.
@@ -266,12 +301,26 @@ fn eval_state_value(
             eval_unary(op, v)
         }
 
-        Expr::Call { fn_, .. } if returns_fresh_reference(fn_, env, ctx) => {
-            StateValue::reference(Stability::PerRender)
+        // Code the analysis does not see, handed `args` (the lowering's
+        // `handed_out`): what an `await` or a `for await` element settles to,
+        // which code that runs when it settles produces. Anything, a new
+        // object included (#304): never a must-fresh reference.
+        Expr::Call { fn_, .. } if matches!(fn_.as_ref(), Expr::SummaryVal(SummaryValue::Top)) => {
+            StateValue::top().join(&StateValue::reference(Stability::PerRender))
         }
-        Expr::Call { .. } => StateValue::top(),
-        // `new` allocates: a fresh reference, whose members stay ⊤ (#158).
-        Expr::New { .. } => StateValue::reference(Stability::PerRender),
+        // A call the pass ran is what its bodies returned (#333).
+        Expr::Call { id, fn_, args } => match ctx.returns.get(*id) {
+            Some(returned) => returned.as_val(),
+            None => allocating_call(fn_, args, env, ctx).unwrap_or_else(StateValue::top),
+        },
+        // `new` of a program class is what its construction body returned
+        // (#335): the instance, or the object its constructor returns. Any
+        // other `new` allocates: a fresh reference, whose members stay ⊤
+        // (#158).
+        Expr::New { id, .. } => match ctx.returns.get(*id) {
+            Some(returned) => returned.as_val(),
+            None => StateValue::reference(Stability::PerRender),
+        },
 
         Expr::FieldAccess { obj, field } => eval_field_access(obj, field, env, ctx),
         Expr::IndexAccess { arr, idx } => eval_index_access(arr, idx, env, ctx),
@@ -279,6 +328,13 @@ fn eval_state_value(
         Expr::TSAnnotated(inner) => eval_state_value(inner, env, ctx),
 
         Expr::SummaryVal(sv) => summary_value(sv),
+
+        // A spread argument stands for entries of its operand at positions
+        // nobody knows: any value.
+        Expr::Spread(inner) => {
+            eval_state_value(inner, env, ctx);
+            StateValue::top()
+        }
     }
 }
 
@@ -314,13 +370,13 @@ fn summary_value(sv: &crate::ir::expr::SummaryValue) -> StateValue {
     }
 }
 
-/// Callees whose return value is a *freshly allocated reference* on every
-/// call — never the receiver, never a cached object. Modeled as
-/// `reference(PerRender)` instead of ⊤ (same seeding as `ArrayLit`), which
-/// lets `always-unstable-deps` *prove* that `const items = arr.map(f)` in a
-/// deps array defeats memoization.
+/// What a call of a builtin that allocates hands back, `None` for any other
+/// callee. A *freshly allocated reference* on every call — never the
+/// receiver, never a cached object — is `reference(PerRender)` instead of ⊤
+/// (same seeding as `ArrayLit`), which lets `always-unstable-deps` *prove*
+/// that `const items = arr.map(f)` in a deps array defeats memoization.
 ///
-/// Two cases keep the proof honest (FP-averse):
+/// Three cases keep the proof honest (FP-averse):
 /// - **kind-ambiguous methods** (`slice`, `concat`): on a string receiver
 ///   they return a *primitive*, which `Object.is` value-compares — claiming
 ///   a per-render reference for `id.slice(0, 8)` would be a false proof. So
@@ -330,14 +386,40 @@ fn summary_value(sv: &crate::ir::expr::SummaryValue) -> StateValue {
 /// - **in-place methods** (`sort`, `reverse`, `fill`, `copyWithin`,
 ///   `Object.assign`): they return the receiver itself — same identity, the
 ///   opposite fact.
-fn returns_fresh_reference(
+/// - **builtins that allocate only where the result is an object** (#306):
+///   `JSON.parse` returns whatever the text encodes (`JSON.parse("1")` is
+///   `1`), and anything a reviver returns; `structuredClone(x)` copies a
+///   primitive `x` as itself. Each is a new reference where it is one, and
+///   may be a primitive elsewhere: never a must-fresh reference alone.
+fn allocating_call(
     callee: &Expr,
+    args: &[Expr],
     env: &AbstractEnv<StateValue>,
     ctx: &mut AnalysisCtx<StateValue>,
-) -> bool {
-    match callee {
-        // `structuredClone(x)` always allocates a deep copy.
-        Expr::Var(v) => v == "structuredClone",
+) -> Option<StateValue> {
+    if !returns_no_input(callee) {
+        return None;
+    }
+    let fresh = StateValue::reference(Stability::PerRender);
+    let allocates = match callee {
+        // A deep copy of an object, the value itself of a primitive; a
+        // function cannot be cloned (it throws).
+        Expr::Var(v) if v == "structuredClone" => {
+            let x = match args.first() {
+                Some(arg) => eval_state_value(arg, env, ctx),
+                None => StateValue::top(),
+            };
+            let object = x.reference != Stability::Bottom || x.setter != SetterVal::Bottom;
+            return Some(StateValue {
+                reference: if object {
+                    Stability::PerRender
+                } else {
+                    Stability::Bottom
+                },
+                setter: SetterVal::Bottom,
+                ..x
+            });
+        }
         Expr::FieldAccess { obj, field } => match field.as_str() {
             // Array methods returning a NEW array, array-only names (a
             // string receiver has none of these).
@@ -350,10 +432,40 @@ fn returns_fresh_reference(
             "keys" | "values" | "entries" | "fromEntries" => {
                 matches!(obj.as_ref(), Expr::Var(v) if v == "Object")
             }
+            // Any JSON value, a new object or array where it is one; with a
+            // reviver, anything the reviver returns.
+            "parse" if matches!(obj.as_ref(), Expr::Var(v) if v == "JSON") => {
+                return Some(match args.len() {
+                    0 | 1 => StateValue::json_value(),
+                    _ => StateValue::top().join(&fresh),
+                });
+            }
+            _ => false,
+        },
+        Expr::TSAnnotated(inner) => return allocating_call(inner, args, env, ctx),
+        _ => false,
+    };
+    allocates.then_some(fresh)
+}
+
+/// The callees [`allocating_call`] reads, the one list of them: each returns
+/// a new array or object, or a primitive, never one of its inputs — what a
+/// proof that a value is not an input's needs of a call (#309). Like that
+/// table, it takes an array method's receiver to be an array (#312).
+pub(crate) fn returns_no_input(callee: &Expr) -> bool {
+    match callee {
+        Expr::Var(v) => v == "structuredClone",
+        Expr::FieldAccess { obj, field } => match field.as_str() {
+            "map" | "filter" | "flat" | "flatMap" | "toSorted" | "toReversed" | "toSpliced"
+            | "with" | "split" | "slice" | "concat" => true,
+            "from" | "of" => matches!(obj.as_ref(), Expr::Var(v) if v == "Array"),
+            "keys" | "values" | "entries" | "fromEntries" => {
+                matches!(obj.as_ref(), Expr::Var(v) if v == "Object")
+            }
             "parse" => matches!(obj.as_ref(), Expr::Var(v) if v == "JSON"),
             _ => false,
         },
-        Expr::TSAnnotated(inner) => returns_fresh_reference(inner, env, ctx),
+        Expr::TSAnnotated(inner) => returns_no_input(inner),
         _ => false,
     }
 }
@@ -610,6 +722,7 @@ fn eval_comp_app(
         &cache_key,
         abstract_props_full,
         props_heap,
+        span,
     );
     flow_back(inter, child, &passed, ctx);
 }
@@ -642,6 +755,7 @@ fn run_child(
     cache_key: &HashMap<Symbol, StateValue>,
     abstract_props_full: HashMap<Symbol, EnvVal<StateValue>>,
     props_heap: Heap,
+    span: Option<crate::ir::SourceRange>,
 ) {
     // Cache lookup (strict equality)
     if inter.cache.borrow().contains(child, cache_key) {
@@ -674,6 +788,10 @@ fn run_child(
         return;
     };
 
+    if crate::profile::on() {
+        let (line, col) = span.map_or((0, 0), |s| (s.line, s.col));
+        crate::profile::site(child, inter.component, line, col);
+    }
     let child_result = inter.child(child).analyze_under(child_ir, input);
 
     // Store result in the program-level results map and cache
@@ -742,19 +860,56 @@ fn props_cache_key(
     key
 }
 
-/// Evaluate field access: read the member off every heap object the receiver
-/// may denote (a whole member chain, not just a bare variable), and, when the
-/// receiver may also be something no site places or a site does not record
-/// the member, what the member of anything is (#240).
+/// Evaluate field access: a member read under the field's name.
 fn eval_field_access(
     obj: &Expr,
     field: &Symbol,
     env: &AbstractEnv<StateValue>,
     ctx: &mut AnalysisCtx<StateValue>,
 ) -> StateValue {
-    let (vals, open) = match resolve_locs(obj, env, ctx.heap) {
+    eval_member(obj, Some(field), None, env, ctx)
+}
+
+/// A **constant** index is a member read, and the heap answers it exactly as it
+/// answers a named one.
+///
+/// Array destructuring lowers to `IndexAccess` with a literal index — `const
+/// [value, setValue] = useAtom(a)` becomes `__arr[0]` / `__arr[1]` — so a
+/// tuple-returning hook's per-slot contract becomes reachable through the same
+/// per-member map a named member already uses (#37). Before this, every indexed
+/// read was ⊤, which is why jotai's setter looked unstable.
+///
+/// A key that is one string names that member too (`o["k"]`, `o[k]` with `k`
+/// one constant, #76). Any other index may select any member: the join of
+/// every entry and of what no entry says (#307), so an element that may be a
+/// new reference keeps that arm. A negative index is not a member either.
+fn eval_index_access(
+    arr: &Expr,
+    idx: &Expr,
+    env: &AbstractEnv<StateValue>,
+    ctx: &mut AnalysisCtx<StateValue>,
+) -> StateValue {
+    let key = member_key(idx, env);
+    eval_member(arr, key.as_ref(), Some(idx), env, ctx)
+}
+
+/// Read `member` (`None`: a key no constant names, `index` the key
+/// expression) off every heap object the receiver may denote — a whole
+/// member chain, a name, or a literal, placed as any literal is
+/// ([`alloc_literal`], #307) — and, when the receiver may also be something
+/// no site places or the key may select a member no entry records, join what
+/// the member of anything is (#240).
+fn eval_member(
+    obj: &Expr,
+    member: Option<&Symbol>,
+    index: Option<&Expr>,
+    env: &AbstractEnv<StateValue>,
+    ctx: &mut AnalysisCtx<StateValue>,
+) -> StateValue {
+    let sites = alloc_literal(&StateValueTransfer, obj, env, ctx);
+    let (vals, open) = match &sites {
         Some(sites) => {
-            let (entries, open) = ctx.heap.members(&sites, field);
+            let (entries, open) = ctx.heap.members(sites, member.map(String::as_str));
             (entries.into_iter().map(EnvVal::as_val).collect(), open)
         }
         None => (Vec::new(), true),
@@ -768,37 +923,32 @@ fn eval_field_access(
     // (the field's *kind* stays unknown — every other slot is ⊤). Same
     // no-mutation-during-render assumption as the `StateVal` read-side
     // conversion above; in-place writes have their own diagnostics
-    // (`state-mutation`). ADR-017 §Limitations, member-deps.
+    // (`state-mutation`). ADR-017 §Limitations, member-deps. A key no
+    // constant names moves with what it is computed from too, which the
+    // labels do not say. Neither do they when the member's name is one an
+    // accessor of the program defines (#334): where the heap places nothing
+    // the read may run it, a call the analysis cannot see, whose result may
+    // be new at any read; off a plain object React builds, only one its
+    // chain may hold (#336).
     let obj_val = eval_state_value(obj, env, ctx);
+    let key = access_key(
+        &StateValueTransfer,
+        obj,
+        sites.as_ref(),
+        member.map(String::as_str),
+        index,
+        env,
+        ctx,
+    );
     let any = StateValue {
-        reference: obj_val.versioned_reference().unwrap_or(Stability::Unknown),
+        reference: match member {
+            _ if ctx.heap.unseen_accessor(sites.as_ref(), key) => Stability::MayBeFresh,
+            Some(_) => obj_val.versioned_reference().unwrap_or(Stability::Unknown),
+            None => Stability::Unknown,
+        },
         ..StateValue::top()
     };
     placed.map_or(any.clone(), |p| p.join(&any))
-}
-
-/// A **constant** index is a member read, and the heap answers it exactly as it
-/// answers a named one.
-///
-/// Array destructuring lowers to `IndexAccess` with a literal index — `const
-/// [value, setValue] = useAtom(a)` becomes `__arr[0]` / `__arr[1]` — so a
-/// tuple-returning hook's per-slot contract becomes reachable through the same
-/// per-member map a named member already uses (#37). Before this, every indexed
-/// read was ⊤, which is why jotai's setter looked unstable.
-///
-/// A key that is one string names that member too (`o["k"]`, `o[k]` with `k`
-/// one constant, #76). Any other index stays ⊤: which element `xs[i]`
-/// denotes is not a member read. A negative index is not a member either.
-fn eval_index_access(
-    arr: &Expr,
-    idx: &Expr,
-    env: &AbstractEnv<StateValue>,
-    ctx: &mut AnalysisCtx<StateValue>,
-) -> StateValue {
-    match member_key(idx, env) {
-        Some(m) => eval_field_access(arr, &m, env, ctx),
-        None => StateValue::top(),
-    }
 }
 
 /// Extract per-prop abstract values from a props expression.
@@ -946,6 +1096,8 @@ fn eval_binop(op: &BinOp, lhs: StateValue, rhs: StateValue) -> StateValue {
         // `str` at ⊥ so a guard over the result still narrows.
         BinOp::Eq
         | BinOp::Neq
+        | BinOp::LooseEq
+        | BinOp::LooseNeq
         | BinOp::Lt
         | BinOp::Gt
         | BinOp::Leq
@@ -1243,6 +1395,48 @@ mod tests {
             ),
             StateValue::reference(Stability::PerRender)
         );
+    }
+
+    /// `JSON.parse` and `structuredClone` allocate only where their result
+    /// is an object (#306): `JSON.parse("1")` is `1`, `structuredClone(1)`
+    /// is `1`. A clone of an object is a new reference, alone.
+    #[test]
+    fn a_builtin_that_may_return_a_primitive_is_fresh_only_where_it_is_an_object() {
+        let (env, mut state, memo) = empty();
+        let mut heap = Heap::new();
+        let mut ctx = AnalysisCtx::null(crate::test_support::C, &mut state, &memo, &mut heap);
+        let call = |fn_: Expr, args: Vec<Expr>| Expr::Call {
+            id: crate::ir::expr::SYNTHETIC_CALL,
+            fn_: Box::new(fn_),
+            args,
+        };
+        let parse = Expr::FieldAccess {
+            obj: Box::new(Expr::Var("JSON".to_string())),
+            field: "parse".to_string(),
+        };
+        let clone = Expr::Var("structuredClone".to_string());
+        let text = Expr::Lit(Prim::String("1".to_string()));
+        let one = Expr::Lit(Prim::Int(1));
+        let obj = Expr::ObjectLit {
+            id: crate::ir::types::ExprId(0),
+            fields: vec![],
+        };
+        let mut eval = |e: Expr| StateValueTransfer.eval_expr(&e, &env, &mut ctx);
+
+        let parsed = eval(call(parse.clone(), vec![text.clone()]));
+        assert!(!parsed.is_unstable_reference_only(), "{parsed:?}");
+        assert!(parsed.is_unstable_reference_when_object(), "{parsed:?}");
+        assert!(!parsed.num.is_bottom() && parsed.null && !parsed.undef);
+
+        // A reviver may return anything, a stable reference included.
+        let revived = eval(call(parse, vec![text, one.clone()]));
+        assert_eq!(revived.reference, Stability::MayBeFresh);
+        assert!(!revived.is_unstable_reference_when_object());
+
+        let cloned = eval(call(clone.clone(), vec![one]));
+        assert_eq!(cloned, StateValue::number(Interval::point(1.0)));
+        let cloned = eval(call(clone, vec![obj]));
+        assert!(cloned.is_unstable_reference_only(), "{cloned:?}");
     }
 
     #[test]
@@ -1580,6 +1774,7 @@ mod tests {
         let call_setter = single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::StateSetter(0)),
                     args: vec![Expr::Lit(Prim::Int(1))],
                 },
@@ -1628,6 +1823,7 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::Lit(Prim::Int(42))],
                 },
@@ -1645,8 +1841,8 @@ mod tests {
     fn functional_updater_increments_state() {
         let (mut env, mut state, memo) = empty();
         state.update(0, StateValue::number(Interval::point(5.0)));
-        env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
+        env.bind_setter("setN".to_string(), 0);
 
         let body_cfg = single_block_cfg(
             vec![],
@@ -1661,6 +1857,7 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::FnLit {
                         id: crate::ir::types::ExprId(0),
@@ -1701,6 +1898,7 @@ mod tests {
                 }],
                 term: Terminator::Branch {
                     span: None,
+                    chain_link: false,
                     cond: Expr::Var("a".to_string()),
                     then_: 1,
                     else_: 2,
@@ -1788,8 +1986,8 @@ mod tests {
     fn functional_updater_branch_joins() {
         let (mut env, mut state, memo) = empty();
         state.update(0, StateValue::number(Interval::point(3.0)));
-        env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
+        env.bind_setter("setN".to_string(), 0);
 
         let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
@@ -1799,6 +1997,7 @@ mod tests {
                 stmts: vec![],
                 term: Terminator::Branch {
                     span: None,
+                    chain_link: false,
                     cond: Expr::Lit(Prim::Bool(true)),
                     then_: 1,
                     else_: 2,
@@ -1842,6 +2041,7 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::FnLit {
                         id: crate::ir::types::ExprId(0),
@@ -1924,6 +2124,7 @@ mod tests {
                 stmts: vec![],
                 term: Terminator::Branch {
                     span: None,
+                    chain_link: false,
                     cond: Expr::Lit(Prim::Bool(true)),
                     then_: 2,
                     else_: 3,
@@ -1977,6 +2178,7 @@ mod tests {
     fn setter_call(name: &str, arg: Expr) -> Stmt {
         Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var(name.to_string())),
                 args: vec![arg],
             },
@@ -1990,8 +2192,8 @@ mod tests {
         // though the body has a back edge; the body's return value is Top.
         let (mut env, mut state, memo) = empty();
         state.update(0, StateValue::number(Interval::point(0.0)));
-        env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
+        env.bind_setter("setN".to_string(), 0);
 
         let body_cfg = while_loop_body(vec![setter_call(
             "setN",
@@ -2088,6 +2290,7 @@ mod tests {
                 }],
                 term: Terminator::Branch {
                     span: None,
+                    chain_link: false,
                     cond: Expr::Var("c".to_string()),
                     then_: 1,
                     else_: 2,
@@ -2144,8 +2347,8 @@ mod tests {
         // The setter in the body block must fire despite the back edge.
         let (mut env, mut state, memo) = empty();
         state.update(0, StateValue::number(Interval::point(0.0)));
-        env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
+        env.bind_setter("setN".to_string(), 0);
 
         let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
@@ -2163,6 +2366,7 @@ mod tests {
                 stmts: vec![],
                 term: Terminator::Branch {
                     span: None,
+                    chain_link: false,
                     cond: Expr::Lit(Prim::Bool(true)),
                     then_: 2,
                     else_: 4,
@@ -2260,13 +2464,13 @@ mod tests {
         // state 1 fires.
         let (mut env, mut state, memo) = empty();
         state.update(0, StateValue::number(Interval::point(5.0)));
-        env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
-        env.bind_setter("setOther".to_string(), 1);
+        env.bind_setter("setN".to_string(), 0);
         env.extend(
             "setOther".to_string(),
             StateValue::reference(Stability::Stable),
         );
+        env.bind_setter("setOther".to_string(), 1);
 
         // Reuse the while shape but give block 3 (exit) a real `c + 1` return.
         let mut body_cfg = while_loop_body(vec![setter_call("setOther", Expr::Lit(Prim::Int(1)))]);
@@ -2283,6 +2487,7 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::FnLit {
                         id: crate::ir::types::ExprId(0),
@@ -2316,15 +2521,16 @@ mod tests {
     fn then_callback_updates_state() {
         let (mut env, mut state, memo) = empty();
         state.update(0, StateValue::number(Interval::point(0.0)));
-        env.bind_setter("setUser".to_string(), 0);
         env.extend(
             "setUser".to_string(),
             StateValue::reference(Stability::Stable),
         );
+        env.bind_setter("setUser".to_string(), 0);
 
         let cb_body = single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setUser".to_string())),
                     args: vec![Expr::Var("u".to_string())],
                 },
@@ -2334,8 +2540,10 @@ mod tests {
         );
         let stmt = Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::FieldAccess {
                     obj: Box::new(Expr::Call {
+                        id: crate::ir::expr::SYNTHETIC_CALL,
                         fn_: Box::new(Expr::Var("fetch".to_string())),
                         args: vec![],
                     }),
@@ -2362,12 +2570,13 @@ mod tests {
     #[test]
     fn set_timeout_callback_updates_state() {
         let (mut env, mut state, memo) = empty();
-        env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
+        env.bind_setter("setN".to_string(), 0);
 
         let cb_body = single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::Lit(Prim::Int(42))],
                 },
@@ -2377,6 +2586,7 @@ mod tests {
         );
         let stmt = Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setTimeout".to_string())),
                 args: vec![
                     Expr::FnLit {
@@ -2402,14 +2612,15 @@ mod tests {
     #[test]
     fn then_chain_descends_both_callbacks() {
         let (mut env, mut state, memo) = empty();
-        env.bind_setter("setA".to_string(), 0);
         env.extend("setA".to_string(), StateValue::reference(Stability::Stable));
-        env.bind_setter("setB".to_string(), 1);
+        env.bind_setter("setA".to_string(), 0);
         env.extend("setB".to_string(), StateValue::reference(Stability::Stable));
+        env.bind_setter("setB".to_string(), 1);
 
         let cb_a = single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setA".to_string())),
                     args: vec![Expr::Lit(Prim::Int(1))],
                 },
@@ -2420,6 +2631,7 @@ mod tests {
         let cb_b = single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setB".to_string())),
                     args: vec![Expr::Lit(Prim::Int(2))],
                 },
@@ -2428,6 +2640,7 @@ mod tests {
             Expr::Lit(Prim::Unit),
         );
         let inner = Expr::Call {
+            id: crate::ir::expr::SYNTHETIC_CALL,
             fn_: Box::new(Expr::FieldAccess {
                 obj: Box::new(Expr::Var("p".to_string())),
                 field: "then".to_string(),
@@ -2439,6 +2652,7 @@ mod tests {
             }],
         };
         let outer = Expr::Call {
+            id: crate::ir::expr::SYNTHETIC_CALL,
             fn_: Box::new(Expr::FieldAccess {
                 obj: Box::new(inner),
                 field: "then".to_string(),
@@ -2463,12 +2677,13 @@ mod tests {
     #[test]
     fn then_in_let_binding_descends() {
         let (mut env, mut state, memo) = empty();
-        env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
+        env.bind_setter("setN".to_string(), 0);
 
         let cb = single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::Lit(Prim::Int(7))],
                 },
@@ -2479,8 +2694,10 @@ mod tests {
         let stmt = Stmt::Let {
             var: "p".to_string(),
             rhs: Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::FieldAccess {
                     obj: Box::new(Expr::Call {
+                        id: crate::ir::expr::SYNTHETIC_CALL,
                         fn_: Box::new(Expr::Var("fetch".to_string())),
                         args: vec![],
                     }),
@@ -2507,12 +2724,13 @@ mod tests {
     #[test]
     fn subscription_callback_not_descended() {
         let (mut env, mut state, memo) = empty();
-        env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
+        env.bind_setter("setN".to_string(), 0);
 
         let cb = single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::Lit(Prim::Int(99))],
                 },
@@ -2522,6 +2740,7 @@ mod tests {
         );
         let stmt = Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::FieldAccess {
                     obj: Box::new(Expr::Var("el".to_string())),
                     field: "addEventListener".to_string(),
@@ -2550,14 +2769,15 @@ mod tests {
     #[test]
     fn then_both_args_descended() {
         let (mut env, mut state, memo) = empty();
-        env.bind_setter("setA".to_string(), 0);
         env.extend("setA".to_string(), StateValue::reference(Stability::Stable));
-        env.bind_setter("setB".to_string(), 1);
+        env.bind_setter("setA".to_string(), 0);
         env.extend("setB".to_string(), StateValue::reference(Stability::Stable));
+        env.bind_setter("setB".to_string(), 1);
 
         let on_fulfilled = single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setA".to_string())),
                     args: vec![Expr::Lit(Prim::Int(1))],
                 },
@@ -2568,6 +2788,7 @@ mod tests {
         let on_rejected = single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setB".to_string())),
                     args: vec![Expr::Lit(Prim::Int(2))],
                 },
@@ -2577,6 +2798,7 @@ mod tests {
         );
         let stmt = Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::FieldAccess {
                     obj: Box::new(Expr::Var("p".to_string())),
                     field: "then".to_string(),
@@ -2610,12 +2832,13 @@ mod tests {
     #[test]
     fn promise_all_settled_then_cb_descended() {
         let (mut env, mut state, memo) = empty();
-        env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
+        env.bind_setter("setN".to_string(), 0);
 
         let cb = single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::Lit(Prim::Int(42))],
                 },
@@ -2625,8 +2848,10 @@ mod tests {
         );
         let stmt = Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::FieldAccess {
                     obj: Box::new(Expr::Call {
+                        id: crate::ir::expr::SYNTHETIC_CALL,
                         fn_: Box::new(Expr::FieldAccess {
                             obj: Box::new(Expr::Var("Promise".to_string())),
                             field: "allSettled".to_string(),
@@ -2660,15 +2885,26 @@ mod tests {
 
     // ── B5: variable callback resolution ─────────────────────────────────────
 
+    /// `name` bound as `let name = StateSetter(0)` binds it: the setter
+    /// label, and the setter as its value — what a closure that captures the
+    /// name holds of it (#326).
+    fn bind_setter_value(env: &mut AbstractEnv<StateValue>, name: &str) {
+        env.extend(
+            name.to_string(),
+            StateValue::component_setter(crate::test_support::C, 0),
+        );
+        env.bind_setter(name.to_string(), 0);
+    }
+
     #[test]
     fn var_callback_updates_state() {
         let (mut env, mut state, memo) = empty();
-        env.bind_setter("setN".to_string(), 0);
-        env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
+        bind_setter_value(&mut env, "setN");
 
         let cb_body = single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::Lit(Prim::Int(42))],
                 },
@@ -2687,6 +2923,7 @@ mod tests {
         };
         let call = Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setTimeout".to_string())),
                 args: vec![Expr::Var("cb".to_string()), Expr::Lit(Prim::Int(1000))],
             },
@@ -2711,12 +2948,13 @@ mod tests {
     #[test]
     fn var_callback_not_descended_without_loc() {
         let (mut env, mut state, memo) = empty();
-        env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
+        env.bind_setter("setN".to_string(), 0);
 
         let cb_body = single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::Lit(Prim::Int(99))],
                 },
@@ -2728,6 +2966,7 @@ mod tests {
 
         let call = Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("myHelper".to_string())),
                 args: vec![Expr::Var("cb".to_string())],
             },
@@ -2743,6 +2982,7 @@ mod tests {
                 captured_locs: std::collections::HashMap::new(),
                 owner: crate::test_support::C,
                 captured_slots: std::collections::HashMap::new(),
+                event: false,
             },
         );
         StateValueTransfer.exec_stmt(
@@ -2759,15 +2999,12 @@ mod tests {
     #[test]
     fn direct_local_call_inlined() {
         let (mut env, mut state, memo) = empty();
-        env.bind_setter("setUser".to_string(), 0);
-        env.extend(
-            "setUser".to_string(),
-            StateValue::reference(Stability::Stable),
-        );
+        bind_setter_value(&mut env, "setUser");
 
         let load_body = single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setUser".to_string())),
                     args: vec![Expr::Lit(Prim::Int(7))],
                 },
@@ -2786,6 +3023,7 @@ mod tests {
         };
         let call_load = Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("load".to_string())),
                 args: vec![],
             },
@@ -2810,12 +3048,12 @@ mod tests {
     #[test]
     fn set_interval_var_callback_updates_state() {
         let (mut env, mut state, memo) = empty();
-        env.bind_setter("setN".to_string(), 0);
-        env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
+        bind_setter_value(&mut env, "setN");
 
         let cb_body = single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::Lit(Prim::Int(5))],
                 },
@@ -2834,6 +3072,7 @@ mod tests {
         };
         let call = Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setInterval".to_string())),
                 args: vec![Expr::Var("cb".to_string()), Expr::Lit(Prim::Int(1000))],
             },
@@ -2856,12 +3095,12 @@ mod tests {
     #[test]
     fn for_each_var_callback_updates_state() {
         let (mut env, mut state, memo) = empty();
-        env.bind_setter("setN".to_string(), 0);
-        env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
+        bind_setter_value(&mut env, "setN");
 
         let cb_body = single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::Lit(Prim::Int(3))],
                 },
@@ -2880,6 +3119,7 @@ mod tests {
         };
         let call = Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::FieldAccess {
                     obj: Box::new(Expr::Var("arr".to_string())),
                     field: "forEach".to_string(),
@@ -2905,12 +3145,12 @@ mod tests {
     #[test]
     fn nested_var_callbacks_both_executed() {
         let (mut env, mut state, memo) = empty();
-        env.bind_setter("setN".to_string(), 0);
-        env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
+        bind_setter_value(&mut env, "setN");
 
         let inner_body = single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::Lit(Prim::Int(9))],
                 },
@@ -2931,6 +3171,7 @@ mod tests {
         let outer_body = single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setTimeout".to_string())),
                     args: vec![Expr::Var("inner".to_string()), Expr::Lit(Prim::Int(100))],
                 },
@@ -2950,6 +3191,7 @@ mod tests {
 
         let call_outer = Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("outer".to_string())),
                 args: vec![],
             },
@@ -2978,13 +3220,14 @@ mod tests {
     #[test]
     fn depth_limit_stops_deep_inlining() {
         let (mut env, mut state, memo) = empty();
-        env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
+        env.bind_setter("setN".to_string(), 0);
 
         let make_body = |callee: &str| -> Arc<CFG> {
             Arc::new(single_block_cfg(
                 vec![Stmt::ExprStmt(
                     Expr::Call {
+                        id: crate::ir::expr::SYNTHETIC_CALL,
                         fn_: Box::new(Expr::Var(callee.to_string())),
                         args: vec![],
                     },
@@ -2997,6 +3240,7 @@ mod tests {
         let setter_body = Arc::new(single_block_cfg(
             vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::Lit(Prim::Int(1))],
                 },
@@ -3044,6 +3288,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("f4".to_string())),
                     args: vec![],
                 },
@@ -3069,13 +3314,14 @@ mod tests {
         // terminates and (b) MAX_INLINE_DEPTH still caps the chain: setN at depth 4
         // is never reached → state stays Bottom.
         let (mut env, mut state, memo) = empty();
-        env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
+        env.bind_setter("setN".to_string(), 0);
 
         // A loop body whose single body-block statement calls `callee()`.
         let make_loop_wrapper = |callee: &str| -> Arc<CFG> {
             Arc::new(while_loop_body(vec![Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var(callee.to_string())),
                     args: vec![],
                 },
@@ -3125,6 +3371,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("f4".to_string())),
                     args: vec![],
                 },

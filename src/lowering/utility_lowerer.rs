@@ -47,7 +47,7 @@ pub fn lower_utilities_with_resolver(
         SourceMap::new(source, files.intern(file)),
         build_jsx_origins(program, file, resolver),
     );
-    detect_utilities(program)
+    let utilities = detect_utilities(program)
         .into_iter()
         .map(|candidate| {
             let (params, body_cfg) = candidate.build_cfg(&ctx);
@@ -58,5 +58,7 @@ pub fn lower_utilities_with_resolver(
                 body_cfg,
             }
         })
-        .collect()
+        .collect();
+    ctx.name_temps(source, files);
+    utilities
 }

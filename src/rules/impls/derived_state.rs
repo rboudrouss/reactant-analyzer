@@ -9,8 +9,8 @@ use crate::ir::{
 
 use crate::engine::setters::WriterRegion;
 use crate::rules::{
-    Diagnostic, MustResult, Rule, all_setter_labels, collect_setter_calls,
-    must_setter_on_all_paths, state_val_labels,
+    Diagnostic, MustResult, Rule, must_setter_on_all_paths, setter_targets_with_paths,
+    state_val_labels,
 };
 
 /// Fires when a `useEffect` unconditionally sets a state variable whose value
@@ -47,16 +47,11 @@ impl Rule for DerivedState {
     fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic> {
         let (result, component) = (ctx.program(), ctx.component());
         let result = &result.components[&component];
-        let setter_label = all_setter_labels(result);
+        // A setter called through a stored pair (`t[1]`) by the converged
+        // values, as the loop rules read it (#288).
+        let setter_label = setter_targets_with_paths(result);
         let state_val_label = state_val_labels(&result.render_cfg);
-        let state_var_names: HashSet<Var> = state_val_label.keys().cloned().collect();
         let setter_vars: HashSet<Var> = setter_label.names().cloned().collect();
-
-        // Setters called in render body are not derived-state candidates.
-        let render_setters: HashSet<Var> = collect_setter_calls(&result.render_cfg, &setter_vars)
-            .into_iter()
-            .map(|c| c.var)
-            .collect();
 
         let mut diags = Vec::new();
 
@@ -80,9 +75,24 @@ impl Rule for DerivedState {
             if deps.len() != 1 || !deps.arity.may_be(1) {
                 continue;
             }
-            let dep_var = match &deps.as_slice()[0] {
-                Expr::Var(v) if state_var_names.contains(v) => v.clone(),
-                _ => continue,
+            // The slot the dep reads: a state binding, or an element of a
+            // stored pair (`[t[0]]`), named as a path (`t.0`) (#288).
+            let dep = &deps.as_slice()[0];
+            let Some(dep_var) = crate::engine::setters::callee_path(dep) else {
+                continue;
+            };
+            let dep_lbl = match dep.peel_ts() {
+                Expr::Var(v) => state_val_label.get(v).copied(),
+                _ => None,
+            }
+            .or_else(|| {
+                match crate::ir::bindings::element_binding(dep, &result.render_cfg) {
+                    Some(Expr::StateVal(l)) => Some(*l),
+                    _ => None,
+                }
+            });
+            let Some(dep_lbl) = dep_lbl else {
+                continue;
             };
 
             // Unconditional single call-free setter on all paths (the promoted
@@ -96,9 +106,7 @@ impl Rule for DerivedState {
 
             // Reject self-referential updates (e.g. `setX(x+1)`) accumulation,
             // not derivation — through any slot the name may write (#202).
-            if let Some(&dep_lbl) = state_val_label.get(&dep_var)
-                && setter_label.targets(&setter_name).any(|l| l == dep_lbl)
-            {
+            if setter_label.targets(&setter_name).any(|l| l == dep_lbl) {
                 continue;
             }
 
@@ -119,9 +127,8 @@ impl Rule for DerivedState {
                 }) {
                     continue;
                 }
-            } else if render_setters.contains(&setter_name) {
-                // No label for this name — fall back to the old render scan
-                // rather than claiming anything.
+            } else {
+                // No label for this name: claim nothing.
                 continue;
             }
 
@@ -148,7 +155,7 @@ impl Rule for DerivedState {
                 crate::rules::Step::Read {
                     what: dep_var.clone(),
                 },
-                state_val_label.get(&dep_var).copied(),
+                Some(dep_lbl),
                 *span,
                 &ctx.names(&name_of),
             );

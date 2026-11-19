@@ -7,6 +7,17 @@ use crate::ir::{
     types::{ExprId, HookLabel, Symbol, Var},
 };
 
+/// Where a file's call ids start ([`Expr::Call`]): the upper half of the
+/// file's id space, which its literals — numbered up from zero — do not
+/// reach, and below a component's hook sites, numbered down from the top of
+/// its range ([`crate::ir::ComponentId::hook_site`]).
+pub const CALL_SITES: u64 = 1 << 31;
+
+/// A call that is no source call — one the analysis builds to ask a
+/// question (a callee applied to a value, a rule's probe): the first call
+/// site, which no lowered call of a component's range is.
+pub const SYNTHETIC_CALL: ExprId = ExprId(CALL_SITES);
+
 #[derive(Debug, Clone)]
 pub enum Prim {
     String(String),
@@ -25,8 +36,16 @@ pub enum BinOp {
     Div,
     And,
     Or,
+    /// `===`, and every other strict comparison the lowering emits (a
+    /// `switch` case, a default's `=== undefined`).
     Eq,
+    /// `!==`.
     Neq,
+    /// `==`: `x == null` and `x == undefined` hold for both `null` and
+    /// `undefined`, which is the test `??`, `??=` and an optional link make.
+    LooseEq,
+    /// `!=`.
+    LooseNeq,
     Lt,
     Gt,
     Leq,
@@ -91,8 +110,90 @@ pub const SPREAD_KEY_PREFIX: &str = "...";
 pub const COMPUTED_KEY_PREFIX: &str = "[computed]";
 
 /// Key prefix of a getter or setter (`{ get x() {…} }`): reading the member
-/// runs the body, so the function literal is not the member's value.
+/// runs the body, so the function literal is not the member's value. The key
+/// says which, and the member it defines ([`accessor_key`], #321).
 pub const ACCESSOR_KEY_PREFIX: &str = "[accessor]";
+
+/// The member of a class's value (its lowered `ObjectLit`) that holds its
+/// construction body (#335): a function whose parameters are the
+/// constructor's and whose body builds the instance [`NEW_INSTANCE`] binds —
+/// the class's methods and accessors, its fields, the constructor's
+/// statements — and returns it, or what the constructor returns.
+pub const CONSTRUCT_KEY: &str = "[construct]";
+
+/// The name a class's member bodies read the instance by: `this`, which no
+/// source binding can spell, so it never meets a program name. The
+/// construction body declares it; a method, an accessor or a field
+/// initializer captures it as any closure captures a name, and an arrow
+/// inside one does in turn.
+pub const THIS: &str = "this";
+
+/// The name a call binds its receiver under (#338): what `r` denotes in a
+/// method call `r.m(…)`, unbound for any other call — a plain one, a
+/// callback a builtin runs, a call by code the analysis does not see — so
+/// that it reads ⊤. A non-arrow function that reads `this`, other than a
+/// class's instance member, binds [`THIS`] to it first, and an arrow inside
+/// captures that binding. Never a source name: no identifier holds an `@`.
+pub const RECEIVER: &str = "@this";
+
+/// The name a construction body ([`CONSTRUCT_KEY`]) reads the object it
+/// builds by: bound by the `new` that runs it — a new object at the `new`'s
+/// site, or the instance a derived class's `super(…)` hands its parent.
+/// Never a source name: no identifier holds a `.`.
+pub const NEW_INSTANCE: &str = "new.instance";
+
+/// The two halves of an accessor: a getter runs at every read of its member,
+/// a setter at every write, with the value written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Accessor {
+    Get,
+    Set,
+}
+
+/// The key of an accessor of `member` (`None`: a computed name, which may be
+/// any member), unique by `n`: `[accessor]<n>:get:<member>`.
+pub fn accessor_key(n: impl std::fmt::Display, kind: Accessor, member: Option<&str>) -> Symbol {
+    let kind = match kind {
+        Accessor::Get => "get",
+        Accessor::Set => "set",
+    };
+    match member {
+        Some(m) => format!("{ACCESSOR_KEY_PREFIX}{n}:{kind}:{m}"),
+        None => format!("{ACCESSOR_KEY_PREFIX}{n}:{kind}"),
+    }
+}
+
+/// What an [`accessor_key`] defines: its half, and the member (`None`: any).
+pub fn accessor_of(key: &str) -> Option<(Accessor, Option<&str>)> {
+    let mut parts = key.strip_prefix(ACCESSOR_KEY_PREFIX)?.splitn(3, ':');
+    parts.next()?;
+    let kind = match parts.next()? {
+        "get" => Accessor::Get,
+        "set" => Accessor::Set,
+        _ => return None,
+    };
+    Some((kind, parts.next()))
+}
+
+/// The getter an object literal's `key` is read through, as written: the
+/// last entry that defines `key` is a getter of it, with no entry after it
+/// that may define any member (a spread, a computed key, an accessor of a
+/// computed name). A setter of `key` alone defines no getter, so the search
+/// goes on past it; a member written as a value ends it with `None`.
+pub fn object_getter<'e>(fields: &'e [(Symbol, Expr)], key: &str) -> Option<&'e Expr> {
+    for (k, v) in fields.iter().rev() {
+        if k == key {
+            return None;
+        }
+        match accessor_of(k) {
+            Some((Accessor::Get, Some(m))) if m == key => return Some(v),
+            Some((_, Some(_))) => {}
+            _ if is_synthetic_key(k) => return None,
+            _ => {}
+        }
+    }
+    None
+}
 
 /// Is `key` one lowering made up — a spread, a computed key, an accessor —
 /// rather than a member's name? Such an entry may write any member.
@@ -160,7 +261,7 @@ pub const MUTATING_METHODS: &[&str] = &[
 /// is its receiver; it has no expression to match, which is why it is not
 /// folded in here.
 pub fn mutation_receiver(expr: &Expr) -> Option<&Expr> {
-    let Expr::Call { fn_, args } = expr else {
+    let Expr::Call { fn_, args, .. } = expr else {
         return None;
     };
     match fn_.as_ref() {
@@ -221,6 +322,20 @@ pub enum Expr {
         params: Vec<Var>,
         body_cfg: Arc<CFG>,
     },
+    /// A new array of the arguments the running call handed its body, from
+    /// position `from` on: the value of a rest parameter (`(a, ...fs)`,
+    /// `from` = 1) and of a function's `arguments` (`from` = 0), #324. The
+    /// lowering emits it only as the right-hand side of a body's first
+    /// statements, where the call's arguments are what the interpreter bound
+    /// with the parameters, and an inlined body's are the call's own
+    /// (`ir::splice`); it evaluates as the array literal of those arguments,
+    /// whose length is unknown when a spread or a caller the analysis does
+    /// not see hands them, an entry from a spread on at any position. `id` is
+    /// the allocation site, as for `ArrayLit`.
+    Arguments {
+        id: ExprId,
+        from: usize,
+    },
 
     // Vars
     Var(Symbol),
@@ -247,19 +362,55 @@ pub enum Expr {
     },
 
     // Calls
+    /// `fn_(args)`. `id` is the call's site, as `ObjectLit`'s `id` is the
+    /// literal's: a call is an allocation site (what it returns lives
+    /// there). The lowering mints it from the file's call counter, from
+    /// [`CALL_SITES`] up, so a call id never meets a literal's and minting
+    /// one moves no other id; placement in a component's range and every
+    /// graft shift it by the [`crate::ir::Offsets`] they apply to sites.
+    ///
+    /// Invariant: one id per call the program performs at one place of one
+    /// component. A body inlined twice (a custom hook, a utility, each
+    /// salted copy) is two places, so its calls get two ids: each graft
+    /// draws its own range from the component's call cursor. A subtree
+    /// copied without a graft — an argument substituted for a parameter,
+    /// a body shared by its `Arc` — denotes the same evaluation and keeps
+    /// the id. Ids are deterministic: they follow the source order of one
+    /// lowering and the order of the grafts.
     Call {
+        id: ExprId,
         fn_: Box<Expr>,
         args: Vec<Expr>,
     },
+    /// `...xs` as an argument of a call or a `new`: the iterable whose
+    /// entries take the positions from here on, however many it holds. It
+    /// occurs only in `args`, and from the first one on no argument has a
+    /// known position ([`Expr::positional_args`]). Evaluated, it is no value
+    /// of its own: what it hands the callee is `xs`'s entries.
+    Spread(Box<Expr>),
     /// `new X(args)`: a call that always allocates. The value domain reads it
     /// as a fresh reference whose members are ⊤, and every syntactic proof
     /// reads it where it reads an object literal — lowered to a plain `Call`
     /// it was a value that "holds still" and that no freshness check could
     /// see (#158). `id` is the allocation site, as for `ObjectLit`.
+    ///
+    /// `ctor` is the construction body ([`CONSTRUCT_KEY`]) of the program
+    /// class `fn_` names at module level, which the engine resolves before
+    /// the fixpoint (#335): the `new` runs it. A class bound in a body is
+    /// read off its value instead, and `None` is any other `new` — of a
+    /// class the analysis does not see, or not resolved yet. Not a child:
+    /// the class's code is where the class is written, and a reader of this
+    /// body's syntax does not walk it.
+    ///
+    /// `on_this` is a derived class's `super(…)`: the parent's construction
+    /// runs on the instance the body's `this` holds, and the expression is
+    /// what it returns, `this` unless the parent returns another object.
     New {
         id: ExprId,
         fn_: Box<Expr>,
         args: Vec<Expr>,
+        ctor: Option<Box<Expr>>,
+        on_this: bool,
     },
     CompApp {
         name: Symbol,
@@ -420,19 +571,23 @@ impl Expr {
     /// `FnLit` bodies are CFGs, not child expressions: crossing the function
     /// boundary is a per-walker decision (see [`crate::ir::cfg::CFG::for_each_expr`]).
     /// The `target.addEventListener("event", <FnLit>)` registration shape.
-    /// Returns the event name and the listener body. Shared between
+    /// Returns the event name, the listener's parameters and its body. Shared between
     /// `extract_subscriptions` (which reifies it as a `HookEntry::Handler`)
     /// and the slot-writer walk (which skips the listener it would otherwise
     /// double-count as a ⊤-phase nested write — ADR-027 §1). One predicate,
     /// so the two sides cannot drift.
-    pub fn subscription_listener(&self) -> Option<(&str, &Arc<CFG>)> {
-        if let Expr::Call { fn_, args } = self
+    pub fn subscription_listener(&self) -> Option<(&str, &[Var], &Arc<CFG>)> {
+        if let Expr::Call { fn_, args, .. } = self
             && let Expr::FieldAccess { field, .. } = fn_.as_ref()
             && field == "addEventListener"
-            && let (Some(Expr::Lit(Prim::String(event))), Some(Expr::FnLit { body_cfg, .. })) =
-                (args.first(), args.get(1))
+            && let (
+                Some(Expr::Lit(Prim::String(event))),
+                Some(Expr::FnLit {
+                    params, body_cfg, ..
+                }),
+            ) = (args.first(), args.get(1))
         {
-            return Some((event, body_cfg));
+            return Some((event, params, body_cfg));
         }
         None
     }
@@ -447,9 +602,12 @@ impl Expr {
     /// elision or flattens a spread (#118).
     ///
     /// Roots read through [`crate::ir::source_name`], so a spliced capture's
-    /// internal `#salt` never reaches the user.
+    /// internal `#salt` never reaches the user, and a name lowering minted
+    /// reads `(…)`: only [`crate::ir::SourceNames::describe`] knows what it
+    /// stands for.
     pub fn describe(&self) -> String {
         match self.peel_ts() {
+            Expr::Var(v) if crate::ir::is_lowering_temp(v) => "(…)".to_string(),
             Expr::Var(v) => crate::ir::source_name(v).to_string(),
             Expr::FieldAccess { obj, field } => format!("{}.{field}", obj.describe()),
             Expr::IndexAccess { arr, .. } => format!("{}[…]", arr.describe()),
@@ -457,6 +615,7 @@ impl Expr {
             Expr::New { fn_, .. } => format!("new {}(…)", fn_.describe()),
             Expr::ObjectLit { .. } => "{…}".to_string(),
             Expr::ArrayLit { .. } => "[…]".to_string(),
+            Expr::Arguments { .. } => "the arguments".to_string(),
             Expr::FnLit { .. } => "() => …".to_string(),
             Expr::Lit(Prim::String(v)) => format!("\"{v}\""),
             Expr::Lit(Prim::Int(v)) => v.to_string(),
@@ -476,13 +635,26 @@ impl Expr {
             Expr::StateSetter(l) => format!("the setter of hook #{l}"),
             Expr::HookMarker(l, _) => format!("hook #{l}"),
             Expr::SummaryVal(_) | Expr::TSAnnotated(_) => "an unmodelled value".to_string(),
+            Expr::Spread(inner) => format!("...{}", inner.describe()),
         }
+    }
+
+    /// The arguments of a call whose position is known: those before the
+    /// first [`Expr::Spread`]. Every parameter from there on may receive any
+    /// argument from there on, or an entry of a spread.
+    pub fn positional_args(args: &[Expr]) -> &[Expr] {
+        let end = args
+            .iter()
+            .position(|a| matches!(a, Expr::Spread(_)))
+            .unwrap_or(args.len());
+        &args[..end]
     }
 
     pub fn for_each_child<'a>(&'a self, f: &mut impl FnMut(&'a Expr)) {
         match self {
             Expr::Lit(_)
             | Expr::Var(_)
+            | Expr::Arguments { .. }
             | Expr::FnLit { .. }
             | Expr::StateVal(_)
             | Expr::StateSetter(_)
@@ -510,7 +682,7 @@ impl Expr {
                 f(rhs);
             }
             Expr::UnaryOp { arg, .. } => f(arg),
-            Expr::Call { fn_, args } | Expr::New { fn_, args, .. } => {
+            Expr::Call { fn_, args, .. } | Expr::New { fn_, args, .. } => {
                 f(fn_);
                 for a in args {
                     f(a);
@@ -525,7 +697,7 @@ impl Expr {
                     f(c);
                 }
             }
-            Expr::TSAnnotated(inner) => f(inner),
+            Expr::TSAnnotated(inner) | Expr::Spread(inner) => f(inner),
         }
     }
 
@@ -535,6 +707,7 @@ impl Expr {
         match self {
             Expr::Lit(_)
             | Expr::Var(_)
+            | Expr::Arguments { .. }
             | Expr::FnLit { .. }
             | Expr::StateVal(_)
             | Expr::StateSetter(_)
@@ -562,7 +735,7 @@ impl Expr {
                 f(rhs);
             }
             Expr::UnaryOp { arg, .. } => f(arg),
-            Expr::Call { fn_, args } | Expr::New { fn_, args, .. } => {
+            Expr::Call { fn_, args, .. } | Expr::New { fn_, args, .. } => {
                 f(fn_);
                 for a in args {
                     f(a);
@@ -577,7 +750,7 @@ impl Expr {
                     f(c);
                 }
             }
-            Expr::TSAnnotated(inner) => f(inner),
+            Expr::TSAnnotated(inner) | Expr::Spread(inner) => f(inner),
         }
     }
 
@@ -652,5 +825,54 @@ impl Expr {
             },
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod accessor_tests {
+    use super::*;
+
+    fn getter(id: u64) -> Expr {
+        Expr::FnLit {
+            id: ExprId(id),
+            params: vec![],
+            body_cfg: std::sync::Arc::new(crate::ir::cfg::CFG {
+                entry: 0,
+                blocks: Default::default(),
+                edges: Vec::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn an_accessor_key_says_its_half_and_its_member() {
+        let k = accessor_key(7, Accessor::Get, Some("a:b"));
+        assert!(is_synthetic_key(&k));
+        assert_eq!(accessor_of(&k), Some((Accessor::Get, Some("a:b"))));
+        let k = accessor_key(8, Accessor::Set, None);
+        assert_eq!(accessor_of(&k), Some((Accessor::Set, None)));
+        assert_eq!(accessor_of("[computed]3"), None);
+        assert_eq!(accessor_of("p"), None);
+    }
+
+    #[test]
+    fn the_last_definition_of_a_member_says_whether_a_getter_reads_it() {
+        let get = |n| (accessor_key(n, Accessor::Get, Some("p")), getter(n));
+        let set = (accessor_key(9, Accessor::Set, Some("p")), getter(9));
+        let data = ("p".to_string(), Expr::Lit(Prim::Int(1)));
+        let other = (accessor_key(10, Accessor::Get, Some("q")), getter(10));
+        let spread = (format!("{SPREAD_KEY_PREFIX}11"), Expr::Var("x".into()));
+        let found = |fields: Vec<(Symbol, Expr)>| {
+            object_getter(&fields, "p").map(|e| match e {
+                Expr::FnLit { id, .. } => id.0,
+                _ => 0,
+            })
+        };
+        assert_eq!(found(vec![data.clone(), get(1)]), Some(1));
+        assert_eq!(found(vec![get(1), data.clone()]), None);
+        assert_eq!(found(vec![get(1), set.clone(), other.clone()]), Some(1));
+        assert_eq!(found(vec![get(1), spread]), None);
+        assert_eq!(found(vec![data, set]), None);
+        assert_eq!(found(vec![other]), None);
     }
 }

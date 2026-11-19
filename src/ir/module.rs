@@ -40,6 +40,190 @@ pub struct ModuleFacts {
     /// The names this module exports *from another analyzed file* — what a
     /// barrel is made of (#49, #226).
     pub re_exports: ReExports,
+    /// The definitions this module reads as a value, anywhere but as a JSX
+    /// element's tag or in an `export` clause (#313): what an element whose
+    /// type the analysis cannot place (`<Comp/>` with `Comp = c ? A : B`), a
+    /// library or a lazy import may mount.
+    pub value_refs: Vec<ValueRef>,
+    /// The member names an accessor this module writes defines (#334).
+    pub accessors: AccessorNames,
+    /// Every name the module binds at its top level, whatever the form (a
+    /// `let`, a `const`, a function, a class): its module scope (#335).
+    pub bindings: Vec<String>,
+    /// The names the module imports from another analysed file: `(local
+    /// name, origin file, the name the origin exports it under)` (#335).
+    pub imported: Vec<(String, PathBuf, String)>,
+}
+
+/// The member names some accessor of the program defines (#334): an object
+/// literal's or a class's `get` / `set` (static too), or a descriptor
+/// `Object.defineProperty` and its kin may install one with. A read (a
+/// write) of such a name runs code wherever the object holding the accessor
+/// is the receiver, so on an object the heap does not place it is a call the
+/// analysis cannot see. A name no constant spells (a computed accessor key, a
+/// descriptor keyed by a variable) may be any name.
+///
+/// A plain object the library builds — React's props object, the object
+/// `useRef` returns — has `Object.prototype` as its prototype and only own
+/// data members (React 19.3.1: `jsxProd` keeps the compiler's literal or
+/// copies it into `{}`, `react-jsx-runtime.production.js:18-22`;
+/// `createElement` copies into `{}`, `react.production.js:455-463`; `useRef`
+/// returns `{ current }`, `react-dom-client.production.js:5855`). Neither a
+/// literal's or a class's accessor nor a `Proxy` can be on that chain, since
+/// `Object.prototype`'s own prototype is `null` and cannot change: a read
+/// off one runs only an accessor a descriptor installed, on it or on
+/// `Object.prototype`, or one of a prototype the program set on it
+/// ([`AccessorNames::may_run_off_plain`], #336).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccessorNames {
+    /// Every name an accessor of the program may have.
+    all: NameSet,
+    /// The names a descriptor installs on an object that exists
+    /// (`Object.defineProperty` and its kin, `__defineGetter__`), and the
+    /// accessors of a literal the program makes another object's prototype.
+    installed: NameSet,
+    /// The program makes something other than a literal an object's
+    /// prototype (`Object.setPrototypeOf(o, p)`, `o.__proto__ = p`): any
+    /// object of the program, a `Proxy` included, may then be on any chain.
+    reprototyped: bool,
+}
+
+/// Member names, as far as which keys they may spell goes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct NameSet {
+    names: std::collections::BTreeSet<String>,
+    /// Some name of `names` may be a number's key ([`AccessKey::Number`]).
+    numeric: bool,
+    any: bool,
+}
+
+/// What a member read or write selects, as far as the accessors of the
+/// program it may run go (#336).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessKey<'a> {
+    /// The member a constant spells.
+    Named(&'a str),
+    /// A key known to be a number no constant spells (`xs[i]`, `i` an
+    /// interval): `ToPropertyKey` makes it the number's canonical string
+    /// (`"1"`, `"-0.5"`, `"NaN"`), so only a name that spells a number, or a
+    /// definition of any name, may be an accessor of it.
+    Number,
+    /// A key nothing is known of.
+    Any,
+    /// The `length` of an array or a string: an own data property the
+    /// language makes non-configurable, so no accessor defines it and a read
+    /// consults no prototype nor `Proxy` trap (`defineProperty` throws on it).
+    Own,
+}
+
+impl<'a> AccessKey<'a> {
+    /// A key a constant may spell (`None`: nothing is known of it).
+    pub fn of(member: Option<&'a str>) -> Self {
+        member.map_or(AccessKey::Any, AccessKey::Named)
+    }
+
+    /// `name` off a receiver known, or not, to be an array or a string.
+    pub fn member(name: &'a str, array_or_string: bool) -> Self {
+        match array_or_string && name == "length" {
+            true => AccessKey::Own,
+            false => AccessKey::Named(name),
+        }
+    }
+}
+
+/// May `name` be the key of a number? A superset of the canonical numeric
+/// strings `ToString(number)` gives: every one of them parses as a float.
+fn spells_number(name: &str) -> bool {
+    name.parse::<f64>().is_ok()
+}
+
+impl NameSet {
+    fn add(&mut self, member: Option<&str>) {
+        match member {
+            Some(m) => {
+                self.numeric |= spells_number(m);
+                self.names.insert(m.to_string());
+            }
+            None => self.any = true,
+        }
+    }
+
+    fn extend(&mut self, other: &NameSet) {
+        self.names.extend(other.names.iter().cloned());
+        self.numeric |= other.numeric;
+        self.any |= other.any;
+    }
+
+    fn may_name(&self, key: AccessKey<'_>) -> bool {
+        match key {
+            AccessKey::Own => false,
+            _ if self.any => true,
+            AccessKey::Named(m) => self.names.contains(m),
+            AccessKey::Number => self.numeric,
+            AccessKey::Any => !self.names.is_empty(),
+        }
+    }
+}
+
+impl AccessorNames {
+    /// An accessor of `member` (`None`: a name no constant spells).
+    pub fn define(&mut self, member: Option<&str>) {
+        self.all.add(member);
+    }
+
+    /// An accessor of `member` installed on an object that may exist before
+    /// it, `Object.prototype` included: by a descriptor, or as a member of a
+    /// literal made a prototype.
+    pub fn install(&mut self, member: Option<&str>) {
+        self.all.add(member);
+        self.installed.add(member);
+    }
+
+    /// The program makes something other than a literal an object's
+    /// prototype.
+    pub fn reprototype(&mut self) {
+        self.reprototyped = true;
+    }
+
+    /// The names either defines.
+    pub fn extend(&mut self, other: &AccessorNames) {
+        self.all.extend(&other.all);
+        self.installed.extend(&other.installed);
+        self.reprototyped |= other.reprototyped;
+    }
+
+    /// May a read or a write of `key` run an accessor of the program?
+    pub fn may_run(&self, key: AccessKey<'_>) -> bool {
+        self.all.may_name(key)
+    }
+
+    /// May a read or a write of `key` off a plain object the library builds
+    /// run an accessor of the program? Only one a descriptor installed, or
+    /// any when the program sets a prototype it may hand such an object to.
+    pub fn may_run_off_plain(&self, key: AccessKey<'_>) -> bool {
+        self.installed.may_name(key) || (self.reprototyped && self.may_run(key))
+    }
+
+    /// No accessor of the program may run at any read.
+    pub fn is_empty(&self) -> bool {
+        !self.all.any && self.all.names.is_empty()
+    }
+
+    /// The names spelled, sorted, and whether any name may be one.
+    pub fn names(&self) -> (impl Iterator<Item = &str>, bool) {
+        (self.all.names.iter().map(String::as_str), self.all.any)
+    }
+}
+
+/// A definition a module reads as a value ([`ModuleFacts::value_refs`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ValueRef {
+    /// The definition `name` of `file`, as the module's own top-level name or
+    /// a named import resolves it.
+    Named(PathBuf, String),
+    /// Any definition of `file`: a default or namespace import, a dynamic
+    /// `import()`.
+    File(PathBuf),
 }
 
 impl ModuleFacts {
@@ -180,6 +364,15 @@ impl ModuleTable {
             .is_some_and(|f| f.has_directive(directive))
     }
 
+    /// The member names some lowered module defines an accessor of (#334).
+    pub fn accessor_names(&self) -> AccessorNames {
+        let mut out = AccessorNames::default();
+        for facts in self.files.values() {
+            out.extend(&facts.accessors);
+        }
+        out
+    }
+
     /// `true` iff any lowered module declares `directive`.
     ///
     /// The gate for every directive-derived rule: a codebase that never
@@ -264,6 +457,48 @@ mod tests {
             star: from.iter().map(PathBuf::from).collect(),
             ..Default::default()
         }
+    }
+
+    fn defining(names: &[&str], any: bool) -> AccessorNames {
+        let mut out = AccessorNames::default();
+        for n in names {
+            out.define(Some(n));
+        }
+        if any {
+            out.define(None);
+        }
+        out
+    }
+
+    #[test]
+    fn a_number_key_may_run_only_a_numeric_name_or_any() {
+        let words = defining(&["length", "p"], false);
+        assert!(!words.may_run(AccessKey::Number));
+        assert!(words.may_run(AccessKey::Any));
+        for n in [
+            "0",
+            "12",
+            "-1",
+            "1.5",
+            "1e+21",
+            "NaN",
+            "Infinity",
+            "-Infinity",
+        ] {
+            assert!(defining(&[n], false).may_run(AccessKey::Number), "{n}");
+        }
+        assert!(defining(&["p"], true).may_run(AccessKey::Number));
+        let mut both = defining(&["p"], false);
+        both.extend(&defining(&["3"], false));
+        assert!(both.may_run(AccessKey::Number));
+    }
+
+    #[test]
+    fn the_length_of_an_array_or_a_string_is_never_an_accessor() {
+        let all = defining(&["length"], true);
+        assert!(!all.may_run(AccessKey::member("length", true)));
+        assert!(all.may_run(AccessKey::member("length", false)));
+        assert!(all.may_run(AccessKey::member("size", true)));
     }
 
     #[test]

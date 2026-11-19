@@ -319,6 +319,10 @@ pub enum HookEntry {
         /// DOM event name without the "on" prefix, lowercased: "click", "change", "submit"…
         event: String,
         body_cfg: CFG,
+        /// Parameters of the handler, bound where its body runs to what the
+        /// event or the child calling it passes, never to a same-named
+        /// binding of the render (#314).
+        params: Vec<Var>,
         span: Option<SourceRange>,
         /// An `on*` prop of a native element: React runs it only when that
         /// DOM event fires there. Not a native `ref` callback (run at
@@ -329,37 +333,7 @@ pub enum HookEntry {
     },
 }
 
-/// The DOM events only a user's interaction fires, or a dispatching call
-/// (`click()`, `requestSubmit()`, `dispatchEvent`): no focus event
-/// (`autoFocus` fires one at commit), no hover, scroll or load event.
-const INTERACTION_EVENTS: &[&str] = &[
-    "click",
-    "dblclick",
-    "contextmenu",
-    "mousedown",
-    "mouseup",
-    "pointerdown",
-    "pointerup",
-    "touchstart",
-    "touchend",
-    "keydown",
-    "keyup",
-    "keypress",
-    "input",
-    "change",
-    "submit",
-];
-
 impl HookEntry {
-    /// Does React run this entry's body only on a user's interaction with an
-    /// element the component renders, or on a program's dispatch of it? A
-    /// native element's handler of a click, key, pointer, touch, input,
-    /// change or submit event.
-    pub fn runs_on_interaction(&self) -> bool {
-        matches!(self, HookEntry::Handler { event, dom_event: true, .. }
-            if INTERACTION_EVENTS.contains(&event.as_str()))
-    }
-
     pub fn label(&self) -> HookLabel {
         match self {
             HookEntry::State { label, .. }
@@ -369,6 +343,33 @@ impl HookEntry {
             | HookEntry::Ref { label, .. }
             | HookEntry::Custom { label, .. }
             | HookEntry::Handler { label, .. } => *label,
+        }
+    }
+
+    /// What a `useCallback` hands back when its argument is no function
+    /// literal (`useCallback(f, deps)`): the argument itself, which lowering
+    /// keeps as the callee of its body's one `return` (calling the hook's
+    /// value calls it). `None` for a literal and for any other hook.
+    pub fn callback_argument(&self) -> Option<&Expr> {
+        let HookEntry::Callback {
+            body_cfg,
+            literal: false,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let mut returns = body_cfg.blocks.values().filter_map(|b| match &b.term {
+            crate::ir::cfg::Terminator::Return(Expr::Call { fn_, args, .. }, _)
+                if args.is_empty() =>
+            {
+                Some(&**fn_)
+            }
+            _ => None,
+        });
+        match (returns.next(), returns.next(), body_cfg.blocks.len()) {
+            (Some(arg), None, 1) => Some(arg),
+            _ => None,
         }
     }
 
@@ -400,6 +401,19 @@ impl HookEntry {
             | HookEntry::Callback { body_cfg, .. }
             | HookEntry::Handler { body_cfg, .. } => Some(body_cfg),
             HookEntry::State { .. } | HookEntry::Ref { .. } | HookEntry::Custom { .. } => None,
+        }
+    }
+
+    /// The parameters [`Self::body_cfg`] binds: a callback's and a handler's,
+    /// none for an effect or a memo body. Exhaustive for the same reason.
+    pub fn body_params(&self) -> &[Var] {
+        match self {
+            HookEntry::Callback { params, .. } | HookEntry::Handler { params, .. } => params,
+            HookEntry::Effect { .. }
+            | HookEntry::Memo { .. }
+            | HookEntry::State { .. }
+            | HookEntry::Ref { .. }
+            | HookEntry::Custom { .. } => &[],
         }
     }
 

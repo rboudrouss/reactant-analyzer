@@ -79,7 +79,10 @@ pub const RULE_DOCS: &[RuleDoc] = &[
                       single such dep defeats the whole array: the hook re-runs every render \
                       no matter how stable the other deps are. For `useEffect` this means the \
                       effect always fires; for `useMemo`/`useCallback` the memoization is dead \
-                      weight.",
+                      weight. A dep that is such a reference whenever it holds an object, and \
+                      `undefined` or another primitive otherwise (`items?.filter(f)`, \
+                      `items && items.map(f)`, `c ? [x] : undefined`), defeats the array at \
+                      every render where it exists, and is reported as such.",
         "useEffect(() => sync(opts), [{ mode }, id]);",
         "Hoist the literal out of render, memoize it (`useMemo`), or depend on its \
               primitive parts (`[mode, id]`) instead of a fresh wrapper object.",
@@ -262,7 +265,9 @@ pub const RULE_DOCS: &[RuleDoc] = &[
                       conditional call → loops whenever the condition holds (Warning). \
                       A third shape warns without claiming a call at all: the setter is \
                       handed to a callee with no timing summary (`handleSubmit(onSubmit)`), \
-                      so the analyzer cannot rule out that it runs during render. A write a \
+                      so the analyzer cannot rule out that it runs during render; or it is \
+                      called in a getter or setter, which runs wherever its member is read \
+                      or written, the render included. A write a \
                       known registrar defers (`setTimeout(() => setN(1))`) is proven not to \
                       be a render write and is not reported here.",
         "function C() { const [n, setN] = useState(0); setN(1); return <div/>; }",
@@ -331,7 +336,10 @@ pub const RULE_DOCS: &[RuleDoc] = &[
         "Mutating a state object (`arr.push(x)`, `obj.f = v`) keeps its reference \
                       identity; calling the setter with that same reference makes React bail \
                       out (`Object.is(old, new)` is true) and skip the re-render. The UI \
-                      silently freezes (Error). Mutating an object received via props writes \
+                      silently freezes: an Error when one run mutates the object and then \
+                      hands it to the setter, a Warning when the two may run apart (on \
+                      exclusive branches, in different handlers, in a loop or a callback). \
+                      Mutating an object received via props writes \
                       into data owned by the parent (Warning).",
         "const [items, setItems] = useState([]);\n\
                   const add = (x) => { items.push(x); setItems(items); };",

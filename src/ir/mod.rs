@@ -23,8 +23,10 @@ pub use function_ir::FunctionIR;
 pub use hook_ir::HookIR;
 pub use hooks::HookEntry;
 pub use module::{ModuleFacts, ModuleTable};
-pub use names::{SourceNames, source_name};
-pub use remap::{Offsets, alloc_id_span, remap_cfg, remap_expr, remap_hooks};
+pub use names::{SourceNames, is_lowering_temp, source_name};
+pub use remap::{
+    Offsets, alloc_id_span, call_id_span, graft_spans, remap_cfg, remap_expr, remap_hooks,
+};
 pub use source_range::{
     FileId, FileTable, SourceMap, SourceRange, compute_line_starts, offset_to_range,
 };

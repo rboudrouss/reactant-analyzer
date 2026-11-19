@@ -299,10 +299,6 @@ fn a_counter_is_an_error_like_an_object_churn() {
         "const [n, setN] = useState(0); useEffect(() => setN(n - 2), [n]); return <p>{n}</p>;",
         "const [n, setN] = useState(0); useEffect(() => setN((c) => c + 1), [n]); return <p>{n}</p>;",
         "const [n, setN] = useState(2 ** 50); useEffect(() => setN(n + 1), [n]); return <p>{n}</p>;",
-        // A reset only a click runs cannot stop it: React re-runs the effect
-        // on the new value and it steps again (#280).
-        "const [n, setN] = useState(0); useEffect(() => setN(n + 1), [n]); \
-         return <button onClick={() => setN(0)}>{n}</button>;",
         // The step through the name it is written into, in the effect or in
         // the render (#280).
         "const [n, setN] = useState(0); \
@@ -320,6 +316,16 @@ fn a_counter_is_an_error_like_an_object_churn() {
             "{body}"
         );
     }
+    // A reset a click runs cannot stop it with no input, but code the
+    // analysis does not see may click (`el[m]()`, a bound `click`), in the
+    // step's own batch, and restore 0: a possible loop (#280, #313).
+    assert_eq!(
+        severities_of(
+            "const [n, setN] = useState(0); useEffect(() => setN(n + 1), [n]); \
+             return <button onClick={() => setN(0)}>{n}</button>;"
+        ),
+        vec![reactant::rules::Severity::Warning]
+    );
     // Two effects stepping the slot the same way: each is the loop.
     assert_eq!(
         severities_of(

@@ -1,16 +1,17 @@
 use crate::rules::RuleCtx;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use crate::domains::StateValue;
 use crate::ir::{
+    ComponentId,
+    cfg::CFG,
     expr::Expr,
     stmt::Stmt,
     types::{BlockId, HookLabel, Var},
 };
 
-use crate::engine::guards::converges_once_written;
-use crate::engine::setters::{SetterCall, SetterCallPhase};
+use crate::engine::guards::{Invariance, LoopFacts, converges_once_written};
 use crate::engine::triggers::{Always, Rerun};
-use crate::engine::written::{ClosureEnv, SiteEnvs};
 use crate::engine::{Change, SlotWriter, WriterPhase, WriterRegion, triggers_of};
 use crate::ir::hooks::HookEntry;
 use crate::rules::api::query::must_render_write;
@@ -76,28 +77,17 @@ impl Rule for SetterInRender {
 }
 
 impl SetterInRender {
-    /// The setter calls of the render body itself, found by the walk.
+    /// The writes the render body runs, as the writer relation reads them off
+    /// the call relation (ADR-047): one row per (call site, slot), the rows
+    /// the Tier-A `render_setter_calls` relation lists too (#281). A write
+    /// through a local setter, an alias, a stored pair, a parent's prop or a
+    /// closure the render runs is the relation's answer, never a name table.
     fn render_writes(&self, ctx: &RuleCtx, exit_dom: &ExitDominance) -> Vec<Diagnostic> {
         let (result, component) = (ctx.program(), ctx.component());
         let comp_result = &result.components[&component];
         let names = ctx.source_names();
-
-        // The render's setter call sites, the ones the Tier-A
-        // `render_setter_calls` relation lists too (#281): through local
-        // setters and their aliases (`const s = setN`: a name the table
-        // misses is a call the rule never sees, and a false `verified`,
-        // #176), or through a setter the converged values put behind a name
-        // or member path — a parent's setter prop, or this component's own
-        // read off a value (`t[1]`, a nested or memoized destructuring,
-        // #233) — the table the writer relation reads.
-        let crate::engine::setters::RenderSetterSites {
-            local: local_setter_info,
-            converged: cs_vars,
-            names: all_setter_vars,
-            sites,
-        } = crate::engine::setters::RenderSetterSites::of(comp_result);
-
-        if all_setter_vars.is_empty() {
+        let rows: Vec<&SlotWriter> = render_rows(comp_result).collect();
+        if rows.is_empty() {
             return vec![];
         }
 
@@ -111,247 +101,203 @@ impl SetterInRender {
             &must_state_vals(&comp_result.render_cfg, &scopes),
         );
         let members = crate::engine::guards::MemberWrites::of(comp_result);
-
-        // The runs of the closures the render reaches (#246), made once and
-        // only when a site inside one needs them.
-        let exit = comp_result.exit_env();
-        let closures = std::cell::OnceCell::new();
-        let judge = |call: SetterCall| -> Option<Diagnostic> {
-            // The walk classified when this write runs, and this rule is
-            // the question "during the render pass?". A `Handler` or
-            // `Deferred` row is a *proof* of no — a user event or a known
-            // deferring registrar stands between the render pass and the
-            // write — so it is not this rule's finding. `Unknown` is ⊤ and
-            // stays, because ⊤ includes the render pass and dropping it
-            // would be the false negative #130 is about.
-            if !call.class.may_run_in_body() {
-                return None;
-            }
-            // The cross-component map is an existential over program
-            // points; this call site is a program point (#119). Where the
-            // name is *only* a parent's setter by that existential — no
-            // local setter binds it — and this same block reassigns it to
-            // a function mentioning no setter before the call, there is no
-            // write here to report, and the row was reaching Error.
-            //
-            // Deliberately syntactic: the abstract env cannot answer this.
-            // At the call block of `if (c) { f = onUpdate; } f()` the env
-            // holds the join of the arrow and the setter, and that join
-            // drops setter-ness — so refuting on the env would delete the
-            // true finding along with the false one.
-            if cs_vars.contains_key(&call.var)
-                && !local_setter_info.contains(&call.var)
-                && let Some(bid) = call.block_id
-                && let Some(block) = comp_result.render_cfg.blocks.get(&bid)
-                && crate::rules::setter_reassigned_before_call(
-                    block,
-                    &call.var,
-                    call.span,
-                    &all_setter_vars,
-                )
-            {
-                return None;
-            }
-            // Unconditional call ⟹ a `Certified` proof — the only path to
-            // Error, and it takes two musts. The phase must be `Sync`: a ⊤
-            // row is never certain, whatever block it sits in, because the
-            // proof would be about the block, not about the timing. And the
-            // call must surely write (`must_render_write`): dominance cannot
-            // upgrade a may.
-            let proof = match (call.class, call.block_id) {
-                (SetterCallPhase::Sync, Some(bid)) => match must_render_write(
-                    exit_dom,
-                    &comp_result.render_cfg,
-                    &scopes,
-                    &call.var,
-                    bid,
-                    local_setter_info.contains(&call.var),
-                    cs_vars.get(&call.var).map(Vec::as_slice),
-                ) {
+        // The names some body of the component assigns, made once and only
+        // when a closure's settling proof needs them.
+        let assigned = std::cell::OnceCell::new();
+        // What a settling proof reads as held across the passes of the
+        // render loop (#331): only the writes that may run in a render pass
+        // run between two of them. Made once, when a proof needs it.
+        let facts = std::cell::OnceCell::new();
+        let moving = render_pass_slots(result, component);
+        let store_moves = comp_result
+            .slot_writers
+            .iter()
+            .any(|w| w.writes_store() && in_render_pass(w));
+        let free = |v: &str| v == comp_result.param || comp_result.module_consts.contains_key(v);
+        let between = || Between {
+            invariance: facts
+                .get_or_init(|| LoopFacts::of(comp_result, ctx.cache().written()))
+                .invariance(store_moves),
+            render: &comp_result.render_cfg,
+            moving: &moving,
+            free: &free,
+        };
+        let all = rows.clone();
+        let judge = |w: &SlotWriter| -> Option<Diagnostic> {
+            let sync = w.phase == WriterPhase::Render;
+            // Unconditional write ⟹ a `Certified` proof — the only path to
+            // Error. The row is placed only where it runs synchronously in
+            // the render, at least once per pass of its block, through a call
+            // the relation is sure writes that one slot (ADR-047, design-walk
+            // §3); its block must dominate every exit (#279). A ⊤ row is
+            // never certain, whatever block it sits in.
+            let proof = match sync.then_some(w.placed).flatten() {
+                Some(block) => match must_render_write(exit_dom, block) {
                     MustResult::All(c) => Some(c),
                     _ => None,
                 },
-                _ => None,
+                None => None,
             };
-
-            // Sanctioned adjust-during-render idiom: conditional local call
-            // whose guards die once the written value is in the slot —
-            // converges after one extra render, no diagnostic. Only for the
-            // slot's sole render-pass write: with two, the next render reads
-            // whichever ran last.
+            // Sanctioned adjust-during-render idiom: a conditional local
+            // write whose guards die once the written value is in the slot
+            // converges after one extra render. Only for the slot's sole
+            // render-pass write: with two, the next render reads whichever
+            // ran last. The guards are the write's own: the render's, or
+            // those of a closure the render runs synchronously
+            // (`[1].forEach(() => { if (n !== 1) setN(1); })`, #269).
             if proof.is_none()
-                && let Some(bid) = call.block_id
-                && let Some(label) = local_setter_info.sole(&call.var)
-                && sole_render_writer(result, component, label)
-                && let Some(arg) = setter_call_arg(&comp_result.render_cfg, bid, &call.var)
-                && converges_once_written(
-                    &comp_result.render_cfg,
-                    bid,
-                    &state_vals,
-                    &members,
-                    label,
-                    &eval_in_exit_env(arg, comp_result),
-                    Some(arg),
-                    &comp_result.exit_env(),
-                    &mut |e| eval_in_exit_env(e, comp_result),
-                )
+                && sync
+                && w.owner.is_none()
+                && let Some(arg) = w.written.expr.as_ref()
+                && let Some((site, bid)) = w.own
+                && sole_render_writer(result, component, w.slot)
             {
-                return None;
+                let between = between();
+                let render = &comp_result.render_cfg;
+                let settles = match site {
+                    None => converges_once_written(
+                        render,
+                        bid,
+                        &state_vals,
+                        &members,
+                        w.slot,
+                        &eval_in_exit_env(arg, comp_result),
+                        Some(arg),
+                        &|e| between.holds(e, render, &|x| eval_in_exit_env(x, comp_result)),
+                        &comp_result.exit_env(),
+                        &mut |e| eval_in_exit_env(e, comp_result),
+                    ),
+                    Some(site) => settles_in_closure(
+                        comp_result,
+                        (site, bid),
+                        arg,
+                        w.slot,
+                        &state_vals,
+                        &members,
+                        assigned.get_or_init(|| assigned_names(comp_result)),
+                        &between,
+                    ),
+                };
+                if settles {
+                    return None;
+                }
             }
-            // A guarded write in a closure the render runs synchronously
-            // (`[1].forEach(() => { if (n !== 1) setN(1); })`) settles as a
-            // direct one does: its guards are the closure's own, read in the
-            // env of every run of it the closure runs make (#269). A write
-            // the walk could not prove synchronous keeps its row.
-            if proof.is_none()
-                && call.class == SetterCallPhase::Sync
-                && let Some((body, bid)) = call.own
-                && body != std::ptr::from_ref(&comp_result.render_cfg) as usize
-                && let Some(label) = local_setter_info.sole(&call.var)
-                && sole_render_writer(result, component, label)
-                && settles_in_closure(
-                    comp_result,
-                    closures.get_or_init(|| {
-                        SiteEnvs::of(comp_result, &exit)
-                            .closure_envs(&comp_result.render_cfg, &comp_result.hooks)
-                    }),
-                    (body, bid),
-                    &call.var,
-                    label,
-                    &state_vals,
-                    &members,
-                )
-            {
-                return None;
+            // One name at one site that writes several slots (`[setN,
+            // setM].forEach((set) => set(x))`) names each by its slot's own
+            // name: a message naming both `set` would say nothing of which.
+            // An expression a message prints whole (`(a ? setN : setM)(1)`)
+            // says it.
+            let shared = !crate::ir::names::is_named_temp(&w.setter)
+                && all.iter().any(|o| {
+                    o.span == w.span
+                        && o.setter == w.setter
+                        && (o.owner, o.slot) != (w.owner, w.slot)
+                });
+            let slot_name = || {
+                let slot = (w.owner.unwrap_or(component), w.slot);
+                comp_result.calls.slot_name(slot).cloned()
+            };
+            let mut wording = Wording::of(w, comp_result, names);
+            if let Some(name) = shared.then(slot_name).flatten() {
+                wording.name = Some(names.name(&name).into_owned());
             }
-
-            // Rule name, message, and primary anchor (local label vs prop var).
-            let (rule_name, message, label, var): (
-                &'static str,
-                String,
-                Option<HookLabel>,
-                Option<Var>,
-            ) = if let Some(label) = local_setter_info.targets(&call.var).next() {
-                (
+            let setter = wording.setter();
+            let (rule_name, message) = match (w.owner, &wording.through) {
+                // A write in an accessor's body the render's read or write
+                // runs (#337).
+                (None, _) if sync && wording.accessor().is_some() => {
+                    ("setter-in-render", sync_accessor_message(&wording))
+                }
+                (None, None) if sync => (
                     "setter-in-render",
-                    if call.class == SetterCallPhase::Sync {
-                        format!(
-                            "setter `{}` called directly in the render body, \
-                                 move this call into a useEffect or an event handler",
-                            names.name(&call.var)
-                        )
-                    } else {
-                        unknown_phase_message(names, &call.var)
-                    },
-                    Some(label),
-                    None,
-                )
-            } else if let Some(props) = cs_vars.get(&call.var)
-                && props.iter().all(|p| p.component == component)
-            {
-                (
+                    format!(
+                        "{setter} called directly in the render body, \
+                         move this call into a useEffect or an event handler"
+                    ),
+                ),
+                (None, Some(through)) if sync => (
                     "setter-in-render",
-                    if call.class == SetterCallPhase::Sync {
-                        format!(
-                            "setter `{}` called directly in the render body, \
-                                 move this call into a useEffect or an event handler",
-                            names.name(&call.var)
-                        )
-                    } else {
-                        unknown_phase_message(names, &call.var)
-                    },
-                    props.first().map(|p| p.label),
-                    None,
-                )
-            } else if let Some(props) = cs_vars.get(&call.var) {
-                // A prop several call sites bind to several parents'
-                // setters names them all.
-                let mut parents: Vec<String> = props
-                    .iter()
-                    .filter(|p| p.component != component)
-                    .map(|p| result.display_name(p.component))
-                    .collect();
-                parents.dedup();
-                let parents = parents.join("` or `");
-                (
+                    format!(
+                        "{setter} called in the render body through `{through}`, \
+                         move this call into a useEffect or an event handler"
+                    ),
+                ),
+                (None, _) => ("setter-in-render", unknown_phase_message(&wording)),
+                (Some(parent), through) if sync => (
                     "cross-setter-in-render",
-                    if call.class == SetterCallPhase::Sync {
-                        format!(
-                            "prop `{}` (a state setter of parent `{}`) called during render \
-                                 of `{}`, which triggers a parent re-render on every render",
-                            names.name(&call.var),
-                            parents,
+                    format!(
+                        "{} called during render of `{}`{}, which triggers a parent \
+                         re-render on every render",
+                        wording.of_parent(&result.display_name(parent)),
+                        result.display_name(component),
+                        through
+                            .as_ref()
+                            .map_or_else(String::new, |t| format!(" through `{t}`"))
+                    ),
+                ),
+                (Some(parent), _) => (
+                    "cross-setter-in-render",
+                    match wording.accessor() {
+                        Some((accessor, verb)) => format!(
+                            "{} is called{} in {accessor}. If the render {verb} it, `{}` \
+                             re-renders its parent on every render",
+                            wording.of_parent(&result.display_name(parent)),
+                            wording.through_link(),
                             result.display_name(component)
-                        )
-                    } else {
-                        format!(
-                            "prop `{}` (a state setter of parent `{}`) is handed to a callee \
-                                 with no timing summary. If that callee runs it during render, \
-                                 `{}` re-renders its parent on every render",
-                            names.name(&call.var),
-                            parents,
+                        ),
+                        None => format!(
+                            "{} is handed to a callee{} with no timing summary. If that \
+                             callee runs it during render, `{}` re-renders its parent on \
+                             every render",
+                            wording.of_parent(&result.display_name(parent)),
+                            wording.through_clause(),
                             result.display_name(component)
-                        )
+                        ),
                     },
-                    None,
-                    Some(call.var.clone()),
-                )
-            } else {
-                (
-                    "setter-in-render",
-                    if call.class == SetterCallPhase::Sync {
-                        format!(
-                            "setter `{}` called in the render body",
-                            names.name(&call.var)
-                        )
-                    } else {
-                        unknown_phase_message(names, &call.var)
-                    },
-                    None,
-                    None,
-                )
+                ),
             };
-
             let mut d = match proof {
                 Some(proof) => Diagnostic::error(rule_name, proof, message),
                 None => Diagnostic::warn(rule_name, message),
             };
-            if let Some(label) = label {
-                d = d.with_label(label);
-            }
-            if let Some(var) = var {
-                d = d.with_var(var);
-            }
-            if let Some(r) = call.span {
+            d = match w.owner {
+                None => d.with_label(w.slot),
+                Some(_) => d.with_var(w.setter.clone()),
+            };
+            if let Some(r) = w.span {
                 d = d.with_range(r);
             }
             // Witness (ADR-019): the render-time setter call itself.
             d = d.with_step(
-                crate::rules::Step::Call {
-                    callee: call.var.clone(),
-                    class: crate::rules::EffectClass::Setter,
-                },
+                wording.step(w),
                 None,
-                call.span,
+                w.span,
                 &ctx.names(&crate::rules::api::witness::fallback_name),
             );
             Some(d)
         };
         // Every site is judged: a setter whose render-pass site settles may
-        // also be handed to a callee that runs it at any time. A setter is
-        // one finding, its strongest site nothing clears (#285): a certified
-        // one if any — `if (c) setN(1); setN(2)` loops on every render
-        // whatever `c` — else the first, the synchronous ones first.
-        let mut sites = sites;
-        sites.sort_by_key(|s| s.class != SetterCallPhase::Sync);
-        let mut out: Vec<(Var, Diagnostic)> = Vec::new();
-        for site in sites {
-            let var = site.var.clone();
-            let Some(d) = judge(site) else {
+        // also be handed to a callee that runs it at any time. A slot is one
+        // finding, its strongest site nothing clears (#285): a certified one
+        // if any — `if (c) setN(1); setN(2)` loops on every render whatever
+        // `c` — else the first, the synchronous ones first. First in the
+        // source, not in the walk (#301).
+        let mut rows = rows;
+        rows.sort_by_key(|w| {
+            (
+                w.phase != WriterPhase::Render,
+                w.span.is_none(),
+                w.span.map(|r| (r.file, r.pos_key())),
+            )
+        });
+        let mut out: Vec<((Option<ComponentId>, HookLabel), Diagnostic)> = Vec::new();
+        for w in rows {
+            let key = (w.owner, w.slot);
+            let Some(d) = judge(w) else {
                 continue;
             };
-            match out.iter_mut().find(|(v, _)| *v == var) {
-                None => out.push((var, d)),
+            match out.iter_mut().find(|(k, _)| *k == key) {
+                None => out.push((key, d)),
                 Some((_, kept))
                     if d.severity() == Severity::Error && kept.severity() != Severity::Error =>
                 {
@@ -392,9 +338,14 @@ impl SetterInRender {
             .slot_writers
             .iter()
             .filter_map(|w| {
+                // A write of the store is no setter's (ADR-046): the churn
+                // graph carries it.
                 let WriterRegion::Memo(memo) = w.region else {
                     return None;
                 };
+                if w.writes_store() {
+                    return None;
+                }
                 // A deferred or handler row runs on another turn; ⊤ may run
                 // in the memo's own run.
                 let sync = match w.phase {
@@ -434,23 +385,31 @@ impl SetterInRender {
                         MustResult::All(c) => Some(c),
                         _ => None,
                     });
+                let wording = Wording::of(w, comp_result, names);
                 let (rule_name, message) = match w.owner {
                     None if sync => (
                         "setter-in-render",
                         format!(
-                            "setter `{}` called in a useMemo body, which runs during render: \
+                            "{} called in a useMemo body{}, which runs during render: \
                              move this call into a useEffect or an event handler",
-                            names.name(&w.setter)
+                            wording.setter(),
+                            wording
+                                .through
+                                .as_ref()
+                                .map_or_else(String::new, |t| format!(" through `{t}`"))
                         ),
                     ),
-                    None => ("setter-in-render", unknown_phase_message(names, &w.setter)),
+                    None => ("setter-in-render", unknown_phase_message(&wording)),
                     Some(parent) => (
                         "cross-setter-in-render",
                         format!(
-                            "prop `{}` (a state setter of parent `{}`) called in a useMemo body \
-                             during render of `{}`, which triggers a parent re-render",
-                            names.name(&w.setter),
-                            result.display_name(parent),
+                            "{} called in a useMemo body{} during render of `{}`, which \
+                             triggers a parent re-render",
+                            wording.of_parent(&result.display_name(parent)),
+                            wording
+                                .through
+                                .as_ref()
+                                .map_or_else(String::new, |t| format!(" through `{t}`")),
                             result.display_name(component)
                         ),
                     ),
@@ -467,10 +426,7 @@ impl SetterInRender {
                     d = d.with_range(r);
                 }
                 d = d.with_step(
-                    crate::rules::Step::Call {
-                        callee: w.setter.clone(),
-                        class: crate::rules::EffectClass::Setter,
-                    },
+                    wording.step(w),
                     None,
                     w.span,
                     &ctx.names(&crate::rules::api::witness::fallback_name),
@@ -486,67 +442,301 @@ impl SetterInRender {
 /// `composeEventHandlers(a, cb)`), so every phase is possible and the render
 /// pass is one of them. Saying "called directly in the render body" of that row
 /// would state as fact the one thing the walk could not establish.
-fn unknown_phase_message(names: &crate::ir::SourceNames, var: &Var) -> String {
+fn unknown_phase_message(wording: &Wording) -> String {
+    if let Some((accessor, verb)) = wording.accessor() {
+        return format!(
+            "{} is called{} in {accessor}. If the render {verb} it, this re-renders on \
+             every render",
+            wording.setter(),
+            wording.through_link()
+        );
+    }
     format!(
-        "setter `{}` is handed to a callee with no timing summary. If that callee \
+        "{} is handed to a callee{} with no timing summary. If that callee \
          runs it during render, this re-renders on every render",
-        names.name(var)
+        wording.setter(),
+        wording.through_clause()
     )
 }
 
-/// First argument of the top-level `setter(arg)` call in block `bid`, if any.
-/// The write of `setter` at `site` — a block of a closure body, by pointer
-/// identity — settles in every run of that closure: its guards there die once
-/// its value, read in the run's env, sits in slot `label`
-/// ([`converges_once_written`]). No run, no proof.
+/// The wording of a write in an accessor's body that a member read or write
+/// of the render runs (#337): the render does what runs it.
+fn sync_accessor_message(wording: &Wording) -> String {
+    let (accessor, verb) = wording.accessor().unwrap_or_default();
+    format!(
+        "{} is called{} in {accessor}, and the render {verb} it: move this call into a \
+         useEffect or an event handler",
+        wording.setter(),
+        wording.through_link()
+    )
+}
+
+/// How a message names the setter a row writes through (D2,
+/// [`SlotWriter::named`]): as the source spells it at the call when that is
+/// the setter, else the slot's setter and what the write went through — an
+/// object handed to a callee, a closure of another component. No message
+/// calls a value that is not a setter one.
+struct Wording {
+    /// The setter's name, printed; `None` for a slot the source binds to no
+    /// name.
+    name: Option<String>,
+    /// The same name, unprinted, for the witness step.
+    raw: Option<Var>,
+    /// What the write went through, printed, when that is not the setter.
+    through: Option<String>,
+    /// The accessor whose body the write sits in ([`SlotWriter::accessor`]).
+    accessor: Option<crate::engine::setters::AccessorOf>,
+}
+
+impl Wording {
+    fn of(
+        w: &SlotWriter,
+        comp: &crate::engine::AnalysisResult<StateValue>,
+        names: &crate::ir::SourceNames,
+    ) -> Self {
+        let (raw, through) = w.named(&comp.calls, comp.component);
+        Wording {
+            name: raw.as_ref().map(|n| names.name(n).into_owned()),
+            raw,
+            through: through.map(|t| names.name(t).into_owned()),
+            accessor: w.accessor.clone(),
+        }
+    }
+
+    /// Where a write in an accessor's body runs (#321), and what the render
+    /// does that would run it: "the getter of `p`, which runs at every read
+    /// of `p`", "reads".
+    fn accessor(&self) -> Option<(String, &'static str)> {
+        use crate::ir::expr::Accessor;
+        let (half, member) = self.accessor.as_ref()?;
+        let (kind, act, verb) = match half {
+            Accessor::Get => ("getter", "read", "reads"),
+            Accessor::Set => ("setter", "write", "writes"),
+        };
+        let place = match member {
+            Some(m) => format!("the {kind} of `{m}`, which runs at every {act} of `{m}`"),
+            None => format!("a {kind} of a computed member, which runs at every {act} of it"),
+        };
+        Some((place, verb))
+    }
+
+    /// " through `payload`" when the write went through a value that is not
+    /// the setter.
+    fn through_link(&self) -> String {
+        self.through
+            .as_ref()
+            .map_or_else(String::new, |t| format!(" through `{t}`"))
+    }
+
+    /// "setter `setN`", or "a state setter".
+    fn setter(&self) -> String {
+        match &self.name {
+            Some(n) => format!("setter `{n}`"),
+            None => "a state setter".to_string(),
+        }
+    }
+
+    /// A parent's setter: the prop this component calls when the prop is
+    /// that setter, else the setter.
+    fn of_parent(&self, parent: &str) -> String {
+        match (&self.name, &self.through) {
+            (Some(n), None) => format!("prop `{n}` (a state setter of parent `{parent}`)"),
+            _ => format!("{} of parent `{parent}`", self.setter()),
+        }
+    }
+
+    /// " through `payload`," when the write went through a value that is not
+    /// the setter.
+    fn through_clause(&self) -> String {
+        self.through
+            .as_ref()
+            .map_or_else(String::new, |t| format!(" through `{t}`,"))
+    }
+
+    /// The witness step of the row's call: a call of the setter, or, for a
+    /// slot no name binds, a call of the value it went through.
+    fn step(&self, w: &SlotWriter) -> crate::rules::Step {
+        match &self.raw {
+            Some(raw) => crate::rules::Step::Call {
+                callee: raw.clone(),
+                class: crate::rules::EffectClass::Setter,
+            },
+            None => crate::rules::Step::Call {
+                callee: w.setter.clone(),
+                class: crate::rules::EffectClass::Unknown,
+            },
+        }
+    }
+}
+
+/// The rows of the writer relation this rule judges in the render: the
+/// render's own writes of a component's slot that may run in its pass. A
+/// `Handler`, `Deferred` or `Cleanup` row is a *proof* of no — a user event
+/// or a known deferring registrar stands between the render pass and the
+/// write. `Unknown` is ⊤ and stays: ⊤ includes the render pass (#130),
+/// except a JSX prop's, ⊤ only because the program dispatches events
+/// (#219): this rule reads it as the event handler it is, as it always did
+/// (`docs/limitations.md`).
+pub(crate) fn render_rows(
+    comp: &crate::engine::AnalysisResult<crate::domains::StateValue>,
+) -> impl Iterator<Item = &SlotWriter> {
+    comp.slot_writers.iter().filter(|w| {
+        w.region == WriterRegion::Render
+            && !w.writes_store()
+            && match w.phase {
+                WriterPhase::Render => true,
+                WriterPhase::Unknown => !w.listener,
+                _ => false,
+            }
+    })
+}
+
+/// Every name some body of `comp` assigns (`x = …`): the render, its hook
+/// bodies, every function nested in either.
+fn assigned_names(
+    comp: &crate::engine::AnalysisResult<crate::domains::StateValue>,
+) -> HashSet<Var> {
+    let mut out = HashSet::new();
+    let roots =
+        std::iter::once(&comp.render_cfg).chain(comp.hooks.iter().filter_map(HookEntry::body_cfg));
+    for root in roots {
+        let nested = crate::ir::bindings::nested_bodies(root);
+        for body in std::iter::once(root).chain(nested.into_iter().map(|(_, b)| b)) {
+            for stmt in body.blocks.values().flat_map(|b| &b.stmts) {
+                if let Stmt::Assign { var, .. } = stmt {
+                    out.insert(var.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The write storing `arg` into slot `label` at block `block` of the closure
+/// at `site`, which the render runs synchronously, settles: its guards there
+/// die once the value sits in the slot ([`converges_once_written`], #269).
+///
+/// The closure runs at its call, in the render, so what it captures is what
+/// the render's names hold there. The env is the render's exit env, read only
+/// where it is that: a name bound once and never assigned holds one value per
+/// render (#314.2: a capture assigned between the closure's definition and
+/// its call holds neither value), and the closure's own names — its
+/// parameters, its locals — are its own. Every other name is ⊤, and so is
+/// the slot path a name the closure rebinds would claim.
 #[allow(clippy::too_many_arguments)]
 fn settles_in_closure(
     comp: &crate::engine::AnalysisResult<crate::domains::StateValue>,
-    (closures, heap): &(Vec<ClosureEnv<'_>>, crate::domains::stores::Heap),
-    (body, block): (usize, BlockId),
-    setter: &Var,
+    (site, block): (crate::ir::types::ExprId, BlockId),
+    arg: &Expr,
     label: HookLabel,
     slots: &HashMap<Var, crate::engine::guards::SlotPath>,
     members: &crate::engine::guards::MemberWrites<'_>,
+    assigned: &HashSet<Var>,
+    between: &Between<'_>,
 ) -> bool {
-    let runs: Vec<&ClosureEnv<'_>> = closures
+    let Some(body) = comp.calls.body(site) else {
+        return false;
+    };
+    // Its parameters: the literal's, where the component writes it.
+    let roots =
+        std::iter::once(&comp.render_cfg).chain(comp.hooks.iter().filter_map(HookEntry::body_cfg));
+    let Some(params) = roots
+        .flat_map(crate::ir::bindings::nested_bodies)
+        .find(|(_, b)| std::ptr::eq(*b, &**body))
+        .map(|(params, _)| params)
+    else {
+        return false;
+    };
+    let own: HashSet<&str> = crate::ir::bindings::own_names(params, body).collect();
+    let hidden = |v: &str| own.contains(v) || assigned.contains(v);
+    let mut env = comp.exit_env();
+    let mut read = HashSet::new();
+    for b in body.blocks.values() {
+        b.for_each_expr(&mut |e| crate::ir::free_vars::collect_used_vars(e, &mut read));
+    }
+    crate::ir::free_vars::collect_used_vars(arg, &mut read);
+    read.extend(own.iter().map(|v| v.to_string()));
+    for v in read.iter().filter(|v| hidden(v)) {
+        env.forget(v);
+    }
+    let slots: HashMap<Var, crate::engine::guards::SlotPath> = slots
         .iter()
-        .filter(|c| std::ptr::from_ref(c.body) as usize == body)
+        .filter(|(v, _)| !hidden(v))
+        .map(|(v, p)| (v.clone(), p.clone()))
         .collect();
-    let Some(cfg) = runs.first().map(|c| c.body) else {
-        return false;
-    };
-    let Some(arg) = setter_call_arg(cfg, block, setter) else {
-        return false;
-    };
-    runs.iter().all(|c| {
-        let Some(exit) = crate::domains::interp::exit_env_of(c.body, &c.exits) else {
-            return false;
-        };
-        let mut heap = heap.clone();
-        let mut eval = |e: &Expr| {
-            crate::engine::eval::eval_in_stores(
-                e,
-                &exit,
-                comp.component,
-                &comp.state_store,
-                &comp.memo_store,
-                &mut heap,
-            )
-        };
-        let written = eval(arg);
-        converges_once_written(
-            cfg,
-            block,
-            slots,
-            members,
-            label,
-            &written,
-            Some(arg),
-            &exit,
-            &mut eval,
+    let value = |e: &Expr, heap: &mut crate::domains::stores::Heap| {
+        crate::engine::eval::eval_in_stores(
+            e,
+            &env,
+            comp.component,
+            &comp.state_store,
+            &comp.memo_store,
+            heap,
         )
-    })
+    };
+    let mut heap = comp.heap.clone();
+    let written = value(arg, &mut heap);
+    converges_once_written(
+        body,
+        block,
+        &slots,
+        members,
+        label,
+        &written,
+        Some(arg),
+        &|e| between.holds(e, body, &|x| value(x, &mut comp.heap.clone())),
+        &env,
+        &mut |e| value(e, &mut heap),
+    )
+}
+
+/// What a settling proof reads as held across the passes of the render loop
+/// ([`Invariance::holds_between_passes`], #331).
+struct Between<'a> {
+    invariance: Invariance<'a>,
+    render: &'a CFG,
+    /// The slots a write that may run in a render pass writes.
+    moving: &'a HashSet<HookLabel>,
+    /// A name nothing in the component binds that holds: its props, a module
+    /// constant.
+    free: &'a dyn Fn(&str) -> bool,
+}
+
+impl Between<'_> {
+    /// Does `e`, read in `body`, denote one value on every pass? `value`
+    /// evaluates it where it is read.
+    fn holds(&self, e: &Expr, body: &CFG, value: &dyn Fn(&Expr) -> StateValue) -> bool {
+        self.invariance
+            .holds_between_passes(e, body, self.render, self.free, self.moving, value)
+    }
+}
+
+/// A write that may run in a render pass of the component whose slot it
+/// writes: of a render or memo body, synchronously or at an unknown time.
+fn in_render_pass(w: &SlotWriter) -> bool {
+    matches!(w.region, WriterRegion::Render | WriterRegion::Memo(_))
+        && matches!(
+            w.phase,
+            WriterPhase::Render | WriterPhase::Memo | WriterPhase::Unknown
+        )
+}
+
+/// The slots of `component` some write that may run in a render pass writes:
+/// its own, or another component's through a prop.
+fn render_pass_slots(
+    result: &crate::engine::ProgramAnalysisResult,
+    component: crate::ir::ComponentId,
+) -> HashSet<HookLabel> {
+    result
+        .components
+        .iter()
+        .flat_map(|(c, r)| {
+            r.slot_writers.iter().filter(move |w| {
+                in_render_pass(w) && w.owner.unwrap_or(*c) == component && !w.writes_store()
+            })
+        })
+        .map(|w| w.slot)
+        .collect()
 }
 
 /// Slot `label` of `component` has exactly one write that may run in a
@@ -557,14 +747,7 @@ fn sole_render_writer(
     component: crate::ir::ComponentId,
     label: HookLabel,
 ) -> bool {
-    let render_pass = |w: &&SlotWriter| {
-        w.slot == label
-            && matches!(w.region, WriterRegion::Render | WriterRegion::Memo(_))
-            && matches!(
-                w.phase,
-                WriterPhase::Render | WriterPhase::Memo | WriterPhase::Unknown
-            )
-    };
+    let render_pass = |w: &&SlotWriter| w.slot == label && in_render_pass(w);
     let own = result.components[&component]
         .slot_writers
         .iter()
@@ -582,22 +765,6 @@ fn sole_render_writer(
     own == 1 && others == 0
 }
 
-fn setter_call_arg<'a>(
-    cfg: &'a crate::ir::cfg::CFG,
-    bid: BlockId,
-    setter: &Var,
-) -> Option<&'a Expr> {
-    let block = cfg.blocks.get(&bid)?;
-    for stmt in &block.stmts {
-        if let Stmt::ExprStmt(Expr::Call { fn_, args }, _) = stmt
-            && matches!(fn_.as_ref(), Expr::Var(v) if v == setter)
-        {
-            return args.first();
-        }
-    }
-    None
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -607,7 +774,7 @@ mod tests {
         domains::{StateValue, StateValueTransfer},
         engine::{AnalysisResult, Config, ProgramAnalysisResult, analyze_component},
         ir::{
-            cfg::{BasicBlock, CFG, Edge, EdgeKind, Terminator},
+            cfg::{BasicBlock, CFG, Terminator},
             component::ComponentIR,
             expr::{BinOp, Expr, Prim},
             hooks::HookEntry,
@@ -655,196 +822,6 @@ mod tests {
     }
 
     #[test]
-    fn setter_called_in_render_is_error() {
-        let render_stmts = vec![
-            Stmt::Let {
-                var: "setN".to_string(),
-                rhs: Expr::StateSetter(0),
-                span: None,
-            },
-            Stmt::ExprStmt(
-                Expr::Call {
-                    fn_: Box::new(Expr::Var("setN".to_string())),
-                    args: vec![Expr::Lit(Prim::Int(1))],
-                },
-                None,
-            ),
-        ];
-        let result = make_result(vec![], render_stmts);
-        let diags =
-            SetterInRender.check(&RuleCtx::new(&prog("C", &result), crate::test_support::C));
-        assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].rule, "setter-in-render");
-        assert_eq!(diags[0].severity(), Severity::Error);
-    }
-
-    #[test]
-    fn setter_alias_called_in_render_is_error() {
-        // `const s = setN; s(1)` is the same write as `setN(1)` (#176).
-        let render_stmts = vec![
-            Stmt::Let {
-                var: "setN".to_string(),
-                rhs: Expr::StateSetter(0),
-                span: None,
-            },
-            Stmt::Let {
-                var: "s".to_string(),
-                rhs: Expr::Var("setN".to_string()),
-                span: None,
-            },
-            Stmt::ExprStmt(
-                Expr::Call {
-                    fn_: Box::new(Expr::Var("s".to_string())),
-                    args: vec![Expr::Lit(Prim::Int(1))],
-                },
-                None,
-            ),
-        ];
-        let result = make_result(vec![], render_stmts);
-        let diags =
-            SetterInRender.check(&RuleCtx::new(&prog("C", &result), crate::test_support::C));
-        assert_eq!(diags.len(), 1, "{diags:?}");
-        assert_eq!(diags[0].rule, "setter-in-render");
-        assert_eq!(diags[0].hook_label, Some(0));
-        assert_eq!(diags[0].severity(), Severity::Error);
-    }
-
-    #[test]
-    fn a_name_bound_to_the_setter_and_to_something_else_is_a_warning() {
-        // `let s = setN; s = noop; s(1)`: the alias table resolves `s` to the
-        // setter, first binding wins, but a name bound twice is not certainly
-        // the setter at the call — here it is the no-op, and nothing is written.
-        let render_stmts = vec![
-            Stmt::Let {
-                var: "setN".to_string(),
-                rhs: Expr::StateSetter(0),
-                span: None,
-            },
-            Stmt::Let {
-                var: "s".to_string(),
-                rhs: Expr::Var("setN".to_string()),
-                span: None,
-            },
-            Stmt::Assign {
-                var: "s".to_string(),
-                rhs: Expr::Var("noop".to_string()),
-                span: None,
-            },
-            Stmt::ExprStmt(
-                Expr::Call {
-                    fn_: Box::new(Expr::Var("s".to_string())),
-                    args: vec![Expr::Lit(Prim::Int(1))],
-                },
-                None,
-            ),
-        ];
-        let result = make_result(vec![], render_stmts);
-        let diags =
-            SetterInRender.check(&RuleCtx::new(&prog("C", &result), crate::test_support::C));
-        assert_eq!(diags.len(), 1, "{diags:?}");
-        assert_eq!(diags[0].severity(), Severity::Warning);
-    }
-
-    #[test]
-    fn setter_in_branch_block_is_warning() {
-        // block 0: branch → 1 / 2; block 1: setN(42) conditional → Warning
-        let mut blocks = std::collections::BTreeMap::new();
-        blocks.insert(
-            0,
-            BasicBlock {
-                id: 0,
-                stmts: vec![Stmt::Let {
-                    var: "setN".to_string(),
-                    rhs: Expr::StateSetter(0),
-                    span: None,
-                }],
-                term: Terminator::Branch {
-                    span: None,
-                    cond: Expr::Lit(Prim::Bool(true)),
-                    then_: 1,
-                    else_: 2,
-                },
-            },
-        );
-        blocks.insert(
-            1,
-            BasicBlock {
-                id: 1,
-                stmts: vec![Stmt::ExprStmt(
-                    Expr::Call {
-                        fn_: Box::new(Expr::Var("setN".to_string())),
-                        args: vec![Expr::Lit(Prim::Int(42))],
-                    },
-                    None,
-                )],
-                term: Terminator::Return(Expr::Lit(Prim::Unit), None),
-            },
-        );
-        blocks.insert(
-            2,
-            BasicBlock {
-                id: 2,
-                stmts: vec![],
-                term: Terminator::Return(Expr::Lit(Prim::Unit), None),
-            },
-        );
-        let result = crate::test_support::analysis_result(CFG {
-            entry: 0,
-            blocks,
-            edges: vec![
-                Edge {
-                    from: 0,
-                    to: 1,
-                    kind: EdgeKind::IfTrue,
-                },
-                Edge {
-                    from: 0,
-                    to: 2,
-                    kind: EdgeKind::IfFalse,
-                },
-            ],
-        });
-        let diags =
-            SetterInRender.check(&RuleCtx::new(&prog("C", &result), crate::test_support::C));
-        assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].severity(), Severity::Warning);
-    }
-
-    #[test]
-    fn multiple_setters_called_all_reported() {
-        let render_stmts = vec![
-            Stmt::Let {
-                var: "setA".to_string(),
-                rhs: Expr::StateSetter(0),
-                span: None,
-            },
-            Stmt::Let {
-                var: "setB".to_string(),
-                rhs: Expr::StateSetter(1),
-                span: None,
-            },
-            Stmt::ExprStmt(
-                Expr::Call {
-                    fn_: Box::new(Expr::Var("setA".to_string())),
-                    args: vec![Expr::Lit(Prim::Int(1))],
-                },
-                None,
-            ),
-            Stmt::ExprStmt(
-                Expr::Call {
-                    fn_: Box::new(Expr::Var("setB".to_string())),
-                    args: vec![Expr::Lit(Prim::Int(2))],
-                },
-                None,
-            ),
-        ];
-        let result = make_result(vec![], render_stmts);
-        let diags =
-            SetterInRender.check(&RuleCtx::new(&prog("C", &result), crate::test_support::C));
-        assert_eq!(diags.len(), 2, "both setA and setB should be reported");
-    }
-
-    #[test]
     fn via_analyze_component_count_plus_one_is_error() {
         // setCount(count + 1) directly in render body → Error (unconditional).
         let hooks = vec![HookEntry::State {
@@ -866,6 +843,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setCount".to_string())),
                     args: vec![Expr::BinOp {
                         op: BinOp::Add,
@@ -904,46 +882,5 @@ mod tests {
             SetterInRender.check(&RuleCtx::new(&prog("Counter", &result), result.component));
         assert!(!diags.is_empty(), "setter in render body should warn");
         assert_eq!(diags[0].severity(), Severity::Error);
-    }
-
-    #[test]
-    fn setter_inside_callback_arg_is_warning() {
-        // someCall((u) => { setN(u) }) setter in FnLit arg → Warning
-        let cb_cfg = crate::test_support::single_block_cfg(vec![Stmt::ExprStmt(
-            Expr::Call {
-                fn_: Box::new(Expr::Var("setN".to_string())),
-                args: vec![Expr::Var("u".to_string())],
-            },
-            None,
-        )]);
-
-        let render_stmts = vec![
-            Stmt::Let {
-                var: "setN".to_string(),
-                rhs: Expr::StateSetter(0),
-                span: None,
-            },
-            Stmt::ExprStmt(
-                Expr::Call {
-                    fn_: Box::new(Expr::Var("someCall".to_string())),
-                    args: vec![Expr::FnLit {
-                        id: crate::ir::types::ExprId(0),
-                        params: vec!["u".to_string()],
-                        body_cfg: std::sync::Arc::new(cb_cfg),
-                    }],
-                },
-                None,
-            ),
-        ];
-        let result = make_result(vec![], render_stmts);
-        let diags =
-            SetterInRender.check(&RuleCtx::new(&prog("C", &result), crate::test_support::C));
-        assert_eq!(
-            diags.len(),
-            1,
-            "setter inside callback arg should be detected"
-        );
-        assert_eq!(diags[0].rule, "setter-in-render");
-        assert_eq!(diags[0].severity(), Severity::Warning);
     }
 }

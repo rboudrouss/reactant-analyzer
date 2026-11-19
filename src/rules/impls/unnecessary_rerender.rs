@@ -3,6 +3,7 @@ use std::collections::HashMap;
 
 use crate::{
     domains::{AbstractDomain, AbstractEnv, BoolVal, MemoStore, StateStore, StateValue},
+    engine::{setters::WriterRegion, written::SiteEnvs},
     ir::{
         expr::Expr,
         hooks::{Arity, HookEntry},
@@ -63,14 +64,14 @@ impl Rule for UnnecessaryRerender {
             .filter_map(|h| {
                 if let HookEntry::State { label, init, .. } = h {
                     // Mount-time init eval: empty stores + empty heap, NOT the
-                    // converged bundle.
+                    // converged bundle; the heap of the same program (#334).
                     let val = crate::rules::eval_in_stores(
                         init,
                         &empty_env,
                         result.component,
                         &empty_state,
                         &empty_memo,
-                        &mut crate::domains::Heap::new(),
+                        &mut result.heap.blank(),
                     );
                     Some((*label, val))
                 } else {
@@ -85,6 +86,8 @@ impl Rule for UnnecessaryRerender {
         // `setter(B)` is still a call to the underlying state setter.
         let setters = all_setter_labels(result);
         let state_names = state_val_labels(&result.render_cfg);
+        let exit = result.exit_env();
+        let envs = SiteEnvs::of(result, &exit);
 
         let mut diags = Vec::new();
 
@@ -107,8 +110,8 @@ impl Rule for UnnecessaryRerender {
             // mount-only effect forces the extra render, so a flat pass over
             // every block suffices (no need for control-flow ordering).
             for block in body_cfg.blocks.values() {
-                for stmt in &block.stmts {
-                    let Stmt::ExprStmt(Expr::Call { fn_, args }, _) = stmt else {
+                for (i, stmt) in block.stmts.iter().enumerate() {
+                    let Stmt::ExprStmt(Expr::Call { fn_, args, .. }, _) = stmt else {
                         continue;
                     };
                     let Expr::Var(setter_name) = fn_.as_ref() else {
@@ -116,8 +119,28 @@ impl Rule for UnnecessaryRerender {
                     };
 
                     // A name bound to several setters (#202) writes one of
-                    // them: each is a possible extra render.
-                    for state_label in setters.targets(setter_name) {
+                    // them: each is a possible extra render. Which setters
+                    // the name holds at the call is the converged env's
+                    // answer when it is certain: the name table keeps every
+                    // setter the name is ever bound to, a rebinding
+                    // included (#327).
+                    let at_call = envs.eval(
+                        WriterRegion::Effect(*eff_label),
+                        body_cfg,
+                        Some((block.id, i)),
+                        fn_,
+                        &|_| false,
+                    );
+                    let targets: Vec<HookLabel> = match at_call.surely_setter() {
+                        true => at_call
+                            .setters()
+                            .into_iter()
+                            .filter(|(owner, _)| *owner == result.component)
+                            .map(|(_, label)| label)
+                            .collect(),
+                        false => setters.targets(setter_name).collect(),
+                    };
+                    for state_label in targets {
                         let Some(init_val) = init_values.get(&state_label) else {
                             continue;
                         };
@@ -264,6 +287,7 @@ mod tests {
         // useState("light"), useEffect(() => { setX("dark") }, [])
         let eff_stmts = vec![Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setX".to_string())),
                 args: vec![Expr::Lit(Prim::String("dark".into()))],
             },
@@ -294,6 +318,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setter".to_string())),
                     args: vec![Expr::Lit(Prim::String("dark".into()))],
                 },
@@ -317,6 +342,7 @@ mod tests {
         // useState("light"), useEffect(() => { setX("light") }, []) → redundant, not this rule
         let eff_stmts = vec![Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setX".to_string())),
                 args: vec![Expr::Lit(Prim::String("light".into()))],
             },
@@ -340,6 +366,7 @@ mod tests {
         // deps: DepsArg::Absent = runs every render not a mount-only effect
         let eff_stmts = vec![Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setX".to_string())),
                 args: vec![Expr::Lit(Prim::String("dark".into()))],
             },
@@ -365,6 +392,7 @@ mod tests {
         // the target value", which would break hydration.
         let eff_stmts = vec![Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setX".to_string())),
                 args: vec![Expr::Lit(Prim::Bool(true))],
             },
@@ -397,6 +425,7 @@ mod tests {
         // gating needs false-first) — generic message stays.
         let eff_stmts = vec![Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setX".to_string())),
                 args: vec![Expr::Lit(Prim::Bool(false))],
             },
@@ -423,6 +452,7 @@ mod tests {
         // useState(0), useEffect(() => { setX(42) }, [])
         let eff_stmts = vec![Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setX".to_string())),
                 args: vec![Expr::Lit(Prim::Int(42))],
             },

@@ -203,7 +203,7 @@ fn collect_setter_vals_in_expr(
     tracker: &mut HashMap<HookLabel, (StateValue, bool)>,
 ) {
     match expr {
-        Expr::Call { fn_, args } => {
+        Expr::Call { fn_, args, .. } => {
             if let Expr::Var(name) = fn_.as_ref()
                 && let Some(labels) = env.setter_labels(name)
             {
@@ -256,7 +256,7 @@ fn check_setter_calls(
     skip_labels: &HashSet<HookLabel>,
 ) {
     for stmt in stmts {
-        if let Stmt::ExprStmt(Expr::Call { fn_, args }, call_span) = stmt
+        if let Stmt::ExprStmt(Expr::Call { fn_, args, .. }, call_span) = stmt
             && let Expr::Var(name) = fn_.as_ref()
             && let Some(label) = env.setter_label(name)
         {
@@ -383,6 +383,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::Lit(Prim::Int(42))],
                 },
@@ -410,6 +411,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::Lit(Prim::Int(42))],
                 },
@@ -439,6 +441,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::ObjectLit {
                         id: crate::ir::types::ExprId(0),
@@ -471,6 +474,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::Lit(Prim::Int(42))],
                 },
@@ -493,6 +497,7 @@ mod tests {
     fn non_setter_call_no_warning() {
         let stmts = vec![Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("doSomething".to_string())),
                 args: vec![Expr::Lit(Prim::Int(1))],
             },
@@ -518,6 +523,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setV".to_string())),
                     args: vec![Expr::Var("B".to_string())],
                 },
@@ -589,6 +595,7 @@ mod tests {
         }];
         let effect_stmts = vec![Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setN".to_string())),
                 args: vec![Expr::Lit(Prim::Int(42))],
             },
@@ -615,6 +622,7 @@ mod tests {
         }];
         let effect_stmts = vec![Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setN".to_string())),
                 args: vec![Expr::ObjectLit {
                     id: crate::ir::types::ExprId(0),
@@ -646,8 +654,10 @@ mod tests {
         }];
         let effect_stmts = vec![Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setN".to_string())),
                 args: vec![Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("fetchData".to_string())),
                     args: vec![],
                 }],

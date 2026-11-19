@@ -68,6 +68,77 @@ impl<'a> Visit<'a> for Scan {
     }
 }
 
+/// Whether a function's parameters or body read its own `arguments` (#324):
+/// the name anywhere outside a nested `function`, which binds its own. An
+/// arrow binds none, so one nested here reads this function's.
+pub(crate) fn reads_arguments(params: &FormalParameters, body: &FunctionBody) -> bool {
+    let mut scan = ArgumentsScan::default();
+    scan.visit_formal_parameters(params);
+    scan.visit_function_body(body);
+    scan.found
+}
+
+#[derive(Default)]
+struct ArgumentsScan {
+    found: bool,
+    /// How many `function` bodies the walk is inside.
+    nested: usize,
+}
+
+impl<'a> Visit<'a> for ArgumentsScan {
+    fn enter_node(&mut self, kind: AstKind<'a>) {
+        match kind {
+            AstKind::Function(_) => self.nested += 1,
+            AstKind::IdentifierReference(id) if self.nested == 0 && id.name == "arguments" => {
+                self.found = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn leave_node(&mut self, kind: AstKind<'a>) {
+        if let AstKind::Function(_) = kind {
+            self.nested -= 1;
+        }
+    }
+}
+
+/// Whether a function's parameters or body read its own `this` (#338):
+/// `this` anywhere outside a nested `function`, which binds its own. An arrow binds none, so one nested here reads this function's. A
+/// nested class's members bind their own too; reading one as this
+/// function's only adds a binding nothing reads.
+pub(crate) fn reads_this(params: &FormalParameters, body: &FunctionBody) -> bool {
+    let mut scan = ThisScan::default();
+    scan.visit_formal_parameters(params);
+    scan.visit_function_body(body);
+    scan.found
+}
+
+#[derive(Default)]
+struct ThisScan {
+    found: bool,
+    /// How many `function` bodies the walk is inside.
+    nested: usize,
+}
+
+impl<'a> Visit<'a> for ThisScan {
+    fn enter_node(&mut self, kind: AstKind<'a>) {
+        match kind {
+            AstKind::Function(_) => self.nested += 1,
+            AstKind::ThisExpression(_) if self.nested == 0 => {
+                self.found = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn leave_node(&mut self, kind: AstKind<'a>) {
+        if let AstKind::Function(_) = kind {
+            self.nested -= 1;
+        }
+    }
+}
+
 fn callee_is_hook(callee: &Expression) -> bool {
     match callee.without_parentheses() {
         Expression::Identifier(id) => is_hook_name(id.name.as_str()),
@@ -130,6 +201,38 @@ mod tests {
             "function F() { return userId(); }",
         ] {
             assert!(!facts(src).hook_call, "{src}");
+        }
+    }
+
+    fn this_read(src: &str) -> bool {
+        let alloc = Allocator::default();
+        let ret = Parser::new(&alloc, src, SourceType::tsx())
+            .with_options(ParseOptions::default())
+            .parse();
+        assert!(ret.diagnostics.is_empty(), "{:?}", ret.diagnostics);
+        let Some(Statement::FunctionDeclaration(f)) = ret.program.body.first() else {
+            panic!("expected a function declaration");
+        };
+        reads_this(&f.params, f.body.as_ref().unwrap())
+    }
+
+    #[test]
+    fn this_is_read_through_arrows_not_nested_functions() {
+        // #338: an arrow reads its enclosing function's `this`, a nested
+        // `function` binds its own.
+        for src in [
+            "function F() { return this.x; }",
+            "function F(a = this.x) { return a; }",
+            "function F() { return () => this.x; }",
+        ] {
+            assert!(this_read(src), "{src}");
+        }
+        for src in [
+            "function F() { return function () { return this.x; }; }",
+            "function F() { return { m() { return this.x; } }; }",
+            "function F() { return 1; }",
+        ] {
+            assert!(!this_read(src), "{src}");
         }
     }
 }

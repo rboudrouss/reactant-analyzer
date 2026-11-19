@@ -241,8 +241,12 @@ impl Pairing {
 pub struct Registration {
     /// The effect whose body carries the registration.
     pub effect: HookLabel,
-    /// Display name (`setInterval`, `socket.addEventListener`, `.then`).
+    /// Display name (`setInterval`, `socket.addEventListener`, `.then`). A
+    /// message prints [`Registration::shown`].
     pub display: String,
+    /// The receiver of a method registrar, when it is a name lowering
+    /// minted (`(a ?? window).addEventListener`), which `display` leaves out.
+    pub receiver: Option<Var>,
     /// The table row's name — the stable key `display` is not.
     pub registrar: &'static str,
     pub firing: Firing,
@@ -305,12 +309,28 @@ pub fn match_registrar(fn_: &Expr) -> Option<(&'static Registrar, String)> {
     let reg = REGISTRARS
         .iter()
         .find(|r| r.name == method && (!r.method_only || is_method))?;
-    let display = match (root, is_method) {
+    // A receiver lowering named (`(a ?? window).addEventListener`) is
+    // printed by the rule, through [`Registration::shown`].
+    let display = match (root.filter(|r| !crate::ir::is_lowering_temp(r)), is_method) {
         (Some(r), _) => format!("{}.{method}", crate::ir::source_name(r)),
         (None, true) => format!(".{method}"),
         (None, false) => method.to_string(),
     };
     Some((reg, display))
+}
+
+impl Registration {
+    /// How a message names the registrar: [`Registration::display`], with a
+    /// receiver lowering named read as the source expression it stands for.
+    pub fn shown(&self, names: &crate::ir::SourceNames) -> String {
+        match &self.receiver {
+            Some(r) => names.describe(&Expr::FieldAccess {
+                obj: Box::new(Expr::Var(r.clone())),
+                field: self.registrar.to_string(),
+            }),
+            None => self.display.clone(),
+        }
+    }
 }
 
 // ── Synchronous dispatch (#219) ───────────────────────────────────────────────
@@ -390,7 +410,7 @@ pub(crate) fn dispatched_event(fn_: &Expr, args: &[Expr]) -> Option<Option<Strin
 
 fn expr_dispatches_events(e: &Expr) -> bool {
     match e {
-        Expr::Call { fn_, args } | Expr::New { fn_, args, .. }
+        Expr::Call { fn_, args, .. } | Expr::New { fn_, args, .. }
             if dispatched_event(fn_, args).is_some() =>
         {
             true
@@ -673,7 +693,7 @@ fn teardown_in_expr(
     fns: &HashMap<Var, Arc<CFG>>,
     depth: usize,
 ) -> bool {
-    if let Expr::Call { fn_, args } = expr {
+    if let Expr::Call { fn_, args, .. } = expr {
         let called = match fn_.peel_ts() {
             Expr::Var(n) => Some(n.as_str()),
             Expr::FieldAccess { field, .. } => Some(field.as_str()),
@@ -706,13 +726,15 @@ fn teardown_in_expr(
 /// The boolean third argument is `capture`, not `once`, and does not count.
 fn is_self_removing(reg: &Registrar, args: &[Expr]) -> bool {
     reg.name == "addEventListener"
-        && args.get(2).is_some_and(|o| match o.peel_ts() {
-            Expr::ObjectLit { fields, .. } => matches!(
-                crate::ir::expr::object_member(fields, "once").map(Expr::peel_ts),
-                Some(Expr::Lit(crate::ir::expr::Prim::Bool(true)))
-            ),
-            _ => false,
-        })
+        && Expr::positional_args(args)
+            .get(2)
+            .is_some_and(|o| match o.peel_ts() {
+                Expr::ObjectLit { fields, .. } => matches!(
+                    crate::ir::expr::object_member(fields, "once").map(Expr::peel_ts),
+                    Some(Expr::Lit(crate::ir::expr::Prim::Bool(true)))
+                ),
+                _ => false,
+            })
 }
 
 // ── The scan ──────────────────────────────────────────────────────────────────
@@ -767,13 +789,20 @@ fn scan_expr(
     out: &mut Vec<Registration>,
 ) {
     match expr {
-        Expr::Call { fn_, args } => {
+        Expr::Call { fn_, args, .. } => {
             if let Some((reg, display)) = match_registrar(fn_)
-                && let Some(cb) = args.get(reg.cb_arg)
+                && let Some(cb) = Expr::positional_args(args).get(reg.cb_arg)
             {
                 out.push(Registration {
                     effect,
                     display,
+                    receiver: match fn_.peel_ts() {
+                        Expr::FieldAccess { obj, .. } => match obj.peel_ts() {
+                            Expr::Var(v) if crate::ir::is_lowering_temp(v) => Some(v.clone()),
+                            _ => None,
+                        },
+                        _ => None,
+                    },
                     registrar: reg.name,
                     firing: reg.firing,
                     timing: reg.timing,

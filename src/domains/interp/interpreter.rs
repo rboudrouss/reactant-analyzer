@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -15,10 +16,12 @@ use crate::{
         bindings::binding_of,
         cfg::{CFG, EdgeKind, Terminator},
         expr::{
-            ACCESSOR_KEY_PREFIX, Expr, MarkerVal, SPREAD_KEY_PREFIX, SummaryValue, is_synthetic_key,
+            Accessor, CONSTRUCT_KEY, Expr, MarkerVal, NEW_INSTANCE, RECEIVER, SPREAD_KEY_PREFIX,
+            SummaryValue, THIS, accessor_of, is_synthetic_key,
         },
+        module::AccessKey,
         stmt::{MemberKey, Stmt},
-        types::{BlockId, Symbol},
+        types::{BlockId, ExprId, Symbol},
     },
 };
 
@@ -61,12 +64,118 @@ pub(crate) fn exec_body<T: Transfer>(
 /// the inlining depth is preserved across body boundaries.
 pub(crate) fn exec_body_depth<T: Transfer>(
     transfer: &T,
-    cfg: &CFG,
+    body: &Arc<CFG>,
     entry_env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
 ) -> T::Domain {
-    run_cfg(transfer, cfg, entry_env.clone(), ctx, depth).ret
+    run_body(transfer, body, entry_env.clone(), ctx, depth).ret
+}
+
+/// What the solver reads off a body's CFG, whatever env it runs in: the
+/// blocks' reverse post-order, the back edges, the branches whose condition
+/// selects what a block assigns or returns (and the inverse), and the names
+/// the body declares. A function of the CFG alone.
+pub(crate) struct Plan {
+    order: HashMap<BlockId, usize>,
+    back: HashSet<(BlockId, BlockId)>,
+    selecting: HashMap<BlockId, Vec<BlockId>>,
+    returning: HashMap<BlockId, Vec<BlockId>>,
+    selected: HashMap<BlockId, Vec<BlockId>>,
+    declared: HashSet<Symbol>,
+}
+
+impl Plan {
+    fn of(cfg: &CFG) -> Self {
+        let order = cfg
+            .rpo()
+            .into_iter()
+            .enumerate()
+            .map(|(i, b)| (b, i))
+            .collect();
+        let back = cfg
+            .edges
+            .iter()
+            .filter(|e| matches!(e.kind, EdgeKind::Back))
+            .map(|e| (e.from, e.to))
+            .collect();
+        // Block → the branches whose condition selects what it assigns, or
+        // what it returns; and the inverse, for re-queueing when a
+        // condition's bound grows.
+        let selecting = selecting_branches(cfg);
+        let returning = returning_branches(cfg);
+        let mut selected: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+        for (b, branches) in selecting.iter().chain(&returning) {
+            for br in branches {
+                selected.entry(*br).or_default().push(*b);
+            }
+        }
+        // A name the body assigns without declaring it belongs to an
+        // enclosing scope, shared with every body that binds it (#258).
+        let declared = cfg
+            .blocks
+            .values()
+            .flat_map(|block| &block.stmts)
+            .filter_map(|s| match s {
+                Stmt::Let { var, .. } => Some(var.clone()),
+                _ => None,
+            })
+            .collect();
+        Plan {
+            order,
+            back,
+            selecting,
+            returning,
+            selected,
+            declared,
+        }
+    }
+
+    fn rank(&self, b: BlockId) -> usize {
+        self.order.get(&b).copied().unwrap_or(usize::MAX)
+    }
+}
+
+/// The solver's tables (`Plan`) of every body one fixpoint runs as a
+/// closure, computed at its first run. An entry is keyed by the body's
+/// address and holds its `Arc`: while the entry lives the CFG is neither
+/// freed — so its address names no other body — nor changed in place, since
+/// a shared `Arc` gives no `&mut`. A cached plan is therefore the plan
+/// `Plan::of` would compute again, and a run that reads it is the run that
+/// computes it.
+#[derive(Default)]
+pub struct Plans(std::cell::RefCell<HashMap<*const CFG, CachedPlan>>);
+
+/// A body, kept alive, and its plan.
+type CachedPlan = (Arc<CFG>, std::rc::Rc<Plan>);
+
+impl Plans {
+    fn of(&self, body: &Arc<CFG>) -> std::rc::Rc<Plan> {
+        let mut plans = self.0.borrow_mut();
+        let (_, plan) = plans
+            .entry(Arc::as_ptr(body))
+            .or_insert_with(|| (Arc::clone(body), std::rc::Rc::new(Plan::of(body))));
+        std::rc::Rc::clone(plan)
+    }
+}
+
+/// [`run_cfg`] for a body held behind an `Arc` — a closure, a `useCallback`
+/// body, an updater, a reducer — with its plan read off the fixpoint's
+/// [`Plans`] when the context has them.
+pub(crate) fn run_body<T: Transfer>(
+    transfer: &T,
+    body: &Arc<CFG>,
+    entry_env: AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+    depth: usize,
+) -> Run<T::Domain> {
+    match ctx.plans {
+        Some(plans) => {
+            let plan = plans.of(body);
+            solve(transfer, body, &plan, entry_env, ctx, depth)
+        }
+        None => run_cfg(transfer, body, entry_env, ctx, depth),
+    }
 }
 
 /// What one run of [`run_cfg`] over a body leaves behind, besides the writes
@@ -113,31 +222,28 @@ pub(crate) fn run_cfg<T: Transfer>(
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
 ) -> Run<T::Domain> {
-    let order: HashMap<BlockId, usize> = cfg
-        .rpo()
-        .into_iter()
-        .enumerate()
-        .map(|(i, b)| (b, i))
-        .collect();
-    let back: HashSet<(BlockId, BlockId)> = cfg
-        .edges
-        .iter()
-        .filter(|e| matches!(e.kind, EdgeKind::Back))
-        .map(|e| (e.from, e.to))
-        .collect();
-    let rank = |b: BlockId| order.get(&b).copied().unwrap_or(usize::MAX);
+    solve(transfer, cfg, &Plan::of(cfg), entry_env, ctx, depth)
+}
 
-    // Block → the branches whose condition selects what it assigns, or what
-    // it returns; and the inverse, for re-queueing when a condition's bound
-    // grows.
-    let selecting = selecting_branches(cfg);
-    let returning = returning_branches(cfg);
-    let mut selected: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
-    for (b, branches) in selecting.iter().chain(&returning) {
-        for br in branches {
-            selected.entry(*br).or_default().push(*b);
-        }
-    }
+/// [`run_cfg`] over `cfg` with `plan`, its [`Plan`].
+fn solve<T: Transfer>(
+    transfer: &T,
+    cfg: &CFG,
+    plan: &Plan,
+    entry_env: AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+    depth: usize,
+) -> Run<T::Domain> {
+    let _profile = crate::profile::body_run(depth);
+    let Plan {
+        back,
+        selecting,
+        returning,
+        selected,
+        declared,
+        ..
+    } = plan;
+    let rank = |b: BlockId| plan.rank(b);
     let mut cond_bounds: HashMap<BlockId, Stability> = HashMap::new();
     // The join of the change bounds of `branches`, those not yet run
     // contributing nothing: they re-queue the block when they do.
@@ -161,18 +267,6 @@ pub(crate) fn run_cfg<T: Transfer>(
     entries.insert(cfg.entry, entry_env);
     pending.insert((rank(cfg.entry), cfg.entry));
 
-    // A name the body assigns without declaring it belongs to an enclosing
-    // scope, shared with every body that binds it (#258).
-    let declared: HashSet<&Symbol> = cfg
-        .blocks
-        .values()
-        .flat_map(|block| &block.stmts)
-        .filter_map(|s| match s {
-            Stmt::Let { var, .. } => Some(var),
-            _ => None,
-        })
-        .collect();
-
     while let Some((_, b)) = pending.pop_first() {
         let mut env = entries[&b].clone();
         // The change bound of the conditions this block's writes run under.
@@ -180,7 +274,9 @@ pub(crate) fn run_cfg<T: Transfer>(
         if let Some(block) = cfg.blocks.get(&b) {
             ctx.heap.share_assigned(&mut env);
             for stmt in &block.stmts {
+                let outer = std::mem::replace(&mut ctx.stmt, stmt.span());
                 exec_full_stmt(transfer, stmt, &mut env, ctx, depth);
+                ctx.stmt = outer;
                 if under_condition(&pc)
                     && let Stmt::Let { var, .. } | Stmt::Assign { var, .. } = stmt
                     && env.contains(var)
@@ -202,8 +298,10 @@ pub(crate) fn run_cfg<T: Transfer>(
                 // take EXPR's value as the return (ADR-020 item 7). The
                 // body's exit is a merge too: a return the other side of a
                 // branch answers with its own takes the branch's condition.
-                Terminator::Return(expr, _) => {
+                Terminator::Return(expr, span) => {
+                    let outer = std::mem::replace(&mut ctx.stmt, *span);
                     let returned = exec_callbacks_depth(transfer, expr, &env, ctx, depth);
+                    ctx.stmt = outer;
                     let mut val = returned
                         .map_or_else(|| transfer.eval_expr(expr, &env, ctx), |ev| ev.as_val());
                     let pc_ret = bound_under(returning.get(&b), &cond_bounds);
@@ -214,8 +312,10 @@ pub(crate) fn run_cfg<T: Transfer>(
                 }
                 // A condition is evaluated, so its calls run; its change
                 // bound is what the blocks it selects run under.
-                Terminator::Branch { cond, .. } => {
+                Terminator::Branch { cond, span, .. } => {
+                    let outer = std::mem::replace(&mut ctx.stmt, *span);
                     exec_expr_effects(transfer, cond, &mut env, ctx, depth);
+                    ctx.stmt = outer;
                     ctx.heap.share_assigned(&mut env);
                     let bound = condition_bound(transfer, cond, cfg, &env, ctx);
                     if cond_bounds.get(&b) != Some(&bound) {
@@ -330,6 +430,9 @@ fn exec_full_stmt<T: Transfer>(
                 env.bind_locs(var.clone(), ev.sites().cloned());
                 env.extend(var.clone(), ev.as_val());
             }
+            if let Stmt::Assign { .. } = stmt {
+                hold_in_module(transfer, var, rhs, env, ctx);
+            }
         }
         Stmt::MemberWrite { obj, key, rhs, .. } => {
             exec_callbacks_depth(transfer, obj, env, ctx, depth);
@@ -337,7 +440,213 @@ fn exec_full_stmt<T: Transfer>(
                 exec_callbacks_depth(transfer, idx, env, ctx, depth);
             }
             exec_callbacks_depth(transfer, rhs, env, ctx, depth);
+            if let Some(root) = module_root(obj) {
+                hold_in_module(transfer, root, rhs, env, ctx);
+            }
+            // A write through a setter runs its body with the value written
+            // (#321).
+            if ctx.heap.has_accessors() {
+                let key = match key {
+                    MemberKey::Field(field) => Key::Field(field),
+                    MemberKey::Index(idx) => Key::Index(idx),
+                };
+                run_accessors(transfer, obj, key, Some(rhs), env, ctx, depth);
+            }
             exec_stmt_core(transfer, stmt, env, ctx);
+        }
+    }
+}
+
+/// Run the getters the member reads of `expr` run, and nothing else (#321):
+/// what a hook's entry keeps as written, whose calls run in render
+/// statements of their own ([`QueryContext::hook_reads`]). A function
+/// literal is not entered: its reads run when it is called.
+///
+/// [`QueryContext::hook_reads`]: crate::domains::context::QueryContext::hook_reads
+fn run_member_reads<T: Transfer>(
+    transfer: &T,
+    expr: &Expr,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+    depth: usize,
+) {
+    if !ctx.heap.has_accessors() {
+        return;
+    }
+    match expr {
+        Expr::FnLit { .. } => {}
+        Expr::FieldAccess { obj, field } => {
+            run_member_reads(transfer, obj, env, ctx, depth);
+            run_accessors(transfer, obj, Key::Field(field), None, env, ctx, depth);
+        }
+        Expr::IndexAccess { arr, idx } => {
+            run_member_reads(transfer, arr, env, ctx, depth);
+            run_member_reads(transfer, idx, env, ctx, depth);
+            run_accessors(transfer, arr, Key::Index(idx), None, env, ctx, depth);
+        }
+        other => other.for_each_child(&mut |c| run_member_reads(transfer, c, env, ctx, depth)),
+    }
+}
+
+/// The key of a member read or write, as written.
+#[derive(Clone, Copy)]
+enum Key<'a> {
+    Field(&'a str),
+    Index(&'a Expr),
+}
+
+/// What a read or a write of a member of `obj` (placed at `sites`) selects,
+/// for the accessors of the program it may run (#336): the name a constant
+/// spells (`member`), else a number's key when the key expression (`index`)
+/// is surely a number. `length` off a receiver that is surely an array
+/// literal's object or a string is the receiver's own data property.
+pub(crate) fn access_key<'k, T: Transfer>(
+    transfer: &T,
+    obj: &Expr,
+    sites: Option<&Sites>,
+    member: Option<&'k str>,
+    index: Option<&Expr>,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+) -> AccessKey<'k> {
+    fn surely<T: Transfer>(
+        transfer: &T,
+        e: &Expr,
+        kind: &str,
+        env: &AbstractEnv<T::Domain>,
+        ctx: &mut AnalysisCtx<T::Domain>,
+    ) -> bool {
+        transfer
+            .eval_expr(e, env, ctx)
+            .as_state_value()
+            .is_some_and(|v| v.typeof_name() == Some(kind))
+    }
+    match member {
+        Some(m) if m == "length" => {
+            let own = sites.is_some_and(|s| ctx.heap.arrays(s))
+                || surely(transfer, obj, "string", env, ctx);
+            AccessKey::member(m, own)
+        }
+        Some(m) => AccessKey::Named(m),
+        None if index.is_some_and(|i| surely(transfer, i, "number", env, ctx)) => AccessKey::Number,
+        None => AccessKey::Any,
+    }
+}
+
+/// Run the accessors a read (`written: None`) or a write (`Some`: the
+/// expression written) of `member` of what `obj` denotes runs (#321): its
+/// getters, whose returns the heap keeps as what the read is
+/// ([`Heap::record_getter`]), or its setters, handed the value. Past the
+/// inlining budget none runs, and the read may be anything; every accessor
+/// escaped at its literal, so its body still runs, at an unknown time.
+///
+/// Where the heap places nothing — an object no site places, a member a
+/// placed one does not hold, which its prototype may — the read or the write
+/// may run an accessor the program defines (#334), with the receiver as
+/// `this` and the value written as its argument: a call the analysis cannot
+/// see, to which both escape. Off a plain object React builds, only an
+/// accessor its chain may hold ([`Heap::unseen_accessor`], #336).
+///
+/// [`Heap::record_getter`]: crate::domains::stores::Heap::record_getter
+/// [`Heap::unseen_accessor`]: crate::domains::stores::Heap::unseen_accessor
+fn run_accessors<T: Transfer>(
+    transfer: &T,
+    obj: &Expr,
+    key: Key<'_>,
+    written: Option<&Expr>,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+    depth: usize,
+) {
+    if !ctx.heap.has_accessors() {
+        return;
+    }
+    let (constant, index) = match key {
+        Key::Field(field) => (Some(Cow::Borrowed(field)), None),
+        Key::Index(idx) => (member_key(idx, env).map(Cow::Owned), Some(idx)),
+    };
+    let member = constant.as_deref();
+    let sites = alloc_literal(transfer, obj, env, ctx);
+    let unplaced = sites.as_ref().is_none_or(|s| ctx.heap.members(s, member).1);
+    let unseen = unplaced && {
+        let key = access_key(transfer, obj, sites.as_ref(), member, index, env, ctx);
+        ctx.heap.unseen_accessor(sites.as_ref(), key)
+    };
+    if unseen {
+        escape(transfer, obj, env, ctx);
+        if let Some(rhs) = written {
+            escape(transfer, rhs, env, ctx);
+        }
+    }
+    let kind = match written {
+        Some(_) => Accessor::Set,
+        None => Accessor::Get,
+    };
+    let mut accessors: Vec<ExprId> = sites
+        .as_ref()
+        .map(|s| {
+            ctx.heap
+                .accessors(s, kind, member)
+                .ids
+                .into_iter()
+                .collect()
+        })
+        .unwrap_or_default();
+    accessors.sort();
+    // The read is a call of the accessors it runs, anchored where it is
+    // (#337): their bodies run in this statement's region and phase, and
+    // an accessor the analysis does not see — module code included, when
+    // the receiver is read off a module binding — may run here.
+    if unseen || !accessors.is_empty() {
+        let eval = crate::engine::calls::Evaluation {
+            bodies: accessors.iter().copied().collect(),
+            open: unseen,
+            module: unseen && reads_module(obj, ctx),
+            escaped: ctx.escaped,
+            ..Default::default()
+        };
+        let at = ctx.stmt;
+        ctx.record(|r| {
+            for site in &accessors {
+                r.record_accessor(*site, kind, member);
+            }
+            r.record_access(at, eval)
+        });
+    }
+    let Some(sites) = sites else {
+        return;
+    };
+    if accessors.is_empty() {
+        return;
+    }
+    let written = written.map(|rhs| {
+        let at = alloc_literal(transfer, rhs, env, ctx);
+        EnvVal::located(at, transfer.eval_expr(rhs, env, ctx))
+    });
+    let args = written.as_slice();
+    // The accessor's `this` is the object read or written (#338).
+    let receiver = EnvVal::located(Some(sites), transfer.eval_expr(obj, env, ctx));
+    for site in accessors {
+        let returned = match depth >= MAX_INLINE_DEPTH {
+            true => None,
+            false => exec_heap_fns(
+                transfer,
+                Sites::closed([site]),
+                Args::exactly(args).on(Some(&receiver)),
+                env,
+                ctx,
+                depth,
+                &mut Ran::default(),
+            ),
+        };
+        if written.is_none() {
+            let read = returned.and_then(|r| {
+                let sites = r.sites().cloned();
+                r.as_val()
+                    .as_state_value()
+                    .map(|v| EnvVal::located(sites, v))
+            });
+            ctx.heap.record_getter(site, read.as_ref());
         }
     }
 }
@@ -395,13 +704,22 @@ fn exec_stmt_core<T: Transfer>(
         // among several and the Loc set may name several allocation sites, so
         // join, never replace.
         Stmt::MemberWrite { obj, key, rhs, .. } => {
-            let rhs_sites = alloc_literal(transfer, rhs, env, ctx);
-            // An object the heap does not place (a parameter's member, a
-            // call's result) is one code the analysis does not see may
+            // An accessor a class defines on its instance (#335) runs at any
+            // read or write of its member, by whoever makes it, as a
+            // literal's does: its closure escapes where it is defined,
+            // anchored at its own site, since a write has no anchor.
+            let rhs_sites = match (key, rhs) {
+                (MemberKey::Field(k), Expr::FnLit { id, .. }) if accessor_of(k).is_some() => {
+                    escape_at(transfer, rhs, env, ctx, Some((*id, 0)))
+                }
+                _ => alloc_literal(transfer, rhs, env, ctx),
+            };
+            // An object the heap does not place (a parameter's member, the
+            // result of a call no body ran) is one code the analysis does not see may
             // read: what is written there escapes (#254). So is a ref: it
             // outlives the render, and a context value or a module binding
             // may hand it where no row follows (#268).
-            let placed = resolve_locs(obj, env, ctx.heap);
+            let placed = ctx.resolve_locs(obj, env);
             if placed
                 .as_ref()
                 .is_none_or(|s| s.open || ctx.heap.persists(s))
@@ -451,9 +769,20 @@ fn havoc_members<T: Transfer>(
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
 ) {
-    let Some(Sites { ids, .. }) = resolve_locs(receiver, env, ctx.heap) else {
-        return;
-    };
+    if let Some(sites) = ctx.resolve_locs(receiver, env) {
+        havoc_at(transfer, sites, receiver, args, env, ctx);
+    }
+}
+
+/// [`havoc_members`] of the objects at `sites`, which `receiver` denotes.
+fn havoc_at<T: Transfer>(
+    transfer: &T,
+    Sites { ids, .. }: Sites,
+    receiver: &Expr,
+    args: &[Expr],
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+) {
     let mut all = EnvVal::Val(StateValue::undefined());
     for arg in args {
         let sites = alloc_literal(transfer, arg, env, ctx);
@@ -491,6 +820,10 @@ fn havoc_members<T: Transfer>(
 /// heap object) propagate their loc/setter/callback binding to `var`; then the
 /// RHS is evaluated and stored. Keeping this in one place is what guarantees
 /// `let s = setX` and `s = setX` behave identically (see the call site).
+///
+/// The binding replaces everything `var` denoted (#327): its value, its
+/// sites, its slot certificate and its setter and `useCallback` labels,
+/// which only a right-hand side that carries some gives it again.
 fn bind_rhs<T: Transfer>(
     transfer: &T,
     var: &str,
@@ -498,12 +831,15 @@ fn bind_rhs<T: Transfer>(
     env: &mut AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
 ) {
-    if let Expr::StateSetter(label) = rhs {
-        env.bind_setter(var.to_string(), *label);
-    }
-    if let Expr::CallbackVal(label) = rhs {
-        env.bind_callback(var.to_string(), *label);
-    }
+    let (setters, callbacks) = match rhs {
+        Expr::StateSetter(label) => (Some(BTreeSet::from([*label])), None),
+        Expr::CallbackVal(label) => (None, Some(BTreeSet::from([*label]))),
+        Expr::Var(src) => (
+            env.setter_labels(src).cloned(),
+            env.callback_labels(src).cloned(),
+        ),
+        _ => (None, None),
+    };
     // A literal is allocated, and a name or member chain shares the sites it
     // points to (`let __obj = __p0`, `let f = props.onClick`). An object
     // literal is a fresh container whose members keep their own identities:
@@ -512,16 +848,36 @@ fn bind_rhs<T: Transfer>(
     // heap instead of inheriting the container's `PerRender` (issue #88).
     // Anything else points nowhere the heap knows: the sites of the name's
     // previous binding are not what it holds now (#240).
-    let sites = alloc_literal(transfer, rhs, env, ctx);
+    let mut sites = alloc_literal(transfer, rhs, env, ctx);
+    // A hook that hands back a function running its argument
+    // (`useEffectEvent`): a call through the value runs that function, which
+    // is where it points for every reader (#320). A function of its own,
+    // at the hook's site, when the argument is one closure: what tells a
+    // call of it, which throws during a render, from a call of the closure
+    // ([`Heap::alloc_event`]).
+    if let Expr::HookMarker(label, _) = rhs
+        && let Some(arg) = ctx.query.hands_back(*label)
+    {
+        sites = alloc_literal(transfer, arg, env, ctx);
+        let site = ctx.component.hook_site(*label);
+        if let Some(Sites { ids, open: false }) = &sites
+            && let [closure] = ids.iter().copied().collect::<Vec<_>>()[..]
+            && ctx.heap.alloc_event(site, closure)
+        {
+            sites = Some(Sites::closed([site]));
+        }
+    }
     env.bind_locs(var.to_string(), sites);
     // `useRef` returns the hook's one object (#268): the closures a body
     // writes into `current` are what a call through it runs. It persists
-    // across renders, so a value read through it stays unknown.
+    // across renders, so a value read through it stays unknown. React builds
+    // it, a plain object (#336).
     if let Expr::HookMarker(label, MarkerVal::StableRef) = rhs {
-        let id = ctx.component.ref_site(*label);
+        let id = ctx.component.hook_site(*label);
         if ctx.heap.get(id).is_none() {
             let members = Members {
                 persists: true,
+                plain: true,
                 ..Members::default()
             };
             ctx.heap.insert(id, HeapValue::Obj(members));
@@ -550,14 +906,6 @@ fn bind_rhs<T: Transfer>(
             .insert(*id, HeapValue::Obj(Members::at_least(fields)));
         env.bind_locs(var.to_string(), Some(Sites::closed([*id])));
     }
-    if let Expr::Var(src) = rhs {
-        if let Some(labels) = env.setter_labels(src).cloned() {
-            env.bind_setters(var.to_string(), labels);
-        }
-        if let Some(labels) = env.callback_labels(src).cloned() {
-            env.bind_callbacks(var.to_string(), labels);
-        }
-    }
     // A slot read, or a rename of one, certifies the name (#197); any
     // other right-hand side revokes what the name had.
     let slot = match rhs.peel_ts() {
@@ -570,6 +918,12 @@ fn bind_rhs<T: Transfer>(
     if let Some(label) = slot {
         env.bind_slot(var.to_string(), label);
     }
+    if let Some(labels) = setters {
+        env.bind_setters(var.to_string(), labels);
+    }
+    if let Some(labels) = callbacks {
+        env.bind_callbacks(var.to_string(), labels);
+    }
 }
 
 /// The allocation sites `expr` denotes, allocating the literals it is: the one
@@ -580,8 +934,10 @@ fn bind_rhs<T: Transfer>(
 /// members; an array literal an `Obj` of its elements under their indices
 /// (`"0"`, `"1"`…, the keys a constant index reads) — only when every
 /// position is known, i.e. no spread and no elision. A memo points where its
-/// body's returns do (#233). Anything else is what [`resolve_locs`] places, or
-/// `None`.
+/// body's returns do (#233), and so does a call the pass ran ([`Returns`],
+/// #333). Anything else is what [`resolve_locs`] places, or `None`.
+///
+/// [`Returns`]: crate::domains::context::Returns
 pub(crate) fn alloc_literal<T: Transfer>(
     transfer: &T,
     expr: &Expr,
@@ -599,27 +955,44 @@ pub(crate) fn alloc_literal<T: Transfer>(
         }
         Expr::ObjectLit { id, fields } => {
             let mut members = Members::default();
-            for (key, value) in fields {
+            for (i, (key, value)) in fields.iter().enumerate() {
                 if key.starts_with(SPREAD_KEY_PREFIX) {
                     let source = alloc_literal(transfer, value, env, ctx);
                     spread_into(&mut members, source.as_ref(), ctx.heap);
-                } else if key.starts_with(ACCESSOR_KEY_PREFIX) {
-                    // A getter's member is what its body returns, under a
-                    // name the key does not keep.
-                    members.write_unknown();
+                } else if let Some((_, member)) = accessor_of(key) {
+                    // An accessor runs at every read (a getter) or write (a
+                    // setter) of its member, by whoever makes it, code the
+                    // analysis does not see included, at any time: its closure
+                    // escapes here, at the literal's field (ADR-047), and a read
+                    // or a write the analysis evaluates runs it (#321). A
+                    // computed name may be any member.
+                    let sites = escape_at(transfer, value, env, ctx, Some((*id, i)));
+                    let val = transfer
+                        .eval_expr(value, env, ctx)
+                        .as_state_value()
+                        .unwrap_or_else(StateValue::top);
+                    match member {
+                        Some(m) => members.define(m),
+                        None => members.write_unknown(),
+                    }
+                    members
+                        .named
+                        .insert(key.clone(), EnvVal::located(sites, val));
                 } else if is_synthetic_key(key) {
                     // A computed key no constant names: any member may be it.
                     members.write_any(&member_entry(transfer, value, env, ctx));
                 } else {
                     let entry = member_entry(transfer, value, env, ctx);
+                    members.define(key);
                     members.named.insert(key.clone(), entry);
                 }
             }
             (*id, members)
         }
         // An entry before the first spread sits at its index when no
-        // elision moved it; past a spread, every position may hold any entry
-        // of the source, which the heap does not place.
+        // elision moved it. Any other entry, and every element of a spread
+        // source the heap places, may sit at any position the index does not
+        // fix (#307); a source it does not place leaves the array open.
         Expr::ArrayLit {
             id,
             elems,
@@ -627,20 +1000,79 @@ pub(crate) fn alloc_literal<T: Transfer>(
             spread_at,
         } => {
             let placed = elems.len() - spread_at.len() == arity.at_least();
-            let prefix = spread_at.iter().min().copied().unwrap_or(elems.len());
+            let prefix = match placed {
+                true => spread_at.iter().min().copied().unwrap_or(elems.len()),
+                false => 0,
+            };
             let mut named = HashMap::new();
-            if placed {
-                for (i, value) in elems.iter().take(prefix).enumerate() {
-                    named.insert(i.to_string(), member_entry(transfer, value, env, ctx));
-                }
+            for (i, value) in elems.iter().take(prefix).enumerate() {
+                named.insert(i.to_string(), member_entry(transfer, value, env, ctx));
             }
-            let members = match placed && arity.exact().is_some() {
+            let mut members = match placed && arity.exact().is_some() {
                 true => Members::exactly(named),
                 false => Members::at_least(named),
             };
+            members.array = true;
+            for (i, value) in elems.iter().enumerate().skip(prefix) {
+                if !spread_at.contains(&i) {
+                    members.hold_unplaced(&member_entry(transfer, value, env, ctx));
+                    continue;
+                }
+                let Some(source) = alloc_literal(transfer, value, env, ctx) else {
+                    continue;
+                };
+                let held: Vec<EnvVal<StateValue>> = source
+                    .ids
+                    .iter()
+                    .filter_map(|id| match ctx.heap.get(*id) {
+                        Some(HeapValue::Obj(obj)) => Some(obj.values().cloned()),
+                        _ => None,
+                    })
+                    .flatten()
+                    .collect();
+                for entry in &held {
+                    members.hold_unplaced(entry);
+                }
+            }
             (*id, members)
         }
-        Expr::MemoVal(label) => return ctx.memo.sites(*label).cloned(),
+        // A new array of the running call's arguments (#324).
+        Expr::Arguments { id, from } => (*id, arguments_members(transfer, *from, env, ctx)),
+        // A memo, or a callback, points where its recompute's value does.
+        Expr::MemoVal(label) | Expr::CallbackVal(label) => {
+            return ctx.memo.sites(*label).cloned();
+        }
+        // A member read places what [`resolve_locs`] places, off a literal
+        // receiver as well (`[x ?? {}][0]`, `{ a: {} }.a`, #307).
+        Expr::FieldAccess { obj, field } => {
+            let sites = alloc_literal(transfer, obj, env, ctx)?;
+            return ctx.heap.member_sites(&sites, Some(field));
+        }
+        Expr::IndexAccess { arr, idx } => {
+            let sites = alloc_literal(transfer, arr, env, ctx)?;
+            return ctx
+                .heap
+                .member_sites(&sites, member_key(idx, env).as_deref());
+        }
+        // A call the pass ran points where its bodies' returns do (#333); a
+        // builtin whose result is its receiver or one of its entries, where
+        // those do (#330); a callee that may be either, where both may.
+        Expr::Call { id, fn_, args } => {
+            let returned = ctx.returns.get(*id).and_then(|v| v.sites().cloned());
+            let builtin = match fn_.peel_ts() {
+                Expr::FieldAccess { obj, field } => {
+                    method_result_sites(transfer, obj, field, args, env, ctx)
+                }
+                _ => None,
+            };
+            return match (returned, builtin) {
+                (Some(a), Some(b)) => Some(a.join(&b)),
+                (a, b) => a.or(b),
+            };
+        }
+        // A `new` of a program class points where its construction body's
+        // returns do (#335).
+        Expr::New { id, .. } => return ctx.returns.get(*id).and_then(|v| v.sites().cloned()),
         other => return resolve_locs(other, env, ctx.heap),
     };
     ctx.heap.alloc_obj(id, members);
@@ -695,7 +1127,14 @@ fn spread_into(members: &mut Members, source: Option<&Sites>, heap: &Heap) {
     if let Some(others) = &copied.others {
         members.write_any(others);
     }
+    // A spread reads each member through its getter, and the copy holds what
+    // the read returned as a value (#321); an accessor itself is not copied.
+    let mut read: Vec<Symbol> = Vec::new();
     for (m, ev) in copied.named {
+        if let Some((_, name)) = accessor_of(&m) {
+            read.extend(name.map(str::to_string));
+            continue;
+        }
         // A member some object lacks was joined with `undefined`, its value
         // there; the spread then leaves the member before it in place.
         let lacks = objs.iter().any(|o| !o.named.contains_key(&m));
@@ -703,7 +1142,25 @@ fn spread_into(members: &mut Members, source: Option<&Sites>, heap: &Heap) {
             Some(before) if lacks => before.join(&ev),
             _ => ev,
         };
+        members.define(&m);
         members.named.insert(m, entry);
+    }
+    for name in read {
+        let (entries, open) = source.map_or((Vec::new(), true), |s| heap.members(s, Some(&name)));
+        let mut value = entries
+            .into_iter()
+            .cloned()
+            .reduce(|a, b| a.join(&b))
+            .unwrap_or_else(|| EnvVal::Val(StateValue::top()));
+        if open {
+            value = value.join(&EnvVal::Val(StateValue::top()));
+        }
+        let entry = match members.named.get(&name) {
+            Some(before) => before.join(&value),
+            None => value,
+        };
+        members.define(&name);
+        members.named.insert(name, entry);
     }
 }
 
@@ -720,6 +1177,8 @@ fn spread_into(members: &mut Members, source: Option<&Sites>, heap: &Heap) {
 ///   slot's current value (#168) — ⊤ for another component's slot, whose
 ///   value lives in its owner's fixpoint;
 /// - any other argument is stored as evaluated.
+///
+/// Returns each slot written, with the value it stored.
 fn exec_slot_write<T: Transfer>(
     transfer: &T,
     fn_: &Expr,
@@ -727,11 +1186,18 @@ fn exec_slot_write<T: Transfer>(
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
-) {
-    for (owner, label) in call_targets(transfer, fn_, env, ctx) {
-        write_one_slot(transfer, owner, label, args, env, ctx, depth);
-    }
+) -> Vec<(Slot, T::Domain)> {
+    call_targets(transfer, fn_, env, ctx)
+        .into_iter()
+        .map(|(owner, label)| {
+            let next = write_one_slot(transfer, owner, label, args, env, ctx, depth);
+            ((owner, label), next)
+        })
+        .collect()
 }
+
+/// A state slot: its owner and its label there.
+type Slot = (crate::ir::ComponentId, crate::ir::types::HookLabel);
 
 /// A setter an in-cycle callee calls — an array method, a `then`, a timer —
 /// is called there (#291), with what the callee passes it (`given`: an array
@@ -744,13 +1210,13 @@ fn apply_setter<T: Transfer>(
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
-) {
+) -> Vec<Slot> {
     if call_targets(transfer, arg, env, ctx).is_empty() {
-        return;
+        return Vec::new();
     }
     let supplied = [String::from("__supplied")];
     let mut scope = env.clone();
-    bind_params(&mut scope, &supplied, given);
+    bind_params(&mut scope, &supplied, Args::at_least(given));
     exec_slot_write(
         transfer,
         arg,
@@ -758,7 +1224,10 @@ fn apply_setter<T: Transfer>(
         &scope,
         ctx,
         depth,
-    );
+    )
+    .into_iter()
+    .map(|(slot, _)| slot)
+    .collect()
 }
 
 /// The slots a call through `fn_` may write, in `env`: those a name is bound
@@ -788,6 +1257,61 @@ pub(crate) fn call_targets<T: Transfer>(
     }
 }
 
+/// One evaluation of a call through `fn_`, for the call relation (ADR-047):
+/// the slots it wrote and what each stored, the bodies it ran (or stands
+/// for), whether the callee may be something neither names, and whether it
+/// surely is its one target — one setter (a label naming one, or a value
+/// that is surely that setter), or one body (a value that is surely a
+/// reference, every site of which is that closure). A ⊥ callee decides
+/// nothing.
+fn call_evaluation<T: Transfer>(
+    transfer: &T,
+    fn_: &Expr,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+    ran: Ran,
+    written: Vec<(Slot, T::Domain)>,
+) -> crate::engine::calls::Evaluation {
+    let labels = match fn_ {
+        Expr::Var(name) => env.setter_labels(name).map(|l| l.len()),
+        _ => None,
+    };
+    let value = transfer.eval_expr(fn_, env, ctx);
+    let unreached = labels.is_none() && value.is_bottom();
+    let sv = value.as_state_value();
+    let surely_setter = labels.is_some() || sv.as_ref().is_some_and(StateValue::surely_setter);
+    let one_setter = match labels {
+        Some(n) => n == 1,
+        None => surely_setter && sv.as_ref().is_some_and(|v| v.setters().len() == 1),
+    };
+    let one_body = written.is_empty()
+        && ran.bodies.len() == 1
+        && !ran.open
+        && sv.as_ref().is_some_and(StateValue::is_reference_only)
+        && runs_here(&ran, ctx);
+    crate::engine::calls::Evaluation {
+        setters: written.iter().map(|(slot, _)| *slot).collect(),
+        bodies: ran.bodies,
+        open: ran.open && !surely_setter,
+        unreached,
+        one_target: one_setter || one_body,
+        // A call an escaped closure makes runs at a time nothing knows.
+        escaped: ctx.escaped,
+        written: written
+            .into_iter()
+            .map(|(slot, v)| (slot, v.as_state_value().unwrap_or_else(StateValue::top)))
+            .collect(),
+        module: false,
+    }
+}
+
+/// The bodies `ran` lists surely run when called here: none is a function
+/// `useEffectEvent` hands back called in a render, where React throws
+/// instead ([`Heap::alloc_event`]).
+fn runs_here<D: AbstractDomain>(ran: &Ran, ctx: &AnalysisCtx<D>) -> bool {
+    !ctx.render || !ran.bodies.iter().any(|site| ctx.heap.is_event(*site))
+}
+
 /// [`exec_slot_write`] for one target slot.
 fn write_one_slot<T: Transfer>(
     transfer: &T,
@@ -797,7 +1321,7 @@ fn write_one_slot<T: Transfer>(
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
-) {
+) -> T::Domain {
     // The pass's store, joined with the slot's value at the start of the
     // pass: a re-run from ⊥ would otherwise hand the updater ⊥, and a ⊥
     // write vanishes in the join with any other write of the slot.
@@ -823,20 +1347,21 @@ fn write_one_slot<T: Transfer>(
         }
         Some(Reducer::Opaque) => T::Domain::top(),
         None => match args.first() {
+            // React calls an updater plainly, with the slot's value.
             Some(Expr::FnLit {
                 params, body_cfg, ..
             }) => {
                 let mut sub_env = env.clone();
-                if let Some(param) = params.first() {
-                    sub_env.extend(param.clone(), current);
-                }
+                let given = [EnvVal::Val(current)];
+                bind_params(&mut sub_env, params, Args::exactly(&given));
                 exec_body_depth(transfer, body_cfg, &sub_env, ctx, depth + 1)
             }
             Some(a) => transfer.eval_expr(a, env, ctx),
             None => T::Domain::top(),
         },
     };
-    ctx.write_slot(owner, label, next);
+    ctx.write_slot(owner, label, next.clone());
+    next
 }
 
 /// Per-expression effect walk: every call in `expr` runs its effects — the
@@ -852,10 +1377,11 @@ fn write_one_slot<T: Transfer>(
 /// `exec_body_depth`; otherwise `run_cfg → exec_full_stmt → exec_callbacks_depth`
 /// would double-execute. Nesting is handled naturally by that recursion.
 ///
-/// Returns the value of `expr` when it is a call of a local function whose
-/// every body this walk ran (B6): the join of what they returned, and where
-/// it points. `None` for any other expression, and for a call the walk could
-/// not resolve whole or skipped at the depth cap — the evaluator's ⊤ stands.
+/// Returns the value of `expr` when it is a call of a local function some
+/// body of which this walk ran (B6): the join of what they returned, and
+/// where it points, with ⊤ for the part of the callee it could not resolve
+/// (#328). `None` for any other expression, for a call no body of which ran,
+/// and for one skipped at the depth cap — the evaluator's value stands.
 fn exec_callbacks_depth<T: Transfer>(
     transfer: &T,
     expr: &Expr,
@@ -872,14 +1398,18 @@ fn exec_callbacks_depth<T: Transfer>(
             .insert(inter.component);
     }
     match expr {
-        Expr::Call { fn_, args } => {
+        Expr::Call { id, fn_, args } => {
             let class = classify_callee(fn_, env, ctx.query.dispatches());
             // Descend the receiver: handles chains like `a.then(x).then(y)`.
             exec_callbacks_depth(transfer, fn_, env, ctx, depth);
             let runs_args = class == TriggerClass::InCycle && !capped;
             let binds_args = class == TriggerClass::Unknown && !capped;
-            // What a local callee's parameters are bound to (#253).
+            // What a local callee's parameters are bound to (#253): the
+            // arguments up to the first spread, whose entries may take any
+            // position from there on — ⊤ past it, as past the last argument.
             let mut passed: Vec<EnvVal<T::Domain>> = Vec::new();
+            let mut tail: Option<EnvVal<T::Domain>> = None;
+            let positional = Expr::positional_args(args).len();
             for (i, arg) in args.iter().enumerate() {
                 if !matches!(arg, Expr::FnLit { .. }) {
                     exec_callbacks_depth(transfer, arg, env, ctx, depth);
@@ -892,18 +1422,69 @@ fn exec_callbacks_depth<T: Transfer>(
                 // also runs in the slot write below, of a subscription, of an
                 // unknown callee, or past the inlining budget — is handed to
                 // code the analysis does not run (#254). So is one a local
-                // function receives as a parameter below: the lowering drops
-                // a spread argument, so the position it binds is not sure.
-                if runs_args {
+                // function receives as a parameter below: that call is a
+                // write of what it may call, whatever it binds it to.
+                if runs_args && i < positional {
                     let given = callback_args(transfer, fn_, i, env, ctx);
-                    let returned = exec_fn_value(transfer, arg, &given, env, ctx, depth);
+                    let mut ran = Ran::default();
+                    // What the callee passes past those may be more.
+                    let returned = exec_fn_value(
+                        transfer,
+                        arg,
+                        Args::at_least(&given),
+                        env,
+                        ctx,
+                        depth,
+                        &mut ran,
+                    );
+                    // What it returns goes back to the callee: it escapes
+                    // there, at the call (ADR-047).
+                    if let Some(sites) = returned.as_ref().and_then(EnvVal::sites) {
+                        record_reach((*id, crate::engine::calls::CALLEE), Some(sites), &[], ctx);
+                    }
                     escape_returned(returned.as_ref(), ctx);
                     // A setter is run as a call of it (#291).
-                    apply_setter(transfer, arg, &given, env, ctx, depth);
+                    let applied = apply_setter(transfer, arg, &given, env, ctx, depth);
+                    // The callee runs what it is handed: surely its one body
+                    // when the value is surely that function, its one
+                    // setter when the value is surely that setter.
+                    let sure = ctx.calls.is_some() && !ran.objects && {
+                        let value = transfer.eval_expr(arg, env, ctx).as_state_value();
+                        let one_body = applied.is_empty()
+                            && ran.bodies.len() == 1
+                            && !ran.open
+                            && value.as_ref().is_some_and(StateValue::is_reference_only)
+                            && runs_here(&ran, ctx);
+                        let one_setter = applied.len() == 1
+                            && ran.bodies.is_empty()
+                            && value.as_ref().is_some_and(StateValue::surely_setter);
+                        one_body || one_setter
+                    };
+                    let escaped = ctx.escaped;
+                    ctx.record(|r| r.record_escape(*id, i, applied, [], ran.bodies, sure, escaped));
+                    mark_module(arg, (*id, i), ctx);
+                    // An object the callee is handed is no function it runs:
+                    // it may return what the object holds (`Array.from(hs)`)
+                    // or keep it, so it is handed to code the analysis does
+                    // not run (#254).
+                    if ran.objects {
+                        escape_at(transfer, arg, env, ctx, Some((*id, i)));
+                    }
                 } else {
-                    let sites = escape(transfer, arg, env, ctx);
-                    if binds_args {
+                    let sites = escape_at(transfer, arg, env, ctx, Some((*id, i)));
+                    if binds_args && i < positional {
                         passed.push(EnvVal::located(sites, transfer.eval_expr(arg, env, ctx)));
+                    } else if binds_args {
+                        // From a spread on, an argument or a spread source's
+                        // entry may sit at any position (#324).
+                        let value = match arg {
+                            Expr::Spread(source) => {
+                                let source = alloc_literal(transfer, source, env, ctx);
+                                entries_at(source.as_ref(), ctx)
+                            }
+                            _ => EnvVal::located(sites, transfer.eval_expr(arg, env, ctx)),
+                        };
+                        tail = Some(tail.map_or_else(|| value.clone(), |t| t.join(&value)));
                     }
                 }
             }
@@ -917,15 +1498,66 @@ fn exec_callbacks_depth<T: Transfer>(
             // callee is not run here: it escapes, and runs from the top of
             // the budget with the handlers (#254).
             let mut returned = None;
+            let mut ran = Ran::default();
             if class == TriggerClass::Unknown {
                 if capped {
+                    if ctx.calls.is_some() {
+                        // What the call stands for, resolved without a run.
+                        ran = Ran::listing();
+                        exec_fn_value(transfer, fn_, Args::unknown(), env, ctx, depth, &mut ran);
+                    }
                     escape(transfer, fn_, env, ctx);
                 } else {
-                    returned = exec_fn_value(transfer, fn_, &passed, env, ctx, depth);
+                    // A method call binds `this` to what its receiver
+                    // denotes (#338); any other call binds none.
+                    let receiver = match fn_.peel_ts() {
+                        Expr::FieldAccess { obj, .. } | Expr::IndexAccess { arr: obj, .. } => {
+                            let sites = alloc_literal(transfer, obj, env, ctx);
+                            Some(EnvVal::located(sites, transfer.eval_expr(obj, env, ctx)))
+                        }
+                        _ => None,
+                    };
+                    let args = match &tail {
+                        Some(tail) => Args::then_any(&passed, tail),
+                        None => Args::exactly(&passed),
+                    };
+                    let args = args.on(receiver.as_ref());
+                    returned = exec_fn_value(transfer, fn_, args, env, ctx, depth, &mut ran);
                 }
+                // What the call evaluates to wherever no `let` binds it: a
+                // member, an argument, a return (#333).
+                ctx.returns.record(*id, returned.as_ref());
+            } else {
+                // A builtin, a subscription, a setter: no body of the
+                // program, and `open` unless the callee is surely a setter.
+                ran.open = true;
+            }
+            // A builtin the value layer does not model is handed the call's
+            // receiver as well as its arguments (#330): it may return it, an
+            // entry of it or a function calling it (`h.bind(null)`), so what
+            // it holds escapes there ([`ReceiverUse`]).
+            if ran.open
+                && let Expr::FieldAccess { obj, field } = fn_.peel_ts()
+                && ReceiverUse::of(field) == ReceiverUse::Unmodelled
+            {
+                escape_at(
+                    transfer,
+                    obj,
+                    env,
+                    ctx,
+                    Some((*id, crate::engine::calls::CALLEE)),
+                );
             }
             // Arguments first, then the call itself.
-            exec_slot_write(transfer, fn_, args, env, ctx, depth);
+            let written = exec_slot_write(transfer, fn_, args, env, ctx, depth);
+            if ctx.calls.is_some() {
+                // Module code the analysis does not run may call what the
+                // module scope holds (#335).
+                let module = (ran.bodies.is_empty() || ran.open) && reads_module(fn_, ctx);
+                let mut eval = call_evaluation(transfer, fn_, env, ctx, ran, written);
+                eval.module = module;
+                ctx.record(|r| r.record_call(*id, eval));
+            }
             returned
         }
         Expr::CompApp { props, .. } => {
@@ -934,26 +1566,75 @@ fn exec_callbacks_depth<T: Transfer>(
             if !capped {
                 transfer.eval_expr(expr, env, ctx);
             }
+            // What each prop the child may invoke holds (ADR-047).
+            if let Expr::ObjectLit { id, fields, .. } = props.peel_ts() {
+                for (i, (name, val)) in fields.iter().enumerate() {
+                    if crate::lowering::hook_extractor::invoked_prop(false, name) {
+                        hand_at(transfer, val, env, ctx, (*id, i));
+                    }
+                }
+            }
             None
         }
         Expr::TSAnnotated(inner) => exec_callbacks_depth(transfer, inner, env, ctx, depth),
-        // `new X(…)` hands its arguments to a constructor the analysis does
-        // not run — an observer's callback, a promise executor (#254).
-        Expr::New { args, .. } => {
-            expr.for_each_child(&mut |c| {
-                exec_callbacks_depth(transfer, c, env, ctx, depth);
-            });
-            for arg in args {
-                escape(transfer, arg, env, ctx);
-            }
+        // A read through a getter is a call of its body (#321), run before
+        // any reader of the value, as a call is.
+        Expr::FieldAccess { obj, field } => {
+            exec_callbacks_depth(transfer, obj, env, ctx, depth);
+            run_accessors(transfer, obj, Key::Field(field), None, env, ctx, depth);
             None
+        }
+        Expr::IndexAccess { arr, idx } => {
+            exec_callbacks_depth(transfer, arr, env, ctx, depth);
+            exec_callbacks_depth(transfer, idx, env, ctx, depth);
+            run_accessors(transfer, arr, Key::Index(idx), None, env, ctx, depth);
+            None
+        }
+        // `new K(…)` of a class the program defines runs its construction
+        // body (#335) as a call of it, the object it builds bound: a new one
+        // at the `new`'s site, or for `super(…)` the instance `this` holds.
+        // What the call returns is what the `new` evaluates to.
+        Expr::New {
+            id,
+            fn_,
+            args,
+            ctor,
+            on_this,
+        } => {
+            let Some(body) = construction(fn_, ctor.as_deref(), env, ctx) else {
+                return exec_unseen_new(transfer, *id, args, *on_this, expr, env, ctx, depth);
+            };
+            let instance = match on_this {
+                true => env
+                    .lookup_env_val(THIS)
+                    .unwrap_or_else(|| EnvVal::Val(T::Domain::top())),
+                false => {
+                    ctx.heap.alloc_obj(*id, Members::default());
+                    let fresh =
+                        T::Domain::from_state_value(StateValue::reference(Stability::PerRender));
+                    EnvVal::located(Some(Sites::closed([*id])), fresh)
+                }
+            };
+            let mut scope = env.clone();
+            scope.bind_locs(NEW_INSTANCE.to_string(), instance.sites().cloned());
+            scope.extend(NEW_INSTANCE.to_string(), instance.as_val());
+            let call = Expr::Call {
+                id: *id,
+                fn_: Box::new(body),
+                args: args.clone(),
+            };
+            exec_callbacks_depth(transfer, &call, &scope, ctx, depth)
         }
         // A hook the fixpoint did not inline receives its arguments at its
         // call (#254).
         Expr::HookMarker(label, _) => {
             let query = ctx.query;
-            for arg in query.hook_args(*label) {
-                escape(transfer, arg, env, ctx);
+            for read in query.hook_reads(*label) {
+                run_member_reads(transfer, read, env, ctx, depth);
+            }
+            let site = ctx.component.hook_site(*label);
+            for (i, arg) in query.hook_args(*label).iter().enumerate() {
+                escape_at(transfer, arg, env, ctx, Some((site, i)));
             }
             None
         }
@@ -963,10 +1644,10 @@ fn exec_callbacks_depth<T: Transfer>(
             expr.for_each_child(&mut |c| {
                 exec_callbacks_depth(transfer, c, env, ctx, depth);
             });
-            if let Expr::ObjectLit { fields, .. } = props.peel_ts() {
-                for (name, val) in fields {
+            if let Expr::ObjectLit { id, fields, .. } = props.peel_ts() {
+                for (i, (name, val)) in fields.iter().enumerate() {
                     if crate::lowering::hook_extractor::invoked_prop(true, name) {
-                        escape(transfer, val, env, ctx);
+                        escape_at(transfer, val, env, ctx, Some((*id, i)));
                     }
                 }
             }
@@ -983,6 +1664,72 @@ fn exec_callbacks_depth<T: Transfer>(
     }
 }
 
+/// The construction body a `new` of `class` runs (#335), as a callee: the
+/// body the engine resolved for a class of the program's modules (`ctor`),
+/// or the [`CONSTRUCT_KEY`] member of a class value the heap places — a
+/// class written in a body, or inline. `None` for a class the analysis does
+/// not see.
+fn construction<D: AbstractDomain>(
+    class: &Expr,
+    ctor: Option<&Expr>,
+    env: &AbstractEnv<D>,
+    ctx: &AnalysisCtx<D>,
+) -> Option<Expr> {
+    if let Some(body) = ctor {
+        return Some(body.clone());
+    }
+    let defines = match class.peel_ts() {
+        Expr::ObjectLit { fields, .. } => fields.iter().any(|(k, _)| k == CONSTRUCT_KEY),
+        other => ctx.resolve_locs(other, env).is_some_and(|sites| {
+            sites.ids.iter().any(|id| {
+                matches!(ctx.heap.get(*id), Some(HeapValue::Obj(o)) if o.named.contains_key(CONSTRUCT_KEY))
+            })
+        }),
+    };
+    defines.then(|| Expr::FieldAccess {
+        obj: Box::new(class.clone()),
+        field: CONSTRUCT_KEY.to_string(),
+    })
+}
+
+/// `new X(…)` of a class the analysis does not see hands its arguments to a
+/// constructor it does not run — an observer's callback, a promise executor
+/// (#254). A `super(…)` of such a class hands it the instance as well
+/// (#335): the instance may hold any member that class puts there, and that
+/// code holds it. The `super` evaluates to the instance.
+#[allow(clippy::too_many_arguments)]
+fn exec_unseen_new<T: Transfer>(
+    transfer: &T,
+    id: ExprId,
+    args: &[Expr],
+    on_this: bool,
+    expr: &Expr,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+    depth: usize,
+) -> Option<EnvVal<T::Domain>> {
+    expr.for_each_child(&mut |c| {
+        exec_callbacks_depth(transfer, c, env, ctx, depth);
+    });
+    for (i, arg) in args.iter().enumerate() {
+        escape_at(transfer, arg, env, ctx, Some((id, i)));
+    }
+    if !on_this {
+        return None;
+    }
+    let this = env.lookup_env_val(THIS);
+    if let Some(sites) = this.as_ref().and_then(EnvVal::sites).cloned() {
+        for site in &sites.ids {
+            ctx.heap.write_after(*site, |obj| obj.open = true);
+        }
+        for (owner, label) in ctx.heap.escape(&sites) {
+            ctx.write_slot(owner, label, T::Domain::top());
+        }
+    }
+    ctx.returns.record(id, this.as_ref());
+    this
+}
+
 /// Code the analysis does not see receives the value of `expr` (#254): a
 /// callee it does not run, a hook it does not inline, React for an element's
 /// handler, an object it does not place, a child component it cannot resolve
@@ -996,8 +1743,66 @@ pub(crate) fn escape<T: Transfer>(
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
 ) -> Option<Sites> {
+    escape_at(transfer, expr, env, ctx, None)
+}
+
+/// A write of `rhs` into the module binding `name` (#335) — the binding
+/// itself, or a member of what it holds — when `name` denotes one: the
+/// binding's slot holds it, a store every render of every component reads,
+/// so it is recorded at the binding's anchor, where the program's relation
+/// joins every write of it ([`crate::engine::ModuleScope`]); and code the
+/// analysis does not see may read it there, so it escapes, as a value
+/// handed to that code does.
+fn hold_in_module<T: Transfer>(
+    transfer: &T,
+    name: &str,
+    rhs: &Expr,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+) {
+    let anchors = ctx.query.module_binding(name).to_vec();
+    for anchor in anchors {
+        escape_at(transfer, rhs, env, ctx, Some((anchor, 0)));
+    }
+}
+
+/// The name a value read through `expr` is read off: a name, or the root of
+/// a member chain.
+fn module_root(expr: &Expr) -> Option<&str> {
+    match expr.peel_ts() {
+        Expr::Var(v) => Some(v),
+        Expr::FieldAccess { obj, .. } => module_root(obj),
+        Expr::IndexAccess { arr, .. } => module_root(arr),
+        _ => None,
+    }
+}
+
+/// `expr` is read off a module binding (#335): it may be anything the
+/// module scope holds.
+fn reads_module<D: AbstractDomain>(expr: &Expr, ctx: &AnalysisCtx<D>) -> bool {
+    module_root(expr).is_some_and(|name| !ctx.query.module_binding(name).is_empty())
+}
+
+/// [`escape`], recording what the value reached at `at` — an anchor and a
+/// position of the call relation (ADR-047) — when the context records one.
+fn escape_at<T: Transfer>(
+    transfer: &T,
+    expr: &Expr,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+    at: Option<(ExprId, usize)>,
+) -> Option<Sites> {
+    // A spread argument hands over the entries of its operand, which
+    // escape with it.
+    if let Expr::Spread(inner) = expr {
+        return escape_at(transfer, inner, env, ctx, at);
+    }
     let sites = alloc_literal(transfer, expr, env, ctx);
     let mut setters = call_targets(transfer, expr, env, ctx);
+    if let Some(at) = at {
+        record_reach(at, sites.as_ref(), &setters, ctx);
+        mark_module(expr, at, ctx);
+    }
     if let Some(sites) = &sites {
         setters.extend(ctx.heap.escape(sites));
     }
@@ -1005,6 +1810,74 @@ pub(crate) fn escape<T: Transfer>(
         ctx.write_slot(owner, label, T::Domain::top());
     }
     sites
+}
+
+/// What a value handed to a child component as a prop it may invoke
+/// reaches — the child runs it in its own analysis — recorded at `at`
+/// without escaping or allocating anything (ADR-047): a function literal
+/// (allocated by the element's evaluation, before this), or a name, a
+/// member chain or a call read off the env, the heap and what the pass
+/// recorded the call returning (#333). Any other expression is left
+/// unrecorded: its evaluation may analyse an element.
+fn hand_at<T: Transfer>(
+    transfer: &T,
+    expr: &Expr,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+    at: (ExprId, usize),
+) {
+    if ctx.calls.is_none() {
+        return;
+    }
+    let (sites, setters) = match expr.peel_ts() {
+        Expr::FnLit { id, .. } => (Some(Sites::closed([*id])), Vec::new()),
+        e @ (Expr::Var(_)
+        | Expr::FieldAccess { .. }
+        | Expr::IndexAccess { .. }
+        | Expr::Call { .. }) => (
+            ctx.resolve_locs(e, env),
+            call_targets(transfer, e, env, ctx),
+        ),
+        _ => return,
+    };
+    record_reach(at, sites.as_ref(), &setters, ctx);
+    mark_module(expr, at, ctx);
+}
+
+/// The value `expr` handed at `at` is read off a module binding (#335): the
+/// relation says so there ([`crate::engine::Escapes::module`]).
+fn mark_module<D: AbstractDomain>(expr: &Expr, at: (ExprId, usize), ctx: &AnalysisCtx<D>) {
+    if reads_module(expr, ctx) {
+        ctx.record(|r| r.mark_module_escape(at.0, at.1));
+    }
+}
+
+/// Record at `at` the setters `setters` the value is, and everything `sites`
+/// reaches ([`Heap::reach_of`]), which it holds.
+fn record_reach<D: AbstractDomain>(
+    at: (ExprId, usize),
+    sites: Option<&Sites>,
+    setters: &[Slot],
+    ctx: &AnalysisCtx<D>,
+) {
+    if ctx.calls.is_none() {
+        return;
+    }
+    let (held, fns) = sites.map(|s| ctx.heap.reach_of(s)).unwrap_or_default();
+    ctx.record(|r| {
+        for (site, body) in &fns {
+            r.record_body(*site, body);
+        }
+        r.record_escape(
+            at.0,
+            at.1,
+            setters.iter().copied(),
+            held,
+            fns.iter().map(|(s, _)| *s),
+            false,
+            ctx.escaped,
+        );
+    });
 }
 
 /// What a body returns to code the analysis does not see escapes with it.
@@ -1024,7 +1897,7 @@ pub(crate) fn seed_ref<T: Transfer>(
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
 ) {
-    let id = ctx.component.ref_site(label);
+    let id = ctx.component.hook_site(label);
     let sites = alloc_literal(transfer, init, env, ctx);
     // What a ref holds escapes, as a write into `current` does.
     if let Some(sites) = &sites {
@@ -1045,7 +1918,27 @@ pub(crate) fn seed_ref<T: Transfer>(
 /// — at no time the analysis knows, from `env`, every parameter ⊤ — and what
 /// each returns goes back to that code, so it escapes in turn: the worklist
 /// runs until no new closure escapes.
+///
+/// A closure of another component runs in its owner when it can
+/// ([`runs_in_owner`]); the closures handed back to this component escape
+/// here, at each round, since a child analysed by a run of this worklist
+/// may hand one back.
+///
+/// Unknown code may make these calls at any time, a render included: a call
+/// only such runs evaluate is never `sure` in the call relation
+/// ([`AnalysisCtx::escaped`]).
 pub(crate) fn run_escaped<T: Transfer>(
+    transfer: &T,
+    bodies: &[(&[Symbol], &CFG)],
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+) {
+    let outer = std::mem::replace(&mut ctx.escaped, true);
+    run_escaped_rounds(transfer, bodies, env, ctx);
+    ctx.escaped = outer;
+}
+
+fn run_escaped_rounds<T: Transfer>(
     transfer: &T,
     bodies: &[(&[Symbol], &CFG)],
     env: &AbstractEnv<T::Domain>,
@@ -1053,7 +1946,7 @@ pub(crate) fn run_escaped<T: Transfer>(
 ) {
     for (params, body) in bodies {
         let mut sub_env = env.clone();
-        bind_params(&mut sub_env, params, &[]);
+        bind_params(&mut sub_env, params, Args::unknown());
         let run = run_cfg(transfer, body, sub_env, ctx, 1);
         if let Some(sites) = returned_sites(transfer, body, &run.exits, ctx) {
             ctx.heap.escape(&sites);
@@ -1061,62 +1954,278 @@ pub(crate) fn run_escaped<T: Transfer>(
     }
     let mut ran = HashSet::new();
     loop {
+        if let Some(inter) = ctx.inter {
+            let handed: Vec<ExprId> = inter
+                .handed
+                .borrow()
+                .get(&ctx.component)
+                .map(|ids| ids.iter().copied().collect())
+                .unwrap_or_default();
+            ctx.heap.escape(&Sites::closed(handed));
+        }
         let pending: Vec<_> = ctx
             .heap
             .escaped_fns()
             .into_iter()
-            .filter(|id| ran.insert(*id))
+            .filter(|id| ran.insert(*id) && !runs_in_owner(*id, ctx))
             .collect();
         if pending.is_empty() {
             return;
         }
         for id in pending {
-            let returned = exec_heap_fns(transfer, Sites::closed([id]), &[], env, ctx, 0);
+            if crate::profile::on() {
+                let owned = matches!(ctx.heap.get(id), Some(HeapValue::Fn { owner, .. }) if *owner == ctx.component);
+                crate::profile::escaped_run(owned);
+            }
+            let mut ran = Ran::default();
+            let returned = exec_heap_fns(
+                transfer,
+                Sites::closed([id]),
+                Args::unknown(),
+                env,
+                ctx,
+                0,
+                &mut ran,
+            );
             escape_returned(returned.as_ref(), ctx);
         }
     }
 }
 
+/// Whether the escaped closure at `id`, owned by another component P, runs
+/// in P instead of here, in C. It does when the run may touch nothing of C
+/// ([`Heap::may_touch`]) and P runs it: P is on the analysis stack (not a
+/// probe's), and the closure is handed back to P, which escapes it in its own
+/// heap at its next `run_escaped`, in the same iteration, after this child's
+/// analysis returns; or P already ran it, handed back earlier. Anything else
+/// runs here, as it always did: an owner off the stack that never ran the
+/// closure (it escapes only under a later, larger join of C's input, or P is
+/// a probe's caller) is not trusted to.
+///
+/// Soundness. Write f for the closure.
+/// - What f does to C: nothing, by the walk. A name f did not capture is not
+///   in its scope ([`closure_env`]), so C's bindings are not either.
+/// - What f does to P and everything else it reaches: P's run is above the
+///   run here. Same body, every parameter ⊤ in both, its captures joined
+///   with P's live values over P's converged stores where the run here had
+///   the copy C's input carried, which P's heap built. Its writes land in
+///   P's store, P's objects and the shared store, where P's own writes land;
+///   a write into an object C also reads reaches C in its next input, as P's
+///   heap grew and P iterates.
+/// - Every analysis of P after the hand-back runs f: the table only grows
+///   and `run_escaped` escapes all of it. f enters C's input only through an
+///   element P evaluates, in an analysis of P, on the stack then; so a P off
+///   the stack (a finished root, or a child of a third component that
+///   finished) has either run f since, or f escaped in none of P's analyses
+///   and runs here.
+fn runs_in_owner<D: AbstractDomain>(id: ExprId, ctx: &AnalysisCtx<D>) -> bool {
+    let Some(inter) = ctx.inter else {
+        return false;
+    };
+    let Some(HeapValue::Fn { owner, .. }) = ctx.heap.get(id) else {
+        return false;
+    };
+    if *owner == ctx.component || ctx.heap.may_touch(id, ctx.component) {
+        return false;
+    }
+    let mut handed = inter.handed.borrow_mut();
+    if handed.get(owner).is_some_and(|ids| ids.contains(&id)) {
+        return true;
+    }
+    if inter.probe || !inter.call_stack.borrow().contains(owner) {
+        return false;
+    }
+    handed.entry(*owner).or_default().insert(id);
+    true
+}
+
+/// What a call hands the body it runs (#324): the arguments at known
+/// positions, and whether more may follow them — after a spread, or from a
+/// caller the analysis does not see (an event, an escaped closure's run).
+#[derive(Debug)]
+pub(crate) struct Args<'a, D> {
+    pub known: &'a [EnvVal<D>],
+    pub more: bool,
+    /// What the arguments past the known ones may be, at positions nothing
+    /// fixes: from a spread on, each later argument and every entry of each
+    /// spread source.
+    pub tail: Option<&'a EnvVal<D>>,
+    /// What the call binds `this` to (#338): the receiver of a method call
+    /// (`r.m(…)`, an accessor's read or write of `r`), `None` for any other
+    /// call, whose `this` is ⊤.
+    pub this: Option<&'a EnvVal<D>>,
+}
+
+impl<D> Clone for Args<'_, D> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<D> Copy for Args<'_, D> {}
+
+impl<'a, D> Args<'a, D> {
+    /// These arguments and no other.
+    pub fn exactly(known: &'a [EnvVal<D>]) -> Self {
+        Args {
+            known,
+            more: false,
+            tail: None,
+            this: None,
+        }
+    }
+
+    /// These arguments, then any number of unknown ones.
+    pub fn at_least(known: &'a [EnvVal<D>]) -> Self {
+        Args {
+            known,
+            more: true,
+            tail: None,
+            this: None,
+        }
+    }
+
+    /// These arguments, then any number of `tail`'s.
+    pub fn then_any(known: &'a [EnvVal<D>], tail: &'a EnvVal<D>) -> Self {
+        Args {
+            known,
+            more: true,
+            tail: Some(tail),
+            this: None,
+        }
+    }
+
+    /// Any arguments.
+    pub fn unknown() -> Self {
+        Args::at_least(&[])
+    }
+
+    /// These arguments, `this` bound to `receiver` (#338).
+    pub fn on(self, receiver: Option<&'a EnvVal<D>>) -> Self {
+        Args {
+            this: receiver,
+            ..self
+        }
+    }
+}
+
+/// The name the argument at `index` of the running call is bound to, which no
+/// source spells: what [`Expr::Arguments`] reads.
+fn argument_name(index: usize) -> Symbol {
+    format!("@{index}")
+}
+
+/// Bound when a call handed its arguments to the running body; unbound, the
+/// body ran with arguments the analysis does not know.
+const ARGUMENTS_BOUND: &str = "@args";
+/// Bound when more arguments than the bound ones may follow.
+const ARGUMENTS_MORE: &str = "@more";
+/// Bound to what those may be, when the call says ([`Args::tail`]).
+const ARGUMENTS_TAIL: &str = "@tail";
+
 /// Bind `params` in `env` to what a call passes them (#253): the argument at
 /// each position — its value and the sites it points to, so a closure passed
 /// in is the one a call of the parameter runs — and ⊤ past the arguments
 /// given. A parameter shadows a name of the enclosing scope, sites included.
+/// The arguments themselves are bound too, under names no source spells,
+/// for [`Expr::Arguments`] (a rest parameter, `arguments`, #324): each one,
+/// whether more may follow, and the first position past them unbound, so
+/// what an enclosing call bound there is not read as this call's. So is the
+/// receiver ([`RECEIVER`], #338): bound when the call has one, unbound —
+/// ⊤ — otherwise, never an enclosing call's or the creation's.
 pub(crate) fn bind_params<D: AbstractDomain>(
     env: &mut AbstractEnv<D>,
     params: &[Symbol],
-    args: &[EnvVal<D>],
+    args: Args<'_, D>,
 ) {
+    // A parameter past the known arguments takes what an argument from the
+    // spread on may be, or `undefined` past the last one: `super(...args)`
+    // hands the parent the setter it was given (#335). Without a tail, any
+    // value.
+    let past = args.tail.map(|t| {
+        (
+            t.sites().cloned(),
+            t.as_val()
+                .join(&D::from_state_value(StateValue::undefined())),
+        )
+    });
     for (i, p) in params.iter().enumerate() {
-        let (sites, val) = match args.get(i) {
-            Some(arg) => (arg.sites().cloned(), arg.as_val()),
-            None => (None, D::top()),
+        let (sites, val) = match (args.known.get(i), &past) {
+            (Some(arg), _) => (arg.sites().cloned(), arg.as_val()),
+            (None, Some((sites, val))) => (sites.clone(), val.clone()),
+            (None, None) => (None, D::top()),
         };
         env.bind_locs(p.clone(), sites);
         env.extend(p.clone(), val);
     }
+    for (i, arg) in args.known.iter().enumerate() {
+        env.bind_locs(argument_name(i), arg.sites().cloned());
+        env.extend(argument_name(i), arg.as_val());
+    }
+    env.forget(&argument_name(args.known.len()));
+    env.extend(ARGUMENTS_BOUND.to_string(), D::top());
+    match args.more {
+        true => env.extend(ARGUMENTS_MORE.to_string(), D::top()),
+        false => env.forget(ARGUMENTS_MORE),
+    }
+    match args.tail {
+        Some(tail) => {
+            env.bind_locs(ARGUMENTS_TAIL.to_string(), tail.sites().cloned());
+            env.extend(ARGUMENTS_TAIL.to_string(), tail.as_val());
+        }
+        None => env.forget(ARGUMENTS_TAIL),
+    }
+    match args.this {
+        Some(this) => {
+            env.bind_locs(RECEIVER.to_string(), this.sites().cloned());
+            env.extend(RECEIVER.to_string(), this.as_val());
+        }
+        None => env.forget(RECEIVER),
+    }
 }
 
-/// What an in-cycle callee passes its function argument at `index` (#253).
-/// An array method's callback receives the receiver's entries: the join of
-/// the entries of every array the heap places the receiver at, ⊤ joined in
-/// where it may be anything else — at position 0, at position 1 for
-/// `reduce`'s accumulator-first callback, at both for `sort`'s comparator.
-/// Every other position, and every other callee's callback, gets ⊤.
-pub(crate) fn callback_args<T: Transfer>(
+/// The members of the array an [`Expr::Arguments`] allocates in `env`: the
+/// arguments [`bind_params`] bound from position `from` on, at their
+/// positions; then, when more may follow or no call bound any, members
+/// nothing here says — the length unknown, any further entry anything —
+/// and what the call said they may be at positions nothing fixes.
+fn arguments_members<T: Transfer>(
     transfer: &T,
-    callee: &Expr,
-    index: usize,
+    from: usize,
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
-) -> Vec<EnvVal<T::Domain>> {
-    let Expr::FieldAccess { obj, field } = callee.peel_ts() else {
-        return Vec::new();
-    };
-    if index != 0 || !crate::engine::setters::SYNC_HOF_METHODS.contains(&field.as_str()) {
-        return Vec::new();
+) -> Members {
+    if !env.contains(ARGUMENTS_BOUND) {
+        return Members::at_least(HashMap::new());
     }
+    let count = (0..)
+        .take_while(|i| env.contains(&argument_name(*i)))
+        .count();
+    let named: HashMap<Symbol, EnvVal<StateValue>> = (from..count)
+        .enumerate()
+        .map(|(k, i)| {
+            let entry = member_entry(transfer, &Expr::Var(argument_name(i)), env, ctx);
+            (k.to_string(), entry)
+        })
+        .collect();
+    let mut members = match env.contains(ARGUMENTS_MORE) {
+        true => Members::at_least(named),
+        false => Members::exactly(named),
+    };
+    if env.contains(ARGUMENTS_TAIL) {
+        let tail = Expr::Var(ARGUMENTS_TAIL.to_string());
+        members.hold_unplaced(&member_entry(transfer, &tail, env, ctx));
+    }
+    members
+}
+
+/// What an entry of an iterable at `sites` may be: the join of the entries of
+/// every array the heap places it at, ⊤ joined in where it may be anything
+/// else; ⊥ when it has none — a callback over it never runs, a spread of it
+/// hands nothing.
+fn entries_at<D: AbstractDomain>(sites: Option<&Sites>, ctx: &AnalysisCtx<D>) -> EnvVal<D> {
     let top = EnvVal::Val(StateValue::top());
-    let entry = match alloc_literal(transfer, obj, env, ctx) {
+    let entry = match sites {
         Some(sites) => {
             let mut ids: Vec<_> = sites.ids.iter().copied().collect();
             ids.sort();
@@ -1133,21 +2242,111 @@ pub(crate) fn callback_args<T: Transfer>(
                     entry = Some(entry.map_or_else(|| m.clone(), |e| e.join(&m)));
                 }
             }
-            // No entry: the callback never runs, and its parameter holds
-            // nothing.
             entry.unwrap_or_else(|| EnvVal::Val(StateValue::bottom()))
         }
         None => top,
     };
-    let entry = EnvVal::located(
-        entry.sites().cloned(),
-        T::Domain::from_state_value(entry.as_val()),
-    );
+    EnvVal::located(entry.sites().cloned(), D::from_state_value(entry.as_val()))
+}
+
+/// What a builtin method `recv.m(…)` does with its receiver, as the value
+/// layer reads it (#330). A builtin is code the analysis does not run: the
+/// receiver escapes to it unless the method's use is one this table reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReceiverUse {
+    /// The result holds nothing of the receiver: a primitive, the callback
+    /// returns (which escape at the call), `undefined`. The callbacks it runs
+    /// get the receiver's entries ([`callback_args`]).
+    Nothing,
+    /// The result is the receiver itself: an in-place method.
+    Itself,
+    /// The result is one of the receiver's entries, or `undefined`.
+    Entry,
+    /// A builtin the value layer does not model: it may return the receiver,
+    /// some of its entries or a function calling it, so the receiver escapes.
+    Unmodelled,
+    /// No builtin: a method of code the analysis does not see (a prop, a
+    /// library object), handed its arguments only. Not its receiver, though
+    /// that is its `this` (#340).
+    Unseen,
+}
+
+impl ReceiverUse {
+    pub(crate) fn of(method: &str) -> Self {
+        match method {
+            "forEach" | "map" | "flatMap" | "some" | "every" | "findIndex" | "findLastIndex"
+            | "indexOf" | "lastIndexOf" | "includes" | "push" | "unshift" | "join" => {
+                ReceiverUse::Nothing
+            }
+            "sort" | "reverse" | "fill" | "copyWithin" => ReceiverUse::Itself,
+            "at" | "find" | "findLast" | "pop" | "shift" | "get" => ReceiverUse::Entry,
+            "concat" | "entries" | "filter" | "flat" | "keys" | "reduce" | "reduceRight"
+            | "slice" | "splice" | "toReversed" | "toSorted" | "toSpliced" | "values" | "with"
+            | "bind" | "call" | "apply" | "then" | "catch" | "finally" => ReceiverUse::Unmodelled,
+            _ => ReceiverUse::Unseen,
+        }
+    }
+}
+
+/// The sites the result of `recv.method(args…)` points to when
+/// [`ReceiverUse`] reads it: the receiver's, or its entries' as
+/// [`callback_args`] reads them.
+fn method_result_sites<T: Transfer>(
+    transfer: &T,
+    obj: &Expr,
+    method: &str,
+    args: &[Expr],
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+) -> Option<Sites> {
+    match ReceiverUse::of(method) {
+        // Rearranged or filled in place: any entry, or an argument, may sit
+        // at any position — a literal receiver too, which only this
+        // allocation places.
+        ReceiverUse::Itself => {
+            let sites = alloc_literal(transfer, obj, env, ctx)?;
+            havoc_at(transfer, sites.clone(), obj, args, env, ctx);
+            Some(sites)
+        }
+        // An unplaced receiver has no entry the heap places either: what
+        // it holds escaped where it was handed over.
+        ReceiverUse::Entry => {
+            let receiver = alloc_literal(transfer, obj, env, ctx)?;
+            entries_at(Some(&receiver), ctx).sites().cloned()
+        }
+        ReceiverUse::Nothing | ReceiverUse::Unmodelled | ReceiverUse::Unseen => None,
+    }
+}
+
+/// What an in-cycle callee passes its function argument at `index` (#253).
+/// An array method's callback receives the receiver's entries: the join of
+/// the entries of every array the heap places the receiver at, ⊤ joined in
+/// where it may be anything else — at position 0, at position 1 for
+/// `reduce`'s accumulator-first callback, at both for `sort`'s comparator —
+/// and the receiver itself after the index. Every other position, and every
+/// other callee's callback, gets ⊤.
+pub(crate) fn callback_args<T: Transfer>(
+    transfer: &T,
+    callee: &Expr,
+    index: usize,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+) -> Vec<EnvVal<T::Domain>> {
+    let Expr::FieldAccess { obj, field } = callee.peel_ts() else {
+        return Vec::new();
+    };
+    if index != 0 || !crate::engine::setters::SYNC_HOF_METHODS.contains(&field.as_str()) {
+        return Vec::new();
+    }
+    let receiver = alloc_literal(transfer, obj, env, ctx);
+    // The array itself, after the index.
+    let array = EnvVal::located(receiver.clone(), transfer.eval_expr(obj, env, ctx));
+    let entry = entries_at(receiver.as_ref(), ctx);
     let any = EnvVal::Val(T::Domain::top());
     match field.as_str() {
-        "reduce" | "reduceRight" => vec![any, entry],
+        "reduce" | "reduceRight" => vec![any.clone(), entry, any, array],
         "sort" => vec![entry.clone(), entry],
-        _ => vec![entry],
+        _ => vec![entry, any, array],
     }
 }
 
@@ -1157,55 +2356,112 @@ pub(crate) fn callback_args<T: Transfer>(
 /// ([`exec_heap_fns`]), a `useCallback` name through its hook body.
 /// Parameters are bound to `args` ([`bind_params`]). Also how an effect's
 /// returned cleanup runs, which React calls (#171). Returns what the call
-/// returns, with the allocation sites its returns place (#46); `None` when no
-/// body ran whole.
+/// returns, with the allocation sites its returns place (#46), ⊤ for the
+/// part of the callee no body stands for (#328); `None` when no body ran.
 pub(crate) fn exec_fn_value<T: Transfer>(
     transfer: &T,
     callee: &Expr,
-    args: &[EnvVal<T::Domain>],
+    args: Args<'_, T::Domain>,
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
+    ran: &mut Ran,
 ) -> Option<EnvVal<T::Domain>> {
     match callee.peel_ts() {
         Expr::FnLit {
-            params, body_cfg, ..
+            id,
+            params,
+            body_cfg,
         } => {
+            ran.body(*id, body_cfg, ctx);
+            if ran.listing {
+                return None;
+            }
             let mut sub_env = env.clone();
             bind_params(&mut sub_env, params, args);
-            let run = run_cfg(transfer, body_cfg, sub_env, ctx, depth + 1);
+            let run = run_body(transfer, body_cfg, sub_env, ctx, depth + 1);
             let sites = returned_sites(transfer, body_cfg, &run.exits, ctx);
             Some(run.ret)
                 .filter(|v| !v.is_bottom())
                 .map(|v| EnvVal::located(sites, v))
         }
+        // Placed as any value is: a name, a member chain, a call the pass
+        // ran (#333), a literal (`[h][0]()`).
         other => {
-            if let Some(sites) = resolve_locs(other, env, ctx.heap) {
-                return exec_heap_fns(transfer, sites, args, env, ctx, depth);
+            if let Some(sites) = alloc_literal(transfer, other, env, ctx) {
+                return exec_heap_fns(transfer, sites, args, env, ctx, depth, ran);
             }
             // useCallback binding: the body lives in the hook entry, not the
             // heap (the rewrite to `CallbackVal` moved it out of the
             // expression tree). Params stay unbound → env-miss ⊤, captures
-            // resolve in the live env. A name two paths bound to two
+            // resolve in the live env; the arguments are bound for a rest
+            // parameter and `arguments` (#324). A name two paths bound to two
             // callbacks runs either: each runs, and the call returns the
-            // join when every body is in reach.
+            // join, ⊤ when a body is out of reach (#328).
             if let Expr::Var(name) = other
                 && let Some(labels) = env.callback_labels(name).cloned()
             {
-                let mut returned = Some(T::Domain::bottom());
+                let mut env = env.clone();
+                bind_params(&mut env, &[], args);
+                let env = &env;
+                let mut returned: Option<T::Domain> = None;
+                let mut open = false;
                 for label in labels {
                     match ctx.query.callback_body(label) {
                         Some(body_cfg) => {
+                            ran.body(ctx.component.hook_site(label), &body_cfg, ctx);
+                            if ran.listing {
+                                continue;
+                            }
                             let ret = exec_body_depth(transfer, &body_cfg, env, ctx, depth + 1);
-                            returned = returned.map(|r| r.join(&ret));
+                            returned = Some(returned.map_or(ret.clone(), |r| r.join(&ret)));
                         }
-                        None => returned = None,
+                        None => open = true,
                     }
                 }
-                return returned.filter(|v| !v.is_bottom()).map(EnvVal::Val);
+                ran.open |= open;
+                return returned
+                    .map(|r| if open { T::Domain::top() } else { r })
+                    .filter(|v| !v.is_bottom())
+                    .map(EnvVal::Val);
             }
+            // No site and no body: nothing of the program the heap places.
+            // (An object or array literal is placed above, an object which
+            // no call runs: `Array.from([setN], f)`.)
+            ran.open = true;
             None
         }
+    }
+}
+
+/// What a call of a function value ran ([`exec_fn_value`]), for the call
+/// relation (ADR-047): the bodies, by allocation site, and whether the value
+/// may be something no body stands for — unplaced, open sites, a site that
+/// is no closure. A *listing* only resolves the value, running nothing: the
+/// bodies a callee stands for past the inlining budget, where it escapes
+/// instead.
+#[derive(Debug, Default)]
+pub(crate) struct Ran {
+    pub bodies: BTreeSet<ExprId>,
+    pub open: bool,
+    /// The value may be an object, which no call runs.
+    pub objects: bool,
+    pub listing: bool,
+}
+
+impl Ran {
+    /// What [`exec_fn_value`] would run, resolved without running it.
+    pub fn listing() -> Self {
+        Ran {
+            listing: true,
+            ..Ran::default()
+        }
+    }
+
+    /// The body at `site` runs (or would).
+    fn body<D: AbstractDomain>(&mut self, site: ExprId, body: &Arc<CFG>, ctx: &AnalysisCtx<D>) {
+        self.bodies.insert(site);
+        ctx.record(|r| r.record_body(site, body));
     }
 }
 
@@ -1213,21 +2469,27 @@ pub(crate) fn exec_fn_value<T: Transfer>(
 /// (callbacks: `setTimeout(cb)`) and B6 (direct calls: `load()`,
 /// `api.tick()`).
 ///
-/// Returns the join of what the bodies returned when every target was a
-/// body that ran, with the allocation sites those returns place (#46):
-/// locations that include anything else, or open ones that may be something
-/// no site places (#240), answer `None`; so does a body no run returns from.
+/// Returns the join of what the bodies that ran returned, with the
+/// allocation sites those returns place (#46), and of what the rest of the
+/// callee may return (#328): where the locations include something that is
+/// no closure, or are open — may be something no site places (#240) — that
+/// part returns anything, ⊤ and open sites. Never less because a part is
+/// unknown: a closure a body that ran returns is one the call's value
+/// holds, so a later call of it runs it. `None` when no body ran, or none
+/// returns.
 fn exec_heap_fns<T: Transfer>(
     transfer: &T,
     sites: Sites,
-    args: &[EnvVal<T::Domain>],
+    args: Args<'_, T::Domain>,
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
+    ran: &mut Ran,
 ) -> Option<EnvVal<T::Domain>> {
     let mut ids: Vec<_> = sites.ids.into_iter().collect();
     ids.sort();
-    let mut returned = (!sites.open).then(T::Domain::bottom);
+    let mut open = sites.open;
+    let mut returned = T::Domain::bottom();
     // `None` until a body is run, as in [`returned_sites`].
     let mut placed: Option<Option<Sites>> = None;
     for id in ids {
@@ -1236,28 +2498,51 @@ fn exec_heap_fns<T: Transfer>(
             .get(id)
             .and_then(|closure| closure_env(closure, env, ctx.component))
         {
+            ran.body(id, &body_cfg, ctx);
+            if ran.listing {
+                continue;
+            }
             bind_params(&mut sub_env, &params, args);
-            let run = run_cfg(transfer, &body_cfg, sub_env, ctx, depth + 1);
+            let run = run_body(transfer, &body_cfg, sub_env, ctx, depth + 1);
             let sites = returned_sites(transfer, &body_cfg, &run.exits, ctx);
             placed = Some(match placed {
                 None => sites,
                 Some(acc) => Sites::join_opt(acc.as_ref(), sites.as_ref()),
             });
-            returned = returned.map(|acc| acc.join(&run.ret));
+            returned = returned.join(&run.ret);
         } else {
-            returned = None;
+            open = true;
+            ran.objects |= matches!(ctx.heap.get(id), Some(HeapValue::Obj(_)));
         }
     }
-    returned
+    ran.open |= open;
+    let placed = placed?;
+    if open {
+        return Some(EnvVal::located(placed.map(Sites::opened), T::Domain::top()));
+    }
+    Some(returned)
         .filter(|v| !v.is_bottom())
-        .map(|v| EnvVal::located(placed.flatten(), v))
+        .map(|v| EnvVal::located(placed, v))
 }
 
 /// The parameters and body of `closure`, a heap `Fn`, and the env its body
 /// runs in when called from `env` in `component`, parameters not yet bound:
-/// `env` with each name the closure captured bound to what it captured — its
-/// value, its sites, its slot certificate. `None` when `closure` is no
-/// function.
+/// each name the closure captured bound to what it captured — its value, its
+/// sites, its slot certificate. `None` when `closure` is no function.
+///
+/// The scope is the closure's own (#326). Every free name of the body
+/// (nested functions' too) is a capture. The caller's env is the rest of the
+/// scope only for a closure of the calling component, whose every body is
+/// lexically inside the component's function: it holds the live bindings
+/// (#215) a closure called from this body reads, through its own captures,
+/// at the call, and its `useCallback` labels name this component's
+/// callbacks. A closure of another component starts from its captures
+/// alone: the caller's labels, mapped to the *calling* component, would
+/// resolve a parent's `setK` to a child's `setK`. What tells the two apart
+/// is the body's owner, not a name lookup. Either way a captured name is a
+/// new binding, no setter by name: its value carries the setter with its
+/// owner, where a label — read before the value — would let a same-named
+/// binding of the caller replace it.
 pub(crate) fn closure_env<D: AbstractDomain>(
     closure: &HeapValue,
     env: &AbstractEnv<D>,
@@ -1270,6 +2555,7 @@ pub(crate) fn closure_env<D: AbstractDomain>(
         captured_locs,
         owner,
         captured_slots,
+        ..
     } = closure
     else {
         return None;
@@ -1283,7 +2569,10 @@ pub(crate) fn closure_env<D: AbstractDomain>(
     } else {
         HashSet::new()
     };
-    let mut sub_env = env.clone();
+    let mut sub_env = match *owner == component {
+        true => env.clone(),
+        false => AbstractEnv::new(),
+    };
     for (var, val) in captured {
         let mut val = D::from_state_value(val.clone());
         let mut sites = captured_locs.get(var).cloned();
@@ -1294,6 +2583,13 @@ pub(crate) fn closure_env<D: AbstractDomain>(
         }
         sub_env.bind_locs(var.clone(), sites);
         sub_env.extend(var.clone(), val);
+        // The binding the body reads at the call is the caller's: its
+        // `useCallback` labels are that binding's (#327).
+        if live.contains(var)
+            && let Some(labels) = env.callback_labels(var)
+        {
+            sub_env.bind_callbacks(var.clone(), labels.clone());
+        }
     }
     // The creation-time certificates, not the call site's: the body's `a` is
     // the one it closed over — and, for a name the call also reads, only

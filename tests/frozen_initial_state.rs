@@ -459,7 +459,9 @@ fn key_built_from_the_seed_downgrades_to_info() {
 #[test]
 fn key_reading_less_than_the_seed_still_fires() {
     // `key={label.id}` moves only with one field; the seed is the whole
-    // `label`, so a rename keeps the instance and freezes `text`.
+    // `label`, so a rename keeps the instance and freezes `text`. Nothing
+    // proves the write keeps `id`, though: a write that moves it remounts the
+    // row, which then reads the new label, so the freeze is a Warning (#313).
     let d = diags_for(
         r#"
         import { useState } from "react";
@@ -475,7 +477,7 @@ fn key_reading_less_than_the_seed_still_fires() {
         "Row",
     );
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
-    assert_eq!(d[0].severity(), Severity::Error);
+    assert_eq!(d[0].severity(), Severity::Warning);
 }
 
 #[test]
@@ -533,9 +535,11 @@ fn writer_coupled_mount_caps_proven_at_warning() {
 }
 
 #[test]
-fn a_feeder_written_without_the_guard_stays_an_error() {
+fn a_feeder_written_without_the_guard_is_still_reported() {
     // `setLink` also fires on its own (`onPick`), a commit where a mounted
-    // `EditLink` really does see `link` move.
+    // `EditLink` really does see `link` move. Whether an instance is mounted
+    // when a feeder write runs is a question of the guard's value, which no
+    // proof here reads: only an unguarded site is one (#313), so a Warning.
     let d = diags_for(
         r#"
         import { useState } from "react";
@@ -554,7 +558,7 @@ fn a_feeder_written_without_the_guard_stays_an_error() {
         "EditLink",
     );
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
-    assert_eq!(d[0].severity(), Severity::Error);
+    assert_eq!(d[0].severity(), Severity::Warning);
 }
 
 #[test]
@@ -725,11 +729,10 @@ fn a_guard_does_not_read_the_element_it_guards() {
         "Row",
     );
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
-    assert_eq!(
-        d[0].severity(),
-        Severity::Error,
-        "a guard unrelated to the seed must not downgrade: {d:?}"
-    );
+    // The guard is not the seed's (no `Reseeds` advice), but `enabled` may
+    // be false whenever the label moves, and nothing proves an instance is
+    // mounted then: a Warning (#313).
+    assert_eq!(d[0].severity(), Severity::Warning, "{d:?}");
 }
 
 #[test]
@@ -1198,4 +1201,81 @@ fn a_defaulted_prop_fed_by_a_moving_parent_state_still_errors() {
     );
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
     assert_eq!(d[0].severity(), Severity::Error, "{d:?}");
+}
+
+/// `Child` under a parent whose button writes the feeding `user`, with
+/// `child` as its body and `site` as the element.
+fn under_moving_parent(child: &str, site: &str) -> Vec<reactant::rules::Diagnostic> {
+    diags_for(
+        &format!(
+            r#"
+            import {{ useEffect, useState }} from "react";
+            function Child({{ user, tick }}) {{
+              {child}
+            }}
+            export function App() {{
+              const [user, setUser] = useState({{ name: "a" }});
+              return (
+                <div>
+                  <button onClick={{() => setUser({{ name: "b" }})}}>+</button>
+                  {site}
+                </div>
+              );
+            }}
+            "#
+        ),
+        "Child",
+    )
+}
+
+#[test]
+fn a_sync_the_relation_does_not_credit_is_not_proven_absent() {
+    // React re-syncs `local` to "b" after the click in each (#313): an
+    // effect gated by an opaque list, by a value computed from the prop, by
+    // another prop the same slot moves, or a write through a callee the
+    // analysis does not see.
+    for effect in [
+        "const deps = [user]; useEffect(() => { setLocal(user); }, deps);",
+        "const name = user.name; useEffect(() => { setLocal(user); }, [name]);",
+        "useEffect(() => { setLocal(user); }, [tick]);",
+        "useEffect(() => { someLib(() => setLocal(user)); }, [user]);",
+    ] {
+        let d = under_moving_parent(
+            &format!(
+                "const [local, setLocal] = useState(user); {effect} return <p>{{local.name}}</p>;"
+            ),
+            "<Child user={user} tick={user} />",
+        );
+        assert_eq!(d.len(), 1, "{effect}: {d:?}");
+        assert_eq!(d[0].severity(), Severity::Warning, "{effect}: {d:?}");
+    }
+    // A handler writing back what the render holds may be dispatched.
+    let d = under_moving_parent(
+        "const [local, setLocal] = useState(user); \
+         return <p onClick={() => setLocal(user)}>{local.name}</p>;",
+        "<Child user={user} tick={user} />",
+    );
+    assert_eq!(d[0].severity(), Severity::Warning, "{d:?}");
+    // The twin: only an event writes it, with a constant.
+    let d = under_moving_parent(
+        "const [local, setLocal] = useState(user); \
+         return <p onClick={() => setLocal({ name: \"c\" })}>{local.name}</p>;",
+        "<Child user={user} tick={user} />",
+    );
+    assert_eq!(d[0].severity(), Severity::Error, "{d:?}");
+}
+
+#[test]
+fn an_instance_is_observed_only_at_a_site_that_keeps_it_mounted() {
+    let child = "const [local, setLocal] = useState(user); \
+                 return <p onClick={() => setLocal({ name: \"c\" })}>{local.name}</p>;";
+    // A key or a guard that reads what the prop is read from may remount
+    // it: React shows "b" after the click (#313).
+    for site in [
+        "<Child key={user.name} user={user} tick={user} />",
+        "{user.name !== \"\" && <Child user={user} tick={user} />}",
+    ] {
+        let d = under_moving_parent(child, site);
+        assert_eq!(d[0].severity(), Severity::Warning, "{site}: {d:?}");
+    }
 }

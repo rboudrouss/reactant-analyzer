@@ -1111,3 +1111,86 @@ fn a_navigate_function_under_another_name_is_a_navigation() {
         "`go` is `useNavigate()`'s result: {fired:?}"
     );
 }
+
+/// The `infinite-loop` findings of `component`, with their severity.
+fn loop_findings(src: &str, component: &str) -> Vec<(reactant::rules::Severity, String)> {
+    let result = parse_and_analyze_with_config(src, common_config());
+    diags_for(&result, component)
+        .into_iter()
+        .filter(|d| d.rule == "infinite-loop")
+        .map(|d| (d.severity(), d.message.clone()))
+        .collect()
+}
+
+/// `useSelectedLayoutSegments()` builds a new array at each call (#299):
+/// copying it into state on `[segments]` loops in production. Main read it
+/// as held and said nothing (probe p23).
+#[test]
+fn selected_layout_segments_is_not_held() {
+    let found = loop_findings(
+        r#"
+        import { useEffect, useState } from "react";
+        import { useSelectedLayoutSegments } from "next/navigation";
+        export function C() {
+          const segments = useSelectedLayoutSegments();
+          const [s, setS] = useState<string[]>([]);
+          useEffect(() => {
+            setS([...segments]);
+          }, [segments]);
+          return <p>{s.length}</p>;
+        }
+        "#,
+        "C",
+    );
+    assert!(
+        found
+            .iter()
+            .any(|(s, _)| *s == reactant::rules::Severity::Warning),
+        "{found:?}"
+    );
+}
+
+/// The pages router's `push` is a new closure on every router snapshot
+/// (#299): a deps list naming it does not gate the effect.
+#[test]
+fn a_pages_router_method_is_not_a_stable_dep() {
+    for pkg in ["next/router", "next/compat/router"] {
+        let found = loop_findings(
+            &format!(
+                r#"
+                import {{ useEffect, useState }} from "react";
+                import {{ useRouter }} from "{pkg}";
+                export function C() {{
+                  const router = useRouter();
+                  const push = router.push;
+                  const [n, setN] = useState(0);
+                  useEffect(() => {{
+                    setN((c) => c + 1);
+                  }}, [push]);
+                  return <p>{{n}}</p>;
+                }}
+                "#
+            ),
+            "C",
+        );
+        assert!(!found.is_empty(), "{pkg}: {found:?}");
+    }
+    // The app router's methods are memoized: the same shape stays gated.
+    let found = loop_findings(
+        r#"
+        import { useEffect, useState } from "react";
+        import { useRouter } from "next/navigation";
+        export function C() {
+          const router = useRouter();
+          const push = router.push;
+          const [n, setN] = useState(0);
+          useEffect(() => {
+            setN((c) => c + 1);
+          }, [push]);
+          return <p>{n}</p>;
+        }
+        "#,
+        "C",
+    );
+    assert!(found.is_empty(), "{found:?}");
+}

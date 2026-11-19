@@ -95,8 +95,8 @@ struct JsonDiagnostic<'a> {
 #[derive(Serialize)]
 struct JsonNote<'a> {
     message: &'a str,
-    /// binding | resolve | call | write | read | branch | cycle-edge |
-    /// widen | mutate | capture | init-once | forward | rerender
+    /// binding | resolve | call | write | store-write | read | branch |
+    /// cycle-edge | widen | mutate | capture | init-once | forward | rerender
     kind: &'static str,
     hook_label: Option<usize>,
     /// File the note's position points into — may differ from the
@@ -203,6 +203,7 @@ fn to_json_note<'a>(
                 crate::rules::ValueClass::Unknown => "unknown",
             });
         }
+        Step::StoreWrite { callee } => j.callee = Some(callee),
         Step::Read { what } => j.what = Some(what),
         Step::Branch { desc } => j.desc = Some(desc),
         Step::CycleEdge { from, to } => {

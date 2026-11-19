@@ -6,7 +6,7 @@ import { joinFiles, ENTRY } from "./files.mjs";
 
 const REACT = ["useState", "useEffect", "useLayoutEffect", "useReducer", "useMemo", "useCallback", "useRef"];
 // The package the analyzer cannot see into (react-run.mjs).
-const EXT = ["defer", "runNow"];
+const EXT = ["defer", "runNow", "format", "absent"];
 
 const fileOf = (x) => x.file ?? ENTRY;
 
@@ -52,13 +52,16 @@ function printHelper(h, exported) {
       return `${ex}function ${h.name}(s, a) {\n  return ${expr(h.body)};\n}`;
     case "hook":
       return `${ex}function ${h.name}(init) {\n  const [v, setV] = useState(init);\n  return [v, setV];\n}`;
+    case "yielder":
+      return `${ex}function* ${h.name}(f) {\n  yield f;\n}`;
     default:
       throw new Error(`print: helper ${h.kind}`);
   }
 }
 
 function printComp(c, usedElsewhere) {
-  const params = c.props.length ? `{ ${c.props.map((p) => p.name).join(", ")} }` : "";
+  const param = (p) => (p.default ? `${p.name} = ${expr(p.default)}` : p.name);
+  const params = c.props.length ? `{ ${c.props.map(param).join(", ")} }` : "";
   const lines = [`${c.exported || usedElsewhere ? "export " : ""}function ${c.name}(${params}) {`];
   for (const it of c.body) lines.push(indent(item(it), 1));
   lines.push(`  return ${jsx(c.view, 1)};`, "}");
@@ -112,7 +115,7 @@ function arg(a) {
 export function stmt(s) {
   switch (s.kind) {
     case "write": {
-      const call = `${s.target}(${arg(s.arg)})`;
+      const call = writeCall(s);
       switch (s.wrap) {
         case "plain":
           return `${call};`;
@@ -128,7 +131,11 @@ export function stmt(s) {
           return `(() => ${call})();`;
         case "defer":
         case "runNow":
-          return `${s.wrap}(() => ${call});`;
+          return `${s.wrap}${opt(s.wrapOptional)}(() => ${call});`;
+        case "optarg":
+          return `${s.via}?.(${call});`;
+        case "yield":
+          return `for (const f of ${s.via}(${s.target})) ${writeCall({ ...s, target: "f" })};`;
         default:
           throw new Error(`print: wrap ${s.wrap}`);
       }
@@ -136,7 +143,7 @@ export function stmt(s) {
     case "helpercall":
       return `${s.helper}(${s.target}, ${expr(s.arg)});`;
     case "call":
-      return `${s.target}(${expr(s.arg)});`;
+      return `${callCall(s)};`;
     case "if":
       return s.else.length
         ? `if (${expr(s.cond)}) ${block(s.then, 0)} else ${block(s.else, 0)}`
@@ -147,6 +154,11 @@ export function stmt(s) {
       throw new Error(`print: stmt ${s.kind}`);
   }
 }
+
+// `f?.(x)` for an optional call, `f(x)` otherwise.
+const opt = (optional) => (optional ? "?." : "");
+const writeCall = (s) => `${s.target}${opt(s.optional)}(${arg(s.arg)})`;
+const callCall = (s) => `${s.target}${opt(s.optional)}(${expr(s.arg)})`;
 
 // The context of a concise arrow body, where a leading `{` would open a block.
 const ARROW_BODY = -1;
@@ -162,6 +174,8 @@ export function expr(e, ctx = 0) {
       return String(e.v);
     case "null":
       return "null";
+    case "undefined":
+      return "undefined";
     case "var":
       return e.name;
     case "member":
@@ -171,6 +185,25 @@ export function expr(e, ctx = 0) {
       const s = `${expr(e.l, p)} ${e.op} ${expr(e.r, p + 1)}`;
       return p < ctx ? `(${s})` : s;
     }
+    case "coalesce": {
+      // Parenthesized beside `&&` / `||` (which `??` may not mix with), as an
+      // operand, and as a concise arrow body.
+      const s = `${expr(e.l, 3)} ?? ${expr(e.r, 3)}`;
+      return ctx > 1 || ctx === ARROW_BODY ? `(${s})` : s;
+    }
+    case "or": {
+      // Parenthesized as an operand (beside `??` it must be), and as a
+      // concise arrow body.
+      const s = `${expr(e.l, 3)} || ${expr(e.r, 3)}`;
+      return ctx > 1 || ctx === ARROW_BODY ? `(${s})` : s;
+    }
+    case "index": {
+      // `{ a: x }["a"]` as a concise arrow body would open a block.
+      const s = `${expr(e.obj, 9)}[${expr(e.idx)}]`;
+      return ctx === ARROW_BODY ? `(${s})` : s;
+    }
+    case "optcall":
+      return `${e.fn}?.(${e.args.map((a) => expr(a)).join(", ")})`;
     case "not":
       return `!${expr(e.e, 8)}`;
     case "cond": {
@@ -197,8 +230,8 @@ export function expr(e, ctx = 0) {
 
 function stmtExprBody(s) {
   // An inline handler prop: `(v) => setN(v + 1)`, a write without its `;`.
-  if (s.kind === "write" && s.wrap === "plain") return `${s.target}(${arg(s.arg)})`;
-  if (s.kind === "call") return `${s.target}(${expr(s.arg)})`;
+  if (s.kind === "write" && s.wrap === "plain") return writeCall(s);
+  if (s.kind === "call") return callCall(s);
   return expr(s);
 }
 

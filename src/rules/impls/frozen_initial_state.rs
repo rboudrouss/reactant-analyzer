@@ -13,8 +13,8 @@ use crate::{
 
 use crate::rules::{
     Certified, Diagnostic, Motion, MovingFeeder, MustResult, Rule, Severity, Step, ValueClass,
-    all_setter_labels, classify_motion, helpers::mount::MountCoupling, may_written_slots,
-    must_frozen_seed, state_slot_name, state_val_labels,
+    classify_motion, helpers::mount::MountCoupling, may_written_slots, must_frozen_seed,
+    setter_targets_with_paths, state_slot_name, state_val_labels,
 };
 
 /// Fires when a `useState` initializer reads a prop and nothing ever syncs
@@ -30,11 +30,13 @@ use crate::rules::{
 /// Stratification (three-level doctrine — Error only on a full proof chain):
 /// - **Error**: the prop is *proven* fed by another component's state slot
 ///   (`Versioned` reference through ADR-012 top-down analysis), that slot may
-///   actually be written in its owner, no effect keyed on the prop (and no
-///   render-time write) syncs the local slot, the local setter never escapes
+///   actually be written in its owner, every write of the local slot runs only
+///   on an event and stores nothing the render holds, so none re-syncs it
+///   (#313: no sync *seen* is not that), the local setter never escapes
 ///   this component (nothing else could sync it), and the move is *observable*
-///   — no call site ties the mount condition to the feeder's own writers, and
-///   every analysed call site passes the feeder.
+///   — a call site in the feeder's owner keeps an instance mounted across its
+///   writes (no guard, no `key`, outside closures: [`MountCoupling::Free`],
+///   #313), and every analysed call site passes the feeder.
 /// - **Warning**: the freeze is real but the prop's motion is not proven
 ///   (props ⊤ in intra-only analysis, `VersionedTop`, per-render or unknown
 ///   values), or the proof chain has a hole (setter escapes, feeding slot's
@@ -89,7 +91,8 @@ impl Rule for FrozenInitialState {
         let (result, component) = (ctx.program(), ctx.component());
         let comp = &result.components[&component];
         let render_cfg = &comp.render_cfg;
-        let setter_labels = all_setter_labels(comp);
+        // A slot written only through a stored pair (`t[1]`) is written (#288).
+        let setter_labels = setter_targets_with_paths(comp);
         let state_labels = state_val_labels(render_cfg);
         let locally_written = may_written_slots(render_cfg, &comp.hooks, &setter_labels);
         let name_of = |l: HookLabel| state_slot_name(l, ctx.source_names(), &state_labels);
@@ -187,12 +190,15 @@ impl Rule for FrozenInitialState {
                         .unwrap_or_default(),
                     result,
                 ),
-                None => MountCoupling::Free,
+                None => MountCoupling::Unobserved,
             };
 
             // Every row of one slot carries the same escape verdict — it is a
             // property of the setter, not of the seed.
             let escaped = seeds[0].setter_escapes;
+            // A write that may run without an event, or store what the render
+            // holds, may re-sync the slot where no sync was seen (#313).
+            let only_on_events = seeds[0].only_on_events;
             let slot_name = name_of(*label);
 
             let (mut severity, message, proven_evidence) = match (&proven, &unproven_path) {
@@ -203,9 +209,9 @@ impl Rule for FrozenInitialState {
                     // the mount condition moves with the feeder, so no mounted
                     // instance need ever observe the change. `Unfed`: some
                     // instance is mounted where no feeder reaches it.
-                    let severity = if escaped
-                        || matches!(mount, MountCoupling::WriterCoupled | MountCoupling::Unfed)
-                    {
+                    // `Unobserved`: no call site is proven to keep an
+                    // instance mounted across the move.
+                    let severity = if escaped || !only_on_events || mount != MountCoupling::Free {
                         Severity::Warning
                     } else {
                         Severity::Error
@@ -275,6 +281,7 @@ impl Rule for FrozenInitialState {
                 (Severity::Error, Some(proof)) => match must_frozen_seed(
                     proof,
                     escaped,
+                    only_on_events,
                     all_seed_named,
                     locally_written.contains(label),
                     mount,

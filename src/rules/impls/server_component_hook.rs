@@ -354,6 +354,7 @@ mod tests {
                 blocks: Default::default(),
                 edges: vec![],
             },
+            params: vec![],
             span: None,
             dom_event: true,
         };

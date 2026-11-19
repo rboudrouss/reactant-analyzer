@@ -229,9 +229,10 @@ function NestedHelperLoop() {
   return <div>{n}</div>;
 }
 
-// ── Depth limit — deeply nested chain NOT detected (known FN) ────────────────
-// Four levels of direct calls exceed MAX_INLINE_DEPTH=3 → analysis bails.
-// Documented limit: ADR-010.
+// ── Depth limit — deeply nested chain ────────────────────────────────────────
+// Four levels of direct calls exceed the walk's depth (3). Past it, what a
+// body writes is read off the call relation (ADR-047): a possible write, a
+// Warning (it was a known FN, ADR-010).
 
 function DeepHelperOk() {
   const [n, setN] = useState(0);
@@ -240,7 +241,7 @@ function DeepHelperOk() {
     const f2 = () => f1();
     const f3 = () => f2();
     const f4 = () => f3();
-    f4(); // ✓ not detected — depth 4 > MAX_INLINE_DEPTH=3 (known FN)
+    f4(); // ❌ infinite-loop (past the walk's depth, unplaced)
   }, [n]);
   return <div>{n}</div>;
 }

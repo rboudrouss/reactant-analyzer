@@ -32,7 +32,7 @@ use crate::{
 
 use crate::rules::api::cache::ProgramCache;
 use crate::rules::helpers::mount::MountCoupling;
-use crate::rules::{ConvergedEval, Note, SetterCall, Step, arg_is_call_free, local_bindings};
+use crate::rules::{ConvergedEval, Note, Step, arg_is_call_free, local_bindings};
 
 /// Where a certified fact lives, and the witness chain that proves it (ADR-019).
 ///
@@ -44,8 +44,8 @@ use crate::rules::{ConvergedEval, Note, SetterCall, Step, arg_is_call_free, loca
 /// the cycle).
 ///
 /// Some primitives legitimately leave it [`Default`]: they are handed the shape
-/// of the proof and not its location — `must_same_ref_mutation` receives
-/// container ids, `must_init_calls_setter` an `Expr` (which carries no span),
+/// of the proof and not its location — `must_init_calls_setter` an `Expr`
+/// (which carries no span),
 /// `must_on_all_paths` a block set. Empty provenance there is honest, not an
 /// omission; enriching it would mean widening those signatures for a position
 /// the rule already has.
@@ -157,7 +157,7 @@ pub enum StabilityVerdict {
 }
 
 impl StabilityVerdict {
-    /// Total projection of the six-variant [`Stability`] lattice onto the
+    /// Total projection of the seven-variant [`Stability`] lattice onto the
     /// rule-facing verdict. `Bottom` (⊥, unreachable/uninitialised) is **not**
     /// provably stable, so it folds to `Unknown` (may side) — matching the
     /// existing `is_stable` semantics (true only for `Stable`).
@@ -167,7 +167,9 @@ impl StabilityVerdict {
             Stability::Versioned(slots) => StabilityVerdict::Versioned(slots),
             Stability::VersionedTop => StabilityVerdict::Versioned(BTreeSet::new()),
             Stability::PerRender => StabilityVerdict::PerRender,
-            Stability::Bottom | Stability::Unknown => StabilityVerdict::Unknown,
+            Stability::Bottom | Stability::Unknown | Stability::MayBeFresh => {
+                StabilityVerdict::Unknown
+            }
         }
     }
 
@@ -419,8 +421,9 @@ impl<'a> RuleCtx<'a> {
     /// expression a lowering temp stands for, not its spelling. Built on first
     /// use.
     pub fn source_names(&self) -> &crate::ir::SourceNames {
-        self.source_names
-            .get_or_init(|| crate::rules::helpers::source_names_of(self.comp))
+        self.source_names.get_or_init(|| {
+            crate::rules::helpers::source_names_of(self.comp, &self.program().file_table)
+        })
     }
 
     /// The one printer of a message's names: slots through `slot` (the rule's
@@ -534,6 +537,15 @@ fn cfg_hook_calls(
     comp.hook_calls.iter()
 }
 
+/// Evidence of a setter call written in a body's own statements: the name
+/// called, its position and its block there.
+#[derive(Debug, Clone)]
+pub struct SetterCall {
+    pub var: Var,
+    pub span: Option<SourceRange>,
+    pub block_id: Option<BlockId>,
+}
+
 /// The unconditional-setter must-forward, promoted from the private
 /// `derived_state::find_uncond_setter_call` (ADR-021 §3).
 ///
@@ -581,14 +593,12 @@ pub fn must_setter_on_all_paths(
     {
         return MustResult::None;
     }
+    // The scan above reads statements of `cfg` itself, never a nested body,
+    // so every site it can find runs when `cfg` runs.
     let evidence = SetterCall {
         var: target,
         span: target_span,
         block_id: Some(target_block),
-        // The scan above reads statements of `cfg` itself, never a nested
-        // body, so every site it can find runs when `cfg` runs.
-        class: crate::engine::setters::SetterCallPhase::Sync,
-        own: None,
     };
 
     // must_in[B] = ∧ must_out[preds]; must_out[B] = must_in[B] ∨ called_in[B].
@@ -735,40 +745,21 @@ pub struct RenderWrite {
     pub block: BlockId,
 }
 
-/// `All` iff the call through `var` at `block` of `render_cfg` writes on every
-/// render: its block dominates every exit, and the callee surely is the
-/// setter. Dominance proves the call runs, not that it writes (#279).
-///
-/// A name the render binds to a setter (`local`) must be bound to it on every
-/// path: the alias table is a may-map (first binding wins), and a name bound
-/// to the setter on one path and to anything else on another — `if (c) set =
-/// setV`, a hook returning `[v, setV]` or `[v, noop]`, a closure the render
-/// runs that rebinds it (#235) — writes on some renders only. So the binding
-/// is the must-alias one, read over `scopes` (`must_alias_scopes`). A name the
-/// converged values put a setter behind (`props`) must provably write: a
-/// helper that only carries a captured setter into a JSX handler writes
-/// nothing when called (`SetterProp::must_write`). A name neither table
-/// knows as a setter is not one.
+/// `All` iff a render write placed at `block` writes on every render: its
+/// block dominates every exit. The writer relation places a row
+/// ([`SlotWriter::placed`](crate::engine::SlotWriter::placed)) only where it
+/// runs synchronously in the render, at least once per pass of its block,
+/// through a call every evaluation of which was surely that one setter (the
+/// call relation's `sure`, ADR-047): dominance proves the call runs, the
+/// relation that it writes (#279). A name bound to the setter on one path
+/// and to anything else on another (#235), a helper that only carries a
+/// captured setter (#233), a call with several targets: none is placed.
 pub(in crate::rules) fn must_render_write(
     exit_dom: &ExitDominance,
-    render_cfg: &CFG,
-    scopes: &[(&[Var], &CFG)],
-    var: &Var,
     block: BlockId,
-    local: bool,
-    props: Option<&[crate::engine::setters::SetterProp]>,
 ) -> MustResult<RenderWrite> {
-    let bound = || {
-        matches!(
-            crate::ir::bindings::must_binding(&Expr::Var(var.clone()), render_cfg, scopes),
-            Some(Expr::StateSetter(_))
-        )
-    };
-    let surely_the_setter = (local || props.is_some())
-        && (!local || bound())
-        && props.is_none_or(|ps| ps.iter().all(|p| p.must_write));
     match exit_dom.certify(block) {
-        MustResult::All(_) if surely_the_setter => MustResult::All(Certified::mint(
+        MustResult::All(_) => MustResult::All(Certified::mint(
             RenderWrite { block },
             Provenance::default(),
         )),
@@ -902,17 +893,19 @@ fn slot_write_evidence(
     owner: &AnalysisResult<StateValue>,
     slot: HookLabel,
 ) -> (bool, Option<SourceRange>) {
-    let setter_labels = crate::rules::all_setter_labels(owner);
+    // A slot written only through a stored pair (`t[1]`, #288) is written:
+    // the stillness proof reads every setter path the converged values hold.
+    let setter_labels = crate::rules::setter_targets_with_paths(owner);
     let may = crate::rules::may_written_slots(&owner.render_cfg, &owner.hooks, &setter_labels);
     if !may.contains(&slot) {
         return (false, None);
     }
-    let setters: HashSet<Var> = setter_labels.aliases_of(slot);
-    let render_fns = crate::rules::collect_fn_bindings(&owner.render_cfg);
-    let mut spans: Vec<SourceRange> = std::iter::once(&owner.render_cfg)
-        .chain(owner.hooks.iter().filter_map(|h| h.body_cfg()))
-        .flat_map(|cfg| crate::rules::collect_setter_calls_with_extra(cfg, &setters, &render_fns))
-        .filter_map(|c| c.span)
+    // The first write site the writer relation lists for the slot.
+    let mut spans: Vec<SourceRange> = owner
+        .slot_writers
+        .iter()
+        .filter(|w| w.owner.is_none() && w.slot == slot)
+        .filter_map(|w| w.span)
         .collect();
     spans.sort_by_key(|r| r.pos_key());
     (true, spans.first().copied())
@@ -940,7 +933,7 @@ pub fn classify_motion(val: &StateValue, result: &ProgramAnalysisResult) -> Moti
                     "state {} of `{}`",
                     crate::rules::state_slot_name(
                         *slot,
-                        &crate::rules::helpers::source_names_of(owner_result),
+                        &crate::rules::helpers::source_names_of(owner_result, &result.file_table),
                         &owner_states
                     ),
                     result.display_name(*owner)
@@ -981,7 +974,10 @@ pub fn classify_motion(val: &StateValue, result: &ProgramAnalysisResult) -> Moti
 }
 
 /// `All` iff a proven moving feeder survives the idiomatic downgrades: the
-/// setter does not escape, the seeds are not all seed-named (`initial*`/
+/// setter does not escape, every write of the slot runs only on an event
+/// and stores nothing of the render, so none re-syncs it
+/// ([`crate::engine::SlotSeed::only_on_events`], #313), the seeds are not all
+/// seed-named (`initial*`/
 /// `default*`), the slot is locally written, and the feeder's move is
 /// *observable* by a mounted consumer — the certain `frozen-initial-state`
 /// Error (ADR-021 §3). Any failed gate *demotes* the proof
@@ -995,11 +991,17 @@ pub fn classify_motion(val: &StateValue, result: &ProgramAnalysisResult) -> Moti
 pub fn must_frozen_seed(
     feeder: Certified<MovingFeeder>,
     escaped: bool,
+    only_on_events: bool,
     all_seed_named: bool,
     locally_written: bool,
     mount: MountCoupling,
 ) -> MustResult<MovingFeeder> {
-    if !escaped && !all_seed_named && locally_written && mount == MountCoupling::Free {
+    if !escaped
+        && only_on_events
+        && !all_seed_named
+        && locally_written
+        && mount == MountCoupling::Free
+    {
         MustResult::All(feeder)
     } else {
         MustResult::Some(feeder.into_evidence())
@@ -1112,7 +1114,7 @@ pub(in crate::rules) fn must_effect_cycle(
         // them from a `Vec` index.
         let first = cycle.edge_idx.first().map(|&i| &edges[i]);
         let provenance = match first {
-            Some(e) => Provenance::at(e.write_span, Some(e.effect_label)),
+            Some(e) => Provenance::at(e.write_span, e.carrier.effect()),
             None => Provenance::default(),
         };
         MustResult::All(Certified::mint(EffectCycleProof, provenance))
@@ -1121,27 +1123,71 @@ pub(in crate::rules) fn must_effect_cycle(
     }
 }
 
-/// Evidence that a state object is mutated in place while its setter is called
-/// with the same reference in the same trigger — React's `Object.is` sees no
-/// change and skips the re-render.
+/// Evidence that a state object is mutated in place and then handed back to
+/// its setter by the same run — React's `Object.is` sees no change and skips
+/// the re-render.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SameRefMutation;
 
-/// `All` iff a mutation site and a setter-call site share a container (the same
-/// event/trigger scope) — the certain `state-mutation` Error (ADR-021 §3);
-/// `None` otherwise (a MAY: mutation and set on different triggers).
+/// One site of the pairing [`must_same_ref_mutation`] certifies: the object
+/// expression it touches (a mutation's receiver, a setter's argument, an
+/// updater's return), the body it sits in and its point there (block,
+/// statement index; the terminator at `stmts.len()`).
+pub struct RefSite<'a> {
+    pub body: &'a CFG,
+    pub at: (BlockId, usize),
+    pub expr: &'a Expr,
+    pub span: Option<SourceRange>,
+    /// The state parameter of the updater whose body this is, and the slot
+    /// whose object React hands it.
+    pub param: Option<(&'a Var, HookLabel)>,
+}
+
+/// `All` iff one run of a body mutates the object of `slot` in place and then
+/// hands that object to its setter (#180): both sites sit in one body and
+/// co-execute in that order ([`co_executes_in_order`]), and each expression
+/// certainly is the slot's object — its sole binding chain in the body ends
+/// at the slot's read, at a render name `must_reads` ties to it, or at the
+/// updater's untouched parameter; a mutation's receiver may be a member of
+/// it. `None` otherwise: the two sites only may co-execute, or the reference
+/// only may be the slot's.
+///
+/// [`co_executes_in_order`]: crate::engine::dominance::co_executes_in_order
 pub fn must_same_ref_mutation(
-    mutation_containers: &HashSet<usize>,
-    setter_containers: &HashSet<usize>,
+    slot: HookLabel,
+    mutation: &RefSite<'_>,
+    set: &RefSite<'_>,
+    must_reads: &HashMap<Var, HookLabel>,
 ) -> MustResult<SameRefMutation> {
-    if mutation_containers
-        .intersection(setter_containers)
-        .next()
-        .is_some()
+    let is_slot = |site: &RefSite<'_>, members: bool| {
+        let nested = crate::ir::bindings::nested_bodies(site.body);
+        let mut cur = site.expr;
+        for _ in 0..crate::ir::bindings::MAX_ALIAS_HOPS {
+            match crate::ir::bindings::must_binding_within(cur, site.body, &nested) {
+                Some(Expr::StateVal(l)) => return *l == slot,
+                Some(Expr::FieldAccess { obj, .. }) if members => cur = obj,
+                Some(Expr::IndexAccess { arr, .. }) if members => cur = arr,
+                Some(Expr::Var(v)) if site.param.is_some_and(|(p, _)| p == v) => {
+                    return site.param.is_some_and(|(_, l)| l == slot)
+                        && !nested
+                            .iter()
+                            .any(|(ps, b)| ps.contains(v) || crate::ir::bindings::binds(v, b));
+                }
+                Some(Expr::Var(v)) => return must_reads.get(v) == Some(&slot),
+                _ => return false,
+            }
+        }
+        false
+    };
+    if std::ptr::eq(mutation.body, set.body)
+        && crate::engine::dominance::co_executes_in_order(mutation.body, mutation.at, set.at)
+        && is_slot(mutation, true)
+        && is_slot(set, false)
     {
-        // No provenance: the inputs are container ids, so neither the mutation
-        // site nor the setter call reaches this primitive. The rule anchors it.
-        MustResult::All(Certified::mint(SameRefMutation, Provenance::default()))
+        MustResult::All(Certified::mint(
+            SameRefMutation,
+            Provenance::at(mutation.span, Some(slot)),
+        ))
     } else {
         MustResult::None
     }
@@ -1151,11 +1197,13 @@ fn try_extract_setter_call<'e>(
     expr: &'e Expr,
     setter_vars: &HashSet<Var>,
 ) -> Option<(Var, &'e Expr)> {
-    if let Expr::Call { fn_, args } = expr
-        && let Expr::Var(name) = fn_.as_ref()
-        && setter_vars.contains(name)
+    // Through a name or a member path (`t[1]` is `t.1`), as the setter
+    // walk matches a call.
+    if let Expr::Call { fn_, args, .. } = expr
+        && let Some(name) = crate::engine::setters::callee_path(fn_)
+        && setter_vars.contains(&name)
     {
-        Some((name.clone(), args.first()?))
+        Some((name, args.first()?))
     } else {
         None
     }
@@ -1279,6 +1327,7 @@ mod tests {
     fn set_call(line: u32) -> Stmt {
         Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setX".to_string())),
                 args: vec![Expr::Lit(Prim::Int(0))],
             },

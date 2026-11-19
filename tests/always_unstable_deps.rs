@@ -24,6 +24,10 @@ fn make_prog(
 }
 
 fn hits(src: &str) -> usize {
+    messages(src).len()
+}
+
+fn messages(src: &str) -> Vec<String> {
     let alloc = Allocator::default();
     let ret = Parser::new(&alloc, src, SourceType::tsx())
         .with_options(ParseOptions::default())
@@ -42,15 +46,17 @@ fn hits(src: &str) -> usize {
     assert!(!components.is_empty(), "no component detected");
     components
         .into_iter()
-        .map(|comp| {
+        .flat_map(|comp| {
             let name = comp.name.clone();
             let result = analyze_component(comp, &StateValueTransfer, &Config::default());
             let prog = make_prog(&name, result);
             AlwaysUnstableDeps
                 .check(&RuleCtx::new(&prog, prog.component_named(&name).unwrap()))
-                .len()
+                .into_iter()
+                .map(|d| d.message)
+                .collect::<Vec<_>>()
         })
-        .sum()
+        .collect()
 }
 
 // ── True positives ────────────────────────────────────────────────────────────
@@ -587,4 +593,83 @@ fn a_spread_in_deps_is_judged_by_its_elements() {
         "#,
     );
     assert_eq!(fresh, 1, "its one element is a new object every render");
+}
+
+/// A dep that is a new array wherever it is one, and `undefined` (or the
+/// falsy part of an opaque value) elsewhere: the memo re-runs at every render
+/// where the value exists. One fact for the three spellings (#301).
+#[test]
+fn a_dep_fresh_wherever_it_holds_an_object_is_reported_as_such() {
+    for (shape, bind) in [
+        ("optional call", "const p = a?.map((x) => x + 1);"),
+        ("&&", "const p = a && a.map((x) => x + 1);"),
+        ("ternary", "const p = c ? [c] : undefined;"),
+    ] {
+        let found = messages(&format!(
+            r#"
+            import {{ useMemo }} from "react";
+            function C({{ a, c }}) {{
+                {bind}
+                const t = useMemo(() => p?.length, [p]);
+                return <div>{{t}}</div>;
+            }}
+            "#
+        ));
+        assert_eq!(found.len(), 1, "{shape}: {found:?}");
+        assert!(
+            found[0].contains("a new reference at every render where it holds an object"),
+            "{shape}: {found:?}"
+        );
+    }
+}
+
+/// A must-fresh dep keeps its wording, and a may-fresh one beside it is named
+/// after it rather than dropped.
+#[test]
+fn a_dep_fresh_wherever_it_holds_an_object_is_named_beside_a_fresh_one() {
+    let found = messages(
+        r#"
+        import { useMemo } from "react";
+        function C({ a, x }) {
+            const p = a?.map((y) => y + 1);
+            const q = { x };
+            const t = useMemo(() => [p, q], [p, q]);
+            return <div>{t.length}</div>;
+        }
+        "#,
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found[0].starts_with("this memo depends on `q`, a new reference every render,")
+            && found[0].contains("it also depends on `p`, a new reference at every render where"),
+        "{found:?}"
+    );
+}
+
+/// The may fact needs every object the dep can be to be a fresh one: a
+/// stable alternative, a setter, `a ?? []`, `a || []`, a memo over the
+/// chain or the prop itself say nothing.
+#[test]
+fn a_dep_that_may_be_a_stable_object_stays_silent() {
+    for (shape, bind) in [
+        ("stable alternative", "const p = c ? a?.map((x) => x) : s;"),
+        ("setter alternative", "const p = c ? setX : [1];"),
+        ("??", "const p = a ?? [];"),
+        ("||", "const p = a || [];"),
+        ("memo", "const p = useMemo(() => a?.map((x) => x), [a]);"),
+        ("prop", "const p = a;"),
+    ] {
+        let found = messages(&format!(
+            r#"
+            import {{ useMemo, useState }} from "react";
+            function C({{ a, c, s }}) {{
+                const [, setX] = useState(0);
+                {bind}
+                const t = useMemo(() => typeof p, [p]);
+                return <div>{{t}}</div>;
+            }}
+            "#
+        ));
+        assert!(found.is_empty(), "{shape}: {found:?}");
+    }
 }

@@ -47,7 +47,7 @@ pub(crate) fn describe_value(val: &StateValue) -> &'static str {
         Stability::Versioned(_) | Stability::VersionedTop => {
             "its value changes when state is updated"
         }
-        Stability::Unknown => "its value may change between renders",
+        Stability::Unknown | Stability::MayBeFresh => "its value may change between renders",
     }
 }
 
@@ -131,13 +131,16 @@ pub(crate) fn state_slot_name(
 /// them: for a message about another component's slots.
 pub(crate) fn source_names_of(
     comp: &crate::engine::AnalysisResult<crate::domains::StateValue>,
+    files: &crate::ir::FileTable,
 ) -> crate::ir::SourceNames {
     crate::ir::SourceNames::of(
         &comp.render_cfg,
+        &comp.hooks,
         &comp.hook_provenance,
         comp.inline_origins
             .iter()
             .filter_map(|o| Some((o.bound.as_ref()?, o.name.as_str()))),
+        files,
     )
 }
 
@@ -213,7 +216,7 @@ pub(in crate::rules) fn fn_lit_binding<'c>(
 /// primitive.
 pub(crate) fn collect_callees<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
     match e {
-        Expr::Call { fn_, args } | Expr::New { fn_, args, .. } => {
+        Expr::Call { fn_, args, .. } | Expr::New { fn_, args, .. } => {
             out.push(fn_);
             collect_callees(fn_, out);
             for a in args {
@@ -319,7 +322,7 @@ mod tests {
             let_("scrollDismissActive", Expr::StateVal(3)),
             let_("isDragging", Expr::Var("scrollDismissActive".into())),
         ]);
-        let names = crate::ir::SourceNames::of(&cfg, &[], []);
+        let names = crate::ir::SourceNames::of(&cfg, &[], &[], [], &Default::default());
         let mut m: HashMap<Var, HookLabel> = HashMap::new();
         m.insert("scrollDismissActive".into(), 3);
         m.insert("isDragging".into(), 3);

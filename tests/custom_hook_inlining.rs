@@ -352,10 +352,11 @@ fn rule_messages_name_a_spliced_local_without_its_salt() {
         ),
         ("Init", "side-effect-in-init", "calls `client.subscribe`"),
         ("Bus", "missing-cleanup", "calls `bus.addEventListener`"),
+        // The spliced `set#…` is printed as the slot's own setter (D2).
         (
             "Child",
             "cross-component-infinite-loop",
-            "calls `set`, a state setter",
+            "calls `setX`, a state setter",
         ),
     ];
     for (comp, rule, wording) in expect {
@@ -1290,10 +1291,12 @@ fn a_setter_or_a_closure_a_call_returns_is_written_when_called() {
             "setter-in-render",
             Error,
         ),
+        // Every evaluation of the call surely ran the one closure
+        // `makeSetter` returns, which surely writes (ADR-047).
         (
             "const [v, setV] = useState(0); const makeSetter = () => (x) => setV(x); makeSetter()(v + 1); return <div />;",
             "setter-in-render",
-            Warning,
+            Error,
         ),
         (
             "const [v, setV] = useState(0); const get = () => (c ? setV : (x) => {}); get()(v + 1); return <div />;",

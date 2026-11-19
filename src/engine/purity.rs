@@ -32,6 +32,7 @@ use crate::ir::{
     cfg::CFG,
     expr::{BinOp, Expr, Prim, UnaryOp},
     free_vars::compute_free_vars,
+    module::{AccessKey, AccessorNames},
     types::Var,
 };
 
@@ -55,6 +56,10 @@ pub enum Kind {
     ParamsPair,
     /// A `Map` or a `Set`.
     Keyed,
+    /// A plain object React builds — `useRef`'s, the props object — whose
+    /// reads run only an accessor its chain may hold (#336,
+    /// [`AccessorNames::may_run_off_plain`]).
+    Plain,
 }
 
 impl Kind {
@@ -329,13 +334,15 @@ impl<'e> Callee<'e> {
 /// The kind of a known builtin's result when the call returns the same value
 /// on the same inputs, `None` when it may differ. `arg` is the kind of the
 /// argument at an index; `var` the kind of a free name of a closure argument
-/// the builtin runs, as the caller sees it.
+/// the builtin runs, as the caller sees it; `accessors` what the program's
+/// accessors define, which such a closure's member reads may run (#334).
 pub fn call(
     callee: Callee<'_>,
     new: bool,
     args: &[Expr],
     arg: &dyn Fn(usize) -> Kind,
     var: &dyn Fn(&str) -> Kind,
+    accessors: &AccessorNames,
 ) -> Option<Kind> {
     let found = match (callee, new) {
         (Callee::Value(k), false) => CALLS.iter().find(|x| x.on == k),
@@ -346,20 +353,63 @@ pub fn call(
         (Callee::Method(k, name), false) => METHODS.iter().find(|x| x.on == k && x.name == name),
         (Callee::Method(..), true) => None,
     }?;
+    // A spread at or before the position it runs may hand it anything.
+    let positional = Expr::positional_args(args).len();
+    if positional < args.len() && found.runs.is_some_and(|i| i >= positional) {
+        return None;
+    }
     let ran = found.runs.and_then(|i| args.get(i).map(|a| (i, a)));
     let runs_known = ran.is_none_or(|(i, a)| match a.peel_ts() {
         Expr::FnLit {
             params, body_cfg, ..
-        } => body_holds(body_cfg, params, var),
+        } => body_holds(body_cfg, params, var, accessors),
         _ => arg(i).is_data(),
     });
     runs_known.then_some(found.gives)
 }
 
+/// What a read off a receiver of kind `receiver` selects, for the accessors
+/// of the program it may run (#336): the member `key` a constant spells,
+/// else a number's key when the key is of kind `Num`. The `length` of an
+/// array or a string is the receiver's own.
+pub fn access(receiver: Kind, key: Option<&str>, key_kind: Kind) -> AccessKey<'_> {
+    match key {
+        Some(k) => AccessKey::member(k, matches!(receiver, Kind::Array | Kind::Str)),
+        None if key_kind == Kind::Num => AccessKey::Number,
+        None => AccessKey::Any,
+    }
+}
+
+/// May a read of `key` off a receiver of kind `receiver` run an accessor of
+/// the program (#334)? Off a plain object React builds, only one its chain
+/// may hold (#336).
+pub fn reads_accessor(accessors: &AccessorNames, receiver: Kind, key: AccessKey<'_>) -> bool {
+    match receiver {
+        Kind::Plain => accessors.may_run_off_plain(key),
+        _ => accessors.may_run(key),
+    }
+}
+
+/// The member a key spells when it is a constant: what a read `o[k]` reads.
+pub fn constant_key(idx: &Expr) -> Option<String> {
+    match idx.peel_ts() {
+        Expr::Lit(Prim::Int(i)) => Some(i.to_string()),
+        Expr::Lit(Prim::String(s)) => Some(s.to_string()),
+        _ => None,
+    }
+}
+
 /// Does every call `body` runs, closures it only builds aside, return the
 /// same value on the same inputs? Its own names have no known kind; a free
-/// one has the kind `var` gives it.
-pub fn body_holds(body: &CFG, params: &[Var], var: &dyn Fn(&str) -> Kind) -> bool {
+/// one has the kind `var` gives it. A member read of a name an accessor of
+/// the program defines may be a call of it (#334), which no table knows; a
+/// known builtin's method is read off a receiver of its own kind.
+pub fn body_holds(
+    body: &CFG,
+    params: &[Var],
+    var: &dyn Fn(&str) -> Kind,
+    accessors: &AccessorNames,
+) -> bool {
     let free: HashSet<Var> = compute_free_vars(body);
     let inner = |v: &str| {
         if params.iter().any(|p| p == v) || !free.contains(v) {
@@ -368,53 +418,76 @@ pub fn body_holds(body: &CFG, params: &[Var], var: &dyn Fn(&str) -> Kind) -> boo
             var(v)
         }
     };
-    fn walk(e: &Expr, var: &dyn Fn(&str) -> Kind) -> bool {
+    fn walk(e: &Expr, var: &dyn Fn(&str) -> Kind, accessors: &AccessorNames) -> bool {
         match e {
             // Built, not run.
             Expr::FnLit { .. } => true,
-            Expr::Call { fn_, args } | Expr::New { fn_, args, .. } => {
-                let callee = Callee::of(fn_, &mut |x| kind_of(x, var));
+            Expr::Call { fn_, args, .. } | Expr::New { fn_, args, .. } => {
+                let callee = Callee::of(fn_, &mut |x| kind_of(x, var, accessors));
+                let read = match fn_.peel_ts() {
+                    Expr::FieldAccess { obj, .. } => obj,
+                    other => other,
+                };
                 call(
                     callee,
                     matches!(e, Expr::New { .. }),
                     args,
-                    &|i| kind_of(&args[i], var),
+                    &|i| kind_of(&args[i], var, accessors),
                     var,
+                    accessors,
                 )
                 .is_some()
-                    && walk(fn_, var)
-                    && args.iter().all(|a| walk(a, var))
+                    && walk(read, var, accessors)
+                    && args.iter().all(|a| walk(a, var, accessors))
+            }
+            Expr::FieldAccess { obj, field } => {
+                let receiver = kind_of(obj, var, accessors);
+                let key = access(receiver, Some(field), Kind::Unknown);
+                !reads_accessor(accessors, receiver, key) && walk(obj, var, accessors)
+            }
+            Expr::IndexAccess { arr, idx } => {
+                let constant = constant_key(idx);
+                let receiver = kind_of(arr, var, accessors);
+                let key = access(receiver, constant.as_deref(), kind_of(idx, var, accessors));
+                !reads_accessor(accessors, receiver, key)
+                    && walk(arr, var, accessors)
+                    && walk(idx, var, accessors)
             }
             _ => {
                 let mut ok = true;
-                e.for_each_child(&mut |c| ok = ok && walk(c, var));
+                e.for_each_child(&mut |c| ok = ok && walk(c, var, accessors));
                 ok
             }
         }
     }
     let mut ok = true;
-    body.for_each_expr(&mut |e| ok = ok && walk(e, &inner));
+    body.for_each_expr(&mut |e| ok = ok && walk(e, &inner, accessors));
     ok
 }
 
 /// The kind of `e` read syntactically, a name's kind given by `var`.
-pub fn kind_of(e: &Expr, var: &dyn Fn(&str) -> Kind) -> Kind {
+pub fn kind_of(e: &Expr, var: &dyn Fn(&str) -> Kind, accessors: &AccessorNames) -> Kind {
     match e {
         Expr::Lit(p) => lit(p),
         Expr::Var(v) => var(v),
         Expr::ArrayLit { .. } => Kind::Array,
-        Expr::IndexAccess { arr, idx } => element(kind_of(arr, var), idx),
-        Expr::TSAnnotated(inner) => kind_of(inner, var),
-        Expr::BinOp { op, lhs, rhs } => binop(op, kind_of(lhs, var), kind_of(rhs, var)),
+        Expr::IndexAccess { arr, idx } => element(kind_of(arr, var, accessors), idx),
+        Expr::TSAnnotated(inner) => kind_of(inner, var, accessors),
+        Expr::BinOp { op, lhs, rhs } => binop(
+            op,
+            kind_of(lhs, var, accessors),
+            kind_of(rhs, var, accessors),
+        ),
         Expr::UnaryOp { op, .. } => unary(op),
-        Expr::Call { fn_, args } | Expr::New { fn_, args, .. } => {
-            let callee = Callee::of(fn_, &mut |x| kind_of(x, var));
+        Expr::Call { fn_, args, .. } | Expr::New { fn_, args, .. } => {
+            let callee = Callee::of(fn_, &mut |x| kind_of(x, var, accessors));
             call(
                 callee,
                 matches!(e, Expr::New { .. }),
                 args,
-                &|i| kind_of(&args[i], var),
+                &|i| kind_of(&args[i], var, accessors),
                 var,
+                accessors,
             )
             .unwrap_or_default()
         }
@@ -451,6 +524,8 @@ pub fn binop(op: &BinOp, l: Kind, r: Kind) -> Kind {
         | BinOp::UShr => Kind::Num,
         BinOp::Eq
         | BinOp::Neq
+        | BinOp::LooseEq
+        | BinOp::LooseNeq
         | BinOp::Lt
         | BinOp::Gt
         | BinOp::Leq

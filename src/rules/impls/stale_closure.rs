@@ -1,6 +1,5 @@
 use crate::rules::RuleCtx;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
 
 use crate::{
     domains::impls::Stability,
@@ -8,7 +7,7 @@ use crate::{
         SourceRange,
         cfg::CFG,
         expr::Expr,
-        free_vars::{AccessPath, compute_free_paths, dep_paths, path_covered},
+        free_vars::{AccessPath, compute_free_paths_indexed, dep_paths_indexed, path_covered},
         hooks::{Arity, HookEntry},
         types::{HookLabel, Var},
     },
@@ -18,9 +17,8 @@ use crate::ir::ComponentId;
 use crate::rules::helpers::eval_in_exit_env;
 use crate::rules::{
     Certified, Diagnostic, EffectClass, MustResult, Rule, Severity, StaleCapture, Step, ValueClass,
-    all_setter_labels, collect_fn_bindings, collect_setter_calls_with_extra, fn_lit_binding,
-    may_written_slots, memo_val_labels, must_stale_capture, resolve_setter_aliases,
-    state_slot_name, state_val_labels,
+    all_setter_labels, fn_lit_binding, may_written_slots, memo_val_labels, must_stale_capture,
+    resolve_setter_aliases, setter_targets_with_paths, state_slot_name, state_val_labels,
 };
 
 /// Fires when a callback that **outlives the render** — handed to
@@ -121,14 +119,19 @@ struct RootSlots {
     /// (`VersionedTop`) — real staleness, but nothing local to prove
     /// against: Warning ceiling, no never-written kill.
     foreign: bool,
+    /// Read through an element of a stored array (`t[0]` of `const t =
+    /// useState(0)`, #288): a may reading, the array may be mutated, so the
+    /// capture is no proof (Warning ceiling).
+    stored: bool,
 }
 
 fn resolve_root_slots(
-    root: &Var,
+    path: &AccessPath,
     state_vals: &HashMap<Var, HookLabel>,
     component: ComponentId,
     comp_result: &crate::engine::AnalysisResult<crate::domains::StateValue>,
 ) -> RootSlots {
+    let root = &path.root;
     // Syntactic first: state bindings and their aliases. This is what makes
     // primitive slots work — a counter's product value has a ⊥ reference
     // slot, so the read-side `Versioned` conversion (ADR-017) never applies
@@ -137,6 +140,24 @@ fn resolve_root_slots(
         return RootSlots {
             local: vec![l],
             foreign: false,
+            stored: false,
+        };
+    }
+    // The same chain through a stored array's elements: `t[0]` reads the
+    // slot, `t[1]` (its setter) none, a whole `t` every slot it keeps.
+    let head = match path.segments.first().and_then(|s| s.parse::<i32>().ok()) {
+        Some(i) => Expr::IndexAccess {
+            arr: Box::new(Expr::Var(root.clone())),
+            idx: Box::new(Expr::Lit(crate::ir::expr::Prim::Int(i))),
+        },
+        None => Expr::Var(root.clone()),
+    };
+    let stored = crate::ir::bindings::stored_slot_values(&head, &comp_result.render_cfg);
+    if !stored.is_empty() {
+        return RootSlots {
+            local: stored,
+            foreign: false,
+            stored: true,
         };
     }
     // Domain fallback: memo chains, destructured props, object state
@@ -146,6 +167,7 @@ fn resolve_root_slots(
         return RootSlots {
             local: vec![],
             foreign: false,
+            stored: false,
         };
     }
     let val = eval_in_exit_env(&Expr::Var(root.clone()), comp_result);
@@ -158,15 +180,21 @@ fn resolve_root_slots(
                 .collect();
             local.sort_unstable();
             let foreign = labels.iter().any(|(c, _)| *c != component);
-            RootSlots { local, foreign }
+            RootSlots {
+                local,
+                foreign,
+                stored: false,
+            }
         }
         Stability::VersionedTop => RootSlots {
             local: vec![],
             foreign: true,
+            stored: false,
         },
         _ => RootSlots {
             local: vec![],
             foreign: false,
+            stored: false,
         },
     }
 }
@@ -220,9 +248,12 @@ impl Rule for StaleClosure {
         let state_vals_render = resolve_setter_aliases(render_cfg, &state_val_labels(render_cfg));
         let memo_vars = resolve_setter_aliases(render_cfg, &memo_val_labels(render_cfg));
 
-        let setter_labels = all_setter_labels(comp_result);
+        // The setters by name, which the Error's proof takes, and with the
+        // member paths the converged values put one behind (`t[1]`, #288),
+        // which every may reading takes.
+        let named_setters = all_setter_labels(comp_result);
+        let setter_labels = setter_targets_with_paths(comp_result);
         let written = may_written_slots(render_cfg, &comp_result.hooks, &setter_labels);
-        let render_fns = collect_fn_bindings(render_cfg);
         let callback_hooks: HashMap<HookLabel, (&[Var], &CFG)> = comp_result
             .hooks
             .iter()
@@ -259,16 +290,14 @@ impl Rule for StaleClosure {
                 continue;
             }
             // The coverage view, not every visible element: a flattened
-            // spread covers its contents, never its own identity.
+            // spread covers its contents, never its own identity. A constant
+            // index names its element on both sides: `[t[0]]` covers a read
+            // of `t[0]`, and a call of `t[1]` is no read of `t[0]` (#288).
             let declared = deps
                 .list()
-                .map_or_else(Vec::new, |l| dep_paths(&l.covering()));
+                .map_or_else(Vec::new, |l| dep_paths_indexed(&l.covering()));
             let mount_only = matches!(deps.list(), Some(l) if l.arity == Arity::Exact(0));
 
-            let mut fn_bodies = collect_fn_bindings(body_cfg);
-            for (k, v) in &render_fns {
-                fn_bodies.entry(k.clone()).or_insert_with(|| Arc::clone(v));
-            }
             // The engine's registration relation (ADR-034), not a second scan.
             let regs: Vec<_> = comp_result
                 .registrations
@@ -297,7 +326,7 @@ impl Rule for StaleClosure {
                 ) else {
                     continue;
                 };
-                let mut caps: Vec<AccessPath> = compute_free_paths(cb_body)
+                let mut caps: Vec<AccessPath> = compute_free_paths_indexed(cb_body)
                     .into_iter()
                     .filter(|p| !params.contains(&p.root))
                     .collect();
@@ -307,7 +336,7 @@ impl Rule for StaleClosure {
                     if path_covered(&path, &declared) {
                         continue;
                     }
-                    let roots = resolve_root_slots(&path.root, &state_vals, component, comp_result);
+                    let roots = resolve_root_slots(&path, &state_vals, component, comp_result);
                     if roots.local.is_empty() && !roots.foreign {
                         continue;
                     }
@@ -331,22 +360,32 @@ impl Rule for StaleClosure {
                         .filter(|v| setter_labels.targets(v).all(|l| live_local.contains(&l)))
                         .cloned()
                         .collect();
+                    // The callback's writes are the call relation's (ADR-047).
                     let self_write = if slot_setters.is_empty() {
                         None
                     } else {
-                        let mut calls =
-                            collect_setter_calls_with_extra(cb_body, &slot_setters, &fn_bodies);
-                        calls.sort_by_key(|c| c.span.map_or((u32::MAX, u32::MAX), |r| r.pos_key()));
-                        calls
-                            .first()
-                            .and_then(|c| setter_labels.targets(&c.var).next().map(|l| (l, c.span)))
+                        let mut writes: Vec<_> =
+                            crate::engine::setters::body_writes(comp_result, cb_body)
+                                .into_iter()
+                                .filter(|w| w.slot.0 == component && live_local.contains(&w.slot.1))
+                                .collect();
+                        writes
+                            .sort_by_key(|w| w.span.map_or((u32::MAX, u32::MAX), |r| r.pos_key()));
+                        writes.first().map(|w| (w.slot.1, w.span))
                     };
 
                     // The whole Error claim is one proof (#142): a proof of
                     // one conjunct (the registration's reach) is not enough.
+                    // A slot read or written through a stored array is a may
+                    // reading, no conjunct of it (#288).
+                    let sure_setters: HashSet<Var> = slot_setters
+                        .iter()
+                        .filter(|v| named_setters.contains(v))
+                        .cloned()
+                        .collect();
                     let proof =
-                        match must_stale_capture(reg, deps, body_cfg, cb_body, &slot_setters) {
-                            MustResult::All(c) => Some(c),
+                        match must_stale_capture(reg, deps, body_cfg, cb_body, &sure_setters) {
+                            MustResult::All(c) if !roots.stored => Some(c),
                             _ => None,
                         };
                     let severity = if proof.is_some() {
@@ -365,7 +404,7 @@ impl Rule for StaleClosure {
                     let candidate = PathFinding {
                         severity,
                         proof,
-                        registrar: reg.display.clone(),
+                        registrar: reg.shown(ctx.source_names()),
                         reg_span: reg.span,
                         resolved_via: via.map(str::to_string),
                         slots: live_local.clone(),

@@ -53,19 +53,34 @@ that writes it (see *Cross-file limits*).
   npm-package callee (`pkgFn(() => setN(1))`, `new IntersectionObserver(cb)`), a hook it does not
   inline (`useTable({ onClick })`), React through an element's `on*` or `ref`, an object the heap
   does not place (`props.box.current = cb`), what such a function returns, a callback past the inlining
-  depth, and every `useCallback` body, whose value the heap does not follow — runs with the
+  depth, and every `useCallback` body — runs with the
   handlers, at an unknown time [#254](https://github.com/rboudrouss/reactant-analyzer/issues/254):
   its writes reach the state store as possible writes, never as writes of the body that handed it
   over. So a loop it closes in an effect is claimed only through the slot values it moves, as a
-  Warning [#19](https://github.com/rboudrouss/reactant-analyzer/issues/19). The writer relation reads one
+  Warning [#19](https://github.com/rboudrouss/reactant-analyzer/issues/19). A builtin method the
+  analysis does not model receives the call's receiver too
+  [#330](https://github.com/rboudrouss/reactant-analyzer/issues/330): `h.bind(null)`,
+  `h.call(null)`, `[h].slice()`, `[h].filter(f)`, `[h].values()` hand `h` over, so it runs at an
+  unknown time even when the result is never called (a Warning React may not confirm), and a
+  write through `bind`, `call` or `apply` is never an Error. Only `at`, `find`, `findLast`, `pop`,
+  `shift`, `get` (an entry of the receiver) and `sort`, `reverse`, `fill`, `copyWithin` (the
+  receiver, its positions lost) are read for what they return. The builtins are known by method
+  name; a method of code the analysis does not see (`props.onPick(x)`, a library object's) is
+  handed its arguments only, not the object it is called on. The writer relation reads one
   the render hands to such a callee or hook — a literal, or a name bound to one or to a
   `useCallback` value, or one held by an object or array it hands over — as a possible render write
   [#262](https://github.com/rboudrouss/reactant-analyzer/issues/262),
   [#264](https://github.com/rboudrouss/reactant-analyzer/issues/264). React's
   `useEffectEvent` is the exception: its argument — a literal, or a name bound to one or to a
   `useCallback` value — runs where a name bound once to the function it hands back is called, as a
-  `useCallback` value does; the value itself stays opaque, so a call through it React would reject
-  during render is still read as running the argument. A few package hooks have a timing of their
+  `useCallback` value does, and a call through its value runs the argument: surely outside a
+  render, when the argument is one closure; during a render React throws instead, and such a call
+  is still read as possibly running it, never as a certain write. A function a hook hands back is where every
+  reader finds a closure, wherever the value goes (a prop a child calls, #320): a `useCallback`
+  literal's closure, `useCallback(f, deps)`'s `f`, what a memo returns, `useEffectEvent`'s
+  argument. A package's wrapper with no summary (`useCallbackRef`, a library's `useEvent` or
+  `useEffectEvent`) is a hook the analysis does not inline: its argument runs with the handlers,
+  and a write through it is never an Error. A few package hooks have a timing of their
   own (`engine::timing`): `use-debounce`'s `useDebouncedCallback(fn, wait)` runs `fn` deferred
   when it gets no options and its result is only called, cancelled or listed in deps (a `flush`, a
   `leading` option or a result handed elsewhere keep it of unknown timing), and `usehooks-ts`'s
@@ -83,16 +98,37 @@ that writes it (see *Cross-file limits*).
   local function's parameter (`const f = (g) => g(); f(() => setN(1))`) or an array method's
   callback parameter (`fs.forEach((f) => f())`, the parameter being the array's entries) runs
   where it is called [#253](https://github.com/rboudrouss/reactant-analyzer/issues/253), a possible
-  write: the call is not proven to be of that one closure. In render, `setter-in-render` does
-  not read the callback parameter, so `[() => setN(1)].forEach((f) => f())` there is not its
-  finding. Utility *inlining* is statement-position only [#52](https://github.com/rboudrouss/reactant-analyzer/issues/52). A setter
+  write: the call is not proven to be of that one closure. The writer rows every loop rule reads
+  are the fixpoint's own answer (the call relation, ADR-047): a call writes the setters and runs
+  the bodies its evaluations saw, joined over every context, and a value handed to code the
+  analysis does not run writes, at that point, every setter it reaches and runs every closure it
+  reaches, of unknown timing. A row is keyed by (call site, slot, region): one slot spelled two
+  ways at one site is one row, printed with what the source wrote there, else the slot's own
+  setter. **A helper called with one setter in one place and another elsewhere writes either at
+  every call of it**, so a write through it is a Warning, never an Error; an Error through a
+  helper's parameter needs every call of the helper to pass the one setter. Past the walk's depth
+  the writes of a body still count, unplaced. `setter-in-render`, the cross-component arm of
+  `infinite-loop` and every rule's own body scan (`stale-closure`, the mount guards, a pack's
+  `body_setter_calls`, `calls` and `reads`) read the same relation: no rule matches a setter by
+  name. `setter-in-render` and the cross-component arm read a JSX prop's or a registered
+  listener's write as the event handler it is even in a program that dispatches events itself,
+  where the loop rules read it as ⊤ ([#219](https://github.com/rboudrouss/reactant-analyzer/issues/219)):
+  a render that dispatches an event to such a listener is not their finding. A child component
+  the analysis does not resolve is read as calling the props it is handed on an event only
+  [#325](https://github.com/rboudrouss/reactant-analyzer/issues/325). A rest parameter (`(...fs)`) and `arguments` are the arrays of the call's arguments
+  [#324](https://github.com/rboudrouss/reactant-analyzer/issues/324); from a spread on an argument
+  may sit at any position, and `fs.length` / `arguments.length` are not modelled, so a guard on
+  them never rules a write out. Utility *inlining* is statement-position only [#52](https://github.com/rboudrouss/reactant-analyzer/issues/52). A setter
   or a closure called through a call that returns it (`get()(x)`, `makeSetter()(x)`,
   `api.get()(x)`) is written where the call's value is read: off the converged envs of the render,
   an effect or a handler [#46](https://github.com/rboudrouss/reactant-analyzer/issues/46), and off a
-  run of a body that keeps none — a memo or callback body, a closure nested in any body (a `forEach`
-  callback, a `.then` continuation) — from the env it is reached from
-  [#246](https://github.com/rboudrouss/reactant-analyzer/issues/246). `setter-in-render` still reads
-  the render's own names only: `xs.forEach(() => get()(x))` in render is not its finding. A setter or `dispatch` *call* in any expression
+  run of the body by the fixpoint itself, at the call
+  [#246](https://github.com/rboudrouss/reactant-analyzer/issues/246),
+  [#314](https://github.com/rboudrouss/reactant-analyzer/issues/314). That value is the call's in
+  every position, not only under a `let` — a member, an element, an argument, a prop, a callee
+  ([#333](https://github.com/rboudrouss/reactant-analyzer/issues/333)) — joined over the call's
+  runs in the pass, and unknown where no body ran (a callee the analysis does not see, past the
+  inlining budget). A setter or `dispatch` *call* in any expression
   position, `wrap(setN(1))`, a `&&` or ternary arm, a branch condition, a JSX prop, writes its slot
   [#169](https://github.com/rboudrouss/reactant-analyzer/issues/169); it is the callee's *inlining* that is not.
 - **What a custom hook returns reaches the caller.** A setter, a slot value or a closure a hook
@@ -139,21 +175,32 @@ that writes it (see *Cross-file limits*).
   [#30](https://github.com/rboudrouss/reactant-analyzer/issues/30), and `redundant-set-state` on a reference: the domain
   knows a reference is stable, not which one it is, so `setV(A)` while `v` holds `A` is not
   reported, the price of not reporting `setV(B)` [#179](https://github.com/rboudrouss/reactant-analyzer/issues/179).
+- A slot read through a stored pair (`const t = useState(0)` then `t[0]`, `const t = [v, setV]`)
+  is read off the array's elements, a reading the analysis does not prove (the array is an object
+  a body may mutate): `stale-closure` reports such a capture as a Warning, never an Error, where
+  the destructured `n` of the same program is an Error [#288](https://github.com/rboudrouss/reactant-analyzer/issues/288).
 - The guard proofs assume a call over held inputs returns the same value on every run. The
   reads-kill does not: a write whose value crosses a call not known pure (see *Which calls are
   functions of their inputs* below) is read as a function of its inputs only when that value is
   one value, and one crossing any call only when it is no new reference; a reference versioned by
   what the write reads passes both
   [#218](https://github.com/rboudrouss/reactant-analyzer/issues/218),
-  [#224](https://github.com/rboudrouss/reactant-analyzer/issues/224). The convergence proof also assumes
-  that a call it cannot see into does not navigate: a router hook's result (`useSearchParams`,
-  `useParams`, `usePathname`, `useLocation`) holds still across the loop unless some render,
-  effect, memo or callback body of the program visibly navigates — a call through what a summary
-  names a navigator (`useNavigate()`'s result, `router.push`/`replace`, the setter of react-router's
-  `useSearchParams` tuple, under any name the bindings reach), `history.*`, `location.assign`, a
-  write to `location`, a bare `navigate()`/`redirect()`, a `<Navigate/>`. A navigation hidden in
-  an opaque callee, or through a router object handed down as a prop, is not seen
-  [#161](https://github.com/rboudrouss/reactant-analyzer/issues/161).
+  [#224](https://github.com/rboudrouss/reactant-analyzer/issues/224).
+- **Library stores are one slot the analysis does not own** (ADR-046). A held router hook result
+  (`useSearchParams`, `useParams`, `usePathname`, `useLocation`, `useMatch`) is a read of that
+  slot, and a visible mover is a write of it, in every phase but a handler: a call through what a
+  summary names a navigator (`useNavigate()`'s result, `router.push`/`replace`, the setter of
+  react-router's `useSearchParams` tuple, under any name the bindings reach), `history.*`,
+  `location.assign`, a write to `location`, a bare `navigate()`/`redirect()`, a `<Navigate/>`. An
+  effect on a held value that navigates is a possible loop, a Warning, never an Error
+  [#298](https://github.com/rboudrouss/reactant-analyzer/issues/298). Assumed: a call the analysis
+  cannot see into does not write the store, and neither does a router object handed down as a
+  prop; the convergence proof reads a held value as holding still across the loop when no body
+  writes the store and its hook's arguments hold
+  [#161](https://github.com/rboudrouss/reactant-analyzer/issues/161). Still missed: a loop through
+  the store and a render alone (`navigate(…)` in a render body, no effect), outside the churn graph
+  like `setter-in-render`'s; and a store write's effect on a child's props in the convergence and
+  mount proofs, which read the props as holding across it.
 - It also assumes a `useMemo` or `useCallback` with an exact deps list over held values hands back
   its cached value. React documents the cache as a performance hint, not a guarantee: a React that
   dropped it would recompute a fresh value the proof reads as held
@@ -162,7 +209,13 @@ that writes it (see *Cross-file limits*).
   outside closures, on every path or behind guards that hold still, without a `key` that moves,
   and its parent stays mounted in turn ([#213](https://github.com/rboudrouss/reactant-analyzer/issues/213)).
   A child rendered from a `.map` callback (any closure) is read as remounting, the fail-closed
-  side [#162](https://github.com/rboudrouss/reactant-analyzer/issues/162).
+  side [#162](https://github.com/rboudrouss/reactant-analyzer/issues/162). So is one an element
+  the tree cannot place may mount: a component some module reads as a value (`c ? A : B`,
+  `{ A }`, `[A]`, a lazy `import()`), one whose name several components share, every component
+  of a file an element names under a definition the table does not resolve, one that renders
+  itself [#313](https://github.com/rboudrouss/reactant-analyzer/issues/313). A component
+  referenced only by code the analysis does not read (a file it skipped, a `require`) is still
+  read as a root.
 - `x.slice()` and `x.concat()` are proven fresh only when `x` can only be an object: on a string they
   return a primitive, so a receiver of unknown kind (a prop, a nullable value) leaves the result
   unknown [#22](https://github.com/rboudrouss/reactant-analyzer/issues/22).
@@ -175,13 +228,102 @@ that writes it (see *Cross-file limits*).
   a spread of a value the heap does not place may overwrite every member before it, which stay
   possible. A computed key resolves when a literal spells it (`{ [1]: a }`, `o["k"]`) or, in a
   read or a destructuring, when its value is one string (`const { [k]: v } = o`); in an object
-  literal it may be any member. Not modeled: an array entry past a spread (its index is ⊤), a
-  spread argument `f(...args)`, kept for its reads, so a setter forwarded through
-  `f(...handlers)` is not seen, nor do the closures it holds escape, and a parameter's default as
-  the parameter's value outside a spliced hook [#76](https://github.com/rboudrouss/reactant-analyzer/issues/76).
-  Because the call keeps no trace of the spread, the arguments after it may sit at other
-  positions: a local function's parameters are bound to its arguments (#253), and the arguments
-  still run with the handlers.
+  literal it may be any member. Not modeled: an array entry past a spread (its index is ⊤)
+  [#76](https://github.com/rboudrouss/reactant-analyzer/issues/76). A spread argument
+  `f(...args)` is kept, marked: a parameter from it on may hold any entry of it or any later
+  argument, and a callee the analysis does not see receives its entries as it receives an
+  argument's. A setter held in a container handed to such a callee (`foo(arr)`, `foo([setN])`)
+  is a possible write there, as the store already had it
+  [#322](https://github.com/rboudrouss/reactant-analyzer/issues/322). A parameter's default is its value when the argument is omitted or
+  `undefined`, as JavaScript stores it.
+- A getter or a setter of an object literal runs at every read or write of its member
+  [#321](https://github.com/rboudrouss/reactant-analyzer/issues/321): where the heap places the
+  object (a literal of the render, a memo's or a call's returned literal, a prop literal), the read
+  is what the getter's runs returned, and a write runs the setter with the value. Its body also
+  runs at an unknown time, since anything holding the object may read the member (a spread, a
+  library): a write in it is a possible write of the render the literal is in, never an Error, and
+  a spread's copy holds what the getter may return, a new object included. A read or a write the
+  analysis evaluates is a call of the accessors it runs, in its own region and phase, wherever
+  the accessor was defined [#337](https://github.com/rboudrouss/reactant-analyzer/issues/337):
+  the call relation anchors it at its statement, since a member access has no id, so every
+  access of one statement (or of statements at one position: a spliced copy's, or several a
+  lowering gave none) runs every accessor any of them ran there, never placed (a Warning, never
+  an Error). A member read off an object the heap does not place —
+  a module binding, an instance of a class the analysis does not see, what unknown code returns —
+  or a member a placed object does not hold (its
+  prototype's) is a call the analysis cannot see when some accessor of the analysed files defines
+  that name: a getter or setter of a literal or a class, a descriptor of `Object.defineProperty`
+  and its kin, any name under a computed accessor key or a `Proxy` trap
+  [#334](https://github.com/rboudrouss/reactant-analyzer/issues/334). Such a read may be a new
+  value at any render (a Warning, never an Error) and the receiver escapes there. The names are
+  program-wide: one getter named `length` in a test file makes every `x.length` off an unplaced
+  value a possible change, a key no constant names (`xs[i]`) may be any accessor's unless it is
+  known to be a number and no accessor's name spells one, and one `Proxy` (or computed accessor
+  key) anywhere makes every name an accessor's in every component, whether or not its module is
+  ever loaded with that component's: no narrowing by the import graph is sound, since a module
+  nothing imports may be loaded beside it (a test setup file, a framework route) and an object
+  reaches a render through a global or a store
+  [#336](https://github.com/rboudrouss/reactant-analyzer/issues/336). Only the `length` of an
+  array literal or a string is never an accessor's. A read off the props object of a child the
+  analysis renders, or off a `useRef` object, both plain objects React builds, may run only an
+  accessor a descriptor installs (on it or on `Object.prototype`, whatever the target, since the
+  analysis does not know it) or one of a prototype the program sets: one descriptor installed
+  under a name no constant spells (a polyfill looping over property names) makes every such read
+  a possible call again. The props of a component no element of the analysis renders, the state
+  and context values and a callback's arguments keep the program-wide reading. Not seen:
+  a getter defined by code the analysis does not read (a library, a skipped file), which is still
+  read as the receiver's member, a prototype set under a key no constant spells (`o[k] = p`) or
+  by `Object.assign` from an object with an own `__proto__`, and a state setter kept by unseen
+  code past the point it escaped and called later from an accessor or a method
+  [#335](https://github.com/rboudrouss/reactant-analyzer/issues/335).
+- **Classes.** A `new` of a class the program defines — in the body, at the top level of a module,
+  or imported from one — runs its constructor with its arguments, on an instance placed at the
+  `new` whose methods, accessors and field initializers are the class's bodies, `this` bound to the
+  instance; a parent the program defines constructs the same instance through `super(…)`, and a
+  constructor's `return` of an object is what the `new` evaluates to
+  [#335](https://github.com/rboudrouss/reactant-analyzer/issues/335). What stays as before:
+  a `new` of a class the analysis does not see (a library's, a global's) is a new reference whose
+  members are ⊤, handed its arguments [#311](https://github.com/rboudrouss/reactant-analyzer/issues/311);
+  a class that extends one is open (any member) and that parent holds the instance; a static
+  member called off a module's class (`K.create()`) is code the analysis does not run; a module
+  class reached through a `let` binding or a name the component rebinds is not resolved. Every
+  instance gets its own copy of the methods, so two `new`s of a class give `k1.run !== k2.run`
+  where the language shares one function; a parent's constructor that calls a method the child
+  overrides runs both bodies, and a method named like a mutating builtin (`set`, `add`, `push`)
+  also reads as one on the instance. An accessor's body runs at an unknown time from where the
+  instance is built, as an object literal's does (#321), and where a read or a write runs it
+  [#337](https://github.com/rboudrouss/reactant-analyzer/issues/337).
+- **`this`.** In a non-arrow function `this` is what the call binds it to
+  [#338](https://github.com/rboudrouss/reactant-analyzer/issues/338): the receiver of a method call
+  (`o.m()`, `o[k]()`), the object an accessor reads or writes, and
+  anything for any other call — a plain call, a callback a builtin runs, an inlined utility, a run
+  by code the analysis does not see; an arrow reads its enclosing function's. That last reading
+  is sound because a plain call's `this` is `undefined` in a module and the global object in
+  sloppy code, and what `call`, `apply`, `bind` or code the analysis does not see hand a function
+  as `this` escaped there — except a receiver: a method call the analysis does not resolve to a
+  body (a module function or a static method read as a member, a library's method) hands that
+  code its arguments, not its receiver, so a setter only the receiver holds is not reported
+  [#340](https://github.com/rboudrouss/reactant-analyzer/issues/340). Handing it would flood: a
+  hook's `useCallback` returned in an object reads as no body through the member. What stays as
+  before: a class's instance member keeps the instance as `this` wherever it is called
+  (`const f = k.run; f()` too); `super` outside a class's instance member is opaque; a setter
+  written into the global object does not escape
+  [#339](https://github.com/rboudrouss/reactant-analyzer/issues/339). A function component that
+  reads `this` reads a value that may change, so an effect reading it may get a `missing-deps`
+  Warning for `this`.
+- **Module bindings.** Every top-level binding of an analysed module is one slot shared by every
+  render of every component [#335](https://github.com/rboudrouss/reactant-analyzer/issues/335):
+  what a body stores there — the binding itself, or a member of the object it holds — joins
+  into it, and escapes, since code the analysis does not see may read it. A call of module code
+  the analysis does not run (a module object's method, a module class's static member, a utility
+  called where it is not inlined, a function a binding holds), and a value called or handed on
+  by a binding's name, may call anything any module binding holds, in its own phase; so may a
+  read off a module binding that may run an accessor the analysis does not see (#337). The
+  slots are one pool for such a call, whatever module it reads. What stays as before: the value
+  a read of the binding binds, in a component other than the one that stored it, is not the
+  setter, so an alias there (`const s = setter; s()`) is not followed; a name a component declares anywhere is its
+  own, never the module's; a setter handed to code the analysis does not see, which that code
+  keeps (a library, a module function storing its argument), still runs where it escaped.
 - **Mount-coupled seeds.** `frozen-initial-state` drops to Info, hidden without `--info`, when every
   call site renders the consumer under a `key` built from the seeding prop, or under a guard built
   from it (`{msg && <Toast msg={msg}/>}`). Neither shape is a proof: a `msg` moving between two
@@ -189,7 +331,13 @@ that writes it (see *Cross-file limits*).
   an object `key` stringifies to a constant. The finding is downgraded, never deleted. The residual
   family, a caller that always remounts with a `key`, is [#136](https://github.com/rboudrouss/reactant-analyzer/issues/136).
   A guard on the feeding state itself (`switch (step.type)`), or one call site the feeder does not
-  reach (a story passing constants), caps a proven freeze at Warning.
+  reach (a story passing constants), caps a proven freeze at Warning. So does a slot one write of
+  which may run without an event, or store a name of the render: a sync the relation does not
+  recognise (an opaque deps list, a dep computed from the prop, another prop the same slot moves,
+  an unknown callee) is still a sync [#313](https://github.com/rboudrouss/reactant-analyzer/issues/313).
+  And the Error needs one call site in the feeding component that keeps an instance mounted: no
+  guard, no `key`, outside closures. A `key` or guard that happens to hold when the prop moves
+  (`key={label.id}` over a rename) is a Warning, since whether it holds is a value no proof reads.
 - **Per-call-site facts.** A child's result is its analysis under the join of every call site
   [#175](https://github.com/rboudrouss/reactant-analyzer/issues/175). The child is also
   re-analysed under each call site alone: a dep fresh through one parent is reported by
@@ -239,9 +387,17 @@ that writes it (see *Cross-file limits*).
   the analysis cannot see into, and a context value it cannot pin to its provider: either may be a
   new reference at every render (a package hook returning a fresh object per call loops), so
   `[useThing()]` or `[useContext(Ctx)]` is a possible re-run at every render, a Warning. Only a
-  hook summary that pins the result keeps it held, the router hooks' navigation-only values
-  [#294](https://github.com/rboudrouss/reactant-analyzer/issues/294), which reverses the hold
-  [#161](https://github.com/rboudrouss/reactant-analyzer/issues/161) assumed. A callback that only
+  hook summary that pins the result keeps it held: a router hook's held value is a read of the
+  store, which re-runs the effect when a body writes it (see *Library stores* above,
+  [#294](https://github.com/rboudrouss/reactant-analyzer/issues/294),
+  [#298](https://github.com/rboudrouss/reactant-analyzer/issues/298)). So may a dep that is a new
+  reference on one path and something else on another — `imported ?? {}`, `prop || []`,
+  `c ? CONST : {}`, or a memo such a dep recomputes whose body allocates — though nothing it is
+  computed from moved
+  [#304](https://github.com/rboudrouss/reactant-analyzer/issues/304), and an element read whose
+  index or key may select such an element (`arr[c ? 1 : 0]` over `[CONST, {}]`), off a name or
+  directly off a literal
+  [#307](https://github.com/rboudrouss/reactant-analyzer/issues/307). A callback that only
   names the ref or the binding in its body does not read it: its identity moves with its deps list
   [#227](https://github.com/rboudrouss/reactant-analyzer/issues/227). A dep that moves for another
   reason reads as held: a module binding written only behind a call the analysis cannot see into.
@@ -275,6 +431,25 @@ carries an Error.
   store a fresh reference on every dispatch; a reducer the analysis cannot reach (a prop, an
   unresolved import) stores ⊤ [#170](https://github.com/rboudrouss/reactant-analyzer/issues/170).
 - **`state-mutation`** on a DOM-typed prop whose type is imported from another file [#38](https://github.com/rboudrouss/reactant-analyzer/issues/38).
+  It is an Error only when one run of one body mutates the slot's object and then hands it to the
+  setter, each name certainly the slot's object (a render name bound to the read, a sole local
+  binding, an updater's untouched parameter); a mutation and a set inside one statement, or a
+  handler's local alias read from a closure nested in it, stay Warnings [#180](https://github.com/rboudrouss/reactant-analyzer/issues/180).
+- **A dep that is a new reference on one path** (`x ?? {}`, `c ? CONST : {}`) is a possible re-run
+  at every render even when the other path is always taken: a state the program only ever sets
+  to an array (`v == null ? [] : v`), a package export that is never nullish, or a known builtin's
+  result the value domain reads as an opaque value (`Math.max(a, b) ?? {}`,
+  [#305](https://github.com/rboudrouss/reactant-analyzer/issues/305))
+  [#304](https://github.com/rboudrouss/reactant-analyzer/issues/304). So is an element read under
+  an index or a key no constant names when one element it may select is fresh, even when the key
+  always selects a stable one: the key's values are not enumerated
+  [#307](https://github.com/rboudrouss/reactant-analyzer/issues/307). And so is `JSON.parse(text)`
+  when the text always encodes a primitive: its text is not read
+  [#306](https://github.com/rboudrouss/reactant-analyzer/issues/306).
+- **Optional chains** branch on every `?.` link that skips a call or an index, even when the left
+  side is never nullish (`setN?.(x)`, a local function, a callback prop every parent passes): a
+  write in the skipped part is a possible one, a Warning, not an Error
+  [#301](https://github.com/rboudrouss/reactant-analyzer/issues/301).
 - **The churn graph** keeps a cycle edge on a convergent slot when the proof cannot read what
   would settle it: a write site in another component, whose guards live in that component's
   bodies (the residual of [#39](https://github.com/rboudrouss/reactant-analyzer/issues/39)); a
@@ -296,10 +471,12 @@ carries an Error.
   controlled input mirrored through two slots (`setLocal(value)`, then `onChange(local)`). Never an
   Error: the Error still needs a new reference stored on all paths
   [#157](https://github.com/rboudrouss/reactant-analyzer/issues/157), or every write of the
-  slot moving it the same way by a nonzero integer from an integer start within ±2^50, a
-  write only a click, key or submit runs aside
+  slot moving it the same way by a nonzero integer from an integer start within ±2^50, an event
+  handler's write included: a reset only a click runs is a possible loop, since code the analysis
+  does not see may click (a computed `el[m]()`, a bound `click`, a library) in the step's own batch
   [#144](https://github.com/rboudrouss/reactant-analyzer/issues/144),
-  [#280](https://github.com/rboudrouss/reactant-analyzer/issues/280). Each proof reads only what
+  [#280](https://github.com/rboudrouss/reactant-analyzer/issues/280),
+  [#313](https://github.com/rboudrouss/reactant-analyzer/issues/313). Each proof reads only what
   it can certify: a slot read through a name bound to it on one arm only, or bound in any other
   body of the component (a closure, a hook body, a parameter), is not the slot, nor is it for
   `setter-in-render`'s adjust-during-render proof
@@ -308,6 +485,27 @@ carries an Error.
   [#209](https://github.com/rboudrouss/reactant-analyzer/issues/209); and a write that reads a slot
   its effect does not depend on keeps an edge from that slot, even when the read sits on an arm
   that never runs (`false ? s1 : 2`) [#204](https://github.com/rboudrouss/reactant-analyzer/issues/204).
+- **A write in a closure reads what the closure binds as unknown.** In an IIFE, a helper, a
+  callback, a timer or a cleanup, the closure's own locals and parameters, and the temps a `?:`,
+  `??` or `&&` there lowers to, are ⊤ in the value the write stores; through a helper called by
+  name, so is every name the calling body rebinds. `.then(() => setS(c ? 2 : 1))` is then a
+  possible loop where it settles [#310](https://github.com/rboudrouss/reactant-analyzer/issues/310).
+- **No promise and no iterator is modeled.** A call of a generator or an async function is a new
+  object whose contents are unknown; what a `yield` or a `return` hands out, and what an `await`
+  is given, is handed to code the analysis does not see, and an `await` is ⊤ or a new object.
+  A setter a generator yields is then written with any value: `for (const x of gen()) setN(x)`
+  over `function* gen() { yield 0; }` is a possible loop where it settles. An effect depending
+  on an awaited value (through a prop of the component that awaits it) is a possible loop even
+  where the `await` settles to the same object every time. A generator's body runs
+  where it is called, as far as its consumer may drive it, so a write in it is never certain
+  [#317](https://github.com/rboudrouss/reactant-analyzer/issues/317).
+- **A value an input hands the component is new only when the parent renders.** A fresh dep or
+  a fresh write is certain only where the component's own run allocates it (a literal, an
+  element, an allocating builtin, a member a constant names of one, a memo over one, a name
+  bound only to those); a prop, a context value or a hook result — through a destructuring
+  default too — is a possible loop, a Warning, even when the parent does re-render at every
+  commit. A default counts as allocated where the prop holds no reference
+  [#309](https://github.com/rboudrouss/reactant-analyzer/issues/309).
 - **An effect loop is an Error only when nothing in the batch can undo it.** React re-renders on
   the last value a batch leaves in the slot, and the engine does not order the writes of one batch
   (two effects, a layout effect and the passive effects React flushes before its re-render, a
@@ -391,7 +589,11 @@ carries an Error.
   revive each other's guard — and reads a guard inside a callback the render runs synchronously
   (`[1].forEach(() => { if (n !== 1) setN(1); })`) in the env of the callback's run
   [#269](https://github.com/rboudrouss/reactant-analyzer/issues/269); a callback handed to a
-  callee with no timing summary keeps its Warning.
+  callee with no timing summary keeps its Warning. The compared expression must hold across the
+  passes: a literal, a prop, a slot no render write moves, or a builtin the purity table knows
+  over those; a call of a function the analysis does not see (an import, a `RegExp`'s `exec`, a
+  prop's method) keeps the Warning, and so does a name of a callback's own scope
+  [#331](https://github.com/rboudrouss/reactant-analyzer/issues/331).
 - **A library hook's per-member contract is a table, not an inference.** `useForm()`, `useRouter()`
   and SWR's `mutate` have their stable members listed by name. A member that is not listed reads ⊤, so
   a library that adds one, or a library with no entry at all, keeps firing. `formState`, `data` and

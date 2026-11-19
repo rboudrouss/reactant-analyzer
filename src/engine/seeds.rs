@@ -75,6 +75,14 @@ pub struct SlotSeed {
     /// native rule's Error tier is built on — a no-sync claim is certain only
     /// when the setter stayed home.
     pub setter_escapes: bool,
+    /// **Must**: every write of the slot runs only on an event (a handler
+    /// row) and stores nothing but what its handler is handed (`e.target.value`,
+    /// a constant), never a name of the render (#313). Then no write re-syncs
+    /// the slot to the prop, whatever runs it: the positive proof the Error
+    /// tier needs, where [`SeedSync::NoneSeen`] only says no sync was seen (an
+    /// effect gated by an opaque list or by a value the prop moves, a write
+    /// through a callee the analysis does not see, do re-sync).
+    pub only_on_events: bool,
 }
 
 /// Every prop-seeded slot of the component, with its sync verdict.
@@ -144,6 +152,21 @@ pub(crate) fn collect_slot_seeds(
         });
 
         let escapes = setter_escapes(render_cfg, hooks, &aliases);
+        let only_on_events = rows().all(|w| {
+            let WriterRegion::Handler(l) = w.region else {
+                return false;
+            };
+            let params = hooks.iter().find_map(|h| match h {
+                HookEntry::Handler { label, params, .. } if *label == l => Some(params),
+                _ => None,
+            });
+            w.phase == WriterPhase::Handler
+                && w.written.expr.as_ref().zip(params).is_some_and(|(e, ps)| {
+                    let mut read = HashSet::new();
+                    crate::ir::free_vars::collect_used_vars(e, &mut read);
+                    read.iter().all(|v| ps.contains(v))
+                })
+        });
 
         for seed in seeds {
             // Per-seed: an effect whose declared deps cover THIS seed's path
@@ -170,6 +193,7 @@ pub(crate) fn collect_slot_seeds(
                 path: seed.orig,
                 sync,
                 setter_escapes: escapes,
+                only_on_events,
             });
         }
     }

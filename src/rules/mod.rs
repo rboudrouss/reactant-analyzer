@@ -27,14 +27,14 @@ pub use api::diagnostic::{Diagnostic, Severity};
 pub use api::query::{
     Certified, CleanupVerdict, ConditionalHookCall, DominatesAllExits, EffectCycleProof,
     ExitDominance, InitSetterCall, May, Motion, MovingFeeder, MustResult, OnAllPaths, OptionKind,
-    OptionSpec, Provenance, ReturnsVerdict, RuleConfig, RuleCtx, SameRefMutation, StabilityVerdict,
-    StaleCapture, classify_motion, cleanup_verdict, may_change_of, must_dominates_all_exits,
-    must_frozen_seed, must_init_calls_setter, must_on_all_paths, must_same_ref_mutation,
-    must_setter_on_all_paths, must_stale_capture, returns_verdict_of, stability_verdict_of,
+    OptionSpec, Provenance, RefSite, ReturnsVerdict, RuleConfig, RuleCtx, SameRefMutation,
+    SetterCall, StabilityVerdict, StaleCapture, classify_motion, cleanup_verdict, may_change_of,
+    must_dominates_all_exits, must_frozen_seed, must_init_calls_setter, must_on_all_paths,
+    must_same_ref_mutation, must_setter_on_all_paths, must_stale_capture, returns_verdict_of,
+    stability_verdict_of,
 };
 pub use api::witness::{EffectClass, Note, ResolveTarget, Step, ValueClass};
 pub use docs::{RULE_DOCS, RuleDoc, rule_doc};
-pub use helpers::setters::{SetterCall, collect_setter_calls, collect_setter_calls_with_extra};
 pub use impls::{
     AlwaysUnstableDeps, AnalysisLimitInfo, ConditionalHook, DerivedState, FrozenInitialState,
     InfiniteLoop, LazyInit, MissingCleanup, MissingDeps, RedundantSetState, ServerComponentHook,
@@ -45,12 +45,10 @@ pub use registry::{ComponentFindings, OverrideEntry, RegistryError, RuleOverride
 
 // Internal vocabulary shared by api/helpers/impls, re-exported at its
 // historical paths so call sites stay `crate::rules::X`.
+pub(in crate::rules) use helpers::setters::may_written_slots;
 pub(crate) use helpers::setters::{
     all_setter_labels, hook_val_labels, memo_val_labels, must_alias_scopes, must_state_vals,
-    resolve_setter_aliases, setter_var_labels, state_val_labels,
-};
-pub(in crate::rules) use helpers::setters::{
-    collect_fn_bindings, cross_component_setters, may_written_slots, setter_reassigned_before_call,
+    resolve_setter_aliases, setter_targets_with_paths, setter_var_labels, state_val_labels,
 };
 pub(crate) use helpers::{
     ConvergedEval, arg_is_call_free, collect_callees, describe_value, eval_in_stores,

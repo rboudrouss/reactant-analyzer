@@ -14,6 +14,7 @@ use crate::{
         expr::{Expr, SummaryValue},
         free_vars::{compute_free_vars, free_paths_and_pinned},
         hooks::HookEntry,
+        module::AccessorNames,
         stmt::Stmt,
         types::{BlockId, HookLabel, Var},
     },
@@ -43,6 +44,10 @@ pub struct Config {
     /// Utility-function inlining registry. When non-empty, statement-level calls
     /// to known utilities are spliced into the caller's CFG instead of opaque `Top`.
     pub function_registry: FunctionRegistry,
+    /// The construction body of every class the program's modules define at
+    /// top level, by `(file, class name)` and resolved as a utility is
+    /// (#335): what a `new` of one runs.
+    pub class_registry: FunctionRegistry,
     /// Cap on transitive utility-inlining depth, to bound CFG growth when
     /// utilities chain or recurse.
     pub max_inline_depth: usize,
@@ -54,6 +59,7 @@ impl Default for Config {
             widen_threshold: 3,
             summary_registry: SummaryRegistry::new(),
             function_registry: FunctionRegistry::new(),
+            class_registry: FunctionRegistry::new(),
             max_inline_depth: 8,
         }
     }
@@ -70,17 +76,34 @@ pub struct ProgramFacts {
     /// ([`written_names`](crate::engine::render_deps::written_names)): a
     /// module binding among them is a cell that moves with no slot (#224).
     pub written: HashSet<Var>,
+    /// The member names some accessor of the program defines, read off every
+    /// lowered file (#334): every heap of the program starts from it
+    /// ([`Heap::with_defined`]).
+    pub accessors: std::sync::Arc<AccessorNames>,
+    /// The program's module scope (#335): the top-level bindings of its
+    /// files, each a slot of a store no component owns.
+    pub modules: std::sync::Arc<crate::engine::ModuleScope>,
+    /// The program computes every analysis's relations once all are kept
+    /// ([`analyze_program_defining`]), the unreached components' too, so
+    /// the module scope's rows they read are the whole program's.
+    relations_after_all: bool,
 }
 
 impl ProgramFacts {
-    /// Every component, custom hook and utility of the program, as lowered.
+    /// Every component, custom hook and utility of the program, as lowered,
+    /// the accessors its files define and its module scope.
     pub(crate) fn of(
         components: &ComponentRegistry,
         hooks: &HookRegistry,
         utilities: &FunctionRegistry,
+        accessors: AccessorNames,
+        modules: crate::engine::ModuleScope,
     ) -> Self {
         use crate::engine::render_deps::written_in;
         let mut facts = Self::of_utilities(utilities);
+        facts.accessors = std::sync::Arc::new(accessors);
+        facts.modules = std::sync::Arc::new(modules);
+        facts.relations_after_all = true;
         facts.dispatches =
             crate::engine::registrations::program_dispatches_events(components, hooks, utilities);
         for c in components.all_components() {
@@ -99,7 +122,8 @@ impl ProgramFacts {
     }
 
     /// A lone component's program: the utilities it may call. Its own bodies
-    /// are read where it is analysed, after its hooks are inlined.
+    /// are read where it is analysed, after its hooks are inlined. It has no
+    /// files, so no accessor an object it does not place may hold.
     fn of_utilities(utilities: &FunctionRegistry) -> Self {
         ProgramFacts {
             dispatches: utilities
@@ -109,6 +133,9 @@ impl ProgramFacts {
                 .all_functions()
                 .flat_map(|f| crate::engine::render_deps::written_roots(&f.params, &f.body_cfg))
                 .collect(),
+            accessors: Default::default(),
+            modules: Default::default(),
+            relations_after_all: false,
         }
     }
 }
@@ -198,6 +225,23 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     program: &ProgramFacts,
     hook_registry: Option<&HookRegistry>,
 ) -> AnalysisResult<StateValue> {
+    // Every heap of the analysis knows what the program's accessors define
+    // (#334), the scratch ones seeding a value below included.
+    let initial_heap = initial_heap.with_defined(program.accessors.clone());
+    let _profile = crate::profile::on().then(|| {
+        let kind = match inter {
+            None => "intra",
+            Some(i) if i.probe => "probe",
+            Some(i) if i.call_stack.borrow().is_empty() => "root",
+            Some(_) => "child",
+        };
+        let closures = initial_heap
+            .iter()
+            .filter(|(_, v)| matches!(v, crate::domains::HeapValue::Fn { .. }))
+            .count();
+        let cells = initial_heap.iter().count();
+        crate::profile::analysis(comp_id, &comp.name, kind, cells as u64, closures as u64)
+    });
     let ComponentIR {
         file: comp_file,
         name: _,
@@ -226,7 +270,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     let module_env = {
         let mut seed_state = StateStore::bottom();
         let seed_memo: MemoStore<StateValue> = MemoStore::new();
-        let mut seed_heap = crate::domains::Heap::new();
+        let mut seed_heap = initial_heap.blank();
         let mut ac = AnalysisCtx::null(comp_id, &mut seed_state, &seed_memo, &mut seed_heap);
         let empty_env = AbstractEnv::bottom();
         let mut env = AbstractEnv::bottom();
@@ -291,6 +335,27 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         &mut splice_salt,
     );
 
+    // Every `new` of a class a module of the program defines runs its
+    // construction body (#335), resolved once every splice has landed.
+    let mut class_files: Vec<std::path::PathBuf> = Vec::new();
+    if expand_class_constructions(
+        &mut render_cfg,
+        &mut hooks,
+        &config.class_registry,
+        &comp_file,
+        &inline_regions,
+        config.max_inline_depth,
+        &mut splice_salt,
+        &mut class_files,
+    ) && let Some(inter) = inter
+    {
+        inter
+            .stats
+            .borrow_mut()
+            .inline_budget_exhausted
+            .insert(comp_id);
+    }
+
     // Returns-verdict of inline `FnLit` args of the custom hooks that survived
     // expansion — the opaque/summarized library calls (`useStore(s => …)`),
     // exactly the rows the Tier-A `args` edge navigates (ADR-023 §3). Params
@@ -304,7 +369,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         let mut out = HashMap::new();
         let mut seed_state = StateStore::bottom();
         let seed_memo: MemoStore<StateValue> = MemoStore::new();
-        let mut seed_heap = crate::domains::Heap::new();
+        let mut seed_heap = initial_heap.blank();
         let mut ac = AnalysisCtx::null(comp_id, &mut seed_state, &seed_memo, &mut seed_heap);
         for hook in &hooks {
             let HookEntry::Custom { label, args, .. } = hook else {
@@ -392,15 +457,71 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             _ => None,
         })
         .collect();
+    let hands_back = crate::engine::setters::effect_event_args(&hooks, &hook_provenance);
+    let hook_reads: HashMap<HookLabel, Vec<Expr>> = hooks
+        .iter()
+        .filter_map(|h| {
+            let (label, mut read, deps) = match h {
+                HookEntry::State { label, init, .. } | HookEntry::Ref { label, init, .. } => {
+                    (*label, vec![init.clone()], None)
+                }
+                HookEntry::Effect { label, deps, .. }
+                | HookEntry::Memo { label, deps, .. }
+                | HookEntry::Callback { label, deps, .. } => (*label, Vec::new(), Some(deps)),
+                HookEntry::Custom {
+                    label, args, deps, ..
+                } => (*label, args.clone(), Some(deps)),
+                HookEntry::Handler { .. } => return None,
+            };
+            match deps {
+                Some(crate::ir::hooks::DepsArg::List(list)) => {
+                    read.extend(list.elems.iter().cloned())
+                }
+                Some(crate::ir::hooks::DepsArg::Opaque(e)) => read.push(e.clone()),
+                _ => {}
+            }
+            Some((label, read))
+        })
+        .collect();
+    // The module bindings the component's bodies name (#335): those of its
+    // file, and of every file a body was spliced from, but the names it
+    // declares itself.
+    let module_names = {
+        let mut declared: HashSet<Var> = HashSet::from([comp_param.clone()]);
+        declared_names(&render_cfg, &mut declared);
+        for hook in &hooks {
+            declared.extend(hook.body_params().iter().cloned());
+            if let Some(body) = hook.body_cfg() {
+                declared_names(body, &mut declared);
+            }
+        }
+        let spliced = inline_regions
+            .render
+            .iter()
+            .chain(inline_regions.bodies.values().flatten())
+            .map(|r| r.from.as_path());
+        let classes = class_files.iter().map(std::path::PathBuf::as_path);
+        program.modules.names(
+            std::iter::once(comp_file.as_path())
+                .chain(spliced)
+                .chain(classes),
+            &declared,
+        )
+    };
     let query = FixpointCtx {
         callbacks: &callback_bodies,
         reducers: &reducers,
         dispatches,
         hook_args: &hook_args,
+        hands_back: &hands_back,
+        hook_reads: &hook_reads,
+        module: &module_names,
     };
-    // A `useCallback` value is a function the heap does not place — its body
-    // lives in the hook entry — so where it goes is not followed: its body
-    // may run wherever an escaped closure may (#254).
+    // A `useCallback` value is placed where its recompute hands it back (a
+    // literal's closure at the hook's site, or the argument's sites, #320),
+    // which a name holding it may not follow (a rename through a body the
+    // heap does not see): its body may also run wherever an escaped closure
+    // may (#254).
     let escaped_bodies: Vec<(&[Var], &CFG)> = hooks
         .iter()
         .filter_map(|h| match h {
@@ -414,6 +535,13 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         after: config.widen_threshold,
         thresholds: &thresholds,
     };
+    // The solver's tables of every closure a pass runs, computed once for
+    // the whole fixpoint.
+    let plans = crate::domains::interp::Plans::default();
+    // The call relation (ADR-047): every call the passes below evaluate,
+    // joined. A probe's input is below the kept one: it records nothing.
+    let calls = std::cell::RefCell::new(crate::engine::CallRelation::default());
+    let recording = inter.is_none_or(|i| !i.probe).then_some(&calls);
     let pass = |cfg: &CFG,
                 entry: AbstractEnv<StateValue>,
                 writes: &StateStore<StateValue>,
@@ -421,9 +549,10 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 memo: &MemoStore<StateValue>,
                 heap: &mut Heap,
                 children: bool,
-                effect: bool| {
+                effect: Option<HookLabel>,
+                render: bool| {
         let mut out = writes.clone();
-        let envs = {
+        let (envs, returns) = {
             let mut ac = AnalysisCtx {
                 component: comp_id,
                 state: &mut out,
@@ -433,20 +562,40 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 query: &query,
                 inter: inter.filter(|_| children),
                 widening,
+                plans: Some(&plans),
+                calls: recording,
+                returns: Default::default(),
+                render,
+                escaped: false,
+                stmt: None,
             };
             let envs = analyze_cfg(transfer, cfg, entry, &mut ac);
-            if effect {
+            if let Some(label) = effect {
                 for (bid, block) in &cfg.blocks {
                     if let Terminator::Return(ret, _) = &block.term
                         && let Some(env) = envs.get(bid)
                     {
-                        let _ = exec_fn_value(transfer, ret, &[], env, &mut ac, 0);
+                        let mut ran = crate::domains::interp::Ran::default();
+                        // React calls a cleanup with no argument.
+                        let none = crate::domains::interp::Args::exactly(&[]);
+                        let _ = exec_fn_value(transfer, ret, none, env, &mut ac, 0, &mut ran);
+                        ac.record(|r| {
+                            r.record_escape(
+                                comp_id.hook_site(label),
+                                crate::engine::calls::CLEANUP,
+                                [],
+                                [],
+                                ran.bodies,
+                                false,
+                                false,
+                            )
+                        });
                     }
                 }
             }
-            envs
+            (envs, std::mem::take(&mut ac.returns))
         };
-        (envs, out)
+        (envs, out, returns)
     };
 
     // Fixpoint carrier: the product StateValue tracks every JS kind per label
@@ -476,7 +625,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             if let HookEntry::State { label, init, .. } = hook {
                 let init_val = {
                     let mut init_state = StateStore::bottom();
-                    let mut heap = crate::domains::Heap::new();
+                    let mut heap = heap.blank();
                     let mut ac = AnalysisCtx::null(comp_id, &mut init_state, &init_memo, &mut heap);
                     // A null/undefined init needs no TS-hint override: the product
                     // value joins the null slot with whatever the setters write,
@@ -507,7 +656,8 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
 
         // ── Render pass ───────────────────────────────────────────────────────
         // Use initial_env as entry: child analyses start with props bound.
-        let (bs, state_from_render) = pass(
+        let profile = crate::profile::pass("pass:render");
+        let (bs, state_from_render, render_returns) = pass(
             &render_cfg,
             initial_env.clone(),
             &state_store,
@@ -515,9 +665,12 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             &memo_store,
             &mut heap,
             true,
-            false,
+            None,
+            true,
         );
         block_states = bs;
+        drop(profile);
+        let profile = crate::profile::pass("pass:memo");
 
         // ── Recompute memo store from exit env ────────────────────────────────
         // Deps evaluate through the normal path against the real fixpoint stores
@@ -526,6 +679,10 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         // second pass so each recompute reads a consistent snapshot — the
         // fixpoint converges any memo-to-memo dependency across iterations.
         env_exit = exit_env(&render_cfg, &block_states);
+        // A memo's deps, a callback's argument and a ref's initial value are
+        // render expressions read in the render's exit env: a call among them
+        // is what the render pass recorded it returning (#333).
+        let mut returns = render_returns;
         let memo_updates: Vec<(HookLabel, crate::domains::EnvVal<StateValue>)> = {
             let mut memo_ctx = AnalysisCtx {
                 component: comp_id,
@@ -536,8 +693,14 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 query: &query,
                 inter,
                 widening,
+                plans: Some(&plans),
+                calls: recording,
+                returns: std::mem::take(&mut returns),
+                render: true,
+                escaped: false,
+                stmt: None,
             };
-            hooks
+            let updates = hooks
                 .iter()
                 .filter_map(|hook| match hook {
                     HookEntry::Memo { label, .. } | HookEntry::Callback { label, .. } => Some((
@@ -552,7 +715,9 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                     )),
                     _ => None,
                 })
-                .collect()
+                .collect();
+            returns = memo_ctx.returns;
+            updates
         };
         let memo_before = memo_store.clone();
         for (label, val) in memo_updates {
@@ -570,6 +735,12 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 query: &query,
                 inter,
                 widening,
+                plans: Some(&plans),
+                calls: recording,
+                returns,
+                render: true,
+                escaped: false,
+                stmt: None,
             };
             for hook in &hooks {
                 if let HookEntry::Ref { label, init, .. } = hook {
@@ -584,6 +755,9 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             }
         }
 
+        drop(profile);
+        let profile = crate::profile::pass("pass:effects");
+
         // ── Effect passes ─────────────────────────────────────────────────────
         let mut state_from_effects = StateStore::bottom();
         slot_writers.clear();
@@ -592,7 +766,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 label, body_cfg, ..
             } = hook
             {
-                let (eff_bs, eff_state) = pass(
+                let (eff_bs, eff_state, _) = pass(
                     body_cfg,
                     env_exit.clone(),
                     &state_store,
@@ -600,7 +774,8 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                     &memo_store,
                     &mut heap,
                     true,
-                    true,
+                    Some(*label),
+                    false,
                 );
                 effect_block_states.insert(*label, eff_bs);
                 for slot in eff_state.labels() {
@@ -613,20 +788,36 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         // ── Handler passes (in-cycle) ─────────────────────────────────────────
         // Handlers run 0..N times → include in fixpoint for sound range approx.
         // NOT tracked in widened_labels (handler-caused widening ≠ InfiniteLoop).
+        // Each runs from the render's exit env with its parameters ⊤, as an
+        // escaped closure does (#314): an event holds no function of the
+        // component, and what a child passes back escaped when it was handed
+        // down.
+        drop(profile);
+        let profile = crate::profile::pass("pass:handlers");
         let mut state_from_handlers = StateStore::bottom();
         for hook in &hooks {
             if let HookEntry::Handler {
-                label, body_cfg, ..
+                label,
+                body_cfg,
+                params,
+                ..
             } = hook
             {
-                let (h_bs, h_state) = pass(
+                let mut entry = env_exit.clone();
+                crate::domains::interp::bind_params(
+                    &mut entry,
+                    params,
+                    crate::domains::interp::Args::unknown(),
+                );
+                let (h_bs, h_state, _) = pass(
                     body_cfg,
-                    env_exit.clone(),
+                    entry,
                     &state_store,
                     &state_store,
                     &memo_store,
                     &mut heap,
                     true,
+                    None,
                     false,
                 );
                 handler_block_states.insert(*label, h_bs);
@@ -638,7 +829,9 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         // stored where the heap does not follow — run as handlers do, from
         // the render's exit env (#254). Every pass above has run, so every
         // closure this iteration let escape runs in it.
+        drop(profile);
         {
+            let _profile = crate::profile::pass("pass:escaped");
             let mut out = state_store.clone();
             let mut ac = AnalysisCtx {
                 component: comp_id,
@@ -649,6 +842,12 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 query: &query,
                 inter,
                 widening,
+                plans: Some(&plans),
+                calls: recording,
+                returns: Default::default(),
+                render: false,
+                escaped: false,
+                stmt: None,
             };
             crate::domains::interp::run_escaped(transfer, &escaped_bodies, &env_exit, &mut ac);
             state_from_handlers = state_from_handlers.join(&out);
@@ -718,7 +917,8 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     // `inter` is `None`: this re-evaluates and re-allocates, it does not
     // re-analyze children (same choice as the effect re-run below).
     {
-        let (bs, _) = pass(
+        let _profile = crate::profile::pass("pass:post-render");
+        let (bs, _, _) = pass(
             &render_cfg,
             initial_env.clone(),
             &state,
@@ -726,66 +926,24 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             &memo_store,
             &mut heap,
             false,
-            false,
+            None,
+            true,
         );
         block_states = bs;
-        env_exit = exit_env(&render_cfg, &block_states);
     }
 
     let final_state = state;
     let hook_calls = collect_hook_calls(&hooks, &render_cfg);
     let effect_info = collect_effect_info(&hooks);
     let handler_info = collect_handler_info(&hooks);
-    // A write through a parent's setter prop is a row too, owner-qualified
-    // (ADR-042 §2) — the same resolution `setter-in-render` reads — and so is
-    // one through a name or member the converged values bind to an own setter.
-    let render_params = std::slice::from_ref(&comp_param);
-    let converged_setters = crate::engine::setters::collect_component_setter_vars(
-        &render_cfg,
-        render_params,
-        &block_states,
-        &heap,
-    );
-    // The envs each row's argument is evaluated in: the converged stores, and
-    // the per-block envs of the region the row sits in.
-    let site_envs = crate::engine::written::SiteEnvs {
-        component: comp_id,
-        state: &final_state,
-        memo: &memo_store,
-        heap: &heap,
-        render_entry: &initial_env,
-        render_exits: &block_states,
-        exit: &env_exit,
-        effect_exits: &effect_block_states,
-        handler_exits: &handler_block_states,
-    };
-    let slot_writers = crate::engine::setters::collect_slot_writers(
-        &render_cfg,
-        render_params,
-        &hooks,
-        &inline_regions,
-        &hook_provenance,
-        &converged_setters,
-        &site_envs,
-        &reducers,
-        dispatches,
-    );
-    // The seed relation rides the same slice: it folds `slot_writers` rows and
-    // the effects' declared deps, so it must come after both (#106, ADR-031).
-    let slot_seeds = crate::engine::seeds::collect_slot_seeds(
-        &render_cfg,
-        &hooks,
-        &comp_param,
-        &crate::engine::setters::setter_labels_of(&render_cfg, &hooks),
-        &slot_writers,
-        &effect_info,
-    );
-    // The registration relation rides the same slice (#111, ADR-034): one
-    // scan of the effect bodies, read by `stale-closure`, `missing-cleanup`
-    // and the Tier-A `registrations` anchor alike.
-    let registrations =
-        crate::engine::registrations::collect_registrations(&render_cfg, &hooks, dispatches);
     let hooks_clone = hooks.clone();
+    let mut calls = calls.into_inner();
+    calls.name_slots(comp_id, &render_cfg);
+    let pending = RelationInputs {
+        inline_regions,
+        reducers: reducers.into_own(),
+        dispatches,
+    };
 
     let mut result = AnalysisResult {
         component: comp_id,
@@ -809,22 +967,120 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         render_cfg,
         hooks: hooks_clone,
         hook_provenance,
-        slot_writers,
-        slot_seeds,
-        registrations,
+        slot_writers: Vec::new(),
+        slot_seeds: Vec::new(),
+        registrations: Vec::new(),
         effect_triggers: Vec::new(),
         effect_reruns: HashMap::new(),
         effect_props: Default::default(),
         iterations: iteration,
         heap,
+        calls: std::sync::Arc::new(calls),
+        relations_pending: None,
     };
+    // An inter-component analysis may be thrown away (a child re-analysed
+    // under a bigger join, a root rendered by a later root, a probe): its
+    // relations wait for `analyze_program` to know which result is kept. So
+    // do a program's unreached components', whose module rows are the
+    // program's (#335).
+    match (inter, program.relations_after_all) {
+        (None, false) => compute_relations(&mut result, pending, None, program),
+        _ => result.relations_pending = Some(Box::new(pending)),
+    }
+    result
+}
+
+/// What [`compute_relations`] needs beyond the converged result: the splice
+/// regions, the component's own reducers and whether the program dispatches
+/// events. Kept on a result whose relations are not computed yet.
+#[derive(Debug, Clone)]
+pub(crate) struct RelationInputs {
+    inline_regions: crate::engine::setters::InlineRegions,
+    reducers: HashMap<HookLabel, crate::engine::reducers::Reducer>,
+    dispatches: bool,
+}
+
+/// The relations the rules read off a converged result: the writer rows, the
+/// seeds, the registrations and the effect triggers.
+///
+/// A pure function of the result: every body it runs, it runs through a null
+/// context, so it writes no shared state. `program_reducers` is the table the
+/// analysis registered its reducers in; it only grows, and with values a
+/// component's own hooks fix, so a slot the converged result can name was
+/// registered before the analysis ended (by the analysis that minted its
+/// setter) and reads the same entry at any later point.
+fn compute_relations(
+    result: &mut AnalysisResult<StateValue>,
+    inputs: RelationInputs,
+    program_reducers: Option<&crate::engine::ProgramReducers>,
+    program: &ProgramFacts,
+) {
+    let RelationInputs {
+        inline_regions,
+        reducers,
+        dispatches,
+    } = inputs;
+    let comp_id = result.component;
+    let profile = crate::profile::pass("relations:writers");
+    let reducers = crate::engine::Reducers::registered(comp_id, reducers, program_reducers);
+    let env_exit = result.exit_env();
+    // What every call writes and runs is the call relation's (ADR-047): a
+    // write through a parent's setter prop is a row too, owner-qualified
+    // (ADR-042 §2).
+    let calls = std::sync::Arc::clone(&result.calls);
+    // The envs each row's argument is evaluated in: the converged stores, and
+    // the per-block envs of the region the row sits in.
+    let site_envs = crate::engine::written::SiteEnvs {
+        component: comp_id,
+        state: &result.state_store,
+        memo: &result.memo_store,
+        heap: &result.heap,
+        render_entry: &result.render_entry,
+        render_exits: &result.block_states,
+        exit: &env_exit,
+        effect_exits: &result.effect_block_states,
+        handler_exits: &result.handler_block_states,
+    };
+    let slot_writers = crate::engine::setters::collect_slot_writers(
+        &result.render_cfg,
+        &result.hooks,
+        &inline_regions,
+        &result.hook_provenance,
+        &calls,
+        &site_envs,
+        &reducers,
+        dispatches,
+    );
+    // The seed relation rides the same slice: it folds `slot_writers` rows and
+    // the effects' declared deps, so it must come after both (#106, ADR-031).
+    let slot_seeds = crate::engine::seeds::collect_slot_seeds(
+        &result.render_cfg,
+        &result.hooks,
+        &result.param,
+        &crate::engine::setters::setter_labels_of(&result.render_cfg, &result.hooks),
+        &slot_writers,
+        &result.effect_info,
+    );
+    // The registration relation rides the same slice (#111, ADR-034): one
+    // scan of the effect bodies, read by `stale-closure`, `missing-cleanup`
+    // and the Tier-A `registrations` anchor alike.
+    let registrations = crate::engine::registrations::collect_registrations(
+        &result.render_cfg,
+        &result.hooks,
+        dispatches,
+    );
+    result.slot_writers = slot_writers;
+    result.slot_seeds = slot_seeds;
+    result.registrations = registrations;
+    drop(profile);
+    let _profile = crate::profile::pass("relations:triggers");
     // The effect-trigger relation (ADR-042 §3): a dep evaluated in the render
     // exit env, the one every hook body starts from, and what it is computed
     // from where the effect is called. A module name some body of the
     // program writes, this one's inlined bodies included, is a cell (#224).
-    let mut written = crate::engine::render_deps::written_names(&result);
+    let mut written = crate::engine::render_deps::written_names(result);
     written.extend(program.written.iter().cloned());
-    let sources = crate::engine::render_deps::render_deps(&result, &written).effect_deps;
+    let sources = crate::engine::render_deps::render_deps(result, &written).effect_deps;
     let relation = {
         let mut scratch = result.heap.clone();
         crate::engine::triggers::collect_effect_triggers(
@@ -848,7 +1104,6 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     result.effect_triggers = relation.rows;
     result.effect_reruns = relation.reruns;
     result.effect_props = relation.props;
-    result
 }
 
 // ── Program-level analysis ────────────────────────────────────────────────────
@@ -917,11 +1172,34 @@ fn forwarded_props(
         .collect()
 }
 
+/// [`analyze_program_defining`] a program whose files define no accessor
+/// and no module scope (a hand-built registry).
 pub fn analyze_program(
     registry: ComponentRegistry,
     hook_registry: HookRegistry,
     strategy: RootStrategy,
     config: &Config,
+) -> ProgramAnalysisResult {
+    analyze_program_defining(
+        registry,
+        hook_registry,
+        strategy,
+        config,
+        AccessorNames::default(),
+        crate::engine::ModuleScope::default(),
+    )
+}
+
+/// Analyse the program whose files define the accessors `accessors`
+/// (#334, [`crate::ir::ModuleTable::accessor_names`]) and the module scope
+/// `modules` (#335).
+pub fn analyze_program_defining(
+    registry: ComponentRegistry,
+    hook_registry: HookRegistry,
+    strategy: RootStrategy,
+    config: &Config,
+    accessors: AccessorNames,
+    modules: crate::engine::ModuleScope,
 ) -> ProgramAnalysisResult {
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -937,10 +1215,17 @@ pub fn analyze_program(
         RefCell::new(HashMap::new());
     let site_inputs: RefCell<HashMap<crate::domains::SiteKey, crate::domains::ChildInput>> =
         RefCell::new(HashMap::new());
+    let handed: RefCell<crate::domains::context::HandedBack> = RefCell::new(HashMap::new());
 
     let roots = strategy.detect(&registry);
     let mut analysed: std::collections::HashSet<ComponentId> = std::collections::HashSet::new();
-    let program = ProgramFacts::of(&registry, &hook_registry, &config.function_registry);
+    let program = ProgramFacts::of(
+        &registry,
+        &hook_registry,
+        &config.function_registry,
+        accessors,
+        modules,
+    );
 
     let inter_for = |component: ComponentId, call_stack: Vec<ComponentId>| InterCtx {
         registry: &registry,
@@ -959,6 +1244,7 @@ pub fn analyze_program(
         analyze_child: analyze_component_inter as AnalyzeChildFn,
         hook_registry: Some(&hook_registry),
         program: &program,
+        handed: &handed,
     };
 
     // Phase 1: analyze roots top-down (children inlined via eval_comp_app).
@@ -984,7 +1270,6 @@ pub fn analyze_program(
             analysed.insert(root);
         }
     }
-
     // Per-site facts (#175). A child's result is its analysis under the join
     // of every element's input, and the join loses what holds through one
     // element alone (a dep that is a new reference at every render when one
@@ -1011,9 +1296,7 @@ pub fn analyze_program(
             ..inter_for(*child, vec![*caller])
         };
         let result = probe.analyze_under(ir, input.clone());
-        let facts = crate::engine::SiteFacts {
-            fresh_deps: crate::engine::fresh_deps(&result),
-        };
+        let facts = crate::engine::SiteFacts::of(&result);
         if let Some(row) = call_graph.borrow_mut().site_mut(*caller, *child, *span) {
             row.own = Some(facts);
         }
@@ -1055,10 +1338,9 @@ pub fn analyze_program(
                 ..inter_for(*child, vec![*grand, *caller])
             };
             let result = probe.analyze_under(ir, derived);
-            let facts = crate::engine::SiteFacts {
-                fresh_deps: crate::engine::fresh_deps(&result),
-            };
-            if facts.fresh_deps.is_empty() {
+            let facts = crate::engine::SiteFacts::of(&result);
+            // The may fact holds wherever the must one does.
+            if facts.fresh_when_object.is_empty() {
                 continue;
             }
             if let Some(row) = call_graph.borrow_mut().site_mut(*caller, *child, *span) {
@@ -1109,6 +1391,45 @@ pub fn analyze_program(
         }
     }
 
+    // The results the program kept: the last analysis of each component
+    // phase 1 reached, and every unreached one. Their relations are computed
+    // now, once. No other analysis needs them: during phase 1 `results` is
+    // read only by `flow_back` (its heap), an analysis that is replaced is
+    // dropped unread, and a probe is read only through `SiteFacts::of` (exit
+    // env, stores, heap).
+    //
+    // The call relation of the program first (ADR-047): a call of a closure
+    // a child runs, or of one its owner runs after a child let it escape,
+    // is evaluated in another component's analysis than the one that writes
+    // it, and a module binding one component writes is read in another's
+    // (#335). Every kept analysis's evaluations join into one relation,
+    // which every result then holds.
+    {
+        let mut results = results.borrow_mut();
+        let mut ids: Vec<ComponentId> = results.keys().copied().collect();
+        ids.sort();
+        let mut program_calls = crate::engine::CallRelation::default();
+        for id in &ids {
+            program_calls.join(&results[id].calls);
+            // Every component's slots, named: a closure of a parent written
+            // in a child's analysis names the parent's setter.
+            if let Some(ir) = registry.ir_of(*id) {
+                program_calls.name_slots(*id, &ir.render_cfg);
+            }
+        }
+        let program_calls = std::sync::Arc::new(program_calls);
+        for result in results.values_mut() {
+            result.calls = std::sync::Arc::clone(&program_calls);
+        }
+    }
+    for (id, result) in results.borrow_mut().iter_mut() {
+        if let Some(inputs) = result.relations_pending.take() {
+            // An unreached component registers its reducers nowhere.
+            let reached = phase1_reached.contains(id).then_some(&reducers);
+            compute_relations(result, *inputs, reached, &program);
+        }
+    }
+
     let final_stats = stats.into_inner();
     let recursive_components = final_stats
         .recursive_component_refs
@@ -1153,15 +1474,20 @@ pub fn analyze_program(
 pub(crate) struct SpliceIds {
     salt: u32,
     next_alloc: u64,
+    /// The call-site cursor, counted from [`crate::ir::expr::CALL_SITES`]:
+    /// a graft's calls land above every call already in the component.
+    next_call: u64,
 }
 
 impl SpliceIds {
     /// Grafts land above the component's own sites, inside its range
-    /// ([`ComponentId::site_base`]) even when it allocates nothing itself.
+    /// ([`ComponentId::site_base`]) even when it allocates nothing itself;
+    /// their calls above the component's own calls, in the same range.
     fn for_component(render_cfg: &CFG, hooks: &[HookEntry], component: ComponentId) -> Self {
         SpliceIds {
             salt: 0,
             next_alloc: alloc_span(render_cfg, hooks).max(component.site_base()),
+            next_call: call_span(render_cfg, hooks).max(component.site_base()),
         }
     }
 
@@ -1173,30 +1499,50 @@ impl SpliceIds {
         crate::ir::types::ExprId(id)
     }
 
-    /// The salt and allocation-id offset for one graft `span` ids wide,
-    /// advancing both supplies past it.
-    fn take(&mut self, span: u64) -> (u32, u64) {
+    /// One call site, for a call the source does not spell — React's call
+    /// of the callback an aliased effect hook is handed.
+    fn call_one(&mut self) -> crate::ir::types::ExprId {
+        let n = self.next_call;
+        self.next_call += 1;
+        crate::ir::types::ExprId(crate::ir::expr::CALL_SITES + n)
+    }
+
+    /// The salt and the offsets for one graft of `cfg` and its `hooks` —
+    /// its allocation sites and its call sites, its labels shifted by
+    /// `labels` — advancing every supply past it.
+    fn take(
+        &mut self,
+        cfg: &CFG,
+        hooks: &[HookEntry],
+        labels: HookLabel,
+    ) -> (u32, crate::ir::Offsets) {
         let salt = self.salt;
         self.salt += 1;
-        let ids = self.next_alloc;
-        self.next_alloc += span;
-        (salt, ids)
+        let off = crate::ir::Offsets {
+            labels,
+            ids: self.next_alloc,
+            calls: self.next_call,
+        };
+        self.next_alloc += alloc_span(cfg, hooks);
+        self.next_call += call_span(cfg, hooks);
+        (salt, off)
     }
 }
 
 /// The allocation-id width of a body together with the hook table grafted
 /// alongside it — they are numbered from one file counter, so they share a
-/// range and must be shifted by one offset.
+/// range and must be shifted by one offset. Every id the table holds counts,
+/// beside its bodies: a custom hook's argument, an initializer, a deps list
+/// (`crate::ir::graft_spans`); a graft landing on one would make two
+/// allocations, or two calls, one.
 fn alloc_span(cfg: &CFG, hooks: &[HookEntry]) -> u64 {
-    std::iter::once(crate::ir::alloc_id_span(cfg))
-        .chain(
-            hooks
-                .iter()
-                .filter_map(HookEntry::body_cfg)
-                .map(crate::ir::alloc_id_span),
-        )
-        .max()
-        .unwrap_or(0)
+    crate::ir::graft_spans(cfg, hooks).0
+}
+
+/// [`alloc_span`] for call sites: one file call counter numbered the body's
+/// and its hooks' calls.
+fn call_span(cfg: &CFG, hooks: &[HookEntry]) -> u64 {
+    crate::ir::graft_spans(cfg, hooks).1
 }
 
 /// The recursion guard both splices share (custom hooks, utilities): the
@@ -1339,6 +1685,7 @@ fn expand_custom_hooks(
                 custom_label,
                 call_args,
                 span,
+                salt.call_one(),
             ) {
                 hooks[i] = entry;
             }
@@ -1352,21 +1699,20 @@ fn expand_custom_hooks(
         // Param→arg substitution for State inits: they are seeded in a separate
         // env (module consts + props), which the render-body param bindings
         // never reach, so `useState(initial)` must inline the concrete arg.
+        // Only an argument whose position is known names a parameter.
+        let positional = Expr::positional_args(&call_args);
+        let omits = |i: usize| i >= call_args.len();
         let param_subst: HashMap<String, Expr> = hook_ir
             .params
             .iter()
-            .zip(call_args.iter())
+            .zip(positional.iter())
             .map(|(p, a)| (p.clone(), a.clone()))
             .collect();
 
         // One alpha-rename map for this expansion, shared by the body splice and
         // by every sub-hook body that captures a render-scope local — otherwise
         // an effect capturing `x` would desync from the body's renamed `x`.
-        let (s, id_offset) = salt.take(alloc_span(&hook_ir.body_cfg, &hook_ir.hooks));
-        let off = crate::ir::Offsets {
-            labels: offset,
-            ids: id_offset,
-        };
+        let (s, off) = salt.take(&hook_ir.body_cfg, &hook_ir.hooks, offset);
         // The caller's own bindings, so a free name of the hook body cannot be
         // captured by one of them (#141).
         let caller_bound = crate::ir::bound_vars(render_cfg, &[]);
@@ -1395,12 +1741,13 @@ fn expand_custom_hooks(
                         &hook_ir.body_cfg,
                         &elsewhere,
                         &hook_ir.params,
+                        &|i| hook_ir.param_defaults.get(i).is_some_and(Option::is_some),
                     ),
                     _ => None,
                 };
-                let arg = param.and_then(|i| call_args.get(i).cloned());
+                let arg = param.and_then(|i| positional.get(i).cloned());
                 let default = param
-                    .filter(|_| arg.is_none())
+                    .filter(|&i| omits(i))
                     .and_then(|i| hook_ir.param_defaults.get(i).cloned().flatten());
                 if let (Some(d), Some(deps)) = (default, h.deps_mut()) {
                     *deps = DepsArg::from_expr(crate::ir::remap_expr(d, off));
@@ -1477,7 +1824,7 @@ fn expand_custom_hooks(
             let param_lets: Vec<Stmt> = hook_ir
                 .params
                 .iter()
-                .zip(call_args.iter())
+                .zip(positional.iter())
                 .map(|(p, a)| Stmt::Let {
                     var: rename.get(p).cloned().unwrap_or_else(|| p.clone()),
                     rhs: a.clone(),
@@ -1940,6 +2287,200 @@ fn expand_utility_calls(
     ctx.truncated
 }
 
+/// Resolve each `new K(…)` of the component whose `K` names a class a module
+/// of the program defines (#335): its [`Expr::New`] `ctor` is that class's
+/// construction body, copied onto sites of the component's own
+/// ([`SpliceIds`]), so every `new` is an allocation site of its own as a
+/// spliced utility is, and the `new`s inside it are resolved in turn from
+/// the class's file. A name the component binds anywhere is its own, not
+/// the module's; a class already on the way (`m() { return new K() }`)
+/// is left as written, as is every `new` past `budget` expansions — read
+/// as a class the analysis does not see. Returns whether the budget ran
+/// out; `files` gets the file of every class resolved, whose module scope
+/// its bodies read (#335).
+#[allow(clippy::too_many_arguments)]
+fn expand_class_constructions(
+    render_cfg: &mut CFG,
+    hooks: &mut [HookEntry],
+    registry: &FunctionRegistry,
+    caller_file: &std::path::Path,
+    regions: &crate::engine::setters::InlineRegions,
+    budget: usize,
+    salt: &mut SpliceIds,
+    files: &mut Vec<std::path::PathBuf>,
+) -> bool {
+    if registry.is_empty() {
+        return false;
+    }
+    let mut bound = HashSet::new();
+    bound_names(render_cfg, &mut bound);
+    for hook in hooks.iter() {
+        if let Some(body) = hook.body_cfg() {
+            bound_names(body, &mut bound);
+        }
+    }
+    let mut pass = ClassPass {
+        registry,
+        bound,
+        salt,
+        budget: budget * 8,
+        truncated: false,
+        within: Vec::new(),
+        files: Vec::new(),
+    };
+    pass.cfg(render_cfg, &regions.render, caller_file);
+    for hook in hooks.iter_mut() {
+        let label = hook.label();
+        let none = Vec::new();
+        let body_regions = regions.bodies.get(&label).unwrap_or(&none);
+        match hook {
+            HookEntry::Effect { body_cfg, .. }
+            | HookEntry::Memo { body_cfg, .. }
+            | HookEntry::Callback { body_cfg, .. }
+            | HookEntry::Handler { body_cfg, .. } => {
+                pass.cfg(body_cfg, body_regions, caller_file);
+            }
+            HookEntry::State { init, reducer, .. } => {
+                pass.expr(init, caller_file);
+                if let Some(r) = reducer {
+                    pass.expr(r, caller_file);
+                }
+            }
+            HookEntry::Ref { init, .. } => pass.expr(init, caller_file),
+            HookEntry::Custom { args, .. } => {
+                for a in args {
+                    pass.expr(a, caller_file);
+                }
+            }
+        }
+    }
+    files.extend(pass.files);
+    pass.truncated
+}
+
+/// Every name a body declares — a `let`, a parameter — nested bodies
+/// included; not a name it only assigns.
+fn declared_names(cfg: &CFG, out: &mut HashSet<Var>) {
+    fn expr(e: &Expr, out: &mut HashSet<Var>) {
+        if let Expr::FnLit {
+            params, body_cfg, ..
+        } = e
+        {
+            out.extend(params.iter().cloned());
+            declared_names(body_cfg, out);
+        }
+        e.for_each_child(&mut |c| expr(c, out));
+    }
+    for block in cfg.blocks.values() {
+        for stmt in &block.stmts {
+            if let Stmt::Let { var, .. } = stmt {
+                out.insert(var.clone());
+            }
+        }
+        block.for_each_expr(&mut |e| expr(e, out));
+    }
+}
+
+/// Every name a body binds — a `let`, an assignment, a parameter — nested
+/// bodies included.
+fn bound_names(cfg: &CFG, out: &mut HashSet<crate::ir::types::Var>) {
+    fn expr(e: &Expr, out: &mut HashSet<crate::ir::types::Var>) {
+        if let Expr::FnLit {
+            params, body_cfg, ..
+        } = e
+        {
+            out.extend(params.iter().cloned());
+            bound_names(body_cfg, out);
+        }
+        e.for_each_child(&mut |c| expr(c, out));
+    }
+    for block in cfg.blocks.values() {
+        for stmt in &block.stmts {
+            if let Stmt::Let { var, .. } | Stmt::Assign { var, .. } = stmt {
+                out.insert(var.clone());
+            }
+        }
+        block.for_each_expr(&mut |e| expr(e, out));
+    }
+}
+
+/// [`expand_class_constructions`]'s walk.
+struct ClassPass<'r, 's> {
+    registry: &'r FunctionRegistry,
+    bound: HashSet<crate::ir::types::Var>,
+    salt: &'s mut SpliceIds,
+    budget: usize,
+    truncated: bool,
+    /// The classes whose bodies the walk is in.
+    within: Vec<crate::engine::FunctionKey>,
+    /// The file of every class resolved.
+    files: Vec<std::path::PathBuf>,
+}
+
+impl ClassPass<'_, '_> {
+    /// Every block of `cfg`; one inside a spliced region resolves through
+    /// the file its body came from (ADR-027 §3–§4).
+    fn cfg(
+        &mut self,
+        cfg: &mut CFG,
+        regions: &[crate::engine::setters::InlineRegion],
+        file: &std::path::Path,
+    ) {
+        for (&bid, block) in cfg.blocks.iter_mut() {
+            let from = regions
+                .iter()
+                .find(|r| r.start <= bid && bid < r.end)
+                .map(|r| r.from.clone())
+                .unwrap_or_else(|| file.to_path_buf());
+            block.for_each_expr_mut(&mut |e| self.expr(e, &from));
+        }
+    }
+
+    fn expr(&mut self, e: &mut Expr, file: &std::path::Path) {
+        if let Expr::FnLit { body_cfg, .. } = e {
+            self.cfg(std::sync::Arc::make_mut(body_cfg), &[], file);
+            return;
+        }
+        e.for_each_child_mut(&mut |c| self.expr(c, file));
+        let Expr::New { fn_, ctor, .. } = e else {
+            return;
+        };
+        let Expr::Var(name) = fn_.peel_ts() else {
+            return;
+        };
+        if ctor.is_some() || self.bound.contains(name) {
+            return;
+        }
+        let Some(class) = self.registry.resolve(file, name) else {
+            return;
+        };
+        let key = (class.file.clone(), class.name.clone());
+        if self.within.contains(&key) {
+            return;
+        }
+        if self.budget == 0 {
+            self.truncated = true;
+            return;
+        }
+        self.budget -= 1;
+        let (_, off) = self.salt.take(&class.body_cfg, &[], 0);
+        let mut body = crate::ir::remap_cfg(class.body_cfg.clone(), off);
+        let params = class.params.clone();
+        let from = class.file.clone();
+        if !self.files.contains(&from) {
+            self.files.push(from.clone());
+        }
+        self.within.push(key);
+        self.cfg(&mut body, &[], &from);
+        self.within.pop();
+        *ctor = Some(Box::new(Expr::FnLit {
+            id: self.salt.alloc_one(),
+            params,
+            body_cfg: std::sync::Arc::new(body),
+        }));
+    }
+}
+
 /// Splice utility calls in `cfg`. The recursion guard is each block's
 /// [`Ancestry`]: a call is left `Call` → opaque `Top` only inside an inlining
 /// of its own callee (self-recursion, `A → B → A`), so two sibling calls of
@@ -2118,19 +2659,13 @@ fn splice_one_call(
     let name = utility_call_target(&call_stmt)?;
     let utility = resolve_utility(registry, caller_file, &name)?.clone();
 
-    let (s, id_offset) = salt.take(alloc_span(&utility.body_cfg, &[]));
+    let (s, off) = salt.take(&utility.body_cfg, &[], 0);
     // The caller's own bindings, so a free name of the utility cannot be
     // captured by one of them (#141).
     let caller_bound = crate::ir::bound_vars(cfg, &[]);
     let rename =
         crate::ir::callee_rename_map(&utility.body_cfg, &[], &utility.params, s, &caller_bound);
-    let body = crate::ir::remap_cfg(
-        utility.body_cfg,
-        crate::ir::Offsets {
-            labels: 0,
-            ids: id_offset,
-        },
-    );
+    let body = crate::ir::remap_cfg(utility.body_cfg, off);
     let range = crate::ir::splice_callee_into_cfg(
         cfg,
         block_id,
@@ -2191,6 +2726,7 @@ mod tests {
                 stmts: vec![],
                 term: Terminator::Branch {
                     span: None,
+                    chain_link: false,
                     cond: Expr::BinOp {
                         op: crate::ir::expr::BinOp::Lt,
                         lhs: Box::new(Expr::Var("x".to_string())),
@@ -2263,6 +2799,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::Lit(Prim::Int(42))],
                 },
@@ -2324,6 +2861,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::ObjectLit {
                         id: crate::ir::types::ExprId(0),
@@ -2370,6 +2908,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::ObjectLit {
                         id: crate::ir::types::ExprId(0),
@@ -2450,6 +2989,7 @@ mod tests {
         // Effect body uses "n" and "setN" both are free vars
         let eff_cfg = crate::test_support::single_block_cfg(vec![Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setN".to_string())),
                 args: vec![Expr::Var("n".to_string())],
             },
@@ -2531,6 +3071,7 @@ mod tests {
         // cb body CFG: ExprStmt(setN({}))
         let cb_body = Arc::new(crate::test_support::single_block_cfg(vec![Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setN".to_string())),
                 args: vec![Expr::ObjectLit {
                     id: ExprId(0),
@@ -2543,6 +3084,7 @@ mod tests {
         // Effect body CFG: ExprStmt(setTimeout(cb, 0))
         let eff_cfg = crate::test_support::single_block_cfg(vec![Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setTimeout".to_string())),
                 args: vec![Expr::Var("cb".to_string()), Expr::Lit(Prim::Int(0))],
             },
@@ -2615,6 +3157,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::Lit(Prim::Int(1))],
                 },
@@ -2632,6 +3175,7 @@ mod tests {
                 label: 1,
                 event: "click".to_string(),
                 body_cfg: body,
+                params: vec![],
                 span: None,
                 dom_event: true,
             },
@@ -2664,6 +3208,57 @@ mod tests {
     }
 
     #[test]
+    fn a_handler_parameter_is_not_the_render_binding_of_its_name() {
+        // Render: `const v = 5`; handler `(v) => setS(v)`. The handler writes
+        // what the event or the child passes it, not the render's 5 (#314).
+        let body = handler_cfg(vec![Stmt::ExprStmt(
+            Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
+                fn_: Box::new(Expr::Var("setS".to_string())),
+                args: vec![Expr::Var("v".to_string())],
+            },
+            None,
+        )]);
+        let hooks = vec![
+            HookEntry::State {
+                label: 0,
+                reducer: None,
+                init: Expr::Lit(Prim::Int(0)),
+                span: None,
+            },
+            HookEntry::Handler {
+                label: 1,
+                event: "click".to_string(),
+                body_cfg: body,
+                params: vec!["v".to_string()],
+                span: None,
+                dom_event: true,
+            },
+        ];
+        let comp = component(
+            hooks,
+            vec![
+                Stmt::Let {
+                    var: "v".to_string(),
+                    rhs: Expr::Lit(Prim::Int(5)),
+                    span: None,
+                },
+                Stmt::Let {
+                    var: "setS".to_string(),
+                    rhs: Expr::StateSetter(0),
+                    span: None,
+                },
+            ],
+        );
+        let result = analyze_component(comp, &StateValueTransfer, &Config::default());
+        assert!(
+            result.state_store.get(0).is_top_value(),
+            "{:?}",
+            result.state_store.get(0)
+        );
+    }
+
+    #[test]
     fn handler_does_not_drive_widening() {
         // incycle_typed (render+effects only) never grows → widened_labels stays empty.
         let body = handler_cfg(vec![
@@ -2674,6 +3269,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::BinOp {
                         op: crate::ir::expr::BinOp::Add,
@@ -2695,6 +3291,7 @@ mod tests {
                 label: 1,
                 event: "click".to_string(),
                 body_cfg: body,
+                params: vec![],
                 span: None,
                 dom_event: true,
             },
@@ -2749,6 +3346,7 @@ mod tests {
                 stmts: vec![],
                 term: Terminator::Branch {
                     span: None,
+                    chain_link: false,
                     cond: Expr::Lit(Prim::Bool(true)),
                     then_: 2,
                     else_: 3,
@@ -2813,6 +3411,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::BinOp {
                         op: crate::ir::expr::BinOp::Add,
@@ -2834,6 +3433,7 @@ mod tests {
                 label: 1,
                 event: "click".to_string(),
                 body_cfg: body,
+                params: vec![],
                 span: None,
                 dom_event: true,
             },
@@ -2886,6 +3486,7 @@ mod tests {
             },
             Stmt::ExprStmt(
                 Expr::Call {
+                    id: crate::ir::expr::SYNTHETIC_CALL,
                     fn_: Box::new(Expr::Var("setN".to_string())),
                     args: vec![Expr::Lit(Prim::Int(99))],
                 },
@@ -2903,6 +3504,7 @@ mod tests {
                 label: 1,
                 event: "click".to_string(),
                 body_cfg: body,
+                params: vec![],
                 span: None,
                 dom_event: true,
             },
@@ -2958,6 +3560,7 @@ mod tests {
                 stmts: vec![],
                 term: Terminator::Branch {
                     span: None,
+                    chain_link: false,
                     cond: Expr::BinOp {
                         op: crate::ir::expr::BinOp::Gt,
                         lhs: Box::new(Expr::Var("count".to_string())),
@@ -2974,6 +3577,7 @@ mod tests {
                 id: 1,
                 stmts: vec![Stmt::ExprStmt(
                     Expr::Call {
+                        id: crate::ir::expr::SYNTHETIC_CALL,
                         fn_: Box::new(Expr::Var("setCount".to_string())),
                         args: vec![Expr::BinOp {
                             op: crate::ir::expr::BinOp::Add,
@@ -3018,6 +3622,7 @@ mod tests {
 
         let h_cfg = handler_cfg(vec![Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setCount".to_string())),
                 args: vec![Expr::BinOp {
                     op: crate::ir::expr::BinOp::Add,
@@ -3045,6 +3650,7 @@ mod tests {
                 label: 2,
                 event: "click".to_string(),
                 body_cfg: h_cfg,
+                params: vec![],
                 span: None,
                 dom_event: true,
             },
@@ -3075,6 +3681,7 @@ mod tests {
         // Handler reads "n" and calls setN both are free vars.
         let body = handler_cfg(vec![Stmt::ExprStmt(
             Expr::Call {
+                id: crate::ir::expr::SYNTHETIC_CALL,
                 fn_: Box::new(Expr::Var("setN".to_string())),
                 args: vec![Expr::Var("n".to_string())],
             },
@@ -3091,6 +3698,7 @@ mod tests {
                 label: 1,
                 event: "click".to_string(),
                 body_cfg: body,
+                params: vec![],
                 span: None,
                 dom_event: true,
             },
@@ -3120,6 +3728,7 @@ mod tests {
                 stmts: vec![],
                 term: Terminator::Branch {
                     span: None,
+                    chain_link: false,
                     cond: Expr::BinOp {
                         op: crate::ir::expr::BinOp::Gt,
                         lhs: Box::new(Expr::Var("x".to_string())),
@@ -3137,6 +3746,7 @@ mod tests {
                 id: 1,
                 stmts: vec![Stmt::ExprStmt(
                     Expr::Call {
+                        id: crate::ir::expr::SYNTHETIC_CALL,
                         fn_: Box::new(Expr::Var("setN".to_string())),
                         args: vec![Expr::Lit(Prim::Int(1))],
                     },

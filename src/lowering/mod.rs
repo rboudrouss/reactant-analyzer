@@ -1,5 +1,6 @@
 mod body_scan;
 pub mod cfg_builder;
+pub mod class_lowerer;
 pub mod component_detector;
 mod detector;
 pub mod expr_lower;
@@ -12,6 +13,7 @@ pub mod utility_lowerer;
 
 pub use crate::ir::{FileId, FileTable, SourceMap, compute_line_starts, offset_to_range};
 pub use cfg_builder::{LowerCtx, build_cfg, build_fn_body_cfg};
+pub use class_lowerer::lower_classes_with_resolver;
 pub use component_detector::{ComponentCandidate, detect_components};
 pub use hook_detector::{HookCandidate, detect_custom_hooks};
 pub use hook_extractor::{extract_handlers, extract_hooks, extract_subscriptions};
@@ -140,20 +142,40 @@ pub struct Candidate<'a> {
     /// returns unit, and every consumer of `useThing` is left with an
     /// unresolvable hook (#5).
     pub expression: bool,
+    /// What a call of the function evaluates to: an `async` or generator
+    /// function's call is not its `return` value (#317).
+    pub kind: cfg_builder::FnKind,
+    /// An arrow function, which binds no `arguments` of its own (#324).
+    pub arrow: bool,
 }
 
 impl Candidate<'_> {
     /// Lower this candidate's body to a CFG, honouring a concise arrow's
-    /// implicit return.
+    /// implicit return and what a call of the function's kind evaluates to.
     ///
     /// The single place that dispatch happens, so a new consumer of
     /// [`Candidate`] cannot forget it — which is how the flag came to be
     /// dropped in the first place.
     pub(crate) fn build_cfg(&self, ctx: &LowerCtx) -> (Vec<String>, crate::ir::cfg::CFG) {
+        self.build_cfg_as(self.kind, ctx)
+    }
+
+    /// [`Self::build_cfg`] for a component's render: React awaits an async
+    /// component's promise and renders what the body returns, so the render's
+    /// `return` is its output whatever the function's kind.
+    pub(crate) fn build_render_cfg(&self, ctx: &LowerCtx) -> (Vec<String>, crate::ir::cfg::CFG) {
+        self.build_cfg_as(cfg_builder::FnKind::Plain, ctx)
+    }
+
+    fn build_cfg_as(
+        &self,
+        kind: cfg_builder::FnKind,
+        ctx: &LowerCtx,
+    ) -> (Vec<String>, crate::ir::cfg::CFG) {
         if self.expression {
-            cfg_builder::build_expr_fn_body_cfg(self.params, self.body, ctx)
+            cfg_builder::build_expr_fn_body_cfg(self.params, self.body, kind, ctx)
         } else {
-            cfg_builder::build_fn_body_cfg(self.params, self.body, ctx)
+            cfg_builder::build_fn_body_cfg(self.params, self.body, kind, self.arrow, ctx)
         }
     }
 
@@ -443,6 +465,7 @@ pub fn lower_custom_hooks_with_resolver(
         hook_provenance: vec![],
         alias_of: Some(hook),
     }));
+    ctx.name_temps(source, files);
     out
 }
 
@@ -529,10 +552,10 @@ pub fn lower_program_with_resolver(
         local_hooks: &local_hooks,
         current_file: Some(file),
     };
-    detect_components(program)
+    let components = detect_components(program)
         .into_iter()
         .map(|candidate| {
-            let (param_names, mut render_cfg) = candidate.build_cfg(&ctx);
+            let (param_names, mut render_cfg) = candidate.build_render_cfg(&ctx);
             let (mut hooks, hook_provenance, mut next_label) =
                 extract_hooks(&mut render_cfg, &imports, &ctx.ids);
             extract_handlers(&render_cfg, &mut hooks, &mut next_label);
@@ -556,7 +579,9 @@ pub fn lower_program_with_resolver(
                 module_consts: module_consts.clone(),
             }
         })
-        .collect()
+        .collect();
+    ctx.name_temps(source, files);
+    components
 }
 
 #[cfg(test)]

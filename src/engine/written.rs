@@ -15,13 +15,13 @@
 //! replaces evaluated every argument in the render exit env, where an
 //! effect-local `const next = {…}` is unknown and read `Maybe`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     domains::{
         AbstractDomain, AnalysisCtx, Interval, Stability, StateValue, StateValueTransfer, Transfer,
-        interp::{bind_params, callback_args, entry_env_of, exit_env_of, run_cfg},
-        stores::{AbstractEnv, EnvVal, Heap, MemoStore, StateStore},
+        interp::{entry_env_of, exit_env_of},
+        stores::{AbstractEnv, Heap, MemoStore, StateStore},
         transfer::as_arith,
     },
     engine::{
@@ -33,7 +33,6 @@ use crate::{
         bindings::{must_param, nested_bodies},
         cfg::{CFG, Terminator},
         expr::{BinOp, Expr},
-        hooks::HookEntry,
         types::{BlockId, HookLabel, Var},
     },
 };
@@ -246,7 +245,7 @@ fn step_of(
 /// returns are. `None` when one return is not.
 fn returns_step(body: &CFG, params: &[Var]) -> Option<Interval> {
     let nested = nested_bodies(body);
-    let is_param = |x: &Expr| must_param(x, body, &nested, params) == Some(0);
+    let is_param = |x: &Expr| must_param(x, body, &nested, params, &|_| false) == Some(0);
     let mut step: Option<Interval> = None;
     for b in body.blocks.values() {
         if let Terminator::Return(e, _) = &b.term {
@@ -314,9 +313,10 @@ fn returns_value(body: &CFG) -> StateValue {
 
 /// What a functional updater's (or a reducer's) returns do to the slot, read
 /// without an env (the body runs in its own scope): `Must` when every return
-/// allocates, `Never` when every return is the state parameter itself,
-/// `Once` when all of them are one literal, `May` otherwise or when nothing
-/// returns.
+/// allocates, `Never` when every return is the state parameter itself —
+/// never rebound, as [`returns_step`] reads it: a `s = s + 1` on a path
+/// returns another value (#214) —, `Once` when all of them are one literal,
+/// `May` otherwise or when nothing returns.
 fn returns_change(body: &CFG, params: &[Var]) -> Change {
     let returns: Vec<&Expr> = body
         .blocks
@@ -335,7 +335,8 @@ fn returns_change(body: &CFG, params: &[Var]) -> Change {
             Expr::ObjectLit { .. } | Expr::ArrayLit { .. } | Expr::FnLit { .. } | Expr::New { .. }
         )
     };
-    let identity = |e: &&Expr| matches!(e, Expr::Var(v) if params.first() == Some(v));
+    let nested = nested_bodies(body);
+    let identity = |e: &&Expr| must_param(e, body, &nested, params, &|_| false) == Some(0);
     if returns.iter().all(allocates) {
         Change::Must
     } else if returns.iter().all(identity) {
@@ -453,32 +454,51 @@ impl SiteEnvs<'_> {
     /// block's entry env replayed through the statements before the call.
     /// With no position — a nested, deferred or repeating site — the region's
     /// exit env, which over-approximates every binding the closure captured.
+    ///
+    /// That env holds the names of `cfg` and of the render. `hides` are the
+    /// names `expr` reads from another body — a write in a closure reads the
+    /// closure's `x`, not the region's (#310) — and they are ⊤; so are
+    /// `cfg`'s own names where the env is the render's (a memo or callback
+    /// body keeps no envs of its own).
     pub fn eval(
         &self,
         region: WriterRegion,
         cfg: &CFG,
         at: Option<(BlockId, usize)>,
         expr: &Expr,
+        hides: &dyn Fn(&str) -> bool,
     ) -> StateValue {
         let mut state = self.state.clone();
         let mut heap = self.heap.clone();
         let mut ac = AnalysisCtx::null(self.component, &mut state, self.memo, &mut heap);
-        match self.env_at(region, cfg, at, &mut ac) {
-            Some(env) => StateValueTransfer.eval_expr(expr, &env, &mut ac),
-            None => StateValue::bottom(),
+        let Some((mut env, holds_body)) = self.env_at(region, cfg, at, &mut ac) else {
+            return StateValue::bottom();
+        };
+        let own: HashSet<&str> = if holds_body {
+            HashSet::new()
+        } else {
+            crate::ir::bindings::own_names(&[], cfg).collect()
+        };
+        let mut read = HashSet::new();
+        crate::ir::free_vars::collect_used_vars(expr, &mut read);
+        for v in read.iter().filter(|v| hides(v) || own.contains(v.as_str())) {
+            env.forget(v);
         }
+        StateValueTransfer.eval_expr(expr, &env, &mut ac)
     }
 
     /// `None` for a site in a block the converged run never reaches — a side
     /// of a branch no value takes: the write never runs, so it stores
-    /// nothing.
+    /// nothing. Otherwise the env, and whether it holds `cfg`'s own names —
+    /// not when it is the render's exit env standing in for a body that
+    /// keeps none.
     fn env_at(
         &self,
         region: WriterRegion,
         cfg: &CFG,
         at: Option<(BlockId, usize)>,
         ac: &mut AnalysisCtx<'_, StateValue>,
-    ) -> Option<AbstractEnv<StateValue>> {
+    ) -> Option<(AbstractEnv<StateValue>, bool)> {
         let (entry, exits) = match region {
             WriterRegion::Render => (self.render_entry, Some(self.render_exits)),
             WriterRegion::Effect(l) => (self.exit, self.effect_exits.get(&l)),
@@ -487,11 +507,10 @@ impl SiteEnvs<'_> {
             WriterRegion::Memo(_) | WriterRegion::Callback(_) => (self.exit, None),
         };
         let (Some((block, stmt)), Some(exits)) = (at, exits) else {
-            return Some(
-                exits
-                    .and_then(|ex| exit_env_of(cfg, ex))
-                    .unwrap_or_else(|| self.exit.clone()),
-            );
+            return Some(match exits.and_then(|ex| exit_env_of(cfg, ex)) {
+                Some(env) => (env, true),
+                None => (self.exit.clone(), region == WriterRegion::Render),
+            });
         };
         if !exits.is_empty() && !exits.contains_key(&block) {
             return None;
@@ -502,173 +521,10 @@ impl SiteEnvs<'_> {
                 StateValueTransfer.exec_stmt(s, &mut env, ac);
             }
         }
-        Some(env)
+        // With no exit env of any block, the entry env stands in for every
+        // block before this one.
+        Some((env, !exits.is_empty() || region == WriterRegion::Render))
     }
-
-    /// Every body of the component the fixpoint keeps no per-block envs for
-    /// — a memo or a callback body, and every function literal nested in any
-    /// body — with the envs a run of it settles on, and the heap those runs
-    /// leave: what a name such a body binds holds, `get()`'s temp in a
-    /// `forEach` callback included (#246).
-    ///
-    /// Each literal runs, as the interpreter runs a closure, from the env it
-    /// is reached from: the env at its statement — what [`Self::eval`]
-    /// replays for a write — joined with its body's exit env, where a closure
-    /// called later finds what it captured (#215); its parameters are ⊤, and
-    /// a memo or callback body runs from the render exit env, as the fixpoint
-    /// runs it. The runs are made here, once per component over the converged
-    /// stores, rather than each time the setter walk enters a closure or by
-    /// hoisting the callee call out of the closure in lowering: one table
-    /// then serves every way a closure is reached — a sync callback, a
-    /// continuation, a listener, a call by name or through a memo, from any
-    /// region — and every name it binds, a `const s = get()` as much as a
-    /// temp, while when a write runs and where it is placed stay the walk's.
-    pub(crate) fn closure_envs<'c>(
-        &self,
-        render: &'c CFG,
-        hooks: &'c [HookEntry],
-    ) -> (Vec<ClosureEnv<'c>>, Heap) {
-        let mut state = self.state.clone();
-        let mut heap = self.heap.clone();
-        let mut out = Vec::new();
-        {
-            let mut ac = AnalysisCtx::null(self.component, &mut state, self.memo, &mut heap);
-            reach_literals(
-                &mut ac,
-                render,
-                self.render_entry,
-                self.render_exits,
-                &mut out,
-            );
-            for hook in hooks {
-                match hook {
-                    HookEntry::Effect {
-                        label, body_cfg, ..
-                    } => {
-                        if let Some(exits) = self.effect_exits.get(label) {
-                            reach_literals(&mut ac, body_cfg, self.exit, exits, &mut out);
-                        }
-                    }
-                    HookEntry::Handler {
-                        label, body_cfg, ..
-                    } => {
-                        if let Some(exits) = self.handler_exits.get(label) {
-                            reach_literals(&mut ac, body_cfg, self.exit, exits, &mut out);
-                        }
-                    }
-                    HookEntry::Memo { body_cfg, .. } => {
-                        run_literal(&mut ac, body_cfg, &[], &[], self.exit.clone(), &mut out);
-                    }
-                    HookEntry::Callback {
-                        body_cfg, params, ..
-                    } => {
-                        run_literal(&mut ac, body_cfg, params, &[], self.exit.clone(), &mut out);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        (out, heap)
-    }
-}
-
-/// A body the fixpoint keeps no per-block envs for, with the exit env of
-/// every block a run of it reached ([`SiteEnvs::closure_envs`]).
-pub(crate) struct ClosureEnv<'c> {
-    pub body: &'c CFG,
-    pub params: &'c [Var],
-    pub exits: HashMap<BlockId, AbstractEnv<StateValue>>,
-}
-
-/// Run every function literal written in `body` (not those nested in another
-/// literal: its own run reaches them) from the env it is reached from, given
-/// the body's entry env and per-block exit envs. A block no run reached holds
-/// no literal that runs.
-fn reach_literals<'c>(
-    ac: &mut AnalysisCtx<'_, StateValue>,
-    body: &'c CFG,
-    entry: &AbstractEnv<StateValue>,
-    exits: &HashMap<BlockId, AbstractEnv<StateValue>>,
-    out: &mut Vec<ClosureEnv<'c>>,
-) {
-    // Each literal with the call and position it is an argument at, if any:
-    // an in-cycle callee passes it arguments (#253).
-    type Literal<'c> = (&'c [Var], &'c CFG, Option<(&'c Expr, usize)>);
-    fn literals<'c>(e: &'c Expr, at: Option<(&'c Expr, usize)>, out: &mut Vec<Literal<'c>>) {
-        match e {
-            Expr::FnLit {
-                params, body_cfg, ..
-            } => out.push((params, body_cfg, at)),
-            Expr::Call { fn_, args } => {
-                literals(fn_, None, out);
-                for (i, a) in args.iter().enumerate() {
-                    literals(a, Some((&**fn_, i)), out);
-                }
-            }
-            _ => e.for_each_child(&mut |c| literals(c, None, out)),
-        }
-    }
-    let after = exit_env_of(body, exits);
-    let reached = |env: &AbstractEnv<StateValue>| match &after {
-        Some(after) => env.join(after),
-        None => env.clone(),
-    };
-    for (&bid, block) in &body.blocks {
-        if !exits.contains_key(&bid) {
-            continue;
-        }
-        // The literals of each statement, the terminator's last.
-        let mut at: Vec<Vec<Literal<'c>>> = block
-            .stmts
-            .iter()
-            .map(|s| {
-                let mut lits = Vec::new();
-                s.for_each_expr(&mut |e| literals(e, None, &mut lits));
-                lits
-            })
-            .collect();
-        let mut term = Vec::new();
-        if let Terminator::Return(e, _) | Terminator::Branch { cond: e, .. } = &block.term {
-            literals(e, None, &mut term);
-        }
-        at.push(term);
-        let Some(last) = at.iter().rposition(|lits| !lits.is_empty()) else {
-            continue;
-        };
-        let mut env = entry_env_of(body, bid, entry, exits);
-        for (i, lits) in at.iter().enumerate().take(last + 1) {
-            for &(params, lit, call) in lits {
-                let env = reached(&env);
-                let args = call.map_or_else(Vec::new, |(callee, index)| {
-                    callback_args(&StateValueTransfer, callee, index, &env, ac)
-                });
-                run_literal(ac, lit, params, &args, env, out);
-            }
-            if let Some(stmt) = block.stmts.get(i).filter(|_| i < last) {
-                StateValueTransfer.exec_stmt(stmt, &mut env, ac);
-            }
-        }
-    }
-}
-
-/// Run one body from `env`, its parameters bound to `args` and ⊤ past them,
-/// then the literals it holds.
-fn run_literal<'c>(
-    ac: &mut AnalysisCtx<'_, StateValue>,
-    body: &'c CFG,
-    params: &'c [Var],
-    args: &[EnvVal<StateValue>],
-    mut env: AbstractEnv<StateValue>,
-    out: &mut Vec<ClosureEnv<'c>>,
-) {
-    bind_params(&mut env, params, args);
-    let exits = run_cfg(&StateValueTransfer, body, env.clone(), ac, 0).exits;
-    reach_literals(ac, body, &env, &exits, out);
-    out.push(ClosureEnv {
-        body,
-        params,
-        exits,
-    });
 }
 
 #[cfg(test)]
@@ -752,6 +608,8 @@ mod tests {
                 id: ExprId::fresh(),
                 fn_: Box::new(Expr::Var("Map".into())),
                 args: vec![Expr::Var("p".into())],
+                ctor: None,
+                on_this: false,
             },
             "p",
         );

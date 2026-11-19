@@ -42,12 +42,13 @@ use crate::{
         guards::{call_may_differ, site_guards, write_settles_member},
         render_deps::{Deps, Source},
         setters::{memo_val_labels, resolve_setter_aliases},
+        store::STORE_SLOT,
     },
     ir::{
         ComponentId, QualifiedSlot,
         bindings::{binding_of, must_slot_read},
         cfg::{CFG, Terminator},
-        expr::{Expr, MarkerVal, SummaryValue, mutation_receiver},
+        expr::{Expr, mutation_receiver},
         hooks::{Arity, DepsArg, HookEntry},
         stmt::{MemberKey, Stmt},
         types::{BlockId, HookLabel, Var},
@@ -167,7 +168,6 @@ pub(crate) fn collect_effect_triggers(
         props: HashSet::new(),
     };
     let mut refs_move: HashMap<(HookLabel, bool), bool> = HashMap::new();
-    let held_hooks = held_hook_labels(render_cfg);
     for hook in hooks {
         // A memo's deps list gates its body exactly as an effect's does: React
         // compares both lists the same way, at the same render (#249).
@@ -223,9 +223,10 @@ pub(crate) fn collect_effect_triggers(
                 } else {
                     mutable.get_or_insert(i);
                 }
-            } else if val.reference == Stability::PerRender {
-                // A new reference on some path (`c ? {} : undefined`): new at
-                // every render that takes it.
+            } else if matches!(val.reference, Stability::PerRender | Stability::MayBeFresh) {
+                // A new reference on some path (`c ? {} : undefined`, `x ??
+                // {}`): new at every render that takes it, with nothing it is
+                // computed from moving (#304).
                 mutable.get_or_insert(i);
             }
             // A spread stands for elements nothing here sees: they hold only
@@ -254,7 +255,10 @@ pub(crate) fn collect_effect_triggers(
                 slots.extend(labels.iter().copied());
             }
             let by_identity = val.is_reference_only()
-                && !matches!(val.reference, Stability::Unknown | Stability::VersionedTop);
+                && !matches!(
+                    val.reference,
+                    Stability::Unknown | Stability::VersionedTop | Stability::MayBeFresh
+                );
             // One value at every render (`useMemo(() => 3, [s])`) moves with
             // nothing it is computed from; a name holds it at the call only
             // when it is bound once.
@@ -276,19 +280,19 @@ pub(crate) fn collect_effect_triggers(
                 // into hands back, which may be a new reference at every
                 // render (#294: holding it still was an assumption, and a
                 // hook returning a fresh object per call loops). A summary
-                // that pins the result keeps it: through the value
-                // (`by_identity`, `held`), or the router hooks' values that
-                // move on navigation alone (`held_hooks`). A source a function value
-                // only captures is not read here: the function's identity,
-                // not the cell, is compared.
+                // that pins the result keeps it, through the value
+                // (`by_identity`, `held`). A held result is a read of the
+                // store (ADR-046): a row on the store slot, which moves when a
+                // body writes it. A source a function value only captures is
+                // not read here: the function's identity, not the cell, is
+                // compared.
                 if src.top
                     || (src.impure && call_may_differ(&val, |_| true, true))
                     || src.set.iter().any(|s| {
                         !src.captured.contains(s)
                             && match s {
                                 Source::Ref(l) => moving_ref(*l),
-                                Source::Hook(l) => !held_hooks.contains(l),
-                                Source::Module(_) | Source::Context(_) => true,
+                                Source::Hook(_) | Source::Module(_) | Source::Context(_) => true,
                                 _ => false,
                             }
                     })
@@ -297,6 +301,7 @@ pub(crate) fn collect_effect_triggers(
                 }
                 slots.extend(src.set.iter().filter_map(|s| match s {
                     Source::Slot(l) => Some((component, *l)),
+                    Source::Store => Some(STORE_SLOT),
                     _ => None,
                 }));
                 // What a prop is computed from lives in a parent, which may
@@ -326,21 +331,6 @@ pub(crate) fn collect_effect_triggers(
         };
         out.reruns.insert(*label, class);
     }
-    out
-}
-
-/// The hooks whose summary says the result moves only on navigation, which
-/// the automatic loop cannot raise (`SummaryValue::Held`, the router hooks,
-/// #161): the one hook result a re-run class may read as held (#294).
-fn held_hook_labels(render_cfg: &CFG) -> HashSet<HookLabel> {
-    fn walk(e: &Expr, out: &mut HashSet<HookLabel>) {
-        if let Expr::HookMarker(l, MarkerVal::Summary(SummaryValue::Held)) = e {
-            out.insert(*l);
-        }
-        e.for_each_child(&mut |c| walk(c, out));
-    }
-    let mut out = HashSet::new();
-    render_cfg.for_each_expr(&mut |e| walk(e, &mut out));
     out
 }
 
@@ -521,25 +511,44 @@ pub fn dep_is_fresh(
 /// React compares the elements it supplies, never `src` (#272): it is when
 /// every array the heap places `src` at holds an element that is one. A
 /// source the heap does not place, or that may hold elements no entry says,
-/// answers nothing.
-fn spread_is_fresh(src: &Expr, env: &AbstractEnv<StateValue>, heap: &Heap) -> bool {
+/// answers nothing. `fresh` is the fact asked of an element.
+fn spread_is_fresh(
+    src: &Expr,
+    env: &AbstractEnv<StateValue>,
+    heap: &Heap,
+    fresh: fn(&StateValue) -> bool,
+) -> bool {
     let Some(sites) = crate::domains::stores::resolve_locs(src, env, heap) else {
         return false;
     };
     !sites.open
         && !sites.ids.is_empty()
         && sites.ids.iter().all(|id| match heap.get(*id) {
-            Some(crate::domains::HeapValue::Obj(obj)) if !obj.is_open() => obj
-                .named
-                .values()
-                .any(|ev| ev.as_val().is_unstable_reference_only()),
+            Some(crate::domains::HeapValue::Obj(obj)) if !obj.is_open() => {
+                obj.named.values().any(|ev| fresh(&ev.as_val()))
+            }
             _ => false,
         })
 }
 
 /// Every effect, memo and callback of `result` with a written deps list
-/// that holds a dep [`dep_is_fresh`], and the indices of those deps.
+/// that holds a dep [`dep_is_fresh`], and the indices of those deps. A must
+/// fact: the loop rules' `Always::FreshDep` reads it.
 pub fn fresh_deps(result: &AnalysisResult<StateValue>) -> FreshDeps {
+    deps_where(result, StateValue::is_unstable_reference_only)
+}
+
+/// The deps that are a new reference at every render where they hold an
+/// object ([`StateValue::is_unstable_reference_when_object`]): `a?.map(f)`,
+/// `a && a.map(f)`. Not a must fact — only `always-unstable-deps` reads it,
+/// never a proof.
+pub fn fresh_deps_when_object(result: &AnalysisResult<StateValue>) -> FreshDeps {
+    deps_where(result, StateValue::is_unstable_reference_when_object)
+}
+
+/// The deps of every hook of `result` whose value at the render's exit has
+/// the fact `fresh`.
+fn deps_where(result: &AnalysisResult<StateValue>, fresh: fn(&StateValue) -> bool) -> FreshDeps {
     let env = result.exit_env();
     // One scratch heap for the whole component: a member dep (`obj.f`) only
     // resolves through the converged heap (#135).
@@ -555,27 +564,27 @@ pub fn fresh_deps(result: &AnalysisResult<StateValue>) -> FreshDeps {
         let Some(list) = deps.list() else {
             continue;
         };
-        let fresh: BTreeSet<usize> = list
+        let found: BTreeSet<usize> = list
             .as_slice()
             .iter()
             .enumerate()
             .filter(|(i, dep)| {
                 if list.spread_at.contains(i) {
-                    return spread_is_fresh(dep, &env, &heap);
+                    return spread_is_fresh(dep, &env, &heap, fresh);
                 }
-                dep_is_fresh(
-                    result.component,
+                fresh(&crate::engine::eval::eval_in_stores(
                     dep,
                     &env,
+                    result.component,
                     &result.state_store,
                     &result.memo_store,
                     &mut heap,
-                )
+                ))
             })
             .map(|(i, _)| i)
             .collect();
-        if !fresh.is_empty() {
-            out.insert(*label, fresh);
+        if !found.is_empty() {
+            out.insert(*label, found);
         }
     }
     out

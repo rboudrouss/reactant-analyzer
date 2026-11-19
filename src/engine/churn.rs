@@ -93,32 +93,33 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::{
-    domains::{AbstractEnv, Interval, StateValue, transfer::as_arith},
+    domains::{
+        AbstractEnv, Interval, StateValue,
+        transfer::{as_arith, returns_no_input},
+    },
     engine::{
         AnalysisResult, Change, ConvergedEval, EffectTrigger, HookKind, ProgramAnalysisResult,
         SlotWriter, WriterPhase, WriterRegion,
         dominance::on_all_paths,
         guards::{
-            Invariance, MemberWrites, SlotPath, WriteSite, call_may_differ,
-            converges_under_all_writes, let_bindings, must_slot_paths, mutated_roots, navigates,
-            site_guards,
+            Invariance, LoopFacts, MemberWrites, SlotPath, WriteSite, call_may_differ,
+            converges_under_all_writes, let_bindings, must_slot_paths, site_guards,
         },
-        registrations::dispatches_events,
         render_deps::written_names,
-        setters::{
-            memo_val_labels, must_alias_scopes, must_state_vals, resolve_setter_aliases,
-            state_val_labels,
-        },
+        setters::{must_alias_scopes, must_state_vals},
+        store::{STORE_SLOT, body_writes},
         triggers::{Always, Rerun},
         triggers_of,
-        written::{Written, churning_part, keeps_initial},
+        written::{SiteEnvs, Written, churning_part, keeps_initial},
     },
     ir::{
-        ComponentId, QualifiedSlot, SourceRange,
-        bindings::local_bindings,
+        CompOrigin, ComponentId, QualifiedSlot, SourceRange,
+        bindings::{binds, local_bindings, must_param, nested_bodies},
         cfg::{CFG, Terminator},
-        expr::{Expr, SPREAD_KEY_PREFIX, object_member},
+        expr::{Expr, Prim, SPREAD_KEY_PREFIX, object_getter, object_member},
         hooks::HookEntry,
+        module::ValueRef,
+        stmt::Stmt,
         types::{BlockId, HookLabel, Symbol, Var},
     },
 };
@@ -136,9 +137,9 @@ pub struct ChurnEdge {
     pub from: QualifiedSlot,
     pub to: QualifiedSlot,
     pub strength: EdgeStrength,
-    /// Component whose effect carries this edge.
+    /// Component whose effect (or render) carries this edge.
     pub component: ComponentId,
-    pub effect_label: HookLabel,
+    pub carrier: Carrier,
     pub write_span: Option<SourceRange>,
     /// The edge exists because the carrying effect re-runs after every render
     /// (its re-run class, `engine::triggers::Rerun::Always`, or a call
@@ -151,6 +152,25 @@ pub struct ChurnEdge {
     /// start, not by a new reference (`stepping_slots`, #144): what its
     /// message says the loop rests on.
     pub stepping: bool,
+}
+
+/// What re-runs to carry an edge: an effect, or the render of the edge's
+/// component, which writes the store from its body (ADR-046). A finding is
+/// reported at an effect, never at a render.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Carrier {
+    Effect(HookLabel),
+    Render,
+}
+
+impl Carrier {
+    /// The carrying effect, if an effect carries the edge.
+    pub fn effect(self) -> Option<HookLabel> {
+        match self {
+            Carrier::Effect(l) => Some(l),
+            Carrier::Render => None,
+        }
+    }
 }
 
 /// Why an effect re-runs after every render, as the edges it carries say.
@@ -178,6 +198,9 @@ pub struct ChurnCycle {
     /// carriers) — severity is capped at Warning: cross-component must-rerun
     /// cannot be proven (prop deps are `Versioned`, never exact).
     pub cross_component: bool,
+    /// The cycle goes through the store (ADR-046): every edge into it is a
+    /// may-write, so the cycle is never all-must.
+    pub store: bool,
 }
 
 /// The program's churn graph: every edge plus the cycles found in it.
@@ -243,40 +266,28 @@ fn initial_only_slots(result: &ProgramAnalysisResult) -> HashSet<QualifiedSlot> 
         .collect()
 }
 
-/// The slots every write of which, in a run with no user input, moves the slot
-/// the same way at every call (#144, #280). The slot starts at an integer
-/// within ±2^50, its setter reaches nothing the rows do not describe, and each
-/// write of it program-wide either stores its own read plus an integer step
-/// `δ`, 1 ≤ |δ| ≤ 2^20, of one sign for all of them, once per run of its body;
-/// or runs only on a user's interaction (`HookEntry::runs_on_interaction`), in
-/// a program that dispatches no event: React with no input, the semantics an
-/// Error is judged by, never runs that one. Value steps start from the
-/// committed value and updaters add to the running one, so a batch moves the
-/// slot strictly one way and no write in it restores where it started; and the
-/// integers it holds stay exact, below 2^51, for 2^30 batches per write, far
-/// past the 50 nested updates React stops a loop at, the cutoff a loop claim
-/// rests on. A start the bound misses is not claimed: `n + 1` is `n` from 2^53
-/// on, and at ±∞.
+/// The slots every write of which moves the slot the same way at every call
+/// (#144, #280). The slot starts at an integer within ±2^50, its setter
+/// reaches nothing the rows do not describe, and each write of it
+/// program-wide, an event handler's included, stores its own read plus an
+/// integer step `δ`, 1 ≤ |δ| ≤ 2^20, of one sign for all of them. A handler
+/// waits for no user when something dispatches its event, which code the
+/// analysis does not see may do (a computed `el[m]()`, a bound `click`, a
+/// library), so its write is in the batch it may restore (#313). Value steps
+/// start from the committed value and updaters add to the running one, so a
+/// batch moves the slot strictly one way and no write in it restores where it
+/// started, however many writes of it run in the batch: `same_tick` is a may
+/// fact (#313), a write it pairs with nothing may still run twice, which only
+/// adds steps of the same sign. The integers it holds stay exact, below 2^51,
+/// for 2^30 / k batches when a batch runs k writes of the slot — past the 50
+/// nested updates React stops a loop at, the cutoff a loop claim rests on,
+/// unless one batch runs 2^24 of them. A start the bound misses is not
+/// claimed: `n + 1` is `n` from 2^53 on, and at ±∞.
 fn stepping_slots(result: &ProgramAnalysisResult) -> HashSet<QualifiedSlot> {
     const START: f64 = (1u64 << 50) as f64;
     const STEP: f64 = (1u64 << 20) as f64;
     let within =
         |i: &Interval, lo: f64, hi: f64| i.is_int && !i.is_bottom() && lo <= i.lo && i.hi <= hi;
-    // A dispatch runs a handler before it returns, with no user: then none
-    // waits for one (#277 adds the rows of the dispatching component's own).
-    let dispatches = result.components.values().any(|c| {
-        dispatches_events(&c.render_cfg)
-            || c.hooks
-                .iter()
-                .filter_map(HookEntry::body_cfg)
-                .any(dispatches_events)
-    });
-    let user_only = |c: ComponentId, w: &SlotWriter| {
-        !dispatches
-            && matches!(w.region, WriterRegion::Handler(l)
-                if result.components[&c].hooks.iter()
-                    .any(|h| h.label() == l && h.runs_on_interaction()))
-    };
     let mut rows: HashMap<QualifiedSlot, Vec<(ComponentId, &SlotWriter)>> = HashMap::new();
     for (&c, r) in &result.components {
         for w in &r.slot_writers {
@@ -290,7 +301,6 @@ fn stepping_slots(result: &ProgramAnalysisResult) -> HashSet<QualifiedSlot> {
             };
             let steps: Option<Vec<Interval>> = ws
                 .iter()
-                .filter(|(c, w)| !user_only(*c, w))
                 .map(|(_, w)| w.written.step.filter(|_| !w.same_tick))
                 .collect();
             steps.is_some_and(|ds| {
@@ -302,6 +312,33 @@ fn stepping_slots(result: &ProgramAnalysisResult) -> HashSet<QualifiedSlot> {
         })
         .map(|(slot, _)| slot)
         .collect()
+}
+
+/// Does the render read a held value — a summary marker whose result, or a
+/// member of it, moves with the store (ADR-046)? Such a component re-renders
+/// when the store is written, and hands its children new props.
+fn reads_held(render_cfg: &CFG) -> bool {
+    use crate::ir::expr::{MarkerVal, SummaryValue};
+    fn held(sv: &SummaryValue) -> bool {
+        match sv {
+            SummaryValue::Held | SummaryValue::Navigator { stable: false } => true,
+            SummaryValue::Shape { members, .. } => members.iter().any(|(_, m)| held(m)),
+            _ => false,
+        }
+    }
+    fn walk(e: &Expr) -> bool {
+        if let Expr::HookMarker(_, MarkerVal::Summary(sv)) = e
+            && held(sv)
+        {
+            return true;
+        }
+        let mut found = false;
+        e.for_each_child(&mut |c| found |= walk(c));
+        found
+    }
+    let mut found = false;
+    render_cfg.for_each_expr(&mut |e| found |= walk(e));
+    found
 }
 
 /// One element of a component in another one's render: where it mounts.
@@ -319,8 +356,110 @@ struct Element<'a> {
 
 /// The program's component tree, child → the elements that mount it (#213).
 /// A component another one renders only through a value the lowering cannot
-/// place (`origin: None`) has no element here.
+/// place (`origin: None`) has no element here: [`mounted_unplaced`] says
+/// which components that may be.
 type ComponentTree<'a> = HashMap<ComponentId, Vec<Element<'a>>>;
+
+/// The components an element the tree does not place may mount (#313), so
+/// that nothing proves they stay mounted: one a module reads as a value (a
+/// ternary or a collection of components, a prop a library mounts, a lazy
+/// import), one whose name several components share, every component of a
+/// file an element names under a definition the table does not resolve (a
+/// default export under another name, a barrel), and one that renders
+/// itself. A component outside all of them is mounted only by the elements
+/// of the tree, or is a root.
+fn mounted_unplaced(result: &ProgramAnalysisResult) -> HashSet<ComponentId> {
+    let table = &result.component_table;
+    let modules = &result.module_table;
+    let graph = modules.re_export_graph();
+    let defines = |p: &std::path::Path, n: &str| {
+        table
+            .id_of(&CompOrigin {
+                file: p.to_path_buf(),
+                name: n.to_string(),
+            })
+            .is_some()
+    };
+    let mut out: HashSet<ComponentId> = HashSet::new();
+    // Any definition of `file`, and of the files it re-exports from.
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    let named = |file: &std::path::Path, name: &str, out: &mut HashSet<ComponentId>| {
+        let (f, n) = graph
+            .origin(file, name, &defines)
+            .unwrap_or_else(|| (file.to_path_buf(), name.to_string()));
+        match table.id_of(&CompOrigin { file: f, name: n }) {
+            Some(id) => {
+                out.insert(id);
+            }
+            None => out.extend(table.ids_named(name)),
+        }
+    };
+    for path in modules.paths() {
+        for r in modules.facts(path).map_or(&[][..], |f| &f.value_refs) {
+            match r {
+                ValueRef::Named(file, name) => named(file, name, &mut out),
+                ValueRef::File(file) => files.push(file.clone()),
+            }
+        }
+    }
+    for r in &result.components {
+        r.1.render_cfg.for_each_expr(&mut |e| {
+            walk_elements(e, &mut |name, origin| {
+                let by_origin = origin.and_then(|o| table.id_of(o));
+                match by_origin {
+                    Some(child) if child == *r.0 => {
+                        out.insert(child);
+                    }
+                    Some(_) => {}
+                    None => {
+                        let same: Vec<ComponentId> = table.ids_named(name).collect();
+                        if same.len() > 1 {
+                            out.extend(same.iter().copied());
+                        } else if same.as_slice() == [*r.0] {
+                            out.insert(*r.0);
+                        }
+                        if let Some(o) = origin
+                            && same.is_empty()
+                        {
+                            files.push(o.file.clone());
+                        }
+                    }
+                }
+            });
+        });
+    }
+    let mut seen: HashSet<std::path::PathBuf> = HashSet::new();
+    while let Some(file) = files.pop() {
+        if !seen.insert(file.clone()) {
+            continue;
+        }
+        out.extend(
+            table
+                .ids()
+                .filter(|&id| table.origin(id).is_some_and(|o| o.file == file)),
+        );
+        if let Some(facts) = modules.facts(&file) {
+            for (_, from, imported) in &facts.re_exports.named {
+                named(from, imported, &mut out);
+                files.push(from.clone());
+            }
+            files.extend(facts.re_exports.star.iter().cloned());
+        }
+    }
+    out
+}
+
+/// Every element under `e`, closures included: its tag as written and the
+/// component the lowering proved it names.
+fn walk_elements<'a>(e: &'a Expr, f: &mut dyn FnMut(&'a str, Option<&'a CompOrigin>)) {
+    if let Expr::CompApp { name, origin, .. } = e {
+        f(name, origin.as_deref());
+    }
+    if let Expr::FnLit { body_cfg, .. } = e {
+        body_cfg.for_each_expr(&mut |x| walk_elements(x, f));
+    }
+    e.for_each_child(&mut |c| walk_elements(c, f));
+}
 
 fn component_tree(result: &ProgramAnalysisResult) -> ComponentTree<'_> {
     /// Every node under `e`, with whether it sits inside a closure.
@@ -342,15 +481,23 @@ fn component_tree(result: &ProgramAnalysisResult) -> ComponentTree<'_> {
             block.for_each_expr(&mut |e| {
                 walk(e, false, &mut |e, closure| {
                     let Expr::CompApp {
-                        origin: Some(o),
+                        name,
+                        origin,
                         props,
                         ..
                     } = e
                     else {
                         return;
                     };
-                    let Some(child) = result.component_table.id_of(o) else {
-                        return;
+                    // As the engine resolves the child it analyses: the
+                    // proven origin, else the one component of that name.
+                    let table = &result.component_table;
+                    let child = match origin.as_deref().and_then(|o| table.id_of(o)) {
+                        Some(child) => child,
+                        None => match table.ids_named(name).collect::<Vec<_>>()[..] {
+                            [child] => child,
+                            _ => return,
+                        },
                     };
                     if child == parent {
                         return;
@@ -392,9 +539,8 @@ fn ancestors(c: ComponentId, tree: &ComponentTree<'_>) -> HashSet<ComponentId> {
 pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
     // Per-component facts the proofs read.
     struct CompCtx<'a> {
-        /// The names some render binding ties to a slot's read: a may
-        /// reading, for what may move.
-        state_vals: HashMap<Var, HookLabel>,
+        /// What the invariance proofs read ([`LoopFacts`]).
+        facts: LoopFacts<'a>,
         /// The names the render binds to a slot's read on every path, no
         /// other body rebinding them (`setters::must_state_vals`): what the
         /// proofs may read as the slot itself (#210, #222).
@@ -405,10 +551,9 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         slot_paths: HashMap<Var, SlotPath>,
         /// The member writes into each slot's object, in any body (#252).
         members: MemberWrites<'a>,
-        memo_vals: HashMap<Var, HookLabel>,
-        memo_deps: HashMap<HookLabel, &'a [Expr]>,
-        render_lets: HashMap<&'a str, Option<&'a Expr>>,
-        mutated: HashSet<Var>,
+        /// Every body but the render, with its parameters
+        /// (`setters::must_alias_scopes`).
+        scopes: Vec<(&'a [Var], &'a CFG)>,
         /// The props hold across every loop the component's edges can be on:
         /// no write the loop can run moves a slot of an ancestor (#206), and
         /// no effect of the component reacts to another component's slot.
@@ -454,16 +599,21 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
     // component's effect: the union is program-wide, as `render_deps` reads
     // it.
     let module_written: HashSet<Var> = result.components.values().flat_map(written_names).collect();
-    // A visible navigation in any body the loop can run moves every
-    // navigation-held value program-wide (#161).
-    let navigates = result.components.values().any(|c| {
+    // A visible write of the store in any body the loop can run moves every
+    // held value program-wide (#161, ADR-046): a body that writes it anywhere,
+    // nested closures included, or a row the writer walk placed outside a
+    // handler.
+    let store_moves = result.components.values().any(|c| {
         let render = local_bindings(&c.render_cfg);
-        navigates(&c.render_cfg, &render)
+        body_writes(&c.render_cfg, &render)
             || c.hooks
                 .iter()
                 .filter(|h| !matches!(h, HookEntry::Handler { .. }))
                 .filter_map(HookEntry::body_cfg)
-                .any(|b| navigates(b, &render))
+                .any(|b| body_writes(b, &render))
+            || c.slot_writers
+                .iter()
+                .any(|w| w.writes_store() && w.phase != WriterPhase::Handler)
     });
 
     // The component tree (#213), and the components a write the loop can run
@@ -480,11 +630,23 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 .map(move |w| node_of(c, w))
         })
         .collect();
+    // A store trigger row is live only when some write the loop can run
+    // writes the store: otherwise nothing moves it.
+    let store_written = moved.contains(&STORE_SLOT);
+    let live = |t: &&EffectTrigger| store_written || t.slot != STORE_SLOT;
+    // The components whose render reads a held value: a write of the store
+    // re-renders them (ADR-046).
+    let subscribers: HashSet<ComponentId> = result
+        .components
+        .iter()
+        .filter(|(_, r)| reads_held(&r.render_cfg))
+        .map(|(&c, _)| c)
+        .collect();
     // The props node `P_c` (#207), by its in-edges: every slot of an
     // ancestor some write the loop can run moves — `P_parent → P_c` is
-    // folded in, the ancestors being transitive. An edge out of `P_c` is
-    // pushed from each of them, so every edge stays a slot-to-slot write
-    // edge with its carrying effect.
+    // folded in, the ancestors being transitive — and the store, when an
+    // ancestor reads it. An edge out of `P_c` is pushed from each of them,
+    // so every edge stays a slot-to-slot write edge with its carrying effect.
     let props_in: HashMap<ComponentId, Vec<QualifiedSlot>> = result
         .components
         .keys()
@@ -495,6 +657,9 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 .filter(|s| up.contains(&s.0))
                 .copied()
                 .collect();
+            if store_written && up.iter().any(|a| subscribers.contains(a)) {
+                v.push(STORE_SLOT);
+            }
             v.sort();
             (c, v)
         })
@@ -502,39 +667,22 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
 
     for (&comp, comp_result) in &result.components {
         let cfg = &comp_result.render_cfg;
-        let mut mutated = module_written.clone();
-        mutated.extend(mutated_roots(cfg));
-        for body in comp_result.hooks.iter().filter_map(HookEntry::body_cfg) {
-            mutated.extend(mutated_roots(body));
-        }
-        let state_vals = resolve_setter_aliases(cfg, &state_val_labels(cfg));
         let scopes = must_alias_scopes(cfg, &comp_result.hooks);
         let must_state_vals = must_state_vals(cfg, &scopes);
         let slot_paths = must_slot_paths(cfg, &scopes, &must_state_vals);
         ctxs.insert(
             comp,
             CompCtx {
-                state_vals,
+                facts: LoopFacts::of(comp_result, &module_written),
                 must_state_vals,
                 slot_paths,
                 members: MemberWrites::of(comp_result),
-                memo_vals: resolve_setter_aliases(cfg, &memo_val_labels(cfg)),
-                memo_deps: comp_result
-                    .hooks
-                    .iter()
-                    .filter_map(|h| match h {
-                        HookEntry::Memo { label, deps, .. }
-                        | HookEntry::Callback { label, deps, .. } => deps
-                            .list()
-                            .filter(|d| d.arity.exact().is_some())
-                            .map(|d| (*label, d.as_slice())),
-                        _ => None,
-                    })
-                    .collect(),
-                render_lets: let_bindings(cfg),
-                mutated,
+                scopes,
                 // An effect's rows: a memo's write is a render-phase write,
                 // whose re-runs the render's own sites already stand for.
+                // The store is read here as the proofs read it before it
+                // was a node (#161): a store write moves no prop they read
+                // (`docs/limitations.md`).
                 props_hold: comp_result
                     .effect_triggers
                     .iter()
@@ -544,23 +692,27 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                             .get(&t.hook)
                             .is_some_and(|i| i.kind == HookKind::Effect)
                     })
-                    .all(|t| t.slot.0 == comp)
-                    && props_in[&comp].is_empty(),
+                    .all(|t| t.slot.0 == comp || t.slot == STORE_SLOT)
+                    && props_in[&comp].iter().all(|s| *s == STORE_SLOT),
                 exit: comp_result.exit_env(),
             },
         );
     }
 
     // Which components stay mounted across the loop, on the component tree
-    // (#162, #213).
-    let mut stays_memo: HashMap<ComponentId, bool> = HashMap::new();
+    // (#162, #213). One an element the tree does not place may mount does
+    // not: nothing says what that element is under (#313).
+    let mut stays_memo: HashMap<ComponentId, bool> = mounted_unplaced(result)
+        .into_iter()
+        .map(|c| (c, false))
+        .collect();
     let kept_mounted: HashMap<ComponentId, bool> = result
         .components
         .keys()
         .map(|&c| {
             (
                 c,
-                stays(c, &tree, result, &ctxs, navigates, &mut stays_memo),
+                stays(c, &tree, result, &ctxs, store_moves, &mut stays_memo),
             )
         })
         .collect();
@@ -625,8 +777,9 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             if writes.is_empty() {
                 continue;
             }
-            let triggers: Vec<&EffectTrigger> =
-                triggers_of(&comp_result.effect_triggers, *label).collect();
+            let triggers: Vec<&EffectTrigger> = triggers_of(&comp_result.effect_triggers, *label)
+                .filter(live)
+                .collect();
             let mut exact_local: HashSet<HookLabel> = HashSet::new();
             let mut versioned: HashSet<QualifiedSlot> = HashSet::new();
             for t in &triggers {
@@ -647,23 +800,12 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             // Where the result, the join of every call site's input, says
             // nothing, a dep fresh under one element's input alone re-runs it
             // after every render through that element (#237): a possible
-            // re-run, since another element may hand it a stable value.
-            let always = match comp_result.rerun(*label).and_then(Rerun::always) {
-                Some(why) => Some(EveryRender {
-                    why,
-                    surely: match why {
-                        Always::FreshDep(i) => deps.get(i).is_some_and(|d| {
-                            !invariance_of(&ctxs[&comp], navigates).holds(
-                                d,
-                                &ctxs[&comp].render_lets,
-                                true,
-                            )
-                        }),
-                        _ => why.certain(),
-                    },
-                    through: BTreeSet::new(),
-                }),
-                None => result
+            // re-run, since another element may hand it a stable value. A
+            // join that only may re-run it (a stable and a fresh input are
+            // `MayBeFresh`, #304) says no more than that element does.
+            let joined = comp_result.rerun(*label).and_then(Rerun::always);
+            let through = || {
+                result
                     .call_graph
                     .fresh_through(comp, *label)
                     .into_iter()
@@ -672,7 +814,29 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                         why: Always::FreshDep(i),
                         surely: false,
                         through,
-                    }),
+                    })
+            };
+            let site = match joined {
+                Some(Always::MutableDep(_)) | None => through(),
+                _ => None,
+            };
+            // Surely, a fresh dep re-runs the effect after every render of
+            // this component only where this render allocates it: a prop, a
+            // context value or a default over a prop is new only when the
+            // parent renders (#309).
+            let always = match joined {
+                _ if site.is_some() => site,
+                Some(why) => Some(EveryRender {
+                    why,
+                    surely: match why {
+                        Always::FreshDep(i) => deps.get(i).is_some_and(|d| {
+                            fresh_here(&ctxs[&comp], comp_result, d, &comp_result.render_cfg)
+                        }),
+                        _ => why.certain(),
+                    },
+                    through: BTreeSet::new(),
+                }),
+                None => None,
             };
             facts.push(EffectFacts {
                 comp,
@@ -707,29 +871,60 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 m.entry(s.comp).or_default().push(i);
                 m
             });
-    fn invariance_of<'c>(ctx: &'c CompCtx<'_>, navigates: bool) -> Invariance<'c> {
-        Invariance {
-            render: &ctx.render_lets,
-            state_vals: &ctx.state_vals,
-            memo_vals: &ctx.memo_vals,
-            memo_deps: &ctx.memo_deps,
-            mutated: &ctx.mutated,
-            navigates,
+    /// [`allocated_every_run`] for `e`, read in `body` of the component of
+    /// `ctx`: a render binding holds no reference where the converged
+    /// render env, at its statement, says it holds none.
+    fn fresh_here<'c>(
+        ctx: &'c CompCtx<'c>,
+        comp: &'c AnalysisResult<StateValue>,
+        e: &'c Expr,
+        body: &'c CFG,
+    ) -> bool {
+        let envs = SiteEnvs::of(comp, &ctx.exit);
+        let render = &comp.render_cfg;
+        let no_reference = |at: (BlockId, usize), rhs: &Expr| {
+            envs.eval(WriterRegion::Render, render, Some(at), rhs, &|_| false)
+                .holds_no_reference()
+        };
+        let memos = comp
+            .hooks
+            .iter()
+            .filter_map(|h| match h {
+                HookEntry::Memo {
+                    label, body_cfg, ..
+                } => Some((*label, Some(body_cfg))),
+                HookEntry::Callback { label, .. } => Some((*label, None)),
+                _ => None,
+            })
+            .filter_map(|(l, b)| ctx.facts.memo_deps.get(&l).map(|d| (l, (b, *d))))
+            .collect();
+        Allocated {
+            render,
+            elsewhere: &ctx.scopes,
+            mutated: &ctx.facts.mutated,
+            memos,
+            no_reference: &no_reference,
         }
+        .fresh(e, body, 8)
+    }
+    fn invariance_of<'c>(ctx: &'c CompCtx<'_>, store_moves: bool) -> Invariance<'c> {
+        ctx.facts.invariance(store_moves)
     }
     /// Does every element that mounts `c` keep it mounted across the loop,
     /// and is its parent kept mounted in turn (#213)? An element keeps its
     /// child when it sits outside any closure, under guards that hold still
     /// in the parent, with no `key` or one that holds. A component no
-    /// element mounts is a root and stays; one the table cannot place, or
-    /// one met again while its own answer is pending (a component that
-    /// renders an ancestor of itself), fails closed.
+    /// element mounts is a root and stays — `memo` starts with every one an
+    /// element the tree does not place may mount ([`mounted_unplaced`]),
+    /// which does not; one the table cannot place, or one met again while
+    /// its own answer is pending (a component that renders an ancestor of
+    /// itself), fails closed.
     fn stays(
         c: ComponentId,
         tree: &ComponentTree<'_>,
         result: &ProgramAnalysisResult,
         ctxs: &HashMap<ComponentId, CompCtx<'_>>,
-        navigates: bool,
+        store_moves: bool,
         memo: &mut HashMap<ComponentId, bool>,
     ) -> bool {
         if let Some(&s) = memo.get(&c) {
@@ -740,12 +935,12 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             && tree.get(&c).is_none_or(|els| {
                 els.iter().all(|e| {
                     let ctx = &ctxs[&e.parent];
-                    let invariance = invariance_of(ctx, navigates);
+                    let invariance = invariance_of(ctx, store_moves);
                     !e.closure
                         && e.held
                             .iter()
-                            .all(|x| invariance.holds(x, &ctx.render_lets, ctx.props_hold))
-                        && stays(e.parent, tree, result, ctxs, navigates, memo)
+                            .all(|x| invariance.holds(x, &ctx.facts.render_lets, ctx.props_hold))
+                        && stays(e.parent, tree, result, ctxs, store_moves, memo)
                 })
             });
         memo.insert(c, s);
@@ -838,7 +1033,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 Expr::FnLit {
                     params, body_cfg, ..
                 } => {
-                    let [p] = params.as_slice() else {
+                    let [_] = params.as_slice() else {
                         return None;
                     };
                     let mut returns = body_cfg.blocks.values().filter_map(|b| match &b.term {
@@ -848,7 +1043,12 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     let (Some(r), None) = (returns.next(), returns.next()) else {
                         return None;
                     };
-                    step(r, &|x| matches!(x.peel_ts(), Expr::Var(v) if v == p))
+                    // The parameter as React hands it: one the body rebinds
+                    // holds another value at the return (#214).
+                    let nested = nested_bodies(body_cfg);
+                    step(r, &|x| {
+                        must_param(x, body_cfg, &nested, params, &|_| false) == Some(0)
+                    })
                 }
                 other => step(other, &|x| match x.peel_ts() {
                     Expr::StateVal(l) => *l == label,
@@ -868,6 +1068,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         result: &ProgramAnalysisResult,
         props_in: &HashMap<ComponentId, Vec<QualifiedSlot>>,
         kept_mounted: &HashMap<ComponentId, bool>,
+        store_written: bool,
     ) -> bool {
         let WriterRegion::Effect(l) = s.row.region else {
             return true;
@@ -879,13 +1080,13 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             Some(Rerun::Always(_)) => true,
             Some(Rerun::MountOnly) => kept_mounted.get(&s.comp) != Some(&true),
             Some(Rerun::OnSlots) | None => {
-                triggers_of(&r.effect_triggers, l).next().is_some()
+                triggers_of(&r.effect_triggers, l).any(|t| store_written || t.slot != STORE_SLOT)
                     || (r.effect_props.contains(&l)
                         && props_in.get(&s.comp).is_none_or(|p| !p.is_empty()))
             }
         }
     }
-    let invariance_of = |ctx| invariance_of(ctx, navigates);
+    let invariance_of = |ctx| invariance_of(ctx, store_moves);
 
     // The sites that fire at most once in the automatic loop, by least
     // fixpoint (module doc). Monotone — a proven site only removes
@@ -932,7 +1133,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
     // Deduplicate on (from, to, component, effect): keep the strongest, and
     // among equals the earliest write site, so the row a reader anchors on
     // does not depend on relation order.
-    let mut best: HashMap<(QualifiedSlot, QualifiedSlot, ComponentId, HookLabel), ChurnEdge> =
+    let mut best: HashMap<(QualifiedSlot, QualifiedSlot, ComponentId, Carrier), ChurnEdge> =
         HashMap::new();
     let mut one_way: HashMap<QualifiedSlot, bool> = HashMap::new();
     // The slots some write may restore within a batch (#188): React re-renders
@@ -941,12 +1142,14 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
     // before its re-render, a mount-only effect, a callback prop a child
     // calls, which is a `Handler` row — so a fresh write proves a change only
     // when every write of its slot is fresh. Fresh at every call means a new
-    // reference (`Change::Must`) that does not hold while props hold: a prop
-    // the parent allocates is new at the parent's renders, and `setS(p)`
-    // stores the same `p` again when the component re-renders alone.
+    // reference (`Change::Must`) its body allocates at every run: a prop the
+    // parent allocates is new at the parent's renders, and `setS(p)` stores
+    // the same `p` again when the component re-renders alone (#309). A row
+    // with no expression is an updater or reducer whose every return
+    // allocates, or an argument read in a body the region's env does not
+    // hold (#310), whose value then is no input's only where it allocates.
     let mut restorable: HashSet<QualifiedSlot> = HashSet::new();
     for (&comp, r) in &result.components {
-        let invariance = invariance_of(&ctxs[&comp]);
         for w in &r.slot_writers {
             let body = match w.region {
                 WriterRegion::Render => Some(&r.render_cfg),
@@ -961,10 +1164,10 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             };
             let fresh = w.written.change == Change::Must
                 && body.is_some_and(|b| {
-                    !w.written
+                    w.written
                         .expr
                         .as_ref()
-                        .is_some_and(|e| invariance.holds(e, &let_bindings(b), true))
+                        .is_none_or(|e| fresh_here(&ctxs[&comp], r, e, b))
                 });
             if !fresh {
                 restorable.insert(node_of(comp, w));
@@ -1006,7 +1209,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     node_of(s.comp, s.row) == node
                         && !std::ptr::eq(s.row, *w)
                         && !convergent[*j]
-                        && reruns_in_loop(s, result, &props_in, &kept_mounted)
+                        && reruns_in_loop(s, result, &props_in, &kept_mounted, store_written)
                 })
                 .any(|(_, s)| match s.row.written.change {
                     Change::Never => false,
@@ -1087,6 +1290,9 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             let reads_slot = |x: QualifiedSlot| match &reads {
                 None => true,
                 Some(r) if x.0 == f.comp => r.slots.contains(&x.1),
+                // `reads` fails on a held value while the store moves, so a
+                // write it reads does not read the store.
+                Some(_) if x == STORE_SLOT => false,
                 Some(r) => r.props,
             };
             let fresh_blocks: HashSet<BlockId> = f
@@ -1137,7 +1343,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                         to: node,
                         strength,
                         component: f.comp,
-                        effect_label: f.effect_label,
+                        carrier: Carrier::Effect(f.effect_label),
                         write_span: w.span,
                         always: always.cloned(),
                         self_slot,
@@ -1153,8 +1359,10 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             // reads a prop, or anything, changes when `P_c` moves. Where no
             // edge enters `P_c` — a root, or a component rendered through a
             // value the tree cannot place — the write's own slot stands in
-            // for it, a self-edge, as before the node existed.
+            // for it, a self-edge, as before the node existed. The store
+            // entering it is no slot of an ancestor: the stand-in stays.
             let p_in = &props_in[&f.comp];
+            let no_slot_in = p_in.iter().all(|s| *s == STORE_SLOT);
             let reads_props = reads.as_ref().is_none_or(|r| r.props);
             let from_props: &[QualifiedSlot] = if reads_props { p_in } else { &[] };
             // An effect that re-runs after every render: a change of anything
@@ -1163,7 +1371,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             // reads everything re-triggers itself, whichever turn it runs on.
             let every_render: Vec<QualifiedSlot> = match &reads {
                 Some(r) => {
-                    let props = (r.props && p_in.is_empty()).then_some(node);
+                    let props = (r.props && no_slot_in).then_some(node);
                     r.slots.iter().map(|&l| (f.comp, l)).chain(props).collect()
                 }
                 None => vec![node],
@@ -1254,7 +1462,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                         to: node_of(comp, w),
                         strength: EdgeStrength::May,
                         component: comp,
-                        effect_label,
+                        carrier: Carrier::Effect(effect_label),
                         write_span: w.span,
                         always: None,
                         self_slot: false,
@@ -1265,14 +1473,49 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         }
     }
 
+    // Render-carried edges (ADR-046): a render or memo body that writes the
+    // store runs again whenever its component re-renders, so a change of any
+    // of its slots or of its props may write the store. The store's own
+    // change re-running a render that writes it is a loop without an effect,
+    // outside the graph like `setter-in-render`'s (`docs/limitations.md`).
+    for (&comp, r) in &result.components {
+        let Some(w) = r
+            .slot_writers
+            .iter()
+            .filter(|w| {
+                w.writes_store()
+                    && matches!(w.region, WriterRegion::Render | WriterRegion::Memo(_))
+                    && w.phase != WriterPhase::Handler
+            })
+            .min_by_key(|w| pos(w.span))
+        else {
+            continue;
+        };
+        let slots = r.state_store.labels().into_iter().map(|l| (comp, l));
+        for from in slots.chain(props_in[&comp].iter().copied()) {
+            if from == STORE_SLOT {
+                continue;
+            }
+            insert_edge(
+                &mut best,
+                ChurnEdge {
+                    from,
+                    to: STORE_SLOT,
+                    strength: EdgeStrength::May,
+                    component: comp,
+                    carrier: Carrier::Render,
+                    write_span: w.span,
+                    always: None,
+                    self_slot: false,
+                    stepping: false,
+                },
+            );
+        }
+    }
+
     let mut edges: Vec<ChurnEdge> = best.into_values().collect();
     edges.sort_by(|a, b| {
-        (&a.component, a.effect_label, &a.from, &a.to).cmp(&(
-            &b.component,
-            b.effect_label,
-            &b.from,
-            &b.to,
-        ))
+        (&a.component, a.carrier, &a.from, &a.to).cmp(&(&b.component, b.carrier, &b.from, &b.to))
     });
     return edges;
 
@@ -1281,13 +1524,13 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         s.map_or((u32::MAX, u32::MAX), |r| r.pos_key())
     }
 
-    /// Keep, per (from, to, component, effect), the strongest edge, and
+    /// Keep, per (from, to, component, carrier), the strongest edge, and
     /// among equals the earliest write site.
     fn insert_edge(
-        best: &mut HashMap<(QualifiedSlot, QualifiedSlot, ComponentId, HookLabel), ChurnEdge>,
+        best: &mut HashMap<(QualifiedSlot, QualifiedSlot, ComponentId, Carrier), ChurnEdge>,
         edge: ChurnEdge,
     ) {
-        let key = (edge.from, edge.to, edge.component, edge.effect_label);
+        let key = (edge.from, edge.to, edge.component, edge.carrier);
         best.entry(key)
             .and_modify(|e| {
                 if (edge.strength, std::cmp::Reverse(pos(edge.write_span)))
@@ -1318,13 +1561,22 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
 }
 
 /// Find churn cycles: first in the must-only subgraph (all-must cycles),
-/// then in the full graph, skipping regions already reported. Self-slot
-/// edges are the other arm's and never enter the search.
+/// then through slots alone, then through the store (ADR-046), skipping
+/// regions already reported. A cycle through slots is searched without the
+/// store's edges, so a store edge never changes the cycle a slot loop is
+/// reported with. Self-slot edges are the other arm's and never enter the
+/// search.
 pub fn find_cycles(edges: &[ChurnEdge]) -> Vec<ChurnCycle> {
+    let touches_store = |i: usize| edges[i].from == STORE_SLOT || edges[i].to == STORE_SLOT;
     let must_idx: Vec<usize> = (0..edges.len())
         .filter(|&i| !edges[i].self_slot && edges[i].strength == EdgeStrength::Must)
         .collect();
     let all_idx: Vec<usize> = (0..edges.len()).filter(|&i| !edges[i].self_slot).collect();
+    let slot_idx: Vec<usize> = all_idx
+        .iter()
+        .copied()
+        .filter(|&i| !touches_store(i))
+        .collect();
 
     let mut cycles = Vec::new();
     let mut covered_nodes: HashSet<QualifiedSlot> = HashSet::new();
@@ -1336,7 +1588,15 @@ pub fn find_cycles(edges: &[ChurnEdge]) -> Vec<ChurnCycle> {
         }
         cycles.push(make_cycle(edges, cyc, true));
     }
-    for cyc in cycles_in(edges, &all_idx) {
+    let store_cycles = if slot_idx.len() < all_idx.len() {
+        cycles_in(edges, &all_idx)
+            .into_iter()
+            .filter(|cyc| cyc.iter().any(|&i| touches_store(i)))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    for cyc in cycles_in(edges, &slot_idx).into_iter().chain(store_cycles) {
         // A node already inside an all-must cycle: the Error already flags
         // that loop region — don't re-report a weaker overlapping cycle.
         if cyc.iter().any(|&i| {
@@ -1356,9 +1616,14 @@ fn make_cycle(edges: &[ChurnEdge], edge_idx: Vec<usize>, all_must: bool) -> Chur
         comps.insert(edges[i].to.0);
         comps.insert(edges[i].component);
     }
+    // The store is no component: a store loop inside one component is that
+    // component's loop.
+    let store = comps.remove(&ComponentId::STORE);
+    debug_assert!(!(store && all_must), "an edge into the store is a may-edge");
     ChurnCycle {
         all_must,
         cross_component: comps.len() > 1,
+        store,
         edge_idx,
     }
 }
@@ -1399,10 +1664,10 @@ fn cycles_in(edges: &[ChurnEdge], subset: &[usize]) -> Vec<Vec<usize>> {
         // Every edge inside the component lies on a cycle — its head reaches
         // its tail — so every effect carrying one is on a loop: one the first
         // cycle misses gets its own, the edge and the way back (#263).
-        let mut carried: HashSet<(ComponentId, HookLabel)> = found
+        let mut carried: HashSet<(ComponentId, Carrier)> = found
             .iter()
             .flatten()
-            .map(|&e| (edges[e].component, edges[e].effect_label))
+            .map(|&e| (edges[e].component, edges[e].carrier))
             .collect();
         let mut inner: Vec<usize> = scc
             .iter()
@@ -1411,7 +1676,7 @@ fn cycles_in(edges: &[ChurnEdge], subset: &[usize]) -> Vec<Vec<usize>> {
             .collect();
         inner.sort_unstable();
         for e in inner {
-            if !carried.insert((edges[e].component, edges[e].effect_label)) {
+            if !carried.insert((edges[e].component, edges[e].carrier)) {
                 continue;
             }
             let (from, to) = (node_id[&edges[e].from], node_id[&edges[e].to]);
@@ -1420,7 +1685,7 @@ fn cycles_in(edges: &[ChurnEdge], subset: &[usize]) -> Vec<Vec<usize>> {
                 carried.extend(
                     cycle
                         .iter()
-                        .map(|&i| (edges[i].component, edges[i].effect_label)),
+                        .map(|&i| (edges[i].component, edges[i].carrier)),
                 );
                 found.push(cycle);
             }
@@ -1579,6 +1844,204 @@ fn find_cycle_from(
 ///
 /// `triggers` are the effect's rows of the trigger relation: a dep reacts to
 /// `label` when one of its rows names this component's slot.
+/// Is a value, read in a body of a component (the render or a hook body), one
+/// no input hands it — a reference allocated afresh at each run of that body,
+/// never one a prop, a context, a hook's result, a slot or a memo holds? A
+/// positive proof, where the failure of [`Invariance::holds`] is none (#309):
+/// an object, array or function literal, an element, a builtin call that
+/// returns none of its inputs ([`returns_no_input`]), the member a constant
+/// names of such a literal; a memo or callback with a dep that is one, so it
+/// recomputes at every run, and (a memo) whose every return is one; or a name
+/// only its scope binds — no other body binds it — each binding of which is
+/// one, or, in the render, holds no reference where it runs (`no_reference`,
+/// given its position and right-hand side): a primitive, the `undefined` a
+/// default replaces.
+struct Allocated<'a> {
+    render: &'a CFG,
+    /// Every body but the render, with its parameters.
+    elsewhere: &'a [(&'a [Var], &'a CFG)],
+    /// The names some body writes or mutates: a member of what they hold
+    /// may be anything.
+    mutated: &'a HashSet<Var>,
+    /// Each memo's and callback's body (`None` for a callback, whose value
+    /// is the function itself) and exact deps.
+    memos: HashMap<HookLabel, (Option<&'a CFG>, &'a [Expr])>,
+    no_reference: &'a dyn Fn((BlockId, usize), &Expr) -> bool,
+}
+
+impl<'a> Allocated<'a> {
+    fn fresh(&self, e: &'a Expr, scope: &'a CFG, depth: usize) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        let next = depth - 1;
+        match e.peel_ts() {
+            Expr::ObjectLit { .. }
+            | Expr::ArrayLit { .. }
+            | Expr::FnLit { .. }
+            | Expr::NativeElem { .. }
+            | Expr::CompApp { .. } => true,
+            Expr::Call { fn_, .. } => returns_no_input(fn_),
+            Expr::FieldAccess { obj, field } => self.read(obj, field, scope, next),
+            Expr::IndexAccess { arr, idx } => {
+                let key = match idx.peel_ts() {
+                    Expr::Lit(Prim::Int(i)) => i.to_string(),
+                    Expr::Lit(Prim::String(s)) => s.to_string(),
+                    _ => return false,
+                };
+                self.read(arr, &key, scope, next)
+            }
+            Expr::MemoVal(l) | Expr::CallbackVal(l) => {
+                self.memos.get(l).is_some_and(|(body, deps)| {
+                    deps.iter().any(|d| self.fresh(d, self.render, next))
+                        && body.is_none_or(|b| self.returns_fresh(b, next))
+                })
+            }
+            Expr::Var(v) => self.bindings(v, scope).is_some_and(|(in_render, rhss)| {
+                !rhss.is_empty()
+                    && rhss.iter().all(|&(at, rhs, s)| {
+                        self.fresh(rhs, s, next) || (in_render && (self.no_reference)(at, rhs))
+                    })
+            }),
+            _ => false,
+        }
+    }
+
+    /// Is the read of a constant `key` of `e` allocated afresh: the member as
+    /// written, or a call of the getter it is read through (#321), every
+    /// return of which is.
+    fn read(&self, e: &'a Expr, key: &str, scope: &'a CFG, depth: usize) -> bool {
+        self.member(e, key, scope, depth)
+            .is_some_and(|(m, s)| self.fresh(m, s, depth))
+            || self
+                .getter(e, key, scope, depth)
+                .is_some_and(|body| self.returns_fresh(body, depth))
+    }
+
+    /// Does `body` return, and is every value it returns allocated afresh?
+    /// A body that only throws returns nothing to prove.
+    fn returns_fresh(&self, body: &'a CFG, depth: usize) -> bool {
+        let mut returns = body
+            .blocks
+            .values()
+            .filter_map(|blk| match &blk.term {
+                Terminator::Return(r, _) => Some(r),
+                _ => None,
+            })
+            .peekable();
+        returns.peek().is_some() && returns.all(|r| self.fresh(r, body, depth))
+    }
+
+    /// The body of the getter a constant `key` of `e` is read through, as
+    /// written ([`object_getter`]): of an object literal, of a member of one,
+    /// or of a name bound once to one that no body mutates.
+    fn getter(&self, e: &'a Expr, key: &str, scope: &'a CFG, depth: usize) -> Option<&'a CFG> {
+        if depth == 0 {
+            return None;
+        }
+        match e.peel_ts() {
+            Expr::ObjectLit { fields, .. } => match object_getter(fields, key)?.peel_ts() {
+                Expr::FnLit { body_cfg, .. } => Some(body_cfg),
+                _ => None,
+            },
+            Expr::FieldAccess { obj, field } => {
+                let (inner, s) = self.member(obj, field, scope, depth - 1)?;
+                self.getter(inner, key, s, depth - 1)
+            }
+            Expr::Var(v) if !self.mutated.contains(v) => match self.bindings(v, scope)? {
+                (_, rhss) if rhss.len() == 1 => {
+                    let (_, rhs, s) = rhss[0];
+                    self.getter(rhs, key, s, depth - 1)
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The expression a constant `key` of `e` is, as written in a literal, and
+    /// the scope it reads in: a member of an object literal after its last
+    /// spread, an element of an array literal with no spread or elision, or
+    /// one of a name bound once to such a literal that no body mutates.
+    fn member(
+        &self,
+        e: &'a Expr,
+        key: &str,
+        scope: &'a CFG,
+        depth: usize,
+    ) -> Option<(&'a Expr, &'a CFG)> {
+        if depth == 0 {
+            return None;
+        }
+        match e.peel_ts() {
+            Expr::ObjectLit { fields, .. } => object_member(fields, key).map(|m| (m, scope)),
+            Expr::ArrayLit {
+                elems,
+                arity,
+                spread_at,
+                ..
+            } if spread_at.is_empty() && arity.exact() == Some(elems.len()) => key
+                .parse::<usize>()
+                .ok()
+                .and_then(|i| elems.get(i))
+                .map(|m| (m, scope)),
+            Expr::FieldAccess { obj, field } => {
+                let (inner, s) = self.member(obj, field, scope, depth - 1)?;
+                self.member(inner, key, s, depth - 1)
+            }
+            Expr::Var(v) if !self.mutated.contains(v) => match self.bindings(v, scope)? {
+                (_, rhss) if rhss.len() == 1 => {
+                    let (_, rhs, s) = rhss[0];
+                    self.member(rhs, key, s, depth - 1)
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Every binding of `v` read in `scope`: whether it resolves in the
+    /// render, and each binding's position, right-hand side and scope. `None`
+    /// when another body may assign the same `v` — one that assigns it and
+    /// neither declares it nor takes it as a parameter, which would make it
+    /// its own — or `scope`'s parameter is `v`.
+    #[allow(clippy::type_complexity)]
+    fn bindings(
+        &self,
+        v: &str,
+        scope: &'a CFG,
+    ) -> Option<(bool, Vec<((BlockId, usize), &'a Expr, &'a CFG)>)> {
+        let in_render = std::ptr::eq(scope, self.render) || !binds(v, scope);
+        let scope = if in_render { self.render } else { scope };
+        let stmts = |b: &'a CFG| b.blocks.values().flat_map(|blk| blk.stmts.iter());
+        let declares =
+            |b: &'a CFG| stmts(b).any(|s| matches!(s, Stmt::Let { var, .. } if var == v));
+        let assigns =
+            |b: &'a CFG| stmts(b).any(|s| matches!(s, Stmt::Assign { var, .. } if var == v));
+        if self.elsewhere.iter().any(|(params, b)| {
+            let param = params.iter().any(|p| p == v);
+            if std::ptr::eq(*b, scope) {
+                param
+            } else {
+                !param && !declares(b) && assigns(b)
+            }
+        }) {
+            return None;
+        }
+        let mut out = Vec::new();
+        for (&bid, block) in &scope.blocks {
+            for (i, stmt) in block.stmts.iter().enumerate() {
+                if let Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. } = stmt
+                    && var == v
+                {
+                    out.push(((bid, i), rhs, scope));
+                }
+            }
+        }
+        Some((in_render, out))
+    }
+}
+
 fn can_retrigger(
     dep_exprs: &[Expr],
     triggers: &[&EffectTrigger],
@@ -1614,9 +2077,13 @@ fn updater_overwrites(written_expr: Option<&Expr>) -> Option<HashSet<Symbol>> {
     else {
         return None;
     };
-    let [prev] = params.as_slice() else {
+    let [_] = params.as_slice() else {
         return None;
     };
+    // The parameter as React hands it: one the body rebinds holds another
+    // object at the return (#214).
+    let nested = nested_bodies(body_cfg);
+    let is_prev = |e: &Expr| must_param(e, body_cfg, &nested, params, &|_| false) == Some(0);
     let mut out = HashSet::new();
     let mut returns = 0usize;
     for block in body_cfg.blocks.values() {
@@ -1624,7 +2091,7 @@ fn updater_overwrites(written_expr: Option<&Expr>) -> Option<HashSet<Symbol>> {
             continue;
         };
         returns += 1;
-        out.extend(literal_overwrites(e.peel_ts(), prev)?);
+        out.extend(literal_overwrites(e.peel_ts(), &is_prev)?);
     }
     (returns > 0).then_some(out)
 }
@@ -1633,8 +2100,8 @@ fn updater_overwrites(written_expr: Option<&Expr>) -> Option<HashSet<Symbol>> {
 /// `prev` itself overwrites nothing. Any other shape — a different spread
 /// source, a second spread, a key the lowering could not name — proves
 /// nothing, because a member it cannot see may be one the deps read.
-fn literal_overwrites(e: &Expr, prev: &Var) -> Option<HashSet<Symbol>> {
-    if matches!(e, Expr::Var(v) if v == prev) {
+fn literal_overwrites(e: &Expr, is_prev: &dyn Fn(&Expr) -> bool) -> Option<HashSet<Symbol>> {
+    if is_prev(e) {
         return Some(HashSet::new());
     }
     let Expr::ObjectLit { fields, .. } = e else {
@@ -1643,8 +2110,7 @@ fn literal_overwrites(e: &Expr, prev: &Var) -> Option<HashSet<Symbol>> {
     let [(spread, src), rest @ ..] = fields.as_slice() else {
         return None;
     };
-    if !spread.starts_with(SPREAD_KEY_PREFIX) || !matches!(src.peel_ts(), Expr::Var(v) if v == prev)
-    {
+    if !spread.starts_with(SPREAD_KEY_PREFIX) || !is_prev(src) {
         return None;
     }
     rest.iter()

@@ -237,16 +237,35 @@ impl ComponentCallGraph {
         comp: ComponentId,
         hook: HookLabel,
     ) -> BTreeMap<usize, BTreeSet<ComponentId>> {
+        self.through_where(comp, hook, |f| &f.fresh_deps)
+    }
+
+    /// [`Self::fresh_through`] for the may fact
+    /// [`SiteFacts::fresh_when_object`]: for `always-unstable-deps` only.
+    pub fn fresh_when_object_through(
+        &self,
+        comp: ComponentId,
+        hook: HookLabel,
+    ) -> BTreeMap<usize, BTreeSet<ComponentId>> {
+        self.through_where(comp, hook, |f| &f.fresh_when_object)
+    }
+
+    fn through_where(
+        &self,
+        comp: ComponentId,
+        hook: HookLabel,
+        fact: fn(&SiteFacts) -> &FreshDeps,
+    ) -> BTreeMap<usize, BTreeSet<ComponentId>> {
         let mut out: BTreeMap<usize, BTreeSet<ComponentId>> = BTreeMap::new();
         for (caller, site) in self.sites_of(comp) {
-            let fresh = site.own.as_ref().and_then(|o| o.fresh_deps.get(&hook));
+            let fresh = site.own.as_ref().and_then(|o| fact(o).get(&hook));
             for &i in fresh.into_iter().flatten() {
                 out.entry(i).or_default().insert(caller);
             }
             // A prop the caller forwards is fresh through the component
             // rendering the caller's element that passes it so (#241).
             for (grand, facts) in &site.through {
-                for &i in facts.fresh_deps.get(&hook).into_iter().flatten() {
+                for &i in fact(facts).get(&hook).into_iter().flatten() {
                     out.entry(i).or_default().insert(*grand);
                 }
             }
@@ -296,11 +315,24 @@ pub struct CallSite {
     pub through: Vec<(ComponentId, SiteFacts)>,
 }
 
-/// The callee's facts under one call site's input alone (must, for that
-/// site).
+/// The callee's facts under one call site's input alone.
 #[derive(Debug, Clone, Default)]
 pub struct SiteFacts {
+    /// Must, for that site ([`crate::engine::fresh_deps`]).
     pub fresh_deps: FreshDeps,
+    /// May: a new reference wherever the dep holds an object
+    /// ([`crate::engine::fresh_deps_when_object`]); no proof reads it.
+    pub fresh_when_object: FreshDeps,
+}
+
+impl SiteFacts {
+    /// Both facts of `result`, analysed under one site's input.
+    pub fn of(result: &crate::engine::AnalysisResult<StateValue>) -> Self {
+        Self {
+            fresh_deps: crate::engine::fresh_deps(result),
+            fresh_when_object: crate::engine::fresh_deps_when_object(result),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone)]

@@ -7,15 +7,18 @@ use std::sync::Arc;
 use crate::ir::{
     cfg::{BasicBlock, CFG, EdgeKind, Terminator},
     expr::{
-        ACCESSOR_KEY_PREFIX, BinOp as IrBinOp, COMPUTED_KEY_PREFIX, Expr, Prim, SPREAD_KEY_PREFIX,
-        SummaryValue, UnaryOp as IrUnaryOp,
+        Accessor, BinOp as IrBinOp, COMPUTED_KEY_PREFIX, Expr, Prim, SPREAD_KEY_PREFIX,
+        SummaryValue, UnaryOp as IrUnaryOp, accessor_key,
     },
     hooks::Arity,
     stmt::{MemberKey, Stmt},
+    types::BlockId,
 };
 
 use super::cfg_builder::{
-    BlockBuilder, build_expr_fn_body_cfg, build_fn_body_cfg, build_stmts_cfg, lower_default,
+    BlockBuilder, CtorScope, FnKind, ThisScope, build_construct_cfg, build_expr_fn_body_cfg,
+    build_fields_cfg, build_fn_body_cfg, build_member_body_cfg, build_stmts_cfg, handed_out,
+    lower_default, super_call,
 };
 
 /// An opaque value of unknown kind (⊤). Used for expressions the analysis does
@@ -34,8 +37,28 @@ fn opaque() -> Expr {
 /// a missing read as "this variable is not used" — a claim, not ignorance.
 fn lower_for_effect(expr: &Expression, builder: &mut BlockBuilder) {
     let span = builder.span_at(expr.span().start);
-    let lowered = lower_expr(expr, builder);
-    builder.push_stmt(Stmt::ExprStmt(lowered, span));
+    lower_expr_stmt(expr, span, builder);
+}
+
+/// Lower `expr` evaluated for its effect, as the statement `expr;` at `span`.
+/// An optional chain whose rest is skipped on a nullish link keeps its last
+/// call as that statement, inside the block the chain reaches when nothing is
+/// nullish (#301): `cb?.(x);` reads as `cb(x);` under the guard, the shape
+/// every statement-level reader of a call already knows.
+pub(super) fn lower_expr_stmt(
+    expr: &Expression,
+    span: Option<SourceRange>,
+    builder: &mut BlockBuilder,
+) {
+    match expr.without_parentheses() {
+        Expression::ChainExpression(chain) => {
+            lower_chain(chain, ChainUse::Effect(span), builder);
+        }
+        _ => {
+            let lowered = lower_expr(expr, builder);
+            builder.push_stmt(Stmt::ExprStmt(lowered, span));
+        }
+    }
 }
 
 /// A field name no source property can produce, so a value kept for its reads
@@ -90,22 +113,31 @@ pub(super) fn property_name(key: &PropertyKey) -> Option<String> {
     }
 }
 
-/// Lower a class into an `ObjectLit` holding its member bodies under synthetic
-/// keys.
+/// Lower a class into an `ObjectLit`: its value, whose
+/// [`CONSTRUCT_KEY`](crate::ir::expr::CONSTRUCT_KEY) member is its
+/// construction body ([`build_construct_cfg`]), the one a `new` of it runs
+/// (#335), and whose static members are kept under synthetic keys.
 ///
-/// A class binds nothing the env models — `new X()` and `X.m()` are both ⊤, and
-/// the synthetic keys make sure no real `FieldAccess` ever resolves to a member.
-/// But its **bodies are code**: dropping the whole declaration lost every setter
-/// call and every capture inside it, so `class X { m() { setC(1) } }` read as a
-/// component that never writes `c` — a path the fixpoint never explores, not a
-/// widened one. Same device as an object spread: the value is kept for its
-/// reads, under a name nothing can ask for.
+/// An instance is a placed object whose methods and accessors are the
+/// class's bodies, `this` bound to it: they are written on it by the
+/// construction body, and a member read or call of the instance runs them
+/// as any closure the heap places. A static member is code too — dropping
+/// the declaration lost every setter call and every capture inside it, so
+/// `class X { static m() { setC(1) } }` read as a component that never
+/// writes `c` — kept for its reads under a name no real `FieldAccess`
+/// resolves to, as an object spread is.
 ///
 /// Shared by the declaration and the expression form so neither can drift.
 pub(super) fn lower_class(class: &Class, builder: &mut BlockBuilder) -> Expr {
     let id = builder.next_expr_id();
     let mut fields: Vec<(String, Expr)> = vec![];
     let ctx = builder.ctx.clone();
+    // Instance members: `this` is the instance.
+    let instance = ctx.member(None);
+    let mut methods: Vec<Stmt> = vec![];
+    let mut inits: Vec<(MemberKey, Option<&Expression>, oxc_span::Span)> = vec![];
+    let mut ctor: Option<&Function> = None;
+    let this = || Expr::Var(crate::ir::expr::THIS.to_string());
 
     // A computed member name (`class X { [k]() {} }`) is an expression that
     // runs where the class is defined — its reads have to survive.
@@ -120,36 +152,64 @@ pub(super) fn lower_class(class: &Class, builder: &mut BlockBuilder) -> Expr {
 
     for elem in &class.body.body {
         match elem {
+            ClassElement::MethodDefinition(m) if m.kind == MethodDefinitionKind::Constructor => {
+                ctor = Some(&m.value);
+            }
             ClassElement::MethodDefinition(m) => {
                 computed_key(&m.key, builder);
                 if let Some(body) = m.value.body.as_deref() {
-                    let (params, body_cfg) = build_fn_body_cfg(&m.value.params, body, &ctx);
+                    let kind = FnKind::of(m.value.r#async, m.value.generator);
+                    let (params, body_cfg) = if m.r#static {
+                        build_fn_body_cfg(&m.value.params, body, kind, false, &ctx)
+                    } else {
+                        build_member_body_cfg(&m.value.params, body, kind, &instance)
+                    };
                     let fn_id = builder.next_expr_id();
-                    fields.push((
-                        synthetic_key(builder, "[method]"),
-                        Expr::FnLit {
-                            id: fn_id,
-                            params,
-                            body_cfg: Arc::new(body_cfg),
-                        },
-                    ));
+                    let body = Expr::FnLit {
+                        id: fn_id,
+                        params,
+                        body_cfg: Arc::new(body_cfg),
+                    };
+                    if m.r#static {
+                        fields.push((synthetic_key(builder, "[method]"), body));
+                    } else {
+                        let key = method_key(&m.key, m.kind, builder);
+                        methods.push(Stmt::MemberWrite {
+                            obj: this(),
+                            key,
+                            rhs: body,
+                            span: builder.span_at(m.span.start),
+                        });
+                    }
                 }
             }
             // `handle = () => setC(1)` — a field initializer is an ordinary
             // expression, and the arrow-bound-method form is the one React
-            // class components use everywhere.
+            // class components use everywhere. An instance field's runs at
+            // each construction, on the instance; a static one's where the
+            // class is defined.
             ClassElement::PropertyDefinition(p) => {
                 computed_key(&p.key, builder);
-                if let Some(value) = &p.value {
-                    let lowered = lower_expr(value, builder);
-                    fields.push((synthetic_key(builder, "[field]"), lowered));
+                if p.r#static {
+                    if let Some(value) = &p.value {
+                        let lowered = lower_static(value, builder);
+                        fields.push((synthetic_key(builder, "[field]"), lowered));
+                    }
+                } else {
+                    inits.push((field_key(&p.key), p.value.as_ref(), p.span));
                 }
             }
+            // `accessor x = v`: a field whose getter and setter the language
+            // writes; its initializer is an ordinary expression, as a field's.
             ClassElement::AccessorProperty(a) => {
                 computed_key(&a.key, builder);
-                if let Some(value) = &a.value {
-                    let lowered = lower_expr(value, builder);
-                    fields.push((synthetic_key(builder, ACCESSOR_KEY_PREFIX), lowered));
+                if a.r#static {
+                    if let Some(value) = &a.value {
+                        let lowered = lower_static(value, builder);
+                        fields.push((synthetic_key(builder, "[field]"), lowered));
+                    }
+                } else {
+                    inits.push((field_key(&a.key), a.value.as_ref(), a.span));
                 }
             }
             // `static { … }` runs at definition time. Kept as a zero-arg body
@@ -163,7 +223,7 @@ pub(super) fn lower_class(class: &Class, builder: &mut BlockBuilder) -> Expr {
                     Expr::FnLit {
                         id: fn_id,
                         params: vec![],
-                        body_cfg: Arc::new(build_stmts_cfg(&b.body, &ctx)),
+                        body_cfg: Arc::new(build_stmts_cfg(&b.body, &ctx.static_member())),
                     },
                 ));
             }
@@ -172,13 +232,106 @@ pub(super) fn lower_class(class: &Class, builder: &mut BlockBuilder) -> Expr {
         }
     }
 
-    // `class X extends base()` — the superclass expression runs too.
-    if let Some(super_class) = &class.super_class {
+    // `class X extends base()` — the superclass expression runs too, where
+    // the class is defined; a `super(…)` constructs the class it names, read
+    // as written when that is a name or a member chain, and as a class the
+    // analysis does not see otherwise.
+    let parent = class.super_class.as_ref().map(|super_class| {
         let lowered = lower_expr(super_class, builder);
+        let parent = if is_name_chain(&lowered) {
+            lowered.clone()
+        } else {
+            opaque()
+        };
         fields.push((synthetic_key(builder, "[extends]"), lowered));
-    }
+        parent
+    });
+
+    let init = (!inits.is_empty()).then(|| {
+        let body_cfg = build_fields_cfg(&inits, &instance);
+        Expr::Call {
+            id: builder.next_call_id(),
+            fn_: Box::new(Expr::FnLit {
+                id: builder.next_expr_id(),
+                params: vec![],
+                body_cfg: Arc::new(body_cfg),
+            }),
+            args: vec![],
+        }
+    });
+    let scope = CtorScope {
+        parent,
+        fields: init,
+    };
+    let (params, body_cfg) = build_construct_cfg(ctor, methods, &ctx.member(Some(scope)));
+    fields.push((
+        crate::ir::expr::CONSTRUCT_KEY.to_string(),
+        Expr::FnLit {
+            id: builder.next_expr_id(),
+            params,
+            body_cfg: Arc::new(body_cfg),
+        },
+    ));
 
     Expr::ObjectLit { id, fields }
+}
+
+/// A class's static field initializer, where the class is defined: `this` is
+/// the class (`LowerCtx::static_member`), not the enclosing body's.
+fn lower_static(value: &Expression, builder: &mut BlockBuilder) -> Expr {
+    let outer = std::mem::replace(&mut builder.ctx.this, ThisScope::Opaque);
+    let lowered = lower_expr(value, builder);
+    builder.ctx.this = outer;
+    lowered
+}
+
+/// A name or a member chain off one (`Base`, `React.Component`).
+fn is_name_chain(e: &Expr) -> bool {
+    match e {
+        Expr::Var(_) => true,
+        Expr::FieldAccess { obj, .. } => is_name_chain(obj),
+        _ => false,
+    }
+}
+
+/// The member an instance method or accessor is written under (#335): its
+/// name, or the [`accessor_key`] of a getter or a setter. A name no constant
+/// spells may be any member.
+fn method_key(
+    key: &PropertyKey,
+    kind: MethodDefinitionKind,
+    builder: &mut BlockBuilder,
+) -> MemberKey {
+    let name = class_member_name(key);
+    let half = match kind {
+        MethodDefinitionKind::Get => Accessor::Get,
+        MethodDefinitionKind::Set => Accessor::Set,
+        MethodDefinitionKind::Method | MethodDefinitionKind::Constructor => {
+            return match name {
+                Some(n) => MemberKey::Field(n),
+                None => MemberKey::Index(opaque()),
+            };
+        }
+    };
+    let n = builder.next_expr_id().0;
+    MemberKey::Field(accessor_key(n, half, name.as_deref()))
+}
+
+/// The member an instance field is written under: its name, or any member.
+fn field_key(key: &PropertyKey) -> MemberKey {
+    match class_member_name(key) {
+        Some(n) => MemberKey::Field(n),
+        None => MemberKey::Index(opaque()),
+    }
+}
+
+/// A class member's name: a property's, or `#x` for a private one, as
+/// `this.#x` reads it.
+fn class_member_name(key: &PropertyKey) -> Option<String> {
+    match key {
+        PropertyKey::PrivateIdentifier(p) => Some(format!("#{}", p.name)),
+        key => property_name(key),
+    }
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -238,8 +391,19 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                 Expr::Var(id.name.to_string())
             }
         }
-        // `this`/`super` carry no tracked value in a function component; model
-        // them as an opaque ⊤ rather than a magic `Var("this")` binding.
+        // `this` in a class's instance member is the instance, the name its
+        // construction body binds (#335); `super.m` reads the parent's
+        // member, which that body wrote on the same instance. In any other
+        // non-arrow function `this` is what the call bound, the same name
+        // its preamble binds (#338); an arrow reads its enclosing one's.
+        // Anywhere else — and `super` outside a class's instance member, a
+        // prototype the analysis does not follow — opaque ⊤.
+        Expression::ThisExpression(_) if builder.ctx.this != ThisScope::Opaque => {
+            Expr::Var(crate::ir::expr::THIS.to_string())
+        }
+        Expression::Super(_) if builder.ctx.this == ThisScope::Instance => {
+            Expr::Var(crate::ir::expr::THIS.to_string())
+        }
         Expression::ThisExpression(_) | Expression::Super(_) => opaque(),
 
         // ── Arithmetic / comparison ───────────────────────────────────────────
@@ -365,9 +529,12 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                 id,
                 fn_: Box::new(fn_),
                 args,
+                ctor: None,
+                on_this: false,
             }
         }
         Expression::TaggedTemplateExpression(t) => Expr::Call {
+            id: builder.next_call_id(),
             // Pass the `${…}` interpolations as call args so their reads survive
             // (the constant quasi strings carry none). The tag receives the
             // cooked-strings array in reality; only the interpolations read vars.
@@ -381,7 +548,7 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
         },
 
         // ── Member access ─────────────────────────────────────────────────────
-        Expression::ChainExpression(chain) => lower_chain_element(&chain.expression, builder),
+        Expression::ChainExpression(chain) => lower_chain(chain, ChainUse::Value, builder),
         Expression::StaticMemberExpression(m) => Expr::FieldAccess {
             obj: Box::new(lower_expr(&m.object, builder)),
             field: m.property.name.to_string(),
@@ -404,13 +571,23 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                     ObjectPropertyKind::ObjectProperty(p) => {
                         let named = property_name(&p.key);
                         let key = match named {
-                            // A getter/setter runs code on every read: `o.x`
-                            // is whatever the body returns, not the function
-                            // literal sitting in the property. Kept under a
-                            // synthetic key, like a spread — the body stays
-                            // visible, the name resolves to nothing.
+                            // A getter/setter runs code on every read (write):
+                            // `o.x` is whatever the body returns, not the
+                            // function literal sitting in the property. Kept
+                            // under a synthetic key that says which half and
+                            // which member (#321): the body stays visible, a
+                            // name lookup resolves the member to nothing.
                             _ if p.kind != PropertyKind::Init => {
-                                synthetic_key(builder, ACCESSOR_KEY_PREFIX)
+                                if named.is_none()
+                                    && let Some(e) = p.key.as_expression()
+                                {
+                                    lower_for_effect(e, builder);
+                                }
+                                let kind = match p.kind {
+                                    PropertyKind::Set => Accessor::Set,
+                                    _ => Accessor::Get,
+                                };
+                                accessor_key(builder.next_expr_id().0, kind, named.as_deref())
                             }
                             Some(name) => name,
                             // Computed key (`{ [k]: v }`): the key expression
@@ -492,10 +669,11 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
             let ctx = builder.ctx.clone();
             // Concise body (`x => expr`) carries an implicit return; block body
             // (`x => { ... }`) lowers like any function body.
+            let kind = FnKind::of(arrow.r#async, false);
             let (params, body_cfg) = if arrow.expression {
-                build_expr_fn_body_cfg(&arrow.params, &arrow.body, &ctx)
+                build_expr_fn_body_cfg(&arrow.params, &arrow.body, kind, &ctx)
             } else {
-                build_fn_body_cfg(&arrow.params, &arrow.body, &ctx)
+                build_fn_body_cfg(&arrow.params, &arrow.body, kind, true, &ctx)
             };
             Expr::FnLit {
                 id,
@@ -506,8 +684,9 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
         Expression::FunctionExpression(func) => {
             let id = builder.next_expr_id();
             let ctx = builder.ctx.clone();
+            let kind = FnKind::of(func.r#async, func.generator);
             let (params, body_cfg) = if let Some(body) = func.body.as_deref() {
-                build_fn_body_cfg(&func.params, body, &ctx)
+                build_fn_body_cfg(&func.params, body, kind, false, &ctx)
             } else {
                 (vec![], empty_cfg())
             };
@@ -625,15 +804,20 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
             value
         }
         Expression::ClassExpression(class) => lower_class(class, builder),
-        // `await` splits the block (#117, ADR-035). The value is still the
-        // awaited argument — nothing about the DATA flow changes — but the
-        // statement being lowered, and every statement after it, execute on a
-        // later turn of the event loop. Sealing here puts them in the successor,
-        // which is what lets the writer walk stamp them `deferred` instead of
-        // claiming, falsely, that lexis is execution.
+        // `await` splits the block (#117, ADR-035): the statement being
+        // lowered, and every statement after it, execute on a later turn of
+        // the event loop. Sealing here puts them in the successor, which is
+        // what lets the writer walk stamp them `deferred` instead of claiming,
+        // falsely, that lexis is execution.
         //
         // The split is skipped when the current block is already sealed: a
         // `return await f()` has nothing left to defer.
+        //
+        // The value is not the operand: a thenable operand has its `then`
+        // called and the await yields what that settles to, which the
+        // analysis does not model (an async function's call is a promise,
+        // #317). The operand is handed out ([`handed_out`]), which keeps a
+        // setter or closure it holds, and the value is unknown.
         Expression::AwaitExpression(aw) => {
             let value = lower_expr(&aw.argument, builder);
             // The awaited expression is evaluated BEFORE the suspension:
@@ -648,7 +832,7 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
             let value = match value {
                 v @ (Expr::Var(_) | Expr::Lit(_)) => v,
                 v => {
-                    let tmp = builder.fresh_temp();
+                    let tmp = builder.fresh_temp(aw.argument.span());
                     // The binding is synthetic, its position is not: everything
                     // the walk finds under `await fetch(…)` takes its witness
                     // from the statement it sits in, and a spanless hoist made
@@ -662,27 +846,37 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                 }
             };
             builder.split_at_await();
-            value
+            handed_out(builder.next_call_id(), value)
         }
-        Expression::YieldExpression(y) => y
-            .argument
-            .as_ref()
-            .map(|e| lower_expr(e, builder))
-            .unwrap_or(Expr::Lit(Prim::Unit)),
+        // A `yield` (or `yield*`, which yields every entry of its operand)
+        // hands its operand to the generator's consumer, code the analysis
+        // does not see; the consumer may never resume it, and resumes it with
+        // whatever it passes `next` (#317).
+        Expression::YieldExpression(y) => {
+            if let Some(e) = &y.argument {
+                let value = lower_expr(e, builder);
+                let span = builder.span_at(y.span.start);
+                let call = handed_out(builder.next_call_id(), value);
+                builder.push_stmt(Stmt::ExprStmt(call, span));
+            }
+            builder.may_stop();
+            opaque()
+        }
 
         _ => opaque(),
     }
 }
 
-/// Lower a call/`new` argument list. A `...spread` argument cannot keep a
-/// position — parameters bind positionally when a callee is inlined — so it is
-/// emitted as a statement instead of guessed into a slot, which preserves its
-/// reads without claiming which parameter receives it.
+/// Lower a call/`new` argument list. A `...spread` argument is kept, marked
+/// [`Expr::Spread`]: what it holds reaches the callee, and no argument from
+/// there on has a known position ([`Expr::positional_args`]).
 fn lower_arguments(arguments: &[Argument], builder: &mut BlockBuilder) -> Vec<Expr> {
     let mut args = vec![];
     for a in arguments {
         match a {
-            Argument::SpreadElement(sp) => lower_for_effect(&sp.argument, builder),
+            Argument::SpreadElement(sp) => {
+                args.push(Expr::Spread(Box::new(lower_expr(&sp.argument, builder))));
+            }
             other => {
                 if let Some(e) = other.as_expression() {
                     args.push(lower_expr(e, builder));
@@ -701,22 +895,39 @@ fn lower_arguments(arguments: &[Argument], builder: &mut BlockBuilder) -> Vec<Ex
 /// no other body of the component binds it — the offset alone is shared by
 /// `get()` and `get()()`, whose temps would be one name bound twice.
 fn lower_call(call: &CallExpression, builder: &mut BlockBuilder) -> Expr {
-    let fn_ = match lower_expr(&call.callee, builder) {
-        inner if matches!(inner.peel_ts(), Expr::Call { .. }) => {
-            let at = call.callee.span();
-            let tmp = format!("__call_{}_{}", at.start, at.end);
-            let span = builder.span_at(call.callee.span().start);
-            builder.push_stmt(Stmt::Let {
-                var: tmp.clone(),
-                rhs: inner,
-                span,
-            });
-            Expr::Var(tmp)
-        }
-        other => other,
-    };
+    // `super(…)` in a constructor constructs the parent on `this` (#335).
+    if matches!(call.callee, Expression::Super(_)) && builder.ctx.ctor.is_some() {
+        let args = lower_arguments(&call.arguments, builder);
+        let span = builder.span_at(call.span.start);
+        return super_call(args, span, builder);
+    }
+    let fn_ = lower_expr(&call.callee, builder);
+    finish_call(call, fn_, builder)
+}
+
+/// Bind a callee that is a call to its `__call_` temp ([`lower_call`]),
+/// leave any other value as it is.
+fn bind_call_value(value: Expr, at: oxc_span::Span, builder: &mut BlockBuilder) -> Expr {
+    if !matches!(value.peel_ts(), Expr::Call { .. }) {
+        return value;
+    }
+    let tmp = format!("__call_{}_{}", at.start, at.end);
+    let span = builder.span_at(at.start);
+    builder.push_stmt(Stmt::Let {
+        var: tmp.clone(),
+        rhs: value,
+        span,
+    });
+    Expr::Var(tmp)
+}
+
+/// The call `call` once its callee is lowered to `fn_`: the arguments, then
+/// the call node.
+fn finish_call(call: &CallExpression, fn_: Expr, builder: &mut BlockBuilder) -> Expr {
+    let fn_ = bind_call_value(fn_, call.callee.span(), builder);
     let args = lower_arguments(&call.arguments, builder);
     let call_expr = Expr::Call {
+        id: builder.next_call_id(),
         fn_: Box::new(fn_),
         args,
     };
@@ -726,28 +937,223 @@ fn lower_call(call: &CallExpression, builder: &mut BlockBuilder) -> Expr {
     }
 }
 
-/// `a?.b` / `a?.[i]` / `f?.(x)` — optional chaining lowers like its
-/// non-optional counterpart. The nullish short-circuit needs no separate
-/// branch: a `Loc`-bound receiver is an object literal on every path (never
-/// nullish), and any other receiver already evaluates the access to ⊤,
-/// which covers the `undefined` outcome.
-fn lower_chain_element(elem: &ChainElement, builder: &mut BlockBuilder) -> Expr {
-    match elem {
-        ChainElement::CallExpression(call) => lower_call(call, builder),
-        ChainElement::TSNonNullExpression(ts) => lower_expr(&ts.expression, builder),
-        ChainElement::StaticMemberExpression(m) => Expr::FieldAccess {
-            obj: Box::new(lower_expr(&m.object, builder)),
-            field: m.property.name.to_string(),
-        },
-        ChainElement::ComputedMemberExpression(m) => Expr::IndexAccess {
-            arr: Box::new(lower_expr(&m.object, builder)),
-            idx: Box::new(lower_expr(&m.expression, builder)),
-        },
-        ChainElement::PrivateFieldExpression(p) => Expr::FieldAccess {
-            obj: Box::new(lower_expr(&p.object, builder)),
-            field: format!("#{}", p.field.name),
-        },
+/// How the value of an optional chain is used.
+enum ChainUse {
+    /// As an operand: the chain's value is a temp, `undefined` when a link
+    /// short-circuits.
+    Value,
+    /// As the statement `chain;` at this span ([`lower_expr_stmt`]).
+    Effect(Option<SourceRange>),
+}
+
+/// `a?.b.c(x)` / `a?.[i()]` / `f?.(x).y` — an optional chain (#301).
+///
+/// At the first nullish `?.` link JavaScript skips the whole rest of the
+/// chain: a call there, its arguments, a computed index. That rest is lowered
+/// in a block reached only when the link's left side is not nullish, the
+/// way `??` lowers its right operand:
+///
+///   current:  Branch(f == null, exit, rest)
+///   rest:     Let __tN = f(x); Jump(join)
+///   exit:     Let __tN = undefined; Jump(join)
+///   join:     Var(__tN)   ← result
+///
+/// so a call in the skipped part runs on some paths, not on all of them. A
+/// link with nothing effectful to its right (`a?.b`, `a?.[i]`, `f()?.x`)
+/// branches not: the access evaluates to ⊤ for any receiver that can be
+/// nullish, which covers `undefined`, and nothing else is skipped.
+fn lower_chain(chain: &ChainExpression, use_: ChainUse, builder: &mut BlockBuilder) -> Expr {
+    let mut exit = None;
+    let value = lower_chain_element(&chain.expression, &mut exit, builder);
+    let Some(exit) = exit else {
+        return match use_ {
+            ChainUse::Value => value,
+            ChainUse::Effect(span) => {
+                builder.push_stmt(Stmt::ExprStmt(value, span));
+                Expr::Lit(Prim::Unit)
+            }
+        };
+    };
+    match use_ {
+        ChainUse::Effect(span) => {
+            builder.push_stmt(Stmt::ExprStmt(value, span));
+            let rest = builder.seal_with(Terminator::Jump(exit));
+            builder.add_edge(rest, exit, EdgeKind::Unconditional);
+            builder.start_block(exit);
+            Expr::Lit(Prim::Unit)
+        }
+        ChainUse::Value => {
+            let tmp = builder.fresh_temp(chain.span);
+            let span = builder.span_at(chain.span.start);
+            let join = builder.new_block();
+            builder.push_stmt(Stmt::Let {
+                var: tmp.clone(),
+                rhs: value,
+                span,
+            });
+            let rest = builder.seal_with(Terminator::Jump(join));
+            builder.add_edge(rest, join, EdgeKind::Unconditional);
+            builder.start_block(exit);
+            builder.push_stmt(Stmt::Let {
+                var: tmp.clone(),
+                rhs: Expr::Lit(Prim::Unit),
+                span,
+            });
+            let skipped = builder.seal_with(Terminator::Jump(join));
+            builder.add_edge(skipped, join, EdgeKind::Unconditional);
+            builder.start_block(join);
+            Expr::Var(tmp)
+        }
     }
+}
+
+/// The outermost link of a chain: nothing sits to its right.
+fn lower_chain_element(
+    elem: &ChainElement,
+    exit: &mut Option<BlockId>,
+    builder: &mut BlockBuilder,
+) -> Expr {
+    match elem {
+        ChainElement::CallExpression(call) => lower_chain_call(call, exit, builder),
+        ChainElement::TSNonNullExpression(ts) => {
+            lower_chain_link(&ts.expression, false, exit, builder)
+        }
+        ChainElement::StaticMemberExpression(m) => lower_chain_static(m, false, exit, builder),
+        ChainElement::ComputedMemberExpression(m) => lower_chain_computed(m, false, exit, builder),
+        ChainElement::PrivateFieldExpression(p) => lower_chain_private(p, false, exit, builder),
+    }
+}
+
+/// A link inside a chain. `effect_right` says whether a call or an
+/// effectful index sits to the right of this link, i.e. whether a nullish
+/// short-circuit at or left of it skips anything but a read.
+fn lower_chain_link(
+    expr: &Expression,
+    effect_right: bool,
+    exit: &mut Option<BlockId>,
+    builder: &mut BlockBuilder,
+) -> Expr {
+    match expr {
+        Expression::CallExpression(call) => lower_chain_call(call, exit, builder),
+        Expression::StaticMemberExpression(m) => lower_chain_static(m, effect_right, exit, builder),
+        Expression::ComputedMemberExpression(m) => {
+            lower_chain_computed(m, effect_right, exit, builder)
+        }
+        Expression::PrivateFieldExpression(p) => {
+            lower_chain_private(p, effect_right, exit, builder)
+        }
+        Expression::TSNonNullExpression(ts) => {
+            lower_chain_link(&ts.expression, effect_right, exit, builder)
+        }
+        // The chain's base (`a` in `a?.b`); a parenthesized `(a?.b)` is a
+        // chain of its own, and its short-circuit stops at the parenthesis.
+        other => lower_expr(other, builder),
+    }
+}
+
+fn lower_chain_call(
+    call: &CallExpression,
+    exit: &mut Option<BlockId>,
+    builder: &mut BlockBuilder,
+) -> Expr {
+    let fn_ = lower_chain_object(&call.callee, call.optional, true, exit, builder);
+    finish_call(call, fn_, builder)
+}
+
+fn lower_chain_static(
+    m: &StaticMemberExpression,
+    effect_right: bool,
+    exit: &mut Option<BlockId>,
+    builder: &mut BlockBuilder,
+) -> Expr {
+    Expr::FieldAccess {
+        obj: Box::new(lower_chain_object(
+            &m.object,
+            m.optional,
+            effect_right,
+            exit,
+            builder,
+        )),
+        field: m.property.name.to_string(),
+    }
+}
+
+fn lower_chain_private(
+    p: &PrivateFieldExpression,
+    effect_right: bool,
+    exit: &mut Option<BlockId>,
+    builder: &mut BlockBuilder,
+) -> Expr {
+    Expr::FieldAccess {
+        obj: Box::new(lower_chain_object(
+            &p.object,
+            p.optional,
+            effect_right,
+            exit,
+            builder,
+        )),
+        field: format!("#{}", p.field.name),
+    }
+}
+
+/// `a?.[i]`: reading a name or a literal has no effect to skip, any other
+/// index has one.
+fn lower_chain_computed(
+    m: &ComputedMemberExpression,
+    effect_right: bool,
+    exit: &mut Option<BlockId>,
+    builder: &mut BlockBuilder,
+) -> Expr {
+    let inert = m.expression.is_literal() || matches!(m.expression, Expression::Identifier(_));
+    let arr = lower_chain_object(&m.object, m.optional, effect_right || !inert, exit, builder);
+    Expr::IndexAccess {
+        arr: Box::new(arr),
+        idx: Box::new(lower_expr(&m.expression, builder)),
+    }
+}
+
+/// The left side of a link, and the link's short-circuit when it is
+/// optional and skips something (`guarded`): `Branch(obj == null, exit,
+/// rest)`, the lowering continuing in `rest`. The tested value is read again
+/// by the rest of the chain, so a value that is not a call-free read (a call,
+/// an allocation) is bound to a temp first, a call to its `__call_` temp.
+fn lower_chain_object(
+    obj: &Expression,
+    optional: bool,
+    guarded: bool,
+    exit: &mut Option<BlockId>,
+    builder: &mut BlockBuilder,
+) -> Expr {
+    let value = lower_chain_link(obj, guarded, exit, builder);
+    if !(optional && guarded) {
+        return value;
+    }
+    let at = obj.span();
+    let value = match bind_call_value(value, at, builder) {
+        v if crate::ir::free_vars::call_free_key(&v).is_some() => v,
+        v => {
+            let tmp = builder.fresh_temp(at);
+            builder.push_stmt(Stmt::Let {
+                var: tmp.clone(),
+                rhs: v,
+                span: builder.span_at(at.start),
+            });
+            Expr::Var(tmp)
+        }
+    };
+    let exit = *exit.get_or_insert_with(|| builder.new_block());
+    let rest = builder.new_block();
+    let bid = builder.seal_with(Terminator::Branch {
+        cond: nullish_test(value.clone()),
+        then_: exit,
+        else_: rest,
+        span: builder.span_at(at.start),
+        chain_link: true,
+    });
+    builder.add_edge(bid, exit, EdgeKind::IfTrue);
+    builder.add_edge(bid, rest, EdgeKind::IfFalse);
+    builder.start_block(rest);
+    value
 }
 
 // ── Block-splitting lowering ──────────────────────────────────────────────────
@@ -765,7 +1171,7 @@ fn lower_ternary(cond: &ConditionalExpression, builder: &mut BlockBuilder) -> Ex
     let then_id = builder.new_block();
     let else_id = builder.new_block();
     let join_id = builder.new_block();
-    let tmp = builder.fresh_temp();
+    let tmp = builder.fresh_temp(cond.span);
 
     let span = builder.span_at(cond.test.span().start);
     let bid = builder.seal_with(Terminator::Branch {
@@ -773,6 +1179,7 @@ fn lower_ternary(cond: &ConditionalExpression, builder: &mut BlockBuilder) -> Ex
         then_: then_id,
         else_: else_id,
         span,
+        chain_link: false,
     });
     builder.add_edge(bid, then_id, EdgeKind::IfTrue);
     builder.add_edge(bid, else_id, EdgeKind::IfFalse);
@@ -822,13 +1229,13 @@ fn lower_ternary(cond: &ConditionalExpression, builder: &mut BlockBuilder) -> Ex
 ///
 /// `??` tests nullishness, not truthiness, and its branch says so: lowered
 /// as `||`, the join side was narrowed truthy and `0 ?? d` lost its `0`, and
-/// a guard `!(a ?? b)` was read as "`b` is falsy" where `b` never ran. The IR
-/// conflates `==` and `===`, so the join side only drops `null` — the sound
-/// envelope of both (cf. `narrow_env_for_branch`).
+/// a guard `!(a ?? b)` was read as "`b` is falsy" where `b` never ran. The
+/// test is the loose [`nullish_test`], so the join side holds neither `null`
+/// nor `undefined` (#303).
 ///
 /// Pre-declare + Assign: stability(__tN) = stability(a) ⊔ stability(b)
 fn lower_logical(log: &LogicalExpression, builder: &mut BlockBuilder) -> Expr {
-    let tmp = builder.fresh_temp();
+    let tmp = builder.fresh_temp(log.span);
     let span = builder.span_at(log.left.span().start);
     let left = lower_expr(&log.left, builder);
     builder.push_stmt(Stmt::Let {
@@ -846,15 +1253,7 @@ fn lower_logical(log: &LogicalExpression, builder: &mut BlockBuilder) -> Expr {
         // truthy → join (keep a); falsy → rhs
         LogicalOperator::Or => (Expr::Var(tmp.clone()), join_id, rhs_id),
         // nullish → rhs; anything else → join (keep a)
-        LogicalOperator::Coalesce => (
-            Expr::BinOp {
-                op: IrBinOp::Eq,
-                lhs: Box::new(Expr::Var(tmp.clone())),
-                rhs: Box::new(Expr::Lit(Prim::Null)),
-            },
-            rhs_id,
-            join_id,
-        ),
+        LogicalOperator::Coalesce => (nullish_test(Expr::Var(tmp.clone())), rhs_id, join_id),
     };
 
     let bid = builder.seal_with(Terminator::Branch {
@@ -862,6 +1261,7 @@ fn lower_logical(log: &LogicalExpression, builder: &mut BlockBuilder) -> Expr {
         then_,
         else_,
         span,
+        chain_link: false,
     });
     builder.add_edge(bid, then_, EdgeKind::IfTrue);
     builder.add_edge(bid, else_, EdgeKind::IfFalse);
@@ -1249,11 +1649,11 @@ fn lower_assignment_maybe_default(
 /// but a call-free path is bound to a temp first.
 fn lower_logical_assignment(assign: &AssignmentExpression, builder: &mut BlockBuilder) -> Expr {
     let span = builder.span_at(assign.span.start);
-    let once = |e: Expr, builder: &mut BlockBuilder| {
+    let once = |e: Expr, at: oxc_span::Span, builder: &mut BlockBuilder| {
         if crate::ir::free_vars::call_free_key(&e).is_some() {
             return e;
         }
-        let tmp = builder.fresh_temp();
+        let tmp = builder.fresh_temp(at);
         builder.push_stmt(Stmt::Let {
             var: tmp.clone(),
             rhs: e,
@@ -1262,12 +1662,21 @@ fn lower_logical_assignment(assign: &AssignmentExpression, builder: &mut BlockBu
         Expr::Var(tmp)
     };
     let name = assign_target_ident(&assign.left);
+    // The source of the target's object and computed key, which name their
+    // temps.
+    let (obj_at, key_at) = match &assign.left {
+        AssignmentTarget::ComputedMemberExpression(m) => (m.object.span(), m.expression.span()),
+        other => match other.as_member_expression() {
+            Some(m) => (m.object().span(), other.span()),
+            None => (other.span(), other.span()),
+        },
+    };
     let member = match name {
         Some(_) => None,
         None => assign_target_member(&assign.left, builder).map(|(obj, key)| {
-            let obj = once(obj, builder);
+            let obj = once(obj, obj_at, builder);
             let key = match key {
-                MemberKey::Index(i) => MemberKey::Index(once(i, builder)),
+                MemberKey::Index(i) => MemberKey::Index(once(i, key_at, builder)),
                 field => field,
             };
             (obj, key)
@@ -1290,21 +1699,14 @@ fn lower_logical_assignment(assign: &AssignmentExpression, builder: &mut BlockBu
     let (cond, then_, else_) = match assign.operator.to_logical_operator() {
         Some(LogicalOperator::And) => (read.clone(), rhs_id, join_id),
         Some(LogicalOperator::Or) => (read.clone(), join_id, rhs_id),
-        _ => (
-            Expr::BinOp {
-                op: IrBinOp::Eq,
-                lhs: Box::new(read.clone()),
-                rhs: Box::new(Expr::Lit(Prim::Null)),
-            },
-            rhs_id,
-            join_id,
-        ),
+        _ => (nullish_test(read.clone()), rhs_id, join_id),
     };
     let bid = builder.seal_with(Terminator::Branch {
         cond,
         then_,
         else_,
         span,
+        chain_link: false,
     });
     builder.add_edge(bid, then_, EdgeKind::IfTrue);
     builder.add_edge(bid, else_, EdgeKind::IfFalse);
@@ -1355,14 +1757,27 @@ fn faithful_compound_binop(op: AssignmentOperator) -> Option<IrBinOp> {
     }
 }
 
+/// `e == null`, the test JavaScript makes for `??`, `??=` and an optional
+/// link: loose, so it holds for `undefined` too, and its false side holds
+/// neither (#303).
+fn nullish_test(e: Expr) -> Expr {
+    Expr::BinOp {
+        op: IrBinOp::LooseEq,
+        lhs: Box::new(e),
+        rhs: Box::new(Expr::Lit(Prim::Null)),
+    }
+}
+
 fn lower_binop(op: BinaryOperator) -> IrBinOp {
     match op {
         BinaryOperator::Addition => IrBinOp::Add,
         BinaryOperator::Subtraction => IrBinOp::Sub,
         BinaryOperator::Multiplication => IrBinOp::Mul,
         BinaryOperator::Division => IrBinOp::Div,
-        BinaryOperator::Equality | BinaryOperator::StrictEquality => IrBinOp::Eq,
-        BinaryOperator::Inequality | BinaryOperator::StrictInequality => IrBinOp::Neq,
+        BinaryOperator::StrictEquality => IrBinOp::Eq,
+        BinaryOperator::StrictInequality => IrBinOp::Neq,
+        BinaryOperator::Equality => IrBinOp::LooseEq,
+        BinaryOperator::Inequality => IrBinOp::LooseNeq,
         BinaryOperator::LessThan => IrBinOp::Lt,
         BinaryOperator::GreaterThan => IrBinOp::Gt,
         BinaryOperator::LessEqualThan => IrBinOp::Leq,
@@ -1588,7 +2003,7 @@ mod tests {
             panic!("expected a branch, got {:?}", entry.term);
         };
         assert!(
-            matches!(cond, Expr::BinOp { op: IrBinOp::Eq, rhs, .. }
+            matches!(cond, Expr::BinOp { op: IrBinOp::LooseEq, rhs, .. }
                 if matches!(rhs.as_ref(), Expr::Lit(Prim::Null))),
             "expected `t == null`, got {cond:?}"
         );
@@ -1880,6 +2295,241 @@ mod tests {
                 "read of `opts` must survive lowering: {source}"
             );
         }
+    }
+
+    // ── Optional chains (#301) ────────────────────────────────────────────────
+
+    /// How many calls of `name` (the callee's root variable) `block` holds,
+    /// at any depth of its expressions.
+    fn calls_of(block: &BasicBlock, name: &str) -> usize {
+        fn root(e: &Expr) -> Option<&str> {
+            match e.peel_ts() {
+                Expr::Var(v) => Some(v),
+                Expr::FieldAccess { obj, .. } => root(obj),
+                Expr::IndexAccess { arr, .. } => root(arr),
+                _ => None,
+            }
+        }
+        fn walk(e: &Expr, name: &str, n: &mut usize) {
+            if let Expr::Call { fn_, .. } = e
+                && root(fn_) == Some(name)
+            {
+                *n += 1;
+            }
+            e.for_each_child(&mut |c| walk(c, name, n));
+        }
+        let mut n = 0;
+        block.for_each_expr(&mut |e| walk(e, name, &mut n));
+        n
+    }
+
+    /// Every `Branch` of `cfg`: (block, condition, then, else).
+    fn branches(cfg: &CFG) -> Vec<(BlockId, &Expr, BlockId, BlockId)> {
+        cfg.blocks
+            .values()
+            .filter_map(|b| match &b.term {
+                Terminator::Branch {
+                    cond, then_, else_, ..
+                } => Some((b.id, cond, *then_, *else_)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `cond` is `<tested> == null`, with `tested` spelled as `key`.
+    fn tests_nullish(cond: &Expr, key: &str) -> bool {
+        matches!(cond, Expr::BinOp { op: IrBinOp::LooseEq, lhs, rhs }
+            if matches!(rhs.as_ref(), Expr::Lit(Prim::Null))
+                && crate::ir::free_vars::call_free_key(lhs).as_deref() == Some(key))
+    }
+
+    /// `cb?.(x())`: the arguments run only when `cb` is not nullish, so the
+    /// call and its arguments sit on the false side of `cb == null`, and the
+    /// statement keeps the shape of `cb(x());` there.
+    #[test]
+    fn an_optional_calls_arguments_sit_behind_a_nullish_test() {
+        let cfg = build("function f(cb) { cb?.(x()); }");
+        let bs = branches(&cfg);
+        let [(at, cond, exit, rest)] = bs[..] else {
+            panic!("one branch expected: {:?}", cfg.blocks);
+        };
+        assert_eq!(at, cfg.entry);
+        assert!(tests_nullish(cond, "cb"), "{cond:?}");
+        let rest_block = &cfg.blocks[&rest];
+        assert!(
+            matches!(rest_block.stmts.first(), Some(Stmt::ExprStmt(Expr::Call { fn_, args, .. }, _))
+                if matches!(fn_.as_ref(), Expr::Var(v) if v == "cb")
+                    && matches!(args.as_slice(), [Expr::Call { .. }])),
+            "{rest_block:?}"
+        );
+        assert_eq!(calls_of(&cfg.blocks[&cfg.entry], "x"), 0);
+        assert_eq!(calls_of(&cfg.blocks[&exit], "x"), 0);
+        let kind = |to| {
+            cfg.edges
+                .iter()
+                .find(|e| e.from == at && e.to == to)
+                .map(|e| e.kind.clone())
+        };
+        assert_eq!(kind(exit), Some(EdgeKind::IfTrue));
+        assert_eq!(kind(rest), Some(EdgeKind::IfFalse));
+    }
+
+    /// JavaScript skips the whole rest of the chain at the first nullish
+    /// link: the member call after `a?.b`, a computed index, a call whose
+    /// value is read on.
+    #[test]
+    fn the_rest_of_a_chain_sits_behind_its_first_optional_link() {
+        for (src, tested, callee) in [
+            ("function f(a) { a?.b.c(x()); }", "a", "x"),
+            ("function f(a) { return a?.[i()]; }", "a", "i"),
+            ("function f(g) { return g?.(1).y; }", "g", "g"),
+            ("function f(g) { g?.(1).y(); }", "g", "g"),
+        ] {
+            let cfg = build(src);
+            let (at, cond, exit, _) = branches(&cfg)[0];
+            assert_eq!(at, cfg.entry, "{src}");
+            assert!(tests_nullish(cond, tested), "{src}: {cond:?}");
+            assert_eq!(calls_of(&cfg.blocks[&cfg.entry], callee), 0, "{src}");
+            assert_eq!(calls_of(&cfg.blocks[&exit], callee), 0, "{src}");
+            let all: usize = cfg.blocks.values().map(|b| calls_of(b, callee)).sum();
+            assert!(all > 0, "{src}: the skipped call is still lowered");
+        }
+    }
+
+    /// `a?.b?.(x)`: one test per optional link, both leaving to one exit.
+    #[test]
+    fn every_optional_link_short_circuits_to_the_same_exit() {
+        let cfg = build("function f(a) { a?.b?.(x()); }");
+        let bs = branches(&cfg);
+        assert_eq!(bs.len(), 2, "{:?}", cfg.blocks);
+        assert!(tests_nullish(bs[0].1, "a"), "{:?}", bs[0].1);
+        assert!(tests_nullish(bs[1].1, "a.b"), "{:?}", bs[1].1);
+        assert_eq!(bs[0].2, bs[1].2, "one exit for the chain");
+        assert_eq!(bs[1].0, bs[0].3, "the second link is tested past the first");
+    }
+
+    /// In value position the chain's value is `undefined` on the skipped path
+    /// and the rest's value on the other, joined in one temp.
+    #[test]
+    fn a_chains_value_joins_undefined_on_the_skipped_path() {
+        let cfg = build("function f(g) { return g?.(1).y; }");
+        let Some(join) = cfg.blocks.values().find(
+            |b| matches!(&b.term, Terminator::Return(Expr::Var(v), _) if v.starts_with("__t")),
+        ) else {
+            panic!("the chain's value is a temp: {:?}", cfg.blocks);
+        };
+        let Terminator::Return(Expr::Var(tmp), _) = &join.term else {
+            unreachable!()
+        };
+        let lets: Vec<&Expr> = cfg
+            .blocks
+            .values()
+            .flat_map(|b| &b.stmts)
+            .filter_map(|s| match s {
+                Stmt::Let { var, rhs, .. } if var == tmp => Some(rhs),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lets.len(), 2, "{lets:?}");
+        assert!(lets.iter().any(|e| matches!(e, Expr::Lit(Prim::Unit))));
+        assert!(
+            lets.iter()
+                .any(|e| matches!(e, Expr::FieldAccess { field, .. } if field == "y"))
+        );
+        // The nullish test selects the joined value, like any branch whose
+        // arms meet (#197): both writes of the temp are charged to it.
+        let selecting = crate::engine::dominance::selecting_branches(&cfg);
+        let writers: Vec<BlockId> = cfg
+            .blocks
+            .values()
+            .filter(|b| {
+                b.stmts
+                    .iter()
+                    .any(|s| matches!(s, Stmt::Let { var, .. } if var == tmp))
+            })
+            .map(|b| b.id)
+            .collect();
+        assert_eq!(writers.len(), 2);
+        for b in writers {
+            assert!(
+                selecting.get(&b).is_some_and(|bs| bs.contains(&cfg.entry)),
+                "block {b} is selected by the test: {selecting:?}"
+            );
+        }
+    }
+
+    /// Nothing but a read to skip: no branch (`a?.b.c`, an inert index, a
+    /// call left of the link), and a parenthesis ends the chain, so the call
+    /// after `(a?.b)` is not part of it.
+    #[test]
+    fn a_chain_with_only_reads_to_skip_does_not_branch() {
+        for src in [
+            "function f(a) { return a?.b.c; }",
+            "function f(a, i) { return a?.[i]; }",
+            "function f(a) { return a?.[0]?.b; }",
+            "function f(g) { return g()?.x; }",
+            "function f(a) { (a?.b).c(x); }",
+        ] {
+            let cfg = build(src);
+            assert!(branches(&cfg).is_empty(), "{src}: {:?}", cfg.blocks);
+        }
+    }
+
+    /// Only a chain's own short-circuit is a `chain_link` test, and the paths
+    /// a body reads through it are the chain's: `a?.b?.()` reads `a.b`, not
+    /// a bare `a`. A test the source writes stays a read of `a`.
+    #[test]
+    fn a_chains_nullish_test_reads_as_the_chain() {
+        use crate::ir::free_vars::{AccessPath, compute_free_paths};
+        let links = |cfg: &CFG| -> Vec<bool> {
+            cfg.blocks
+                .values()
+                .filter_map(|b| match &b.term {
+                    Terminator::Branch { chain_link, .. } => Some(*chain_link),
+                    _ => None,
+                })
+                .collect()
+        };
+        let path = |segs: &[&str]| AccessPath {
+            root: "a".to_string(),
+            segments: segs.iter().map(|s| s.to_string()).collect(),
+        };
+        let cfg = build("function f() { a?.b?.(); }");
+        assert_eq!(links(&cfg), [true, true]);
+        assert_eq!(compute_free_paths(&cfg), [path(&["b"])].into());
+        let cfg = build("function f() { a?.c.d(1); }");
+        assert_eq!(compute_free_paths(&cfg), [path(&["c", "d"])].into());
+        for src in [
+            "function f() { if (a == null) return; a.b(); }",
+            "function f() { return a ?? b(); }",
+            "function f() { return a ? b() : c(); }",
+        ] {
+            let cfg = build(src);
+            assert!(links(&cfg).iter().all(|l| !l), "{src}");
+            assert!(compute_free_paths(&cfg).contains(&path(&[])), "{src}");
+        }
+    }
+
+    /// A tested left side that is a call runs once: bound to its `__call_`
+    /// temp, which both the test and the rest of the chain read.
+    #[test]
+    fn a_tested_call_runs_once() {
+        let cfg = build("function f() { get()?.m(x); }");
+        let entry = &cfg.blocks[&cfg.entry];
+        let Some(tmp) = entry.stmts.iter().find_map(|s| match s {
+            Stmt::Let { var, .. } if var.starts_with("__call_") => Some(var.clone()),
+            _ => None,
+        }) else {
+            panic!("`get()` is bound to a temp: {entry:?}");
+        };
+        let all: usize = cfg.blocks.values().map(|b| calls_of(b, "get")).sum();
+        assert_eq!(all, 1);
+        let bs = branches(&cfg);
+        let [(_, cond, _, rest)] = bs[..] else {
+            panic!("one branch expected: {:?}", cfg.blocks);
+        };
+        assert!(tests_nullish(cond, &tmp), "{cond:?}");
+        assert_eq!(calls_of(&cfg.blocks[&rest], &tmp), 1);
     }
 
     #[test]

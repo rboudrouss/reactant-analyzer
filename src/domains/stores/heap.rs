@@ -8,13 +8,17 @@ use crate::{
     ir::{
         ComponentId,
         cfg::CFG,
-        expr::Expr,
+        expr::{Accessor, Expr, accessor_of},
         free_vars::compute_free_vars,
+        module::{AccessKey, AccessorNames},
         types::{ExprId, HookLabel, Symbol, Var},
     },
 };
 
 use super::{AbstractEnv, EnvVal, Sites, map_get_or};
+
+/// A closure [`Heap::reach_of`] reached: its site and its body.
+pub type ReachedFn = (ExprId, Arc<CFG>);
 
 /// Value stored at a heap location (indexed by `ExprId` allocation site).
 #[derive(Debug, Clone)]
@@ -38,6 +42,10 @@ pub enum HeapValue {
         /// creation (`AbstractEnv::slot_label`): what the body's conditions
         /// on them change with (#197).
         captured_slots: HashMap<Symbol, HookLabel>,
+        /// The function React's `useEffectEvent` hands back, which runs this
+        /// body when called outside a render and throws when called during
+        /// one ([`Heap::alloc_event`]).
+        event: bool,
     },
     /// An abstract object: fields may be plain values or heap locations (for FnLit props).
     Obj(Members),
@@ -62,6 +70,13 @@ pub enum HeapValue {
 /// member keeps the sites written there, so a call through it runs what was
 /// stored, and no value: a literal stored there was fresh in the render that
 /// built it, not in the one reading it, so a read through it is unknown.
+///
+/// An accessor (#321) is an entry under its [`accessor_key`]: the closure a
+/// read (a getter) or a write (a setter) of the member it defines runs. A
+/// read of that member is what the getter returned
+/// ([`Heap::members`]), never the closure.
+///
+/// [`accessor_key`]: crate::ir::expr::accessor_key
 #[derive(Debug, Clone, Default)]
 pub struct Members {
     pub named: HashMap<Symbol, EnvVal<StateValue>>,
@@ -69,6 +84,15 @@ pub struct Members {
     pub open: bool,
     pub unseen: bool,
     pub persists: bool,
+    /// An array literal's object, whose `length` is its own (#336). A
+    /// property of the site, so a join keeps it from either side.
+    pub array: bool,
+    /// A plain object the library builds — React's props object, `useRef`'s
+    /// — whose reads run no accessor but one a descriptor installed or a
+    /// prototype the program set (#336,
+    /// [`AccessorNames::may_run_off_plain`]). A property of the site, kept
+    /// from either side as `array` is.
+    pub plain: bool,
 }
 
 impl Members {
@@ -119,6 +143,13 @@ impl Members {
         for slot in self.named.values_mut() {
             *slot = slot.join(value);
         }
+        self.hold_unplaced(value);
+    }
+
+    /// An entry at a position nothing fixes (an array element past a spread
+    /// or an elision): a member no constant names may hold it, and no named
+    /// member does, since each named one sits where its index says (#307).
+    pub fn hold_unplaced(&mut self, value: &EnvVal<StateValue>) {
         self.others = Some(
             self.others
                 .as_ref()
@@ -139,6 +170,31 @@ impl Members {
     /// Every value an entry says a member may hold.
     pub fn values(&self) -> impl Iterator<Item = &EnvVal<StateValue>> {
         self.named.values().chain(&self.others)
+    }
+
+    /// The closures a read (`Get`) or a write (`Set`) of `member` runs: the
+    /// accessors of that member, and of a computed name, which may be it.
+    /// `None` is a key no constant names: every accessor of the half.
+    pub fn accessors(&self, kind: Accessor, member: Option<&str>) -> BTreeSet<ExprId> {
+        self.named
+            .iter()
+            .filter(|(k, _)| {
+                accessor_of(k).is_some_and(|(half, m)| {
+                    half == kind && (m.is_none() || member.is_none() || m == member)
+                })
+            })
+            .filter_map(|(_, ev)| ev.locs())
+            .flatten()
+            .copied()
+            .collect()
+    }
+
+    /// A member a literal writes as a value (`p: v`) or as an accessor
+    /// replaces what it defined for that member before.
+    pub fn define(&mut self, member: &str) {
+        self.named.remove(member);
+        self.named
+            .retain(|k, _| accessor_of(k).is_none_or(|(_, m)| m != Some(member)));
     }
 
     /// Join into this object the writes `written` records: a member before
@@ -212,6 +268,8 @@ impl Members {
             open: self.open || other.open,
             unseen: self.unseen || other.unseen,
             persists: self.persists || other.persists,
+            array: self.array || other.array,
+            plain: self.plain || other.plain,
         }
     }
 
@@ -228,6 +286,8 @@ impl Members {
             && (!self.open || other.open)
             && (!self.unseen || other.unseen)
             && (!self.persists || other.persists)
+            && (!self.array || other.array)
+            && (!self.plain || other.plain)
     }
 }
 
@@ -252,17 +312,131 @@ impl Members {
 /// after the read, a later effect. The next object the site allocates
 /// starts from it as well ([`Heap::alloc_obj`]), so a write the order of a
 /// pass put after the read is seen by the read of the next pass (#258).
+///
+/// `returned` is, per getter (#321), the join of what every run of it at a
+/// read returned, kept across passes: what a read of its member is. A getter
+/// no run of which is recorded may return anything, a new object included.
+///
+/// `defined` is what the heap knows of the objects it does not place (#334):
+/// the member names some accessor of the program defines, the same in every
+/// heap of one program ([`Heap::with_defined`]). A read or a write of such a
+/// name on an object no site places, or of a member a placed object does not
+/// hold (its prototype's), may run one ([`Heap::unseen_accessor`]).
 #[derive(Debug, Clone, Default)]
 pub struct Heap {
     cells: HashMap<ExprId, HeapValue>,
     escaped: BTreeSet<ExprId>,
     assigned: AbstractEnv<StateValue>,
     written: HashMap<ExprId, Members>,
+    returned: HashMap<ExprId, EnvVal<StateValue>>,
+    /// Some object of the heap may hold an accessor: when not, no read or
+    /// write runs one, which [`Heap::has_accessors`] lets a caller skip.
+    accessors: bool,
+    defined: std::sync::Arc<AccessorNames>,
 }
+
+/// What a getter no recorded run bounds returns: anything, a new object
+/// included, and never a must-fresh one.
+static UNRUN: std::sync::LazyLock<EnvVal<StateValue>> = std::sync::LazyLock::new(|| {
+    EnvVal::Val(
+        StateValue::top().join(&StateValue::reference(crate::domains::Stability::PerRender)),
+    )
+});
 
 impl Heap {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Some object may hold an accessor (#321), or the program defines one
+    /// an object the heap does not place may hold (#334).
+    pub fn has_accessors(&self) -> bool {
+        self.accessors || !self.defined.is_empty()
+    }
+
+    /// This heap, for a program whose accessors define `defined` (#334).
+    pub fn with_defined(mut self, defined: std::sync::Arc<AccessorNames>) -> Self {
+        self.defined = defined;
+        self
+    }
+
+    /// An empty heap of the same program: what it knows of the objects it
+    /// does not place, and nothing else.
+    pub fn blank(&self) -> Heap {
+        Heap::new().with_defined(self.defined.clone())
+    }
+
+    /// The member names some accessor of the program defines (#334).
+    pub fn defined(&self) -> &AccessorNames {
+        &self.defined
+    }
+
+    /// May a read or a write of `key` off what `sites` place (`None`:
+    /// nothing) run an accessor where the heap places nothing: on an object
+    /// no site places, or past the members a placed one holds (#334)? A call
+    /// the analysis cannot see, then. Off plain objects the library built
+    /// only, only an accessor such an object's chain may hold (#336).
+    pub fn unseen_accessor(&self, sites: Option<&Sites>, key: AccessKey<'_>) -> bool {
+        match sites.is_some_and(|s| self.plain(s)) {
+            true => self.defined.may_run_off_plain(key),
+            false => self.defined.may_run(key),
+        }
+    }
+
+    /// Is every object `sites` may name a plain object the library built,
+    /// and nothing else (#336)?
+    pub fn plain(&self, sites: &Sites) -> bool {
+        !sites.open
+            && !sites.ids.is_empty()
+            && sites
+                .ids
+                .iter()
+                .all(|id| matches!(self.get(*id), Some(HeapValue::Obj(m)) if m.plain))
+    }
+
+    /// Is every object `sites` may name an array literal's, and nothing
+    /// else (#336)?
+    pub fn arrays(&self, sites: &Sites) -> bool {
+        !sites.open
+            && !sites.ids.is_empty()
+            && sites
+                .ids
+                .iter()
+                .all(|id| matches!(self.get(*id), Some(HeapValue::Obj(m)) if m.array))
+    }
+
+    /// One run of the getter at `site` returned `value` (`None`: it ran no
+    /// body, so it may return anything).
+    pub fn record_getter(&mut self, site: ExprId, value: Option<&EnvVal<StateValue>>) {
+        let value = value.unwrap_or(&UNRUN);
+        let joined = match self.returned.get(&site) {
+            Some(old) => old.join(value),
+            None => value.clone(),
+        };
+        self.returned.insert(site, joined);
+    }
+
+    /// What a read through the getter at `site` is, and whether a recorded
+    /// run bounds it.
+    fn getter_returned(&self, site: ExprId) -> (&EnvVal<StateValue>, bool) {
+        match self.returned.get(&site) {
+            Some(v) => (v, true),
+            None => (&UNRUN, false),
+        }
+    }
+
+    /// The closures a read (`Get`) or write (`Set`) of `member` of a value
+    /// pointing to `sites` runs ([`Members::accessors`]).
+    pub fn accessors(&self, sites: &Sites, kind: Accessor, member: Option<&str>) -> Sites {
+        let ids = sites
+            .ids
+            .iter()
+            .filter_map(|id| match self.get(*id) {
+                Some(HeapValue::Obj(obj)) => Some(obj.accessors(kind, member)),
+                _ => None,
+            })
+            .flatten();
+        Sites::closed(ids)
     }
 
     /// A body that does not declare `var` assigned it what `env` binds it
@@ -303,14 +477,17 @@ impl Heap {
         if let Some(written) = self.written.get(&id) {
             members.overlay(written);
         }
+        self.accessors |= members.named.keys().any(|k| accessor_of(k).is_some());
         self.cells.insert(id, HeapValue::Obj(members));
     }
 
     /// Apply `write` to the object at site `id`, and keep it for the
     /// objects the site allocates next.
+    /// A write may define an accessor: a class's, on its instance (#335).
     pub fn write_after(&mut self, id: ExprId, write: impl Fn(&mut Members)) {
         if let Some(HeapValue::Obj(obj)) = self.cells.get_mut(&id) {
             write(obj);
+            self.accessors |= obj.named.keys().any(|k| accessor_of(k).is_some());
             write(self.written.entry(id).or_default());
         }
     }
@@ -337,6 +514,38 @@ impl Heap {
             }
         }
         held
+    }
+
+    /// What a value at `sites` reaches, as [`Heap::escape`] and
+    /// [`Heap::escaped_fns`] walk it, without escaping anything: the
+    /// setters the objects on the way hold, and the closures (by site, with
+    /// their bodies) reached through members and captures. What the call
+    /// relation records of a value handed to a callee (ADR-047).
+    pub fn reach_of(&self, sites: &Sites) -> (Vec<(ComponentId, HookLabel)>, Vec<ReachedFn>) {
+        let mut stack: Vec<ExprId> = sites.ids.iter().copied().collect();
+        let mut seen = BTreeSet::new();
+        let (mut setters, mut fns) = (Vec::new(), Vec::new());
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            match self.get(id) {
+                Some(HeapValue::Obj(obj)) => {
+                    stack.extend(obj.values().filter_map(EnvVal::locs).flatten().copied());
+                    setters.extend(obj.values().flat_map(|ev| ev.as_val().setters()));
+                }
+                Some(HeapValue::Fn {
+                    body_cfg,
+                    captured_locs,
+                    ..
+                }) => {
+                    fns.push((id, Arc::clone(body_cfg)));
+                    stack.extend(captured_locs.values().flat_map(|s| s.ids.iter().copied()));
+                }
+                None => {}
+            }
+        }
+        (setters, fns)
     }
 
     /// The closures an escaped site reaches, through the members of the
@@ -393,8 +602,48 @@ impl Heap {
                 captured_locs,
                 owner,
                 captured_slots,
+                event: false,
             },
         );
+    }
+
+    /// At `id`, the function React's `useEffectEvent` hands back for the
+    /// closure at `of`, when `of` is one: a function of its own — a new one
+    /// at every render — whose call runs the latest committed argument, with
+    /// the call's arguments, outside a render, and throws during one
+    /// (react-dom 19.3.1 `cjs/react-dom-client.development.js:9060-9082`,
+    /// `ref.impl` set at commit, :15817). Its body and captures are the
+    /// closure's. `false` when `of` is no closure.
+    pub fn alloc_event(&mut self, id: ExprId, of: ExprId) -> bool {
+        let Some(HeapValue::Fn {
+            params,
+            body_cfg,
+            captured,
+            captured_locs,
+            owner,
+            captured_slots,
+            ..
+        }) = self.cells.get(&of)
+        else {
+            return false;
+        };
+        let event = HeapValue::Fn {
+            params: params.clone(),
+            body_cfg: Arc::clone(body_cfg),
+            captured: captured.clone(),
+            captured_locs: captured_locs.clone(),
+            owner: *owner,
+            captured_slots: captured_slots.clone(),
+            event: true,
+        };
+        self.cells.insert(id, event);
+        true
+    }
+
+    /// The function at `id` is one `useEffectEvent` hands back
+    /// ([`Heap::alloc_event`]).
+    pub fn is_event(&self, id: ExprId) -> bool {
+        matches!(self.cells.get(&id), Some(HeapValue::Fn { event: true, .. }))
     }
 
     pub fn get(&self, id: ExprId) -> Option<&HeapValue> {
@@ -406,12 +655,30 @@ impl Heap {
     /// no entry says — the sites are open, or one of them is not an object
     /// recording the member (#240). An object that does not name the member
     /// may still hold it among its `others` (#76).
-    pub fn members(&self, sites: &Sites, member: &str) -> (Vec<&EnvVal<StateValue>>, bool) {
+    ///
+    /// `None` is a key no constant names (`xs[i]`, `o[c ? "a" : "b"]`): it
+    /// may select any member, so the read is every entry of every object, and
+    /// open, since it may also select a member no entry says (#307).
+    pub fn members(&self, sites: &Sites, member: Option<&str>) -> (Vec<&EnvVal<StateValue>>, bool) {
         let mut ids: Vec<_> = sites.ids.iter().copied().collect();
         ids.sort();
+        // A read through a getter is what its runs returned (#321).
         let mut open = sites.open;
         let mut entries = Vec::new();
+        let Some(member) = member else {
+            for id in ids {
+                if let Some(HeapValue::Obj(obj)) = self.get(id) {
+                    entries.extend(obj.values());
+                    self.through(obj.accessors(Accessor::Get, None), &mut entries);
+                }
+            }
+            return (entries, true);
+        };
         for id in ids {
+            let getters = match self.get(id) {
+                Some(HeapValue::Obj(obj)) => obj.accessors(Accessor::Get, Some(member)),
+                _ => BTreeSet::new(),
+            };
             match self.get(id) {
                 Some(HeapValue::Obj(obj)) if obj.named.contains_key(member) => {
                     entries.push(&obj.named[member]);
@@ -424,10 +691,48 @@ impl Heap {
                     entries.push(others);
                     open = true;
                 }
+                Some(HeapValue::Obj(obj)) if !getters.is_empty() => {
+                    open |= obj.is_open() || obj.persists;
+                }
                 _ => open = true,
             }
+            open |= self.through(getters, &mut entries);
         }
         (entries, open)
+    }
+
+    /// Push what a read through each of `getters` is; `true` when a getter
+    /// no recorded run bounds is among them.
+    fn through<'h>(
+        &'h self,
+        getters: BTreeSet<ExprId>,
+        entries: &mut Vec<&'h EnvVal<StateValue>>,
+    ) -> bool {
+        let mut unbounded = false;
+        for g in getters {
+            let (returned, bounded) = self.getter_returned(g);
+            entries.push(returned);
+            unbounded |= !bounded;
+        }
+        unbounded
+    }
+
+    /// The allocation sites `member` of a value pointing to `sites` may be
+    /// ([`Heap::members`]), open when it may also be something no site
+    /// places; `None` when no entry places any.
+    pub fn member_sites(&self, sites: &Sites, member: Option<&str>) -> Option<Sites> {
+        let (entries, open) = self.members(sites, member);
+        let sites = entries.into_iter().fold(
+            Sites {
+                open,
+                ..Sites::default()
+            },
+            |acc, ev| match ev.sites() {
+                Some(s) => acc.join(s),
+                None => acc.opened(),
+            },
+        );
+        (!sites.ids.is_empty()).then_some(sites)
     }
 
     /// The part of the heap reachable from `roots`: every location a member
@@ -455,7 +760,52 @@ impl Heap {
             }
             out.insert(id, hv.clone());
         }
+        out.accessors = self.accessors;
+        out.defined = self.defined.clone();
         out
+    }
+
+    /// Whether a run of the closure at `closure` may read or write something
+    /// of `component`, through what it captured and the members of the
+    /// objects on the way ([`Heap::reachable`]'s walk): a site of its range, a
+    /// closure it owns, one of its setters, or a site no component's range
+    /// holds — a props object, which the walk cannot attribute, so it counts.
+    /// A name the closure did not capture is not its own, so the caller's
+    /// scope is not among what it reaches.
+    pub fn may_touch(&self, closure: ExprId, component: ComponentId) -> bool {
+        let own = |v: &StateValue| v.setters().iter().any(|(o, _)| *o == component);
+        let mut stack = vec![closure];
+        let mut seen = BTreeSet::new();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            match ComponentId::site_owner(id) {
+                Some(owner) if owner != component => {}
+                _ => return true,
+            }
+            match self.get(id) {
+                Some(HeapValue::Fn {
+                    owner,
+                    captured,
+                    captured_locs,
+                    ..
+                }) => {
+                    if *owner == component || captured.values().any(own) {
+                        return true;
+                    }
+                    stack.extend(captured_locs.values().flat_map(|s| s.ids.iter().copied()));
+                }
+                Some(HeapValue::Obj(obj)) => {
+                    if obj.values().any(|ev| own(&ev.as_val())) {
+                        return true;
+                    }
+                    stack.extend(obj.values().filter_map(EnvVal::locs).flatten().copied());
+                }
+                None => {}
+            }
+        }
+        false
     }
 
     pub fn get_mut(&mut self, id: ExprId) -> Option<&mut HeapValue> {
@@ -496,6 +846,7 @@ impl Heap {
                     captured_locs: locs_self,
                     owner,
                     captured_slots: slots_self,
+                    event,
                 }) => {
                     if let HeapValue::Fn {
                         captured: cap_other,
@@ -536,6 +887,7 @@ impl Heap {
                                 captured_locs: joined_locs,
                                 owner: *owner,
                                 captured_slots: joined_slots,
+                                event: *event,
                             },
                         );
                     }
@@ -567,11 +919,30 @@ impl Heap {
             };
             written.insert(*id, merged);
         }
+        let mut returned = self.returned.clone();
+        for (id, theirs) in &other.returned {
+            let merged = match (returned.get(id), widen) {
+                (None, _) => theirs.clone(),
+                (Some(mine), true) => mine.widen(&mine.join(theirs)),
+                (Some(mine), false) => mine.join(theirs),
+            };
+            returned.insert(*id, merged);
+        }
         Heap {
             cells: result,
             escaped: self.escaped.union(&other.escaped).copied().collect(),
             assigned,
             written,
+            returned,
+            accessors: self.accessors || other.accessors,
+            defined: match Arc::ptr_eq(&self.defined, &other.defined) {
+                true => self.defined.clone(),
+                false => {
+                    let mut both = (*self.defined).clone();
+                    both.extend(&other.defined);
+                    Arc::new(both)
+                }
+            },
         }
     }
 
@@ -611,6 +982,10 @@ impl Heap {
                 .written
                 .iter()
                 .all(|(id, w)| other.written.get(id).is_some_and(|o| w.leq(o)))
+            && self
+                .returned
+                .iter()
+                .all(|(id, r)| other.returned.get(id).is_some_and(|o| r.leq(o)))
             && {
                 let mut theirs = other.assigned.clone();
                 self.assigned
@@ -634,27 +1009,32 @@ pub fn resolve_locs<D: AbstractDomain>(
     env: &AbstractEnv<D>,
     heap: &Heap,
 ) -> Option<Sites> {
+    resolve_locs_with(expr, env, heap, &|_| None)
+}
+
+/// [`resolve_locs`], a call placed where `returned` says its value points
+/// (#333): what a pass recorded its bodies returning.
+pub fn resolve_locs_with<D: AbstractDomain>(
+    expr: &Expr,
+    env: &AbstractEnv<D>,
+    heap: &Heap,
+    returned: &dyn Fn(ExprId) -> Option<Sites>,
+) -> Option<Sites> {
     let (obj, member) = match expr {
         Expr::Var(v) => return env.lookup_env_val(v).and_then(|ev| ev.sites().cloned()),
-        Expr::TSAnnotated(inner) => return resolve_locs(inner, env, heap),
-        Expr::FieldAccess { obj, field } => (obj, field.clone()),
+        Expr::TSAnnotated(inner) => return resolve_locs_with(inner, env, heap, returned),
+        Expr::Call { id, .. } | Expr::New { id, .. } => return returned(*id),
+        Expr::FieldAccess { obj, field } => (obj, Some(field.clone())),
         // A constant index is a member read (`t[1]`, `o["k"]`, `o[k]` with
-        // `k` one string), as `eval_index_access` reads it.
-        Expr::IndexAccess { arr, idx } => (arr, member_key(idx, env)?),
+        // `k` one string); any other index may be any member (#307), as
+        // `eval_index_access` reads it.
+        Expr::IndexAccess { arr, idx } => (arr, member_key(idx, env)),
         _ => return None,
     };
-    let (entries, open) = heap.members(&resolve_locs(obj, env, heap)?, &member);
-    let sites = entries.into_iter().fold(
-        Sites {
-            open,
-            ..Sites::default()
-        },
-        |acc, ev| match ev.sites() {
-            Some(s) => acc.join(s),
-            None => acc.opened(),
-        },
-    );
-    (!sites.ids.is_empty()).then_some(sites)
+    heap.member_sites(
+        &resolve_locs_with(obj, env, heap, returned)?,
+        member.as_deref(),
+    )
 }
 
 /// The one member a key expression names, when it names one: a literal
@@ -706,16 +1086,76 @@ mod tests {
     fn a_read_of_a_member_no_constant_names_is_one_of_the_others() {
         let mut h = obj(0.0);
         let sites = Sites::closed([ExprId(7)]);
-        assert!(h.members(&sites, "other").0.is_empty());
+        assert!(h.members(&sites, Some("other")).0.is_empty());
         if let Some(HeapValue::Obj(o)) = h.get_mut(ExprId(7)) {
             o.write_any(&EnvVal::Val(StateValue::number(Interval::point(1.0))));
         }
-        let (entries, open) = h.members(&sites, "other");
+        let (entries, open) = h.members(&sites, Some("other"));
         assert_eq!(entries.len(), 1);
         assert!(open, "the member may also be absent");
         // Written under a key that may be `step` as well.
-        let step = &h.members(&sites, "step").0[0].as_val();
+        let step = &h.members(&sites, Some("step")).0[0].as_val();
         assert_eq!(step.num, Interval::point(0.0).hull(&Interval::point(1.0)));
+    }
+
+    #[test]
+    fn a_read_under_a_key_no_constant_names_is_every_entry_and_open() {
+        // #307: `o[k]` may select `step`, a member under `others`, or a
+        // member no entry says.
+        let mut h = obj(0.0);
+        if let Some(HeapValue::Obj(o)) = h.get_mut(ExprId(7)) {
+            o.others = Some(EnvVal::Val(StateValue::reference(
+                crate::domains::impls::Stability::PerRender,
+            )));
+        }
+        let (entries, open) = h.members(&Sites::closed([ExprId(7)]), None);
+        assert_eq!(entries.len(), 2, "`step` and the others: {entries:?}");
+        assert!(open, "the key may name a member no entry says");
+    }
+
+    /// What a closure of `parent` reaches, as `may_touch` walks it: an object
+    /// of `parent` holding `member` under `m`, captured as `o`.
+    fn parent_closure(parent: ComponentId, member: EnvVal<StateValue>) -> (Heap, ExprId) {
+        let base = parent.site_base();
+        let (f, o) = (ExprId(base + 1), ExprId(base + 2));
+        let mut h = Heap::new();
+        h.insert(
+            o,
+            HeapValue::Obj(Members::exactly(HashMap::from([("m".to_string(), member)]))),
+        );
+        h.insert(
+            f,
+            HeapValue::Fn {
+                params: vec![],
+                body_cfg: Arc::new(crate::test_support::single_block_cfg(vec![])),
+                captured: HashMap::new(),
+                captured_locs: HashMap::from([("o".to_string(), Sites::closed([o]))]),
+                owner: parent,
+                captured_slots: HashMap::new(),
+                event: false,
+            },
+        );
+        (h, f)
+    }
+
+    #[test]
+    fn a_closure_touches_a_component_through_its_sites_setters_and_unowned_sites() {
+        use crate::test_support::cid;
+        let (parent, child) = (cid(0), cid(1));
+        let located =
+            |id: u64| EnvVal::located(Some(Sites::closed([ExprId(id)])), StateValue::top());
+        // Only the parent's own: nothing of the child.
+        let (h, f) = parent_closure(parent, EnvVal::Val(StateValue::top()));
+        assert!(!h.may_touch(f, child));
+        // A site of the child's range.
+        let (h, f) = parent_closure(parent, located(child.site_base() + 3));
+        assert!(h.may_touch(f, child));
+        // A setter of the child.
+        let (h, f) = parent_closure(parent, EnvVal::Val(StateValue::component_setter(child, 0)));
+        assert!(h.may_touch(f, child));
+        // A site no range holds (a props object): not attributable, counted.
+        let (h, f) = parent_closure(parent, located(ExprId::fresh().0));
+        assert!(h.may_touch(f, child));
     }
 
     #[test]

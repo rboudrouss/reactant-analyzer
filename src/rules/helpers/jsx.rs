@@ -227,7 +227,7 @@ fn each_list_element<'a>(
     if depth == 0 {
         return;
     }
-    if let Expr::Call { fn_, args } = expr
+    if let Expr::Call { fn_, args, .. } = expr
         && matches!(fn_.peel_ts(), Expr::FieldAccess { field, .. }
             if crate::engine::setters::SYNC_HOF_METHODS.contains(&field.as_str()))
     {

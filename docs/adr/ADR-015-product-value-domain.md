@@ -111,7 +111,10 @@ when the setter slot is the *only* active one — mirroring the old exact match.
 - **Nullability narrowing on branch guards** (`cfg_analyzer`): the IR
   conflates `==`/`===` into `Eq`, so refinements are the sound envelope of
   both semantics — the positive `x == null` branch keeps {null, undefined};
-  the negative branch drops only the compared literal. Numeric comparisons
+  the negative branch drops only the compared literal. **Amended 2026-11-12
+  (#303):** the IR tells them apart (`LooseEq` / `LooseNeq` for `==` / `!=`,
+  and the test of `??`, `??=` and an optional link); a failed loose test
+  drops both null and undefined, a strict one still only its literal. Numeric comparisons
   deliberately do *not* drop the null slot (`null < 10` is `true` in JS).
 - **Full truthiness narrowing** (`if (x)` / `if (!x)`): the truthy branch
   excludes every falsy JS value per slot — null, undefined, `0` (a point

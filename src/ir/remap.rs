@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::ir::{
     cfg::{BasicBlock, CFG, Terminator},
-    expr::Expr,
+    expr::{CALL_SITES, Expr},
     hooks::HookEntry,
     stmt::{MemberKey, Stmt},
     types::{ExprId, HookLabel},
@@ -22,18 +22,132 @@ pub struct Offsets {
     /// Added to every allocation-site [`ExprId`]. Unique per splice: the same
     /// callee inlined twice is two allocation sites, not one.
     pub ids: u64,
+    /// Added to every call site ([`Expr::Call`]'s `id`), for the same reason:
+    /// the same callee inlined twice performs its calls at two places. Calls
+    /// have a cursor of their own ([`call_id_span`]), so a graft's call
+    /// range moves no allocation site.
+    pub calls: u64,
 }
 
 impl Offsets {
     /// Shift labels only — for a remap that is not a graft (a hook table
     /// renumbered in place keeps its own allocation sites).
     pub fn labels(labels: HookLabel) -> Self {
-        Offsets { labels, ids: 0 }
+        Offsets {
+            labels,
+            ids: 0,
+            calls: 0,
+        }
     }
 
     fn is_identity(self) -> bool {
-        self.labels == 0 && self.ids == 0
+        self.labels == 0 && self.ids == 0 && self.calls == 0
     }
+}
+
+/// How many call sites a graft of `cfg` occupies: one past its largest call
+/// id above [`CALL_SITES`], nested function bodies included; 0 for a body
+/// that calls nothing. The call-site counterpart of [`alloc_id_span`].
+pub fn call_id_span(cfg: &CFG) -> u64 {
+    id_span(cfg_exprs(cfg), call_id)
+}
+
+/// A call's id above [`CALL_SITES`].
+fn call_id(e: &Expr) -> Option<u64> {
+    match e {
+        Expr::Call { id, .. } => Some(id.0.saturating_sub(CALL_SITES)),
+        _ => None,
+    }
+}
+
+/// An allocation site's id.
+fn alloc_id(e: &Expr) -> Option<u64> {
+    match e {
+        Expr::ObjectLit { id, .. }
+        | Expr::ArrayLit { id, .. }
+        | Expr::Arguments { id, .. }
+        | Expr::New { id, .. }
+        | Expr::FnLit { id, .. } => Some(id.0),
+        _ => None,
+    }
+}
+
+/// The top-level expressions of `cfg`.
+fn cfg_exprs(cfg: &CFG) -> Vec<&Expr> {
+    let mut out = Vec::new();
+    cfg.for_each_expr(&mut |e| out.push(e));
+    out
+}
+
+/// One past the largest id `pick` reads off `exprs`, their sub-expressions
+/// and their function literals' bodies.
+fn id_span<'a>(exprs: impl IntoIterator<Item = &'a Expr>, pick: fn(&Expr) -> Option<u64>) -> u64 {
+    fn walk(e: &Expr, pick: fn(&Expr) -> Option<u64>, max: &mut Option<u64>, depth: usize) {
+        if depth == 0 {
+            return;
+        }
+        if let Some(n) = pick(e) {
+            *max = Some(max.map_or(n, |m| m.max(n)));
+        }
+        if let Expr::FnLit { body_cfg, .. } = e {
+            body_cfg.for_each_expr(&mut |inner| walk(inner, pick, max, depth - 1));
+        }
+        e.for_each_child(&mut |c| walk(c, pick, max, depth));
+    }
+    let mut max: Option<u64> = None;
+    // A `FnLit` body is a CFG of its own; the bound keeps a pathological
+    // nesting from recursing without end, and no real body approaches it.
+    for e in exprs {
+        walk(e, pick, &mut max, 64);
+    }
+    max.map_or(0, |m| m + 1)
+}
+
+/// Every expression a hook table holds: each body's, and what an entry holds
+/// beside its body — an initializer, a reducer, a deps list, a custom hook's
+/// arguments. What [`remap_hooks`] shifts.
+fn hook_exprs(hooks: &[HookEntry]) -> Vec<&Expr> {
+    fn deps(d: &crate::ir::hooks::DepsArg) -> Vec<&Expr> {
+        match d {
+            crate::ir::hooks::DepsArg::List(l) => l.as_slice().iter().collect(),
+            crate::ir::hooks::DepsArg::Opaque(e) => vec![e],
+            crate::ir::hooks::DepsArg::Absent => Vec::new(),
+        }
+    }
+    let mut out = Vec::new();
+    for h in hooks {
+        if let Some(body) = h.body_cfg() {
+            out.extend(cfg_exprs(body));
+        }
+        match h {
+            HookEntry::State { init, reducer, .. } => {
+                out.push(init);
+                out.extend(reducer.as_ref());
+            }
+            HookEntry::Ref { init, .. } => out.push(init),
+            HookEntry::Effect { deps: d, .. }
+            | HookEntry::Memo { deps: d, .. }
+            | HookEntry::Callback { deps: d, .. } => out.extend(deps(d)),
+            HookEntry::Custom { args, deps: d, .. } => {
+                out.extend(args);
+                out.extend(deps(d));
+            }
+            HookEntry::Handler { .. } => {}
+        }
+    }
+    out
+}
+
+/// The allocation-id and call-id widths of a body and the hook table grafted
+/// with it — every id [`remap_cfg`] and [`remap_hooks`] shift: a graft lands
+/// above all of them, an argument of a custom hook the table keeps included.
+pub fn graft_spans(cfg: &CFG, hooks: &[HookEntry]) -> (u64, u64) {
+    let mut exprs = cfg_exprs(cfg);
+    exprs.extend(hook_exprs(hooks));
+    (
+        id_span(exprs.iter().copied(), alloc_id),
+        id_span(exprs.iter().copied(), call_id),
+    )
 }
 
 /// One past the largest allocation-site `ExprId` in `cfg`, nested function
@@ -42,28 +156,7 @@ impl Offsets {
 /// A splice adds this to its running cursor so the next graft lands above it,
 /// which is what makes the *same* callee inlined twice two allocation sites.
 pub fn alloc_id_span(cfg: &CFG) -> u64 {
-    let mut max: Option<u64> = None;
-    let mut note = |id: ExprId| max = Some(max.map_or(id.0, |m: u64| m.max(id.0)));
-    fn walk(e: &Expr, note: &mut impl FnMut(ExprId), depth: usize) {
-        if depth == 0 {
-            return;
-        }
-        match e {
-            Expr::ObjectLit { id, .. } | Expr::ArrayLit { id, .. } | Expr::New { id, .. } => {
-                note(*id)
-            }
-            Expr::FnLit { id, body_cfg, .. } => {
-                note(*id);
-                body_cfg.for_each_expr(&mut |inner| walk(inner, note, depth - 1));
-            }
-            _ => {}
-        }
-        e.for_each_child(&mut |c| walk(c, note, depth));
-    }
-    // A `FnLit` body is a CFG of its own; the bound keeps a pathological
-    // nesting from recursing without end, and no real body approaches it.
-    cfg.for_each_expr(&mut |e| walk(e, &mut note, 64));
-    max.map_or(0, |m| m + 1)
+    id_span(cfg_exprs(cfg), alloc_id)
 }
 
 /// Add `off` to every `HookLabel` and every allocation-site `ExprId` embedded
@@ -113,6 +206,11 @@ pub fn remap_expr(expr: Expr, off: Offsets) -> Expr {
             spread_at,
         },
 
+        Expr::Arguments { id, from } => Expr::Arguments {
+            id: shift(id),
+            from,
+        },
+
         Expr::FieldAccess { obj, field } => Expr::FieldAccess {
             obj: Box::new(remap_expr(*obj, off)),
             field,
@@ -130,14 +228,23 @@ pub fn remap_expr(expr: Expr, off: Offsets) -> Expr {
             op,
             arg: Box::new(remap_expr(*arg, off)),
         },
-        Expr::Call { fn_, args } => Expr::Call {
+        Expr::Call { id, fn_, args } => Expr::Call {
+            id: ExprId(id.0 + off.calls),
             fn_: Box::new(remap_expr(*fn_, off)),
             args: args.into_iter().map(|a| remap_expr(a, off)).collect(),
         },
-        Expr::New { id, fn_, args } => Expr::New {
+        Expr::New {
+            id,
+            fn_,
+            args,
+            ctor,
+            on_this,
+        } => Expr::New {
             id: shift(id),
             fn_: Box::new(remap_expr(*fn_, off)),
             args: args.into_iter().map(|a| remap_expr(a, off)).collect(),
+            ctor: ctor.map(|c| Box::new(remap_expr(*c, off))),
+            on_this,
         },
         Expr::CompApp {
             name,
@@ -164,6 +271,7 @@ pub fn remap_expr(expr: Expr, off: Offsets) -> Expr {
             prop_spans,
         },
         Expr::TSAnnotated(inner) => Expr::TSAnnotated(Box::new(remap_expr(*inner, off))),
+        Expr::Spread(inner) => Expr::Spread(Box::new(remap_expr(*inner, off))),
 
         // Leaves with no HookLabel or sub-Expr.
         leaf @ (Expr::Lit(_) | Expr::Var(_) | Expr::SummaryVal(_)) => leaf,
@@ -208,11 +316,13 @@ fn remap_terminator(term: Terminator, off: Offsets) -> Terminator {
             then_,
             else_,
             span,
+            chain_link,
         } => Terminator::Branch {
             cond: remap_expr(cond, off),
             then_,
             else_,
             span,
+            chain_link,
         },
         t @ (Terminator::Jump(_) | Terminator::Unreachable) => t,
     }
@@ -341,12 +451,14 @@ fn remap_hook_entry(entry: HookEntry, off: Offsets) -> HookEntry {
             label,
             event,
             body_cfg,
+            params,
             span,
             dom_event,
         } => HookEntry::Handler {
             label: label + off.labels,
             event,
             body_cfg: remap_cfg(body_cfg, off),
+            params,
             span,
             dom_event,
         },

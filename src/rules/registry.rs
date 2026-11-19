@@ -261,7 +261,9 @@ impl RuleRegistry {
         let mut safe_checks: Vec<SafeCheck> = Vec::new();
         for r in &self.rules {
             let ctx = RuleCtx::cached(cache, component, self.options_for(r.name()));
+            let profile = crate::profile::rule(r.name());
             let produced = r.check(&ctx);
+            drop(profile);
             // `safe_check` is consulted on the *raw* output: a rule whose
             // findings were all filtered away still ran and found something —
             // it is not "verified safe".

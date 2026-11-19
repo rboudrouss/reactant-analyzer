@@ -47,6 +47,9 @@ params included. Two `setX(…)` calls in one body are two rows.
 | `same_tick` | another write of the same slot in this region is CFG-reachable from this one | may, one-directional: `false` is not a promise |
 | `block` | the region block a write that runs synchronously, once per pass, sits in — what `must_on_all_paths` takes | exact; `None` for nested, deferred, cleanup and repeating sites, and for a call through a name with several setters, which writes one, or with a value that may be something else, which may write none |
 | `guard_block` | the region block whose dominating guards the write runs under: `block` for a synchronous write, the statement that scheduled it for a nested, deferred, cleanup or repeating one (#160) | exact; `None` for a row with no placeable block |
+| `placed` | the region block a write that surely runs at least once per pass of it sits in: `block`, or a repeating site the call relation is sure of (a callback a receiver surely runs, #248; `[1].forEach(setN)`, #291). What `setter-in-render` certifies with dominance | must; `None` otherwise |
+| `own` | the body a synchronous write sits in (its allocation site, `None` for the region's CFG) and its block there, never moved to the call that runs the body: where its own guards are (#269) | exact |
+| `listener` | the row is ⊤ only because it runs from a JSX prop or a registered listener in a program that dispatches events (#219); `setter-in-render` and the cross-component arm read it as a handler | exact |
 | `written.change` | the write may change its slot — store a value that fails `Object.is` against what the slot holds. `Must`: a new reference every call. `Never`: the slot's own state read (#155) or the updater's parameter. `Once`: a single value known in advance (`false`, `5`, `null`, a stable reference), which changes the slot again only if another write moves it away. `May`: everything else, a toggle and a bounded counter included | must for `Must`, must for `Never` |
 | `written.value` | the abstract value stored, evaluated in the env of the row's own statement | may (an over-approximation of the value) |
 | `written.expr` | argument 0 as written | exact |
@@ -162,6 +165,54 @@ variable maps to a may-set of sources (`Slot`, `Setter`, `Prop`, `AllProps`,
 
 Absence of a use is a proof here, so every unknown counts as a use.
 
+### `calls` — `CallRelation` (ADR-047)
+
+Recorded by the fixpoint itself, at every call it evaluates in a
+component's passes, not derived at convergence. One `Targets` row per
+**call id** (a call is an allocation site), joined over every evaluation of
+it: passes, iterations, inlining depths, and contexts — a parent's closure a
+child calls joins its child-side evaluations, and the program analysis joins
+every kept analysis's relation into one, shared by every result. A body
+spliced or inlined twice has two ids, so two rows. Every call of a block the
+fixpoint reached has a row; a call of a body no pass ran has none.
+
+| column | claim | polarity |
+|---|---|---|
+| `setters` | the slots a call of the callee may write, with their owner | may |
+| `bodies` | the function bodies the callee may be, by allocation site (`body(site)` gives the CFG); past the inlining budget, the ones it stands for | may |
+| `open` | the callee may be something neither list names — code the analysis does not see, a builtin; what such code may call escaped, so it adds no target | may |
+| `sure()` | every evaluation that reached the call saw exactly one target, surely — one setter, or one body of a value surely that function — and a closed callee, and some evaluation is `placed` | must |
+| `written` | per setter, the value the slot write stored | may (over-approximation) |
+| `escaped` | some evaluation ran in a closure code the analysis does not see may call (`run_escaped`): at an unknown time, a render included | may |
+| `placed` | some evaluation ran outside such a closure, where the pass knows when; a row without one is never `sure` (#313) | exact |
+
+`Escapes { setters, bodies }`, per (anchor, position): what the value handed
+there reaches — everything `escape` reached through members and captures, or
+what an in-cycle callee (an array method, a timer) ran it as. The anchor is
+the call's id (position `CALLEE` for a callee escaped past the inlining
+budget), a `new`'s id, the props object of a JSX element (position: the
+prop's index), a hook the expansion left (its hook site), or an effect's
+hook site (position `CLEANUP`: its returned cleanup). May, except
+`Escapes::sure()`: every evaluation handed a value surely its one setter or
+one function to an in-cycle callee that runs it (`[setN].forEach(cb)`), never
+code the analysis does not see, and some evaluation ran outside an escaped
+closure — must.
+
+`accesses(at)`, a `Targets` row per **statement position** (#337): what
+the member reads and writes of the statement (or terminator) at `at` may
+run — the accessor bodies the heap placed there (`bodies`), one it does not
+see (`open`), module code when the receiver is read off a module binding
+(`module`). A member access has no id, so every access of statements at
+one position shares a row, `None` included: may, never `sure`. The writer
+walk enters its bodies at that statement, in its region and phase; each
+body's half and member is `accessor(site)`.
+
+Readers (ADR-047 §4, amended by P10): the writer walk, and the walks the
+engine runs over a body for the rules (`setters::body_writes`,
+`collect_body_calls`, `collect_slot_reads`); a rule reads the rows they
+build, and `CallRelation::body` / `slot_name` for a body's CFG and a slot's
+printed name.
+
 ## Per program, on `ProgramRelations`
 
 A relation that is a property of the whole program has no per-component
@@ -216,7 +267,13 @@ relation is read once per program from the element tree: `p` is a parent of
 resolves to `c` — the element's creator, which is who hands `c` its props.
 `stays(c)` holds when every such element sits outside closures, under
 guards and a `key` that hold still in `p`, and `stays(p)`; a root stays, a
-cycle of the tree fails closed. Only a component that stays may carry a
+cycle of the tree fails closed. The tree resolves a child as the engine does
+(its proven origin, else the one component of that name), and a component an
+element the tree cannot place may mount never stays: one a module reads as a
+value (`c ? A : B`, `{ A }`, `[A]`, a lazy `import()`), one whose name
+several components share, every component of a file an element names under a
+definition the table does not resolve, one that renders itself (#313).
+Only a component that stays may carry a
 `Must` edge, and only its mount-only effects fire once. The props node
 `P_c` stands for "the props of `c` moved": its in-edges are every slot of
 every ancestor that a non-`Handler` write moves (the `P_parent → P_c` edge

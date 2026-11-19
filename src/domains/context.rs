@@ -4,7 +4,8 @@ use crate::{
     domains::{
         AbstractDomain, StateValue,
         stores::{
-            AbstractEnv, EnvVal, Heap, HeapValue, Members, MemoStore, SharedStateStore, StateStore,
+            AbstractEnv, EnvVal, Heap, HeapValue, Members, MemoStore, SharedStateStore, Sites,
+            StateStore,
         },
     },
     engine::{
@@ -59,6 +60,28 @@ pub trait QueryContext {
     /// (#254).
     fn hook_args(&self, _label: crate::ir::types::HookLabel) -> &[crate::ir::expr::Expr] {
         &[]
+    }
+
+    /// What the call of hook `label` reads in the render as its entry keeps
+    /// it written, outside any function: a deps list, an initial value, a
+    /// custom hook's arguments. Its calls run in render statements ahead of
+    /// the hook (#193), its member reads only at the hook's call (#321).
+    fn hook_reads(&self, _label: crate::ir::types::HookLabel) -> &[crate::ir::expr::Expr] {
+        &[]
+    }
+
+    /// The module bindings (their anchors, [`crate::engine::ModuleScope`])
+    /// the name `name` may denote in this component's bodies (#335): none
+    /// for a name it declares, an import of a package, a global.
+    fn module_binding(&self, _name: &str) -> &[crate::ir::types::ExprId] {
+        &[]
+    }
+
+    /// The function the value of the hook `label` the fixpoint did not
+    /// inline calls, when it hands back one that runs its argument: React's
+    /// `useEffectEvent` (#320). A call through the value runs that function.
+    fn hands_back(&self, _label: crate::ir::types::HookLabel) -> Option<&crate::ir::expr::Expr> {
+        None
     }
 }
 
@@ -115,7 +138,15 @@ pub struct InterCtx<'a> {
     /// What the bodies of the whole program do: whether one fires event
     /// listeners itself (#219), the names they write (#224).
     pub program: &'a crate::engine::ProgramFacts,
+    /// Per component, its closures a component below it let escape and left
+    /// for it to run (`interp::run_escaped`): from then on
+    /// they are escaped in every analysis of their owner.
+    pub handed: &'a RefCell<HandedBack>,
 }
+
+/// Per owner, the closures handed back to it ([`InterCtx::handed`]).
+pub type HandedBack =
+    std::collections::HashMap<ComponentId, std::collections::BTreeSet<crate::ir::types::ExprId>>;
 
 impl<'a> InterCtx<'a> {
     /// Create a child context for inlining a nested component.
@@ -140,6 +171,7 @@ impl<'a> InterCtx<'a> {
             analyze_child: self.analyze_child,
             hook_registry: self.hook_registry,
             program: self.program,
+            handed: self.handed,
         }
     }
 
@@ -156,10 +188,12 @@ impl<'a> InterCtx<'a> {
         // A spread prop (`{...rest}`, kept under its synthetic key) may pass
         // any member.
         let spread = input.props.keys().any(|k| is_synthetic_key(k));
-        let props = match spread {
+        let mut props = match spread {
             true => Members::at_least(input.props),
             false => Members::exactly(input.props),
         };
+        // React builds it: a plain object (#336).
+        props.plain = true;
         heap.insert(input.props_id, HeapValue::Obj(props));
         env.bind_locs(
             ir.param.clone(),
@@ -264,6 +298,82 @@ pub struct AnalysisCtx<'a, D: AbstractDomain> {
     /// every closure it executes share one policy, because they share one
     /// solver.
     pub widening: Widening<'a>,
+    /// The solver's tables of the closures the fixpoint runs, kept across
+    /// its passes; `None` computes them at each run.
+    pub plans: Option<&'a crate::domains::interp::Plans>,
+    /// Where every call this context evaluates is recorded (ADR-047): the
+    /// fixpoint's passes. `None` records nothing: a probe, an evaluation
+    /// outside any fixpoint (a seed, a relation's replay).
+    pub calls: Option<&'a RefCell<crate::engine::CallRelation>>,
+    /// What each call of a local function this context ran returned (#333).
+    pub returns: Returns<D>,
+    /// This context evaluates a render: the render body and what it runs
+    /// synchronously, a memo's body, a ref's initial value. A function
+    /// `useEffectEvent` hands back throws when called there, so no call of
+    /// one is sure to run its body ([`Heap::is_event`]).
+    pub render: bool,
+    /// This context runs closures code the analysis does not see may call
+    /// (`run_escaped`): at a time it does not know (during a render
+    /// included), with arguments it does not know. A call only such runs
+    /// evaluate is no certain write of any region, so the call relation never
+    /// makes its row `sure` (ADR-047 §7).
+    pub escaped: bool,
+    /// The position of the statement (or terminator) the pass is
+    /// evaluating, set by the solver: where a member read or write that may
+    /// run an accessor is anchored in the call relation (#337). `None` for
+    /// one lowering gave no position.
+    pub stmt: Option<crate::ir::SourceRange>,
+}
+
+/// What each call of a local function a pass ran returned, by call site
+/// (#333): the join over the call's evaluations of what its bodies returned
+/// and where it points, with ⊤ for an evaluation that ran no body. The value
+/// of the call in every position — a member, an argument, a callee, a return
+/// — where a `let` is not there to bind it.
+///
+/// Recorded by the effect walk, which runs the call before any reader of its
+/// value in the same statement; read, never recomputed. A call no evaluation
+/// of which ran a body has no entry: the evaluator's value stands.
+pub struct Returns<D> {
+    ran: std::collections::HashMap<crate::ir::types::ExprId, EnvVal<D>>,
+    unresolved: std::collections::HashSet<crate::ir::types::ExprId>,
+}
+
+impl<D> Default for Returns<D> {
+    fn default() -> Self {
+        Returns {
+            ran: Default::default(),
+            unresolved: Default::default(),
+        }
+    }
+}
+
+impl<D: AbstractDomain> Returns<D> {
+    /// One evaluation of the call at `id` returned `returned`; `None` when it
+    /// ran no body.
+    pub fn record(&mut self, id: crate::ir::types::ExprId, returned: Option<&EnvVal<D>>) {
+        match returned {
+            Some(v) => {
+                let joined = match self.ran.get(&id) {
+                    Some(old) => old.join(v),
+                    None => v.clone(),
+                };
+                self.ran.insert(id, joined);
+            }
+            None => {
+                self.unresolved.insert(id);
+            }
+        }
+    }
+
+    /// The value of the call at `id`, when some evaluation ran a body.
+    pub fn get(&self, id: crate::ir::types::ExprId) -> Option<EnvVal<D>> {
+        let ran = self.ran.get(&id)?;
+        Some(match self.unresolved.contains(&id) {
+            true => ran.join(&EnvVal::Val(D::top())),
+            false => ran.clone(),
+        })
+    }
 }
 
 /// When a loop header stops joining and starts widening (ADR-014): after
@@ -301,7 +411,33 @@ impl<'a, D: AbstractDomain> AnalysisCtx<'a, D> {
             query: &NULL,
             inter: None,
             widening: Widening::DEFAULT,
+            plans: None,
+            calls: None,
+            returns: Returns::default(),
+            render: false,
+            escaped: false,
+            stmt: None,
         }
+    }
+
+    /// Record into the call relation, when this context records one.
+    pub fn record(&self, f: impl FnOnce(&mut crate::engine::CallRelation)) {
+        if let Some(calls) = self.calls {
+            f(&mut calls.borrow_mut());
+        }
+    }
+
+    /// The allocation sites `expr` may denote ([`resolve_locs`]), a call read
+    /// off what this pass recorded it returning ([`Returns`]).
+    ///
+    /// [`resolve_locs`]: crate::domains::stores::resolve_locs
+    pub fn resolve_locs(
+        &self,
+        expr: &crate::ir::expr::Expr,
+        env: &AbstractEnv<D>,
+    ) -> Option<Sites> {
+        let returned = |id| self.returns.get(id).and_then(|v| v.sites().cloned());
+        crate::domains::stores::resolve_locs_with(expr, env, self.heap, &returned)
     }
 
     /// Weakly store `val` into slot `(owner, label)`: the component's own slot
@@ -340,6 +476,14 @@ pub struct FixpointCtx<'a> {
     /// See `QueryContext::hook_args`.
     pub hook_args:
         &'a std::collections::HashMap<crate::ir::types::HookLabel, Vec<crate::ir::expr::Expr>>,
+    /// See `QueryContext::hands_back`.
+    pub hands_back:
+        &'a std::collections::HashMap<crate::ir::types::HookLabel, &'a crate::ir::expr::Expr>,
+    /// See `QueryContext::hook_reads`.
+    pub hook_reads:
+        &'a std::collections::HashMap<crate::ir::types::HookLabel, Vec<crate::ir::expr::Expr>>,
+    /// See `QueryContext::module_binding`.
+    pub module: &'a std::collections::HashMap<crate::ir::types::Var, Vec<crate::ir::types::ExprId>>,
 }
 
 impl QueryContext for FixpointCtx<'_> {
@@ -360,5 +504,17 @@ impl QueryContext for FixpointCtx<'_> {
 
     fn hook_args(&self, label: crate::ir::types::HookLabel) -> &[crate::ir::expr::Expr] {
         self.hook_args.get(&label).map_or(&[], Vec::as_slice)
+    }
+
+    fn hook_reads(&self, label: crate::ir::types::HookLabel) -> &[crate::ir::expr::Expr] {
+        self.hook_reads.get(&label).map_or(&[], Vec::as_slice)
+    }
+
+    fn hands_back(&self, label: crate::ir::types::HookLabel) -> Option<&crate::ir::expr::Expr> {
+        self.hands_back.get(&label).copied()
+    }
+
+    fn module_binding(&self, name: &str) -> &[crate::ir::types::ExprId] {
+        self.module.get(name).map_or(&[], Vec::as_slice)
     }
 }

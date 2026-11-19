@@ -198,7 +198,7 @@ fn expr_ok(v: &Var, e: &Expr) -> bool {
     match e {
         Expr::Var(x) => x != v,
         Expr::FnLit { body_cfg, .. } => cfg_ok(v, body_cfg),
-        Expr::Call { fn_, args }
+        Expr::Call { fn_, args, .. }
             if is_v(fn_)
                 || matches!(fn_.peel_ts(), Expr::FieldAccess { obj, field }
                     if is_v(obj) && INERT_MEMBERS.contains(&field.as_str())) =>

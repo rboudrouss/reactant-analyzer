@@ -112,6 +112,7 @@ pub fn run_check(
     display: &dyn Fn(&Path) -> String,
 ) -> CheckOutput {
     let mut err = String::new();
+    let lowering = crate::profile::phase("lowering");
 
     // ── Mistyped command ──────────────────────────────────────────────────────
     // A first argument naming nothing on disk is a mistyped path when it looks
@@ -381,7 +382,11 @@ pub fn run_check(
         summary_registry: crate::registry::SummaryRegistry::new_with_common(),
         ..Config::default()
     };
+    drop(lowering);
+    let analysis = crate::profile::phase("analysis");
     let program_result = analyze_lowered(lowered, strategy, config);
+    drop(analysis);
+    let rules = crate::profile::phase("rules");
 
     if opts.verbose {
         let _ = writeln!(
@@ -487,6 +492,8 @@ pub fn run_check(
         });
     }
 
+    drop(rules);
+    crate::profile::report();
     let exit_code = match opts.fail_on {
         FailOn::Error if errors > 0 => EXIT_FINDINGS,
         FailOn::Warning if errors + warnings > 0 => EXIT_FINDINGS,
