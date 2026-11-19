@@ -244,9 +244,18 @@ that writes it (see *Cross-file limits*).
   library): a write in it is a possible write of the render the literal is in, never an Error, and
   a spread's copy holds what the getter may return, a new object included. `this` in an accessor
   is not bound. A member read off an object the heap does not place — a module binding, a class
-  instance, what unknown code returns — is still a read of the receiver, which holds while the
-  receiver does: a getter reached that way is missed
-  [#334](https://github.com/rboudrouss/reactant-analyzer/issues/334).
+  instance, what unknown code returns — or a member a placed object does not hold (its
+  prototype's) is a call the analysis cannot see when some accessor of the analysed files defines
+  that name: a getter or setter of a literal or a class, a descriptor of `Object.defineProperty`
+  and its kin, any name under a computed accessor key or a `Proxy` trap
+  [#334](https://github.com/rboudrouss/reactant-analyzer/issues/334). Such a read may be a new
+  value at any render (a Warning, never an Error) and the receiver escapes there. The names are
+  program-wide: one getter named `length` in a test file makes every `x.length` off an unplaced
+  value a possible change, and a key no constant names (`xs[i]`) may be any accessor's. Not seen:
+  a getter defined by code the analysis does not read (a library, a skipped file), which is still
+  read as the receiver's member, and a state setter kept by unseen code past the point it escaped
+  and called later from an accessor or a method
+  [#335](https://github.com/rboudrouss/reactant-analyzer/issues/335).
 - **Mount-coupled seeds.** `frozen-initial-state` drops to Info, hidden without `--info`, when every
   call site renders the consumer under a `key` built from the seeding prop, or under a guard built
   from it (`{msg && <Toast msg={msg}/>}`). Neither shape is a proof: a `msg` moving between two

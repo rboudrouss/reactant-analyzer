@@ -916,10 +916,14 @@ fn eval_member(
     // conversion above; in-place writes have their own diagnostics
     // (`state-mutation`). ADR-017 §Limitations, member-deps. A key no
     // constant names moves with what it is computed from too, which the
-    // labels do not say.
+    // labels do not say. Neither do they when the member's name is one an
+    // accessor of the program defines (#334): where the heap places nothing
+    // the read may run it, a call the analysis cannot see, whose result may
+    // be new at any read.
     let obj_val = eval_state_value(obj, env, ctx);
     let any = StateValue {
         reference: match member {
+            _ if ctx.heap.unseen_accessor(member.map(String::as_str)) => Stability::MayBeFresh,
             Some(_) => obj_val.versioned_reference().unwrap_or(Stability::Unknown),
             None => Stability::Unknown,
         },

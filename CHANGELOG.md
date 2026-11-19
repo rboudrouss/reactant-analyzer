@@ -333,9 +333,16 @@ on a program React settles; 323 oracle cases, none a known false negative.
   setter accessor a call of the setter: `const o = { get p() { return {}; } }`
   then `[o.p]` (or `const d = o.p`, `const { p } = o`) is a new reference at
   every render, an `infinite-loop` Error where it was silent, and a getter or
-  setter that writes state is reported where its member is read or written.
-  An object the analysis does not place (a module binding, a class instance)
-  is still read as holding still (#321, #334).
+  setter that writes state is reported where its member is read or written
+  (#321).
+- A member read off an object the analysis does not place (a module-level
+  literal, one handed down as a prop, a class instance kept in a memo, a
+  class's static member) whose name some getter or setter of the program
+  defines (an object literal's, a class's, a descriptor of
+  `Object.defineProperty` and its kin; any name under a computed one or a
+  `Proxy` trap) is a call the analysis cannot see: a dependency read that way
+  may change at any render, a possible `infinite-loop` Warning where it was
+  silent, and the receiver escapes there (#334).
 - False Errors: a component mounted only through an element the analysis
   cannot place (`<Comp/>` with `Comp = c ? A : B`, `<parts.C/>`, a mapped list
   of components, a default import under another name, itself) was read as a

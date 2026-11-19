@@ -8,7 +8,7 @@ use oxc_ast::ast::*;
 use oxc_ast_visit::{Visit, walk};
 
 use crate::ir::ModuleFacts;
-use crate::ir::module::{ReExports, ValueRef};
+use crate::ir::module::{AccessorNames, ReExports, ValueRef};
 use crate::resolver::ImportResolver;
 
 /// Read `file`'s directive prologue and its resolved module edges.
@@ -105,6 +105,139 @@ pub fn collect_module_facts(
         compiled_entries,
         re_exports,
         value_refs: value_refs(program, file, resolver),
+        accessors: accessor_names(program),
+    }
+}
+
+/// The member names `program` defines an accessor of, anywhere in it (#334):
+/// a `get` or `set` of an object literal or a class, static or not; a
+/// descriptor `Object.defineProperty`, `Reflect.defineProperty`,
+/// `Object.defineProperties`, `Object.create` or `__defineGetter__` /
+/// `__defineSetter__` may install one with; a `Proxy` whose handler may trap
+/// `get` or `set`, which runs at a read of any name. A descriptor is an
+/// accessor unless it is a literal with no `get` nor `set` member. A key no
+/// constant spells may be any name. `accessor x` is left out: its getter and
+/// setter only read and write the field's own storage, a data member's
+/// behaviour.
+pub(crate) fn accessor_names(program: &Program) -> AccessorNames {
+    let mut scan = AccessorScan::default();
+    scan.visit_program(program);
+    scan.found
+}
+
+#[derive(Default)]
+struct AccessorScan {
+    found: AccessorNames,
+}
+
+/// The member name `key` spells, the way lowering spells a read of it.
+fn key_name(key: &PropertyKey) -> Option<String> {
+    match key {
+        PropertyKey::PrivateIdentifier(p) => Some(format!("#{}", p.name)),
+        other => super::expr_lower::property_name(other),
+    }
+}
+
+/// A constant string `e` is, as a member name.
+fn const_name(e: &Expression) -> Option<String> {
+    match e.get_inner_expression() {
+        Expression::StringLiteral(s) => Some(s.value.to_string()),
+        Expression::TemplateLiteral(t) if t.expressions.is_empty() => t
+            .quasis
+            .first()
+            .and_then(|q| q.value.cooked.as_ref())
+            .map(|c| c.to_string()),
+        Expression::NumericLiteral(n) if n.value >= 0.0 && n.value.fract() == 0.0 => {
+            Some(format!("{}", n.value as u64))
+        }
+        _ => None,
+    }
+}
+
+/// May the descriptor (or the handler) `e` hold a `get` or a `set`? Only a
+/// literal whose members are all named, none of them those two, holds none.
+fn may_hold_accessor(e: Option<&Expression>) -> bool {
+    let Some(Expression::ObjectExpression(obj)) = e.map(Expression::get_inner_expression) else {
+        return true;
+    };
+    obj.properties.iter().any(|p| match p {
+        ObjectPropertyKind::SpreadProperty(_) => true,
+        ObjectPropertyKind::ObjectProperty(p) => {
+            key_name(&p.key).is_none_or(|k| k == "get" || k == "set")
+        }
+    })
+}
+
+impl<'a> Visit<'a> for AccessorScan {
+    fn visit_object_property(&mut self, it: &ObjectProperty<'a>) {
+        if it.kind != PropertyKind::Init {
+            self.found.define(key_name(&it.key).as_deref());
+        }
+        walk::walk_object_property(self, it);
+    }
+
+    fn visit_method_definition(&mut self, it: &MethodDefinition<'a>) {
+        if matches!(
+            it.kind,
+            MethodDefinitionKind::Get | MethodDefinitionKind::Set
+        ) {
+            self.found.define(key_name(&it.key).as_deref());
+        }
+        walk::walk_method_definition(self, it);
+    }
+
+    fn visit_call_expression(&mut self, it: &CallExpression<'a>) {
+        let arg = |i: usize| it.arguments.get(i).and_then(Argument::as_expression);
+        if let Expression::StaticMemberExpression(m) = it.callee.get_inner_expression() {
+            let on = match m.object.get_inner_expression() {
+                Expression::Identifier(id) => Some(id.name.as_str()),
+                _ => None,
+            };
+            match (on, m.property.name.as_str()) {
+                (Some("Object" | "Reflect"), "defineProperty") => {
+                    if may_hold_accessor(arg(2)) {
+                        self.found.define(arg(1).and_then(const_name).as_deref());
+                    }
+                }
+                // The descriptors are the second argument of both.
+                (Some("Object"), "defineProperties" | "create") => {
+                    match arg(1).map(Expression::get_inner_expression) {
+                        Some(Expression::ObjectExpression(obj)) => {
+                            for p in &obj.properties {
+                                match p {
+                                    ObjectPropertyKind::SpreadProperty(_) => {
+                                        self.found.define(None);
+                                    }
+                                    ObjectPropertyKind::ObjectProperty(p) => {
+                                        if may_hold_accessor(Some(&p.value)) {
+                                            self.found.define(key_name(&p.key).as_deref());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // `Object.create(proto)` installs no member.
+                        None => {}
+                        Some(_) => self.found.define(None),
+                    }
+                }
+                (_, "__defineGetter__" | "__defineSetter__") => {
+                    self.found.define(arg(0).and_then(const_name).as_deref());
+                }
+                _ => {}
+            }
+        }
+        walk::walk_call_expression(self, it);
+    }
+
+    fn visit_new_expression(&mut self, it: &NewExpression<'a>) {
+        if let Expression::Identifier(id) = it.callee.get_inner_expression()
+            && id.name == "Proxy"
+            && may_hold_accessor(it.arguments.get(1).and_then(Argument::as_expression))
+        {
+            self.found.define(None);
+        }
+        walk::walk_new_expression(self, it);
     }
 }
 
@@ -230,6 +363,47 @@ mod tests {
             ret.diagnostics
         );
         collect_module_facts(&ret.program, Path::new("/root/a.tsx"), &FakeResolver)
+    }
+
+    /// The names spelled, and whether any name may be an accessor's.
+    fn accessors_of(source: &str) -> (Vec<String>, bool) {
+        let f = facts_of(source);
+        let (names, any) = f.accessors.names();
+        (names.map(str::to_string).collect(), any)
+    }
+
+    #[test]
+    fn every_accessor_spelling_defines_its_name() {
+        let (names, any) = accessors_of(
+            r#"
+            const o = { get a() { return 1; }, set b(v) {}, c: 1, d() {} };
+            class K { get e() { return 1; } static set f(v) {} get #g() { return 1; } h() {} accessor i = 1; }
+            Object.defineProperty(o, "j", { get() { return 1; } });
+            Object.defineProperty(o, "k", { value: 1, writable: true });
+            Reflect.defineProperty(o, "l", descriptor);
+            Object.defineProperties(o, { m: { get: () => 1 }, n: { value: 2 } });
+            Object.create(null, { p: { set(v) {} } });
+            o.__defineGetter__("q", () => 1);
+        "#,
+        );
+        assert_eq!(names, ["#g", "a", "b", "e", "f", "j", "l", "m", "p", "q"]);
+        assert!(!any);
+    }
+
+    #[test]
+    fn an_accessor_no_constant_names_may_be_any() {
+        for src in [
+            "const o = { get [k]() { return 1; } };",
+            "class K { set [k](v) {} }",
+            "Object.defineProperty(o, k, { get() { return 1; } });",
+            "Object.defineProperties(o, props);",
+            "const p = new Proxy(t, { get: () => 1 });",
+            "const p = new Proxy(t, handler);",
+        ] {
+            assert!(accessors_of(src).1, "{src}");
+        }
+        let (names, any) = accessors_of("const p = new Proxy(t, { apply: () => 1 });");
+        assert!(names.is_empty() && !any);
     }
 
     #[test]

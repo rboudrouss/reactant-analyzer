@@ -45,6 +45,59 @@ pub struct ModuleFacts {
     /// type the analysis cannot place (`<Comp/>` with `Comp = c ? A : B`), a
     /// library or a lazy import may mount.
     pub value_refs: Vec<ValueRef>,
+    /// The member names an accessor this module writes defines (#334).
+    pub accessors: AccessorNames,
+}
+
+/// The member names some accessor of the program defines (#334): an object
+/// literal's or a class's `get` / `set` (static too), or a descriptor
+/// `Object.defineProperty` and its kin may install one with. A read (a
+/// write) of such a name runs code wherever the object holding the accessor
+/// is the receiver, so on an object the heap does not place it is a call the
+/// analysis cannot see. A name no constant spells (a computed accessor key, a
+/// descriptor keyed by a variable) may be any name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccessorNames {
+    names: std::collections::BTreeSet<String>,
+    any: bool,
+}
+
+impl AccessorNames {
+    /// An accessor of `member` (`None`: a name no constant spells).
+    pub fn define(&mut self, member: Option<&str>) {
+        match member {
+            Some(m) => {
+                self.names.insert(m.to_string());
+            }
+            None => self.any = true,
+        }
+    }
+
+    /// The names either defines.
+    pub fn extend(&mut self, other: &AccessorNames) {
+        self.names.extend(other.names.iter().cloned());
+        self.any |= other.any;
+    }
+
+    /// May a read or a write of `member` (`None`: a key no constant names)
+    /// run an accessor of the program?
+    pub fn may_run(&self, member: Option<&str>) -> bool {
+        self.any
+            || match member {
+                Some(m) => self.names.contains(m),
+                None => !self.names.is_empty(),
+            }
+    }
+
+    /// No accessor of the program may run at any read.
+    pub fn is_empty(&self) -> bool {
+        !self.any && self.names.is_empty()
+    }
+
+    /// The names spelled, sorted, and whether any name may be one.
+    pub fn names(&self) -> (impl Iterator<Item = &str>, bool) {
+        (self.names.iter().map(String::as_str), self.any)
+    }
 }
 
 /// A definition a module reads as a value ([`ModuleFacts::value_refs`]).
@@ -194,6 +247,15 @@ impl ModuleTable {
         self.files
             .get(path)
             .is_some_and(|f| f.has_directive(directive))
+    }
+
+    /// The member names some lowered module defines an accessor of (#334).
+    pub fn accessor_names(&self) -> AccessorNames {
+        let mut out = AccessorNames::default();
+        for facts in self.files.values() {
+            out.extend(&facts.accessors);
+        }
+        out
     }
 
     /// `true` iff any lowered module declares `directive`.

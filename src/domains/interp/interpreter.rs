@@ -436,17 +436,7 @@ fn exec_full_stmt<T: Transfer>(
                     MemberKey::Field(field) => Some(field.clone()),
                     MemberKey::Index(idx) => member_key(idx, env),
                 };
-                let sites = alloc_literal(transfer, rhs, env, ctx);
-                let written = EnvVal::located(sites, transfer.eval_expr(rhs, env, ctx));
-                run_accessors(
-                    transfer,
-                    obj,
-                    member.as_deref(),
-                    Some(&written),
-                    env,
-                    ctx,
-                    depth,
-                );
+                run_accessors(transfer, obj, member.as_deref(), Some(rhs), env, ctx, depth);
             }
             exec_stmt_core(transfer, stmt, env, ctx);
         }
@@ -485,19 +475,25 @@ fn run_member_reads<T: Transfer>(
     }
 }
 
-/// Run the accessors a read (`written: None`) or a write (`Some`: the value
-/// written) of `member` of what `obj` denotes runs (#321): its getters,
-/// whose returns the heap keeps as what the read is
+/// Run the accessors a read (`written: None`) or a write (`Some`: the
+/// expression written) of `member` of what `obj` denotes runs (#321): its
+/// getters, whose returns the heap keeps as what the read is
 /// ([`Heap::record_getter`]), or its setters, handed the value. Past the
 /// inlining budget none runs, and the read may be anything; every accessor
 /// escaped at its literal, so its body still runs, at an unknown time.
+///
+/// Where the heap places nothing — an object no site places, a member a
+/// placed one does not hold, which its prototype may — the read or the write
+/// may run an accessor the program defines (#334), with the receiver as
+/// `this` and the value written as its argument: a call the analysis cannot
+/// see, to which both escape.
 ///
 /// [`Heap::record_getter`]: crate::domains::stores::Heap::record_getter
 fn run_accessors<T: Transfer>(
     transfer: &T,
     obj: &Expr,
     member: Option<&str>,
-    written: Option<&EnvVal<T::Domain>>,
+    written: Option<&Expr>,
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
@@ -505,7 +501,15 @@ fn run_accessors<T: Transfer>(
     if !ctx.heap.has_accessors() {
         return;
     }
-    let Some(sites) = alloc_literal(transfer, obj, env, ctx) else {
+    let sites = alloc_literal(transfer, obj, env, ctx);
+    let unplaced = sites.as_ref().is_none_or(|s| ctx.heap.members(s, member).1);
+    if unplaced && ctx.heap.unseen_accessor(member) {
+        escape(transfer, obj, env, ctx);
+        if let Some(rhs) = written {
+            escape(transfer, rhs, env, ctx);
+        }
+    }
+    let Some(sites) = sites else {
         return;
     };
     let kind = match written {
@@ -518,8 +522,15 @@ fn run_accessors<T: Transfer>(
         .ids
         .into_iter()
         .collect();
+    if accessors.is_empty() {
+        return;
+    }
     accessors.sort();
-    let args = written.map(std::slice::from_ref).unwrap_or_default();
+    let written = written.map(|rhs| {
+        let at = alloc_literal(transfer, rhs, env, ctx);
+        EnvVal::located(at, transfer.eval_expr(rhs, env, ctx))
+    });
+    let args = written.as_slice();
     for site in accessors {
         let returned = match depth >= MAX_INLINE_DEPTH {
             true => None,

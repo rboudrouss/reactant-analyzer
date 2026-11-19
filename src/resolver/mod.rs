@@ -19,7 +19,7 @@ use std::sync::Arc;
 use crate::{
     engine::{
         ComponentRegistry, Config, FunctionRegistry, HookRegistry, ProgramAnalysisResult,
-        RootStrategy, analyze_program,
+        RootStrategy, analyze_program_defining,
     },
     ir::{
         FileTable, ModuleConstInit, ModuleTable, component::ComponentIR, function_ir::FunctionIR,
@@ -471,7 +471,9 @@ pub fn analyze_lowered(
     let registry = ComponentRegistry::from_components(lowered.components);
     let hook_registry = HookRegistry::from_hooks(lowered.hooks)
         .with_re_exports(lowered.module_table.re_export_graph());
-    let mut result = analyze_program(registry, hook_registry, strategy, &config);
+    let accessors = lowered.module_table.accessor_names();
+    let mut result =
+        analyze_program_defining(registry, hook_registry, strategy, &config, accessors);
     result.file_table = lowered.file_table;
     result.module_table = lowered.module_table;
     result

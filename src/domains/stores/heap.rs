@@ -10,6 +10,7 @@ use crate::{
         cfg::CFG,
         expr::{Accessor, Expr, accessor_of},
         free_vars::compute_free_vars,
+        module::AccessorNames,
         types::{ExprId, HookLabel, Symbol, Var},
     },
 };
@@ -302,6 +303,12 @@ impl Members {
 /// `returned` is, per getter (#321), the join of what every run of it at a
 /// read returned, kept across passes: what a read of its member is. A getter
 /// no run of which is recorded may return anything, a new object included.
+///
+/// `defined` is what the heap knows of the objects it does not place (#334):
+/// the member names some accessor of the program defines, the same in every
+/// heap of one program ([`Heap::with_defined`]). A read or a write of such a
+/// name on an object no site places, or of a member a placed object does not
+/// hold (its prototype's), may run one ([`Heap::unseen_accessor`]).
 #[derive(Debug, Clone, Default)]
 pub struct Heap {
     cells: HashMap<ExprId, HeapValue>,
@@ -312,6 +319,7 @@ pub struct Heap {
     /// Some object of the heap may hold an accessor: when not, no read or
     /// write runs one, which [`Heap::has_accessors`] lets a caller skip.
     accessors: bool,
+    defined: std::sync::Arc<AccessorNames>,
 }
 
 /// What a getter no recorded run bounds returns: anything, a new object
@@ -327,9 +335,35 @@ impl Heap {
         Self::default()
     }
 
-    /// Some object may hold an accessor (#321).
+    /// Some object may hold an accessor (#321), or the program defines one
+    /// an object the heap does not place may hold (#334).
     pub fn has_accessors(&self) -> bool {
-        self.accessors
+        self.accessors || !self.defined.is_empty()
+    }
+
+    /// This heap, for a program whose accessors define `defined` (#334).
+    pub fn with_defined(mut self, defined: std::sync::Arc<AccessorNames>) -> Self {
+        self.defined = defined;
+        self
+    }
+
+    /// An empty heap of the same program: what it knows of the objects it
+    /// does not place, and nothing else.
+    pub fn blank(&self) -> Heap {
+        Heap::new().with_defined(self.defined.clone())
+    }
+
+    /// The member names some accessor of the program defines (#334).
+    pub fn defined(&self) -> &AccessorNames {
+        &self.defined
+    }
+
+    /// May a read or a write of `member` (`None`: a key no constant names)
+    /// run an accessor where the heap places nothing: on an object no site
+    /// places, or past the members a placed one holds (#334)? A call the
+    /// analysis cannot see, then.
+    pub fn unseen_accessor(&self, member: Option<&str>) -> bool {
+        self.defined.may_run(member)
     }
 
     /// One run of the getter at `site` returned `value` (`None`: it ran no
@@ -686,6 +720,7 @@ impl Heap {
             out.insert(id, hv.clone());
         }
         out.accessors = self.accessors;
+        out.defined = self.defined.clone();
         out
     }
 
@@ -859,6 +894,14 @@ impl Heap {
             written,
             returned,
             accessors: self.accessors || other.accessors,
+            defined: match Arc::ptr_eq(&self.defined, &other.defined) {
+                true => self.defined.clone(),
+                false => {
+                    let mut both = (*self.defined).clone();
+                    both.extend(&other.defined);
+                    Arc::new(both)
+                }
+            },
         }
     }
 

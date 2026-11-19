@@ -32,6 +32,7 @@ use crate::ir::{
     cfg::CFG,
     expr::{BinOp, Expr, Prim, UnaryOp},
     free_vars::compute_free_vars,
+    module::AccessorNames,
     types::Var,
 };
 
@@ -329,13 +330,15 @@ impl<'e> Callee<'e> {
 /// The kind of a known builtin's result when the call returns the same value
 /// on the same inputs, `None` when it may differ. `arg` is the kind of the
 /// argument at an index; `var` the kind of a free name of a closure argument
-/// the builtin runs, as the caller sees it.
+/// the builtin runs, as the caller sees it; `accessors` what the program's
+/// accessors define, which such a closure's member reads may run (#334).
 pub fn call(
     callee: Callee<'_>,
     new: bool,
     args: &[Expr],
     arg: &dyn Fn(usize) -> Kind,
     var: &dyn Fn(&str) -> Kind,
+    accessors: &AccessorNames,
 ) -> Option<Kind> {
     let found = match (callee, new) {
         (Callee::Value(k), false) => CALLS.iter().find(|x| x.on == k),
@@ -355,16 +358,32 @@ pub fn call(
     let runs_known = ran.is_none_or(|(i, a)| match a.peel_ts() {
         Expr::FnLit {
             params, body_cfg, ..
-        } => body_holds(body_cfg, params, var),
+        } => body_holds(body_cfg, params, var, accessors),
         _ => arg(i).is_data(),
     });
     runs_known.then_some(found.gives)
 }
 
+/// The member a key spells when it is a constant: what a read `o[k]` reads.
+pub fn constant_key(idx: &Expr) -> Option<String> {
+    match idx.peel_ts() {
+        Expr::Lit(Prim::Int(i)) => Some(i.to_string()),
+        Expr::Lit(Prim::String(s)) => Some(s.to_string()),
+        _ => None,
+    }
+}
+
 /// Does every call `body` runs, closures it only builds aside, return the
 /// same value on the same inputs? Its own names have no known kind; a free
-/// one has the kind `var` gives it.
-pub fn body_holds(body: &CFG, params: &[Var], var: &dyn Fn(&str) -> Kind) -> bool {
+/// one has the kind `var` gives it. A member read of a name an accessor of
+/// the program defines may be a call of it (#334), which no table knows; a
+/// known builtin's method is read off a receiver of its own kind.
+pub fn body_holds(
+    body: &CFG,
+    params: &[Var],
+    var: &dyn Fn(&str) -> Kind,
+    accessors: &AccessorNames,
+) -> bool {
     let free: HashSet<Var> = compute_free_vars(body);
     let inner = |v: &str| {
         if params.iter().any(|p| p == v) || !free.contains(v) {
@@ -373,53 +392,71 @@ pub fn body_holds(body: &CFG, params: &[Var], var: &dyn Fn(&str) -> Kind) -> boo
             var(v)
         }
     };
-    fn walk(e: &Expr, var: &dyn Fn(&str) -> Kind) -> bool {
+    fn walk(e: &Expr, var: &dyn Fn(&str) -> Kind, accessors: &AccessorNames) -> bool {
         match e {
             // Built, not run.
             Expr::FnLit { .. } => true,
             Expr::Call { fn_, args, .. } | Expr::New { fn_, args, .. } => {
-                let callee = Callee::of(fn_, &mut |x| kind_of(x, var));
+                let callee = Callee::of(fn_, &mut |x| kind_of(x, var, accessors));
+                let read = match fn_.peel_ts() {
+                    Expr::FieldAccess { obj, .. } => obj,
+                    other => other,
+                };
                 call(
                     callee,
                     matches!(e, Expr::New { .. }),
                     args,
-                    &|i| kind_of(&args[i], var),
+                    &|i| kind_of(&args[i], var, accessors),
                     var,
+                    accessors,
                 )
                 .is_some()
-                    && walk(fn_, var)
-                    && args.iter().all(|a| walk(a, var))
+                    && walk(read, var, accessors)
+                    && args.iter().all(|a| walk(a, var, accessors))
+            }
+            Expr::FieldAccess { obj, field } => {
+                !accessors.may_run(Some(field)) && walk(obj, var, accessors)
+            }
+            Expr::IndexAccess { arr, idx } => {
+                !accessors.may_run(constant_key(idx).as_deref())
+                    && walk(arr, var, accessors)
+                    && walk(idx, var, accessors)
             }
             _ => {
                 let mut ok = true;
-                e.for_each_child(&mut |c| ok = ok && walk(c, var));
+                e.for_each_child(&mut |c| ok = ok && walk(c, var, accessors));
                 ok
             }
         }
     }
     let mut ok = true;
-    body.for_each_expr(&mut |e| ok = ok && walk(e, &inner));
+    body.for_each_expr(&mut |e| ok = ok && walk(e, &inner, accessors));
     ok
 }
 
 /// The kind of `e` read syntactically, a name's kind given by `var`.
-pub fn kind_of(e: &Expr, var: &dyn Fn(&str) -> Kind) -> Kind {
+pub fn kind_of(e: &Expr, var: &dyn Fn(&str) -> Kind, accessors: &AccessorNames) -> Kind {
     match e {
         Expr::Lit(p) => lit(p),
         Expr::Var(v) => var(v),
         Expr::ArrayLit { .. } => Kind::Array,
-        Expr::IndexAccess { arr, idx } => element(kind_of(arr, var), idx),
-        Expr::TSAnnotated(inner) => kind_of(inner, var),
-        Expr::BinOp { op, lhs, rhs } => binop(op, kind_of(lhs, var), kind_of(rhs, var)),
+        Expr::IndexAccess { arr, idx } => element(kind_of(arr, var, accessors), idx),
+        Expr::TSAnnotated(inner) => kind_of(inner, var, accessors),
+        Expr::BinOp { op, lhs, rhs } => binop(
+            op,
+            kind_of(lhs, var, accessors),
+            kind_of(rhs, var, accessors),
+        ),
         Expr::UnaryOp { op, .. } => unary(op),
         Expr::Call { fn_, args, .. } | Expr::New { fn_, args, .. } => {
-            let callee = Callee::of(fn_, &mut |x| kind_of(x, var));
+            let callee = Callee::of(fn_, &mut |x| kind_of(x, var, accessors));
             call(
                 callee,
                 matches!(e, Expr::New { .. }),
                 args,
-                &|i| kind_of(&args[i], var),
+                &|i| kind_of(&args[i], var, accessors),
                 var,
+                accessors,
             )
             .unwrap_or_default()
         }

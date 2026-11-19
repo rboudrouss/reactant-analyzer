@@ -129,6 +129,73 @@ fn a_class_getter_read_off_an_instance_the_render_builds_is_reported() {
     assert!(!found.is_empty(), "{found:?}");
 }
 
+/// `src` with an `App` whose effect on `[dep]` bumps `n`, `decl` in its
+/// render, after the module-level `module`.
+fn module_effect_on(module: &str, decl: &str, dep: &str) -> Vec<String> {
+    loops(&format!(
+        "import {{ useEffect, useMemo, useState }} from 'react';\n\
+         {module}\n\
+         export function App() {{\n\
+           const [n, setN] = useState(0);\n\
+           {decl}\n\
+           useEffect(() => {{ setN((c) => c + 1); }}, [{dep}]);\n\
+           return <div>{{n}}</div>;\n\
+         }}\n"
+    ))
+}
+
+#[test]
+fn a_getter_read_off_an_object_the_heap_does_not_place_may_re_run_the_effect() {
+    // #334: a module literal, a class instance a memo keeps, a static getter.
+    let literal = "const o = { get p() { return {}; } };";
+    assert_eq!(module_effect_on(literal, "", "o.p"), [WARNING]);
+    assert_eq!(
+        module_effect_on(
+            "class K { get p() { return {}; } }",
+            "const k = useMemo(() => new K(), []);",
+            "k.p"
+        ),
+        [WARNING]
+    );
+    assert_eq!(
+        module_effect_on("class K { static get p() { return {}; } }", "", "K.p"),
+        [WARNING]
+    );
+    // A getter returning one number settles; the analysis does not run a
+    // getter it does not place, and warns.
+    assert_eq!(
+        module_effect_on("const o = { get p() { return 1; } };", "", "o.p"),
+        [WARNING]
+    );
+}
+
+#[test]
+fn a_module_literal_handed_down_runs_its_getter_in_the_child() {
+    let found = loops(
+        "import { useEffect, useState } from 'react';\n\
+         function C({ o }) {\n\
+           const [n, setN] = useState(0);\n\
+           useEffect(() => { setN((c) => c + 1); }, [o.p]);\n\
+           return <div>{n}</div>;\n\
+         }\n\
+         const shared = { get p() { return {}; } };\n\
+         export function App() { return <C o={shared} />; }\n",
+    );
+    assert_eq!(found, [WARNING]);
+}
+
+#[test]
+fn a_getter_name_read_where_the_heap_places_a_plain_member_stays_precise() {
+    let getter = "const g = { get p() { return {}; } }; export const G = g;";
+    assert!(module_effect_on(getter, "const o = useMemo(() => ({ p: 1 }), []);", "o.p").is_empty());
+    assert_eq!(
+        module_effect_on(getter, "const o = { p: {} };", "o.p"),
+        [ERROR]
+    );
+    // A name no accessor defines is computed from the object, as before.
+    assert!(module_effect_on(getter, "", "g.q").is_empty());
+}
+
 #[test]
 fn an_accessor_writing_state_runs_where_its_member_is_read_or_written() {
     let render = |decl: &str, use_: &str| {

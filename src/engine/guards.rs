@@ -61,6 +61,7 @@ use crate::{
         expr::{Expr, MarkerVal, Prim, SummaryValue, UnaryOp, mutation_receiver, object_member},
         free_vars::{call_free_key, collect_used_vars},
         hooks::HookEntry,
+        module::AccessorNames,
         stmt::{MemberKey, Stmt},
         types::{BlockId, HookLabel, Var},
     },
@@ -410,6 +411,10 @@ pub struct Invariance<'a> {
     pub hook_kinds: &'a HashMap<HookLabel, Kind>,
     /// The names the file binds at module level: never a global.
     pub module: &'a HashSet<Var>,
+    /// The member names some accessor of the program defines (#334): a read
+    /// of one this reader does not resolve to a member as written is a call
+    /// it cannot see.
+    pub accessors: &'a AccessorNames,
 }
 
 /// The per-component facts an [`Invariance`] reads, built once.
@@ -434,6 +439,9 @@ pub struct LoopFacts<'a> {
     /// once in the render, yet `f()` moves it (#331).
     pub assigned: HashSet<Var>,
     pub module: HashSet<Var>,
+    /// What the program's accessors define (#334), as the component's heap
+    /// knows it.
+    pub accessors: &'a AccessorNames,
 }
 
 impl<'a> LoopFacts<'a> {
@@ -489,6 +497,7 @@ impl<'a> LoopFacts<'a> {
             mutated,
             assigned,
             module: comp.module_consts.keys().cloned().collect(),
+            accessors: comp.heap.defined(),
         }
     }
 
@@ -505,6 +514,7 @@ impl<'a> LoopFacts<'a> {
             hook_args: &self.hook_args,
             hook_kinds: &self.hook_kinds,
             module: &self.module,
+            accessors: self.accessors,
         }
     }
 }
@@ -545,7 +555,23 @@ impl<'a> Invariance<'a> {
                 Some(Member::Expr(m, scope)) => self.kind(m, scope, next),
                 _ => Kind::Unknown,
             },
-            other => purity::kind_of(other, &|v| self.kind(&Expr::Var(v.to_string()), body, next)),
+            other => purity::kind_of(
+                other,
+                &|v| self.kind(&Expr::Var(v.to_string()), body, next),
+                self.accessors,
+            ),
+        }
+    }
+
+    /// A read of `member` (`None`: a key no constant names) this reader does
+    /// not resolve to a member as written may run an accessor of the program
+    /// (#334): a call it cannot see, of no known purity, whose result may be
+    /// a new reference.
+    fn unseen_call(&self, member: Option<&str>, out: &mut Reads) {
+        if self.accessors.may_run(member) {
+            out.call = true;
+            out.impure = true;
+            out.reference = true;
         }
     }
 
@@ -695,13 +721,19 @@ impl<'a> Invariance<'a> {
                 seen.remove(key);
                 ok
             }
-            Expr::FieldAccess { obj, .. } => self.read_into(obj, scopes, free, out, seen, next),
-            Expr::IndexAccess { arr, idx } => all(
-                &mut [arr.as_ref(), idx.as_ref()].into_iter(),
-                scopes,
-                out,
-                seen,
-            ),
+            Expr::FieldAccess { obj, field } => {
+                self.unseen_call(Some(field), out);
+                self.read_into(obj, scopes, free, out, seen, next)
+            }
+            Expr::IndexAccess { arr, idx } => {
+                self.unseen_call(purity::constant_key(idx).as_deref(), out);
+                all(
+                    &mut [arr.as_ref(), idx.as_ref()].into_iter(),
+                    scopes,
+                    out,
+                    seen,
+                )
+            }
             Expr::BinOp { lhs, rhs, .. } => all(
                 &mut [lhs.as_ref(), rhs.as_ref()].into_iter(),
                 scopes,
@@ -731,17 +763,18 @@ impl<'a> Invariance<'a> {
                         Expr::HookMarker(l, _) => {
                             self.hook_kinds.get(l).copied().unwrap_or_default()
                         }
-                        r => purity::kind_of(r, &shallow),
+                        r => purity::kind_of(r, &shallow, self.accessors),
                     },
                     _ => shallow(v),
                 };
-                let callee = Callee::of(fn_, &mut |x| purity::kind_of(x, &var));
+                let callee = Callee::of(fn_, &mut |x| purity::kind_of(x, &var, self.accessors));
                 let known = purity::call(
                     callee,
                     false,
                     args,
-                    &|i| purity::kind_of(&args[i], &var),
+                    &|i| purity::kind_of(&args[i], &var, self.accessors),
                     &var,
+                    self.accessors,
                 );
                 out.call = true;
                 out.impure |= known.is_none();
@@ -751,11 +784,14 @@ impl<'a> Invariance<'a> {
                     callee,
                     Callee::Value(Kind::Global(_)) | Callee::Method(Kind::Global(_), _)
                 );
+                // A known builtin's method is read off a receiver of its own
+                // kind, never through an accessor of the program.
+                let read = match fn_.peel_ts() {
+                    Expr::FieldAccess { obj, .. } if known.is_some() => obj.as_ref(),
+                    _ => fn_.as_ref(),
+                };
                 all(
-                    &mut (!global)
-                        .then_some(fn_.as_ref())
-                        .into_iter()
-                        .chain(args.iter()),
+                    &mut (!global).then_some(read).into_iter().chain(args.iter()),
                     scopes,
                     out,
                     seen,
@@ -821,10 +857,15 @@ impl<'a> Invariance<'a> {
                 }
             }
             Expr::MemoVal(l) | Expr::CallbackVal(l) => self.memo_holds(*l, props_hold, next),
+            // A member read as written holds when the member does; any other
+            // is computed from its object, unless an accessor of the program
+            // may run there (#334).
             Expr::FieldAccess { obj, field } => match self.member(obj, field, body) {
                 Some(Member::Expr(member, scope)) => self.go(member, scope, props_hold, next),
                 Some(Member::Summary(sv, l)) => self.summary_holds(sv, Some(l), props_hold, next),
-                None => self.go(obj, body, props_hold, next),
+                None => {
+                    !self.accessors.may_run(Some(field)) && self.go(obj, body, props_hold, next)
+                }
             },
             Expr::IndexAccess { arr, idx } => {
                 let member = match idx.peel_ts() {
@@ -837,7 +878,9 @@ impl<'a> Invariance<'a> {
                         self.summary_holds(sv, Some(l), props_hold, next)
                     }
                     None => {
-                        self.go(arr, body, props_hold, next) && self.go(idx, body, props_hold, next)
+                        !self.accessors.may_run(purity::constant_key(idx).as_deref())
+                            && self.go(arr, body, props_hold, next)
+                            && self.go(idx, body, props_hold, next)
                     }
                 }
             }
@@ -850,15 +893,26 @@ impl<'a> Invariance<'a> {
                 // has nothing of its own to read.
                 let kind = |x: &Expr| self.kind(x, body, next);
                 let callee = Callee::of(fn_, &mut |x| kind(x));
-                let pure = purity::call(callee, false, args, &|i| kind(&args[i]), &|v| {
-                    kind(&Expr::Var(v.to_string()))
-                })
+                let pure = purity::call(
+                    callee,
+                    false,
+                    args,
+                    &|i| kind(&args[i]),
+                    &|v| kind(&Expr::Var(v.to_string())),
+                    self.accessors,
+                )
                 .is_some();
                 let global = matches!(
                     callee,
                     Callee::Value(Kind::Global(_)) | Callee::Method(Kind::Global(_), _)
                 );
-                pure && (global || self.go(fn_, body, props_hold, next))
+                // A known builtin's method is read off a receiver of its own
+                // kind, never through an accessor of the program.
+                let read = match fn_.peel_ts() {
+                    Expr::FieldAccess { obj, .. } => obj.as_ref(),
+                    other => other,
+                };
+                pure && (global || self.go(read, body, props_hold, next))
                     && args.iter().all(|a| self.go(a, body, props_hold, next))
             }
             Expr::HookMarker(l, MarkerVal::Summary(sv)) => {

@@ -14,6 +14,7 @@ use crate::{
         expr::{Expr, SummaryValue},
         free_vars::{compute_free_vars, free_paths_and_pinned},
         hooks::HookEntry,
+        module::AccessorNames,
         stmt::Stmt,
         types::{BlockId, HookLabel, Var},
     },
@@ -70,17 +71,24 @@ pub struct ProgramFacts {
     /// ([`written_names`](crate::engine::render_deps::written_names)): a
     /// module binding among them is a cell that moves with no slot (#224).
     pub written: HashSet<Var>,
+    /// The member names some accessor of the program defines, read off every
+    /// lowered file (#334): every heap of the program starts from it
+    /// ([`Heap::with_defined`]).
+    pub accessors: std::sync::Arc<AccessorNames>,
 }
 
 impl ProgramFacts {
-    /// Every component, custom hook and utility of the program, as lowered.
+    /// Every component, custom hook and utility of the program, as lowered,
+    /// and the accessors its files define.
     pub(crate) fn of(
         components: &ComponentRegistry,
         hooks: &HookRegistry,
         utilities: &FunctionRegistry,
+        accessors: AccessorNames,
     ) -> Self {
         use crate::engine::render_deps::written_in;
         let mut facts = Self::of_utilities(utilities);
+        facts.accessors = std::sync::Arc::new(accessors);
         facts.dispatches =
             crate::engine::registrations::program_dispatches_events(components, hooks, utilities);
         for c in components.all_components() {
@@ -99,7 +107,8 @@ impl ProgramFacts {
     }
 
     /// A lone component's program: the utilities it may call. Its own bodies
-    /// are read where it is analysed, after its hooks are inlined.
+    /// are read where it is analysed, after its hooks are inlined. It has no
+    /// files, so no accessor an object it does not place may hold.
     fn of_utilities(utilities: &FunctionRegistry) -> Self {
         ProgramFacts {
             dispatches: utilities
@@ -109,6 +118,7 @@ impl ProgramFacts {
                 .all_functions()
                 .flat_map(|f| crate::engine::render_deps::written_roots(&f.params, &f.body_cfg))
                 .collect(),
+            accessors: Default::default(),
         }
     }
 }
@@ -198,6 +208,9 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     program: &ProgramFacts,
     hook_registry: Option<&HookRegistry>,
 ) -> AnalysisResult<StateValue> {
+    // Every heap of the analysis knows what the program's accessors define
+    // (#334), the scratch ones seeding a value below included.
+    let initial_heap = initial_heap.with_defined(program.accessors.clone());
     let _profile = crate::profile::on().then(|| {
         let kind = match inter {
             None => "intra",
@@ -240,7 +253,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     let module_env = {
         let mut seed_state = StateStore::bottom();
         let seed_memo: MemoStore<StateValue> = MemoStore::new();
-        let mut seed_heap = crate::domains::Heap::new();
+        let mut seed_heap = initial_heap.blank();
         let mut ac = AnalysisCtx::null(comp_id, &mut seed_state, &seed_memo, &mut seed_heap);
         let empty_env = AbstractEnv::bottom();
         let mut env = AbstractEnv::bottom();
@@ -318,7 +331,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         let mut out = HashMap::new();
         let mut seed_state = StateStore::bottom();
         let seed_memo: MemoStore<StateValue> = MemoStore::new();
-        let mut seed_heap = crate::domains::Heap::new();
+        let mut seed_heap = initial_heap.blank();
         let mut ac = AnalysisCtx::null(comp_id, &mut seed_state, &seed_memo, &mut seed_heap);
         for hook in &hooks {
             let HookEntry::Custom { label, args, .. } = hook else {
@@ -547,7 +560,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             if let HookEntry::State { label, init, .. } = hook {
                 let init_val = {
                     let mut init_state = StateStore::bottom();
-                    let mut heap = crate::domains::Heap::new();
+                    let mut heap = heap.blank();
                     let mut ac = AnalysisCtx::null(comp_id, &mut init_state, &init_memo, &mut heap);
                     // A null/undefined init needs no TS-hint override: the product
                     // value joins the null slot with whatever the setters write,
@@ -1089,11 +1102,31 @@ fn forwarded_props(
         .collect()
 }
 
+/// [`analyze_program_defining`] a program whose files define no accessor
+/// (a hand-built registry).
 pub fn analyze_program(
     registry: ComponentRegistry,
     hook_registry: HookRegistry,
     strategy: RootStrategy,
     config: &Config,
+) -> ProgramAnalysisResult {
+    analyze_program_defining(
+        registry,
+        hook_registry,
+        strategy,
+        config,
+        AccessorNames::default(),
+    )
+}
+
+/// Analyse the program whose files define the accessors `accessors`
+/// (#334, [`crate::ir::ModuleTable::accessor_names`]).
+pub fn analyze_program_defining(
+    registry: ComponentRegistry,
+    hook_registry: HookRegistry,
+    strategy: RootStrategy,
+    config: &Config,
+    accessors: AccessorNames,
 ) -> ProgramAnalysisResult {
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -1113,7 +1146,12 @@ pub fn analyze_program(
 
     let roots = strategy.detect(&registry);
     let mut analysed: std::collections::HashSet<ComponentId> = std::collections::HashSet::new();
-    let program = ProgramFacts::of(&registry, &hook_registry, &config.function_registry);
+    let program = ProgramFacts::of(
+        &registry,
+        &hook_registry,
+        &config.function_registry,
+        accessors,
+    );
 
     let inter_for = |component: ComponentId, call_stack: Vec<ComponentId>| InterCtx {
         registry: &registry,

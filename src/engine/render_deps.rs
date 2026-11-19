@@ -51,6 +51,7 @@ use crate::ir::{
     },
     free_vars::{collect_used_vars, compute_free_vars},
     hooks::HookEntry,
+    module::AccessorNames,
     source_range::SourceRange,
     stmt::{MemberKey, Stmt},
     types::{BlockId, HookLabel, Symbol, Var},
@@ -534,6 +535,7 @@ pub fn render_deps(
         gated: Default::default(),
         written: Default::default(),
         inline_hook: Default::default(),
+        accessors: result.heap.defined(),
     };
     let mut entry = Env::new();
     entry.insert(
@@ -628,6 +630,8 @@ struct Analyzer<'a> {
     /// The render calls a hook where lowering records none
     /// (`<p>{useTheme()}</p>`): it may read any context.
     inline_hook: std::cell::Cell<bool>,
+    /// The member names some accessor of the program defines (#334).
+    accessors: &'a AccessorNames,
 }
 
 struct Run {
@@ -951,23 +955,37 @@ impl<'a> Analyzer<'a> {
     }
 
     /// The member `field` of a value.
-    fn member(base: &DVal, field: &str) -> DVal {
+    fn member(&self, base: &DVal, field: &str) -> DVal {
         match &base.shape {
             Shape::Props => DVal::of(Deps::one(Source::Prop(field.to_string()))),
             Shape::Members(m) => match m.get(field) {
                 Some(v) => v.clone(),
-                None => DVal::of(base.deps.clone()),
+                None => self.computed(base, Some(field)),
             },
             Shape::Spread { members, spreads } => match members.get(field) {
                 Some(v) => v.clone(),
                 None => spreads
                     .iter()
-                    .map(|s| Self::member(s, field))
+                    .map(|s| self.member(s, field))
                     .reduce(|a, b| a.join(&b))
-                    .unwrap_or_else(|| DVal::of(base.deps.clone())),
+                    .unwrap_or_else(|| self.computed(base, Some(field))),
             },
-            Shape::None => DVal::of(base.deps.clone()),
+            Shape::None => self.computed(base, Some(field)),
         }
+    }
+
+    /// A member of `base` no entry of it says (`None`: a key no constant
+    /// names), computed from it. A value of no known kind may run an
+    /// accessor of the program there (#334): a call not known pure.
+    fn computed(&self, base: &DVal, member: Option<&str>) -> DVal {
+        let mut deps = base.deps.clone();
+        if base.kind == Kind::Unknown && self.accessors.may_run(member) {
+            deps = Deps {
+                impure: true,
+                ..deps.ungated()
+            };
+        }
+        DVal::of(deps)
     }
 
     fn eval(&self, e: &Expr, env: &Env) -> DVal {
@@ -1056,12 +1074,13 @@ impl<'a> Analyzer<'a> {
             Expr::FnLit {
                 params, body_cfg, ..
             } => DVal::of(self.closure(params, body_cfg, env)),
-            Expr::FieldAccess { obj, field } => Self::member(&self.eval(obj, env), field),
+            Expr::FieldAccess { obj, field } => self.member(&self.eval(obj, env), field),
             Expr::IndexAccess { arr, idx } => {
                 let a = self.eval(arr, env);
-                let mut d = a.deps;
+                let kind = purity::element(a.kind, idx);
+                let mut d = self.computed(&a, purity::constant_key(idx).as_deref()).deps;
                 d.union_with(&self.eval(idx, env).deps);
-                DVal::of_kind(d, purity::element(a.kind, idx))
+                DVal::of_kind(d, kind)
             }
             Expr::BinOp { op, lhs, rhs } => {
                 let (l, r) = (self.eval(lhs, env), self.eval(rhs, env));
@@ -1089,7 +1108,7 @@ impl<'a> Analyzer<'a> {
                     Expr::FieldAccess { obj, field } => {
                         let recv = self.eval(obj, env);
                         let kind = recv.kind;
-                        (Self::member(&recv, field), Callee::Method(kind, field))
+                        (self.member(&recv, field), Callee::Method(kind, field))
                     }
                     other => {
                         let f = self.eval(other, env);
@@ -1110,6 +1129,7 @@ impl<'a> Analyzer<'a> {
                     args,
                     &|i| vals[i].kind,
                     &|v| self.var_kind(env, v),
+                    self.accessors,
                 );
                 d.impure |= known.is_none();
                 DVal::of_kind(d, known.unwrap_or_default())
@@ -1124,7 +1144,7 @@ impl<'a> Analyzer<'a> {
                     if k.starts_with(SPREAD_KEY_PREFIX) {
                         // What it may put over every member written so far.
                         for (name, m) in members.iter_mut() {
-                            *m = m.join(&Self::member(&val, name));
+                            *m = m.join(&self.member(&val, name));
                         }
                         spreads.push(val);
                     } else if let Some((half, name)) = accessor_of(k) {

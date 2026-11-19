@@ -64,14 +64,14 @@ impl Rule for UnnecessaryRerender {
             .filter_map(|h| {
                 if let HookEntry::State { label, init, .. } = h {
                     // Mount-time init eval: empty stores + empty heap, NOT the
-                    // converged bundle.
+                    // converged bundle; the heap of the same program (#334).
                     let val = crate::rules::eval_in_stores(
                         init,
                         &empty_env,
                         result.component,
                         &empty_state,
                         &empty_memo,
-                        &mut crate::domains::Heap::new(),
+                        &mut result.heap.blank(),
                     );
                     Some((*label, val))
                 } else {
