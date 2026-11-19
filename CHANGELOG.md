@@ -358,6 +358,15 @@ on a program React settles; 323 oracle cases, none a known false negative.
   object (a singleton) no longer makes the `new` a new reference at every
   render: a possible loop where it was a false `infinite-loop` Error (#335,
   #311).
+- A module-level binding a body writes (a `let` the render assigns, a member
+  of a module `const` object) is a slot every render of every component may
+  read: a setter or a closure stored there is called wherever module code the
+  analysis does not run calls (a module object's method, a utility called
+  where it is not inlined), or the binding is called or handed on by name, in
+  that call's phase and component. `setter = setN` then `o.run()` in the
+  render is a `setter-in-render` Warning where it was silent, the same in two
+  effects with no deps an `infinite-loop` Warning, and in a child's render a
+  `cross-setter-in-render` Warning (#335).
 - False Errors: a component mounted only through an element the analysis
   cannot place (`<Comp/>` with `Comp = c ? A : B`, `<parts.C/>`, a mapped list
   of components, a default import under another name, itself) was read as a

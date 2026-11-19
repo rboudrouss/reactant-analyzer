@@ -43,6 +43,12 @@ impl ComponentId {
     /// it owns is a foreign write wherever it sits.
     pub const STORE: ComponentId = ComponentId(u32::MAX - 1);
 
+    /// The owner of the module scope (#335): the top-level bindings of the
+    /// program's modules, which no component owns either. Its site range
+    /// holds one anchor per binding ([`crate::engine::module_scope`]), where
+    /// the call relation keeps what every write of it stores.
+    pub const MODULE: ComponentId = ComponentId(u32::MAX - 2);
+
     /// A raw id, for a unit-test fixture that needs several distinct
     /// components without building a table. Production ids come only from
     /// [`ComponentTable::intern`], which is what keeps an id and the table

@@ -273,7 +273,23 @@ that writes it (see *Cross-file limits*).
   overrides runs both bodies, and a method named like a mutating builtin (`set`, `add`, `push`)
   also reads as one on the instance. An accessor's body runs at an unknown time from where the
   instance is built, as an object literal's does (#321): built in a memo that runs once, a
-  getter the render reads is not reported.
+  getter the render reads is not reported
+  [#337](https://github.com/rboudrouss/reactant-analyzer/issues/337). `this` in an object
+  literal's method is not the receiver
+  [#338](https://github.com/rboudrouss/reactant-analyzer/issues/338).
+- **Module bindings.** Every top-level binding of an analysed module is one slot shared by every
+  render of every component [#335](https://github.com/rboudrouss/reactant-analyzer/issues/335):
+  what a body stores there — the binding itself, or a member of the object it holds — joins
+  into it, and escapes, since code the analysis does not see may read it. A call of module code
+  the analysis does not run (a module object's method, a module class's static member, a utility
+  called where it is not inlined, a function a binding holds), and a value called or handed on
+  by a binding's name, may call anything any module binding holds, in its own phase. The
+  slots are one pool for such a call, whatever module it reads. What stays as before: the value
+  a read of the binding binds, in a component other than the one that stored it, is not the
+  setter, so an alias there (`const s = setter; s()`) is not followed; a getter of a module object
+  is a read the call relation does not place (#337); a name a component declares anywhere is its
+  own, never the module's; a setter handed to code the analysis does not see, which that code
+  keeps (a library, a module function storing its argument), still runs where it escaped.
 - **Mount-coupled seeds.** `frozen-initial-state` drops to Info, hidden without `--info`, when every
   call site renders the consumer under a `key` built from the seeding prop, or under a guard built
   from it (`{msg && <Toast msg={msg}/>}`). Neither shape is a proof: a `msg` moving between two

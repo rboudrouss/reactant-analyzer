@@ -422,6 +422,9 @@ fn exec_full_stmt<T: Transfer>(
                 env.bind_locs(var.clone(), ev.sites().cloned());
                 env.extend(var.clone(), ev.as_val());
             }
+            if let Stmt::Assign { .. } = stmt {
+                hold_in_module(transfer, var, rhs, env, ctx);
+            }
         }
         Stmt::MemberWrite { obj, key, rhs, .. } => {
             exec_callbacks_depth(transfer, obj, env, ctx, depth);
@@ -429,6 +432,9 @@ fn exec_full_stmt<T: Transfer>(
                 exec_callbacks_depth(transfer, idx, env, ctx, depth);
             }
             exec_callbacks_depth(transfer, rhs, env, ctx, depth);
+            if let Some(root) = module_root(obj) {
+                hold_in_module(transfer, root, rhs, env, ctx);
+            }
             // A write through a setter runs its body with the value written
             // (#321).
             if ctx.heap.has_accessors() {
@@ -1203,6 +1209,7 @@ fn call_evaluation<T: Transfer>(
             .into_iter()
             .map(|(slot, v)| (slot, v.as_state_value().unwrap_or_else(StateValue::top)))
             .collect(),
+        module: false,
     }
 }
 
@@ -1363,6 +1370,7 @@ fn exec_callbacks_depth<T: Transfer>(
                     };
                     let escaped = ctx.escaped;
                     ctx.record(|r| r.record_escape(*id, i, applied, [], ran.bodies, sure, escaped));
+                    mark_module(arg, (*id, i), ctx);
                     // An object the callee is handed is no function it runs:
                     // it may return what the object holds (`Array.from(hs)`)
                     // or keep it, so it is handed to code the analysis does
@@ -1441,7 +1449,11 @@ fn exec_callbacks_depth<T: Transfer>(
             // Arguments first, then the call itself.
             let written = exec_slot_write(transfer, fn_, args, env, ctx, depth);
             if ctx.calls.is_some() {
-                let eval = call_evaluation(transfer, fn_, env, ctx, ran, written);
+                // Module code the analysis does not run may call what the
+                // module scope holds (#335).
+                let module = (ran.bodies.is_empty() || ran.open) && reads_module(fn_, ctx);
+                let mut eval = call_evaluation(transfer, fn_, env, ctx, ran, written);
+                eval.module = module;
                 ctx.record(|r| r.record_call(*id, eval));
             }
             returned
@@ -1633,6 +1645,43 @@ pub(crate) fn escape<T: Transfer>(
     escape_at(transfer, expr, env, ctx, None)
 }
 
+/// A write of `rhs` into the module binding `name` (#335) — the binding
+/// itself, or a member of what it holds — when `name` denotes one: the
+/// binding's slot holds it, a store every render of every component reads,
+/// so it is recorded at the binding's anchor, where the program's relation
+/// joins every write of it ([`crate::engine::ModuleScope`]); and code the
+/// analysis does not see may read it there, so it escapes, as a value
+/// handed to that code does.
+fn hold_in_module<T: Transfer>(
+    transfer: &T,
+    name: &str,
+    rhs: &Expr,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+) {
+    let anchors = ctx.query.module_binding(name).to_vec();
+    for anchor in anchors {
+        escape_at(transfer, rhs, env, ctx, Some((anchor, 0)));
+    }
+}
+
+/// The name a value read through `expr` is read off: a name, or the root of
+/// a member chain.
+fn module_root(expr: &Expr) -> Option<&str> {
+    match expr.peel_ts() {
+        Expr::Var(v) => Some(v),
+        Expr::FieldAccess { obj, .. } => module_root(obj),
+        Expr::IndexAccess { arr, .. } => module_root(arr),
+        _ => None,
+    }
+}
+
+/// `expr` is read off a module binding (#335): it may be anything the
+/// module scope holds.
+fn reads_module<D: AbstractDomain>(expr: &Expr, ctx: &AnalysisCtx<D>) -> bool {
+    module_root(expr).is_some_and(|name| !ctx.query.module_binding(name).is_empty())
+}
+
 /// [`escape`], recording what the value reached at `at` — an anchor and a
 /// position of the call relation (ADR-047) — when the context records one.
 fn escape_at<T: Transfer>(
@@ -1651,6 +1700,7 @@ fn escape_at<T: Transfer>(
     let mut setters = call_targets(transfer, expr, env, ctx);
     if let Some(at) = at {
         record_reach(at, sites.as_ref(), &setters, ctx);
+        mark_module(expr, at, ctx);
     }
     if let Some(sites) = &sites {
         setters.extend(ctx.heap.escape(sites));
@@ -1690,6 +1740,15 @@ fn hand_at<T: Transfer>(
         _ => return,
     };
     record_reach(at, sites.as_ref(), &setters, ctx);
+    mark_module(expr, at, ctx);
+}
+
+/// The value `expr` handed at `at` is read off a module binding (#335): the
+/// relation says so there ([`crate::engine::Escapes::module`]).
+fn mark_module<D: AbstractDomain>(expr: &Expr, at: (ExprId, usize), ctx: &AnalysisCtx<D>) {
+    if reads_module(expr, ctx) {
+        ctx.record(|r| r.mark_module_escape(at.0, at.1));
+    }
 }
 
 /// Record at `at` the setters `setters` the value is, and everything `sites`

@@ -70,6 +70,13 @@ pub trait QueryContext {
         &[]
     }
 
+    /// The module bindings (their anchors, [`crate::engine::ModuleScope`])
+    /// the name `name` may denote in this component's bodies (#335): none
+    /// for a name it declares, an import of a package, a global.
+    fn module_binding(&self, _name: &str) -> &[crate::ir::types::ExprId] {
+        &[]
+    }
+
     /// The function the value of the hook `label` the fixpoint did not
     /// inline calls, when it hands back one that runs its argument: React's
     /// `useEffectEvent` (#320). A call through the value runs that function.
@@ -467,6 +474,8 @@ pub struct FixpointCtx<'a> {
     /// See `QueryContext::hook_reads`.
     pub hook_reads:
         &'a std::collections::HashMap<crate::ir::types::HookLabel, Vec<crate::ir::expr::Expr>>,
+    /// See `QueryContext::module_binding`.
+    pub module: &'a std::collections::HashMap<crate::ir::types::Var, Vec<crate::ir::types::ExprId>>,
 }
 
 impl QueryContext for FixpointCtx<'_> {
@@ -495,5 +504,9 @@ impl QueryContext for FixpointCtx<'_> {
 
     fn hands_back(&self, label: crate::ir::types::HookLabel) -> Option<&crate::ir::expr::Expr> {
         self.hands_back.get(&label).copied()
+    }
+
+    fn module_binding(&self, name: &str) -> &[crate::ir::types::ExprId] {
+        self.module.get(name).map_or(&[], Vec::as_slice)
     }
 }

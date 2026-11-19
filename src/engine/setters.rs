@@ -3249,6 +3249,39 @@ impl<'a> SetterWalk<'a> {
             }
             found.absorb(inner, body, mode, at, prov);
         }
+        if row.module {
+            self.module_rows(fn_, mode, depth, found, prov, stmt_span);
+        }
+    }
+
+    /// What the module scope holds (#335), reached at a call of module code
+    /// the analysis does not run, or through a value read off a module
+    /// binding (`via`): every setter and closure some write of the program
+    /// stored in a module binding ([`CallRelation::module_anchors`]) may be
+    /// called there, in `class`.
+    #[allow(clippy::too_many_arguments)]
+    fn module_rows(
+        &mut self,
+        via: &'a Expr,
+        class: WalkClass,
+        depth: usize,
+        found: &mut Found,
+        prov: Option<BlockId>,
+        stmt_span: Option<SourceRange>,
+    ) {
+        let anchors: Vec<crate::ir::types::ExprId> = self.calls.module_anchors().collect();
+        for anchor in anchors {
+            self.relation_handed(
+                Some((anchor, 0)),
+                via,
+                class,
+                None,
+                depth,
+                found,
+                prov,
+                stmt_span,
+            );
+        }
     }
 
     /// The value `arg` handed at `anchor` (a call's argument, a `new`'s, a
@@ -3279,6 +3312,13 @@ impl<'a> SetterWalk<'a> {
             Expr::ObjectLit { .. } | Expr::ArrayLit { .. } | Expr::Spread(_) => WalkClass::Unknown,
             _ => class,
         };
+        // A value read off a module binding may be anything the module scope
+        // holds (#335); a module binding's own row is one of those, which
+        // what `arg` spells reaches, never is.
+        let module = anchor.is_some_and(|(a, _)| crate::engine::ModuleScope::is_anchor(a));
+        if row.module && !module {
+            self.module_rows(arg, held_class, depth, found, prov, stmt_span);
+        }
         let spelling = callee_path(arg);
         // A setter the callee surely calls, where it surely runs its
         // callback (`[1].forEach(setN)`, #291), is placed there.
@@ -3286,7 +3326,7 @@ impl<'a> SetterWalk<'a> {
         for &slot in &row.setters {
             found.setters.push(FoundSite {
                 var: spelling.clone().unwrap_or_default(),
-                carried: spelling.is_some() && !row.direct.contains(&slot),
+                carried: spelling.is_some() && (module || !row.direct.contains(&slot)),
                 slot,
                 sure: row.sure(),
                 listener: self.listening,

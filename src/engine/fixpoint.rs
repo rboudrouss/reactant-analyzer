@@ -80,20 +80,30 @@ pub struct ProgramFacts {
     /// lowered file (#334): every heap of the program starts from it
     /// ([`Heap::with_defined`]).
     pub accessors: std::sync::Arc<AccessorNames>,
+    /// The program's module scope (#335): the top-level bindings of its
+    /// files, each a slot of a store no component owns.
+    pub modules: std::sync::Arc<crate::engine::ModuleScope>,
+    /// The program computes every analysis's relations once all are kept
+    /// ([`analyze_program_defining`]), the unreached components' too, so
+    /// the module scope's rows they read are the whole program's.
+    relations_after_all: bool,
 }
 
 impl ProgramFacts {
     /// Every component, custom hook and utility of the program, as lowered,
-    /// and the accessors its files define.
+    /// the accessors its files define and its module scope.
     pub(crate) fn of(
         components: &ComponentRegistry,
         hooks: &HookRegistry,
         utilities: &FunctionRegistry,
         accessors: AccessorNames,
+        modules: crate::engine::ModuleScope,
     ) -> Self {
         use crate::engine::render_deps::written_in;
         let mut facts = Self::of_utilities(utilities);
         facts.accessors = std::sync::Arc::new(accessors);
+        facts.modules = std::sync::Arc::new(modules);
+        facts.relations_after_all = true;
         facts.dispatches =
             crate::engine::registrations::program_dispatches_events(components, hooks, utilities);
         for c in components.all_components() {
@@ -124,6 +134,8 @@ impl ProgramFacts {
                 .flat_map(|f| crate::engine::render_deps::written_roots(&f.params, &f.body_cfg))
                 .collect(),
             accessors: Default::default(),
+            modules: Default::default(),
+            relations_after_all: false,
         }
     }
 }
@@ -325,6 +337,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
 
     // Every `new` of a class a module of the program defines runs its
     // construction body (#335), resolved once every splice has landed.
+    let mut class_files: Vec<std::path::PathBuf> = Vec::new();
     if expand_class_constructions(
         &mut render_cfg,
         &mut hooks,
@@ -333,6 +346,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         &inline_regions,
         config.max_inline_depth,
         &mut splice_salt,
+        &mut class_files,
     ) && let Some(inter) = inter
     {
         inter
@@ -469,6 +483,31 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             Some((label, read))
         })
         .collect();
+    // The module bindings the component's bodies name (#335): those of its
+    // file, and of every file a body was spliced from, but the names it
+    // declares itself.
+    let module_names = {
+        let mut declared: HashSet<Var> = HashSet::from([comp_param.clone()]);
+        declared_names(&render_cfg, &mut declared);
+        for hook in &hooks {
+            declared.extend(hook.body_params().iter().cloned());
+            if let Some(body) = hook.body_cfg() {
+                declared_names(body, &mut declared);
+            }
+        }
+        let spliced = inline_regions
+            .render
+            .iter()
+            .chain(inline_regions.bodies.values().flatten())
+            .map(|r| r.from.as_path());
+        let classes = class_files.iter().map(std::path::PathBuf::as_path);
+        program.modules.names(
+            std::iter::once(comp_file.as_path())
+                .chain(spliced)
+                .chain(classes),
+            &declared,
+        )
+    };
     let query = FixpointCtx {
         callbacks: &callback_bodies,
         reducers: &reducers,
@@ -476,6 +515,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         hook_args: &hook_args,
         hands_back: &hands_back,
         hook_reads: &hook_reads,
+        module: &module_names,
     };
     // A `useCallback` value is placed where its recompute hands it back (a
     // literal's closure at the hook's site, or the argument's sites, #320),
@@ -936,10 +976,12 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     };
     // An inter-component analysis may be thrown away (a child re-analysed
     // under a bigger join, a root rendered by a later root, a probe): its
-    // relations wait for `analyze_program` to know which result is kept.
-    match inter {
-        Some(_) => result.relations_pending = Some(Box::new(pending)),
-        None => compute_relations(&mut result, pending, None, program),
+    // relations wait for `analyze_program` to know which result is kept. So
+    // do a program's unreached components', whose module rows are the
+    // program's (#335).
+    match (inter, program.relations_after_all) {
+        (None, false) => compute_relations(&mut result, pending, None, program),
+        _ => result.relations_pending = Some(Box::new(pending)),
     }
     result
 }
@@ -1127,7 +1169,7 @@ fn forwarded_props(
 }
 
 /// [`analyze_program_defining`] a program whose files define no accessor
-/// (a hand-built registry).
+/// and no module scope (a hand-built registry).
 pub fn analyze_program(
     registry: ComponentRegistry,
     hook_registry: HookRegistry,
@@ -1140,17 +1182,20 @@ pub fn analyze_program(
         strategy,
         config,
         AccessorNames::default(),
+        crate::engine::ModuleScope::default(),
     )
 }
 
 /// Analyse the program whose files define the accessors `accessors`
-/// (#334, [`crate::ir::ModuleTable::accessor_names`]).
+/// (#334, [`crate::ir::ModuleTable::accessor_names`]) and the module scope
+/// `modules` (#335).
 pub fn analyze_program_defining(
     registry: ComponentRegistry,
     hook_registry: HookRegistry,
     strategy: RootStrategy,
     config: &Config,
     accessors: AccessorNames,
+    modules: crate::engine::ModuleScope,
 ) -> ProgramAnalysisResult {
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -1175,6 +1220,7 @@ pub fn analyze_program_defining(
         &hook_registry,
         &config.function_registry,
         accessors,
+        modules,
     );
 
     let inter_for = |component: ComponentId, call_stack: Vec<ComponentId>| InterCtx {
@@ -1220,41 +1266,6 @@ pub fn analyze_program_defining(
             analysed.insert(root);
         }
     }
-    // The results phase 1 kept: the last analysis of each component. Their
-    // relations are computed now, once. No other analysis needs them: during
-    // phase 1 `results` is read only by `flow_back` (its heap), an analysis
-    // that is replaced is dropped unread, and a probe below is read only
-    // through `SiteFacts::of` (exit env, stores, heap).
-    //
-    // The call relation of the program first (ADR-047): a call of a closure
-    // a child runs, or of one its owner runs after a child let it escape,
-    // is evaluated in another component's analysis than the one that writes
-    // it. Every kept analysis's evaluations join into one relation, which
-    // every result then holds.
-    {
-        let mut results = results.borrow_mut();
-        let mut ids: Vec<ComponentId> = results.keys().copied().collect();
-        ids.sort();
-        let mut program_calls = crate::engine::CallRelation::default();
-        for id in &ids {
-            program_calls.join(&results[id].calls);
-            // Every component's slots, named: a closure of a parent written
-            // in a child's analysis names the parent's setter.
-            if let Some(ir) = registry.ir_of(*id) {
-                program_calls.name_slots(*id, &ir.render_cfg);
-            }
-        }
-        let program_calls = std::sync::Arc::new(program_calls);
-        for result in results.values_mut() {
-            result.calls = std::sync::Arc::clone(&program_calls);
-        }
-    }
-    for result in results.borrow_mut().values_mut() {
-        if let Some(inputs) = result.relations_pending.take() {
-            compute_relations(result, *inputs, Some(&reducers), &program);
-        }
-    }
-
     // Per-site facts (#175). A child's result is its analysis under the join
     // of every element's input, and the join loses what holds through one
     // element alone (a dep that is a new reference at every render when one
@@ -1373,6 +1384,45 @@ pub fn analyze_program_defining(
             );
             stats.borrow_mut().components_analyzed += 1;
             results.borrow_mut().insert(id, result);
+        }
+    }
+
+    // The results the program kept: the last analysis of each component
+    // phase 1 reached, and every unreached one. Their relations are computed
+    // now, once. No other analysis needs them: during phase 1 `results` is
+    // read only by `flow_back` (its heap), an analysis that is replaced is
+    // dropped unread, and a probe is read only through `SiteFacts::of` (exit
+    // env, stores, heap).
+    //
+    // The call relation of the program first (ADR-047): a call of a closure
+    // a child runs, or of one its owner runs after a child let it escape,
+    // is evaluated in another component's analysis than the one that writes
+    // it, and a module binding one component writes is read in another's
+    // (#335). Every kept analysis's evaluations join into one relation,
+    // which every result then holds.
+    {
+        let mut results = results.borrow_mut();
+        let mut ids: Vec<ComponentId> = results.keys().copied().collect();
+        ids.sort();
+        let mut program_calls = crate::engine::CallRelation::default();
+        for id in &ids {
+            program_calls.join(&results[id].calls);
+            // Every component's slots, named: a closure of a parent written
+            // in a child's analysis names the parent's setter.
+            if let Some(ir) = registry.ir_of(*id) {
+                program_calls.name_slots(*id, &ir.render_cfg);
+            }
+        }
+        let program_calls = std::sync::Arc::new(program_calls);
+        for result in results.values_mut() {
+            result.calls = std::sync::Arc::clone(&program_calls);
+        }
+    }
+    for (id, result) in results.borrow_mut().iter_mut() {
+        if let Some(inputs) = result.relations_pending.take() {
+            // An unreached component registers its reducers nowhere.
+            let reached = phase1_reached.contains(id).then_some(&reducers);
+            compute_relations(result, *inputs, reached, &program);
         }
     }
 
@@ -2242,7 +2292,9 @@ fn expand_utility_calls(
 /// the module's; a class already on the way (`m() { return new K() }`)
 /// is left as written, as is every `new` past `budget` expansions — read
 /// as a class the analysis does not see. Returns whether the budget ran
-/// out.
+/// out; `files` gets the file of every class resolved, whose module scope
+/// its bodies read (#335).
+#[allow(clippy::too_many_arguments)]
 fn expand_class_constructions(
     render_cfg: &mut CFG,
     hooks: &mut [HookEntry],
@@ -2251,6 +2303,7 @@ fn expand_class_constructions(
     regions: &crate::engine::setters::InlineRegions,
     budget: usize,
     salt: &mut SpliceIds,
+    files: &mut Vec<std::path::PathBuf>,
 ) -> bool {
     if registry.is_empty() {
         return false;
@@ -2269,6 +2322,7 @@ fn expand_class_constructions(
         budget: budget * 8,
         truncated: false,
         within: Vec::new(),
+        files: Vec::new(),
     };
     pass.cfg(render_cfg, &regions.render, caller_file);
     for hook in hooks.iter_mut() {
@@ -2296,7 +2350,31 @@ fn expand_class_constructions(
             }
         }
     }
+    files.extend(pass.files);
     pass.truncated
+}
+
+/// Every name a body declares — a `let`, a parameter — nested bodies
+/// included; not a name it only assigns.
+fn declared_names(cfg: &CFG, out: &mut HashSet<Var>) {
+    fn expr(e: &Expr, out: &mut HashSet<Var>) {
+        if let Expr::FnLit {
+            params, body_cfg, ..
+        } = e
+        {
+            out.extend(params.iter().cloned());
+            declared_names(body_cfg, out);
+        }
+        e.for_each_child(&mut |c| expr(c, out));
+    }
+    for block in cfg.blocks.values() {
+        for stmt in &block.stmts {
+            if let Stmt::Let { var, .. } = stmt {
+                out.insert(var.clone());
+            }
+        }
+        block.for_each_expr(&mut |e| expr(e, out));
+    }
 }
 
 /// Every name a body binds — a `let`, an assignment, a parameter — nested
@@ -2331,6 +2409,8 @@ struct ClassPass<'r, 's> {
     truncated: bool,
     /// The classes whose bodies the walk is in.
     within: Vec<crate::engine::FunctionKey>,
+    /// The file of every class resolved.
+    files: Vec<std::path::PathBuf>,
 }
 
 impl ClassPass<'_, '_> {
@@ -2383,6 +2463,9 @@ impl ClassPass<'_, '_> {
         let mut body = crate::ir::remap_cfg(class.body_cfg.clone(), off);
         let params = class.params.clone();
         let from = class.file.clone();
+        if !self.files.contains(&from) {
+            self.files.push(from.clone());
+        }
         self.within.push(key);
         self.cfg(&mut body, &[], &from);
         self.within.pop();

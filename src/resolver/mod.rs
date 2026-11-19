@@ -501,8 +501,15 @@ pub fn analyze_lowered(
     let hook_registry = HookRegistry::from_hooks(lowered.hooks)
         .with_re_exports(lowered.module_table.re_export_graph());
     let accessors = lowered.module_table.accessor_names();
-    let mut result =
-        analyze_program_defining(registry, hook_registry, strategy, &config, accessors);
+    let modules = crate::engine::ModuleScope::of(&lowered.module_table);
+    let mut result = analyze_program_defining(
+        registry,
+        hook_registry,
+        strategy,
+        &config,
+        accessors,
+        modules,
+    );
     result.file_table = lowered.file_table;
     result.module_table = lowered.module_table;
     result

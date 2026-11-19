@@ -99,6 +99,11 @@ pub fn collect_module_facts(
             .collect();
     }
 
+    let mut imported: Vec<(String, PathBuf, String)> = bindings
+        .into_iter()
+        .map(|(local, origin)| (local, origin.file, origin.imported))
+        .collect();
+    imported.sort();
     ModuleFacts {
         directives,
         imports,
@@ -106,6 +111,8 @@ pub fn collect_module_facts(
         re_exports,
         value_refs: value_refs(program, file, resolver),
         accessors: accessor_names(program),
+        bindings: super::top_level_binding_names(program),
+        imported,
     }
 }
 

@@ -47,6 +47,12 @@ pub struct ModuleFacts {
     pub value_refs: Vec<ValueRef>,
     /// The member names an accessor this module writes defines (#334).
     pub accessors: AccessorNames,
+    /// Every name the module binds at its top level, whatever the form (a
+    /// `let`, a `const`, a function, a class): its module scope (#335).
+    pub bindings: Vec<String>,
+    /// The names the module imports from another analysed file: `(local
+    /// name, origin file, the name the origin exports it under)` (#335).
+    pub imported: Vec<(String, PathBuf, String)>,
 }
 
 /// The member names some accessor of the program defines (#334): an object

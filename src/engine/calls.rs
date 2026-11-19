@@ -80,6 +80,11 @@ pub struct Targets {
     /// the call runs. A row without one is never `sure`: its write is no
     /// certain write of any region that may read the row (#313).
     pub placed: bool,
+    /// The callee may be module code the analysis does not run (#335): a
+    /// module object's method, a utility it did not inline, a function a
+    /// module binding holds. That code may call what any module binding
+    /// holds ([`CallRelation::module_anchors`]), here.
+    pub module: bool,
 }
 
 impl Targets {
@@ -100,6 +105,7 @@ impl Targets {
         self.open |= other.open;
         self.escaped |= other.escaped;
         self.placed |= other.placed;
+        self.module |= other.module;
         self.sure = match (self.sure, other.sure) {
             (None, s) | (s, None) => s,
             (Some(a), Some(b)) => Some(a && b),
@@ -129,6 +135,8 @@ pub struct Evaluation {
     /// The evaluation ran in a closure code the analysis does not see may
     /// call ([`Targets::escaped`]).
     pub escaped: bool,
+    /// See [`Targets::module`].
+    pub module: bool,
 }
 
 /// What a value handed at one position may reach: every setter and every
@@ -150,6 +158,9 @@ pub struct Escapes {
     /// Some evaluation ran outside a closure code the analysis does not see
     /// may call, as [`Targets::placed`].
     pub placed: bool,
+    /// The value handed is read off a module binding (#335): it may be
+    /// anything the module scope holds ([`CallRelation::module_anchors`]).
+    pub module: bool,
 }
 
 impl Escapes {
@@ -177,9 +188,26 @@ pub struct CallRelation {
     /// The name each slot's setter is bound to in its owner's render: what a
     /// row keyed by its slot prints, whatever the call spelled.
     slot_names: HashMap<Slot, Var>,
+    /// The anchors of the module bindings some write stored a setter or a
+    /// closure at ([`crate::engine::ModuleScope`]), in order.
+    module: BTreeSet<ExprId>,
 }
 
 impl CallRelation {
+    /// The module bindings some write of the program stored a setter or a
+    /// closure in (#335): the anchors whose row ([`Self::escapes`] at
+    /// position 0) says what each may hold, which a call of module code the
+    /// analysis does not run may call ([`Targets::module`]).
+    pub fn module_anchors(&self) -> impl Iterator<Item = ExprId> + '_ {
+        self.module.iter().copied()
+    }
+
+    /// The value handed at `pos` of `anchor` is read off a module binding
+    /// ([`Escapes::module`]).
+    pub fn mark_module_escape(&mut self, anchor: ExprId, pos: usize) {
+        self.escapes.entry((anchor, pos)).or_default().module = true;
+    }
+
     /// The row of call `id`; `None` when no pass reached it.
     pub fn targets(&self, id: ExprId) -> Option<&Targets> {
         self.calls.get(&id)
@@ -234,13 +262,26 @@ impl CallRelation {
         if let Some(body) = self.cfgs.get(&site) {
             let mut anchors: Vec<(ExprId, usize)> = Vec::new();
             body.for_each_expr(&mut |e| collect_anchors(e, &mut anchors));
+            // What module scope holds, which a call of module code or a value
+            // read off a module binding may reach (#335).
+            let mut module = false;
             for (anchor, n) in anchors {
                 if let Some(t) = self.calls.get(&anchor) {
                     out.extend(t.setters.iter().copied());
                     inner.extend(t.bodies.iter().copied());
+                    module |= t.module;
                 }
                 for pos in (0..n).chain([CALLEE]) {
                     if let Some(e) = self.escapes.get(&(anchor, pos)) {
+                        out.extend(e.setters.iter().copied());
+                        inner.extend(e.bodies.iter().copied());
+                        module |= e.module;
+                    }
+                }
+            }
+            if module {
+                for anchor in &self.module {
+                    if let Some(e) = self.escapes.get(&(*anchor, 0)) {
                         out.extend(e.setters.iter().copied());
                         inner.extend(e.bodies.iter().copied());
                     }
@@ -278,6 +319,7 @@ impl CallRelation {
             written: eval.written,
             escaped: eval.escaped,
             placed: !eval.escaped && !eval.unreached,
+            module: eval.module,
         });
     }
 
@@ -305,6 +347,11 @@ impl CallRelation {
         row.setters.extend(held);
         row.bodies.extend(bodies);
         row.sure = Some(row.sure.unwrap_or(true) && sure);
+        // A module binding counts once it may hold something a call runs.
+        let holds = !row.setters.is_empty() || !row.bodies.is_empty();
+        if holds && crate::engine::ModuleScope::is_anchor(anchor) {
+            self.module.insert(anchor);
+        }
     }
     /// Remember the body run at `site`.
     pub fn record_body(&mut self, site: ExprId, body: &Arc<CFG>) {
@@ -344,6 +391,7 @@ impl CallRelation {
             row.direct.extend(e.direct.iter().copied());
             row.bodies.extend(e.bodies.iter().copied());
             row.placed |= e.placed;
+            row.module |= e.module;
             row.sure = match (row.sure, e.sure) {
                 (None, s) | (s, None) => s,
                 (Some(a), Some(b)) => Some(a && b),
@@ -355,6 +403,7 @@ impl CallRelation {
         for (slot, name) in &other.slot_names {
             self.slot_names.entry(*slot).or_insert_with(|| name.clone());
         }
+        self.module.extend(other.module.iter().copied());
     }
 }
 

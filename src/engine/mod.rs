@@ -10,6 +10,7 @@ pub mod fixpoint;
 pub mod function_registry;
 pub mod guards;
 pub mod hook_registry;
+pub mod module_scope;
 pub mod program_relations;
 pub mod program_result;
 pub mod purity;
@@ -42,6 +43,7 @@ pub use fixpoint::{
 };
 pub use function_registry::{FunctionKey, FunctionRegistry};
 pub use hook_registry::{HookKey, HookRegistry};
+pub use module_scope::ModuleScope;
 pub use program_relations::ProgramRelations;
 pub use program_result::{
     AnalysisStats, CallSite, ComponentCallGraph, FreshDeps, ProgramAnalysisResult, SiteFacts,
