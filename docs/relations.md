@@ -198,6 +198,15 @@ one function to an in-cycle callee that runs it (`[setN].forEach(cb)`), never
 code the analysis does not see, and some evaluation ran outside an escaped
 closure — must.
 
+`accesses(at)`, a `Targets` row per **statement position** (#337): what
+the member reads and writes of the statement (or terminator) at `at` may
+run — the accessor bodies the heap placed there (`bodies`), one it does not
+see (`open`), module code when the receiver is read off a module binding
+(`module`). A member access has no id, so every access of statements at
+one position shares a row, `None` included: may, never `sure`. The writer
+walk enters its bodies at that statement, in its region and phase; each
+body's half and member is `accessor(site)`.
+
 Readers (ADR-047 §4, amended by P10): the writer walk, and the walks the
 engine runs over a body for the rules (`setters::body_writes`,
 `collect_body_calls`, `collect_slot_reads`); a rule reads the rows they

@@ -85,15 +85,16 @@ fn setter_messages(case: &str) -> Vec<String> {
 #[test]
 fn a_state_write_in_an_accessor_says_the_read_or_the_write_runs_it() {
     for (case, says) in [
+        // The render's read or write is a call of the accessor (#337).
         (
             "getter-writes-state-in-render-loops",
-            "setter `setN` is called in the getter of `p`, which runs at every read of `p`. \
-             If the render reads it, this re-renders on every render",
+            "setter `setN` is called in the getter of `p`, which runs at every read of `p`, \
+             and the render reads it: move this call into a useEffect or an event handler",
         ),
         (
             "setter-accessor-writes-state-in-render-loops",
-            "setter `setN` is called in the setter of `p`, which runs at every write of `p`. \
-             If the render writes it, this re-renders on every render",
+            "setter `setN` is called in the setter of `p`, which runs at every write of `p`, \
+             and the render writes it: move this call into a useEffect or an event handler",
         ),
         (
             "setter-accessor-in-effect-loops",
@@ -271,4 +272,43 @@ fn an_accessor_writing_state_runs_where_its_member_is_read_or_written() {
         getter.iter().any(|f| f.starts_with("setter-in-render")),
         "{getter:?}"
     );
+}
+
+/// The loop findings of the oracle case `case`.
+fn case_loops(case: &str) -> Vec<String> {
+    loops(
+        &std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("oracle/cases/{case}.tsx")),
+        )
+        .unwrap(),
+    )
+}
+
+#[test]
+fn a_read_is_a_call_of_the_getter_where_it_is_read() {
+    // #337: wherever the accessor was defined — a memo that runs once, a
+    // module object — the read runs it in the read's region and phase.
+    for case in [
+        "getter-memo-literal-setter-loops",
+        "getter-memo-class-instance-setter-loops",
+        "getter-module-object-reads-module-binding-loops",
+    ] {
+        assert_eq!(
+            case_loops(case),
+            ["setter-in-render:warning"],
+            "{case}: the render's read writes state"
+        );
+    }
+    assert_eq!(
+        case_loops("getter-memo-literal-effect-read-loops"),
+        ["infinite-loop:warning"],
+        "a read in an effect with no deps writes state at every run"
+    );
+    for case in [
+        "getter-memo-literal-reads-converges",
+        "getter-memo-literal-handler-read-converges",
+    ] {
+        assert_eq!(case_loops(case), Vec::<String>::new(), "{case}");
+    }
 }

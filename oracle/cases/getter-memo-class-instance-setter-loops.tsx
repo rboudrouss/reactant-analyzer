@@ -1,8 +1,7 @@
 // oracle: react=loop
-// oracle: known=fn #337
 // #335's getter twin: the memo builds the instance once, the render reads a
-// getter that calls the setter its constructor kept. The getter's write is
-// placed where the instance is built, in a memo that runs once.
+// getter that calls the setter its constructor kept. The read is a call of
+// the getter, in the render (#337).
 import { useMemo, useState } from "react";
 
 class K {

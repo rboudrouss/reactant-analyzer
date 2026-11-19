@@ -2745,19 +2745,17 @@ impl<'a> SetterWalk<'a> {
                                 witness,
                             );
                         }
+                        self.relation_accesses(
+                            *span, expr, depth, found, mode, prov_block, witness,
+                        );
                         self.expr(expr, witness, at, depth, found, mode, at_root, prov_block);
                     }
                     Terminator::Branch { cond, span, .. } => {
-                        self.expr(
-                            cond,
-                            span.or(witness),
-                            at,
-                            depth,
-                            found,
-                            mode,
-                            at_root,
-                            prov_block,
+                        let witness = span.or(witness);
+                        self.relation_accesses(
+                            *span, cond, depth, found, mode, prov_block, witness,
                         );
+                        self.expr(cond, witness, at, depth, found, mode, at_root, prov_block);
                     }
                     _ => {}
                 }
@@ -2831,6 +2829,7 @@ impl<'a> SetterWalk<'a> {
             Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } | Stmt::MemberWrite { rhs, .. } => rhs,
         };
         let span = stmt.span().or(witness);
+        self.relation_accesses(stmt.span(), expr, depth, found, mode, prov, span);
         // `state.items.push(x)` reads `state`: the receiver of a member write
         // is the one read position the rhs does not carry.
         if let Stmt::MemberWrite { obj, key, .. } = stmt {
@@ -3251,6 +3250,73 @@ impl<'a> SetterWalk<'a> {
         }
         if row.module {
             self.module_rows(fn_, mode, depth, found, prov, stmt_span);
+        }
+    }
+
+    /// What the member reads and writes of the statement at `at` run (#337),
+    /// as the call relation answers it: each accessor body the heap placed
+    /// runs here, in `mode` — a read is a call of the getters it runs, in
+    /// the read's region and phase, wherever the accessor was defined —
+    /// never placed; and module code the analysis does not run, when the
+    /// receiver is read off a module binding (`via`, the statement's
+    /// expression), may call what the module scope holds.
+    #[allow(clippy::too_many_arguments)]
+    fn relation_accesses(
+        &mut self,
+        at: Option<SourceRange>,
+        via: &'a Expr,
+        depth: usize,
+        found: &mut Found,
+        mode: WalkClass,
+        prov: Option<BlockId>,
+        stmt_span: Option<SourceRange>,
+    ) {
+        let calls = self.calls;
+        let Some(row) = calls.accesses(at) else {
+            return;
+        };
+        // What the bodies are reached through, as a call's are: the read.
+        let name = callee_path(via);
+        for &site in &row.bodies {
+            let Some(body) = calls.body(site) else {
+                continue;
+            };
+            if depth == 0 {
+                self.past_budget(site, mode, found, prov, stmt_span);
+                continue;
+            }
+            let reached = match self.of_other_component(site) {
+                true => Reached::Other,
+                false => Reached::Named,
+            };
+            let named = name.clone().filter(|_| matches!(reached, Reached::Named));
+            let mut inner = Found::default();
+            self.path.extend(named.clone());
+            let outer = match calls.accessor(site) {
+                Some(accessor) => self.accessor.replace(accessor.clone()),
+                None => self.accessor.clone(),
+            };
+            self.enter(
+                body,
+                Some(site),
+                reached,
+                depth - 1,
+                &mut inner,
+                WalkClass::Sync,
+                prov,
+                stmt_span,
+            );
+            self.accessor = outer;
+            if named.is_some() {
+                self.path.pop();
+            }
+            if matches!(reached, Reached::Other) {
+                inner.spelled(name.as_deref());
+            }
+            found.absorb(inner, body, mode, None, prov);
+        }
+        if row.module {
+            self.module_rows(via, mode, depth, found, prov, stmt_span);
         }
     }
 

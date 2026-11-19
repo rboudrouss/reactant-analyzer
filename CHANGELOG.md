@@ -380,6 +380,13 @@ on a program React settles; 323 oracle cases, none a known false negative.
   `{ set: setN, run() { this.set(…) } }.run()` in the render is a
   `setter-in-render` Warning where it was silent, and so is a getter of the
   same literal that calls `this.set` (#338).
+- A member read that runs a getter (or a write that runs a setter accessor)
+  is a call of it where the read is, in the read's region and phase, wherever
+  the accessor was defined: a getter of a literal or a class instance a
+  mount-only memo builds, or of a module object, that writes state is a
+  `setter-in-render` Warning where the render reads it, an `infinite-loop`
+  Warning where an effect with no deps does, where both were silent; its
+  message says the render reads (or writes) the member (#337).
 - False Errors: a component mounted only through an element the analysis
   cannot place (`<Comp/>` with `Comp = c ? A : B`, `<parts.C/>`, a mapped list
   of components, a default import under another name, itself) was read as a

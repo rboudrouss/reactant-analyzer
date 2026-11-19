@@ -1,8 +1,7 @@
 // oracle: react=loop
-// oracle: known=fn #337
 // #335's getter twin: a module object's getter calls the setter the render
-// stored in a module binding. A member read has no anchor in the call
-// relation, so the getter's write is placed nowhere.
+// stored in a module binding. The read is a call of module code the
+// analysis does not run, in the render (#337).
 import { useState } from "react";
 
 let setter = null;

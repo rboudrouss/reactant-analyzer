@@ -191,6 +191,17 @@ pub struct CallRelation {
     /// The anchors of the module bindings some write stored a setter or a
     /// closure at ([`crate::engine::ModuleScope`]), in order.
     module: BTreeSet<ExprId>,
+    /// What the member reads and writes of a statement may run (#337), by
+    /// the statement's position: the accessors the heap placed there, as
+    /// bodies, and whether one it does not see may run (`open`), module
+    /// code included (`module`). A member access has no id of its own, so
+    /// every access of one statement — and of every statement at that
+    /// position, a spliced copy's or one lowering gave none — shares a row:
+    /// a may join, never `sure`.
+    accesses: HashMap<Option<crate::ir::SourceRange>, Targets>,
+    /// The half and the member of each accessor body an access ran: what a
+    /// write inside it says runs it.
+    accessors: HashMap<ExprId, crate::engine::setters::AccessorOf>,
 }
 
 impl CallRelation {
@@ -211,6 +222,46 @@ impl CallRelation {
     /// The row of call `id`; `None` when no pass reached it.
     pub fn targets(&self, id: ExprId) -> Option<&Targets> {
         self.calls.get(&id)
+    }
+
+    /// What the member reads and writes of the statement at `at` may run
+    /// (#337); `None` when none may run an accessor.
+    pub fn accesses(&self, at: Option<crate::ir::SourceRange>) -> Option<&Targets> {
+        self.accesses.get(&at)
+    }
+
+    /// The half and the member of the accessor body at `site`, when an
+    /// access ran it.
+    pub fn accessor(&self, site: ExprId) -> Option<&crate::engine::setters::AccessorOf> {
+        self.accessors.get(&site)
+    }
+
+    /// Remember that the body at `site` is the `half` of `member` (`None`:
+    /// a member no constant names).
+    pub fn record_accessor(
+        &mut self,
+        site: ExprId,
+        half: crate::ir::expr::Accessor,
+        member: Option<&str>,
+    ) {
+        self.accessors
+            .entry(site)
+            .or_insert_with(|| (half, member.map(str::to_string)));
+    }
+
+    /// Join one evaluation of an accessing statement at `at` into its row.
+    /// Never `sure`: the row joins every access there.
+    pub fn record_access(&mut self, at: Option<crate::ir::SourceRange>, eval: Evaluation) {
+        self.accesses.entry(at).or_default().join(Targets {
+            setters: eval.setters,
+            bodies: eval.bodies,
+            open: eval.open,
+            sure: Some(false),
+            written: eval.written,
+            escaped: eval.escaped,
+            placed: !eval.escaped,
+            module: eval.module,
+        });
     }
 
     /// What the value handed at `pos` of `anchor` may reach; `None` when
@@ -265,6 +316,15 @@ impl CallRelation {
             // What module scope holds, which a call of module code or a value
             // read off a module binding may reach (#335).
             let mut module = false;
+            // The accessors its member reads and writes run (#337).
+            let mut accessed = BTreeSet::new();
+            for at in positions(body) {
+                if let Some(t) = self.accesses.get(&at) {
+                    accessed.extend(t.bodies.iter().copied());
+                    module |= t.module;
+                }
+            }
+            inner.extend(accessed);
             for (anchor, n) in anchors {
                 if let Some(t) = self.calls.get(&anchor) {
                     out.extend(t.setters.iter().copied());
@@ -385,6 +445,12 @@ impl CallRelation {
         for (id, t) in &other.calls {
             self.calls.entry(*id).or_default().join(t.clone());
         }
+        for (at, t) in &other.accesses {
+            self.accesses.entry(*at).or_default().join(t.clone());
+        }
+        for (site, a) in &other.accessors {
+            self.accessors.entry(*site).or_insert_with(|| a.clone());
+        }
         for (k, e) in &other.escapes {
             let row = self.escapes.entry(*k).or_default();
             row.setters.extend(e.setters.iter().copied());
@@ -405,6 +471,23 @@ impl CallRelation {
         }
         self.module.extend(other.module.iter().copied());
     }
+}
+
+/// The positions of `body`'s statements and of its terminators that carry
+/// an expression: what [`CallRelation::accesses`] is keyed by.
+fn positions(body: &CFG) -> std::collections::HashSet<Option<crate::ir::SourceRange>> {
+    use crate::ir::cfg::Terminator;
+    let mut out = std::collections::HashSet::new();
+    for block in body.blocks.values() {
+        out.extend(block.stmts.iter().map(crate::ir::stmt::Stmt::span));
+        match &block.term {
+            Terminator::Return(_, span) | Terminator::Branch { span, .. } => {
+                out.insert(*span);
+            }
+            Terminator::Jump(_) | Terminator::Unreachable => {}
+        }
+    }
+    out
 }
 
 /// The anchors of `e` and of its sub-expressions — a call's or a `new`'s id

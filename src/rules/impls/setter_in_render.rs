@@ -203,6 +203,11 @@ impl SetterInRender {
             }
             let setter = wording.setter();
             let (rule_name, message) = match (w.owner, &wording.through) {
+                // A write in an accessor's body the render's read or write
+                // runs (#337).
+                (None, _) if sync && wording.accessor().is_some() => {
+                    ("setter-in-render", sync_accessor_message(&wording))
+                }
                 (None, None) if sync => (
                     "setter-in-render",
                     format!(
@@ -451,6 +456,18 @@ fn unknown_phase_message(wording: &Wording) -> String {
          runs it during render, this re-renders on every render",
         wording.setter(),
         wording.through_clause()
+    )
+}
+
+/// The wording of a write in an accessor's body that a member read or write
+/// of the render runs (#337): the render does what runs it.
+fn sync_accessor_message(wording: &Wording) -> String {
+    let (accessor, verb) = wording.accessor().unwrap_or_default();
+    format!(
+        "{} is called{} in {accessor}, and the render {verb} it: move this call into a \
+         useEffect or an event handler",
+        wording.setter(),
+        wording.through_link()
     )
 }
 

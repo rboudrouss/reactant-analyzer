@@ -274,7 +274,9 @@ fn solve<T: Transfer>(
         if let Some(block) = cfg.blocks.get(&b) {
             ctx.heap.share_assigned(&mut env);
             for stmt in &block.stmts {
+                let outer = std::mem::replace(&mut ctx.stmt, stmt.span());
                 exec_full_stmt(transfer, stmt, &mut env, ctx, depth);
+                ctx.stmt = outer;
                 if under_condition(&pc)
                     && let Stmt::Let { var, .. } | Stmt::Assign { var, .. } = stmt
                     && env.contains(var)
@@ -296,8 +298,10 @@ fn solve<T: Transfer>(
                 // take EXPR's value as the return (ADR-020 item 7). The
                 // body's exit is a merge too: a return the other side of a
                 // branch answers with its own takes the branch's condition.
-                Terminator::Return(expr, _) => {
+                Terminator::Return(expr, span) => {
+                    let outer = std::mem::replace(&mut ctx.stmt, *span);
                     let returned = exec_callbacks_depth(transfer, expr, &env, ctx, depth);
+                    ctx.stmt = outer;
                     let mut val = returned
                         .map_or_else(|| transfer.eval_expr(expr, &env, ctx), |ev| ev.as_val());
                     let pc_ret = bound_under(returning.get(&b), &cond_bounds);
@@ -308,8 +312,10 @@ fn solve<T: Transfer>(
                 }
                 // A condition is evaluated, so its calls run; its change
                 // bound is what the blocks it selects run under.
-                Terminator::Branch { cond, .. } => {
+                Terminator::Branch { cond, span, .. } => {
+                    let outer = std::mem::replace(&mut ctx.stmt, *span);
                     exec_expr_effects(transfer, cond, &mut env, ctx, depth);
+                    ctx.stmt = outer;
                     ctx.heap.share_assigned(&mut env);
                     let bound = condition_bound(transfer, cond, cfg, &env, ctx);
                     if cond_bounds.get(&b) != Some(&bound) {
@@ -560,32 +566,57 @@ fn run_accessors<T: Transfer>(
     let member = constant.as_deref();
     let sites = alloc_literal(transfer, obj, env, ctx);
     let unplaced = sites.as_ref().is_none_or(|s| ctx.heap.members(s, member).1);
-    if unplaced && {
+    let unseen = unplaced && {
         let key = access_key(transfer, obj, sites.as_ref(), member, index, env, ctx);
         ctx.heap.unseen_accessor(key)
-    } {
+    };
+    if unseen {
         escape(transfer, obj, env, ctx);
         if let Some(rhs) = written {
             escape(transfer, rhs, env, ctx);
         }
     }
-    let Some(sites) = sites else {
-        return;
-    };
     let kind = match written {
         Some(_) => Accessor::Set,
         None => Accessor::Get,
     };
-    let mut accessors: Vec<ExprId> = ctx
-        .heap
-        .accessors(&sites, kind, member)
-        .ids
-        .into_iter()
-        .collect();
+    let mut accessors: Vec<ExprId> = sites
+        .as_ref()
+        .map(|s| {
+            ctx.heap
+                .accessors(s, kind, member)
+                .ids
+                .into_iter()
+                .collect()
+        })
+        .unwrap_or_default();
+    accessors.sort();
+    // The read is a call of the accessors it runs, anchored where it is
+    // (#337): their bodies run in this statement's region and phase, and
+    // an accessor the analysis does not see — module code included, when
+    // the receiver is read off a module binding — may run here.
+    if unseen || !accessors.is_empty() {
+        let eval = crate::engine::calls::Evaluation {
+            bodies: accessors.iter().copied().collect(),
+            open: unseen,
+            module: unseen && reads_module(obj, ctx),
+            escaped: ctx.escaped,
+            ..Default::default()
+        };
+        let at = ctx.stmt;
+        ctx.record(|r| {
+            for site in &accessors {
+                r.record_accessor(*site, kind, member);
+            }
+            r.record_access(at, eval)
+        });
+    }
+    let Some(sites) = sites else {
+        return;
+    };
     if accessors.is_empty() {
         return;
     }
-    accessors.sort();
     let written = written.map(|rhs| {
         let at = alloc_literal(transfer, rhs, env, ctx);
         EnvVal::located(at, transfer.eval_expr(rhs, env, ctx))

@@ -242,7 +242,13 @@ that writes it (see *Cross-file limits*).
   is what the getter's runs returned, and a write runs the setter with the value. Its body also
   runs at an unknown time, since anything holding the object may read the member (a spread, a
   library): a write in it is a possible write of the render the literal is in, never an Error, and
-  a spread's copy holds what the getter may return, a new object included. A member read off an object the heap does not place —
+  a spread's copy holds what the getter may return, a new object included. A read or a write the
+  analysis evaluates is a call of the accessors it runs, in its own region and phase, wherever
+  the accessor was defined [#337](https://github.com/rboudrouss/reactant-analyzer/issues/337):
+  the call relation anchors it at its statement, since a member access has no id, so every
+  access of one statement (or of statements at one position: a spliced copy's, or several a
+  lowering gave none) runs every accessor any of them ran there, never placed (a Warning, never
+  an Error). A member read off an object the heap does not place —
   a module binding, an instance of a class the analysis does not see, what unknown code returns —
   or a member a placed object does not hold (its
   prototype's) is a call the analysis cannot see when some accessor of the analysed files defines
@@ -278,8 +284,7 @@ that writes it (see *Cross-file limits*).
   where the language shares one function; a parent's constructor that calls a method the child
   overrides runs both bodies, and a method named like a mutating builtin (`set`, `add`, `push`)
   also reads as one on the instance. An accessor's body runs at an unknown time from where the
-  instance is built, as an object literal's does (#321): built in a memo that runs once, a
-  getter the render reads is not reported
+  instance is built, as an object literal's does (#321), and where a read or a write runs it
   [#337](https://github.com/rboudrouss/reactant-analyzer/issues/337).
 - **`this`.** In a non-arrow function `this` is what the call binds it to
   [#338](https://github.com/rboudrouss/reactant-analyzer/issues/338): the receiver of a method call
@@ -305,11 +310,11 @@ that writes it (see *Cross-file limits*).
   into it, and escapes, since code the analysis does not see may read it. A call of module code
   the analysis does not run (a module object's method, a module class's static member, a utility
   called where it is not inlined, a function a binding holds), and a value called or handed on
-  by a binding's name, may call anything any module binding holds, in its own phase. The
+  by a binding's name, may call anything any module binding holds, in its own phase; so may a
+  read off a module binding that may run an accessor the analysis does not see (#337). The
   slots are one pool for such a call, whatever module it reads. What stays as before: the value
   a read of the binding binds, in a component other than the one that stored it, is not the
-  setter, so an alias there (`const s = setter; s()`) is not followed; a getter of a module object
-  is a read the call relation does not place (#337); a name a component declares anywhere is its
+  setter, so an alias there (`const s = setter; s()`) is not followed; a name a component declares anywhere is its
   own, never the module's; a setter handed to code the analysis does not see, which that code
   keeps (a library, a module function storing its argument), still runs where it escaped.
 - **Mount-coupled seeds.** `frozen-initial-state` drops to Info, hidden without `--info`, when every
