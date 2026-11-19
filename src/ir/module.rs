@@ -40,6 +40,22 @@ pub struct ModuleFacts {
     /// The names this module exports *from another analyzed file* — what a
     /// barrel is made of (#49, #226).
     pub re_exports: ReExports,
+    /// The definitions this module reads as a value, anywhere but as a JSX
+    /// element's tag or in an `export` clause (#313): what an element whose
+    /// type the analysis cannot place (`<Comp/>` with `Comp = c ? A : B`), a
+    /// library or a lazy import may mount.
+    pub value_refs: Vec<ValueRef>,
+}
+
+/// A definition a module reads as a value ([`ModuleFacts::value_refs`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ValueRef {
+    /// The definition `name` of `file`, as the module's own top-level name or
+    /// a named import resolves it.
+    Named(PathBuf, String),
+    /// Any definition of `file`: a default or namespace import, a dynamic
+    /// `import()`.
+    File(PathBuf),
 }
 
 impl ModuleFacts {

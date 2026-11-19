@@ -255,7 +255,13 @@ relation is read once per program from the element tree: `p` is a parent of
 resolves to `c` — the element's creator, which is who hands `c` its props.
 `stays(c)` holds when every such element sits outside closures, under
 guards and a `key` that hold still in `p`, and `stays(p)`; a root stays, a
-cycle of the tree fails closed. Only a component that stays may carry a
+cycle of the tree fails closed. The tree resolves a child as the engine does
+(its proven origin, else the one component of that name), and a component an
+element the tree cannot place may mount never stays: one a module reads as a
+value (`c ? A : B`, `{ A }`, `[A]`, a lazy `import()`), one whose name
+several components share, every component of a file an element names under a
+definition the table does not resolve, one that renders itself (#313).
+Only a component that stays may carry a
 `Must` edge, and only its mount-only effects fire once. The props node
 `P_c` stands for "the props of `c` moved": its in-edges are every slot of
 every ancestor that a non-`Handler` write moves (the `P_parent → P_c` edge

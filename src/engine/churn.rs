@@ -114,11 +114,12 @@ use crate::{
         written::{SiteEnvs, Written, churning_part, keeps_initial},
     },
     ir::{
-        ComponentId, QualifiedSlot, SourceRange,
+        CompOrigin, ComponentId, QualifiedSlot, SourceRange,
         bindings::{binds, local_bindings, must_param, nested_bodies},
         cfg::{CFG, Terminator},
         expr::{Expr, Prim, SPREAD_KEY_PREFIX, object_getter, object_member},
         hooks::HookEntry,
+        module::ValueRef,
         stmt::Stmt,
         types::{BlockId, HookLabel, Symbol, Var},
     },
@@ -369,8 +370,110 @@ struct Element<'a> {
 
 /// The program's component tree, child → the elements that mount it (#213).
 /// A component another one renders only through a value the lowering cannot
-/// place (`origin: None`) has no element here.
+/// place (`origin: None`) has no element here: [`mounted_unplaced`] says
+/// which components that may be.
 type ComponentTree<'a> = HashMap<ComponentId, Vec<Element<'a>>>;
+
+/// The components an element the tree does not place may mount (#313), so
+/// that nothing proves they stay mounted: one a module reads as a value (a
+/// ternary or a collection of components, a prop a library mounts, a lazy
+/// import), one whose name several components share, every component of a
+/// file an element names under a definition the table does not resolve (a
+/// default export under another name, a barrel), and one that renders
+/// itself. A component outside all of them is mounted only by the elements
+/// of the tree, or is a root.
+fn mounted_unplaced(result: &ProgramAnalysisResult) -> HashSet<ComponentId> {
+    let table = &result.component_table;
+    let modules = &result.module_table;
+    let graph = modules.re_export_graph();
+    let defines = |p: &std::path::Path, n: &str| {
+        table
+            .id_of(&CompOrigin {
+                file: p.to_path_buf(),
+                name: n.to_string(),
+            })
+            .is_some()
+    };
+    let mut out: HashSet<ComponentId> = HashSet::new();
+    // Any definition of `file`, and of the files it re-exports from.
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    let named = |file: &std::path::Path, name: &str, out: &mut HashSet<ComponentId>| {
+        let (f, n) = graph
+            .origin(file, name, &defines)
+            .unwrap_or_else(|| (file.to_path_buf(), name.to_string()));
+        match table.id_of(&CompOrigin { file: f, name: n }) {
+            Some(id) => {
+                out.insert(id);
+            }
+            None => out.extend(table.ids_named(name)),
+        }
+    };
+    for path in modules.paths() {
+        for r in modules.facts(path).map_or(&[][..], |f| &f.value_refs) {
+            match r {
+                ValueRef::Named(file, name) => named(file, name, &mut out),
+                ValueRef::File(file) => files.push(file.clone()),
+            }
+        }
+    }
+    for r in &result.components {
+        r.1.render_cfg.for_each_expr(&mut |e| {
+            walk_elements(e, &mut |name, origin| {
+                let by_origin = origin.and_then(|o| table.id_of(o));
+                match by_origin {
+                    Some(child) if child == *r.0 => {
+                        out.insert(child);
+                    }
+                    Some(_) => {}
+                    None => {
+                        let same: Vec<ComponentId> = table.ids_named(name).collect();
+                        if same.len() > 1 {
+                            out.extend(same.iter().copied());
+                        } else if same.as_slice() == [*r.0] {
+                            out.insert(*r.0);
+                        }
+                        if let Some(o) = origin
+                            && same.is_empty()
+                        {
+                            files.push(o.file.clone());
+                        }
+                    }
+                }
+            });
+        });
+    }
+    let mut seen: HashSet<std::path::PathBuf> = HashSet::new();
+    while let Some(file) = files.pop() {
+        if !seen.insert(file.clone()) {
+            continue;
+        }
+        out.extend(
+            table
+                .ids()
+                .filter(|&id| table.origin(id).is_some_and(|o| o.file == file)),
+        );
+        if let Some(facts) = modules.facts(&file) {
+            for (_, from, imported) in &facts.re_exports.named {
+                named(from, imported, &mut out);
+                files.push(from.clone());
+            }
+            files.extend(facts.re_exports.star.iter().cloned());
+        }
+    }
+    out
+}
+
+/// Every element under `e`, closures included: its tag as written and the
+/// component the lowering proved it names.
+fn walk_elements<'a>(e: &'a Expr, f: &mut dyn FnMut(&'a str, Option<&'a CompOrigin>)) {
+    if let Expr::CompApp { name, origin, .. } = e {
+        f(name, origin.as_deref());
+    }
+    if let Expr::FnLit { body_cfg, .. } = e {
+        body_cfg.for_each_expr(&mut |x| walk_elements(x, f));
+    }
+    e.for_each_child(&mut |c| walk_elements(c, f));
+}
 
 fn component_tree(result: &ProgramAnalysisResult) -> ComponentTree<'_> {
     /// Every node under `e`, with whether it sits inside a closure.
@@ -392,15 +495,23 @@ fn component_tree(result: &ProgramAnalysisResult) -> ComponentTree<'_> {
             block.for_each_expr(&mut |e| {
                 walk(e, false, &mut |e, closure| {
                     let Expr::CompApp {
-                        origin: Some(o),
+                        name,
+                        origin,
                         props,
                         ..
                     } = e
                     else {
                         return;
                     };
-                    let Some(child) = result.component_table.id_of(o) else {
-                        return;
+                    // As the engine resolves the child it analyses: the
+                    // proven origin, else the one component of that name.
+                    let table = &result.component_table;
+                    let child = match origin.as_deref().and_then(|o| table.id_of(o)) {
+                        Some(child) => child,
+                        None => match table.ids_named(name).collect::<Vec<_>>()[..] {
+                            [child] => child,
+                            _ => return,
+                        },
                     };
                     if child == parent {
                         return;
@@ -603,8 +714,12 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
     }
 
     // Which components stay mounted across the loop, on the component tree
-    // (#162, #213).
-    let mut stays_memo: HashMap<ComponentId, bool> = HashMap::new();
+    // (#162, #213). One an element the tree does not place may mount does
+    // not: nothing says what that element is under (#313).
+    let mut stays_memo: HashMap<ComponentId, bool> = mounted_unplaced(result)
+        .into_iter()
+        .map(|c| (c, false))
+        .collect();
     let kept_mounted: HashMap<ComponentId, bool> = result
         .components
         .keys()
@@ -813,9 +928,11 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
     /// and is its parent kept mounted in turn (#213)? An element keeps its
     /// child when it sits outside any closure, under guards that hold still
     /// in the parent, with no `key` or one that holds. A component no
-    /// element mounts is a root and stays; one the table cannot place, or
-    /// one met again while its own answer is pending (a component that
-    /// renders an ancestor of itself), fails closed.
+    /// element mounts is a root and stays — `memo` starts with every one an
+    /// element the tree does not place may mount ([`mounted_unplaced`]),
+    /// which does not; one the table cannot place, or one met again while
+    /// its own answer is pending (a component that renders an ancestor of
+    /// itself), fails closed.
     fn stays(
         c: ComponentId,
         tree: &ComponentTree<'_>,

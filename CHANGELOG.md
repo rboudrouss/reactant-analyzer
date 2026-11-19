@@ -336,6 +336,11 @@ on a program React settles; 323 oracle cases, none a known false negative.
   setter that writes state is reported where its member is read or written.
   An object the analysis does not place (a module binding, a class instance)
   is still read as holding still (#321, #334).
+- False Errors: a component mounted only through an element the analysis
+  cannot place (`<Comp/>` with `Comp = c ? A : B`, `<parts.C/>`, a mapped list
+  of components, a default import under another name, itself) was read as a
+  root that stays mounted, so its every-render loop was certain where the
+  element may unmount it. It is a Warning now (#313).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

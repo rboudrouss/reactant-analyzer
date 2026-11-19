@@ -1,12 +1,14 @@
 //! Collect the per-file [`ModuleFacts`] — directive prologue and resolved
 //! import edges (ADR-026 §1).
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use oxc_ast::ast::{ImportOrExportKind, Program, Statement};
+use oxc_ast::ast::*;
+use oxc_ast_visit::{Visit, walk};
 
 use crate::ir::ModuleFacts;
-use crate::ir::module::ReExports;
+use crate::ir::module::{ReExports, ValueRef};
 use crate::resolver::ImportResolver;
 
 /// Read `file`'s directive prologue and its resolved module edges.
@@ -102,7 +104,100 @@ pub fn collect_module_facts(
         imports,
         compiled_entries,
         re_exports,
+        value_refs: value_refs(program, file, resolver),
     }
+}
+
+/// The definitions `program` reads as a value (#313): every identifier read
+/// outside a JSX element's tag, an `export` clause and a type, resolved to
+/// this file's own top-level name or through an import; a default or
+/// namespace import, and a dynamic `import()` of a file, stand for any
+/// definition of that file. A name bound nowhere at the top level and
+/// imported from no analyzed file names no definition of the program.
+fn value_refs(program: &Program, file: &Path, resolver: &dyn ImportResolver) -> Vec<ValueRef> {
+    let mut bindings: HashMap<String, ValueRef> = HashMap::new();
+    for name in super::top_level_binding_names(program) {
+        bindings.insert(name.clone(), ValueRef::Named(file.to_path_buf(), name));
+    }
+    for stmt in &program.body {
+        let Statement::ImportDeclaration(decl) = stmt else {
+            continue;
+        };
+        let Some(from) = resolver.resolve(file, decl.source.value.as_str()) else {
+            continue;
+        };
+        for spec in decl.specifiers.iter().flatten() {
+            let (local, r) = match spec {
+                ImportDeclarationSpecifier::ImportSpecifier(s) => (
+                    s.local.name.to_string(),
+                    ValueRef::Named(from.clone(), s.imported.name().to_string()),
+                ),
+                ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => {
+                    (s.local.name.to_string(), ValueRef::File(from.clone()))
+                }
+                ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => {
+                    (s.local.name.to_string(), ValueRef::File(from.clone()))
+                }
+            };
+            bindings.insert(local, r);
+        }
+    }
+    let mut scan = ValueScan {
+        bindings: &bindings,
+        file,
+        resolver,
+        found: HashSet::new(),
+    };
+    scan.visit_program(program);
+    let mut found: Vec<ValueRef> = scan.found.into_iter().collect();
+    found.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+    found
+}
+
+struct ValueScan<'r> {
+    bindings: &'r HashMap<String, ValueRef>,
+    file: &'r Path,
+    resolver: &'r dyn ImportResolver,
+    found: HashSet<ValueRef>,
+}
+
+impl<'a> Visit<'a> for ValueScan<'_> {
+    fn visit_identifier_reference(&mut self, it: &IdentifierReference<'a>) {
+        if let Some(r) = self.bindings.get(it.name.as_str()) {
+            self.found.insert(r.clone());
+        }
+    }
+
+    // `<C/>`: the element tree places it. A member tag (`<parts.C/>`) reads
+    // its object.
+    fn visit_jsx_element_name(&mut self, it: &JSXElementName<'a>) {
+        if !matches!(it, JSXElementName::IdentifierReference(_)) {
+            walk::walk_jsx_element_name(self, it);
+        }
+    }
+
+    // An export hands the name to importers, whose reads are theirs.
+    fn visit_export_specifier(&mut self, _it: &ExportSpecifier<'a>) {}
+
+    fn visit_export_default_declaration_kind(&mut self, it: &ExportDefaultDeclarationKind<'a>) {
+        if !matches!(it, ExportDefaultDeclarationKind::Identifier(_)) {
+            walk::walk_export_default_declaration_kind(self, it);
+        }
+    }
+
+    fn visit_import_expression(&mut self, it: &ImportExpression<'a>) {
+        if let Expression::StringLiteral(s) = &it.source
+            && let Some(from) = self.resolver.resolve(self.file, s.value.as_str())
+        {
+            self.found.insert(ValueRef::File(from));
+        }
+        walk::walk_import_expression(self, it);
+    }
+
+    // Types are erased before anything runs.
+    fn visit_ts_type(&mut self, _it: &TSType<'a>) {}
+    fn visit_ts_type_annotation(&mut self, _it: &TSTypeAnnotation<'a>) {}
+    fn visit_ts_type_parameter_instantiation(&mut self, _it: &TSTypeParameterInstantiation<'a>) {}
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

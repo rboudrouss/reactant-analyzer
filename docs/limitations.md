@@ -209,7 +209,13 @@ that writes it (see *Cross-file limits*).
   outside closures, on every path or behind guards that hold still, without a `key` that moves,
   and its parent stays mounted in turn ([#213](https://github.com/rboudrouss/reactant-analyzer/issues/213)).
   A child rendered from a `.map` callback (any closure) is read as remounting, the fail-closed
-  side [#162](https://github.com/rboudrouss/reactant-analyzer/issues/162).
+  side [#162](https://github.com/rboudrouss/reactant-analyzer/issues/162). So is one an element
+  the tree cannot place may mount: a component some module reads as a value (`c ? A : B`,
+  `{ A }`, `[A]`, a lazy `import()`), one whose name several components share, every component
+  of a file an element names under a definition the table does not resolve, one that renders
+  itself [#313](https://github.com/rboudrouss/reactant-analyzer/issues/313). A component
+  referenced only by code the analysis does not read (a file it skipped, a `require`) is still
+  read as a root.
 - `x.slice()` and `x.concat()` are proven fresh only when `x` can only be an object: on a string they
   return a primitive, so a receiver of unknown kind (a prop, a nullable value) leaves the result
   unknown [#22](https://github.com/rboudrouss/reactant-analyzer/issues/22).
