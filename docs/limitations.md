@@ -258,6 +258,9 @@ that writes it (see *Cross-file limits*).
   which may run without an event, or store a name of the render: a sync the relation does not
   recognise (an opaque deps list, a dep computed from the prop, another prop the same slot moves,
   an unknown callee) is still a sync [#313](https://github.com/rboudrouss/reactant-analyzer/issues/313).
+  And the Error needs one call site in the feeding component that keeps an instance mounted: no
+  guard, no `key`, outside closures. A `key` or guard that happens to hold when the prop moves
+  (`key={label.id}` over a rename) is a Warning, since whether it holds is a value no proof reads.
 - **Per-call-site facts.** A child's result is its analysis under the join of every call site
   [#175](https://github.com/rboudrouss/reactant-analyzer/issues/175). The child is also
   re-analysed under each call site alone: a dep fresh through one parent is reported by

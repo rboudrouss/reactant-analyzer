@@ -34,8 +34,9 @@ use crate::rules::{
 ///   on an event and stores nothing the render holds, so none re-syncs it
 ///   (#313: no sync *seen* is not that), the local setter never escapes
 ///   this component (nothing else could sync it), and the move is *observable*
-///   — no call site ties the mount condition to the feeder's own writers, and
-///   every analysed call site passes the feeder.
+///   — a call site in the feeder's owner keeps an instance mounted across its
+///   writes (no guard, no `key`, outside closures: [`MountCoupling::Free`],
+///   #313), and every analysed call site passes the feeder.
 /// - **Warning**: the freeze is real but the prop's motion is not proven
 ///   (props ⊤ in intra-only analysis, `VersionedTop`, per-render or unknown
 ///   values), or the proof chain has a hole (setter escapes, feeding slot's
@@ -189,7 +190,7 @@ impl Rule for FrozenInitialState {
                         .unwrap_or_default(),
                     result,
                 ),
-                None => MountCoupling::Free,
+                None => MountCoupling::Unobserved,
             };
 
             // Every row of one slot carries the same escape verdict — it is a
@@ -208,10 +209,9 @@ impl Rule for FrozenInitialState {
                     // the mount condition moves with the feeder, so no mounted
                     // instance need ever observe the change. `Unfed`: some
                     // instance is mounted where no feeder reaches it.
-                    let severity = if escaped
-                        || !only_on_events
-                        || matches!(mount, MountCoupling::WriterCoupled | MountCoupling::Unfed)
-                    {
+                    // `Unobserved`: no call site is proven to keep an
+                    // instance mounted across the move.
+                    let severity = if escaped || !only_on_events || mount != MountCoupling::Free {
                         Severity::Warning
                     } else {
                         Severity::Error

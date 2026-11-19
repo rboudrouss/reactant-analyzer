@@ -351,6 +351,11 @@ on a program React settles; 323 oracle cases, none a known false negative.
   deps list, by a value computed from the prop or by another prop, or a write
   through a callee the analysis does not see, re-syncs the slot where no sync
   was recognised. Each was a false Error; it is a Warning now (#313).
+- `frozen-initial-state` is an Error only when a call site in the component
+  that owns the feeding state renders the consumer with no guard and no `key`,
+  outside closures: a `key={user.name}` or a guard (`{open && <Child/>}`) may
+  remount it, or hide it whenever the prop moves, and the consumer then reads
+  the new value. A Warning there now, as when no call site is visible (#313).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error
