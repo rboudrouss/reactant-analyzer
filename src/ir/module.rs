@@ -18,6 +18,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
+use crate::assumptions::{Assumption, Assumptions};
+
 /// What one lowered file declares about itself.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModuleFacts {
@@ -86,6 +88,11 @@ pub struct AccessorNames {
     /// prototype (`Object.setPrototypeOf(o, p)`, `o.__proto__ = p`): any
     /// object of the program, a `Proxy` included, may then be on any chain.
     reprototyped: bool,
+    /// The run declares that plain objects run no accessor of the program
+    /// ([`Assumption::PlainObjectsRunNoAccessor`], ADR-048). A premise of the
+    /// run, not a fact of the files: set by [`AccessorNames::under`], never
+    /// by lowering.
+    plain_runs_none: bool,
 }
 
 /// Member names, as far as which keys they may spell goes.
@@ -190,6 +197,7 @@ impl AccessorNames {
         self.all.extend(&other.all);
         self.installed.extend(&other.installed);
         self.reprototyped |= other.reprototyped;
+        self.plain_runs_none |= other.plain_runs_none;
     }
 
     /// May a read or a write of `key` run an accessor of the program?
@@ -197,11 +205,20 @@ impl AccessorNames {
         self.all.may_name(key)
     }
 
+    /// These names under the assumptions the run declares (ADR-048).
+    pub fn under(mut self, assumptions: &Assumptions) -> Self {
+        self.plain_runs_none |= assumptions.holds(Assumption::PlainObjectsRunNoAccessor);
+        self
+    }
+
     /// May a read or a write of `key` off a plain object the library builds
     /// run an accessor of the program? Only one a descriptor installed, or
-    /// any when the program sets a prototype it may hand such an object to.
+    /// any when the program sets a prototype it may hand such an object to,
+    /// unless the run declares that none does (the one place
+    /// [`Assumption::PlainObjectsRunNoAccessor`] is read).
     pub fn may_run_off_plain(&self, key: AccessKey<'_>) -> bool {
-        self.installed.may_name(key) || (self.reprototyped && self.may_run(key))
+        !self.plain_runs_none
+            && (self.installed.may_name(key) || (self.reprototyped && self.may_run(key)))
     }
 
     /// No accessor of the program may run at any read.
@@ -468,6 +485,34 @@ mod tests {
             out.define(None);
         }
         out
+    }
+
+    /// The declared premise silences exactly the plain-object reads: both
+    /// halves (an installed accessor, a re-prototyped program) at once, and
+    /// no other read.
+    #[test]
+    fn the_assumption_silences_only_the_plain_object_reads() {
+        let mut installed = defining(&["p"], false);
+        installed.install(Some("p"));
+        let mut reprototyped = defining(&["q"], false);
+        reprototyped.reprototype();
+        let mut declared = Assumptions::default();
+        declared.declare(Assumption::PlainObjectsRunNoAccessor);
+        for (names, key) in [(installed, "p"), (reprototyped, "q")] {
+            assert!(names.may_run_off_plain(AccessKey::Named(key)));
+            let under = names.under(&declared);
+            assert!(!under.may_run_off_plain(AccessKey::Named(key)));
+            assert!(!under.may_run_off_plain(AccessKey::Any));
+            assert!(under.may_run(AccessKey::Named(key)));
+        }
+        // Not declared: unchanged.
+        let mut installed = defining(&["p"], false);
+        installed.install(Some("p"));
+        assert!(
+            installed
+                .under(&Assumptions::default())
+                .may_run_off_plain(AccessKey::Named("p"))
+        );
     }
 
     #[test]

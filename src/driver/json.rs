@@ -24,6 +24,9 @@ struct JsonReport<'a> {
     /// What the run knows it did not read. Non-empty means `summary.errors` and
     /// `summary.warnings` are a lower bound, not a verdict (#9, #47).
     blind_spots: Vec<JsonBlindSpot<'a>>,
+    /// The assumptions the run declared (ADR-048), by name: the premises the
+    /// findings were computed under. Always present, empty by default.
+    assumptions: Vec<&'static str>,
     /// Present only under `--follow-imports` (#138): what the run read beyond
     /// the named paths, and what it found there and is not reporting.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -301,6 +304,12 @@ pub fn render(
                 count: b.count,
                 detail: &b.detail,
             })
+            .collect(),
+        assumptions: report
+            .assumptions
+            .in_force()
+            .iter()
+            .map(|a| a.name())
             .collect(),
         followed: report.followed.as_ref().map(|f| JsonFollowed {
             files: f.files,

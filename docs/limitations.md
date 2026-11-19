@@ -269,7 +269,10 @@ that writes it (see *Cross-file limits*).
   accessor a descriptor installs (on it or on `Object.prototype`, whatever the target, since the
   analysis does not know it) or one of a prototype the program sets: one descriptor installed
   under a name no constant spells (a polyfill looping over property names) makes every such read
-  a possible call again. The props of a component no element of the analysis renders, the state
+  a possible call again (declaring
+  [`plainObjectsRunNoAccessor`](usage.md#assumptions) takes that reading off, at the price of the
+  loop through a getter on `Object.prototype`: an assumption, off by default and stated in the
+  output, [ADR-048](adr/ADR-048-assumptions-are-configuration.md)). The props of a component no element of the analysis renders, the state
   and context values and a callback's arguments keep the program-wide reading. Not seen:
   a getter defined by code the analysis does not read (a library, a skipped file), which is still
   read as the receiver's member, a prototype set under a key no constant spells (`o[k] = p`) or

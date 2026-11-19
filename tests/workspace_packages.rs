@@ -204,6 +204,7 @@ fn check(files: &[(&str, &str)]) -> Vec<(String, String)> {
         entry: vec![],
         exclude_dirs: vec![],
         follow_imports: false,
+        assumptions: Default::default(),
         format: ReportFormat::Json,
         per_component: true,
         fail_on: reactant::driver::FailOn::Never,

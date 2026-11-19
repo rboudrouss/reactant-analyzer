@@ -58,6 +58,7 @@ reactant check src/ --ignore-rule derived-state  # all but this one
 | `--all-roots` | Analyze every component as an entry point (`props = ⊤`). |
 | `--exclude-dir <names>` | Directory names never walked, matched at any depth. Repeatable or comma-separated. **Replaces** the default policy (see [Discovery](#plain-everything-else)) rather than adding to it; `node_modules/` and `.git/` are skipped regardless. |
 | `--follow-imports` | Also analyze the files the named paths import, transitively, so their hooks are read instead of treated as opaque. The report still covers only the paths you named. **Not a speed optimization**, see [Following imports](#following-imports---follow-imports). |
+| `--assume <name>` | Take a statement about your program as true (repeatable; adds to the config's `assumptions`). Off by default, stated in the output; an unknown name exits with code 2. See [Assumptions](#assumptions). |
 | `--verbose` | Debug output on stderr: symbol graph topo order, fixpoint stats, per-component iterations/widened labels. |
 | `--no-color` | Disable ANSI colors. Also honored: a non-empty `NO_COLOR` env var, or stdout not being a terminal. |
 | `--config <path>` | Config file to use (default: `<project root>/reactant.config.json` when present). Also accepted by `rules` and `explain` (their default root is the cwd). |
@@ -99,7 +100,8 @@ degrades to defaults. CLI flags beat config values.
   },
   // check-flag equivalents (camelCase): entry, excludeDirs, followImports,
   // allRoots, failOn, project, format, info, showClean, trace
-  "failOn": "error"
+  "failOn": "error",
+  "assumptions": { "plainObjectsRunNoAccessor": true }   // see Assumptions
 }
 ```
 
@@ -391,6 +393,7 @@ path from an entry leaves that subtree unclassified.
     { "kind": "unread-imports", "count": 3,
       "detail": "3 imported file(s) resolved outside the analysed set ..." }
   ],
+  "assumptions": [],
   "summary": {
     "errors": 0, "warnings": 1, "infos": 0,
     "components_analyzed": 5, "exit_code": 1
@@ -456,6 +459,11 @@ Semantics:
   the occurrences, `detail` is the sentence the human renderer prints.
   A blind spot is *not* a finding: it never changes the exit code (added in
   v2, and a v2 consumer written before this field can ignore it).
+- `assumptions` is the names of the [assumptions](#assumptions) the run
+  declared: the premises its findings were computed under. Always present;
+  empty unless the config or `--assume` declared one. A finding's level does
+  not change under an assumption, so this array is the only place the premise
+  shows in the data: compare runs with it.
 
 ## JavaScript API
 
@@ -644,6 +652,81 @@ example above, an undeclared read of `useThing()`'s result still raises
 `missing-deps` (when it is on) with "its value may change between renders". Withholding an
 assurance is not the same as withholding an alert, and reactant does only the
 former.
+
+## Assumptions
+
+An *assumption* is a statement about your program that the analysis takes as
+true when you declare it, and never otherwise ([ADR-048](adr/ADR-048-assumptions-are-configuration.md)).
+It buys precision where the sound reading is expensive, at the price of the
+findings that depend on the statement being false. It is off by default.
+
+```jsonc
+// reactant.config.json
+{ "assumptions": { "plainObjectsRunNoAccessor": true } }
+```
+
+or `reactant check --assume plainObjectsRunNoAccessor` (repeatable; the flag
+adds to the config). A misspelt name is an error (exit 2). The run states what
+it assumed, once: the human output prints `1 assumption in force: plain objects
+run no accessor of the program` next to the summary (not behind `--info`), and
+the JSON document's `assumptions` array lists the names. A finding keeps the
+level its proof gives; the premise is stated beside it, never folded into it.
+A "no issues found" under an assumption is read with that line.
+
+### `plainObjectsRunNoAccessor`
+
+No accessor of the program sits on `Object.prototype`, and no prototype is set
+on a props or ref object. Where the program installs an accessor on a target the
+analysis cannot resolve, the premise is that the target is neither. A member
+read off a plain object React builds (a child's props, a `useRef` object) then
+runs no code of the program, wherever the member is absent.
+
+**What it recovers.** By default, one `Object.defineProperty(target, name,
+{ get })` whose `target` or `name` the analysis cannot resolve (a polyfill
+looping over property names, installing on `window` or on a variable) makes
+every read of a prop the parent does not pass a possible call of that getter,
+so the value is not known to be stable and the effect that depends on it is not
+known to settle. On `twenty` that was 48 `always-unstable-deps` rows and 7
+cross-component cycle rows, plus 15 % more body runs; on excalidraw, a sound
+false positive (`CustomStats.tsx`). The same holds for an unrelated object the
+program re-prototypes:
+
+```tsx
+const trap = new Proxy({}, { get: () => ({}) });
+const other: any = {};
+Object.setPrototypeOf(other, trap);          // some object of the program
+
+function App() {
+  const ref: any = useRef(null);
+  useEffect(() => { setN((c) => c + 1); }, [ref.missing]);  // loop reported
+  …                                                        // by default,
+}                                                          // not with the premise
+```
+
+**What it misses.** A loop that really runs through such an accessor, when the
+premise is false. React really loops on a getter installed on
+`Object.prototype` under the name of a prop the parent does not pass:
+
+```tsx
+Object.defineProperty(Object.prototype, "hide", { get() { return {}; }, configurable: true });
+function C({ hide }: { hide?: object }) {         // <C /> passes no `hide`
+  const [n, setN] = useState(0);
+  useEffect(() => { setN((c) => c + 1); }, [hide]);  // a new object each render
+  …
+}
+```
+
+Declared, the analysis reports nothing there (the oracle case
+`plain-absent-prop-object-prototype-getter-loops` becomes a false negative).
+It does not touch an accessor on an object the analysis *places*: a getter
+defined on the ref itself (`Object.defineProperty(ref, "current", { get })`)
+and a prototype set on the ref (`Object.setPrototypeOf(ref, trap)`) are read as
+the program says, and their loops stay reported
+(`plain-ref-defined-accessor-loops`, `plain-ref-prototype-proxy-loops`).
+
+Declare it when your program has none of these: no getter on
+`Object.prototype`, no prototype set on a props or ref object. A library you
+analyse that does one is a program that does.
 
 ## Fixtures
 

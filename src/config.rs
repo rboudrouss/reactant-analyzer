@@ -18,6 +18,7 @@ use serde::Deserialize;
 #[cfg(feature = "schema-gen")]
 use schemars::JsonSchema;
 
+use crate::assumptions::{Assumption, Assumptions};
 use crate::project::strip_jsonc;
 use crate::rules::Severity;
 
@@ -64,6 +65,10 @@ pub struct ReactantConfig {
     /// still covers only the named paths. Not a speed optimization.
     #[serde(default)]
     pub follow_imports: Option<bool>,
+    /// Statements about the analysed program the analysis takes as true
+    /// (ADR-048). All off by default; the run states the ones in force.
+    #[serde(default)]
+    pub assumptions: Assumptions,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -245,9 +250,21 @@ pub struct CheckArgsPartial {
     pub entry: Vec<String>,
     pub exclude_dirs: Vec<String>,
     pub follow_imports: bool,
+    /// What `--assume` declared; the config's section is added by `merge`.
+    pub assumptions: Assumptions,
     pub format: Option<FormatConfig>,
     pub fail_on: Option<FailOnConfig>,
     pub project: Option<ProjectConfig>,
+}
+
+/// The assumptions `--assume <name>` arguments declare. An unknown name is an
+/// error naming the valid ones: a misspelt premise must not run as no premise.
+pub fn parse_assumptions(names: &[String]) -> Result<Assumptions, String> {
+    let mut out = Assumptions::default();
+    for name in names {
+        out.declare(Assumption::parse(name).map_err(|e| format!("`--assume {name}`: {e}"))?);
+    }
+    Ok(out)
 }
 
 impl CheckArgsPartial {
@@ -265,6 +282,7 @@ impl CheckArgsPartial {
         self.show_clean |= cfg.show_clean.unwrap_or(false);
         self.trace |= cfg.trace.unwrap_or(false);
         self.follow_imports |= cfg.follow_imports.unwrap_or(false);
+        self.assumptions.merge(&cfg.assumptions);
         self.fail_on = self.fail_on.or(cfg.fail_on);
         self.format = self.format.or(cfg.format);
         self.project = self.project.or(cfg.project);
@@ -408,6 +426,55 @@ mod tests {
         assert_eq!(cfg.project, Some(ProjectConfig::Vite));
         assert_eq!(cfg.format, Some(FormatConfig::Json));
         assert_eq!(cfg.entry, vec!["App".to_string()]);
+    }
+
+    #[test]
+    fn assumptions_are_off_unless_declared() {
+        assert!(parse("{}").unwrap().assumptions.in_force().is_empty());
+        let cfg = parse(r#"{ "assumptions": { "plainObjectsRunNoAccessor": true } }"#).unwrap();
+        assert_eq!(
+            cfg.assumptions.in_force(),
+            [Assumption::PlainObjectsRunNoAccessor]
+        );
+        let cfg = parse(r#"{ "assumptions": {} }"#).unwrap();
+        assert!(cfg.assumptions.in_force().is_empty());
+    }
+
+    #[test]
+    fn a_misspelt_assumption_is_an_error() {
+        let err = parse(r#"{ "assumptions": { "plainObjectRunNoAccessor": true } }"#).unwrap_err();
+        assert!(err.contains("plainObjectRunNoAccessor"), "{err}");
+        assert!(err.contains("plainObjectsRunNoAccessor"), "{err}");
+    }
+
+    #[test]
+    fn the_flag_adds_to_the_config_section() {
+        let on = parse(r#"{ "assumptions": { "plainObjectsRunNoAccessor": true } }"#).unwrap();
+        let off = parse(r#"{ "assumptions": { "plainObjectsRunNoAccessor": false } }"#).unwrap();
+
+        let mut partial = CheckArgsPartial::default();
+        partial.merge(&on);
+        assert_eq!(
+            partial.assumptions.in_force(),
+            [Assumption::PlainObjectsRunNoAccessor]
+        );
+
+        let mut partial = CheckArgsPartial {
+            assumptions: parse_assumptions(&["plainObjectsRunNoAccessor".to_string()]).unwrap(),
+            ..Default::default()
+        };
+        partial.merge(&off);
+        assert_eq!(
+            partial.assumptions.in_force(),
+            [Assumption::PlainObjectsRunNoAccessor]
+        );
+
+        let mut partial = CheckArgsPartial::default();
+        partial.merge(&off);
+        assert!(partial.assumptions.in_force().is_empty());
+
+        let err = parse_assumptions(&["nope".to_string()]).unwrap_err();
+        assert!(err.contains("`--assume nope`"), "{err}");
     }
 
     #[test]
