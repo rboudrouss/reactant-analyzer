@@ -84,8 +84,10 @@ pub struct Members {
     pub open: bool,
     pub unseen: bool,
     pub persists: bool,
-    /// An array literal's object, whose `length` is its own (#336). A
-    /// property of the site, so a join keeps it from either side.
+    /// An array: a literal's object, or the new one a builtin returns
+    /// (#312), whose `length` is its own (#336) and whose methods are the
+    /// language's. A property of the site, so a join keeps it from either
+    /// side.
     pub array: bool,
     /// A plain object the library builds — React's props object, `useRef`'s
     /// — whose reads run no accessor but one a descriptor installed or a
@@ -394,8 +396,8 @@ impl Heap {
                 .all(|id| matches!(self.get(*id), Some(HeapValue::Obj(m)) if m.plain))
     }
 
-    /// Is every object `sites` may name an array literal's, and nothing
-    /// else (#336)?
+    /// Is every object `sites` may name an array, and nothing else (#336,
+    /// #312)?
     pub fn arrays(&self, sites: &Sites) -> bool {
         !sites.open
             && !sites.ids.is_empty()

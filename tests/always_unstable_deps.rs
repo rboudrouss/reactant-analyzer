@@ -216,12 +216,14 @@ fn all_primitive_deps_no_fire() {
 
 #[test]
 fn map_result_var_dep_fires() {
-    // `const items = arr.map(f)` is a fresh array each render — using it as a
-    // dep defeats the memo. Pre-fix `Expr::Call` read ⊤ → silent FN.
+    // `const items = arr.map(f)` off an array is a fresh array each render —
+    // using it as a dep defeats the memo. Pre-fix `Expr::Call` read ⊤ →
+    // silent FN.
     let h = hits(
         r#"
         import { useEffect } from "react";
-        function C({ arr }) {
+        function C({ n }) {
+            const arr = [n, 2];
             const items = arr.map((x) => x * 2);
             useEffect(() => {}, [items]);
             return <div/>;
@@ -236,13 +238,79 @@ fn inline_filter_dep_fires() {
     let h = hits(
         r#"
         import { useEffect } from "react";
-        function C({ arr }) {
-            useEffect(() => {}, [arr.filter(Boolean)]);
+        function C({ obj }) {
+            useEffect(() => {}, [Object.values(obj).filter(Boolean)]);
             return <div/>;
         }
         "#,
     );
     assert_eq!(h, 1, "inline filter call in deps must fire");
+}
+
+/// #312: off a receiver not known to be an array, a method named like an
+/// array's may be any object's, which may return its receiver: the result
+/// is no proof of a new reference at every render.
+#[test]
+fn array_method_off_a_receiver_of_unknown_kind_stays_silent() {
+    for (shape, bind) in [
+        ("prop", "const o = arr.map((x) => x * 2);"),
+        (
+            "chained off a prop",
+            "const o = arr.filter(Boolean).map(String);",
+        ),
+        ("split off a prop", "const o = arr.split(\",\");"),
+        ("slice off a prop", "const o = arr.slice();"),
+        ("program class", "const o = None.map((x) => x + 1);"),
+    ] {
+        let h = hits(&format!(
+            r#"
+            import {{ useEffect }} from "react";
+            class NoneImpl {{ none = true; map(_f) {{ return this; }} }}
+            const None = new NoneImpl();
+            function C({{ arr }}) {{
+                {bind}
+                useEffect(() => {{}}, [o]);
+                return <div/>;
+            }}
+            "#
+        ));
+        assert_eq!(h, 0, "{shape}");
+    }
+}
+
+/// #312: the kind is known through what the heap places — a name bound to
+/// a builtin's new array, a chain, a memo returning an array literal — and a
+/// string literal's `split`.
+#[test]
+fn array_method_off_a_known_array_fires() {
+    for (shape, bind) in [
+        (
+            "Object.keys name",
+            "const ks = Object.keys(obj); const o = ks.map(String);",
+        ),
+        (
+            "chain",
+            "const o = [1, 2].map((x) => x + 1).filter(Boolean);",
+        ),
+        (
+            "memo",
+            "const xs = useMemo(() => [1, 2], []); const o = xs.map(String);",
+        ),
+        ("spread copy", "const o = [...obj.items].map(String);"),
+        ("string split", "const o = \"a,b\".split(\",\");"),
+    ] {
+        let h = hits(&format!(
+            r#"
+            import {{ useEffect, useMemo }} from "react";
+            function C({{ obj }}) {{
+                {bind}
+                useEffect(() => {{}}, [o]);
+                return <div/>;
+            }}
+            "#
+        ));
+        assert_eq!(h, 1, "{shape}");
+    }
 }
 
 #[test]
@@ -281,13 +349,13 @@ fn kind_ambiguous_slice_stays_silent() {
 
 #[test]
 fn slice_and_concat_of_an_array_fire() {
-    // #22: the receiver is a state array, so it can only be a reference, and
-    // `slice`/`concat` copy it at every render.
+    // #22: the receiver is an array, so `slice`/`concat` copy it at every
+    // render (#312: an array the heap places).
     let h = hits(
         r#"
-        import { useEffect, useState } from "react";
-        function C() {
-            const [items] = useState([3, 1, 2]);
+        import { useEffect } from "react";
+        function C({ n }) {
+            const items = [3, 1, n];
             const copy = items.slice();
             const more = items.concat([4]);
             useEffect(() => {}, [copy]);
@@ -597,12 +665,12 @@ fn a_spread_in_deps_is_judged_by_its_elements() {
 
 /// A dep that is a new array wherever it is one, and `undefined` (or the
 /// falsy part of an opaque value) elsewhere: the memo re-runs at every render
-/// where the value exists. One fact for the three spellings (#301).
+/// where the value exists. One fact for the spellings (#301). `a?.map(f)`
+/// off a prop is no longer one: its receiver may be any object (#312).
 #[test]
 fn a_dep_fresh_wherever_it_holds_an_object_is_reported_as_such() {
     for (shape, bind) in [
-        ("optional call", "const p = a?.map((x) => x + 1);"),
-        ("&&", "const p = a && a.map((x) => x + 1);"),
+        ("&&", "const p = a && Object.keys(a);"),
         ("ternary", "const p = c ? [c] : undefined;"),
     ] {
         let found = messages(&format!(
@@ -631,7 +699,7 @@ fn a_dep_fresh_wherever_it_holds_an_object_is_named_beside_a_fresh_one() {
         r#"
         import { useMemo } from "react";
         function C({ a, x }) {
-            const p = a?.map((y) => y + 1);
+            const p = a && Object.keys(a);
             const q = { x };
             const t = useMemo(() => [p, q], [p, q]);
             return <div>{t.length}</div>;

@@ -194,6 +194,16 @@ on a program React settles; 323 oracle cases, none a known false negative.
   dependency on one is a possible loop (Warning) and `always-unstable-deps`
   says "where it holds an object"; `JSON.parse("1") ?? {}` and a reviver's
   result were a false Error, `structuredClone(1)` a false Warning (#306).
+- An array method's result (`map`, `filter`, `flat`, `flatMap`, `slice`,
+  `concat`, `toSorted`, `toReversed`, `toSpliced`, `with`; `split`) is a new
+  reference at every render only off a receiver known to be an array (a
+  string for `split`): a literal, a builtin's new array (`Object.keys(o)`,
+  `xs.map(f)`), a name or a memo every value of which is one. Off any other
+  receiver — a prop, a state value, a hook's result, an object of the
+  program's own class whose `map` returns `this` — it may be new:
+  `infinite-loop` is a Warning, "may differ at any render", and
+  `always-unstable-deps` does not fire. `None.map(f)` (ts-results,
+  Immutable, a local class) was a false Error (#312).
 - A write in a closure the effect runs (an IIFE, a local or render helper, a
   `useCallback` body, an array callback, a timer) stores what its own names
   hold: a local, a parameter or a lowering temp that shares its name with one

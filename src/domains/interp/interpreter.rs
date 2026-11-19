@@ -7,10 +7,12 @@ use crate::{
         AbstractDomain, AnalysisCtx, Stability, Transfer,
         impls::StateValue,
         stores::{AbstractEnv, EnvVal, Heap, HeapValue, Members, Sites, member_key, resolve_locs},
+        transfer::returns_no_input,
     },
     engine::{
         Reducer,
         dominance::{returning_branches, selecting_branches},
+        purity::Kind,
     },
     ir::{
         bindings::binding_of,
@@ -530,6 +532,26 @@ pub(crate) fn access_key<'k, T: Transfer>(
         Some(m) => AccessKey::Named(m),
         None if index.is_some_and(|i| surely(transfer, i, "number", env, ctx)) => AccessKey::Number,
         None => AccessKey::Any,
+    }
+}
+
+/// The kind of an array method's receiver `obj`, as the value layer knows
+/// it (#312): an array where the heap places it at arrays alone
+/// ([`Heap::arrays`]: a literal, a builtin's new array, a name or a memo
+/// every value of which is one), a string where its value is surely one.
+pub(crate) fn receiver_kind<T: Transfer>(
+    transfer: &T,
+    obj: &Expr,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+) -> Kind {
+    if alloc_literal(transfer, obj, env, ctx).is_some_and(|s| ctx.heap.arrays(&s)) {
+        return Kind::Array;
+    }
+    let value = transfer.eval_expr(obj, env, ctx).as_state_value();
+    match value.and_then(|v| v.typeof_name()) {
+        Some("string") => Kind::Str,
+        _ => Kind::Unknown,
     }
 }
 
@@ -1056,7 +1078,18 @@ pub(crate) fn alloc_literal<T: Transfer>(
         }
         // A call the pass ran points where its bodies' returns do (#333); a
         // builtin whose result is its receiver or one of its entries, where
-        // those do (#330); a callee that may be either, where both may.
+        // those do (#330); a callee that may be either, where both may. A
+        // builtin that returns a new array allocates it here, an array whose
+        // entries no site places (#312).
+        Expr::Call { id, fn_, .. }
+            if ctx.returns.get(*id).is_none()
+                && returns_no_input(fn_, &mut |o| receiver_kind(transfer, o, env, ctx))
+                    == Some(Kind::Array) =>
+        {
+            let mut members = Members::at_least(HashMap::new());
+            members.array = true;
+            (*id, members)
+        }
         Expr::Call { id, fn_, args } => {
             let returned = ctx.returns.get(*id).and_then(|v| v.sites().cloned());
             let builtin = match fn_.peel_ts() {
