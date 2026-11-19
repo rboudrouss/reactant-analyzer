@@ -457,9 +457,9 @@ pub struct HookValueSite {
     /// own; else a name is the primitive the file's `const` binds it to, and
     /// ⊤ when it binds none — a name of this file is not one of the callee's.
     args: Vec<crate::ir::Expr>,
-    /// What a call of each argument is: `Some(hook)` the hook it names,
-    /// `None` no hook (a plain value); absent from the map for an argument
-    /// that is ⊤.
+    /// What a call of each argument is: `Some(Some(hook))` the hook it names,
+    /// `Some(None)` no hook (a plain value), `None` unknown (an argument that
+    /// is ⊤): the parameter is then bound to nothing.
     hooks: Vec<Option<Option<hook_extractor::ResolvedHookCall>>>,
 }
 
