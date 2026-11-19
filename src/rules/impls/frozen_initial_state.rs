@@ -30,8 +30,9 @@ use crate::rules::{
 /// Stratification (three-level doctrine — Error only on a full proof chain):
 /// - **Error**: the prop is *proven* fed by another component's state slot
 ///   (`Versioned` reference through ADR-012 top-down analysis), that slot may
-///   actually be written in its owner, no effect keyed on the prop (and no
-///   render-time write) syncs the local slot, the local setter never escapes
+///   actually be written in its owner, every write of the local slot runs only
+///   on an event and stores nothing the render holds, so none re-syncs it
+///   (#313: no sync *seen* is not that), the local setter never escapes
 ///   this component (nothing else could sync it), and the move is *observable*
 ///   — no call site ties the mount condition to the feeder's own writers, and
 ///   every analysed call site passes the feeder.
@@ -194,6 +195,9 @@ impl Rule for FrozenInitialState {
             // Every row of one slot carries the same escape verdict — it is a
             // property of the setter, not of the seed.
             let escaped = seeds[0].setter_escapes;
+            // A write that may run without an event, or store what the render
+            // holds, may re-sync the slot where no sync was seen (#313).
+            let only_on_events = seeds[0].only_on_events;
             let slot_name = name_of(*label);
 
             let (mut severity, message, proven_evidence) = match (&proven, &unproven_path) {
@@ -205,6 +209,7 @@ impl Rule for FrozenInitialState {
                     // instance need ever observe the change. `Unfed`: some
                     // instance is mounted where no feeder reaches it.
                     let severity = if escaped
+                        || !only_on_events
                         || matches!(mount, MountCoupling::WriterCoupled | MountCoupling::Unfed)
                     {
                         Severity::Warning
@@ -276,6 +281,7 @@ impl Rule for FrozenInitialState {
                 (Severity::Error, Some(proof)) => match must_frozen_seed(
                     proof,
                     escaped,
+                    only_on_events,
                     all_seed_named,
                     locally_written.contains(label),
                     mount,

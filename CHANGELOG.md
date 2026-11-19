@@ -346,6 +346,11 @@ on a program React settles; 323 oracle cases, none a known false negative.
   no event fires without a user. Code the analysis does not see may click
   (`el[m]()`, a bound `click`, a library) in the step's own batch and restore
   the value: such a loop is a Warning now (#313).
+- `frozen-initial-state` is an Error only when every write of the slot runs on
+  an event and stores nothing the render holds: an effect gated by an opaque
+  deps list, by a value computed from the prop or by another prop, or a write
+  through a callee the analysis does not see, re-syncs the slot where no sync
+  was recognised. Each was a false Error; it is a Warning now (#313).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

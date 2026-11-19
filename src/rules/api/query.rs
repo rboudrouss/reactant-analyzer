@@ -974,7 +974,10 @@ pub fn classify_motion(val: &StateValue, result: &ProgramAnalysisResult) -> Moti
 }
 
 /// `All` iff a proven moving feeder survives the idiomatic downgrades: the
-/// setter does not escape, the seeds are not all seed-named (`initial*`/
+/// setter does not escape, every write of the slot runs only on an event
+/// and stores nothing of the render, so none re-syncs it
+/// ([`crate::engine::SlotSeed::only_on_events`], #313), the seeds are not all
+/// seed-named (`initial*`/
 /// `default*`), the slot is locally written, and the feeder's move is
 /// *observable* by a mounted consumer — the certain `frozen-initial-state`
 /// Error (ADR-021 §3). Any failed gate *demotes* the proof
@@ -988,11 +991,17 @@ pub fn classify_motion(val: &StateValue, result: &ProgramAnalysisResult) -> Moti
 pub fn must_frozen_seed(
     feeder: Certified<MovingFeeder>,
     escaped: bool,
+    only_on_events: bool,
     all_seed_named: bool,
     locally_written: bool,
     mount: MountCoupling,
 ) -> MustResult<MovingFeeder> {
-    if !escaped && !all_seed_named && locally_written && mount == MountCoupling::Free {
+    if !escaped
+        && only_on_events
+        && !all_seed_named
+        && locally_written
+        && mount == MountCoupling::Free
+    {
         MustResult::All(feeder)
     } else {
         MustResult::Some(feeder.into_evidence())

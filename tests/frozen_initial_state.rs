@@ -1199,3 +1199,65 @@ fn a_defaulted_prop_fed_by_a_moving_parent_state_still_errors() {
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
     assert_eq!(d[0].severity(), Severity::Error, "{d:?}");
 }
+
+/// `Child` under a parent whose button writes the feeding `user`, with
+/// `child` as its body and `site` as the element.
+fn under_moving_parent(child: &str, site: &str) -> Vec<reactant::rules::Diagnostic> {
+    diags_for(
+        &format!(
+            r#"
+            import {{ useEffect, useState }} from "react";
+            function Child({{ user, tick }}) {{
+              {child}
+            }}
+            export function App() {{
+              const [user, setUser] = useState({{ name: "a" }});
+              return (
+                <div>
+                  <button onClick={{() => setUser({{ name: "b" }})}}>+</button>
+                  {site}
+                </div>
+              );
+            }}
+            "#
+        ),
+        "Child",
+    )
+}
+
+#[test]
+fn a_sync_the_relation_does_not_credit_is_not_proven_absent() {
+    // React re-syncs `local` to "b" after the click in each (#313): an
+    // effect gated by an opaque list, by a value computed from the prop, by
+    // another prop the same slot moves, or a write through a callee the
+    // analysis does not see.
+    for effect in [
+        "const deps = [user]; useEffect(() => { setLocal(user); }, deps);",
+        "const name = user.name; useEffect(() => { setLocal(user); }, [name]);",
+        "useEffect(() => { setLocal(user); }, [tick]);",
+        "useEffect(() => { someLib(() => setLocal(user)); }, [user]);",
+    ] {
+        let d = under_moving_parent(
+            &format!(
+                "const [local, setLocal] = useState(user); {effect} return <p>{{local.name}}</p>;"
+            ),
+            "<Child user={user} tick={user} />",
+        );
+        assert_eq!(d.len(), 1, "{effect}: {d:?}");
+        assert_eq!(d[0].severity(), Severity::Warning, "{effect}: {d:?}");
+    }
+    // A handler writing back what the render holds may be dispatched.
+    let d = under_moving_parent(
+        "const [local, setLocal] = useState(user); \
+         return <p onClick={() => setLocal(user)}>{local.name}</p>;",
+        "<Child user={user} tick={user} />",
+    );
+    assert_eq!(d[0].severity(), Severity::Warning, "{d:?}");
+    // The twin: only an event writes it, with a constant.
+    let d = under_moving_parent(
+        "const [local, setLocal] = useState(user); \
+         return <p onClick={() => setLocal({ name: \"c\" })}>{local.name}</p>;",
+        "<Child user={user} tick={user} />",
+    );
+    assert_eq!(d[0].severity(), Severity::Error, "{d:?}");
+}

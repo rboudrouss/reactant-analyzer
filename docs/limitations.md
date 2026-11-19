@@ -254,7 +254,10 @@ that writes it (see *Cross-file limits*).
   an object `key` stringifies to a constant. The finding is downgraded, never deleted. The residual
   family, a caller that always remounts with a `key`, is [#136](https://github.com/rboudrouss/reactant-analyzer/issues/136).
   A guard on the feeding state itself (`switch (step.type)`), or one call site the feeder does not
-  reach (a story passing constants), caps a proven freeze at Warning.
+  reach (a story passing constants), caps a proven freeze at Warning. So does a slot one write of
+  which may run without an event, or store a name of the render: a sync the relation does not
+  recognise (an opaque deps list, a dep computed from the prop, another prop the same slot moves,
+  an unknown callee) is still a sync [#313](https://github.com/rboudrouss/reactant-analyzer/issues/313).
 - **Per-call-site facts.** A child's result is its analysis under the join of every call site
   [#175](https://github.com/rboudrouss/reactant-analyzer/issues/175). The child is also
   re-analysed under each call site alone: a dep fresh through one parent is reported by
