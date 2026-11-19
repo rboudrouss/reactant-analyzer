@@ -843,6 +843,11 @@ pub struct ImportCtx<'a> {
     /// File being lowered — provenance of locally-defined hooks, so the
     /// `(file, name)` registry lookup stays precise. `None` for hand-built IR.
     pub current_file: Option<&'a Path>,
+    /// Names a body binds to what an argument names, ahead of every other
+    /// reading (#342): the parameters of a function whose returned closure is
+    /// a hook, bound to the module call's arguments. `Some`: the argument is
+    /// that hook. `None`: the argument is a value that is no hook.
+    pub bound: &'a HashMap<String, Option<ResolvedHookCall>>,
 }
 
 impl ImportCtx<'static> {
@@ -857,7 +862,17 @@ impl ImportCtx<'static> {
             react_ns: &NAMES,
             local_hooks: &NAMES,
             current_file: None,
+            bound: Self::unbound(),
         }
+    }
+
+    /// No name bound by an argument: [`ImportCtx::bound`] of every body but
+    /// a hook value's.
+    pub fn unbound() -> &'static HashMap<String, Option<ResolvedHookCall>> {
+        use std::sync::LazyLock;
+        static BOUND: LazyLock<HashMap<String, Option<ResolvedHookCall>>> =
+            LazyLock::new(HashMap::new);
+        &BOUND
     }
 }
 
@@ -880,9 +895,12 @@ impl ImportCtx<'_> {
     /// - `ns.useX(...)`: React's iff `ns` is bound to the `react` module or
     ///   is the conventional unimported global `React`; any other receiver
     ///   is a custom hook with unknown provenance.
-    fn classify_callee(&self, fn_: &Expr) -> Option<ResolvedHookCall> {
+    pub(crate) fn classify_callee(&self, fn_: &Expr) -> Option<ResolvedHookCall> {
         match fn_ {
             Expr::Var(name) => {
+                if let Some(bound) = self.bound.get(name) {
+                    return bound.clone();
+                }
                 if self.local_hooks.contains(name) {
                     return Some(ResolvedHookCall {
                         origin_name: name.clone(),
@@ -2045,6 +2063,7 @@ mod tests {
             react_ns: &names,
             local_hooks: &names,
             current_file: None,
+            bound: ImportCtx::unbound(),
         };
         let (hooks, _, _) = extract_hooks(&mut cfg, &ctx, &lower.ids);
 

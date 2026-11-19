@@ -416,6 +416,14 @@ on a program React settles; 323 oracle cases, none a known false negative.
   outside closures: a `key={user.name}` or a guard (`{open && <Child/>}`) may
   remount it, or hide it whenever the prop moves, and the consumer then reads
   the new value. A Warning there now, as when no call site is visible (#313).
+- A hook bound to what a call of one of the file's functions returns
+  (`const useX = make(a)`, exported and imported elsewhere included) is the
+  closure that function returns, run as the hook's body, with the call's
+  arguments for its parameters: its state and its effects are analysed, and a
+  loop in them, silent behind an `analysis-limit` Info, is reported. So is a
+  program wrapper around a hook (`const useX = wrap(useY)`). A factory
+  imported from another file, or returning one of several closures, still
+  leaves the hook unseen (#342, #344).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

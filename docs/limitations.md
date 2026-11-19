@@ -711,7 +711,15 @@ local alias [#50](https://github.com/rboudrouss/reactant-analyzer/issues/50). A 
 hook name to React hooks (`const useIsoEffect = isBrowser ? useLayoutEffect : useEffect`) is read as
 that hook only when every arm is one of React's effect hooks, which the IR lowers alike; any other
 alias, a no-op arm included (`isBrowser ? useLayoutEffect : () => {}`), is a hook the analysis does
-not see. `node_modules` is never lowered, and the
+not see. A module `const` binding a hook name to what a call returns (`const useX = make(a)`) is the
+closure the function returns, run as the hook's body, when the function is one of the same file's
+and every `return` of it hands back that one closure (#342): the parameters hold the call's
+arguments (a name or a primitive as written, ⊤ for anything else or a parameter some body
+reassigns), a call of a parameter is a call of the hook its argument names, and every other local
+of the function the closure reads is ⊤. A factory imported from another file, or one returning one
+of several closures, leaves a hook the analysis does not see
+[#344](https://github.com/rboudrouss/reactant-analyzer/issues/344), and so does a package's
+(zustand's `create`). `node_modules` is never lowered, and the
 `SummaryRegistry` is the supported extension point [#51](https://github.com/rboudrouss/reactant-analyzer/issues/51).
 
 Utility inlining is statement position only [#52](https://github.com/rboudrouss/reactant-analyzer/issues/52), runs once per

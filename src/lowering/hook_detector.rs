@@ -40,6 +40,71 @@ pub struct HookAlias {
     pub arms: Vec<String>,
 }
 
+/// A top-level `const` binding a hook name to the value a call of a
+/// function returns at module time (`const useX = make(a)`, #342): the hook
+/// is that value, which the caller resolves when `callee` is one of the
+/// file's own functions.
+pub struct HookValue<'a> {
+    pub name: String,
+    pub callee: &'a str,
+    pub args: &'a [Argument<'a>],
+}
+
+/// Every [`HookValue`] of `program` whose callee is a bare name.
+pub fn detect_hook_values<'a>(program: &'a Program<'a>) -> Vec<HookValue<'a>> {
+    let mut out = Vec::new();
+    for (id, init) in module_consts(program) {
+        let mut init = init;
+        let call = loop {
+            init = match init {
+                Expression::TSAsExpression(e) => &e.expression,
+                Expression::TSSatisfiesExpression(e) => &e.expression,
+                Expression::TSNonNullExpression(e) => &e.expression,
+                Expression::ParenthesizedExpression(e) => &e.expression,
+                other => break other,
+            };
+        };
+        let Expression::CallExpression(call) = call else {
+            continue;
+        };
+        let Expression::Identifier(callee) = &call.callee else {
+            continue;
+        };
+        if is_custom_hook(&id.name) && !is_custom_hook(&callee.name) {
+            out.push(HookValue {
+                name: id.name.to_string(),
+                callee: callee.name.as_str(),
+                args: &call.arguments,
+            });
+        }
+    }
+    out
+}
+
+/// Every top-level `const` binding of `program` to a name, exported or not,
+/// with its initializer.
+fn module_consts<'a>(
+    program: &'a Program<'a>,
+) -> impl Iterator<Item = (&'a BindingIdentifier<'a>, &'a Expression<'a>)> {
+    program
+        .body
+        .iter()
+        .filter_map(|stmt| match stmt {
+            Statement::VariableDeclaration(d) => Some(&**d),
+            Statement::ExportNamedDeclaration(exp) => match &exp.declaration {
+                Some(Declaration::VariableDeclaration(d)) => Some(&**d),
+                _ => None,
+            },
+            _ => None,
+        })
+        .filter(|d| d.kind == VariableDeclarationKind::Const)
+        .flat_map(|d| &d.declarations)
+        .filter_map(|vd| match (&vd.id, &vd.init) {
+            (BindingPattern::BindingIdentifier(id), Some(init)) => Some((&**id, init)),
+            _ => None,
+        })
+}
+
 /// Every [`HookAlias`] of `program`.
 pub fn detect_hook_aliases(program: &Program) -> Vec<HookAlias> {
     fn arms(e: &Expression, out: &mut Vec<String>) -> bool {
@@ -56,27 +121,14 @@ pub fn detect_hook_aliases(program: &Program) -> Vec<HookAlias> {
             _ => false,
         }
     }
-    let decls = program.body.iter().filter_map(|stmt| match stmt {
-        Statement::VariableDeclaration(d) => Some(&**d),
-        Statement::ExportNamedDeclaration(exp) => match &exp.declaration {
-            Some(Declaration::VariableDeclaration(d)) => Some(&**d),
-            _ => None,
-        },
-        _ => None,
-    });
     let mut out = Vec::new();
-    for decl in decls.filter(|d| d.kind == VariableDeclarationKind::Const) {
-        for vd in &decl.declarations {
-            let (BindingPattern::BindingIdentifier(id), Some(init)) = (&vd.id, &vd.init) else {
-                continue;
-            };
-            let mut names = Vec::new();
-            if is_custom_hook(&id.name) && arms(init, &mut names) {
-                out.push(HookAlias {
-                    name: id.name.to_string(),
-                    arms: names,
-                });
-            }
+    for (id, init) in module_consts(program) {
+        let mut names = Vec::new();
+        if is_custom_hook(&id.name) && arms(init, &mut names) {
+            out.push(HookAlias {
+                name: id.name.to_string(),
+                arms: names,
+            });
         }
     }
     out
@@ -209,5 +261,35 @@ mod tests {
     #[test]
     fn non_use_prefix_excluded() {
         assert!(hook_names("function helper() { return null; }").is_empty());
+    }
+
+    fn hook_values(src: &str) -> Vec<(String, String, usize)> {
+        let alloc = Allocator::default();
+        let ret = Parser::new(&alloc, src, SourceType::tsx())
+            .with_options(ParseOptions::default())
+            .parse();
+        assert!(ret.diagnostics.is_empty(), "{:?}", ret.diagnostics);
+        detect_hook_values(&ret.program)
+            .into_iter()
+            .map(|v| (v.name, v.callee.to_string(), v.args.len()))
+            .collect()
+    }
+
+    /// #342: a hook name bound to what a module call returns, exported or
+    /// not, through a type assertion; a `let`, a non-hook name, a hook-named
+    /// callee and a member callee are not.
+    #[test]
+    fn a_hook_name_bound_to_a_call_is_a_hook_value() {
+        assert_eq!(
+            hook_values(
+                "const useA = make(1, x);\nexport const useB = (wrap(useY) as any);\n\
+                 let useC = make();\nconst store = make();\nconst useD = useMake();\n\
+                 const useE = lib.make();"
+            ),
+            vec![
+                ("useA".to_string(), "make".to_string(), 2),
+                ("useB".to_string(), "wrap".to_string(), 1),
+            ]
+        );
     }
 }
