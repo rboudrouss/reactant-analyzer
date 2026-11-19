@@ -27,6 +27,7 @@ use super::{
     component_registry::ComponentRegistry,
     function_registry::FunctionRegistry,
     hook_registry::HookRegistry,
+    module_scope::SplicedNames,
     program_result::{AnalysisStats, ComponentCallGraph, ProgramAnalysisResult},
     root_detector::RootStrategy,
 };
@@ -260,13 +261,102 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
 
     let mut hooks = hooks;
 
+    // The free names the splices below rename, with what each denotes in the
+    // file its body is written in (#354).
+    let mut spliced = SplicedNames::new(&program.modules, &comp_file, &module_consts);
+
+    // Provenance of every splice below (ADR-019) — ends up on the result.
+    let mut inline_origins: Vec<crate::engine::InlineOrigin> = Vec::new();
+    // Spliced-callee block ranges per CFG (ADR-027 §4): what decides whether
+    // a write site is caller-authored or wrapper-mediated.
+    let mut inline_regions = crate::engine::setters::InlineRegions::default();
+    // The identity supplies every splice in this component draws from.
+    let mut splice_salt = SpliceIds::for_component(&render_cfg, &hooks, comp_id);
+
+    // Utility-function inlining. Runs before `expand_custom_hooks` so utility
+    // bodies containing hook calls become visible to the hook expansion pass.
+    if expand_utility_calls(
+        &mut render_cfg,
+        &mut hooks,
+        &config.function_registry,
+        &comp_file,
+        config.max_inline_depth,
+        &mut inline_origins,
+        &mut inline_regions,
+        &mut splice_salt,
+        &mut spliced,
+    ) && let Some(inter) = inter
+    {
+        inter
+            .stats
+            .borrow_mut()
+            .inline_budget_exhausted
+            .insert(comp_id);
+    }
+
+    // Expand Custom entries before seeding so inlined State entries are seeded.
+    expand_custom_hooks(
+        &mut hooks,
+        &mut hook_provenance,
+        &mut render_cfg,
+        config,
+        hook_registry,
+        &mut inline_origins,
+        &mut inline_regions,
+        &mut splice_salt,
+        &mut spliced,
+    );
+
+    // Every `new` of a class a module of the program defines runs its
+    // construction body (#335), resolved once every splice has landed.
+    let mut class_files: Vec<std::path::PathBuf> = Vec::new();
+    if expand_class_constructions(
+        &mut render_cfg,
+        &mut hooks,
+        &config.class_registry,
+        &comp_file,
+        &inline_regions,
+        config.max_inline_depth,
+        &mut splice_salt,
+        &mut class_files,
+        &mut spliced,
+    ) && let Some(inter) = inter
+    {
+        inter
+            .stats
+            .borrow_mut()
+            .inline_budget_exhausted
+            .insert(comp_id);
+    }
+
     // Seed module-level `const` bindings (TODO.md F7). A module const is
     // evaluated once per module lifetime, so its value never changes across
     // renders: a primitive literal seeds its exact value, a reference
     // literal (`const D = {...}`) seeds a Stable reference. Without this,
     // reads fall through to the env-miss default (⊤) and downstream rules
     // see "may be fresh each render". Bindings already present in
-    // `initial_env` (props from a parent analysis) win.
+    // `initial_env` (props from a parent analysis) win. The component's file
+    // binds its own names; a free name a splice renamed is seeded with the
+    // `const` its body's file binds it to (#354), and is one of the
+    // component's module `const`s from here on.
+    let renamed_anchors: Vec<(Var, crate::ir::types::ExprId)> = spliced
+        .anchors()
+        .map(|(name, anchor)| (name.clone(), anchor))
+        .collect();
+    let renamed: Vec<(Var, ModuleConstInit)> = spliced
+        .consts()
+        .map(|(name, init)| (name.clone(), init.clone()))
+        .collect();
+    let module_consts = {
+        match renamed.is_empty() {
+            true => module_consts,
+            false => {
+                let mut all = (*module_consts).clone();
+                all.extend(renamed);
+                std::sync::Arc::new(all)
+            }
+        }
+    };
     let mut initial_env = initial_env;
     // Module consts alone, in their own env: reused below as the entry env of
     // custom-hook argument bodies — a module const has the same value at every
@@ -298,67 +388,6 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         }
         env
     };
-
-    // Provenance of every splice below (ADR-019) — ends up on the result.
-    let mut inline_origins: Vec<crate::engine::InlineOrigin> = Vec::new();
-    // Spliced-callee block ranges per CFG (ADR-027 §4): what decides whether
-    // a write site is caller-authored or wrapper-mediated.
-    let mut inline_regions = crate::engine::setters::InlineRegions::default();
-    // The identity supplies every splice in this component draws from.
-    let mut splice_salt = SpliceIds::for_component(&render_cfg, &hooks, comp_id);
-
-    // Utility-function inlining. Runs before `expand_custom_hooks` so utility
-    // bodies containing hook calls become visible to the hook expansion pass.
-    if expand_utility_calls(
-        &mut render_cfg,
-        &mut hooks,
-        &config.function_registry,
-        &comp_file,
-        config.max_inline_depth,
-        &mut inline_origins,
-        &mut inline_regions,
-        &mut splice_salt,
-    ) && let Some(inter) = inter
-    {
-        inter
-            .stats
-            .borrow_mut()
-            .inline_budget_exhausted
-            .insert(comp_id);
-    }
-
-    // Expand Custom entries before seeding so inlined State entries are seeded.
-    expand_custom_hooks(
-        &mut hooks,
-        &mut hook_provenance,
-        &mut render_cfg,
-        config,
-        hook_registry,
-        &mut inline_origins,
-        &mut inline_regions,
-        &mut splice_salt,
-    );
-
-    // Every `new` of a class a module of the program defines runs its
-    // construction body (#335), resolved once every splice has landed.
-    let mut class_files: Vec<std::path::PathBuf> = Vec::new();
-    if expand_class_constructions(
-        &mut render_cfg,
-        &mut hooks,
-        &config.class_registry,
-        &comp_file,
-        &inline_regions,
-        config.max_inline_depth,
-        &mut splice_salt,
-        &mut class_files,
-    ) && let Some(inter) = inter
-    {
-        inter
-            .stats
-            .borrow_mut()
-            .inline_budget_exhausted
-            .insert(comp_id);
-    }
 
     // Returns-verdict of inline `FnLit` args of the custom hooks that survived
     // expansion — the opaque/summarized library calls (`useStore(s => …)`),
@@ -505,12 +534,20 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             .chain(inline_regions.bodies.values().flatten())
             .map(|r| r.from.as_path());
         let classes = class_files.iter().map(std::path::PathBuf::as_path);
-        program.modules.names(
+        let mut names = program.modules.names(
             std::iter::once(comp_file.as_path())
                 .chain(spliced)
                 .chain(classes),
             &declared,
-        )
+        );
+        // A free name a splice renamed is the binding of its body's file
+        // (#354).
+        for (name, anchor) in renamed_anchors {
+            if !declared.contains(&name) {
+                names.entry(name).or_default().push(anchor);
+            }
+        }
+        names
     };
     let query = FixpointCtx {
         callbacks: &callback_bodies,
@@ -1591,6 +1628,7 @@ fn expand_custom_hooks(
     origins: &mut Vec<crate::engine::InlineOrigin>,
     regions: &mut crate::engine::setters::InlineRegions,
     salt: &mut SpliceIds,
+    names: &mut SplicedNames,
 ) {
     let Some(reg) = hook_registry else {
         return;
@@ -1719,14 +1757,22 @@ fn expand_custom_hooks(
         // an effect capturing `x` would desync from the body's renamed `x`.
         let (s, off) = salt.take(&hook_ir.body_cfg, &hook_ir.hooks, offset);
         // The caller's own bindings, so a free name of the hook body cannot be
-        // captured by one of them (#141).
-        let caller_bound = crate::ir::bound_vars(render_cfg, &[]);
+        // captured by one of them (#141), nor by a module `const` the
+        // component binds it to when the body's file binds it otherwise
+        // (#354).
+        let mut caller_bound = crate::ir::bound_vars(render_cfg, &[]);
+        caller_bound.extend(names.isolated(hook_ir.body_file()));
         let rename = crate::ir::callee_rename_map(
             &hook_ir.body_cfg,
             &hook_ir.hooks,
             &hook_ir.params,
             s,
             &caller_bound,
+        );
+        names.record(
+            hook_ir.body_file(),
+            &rename,
+            &crate::ir::bound_vars(&hook_ir.body_cfg, &hook_ir.params),
         );
 
         // A deps argument the hook binds to one of its parameters is the
@@ -2221,7 +2267,7 @@ fn collect_handler_info(hooks: &[HookEntry]) -> HashMap<HookLabel, HandlerInfo> 
 /// What every round of utility inlining in one component shares: where to look
 /// callees up, the per-CFG splice budget, and the accumulators the whole
 /// component writes into.
-struct InlineCtx<'a> {
+struct InlineCtx<'a, 'm> {
     registry: &'a FunctionRegistry,
     caller_file: &'a std::path::Path,
     max_depth: usize,
@@ -2229,6 +2275,8 @@ struct InlineCtx<'a> {
     /// Monotonic across every splice in the component: alpha-rename salt plus
     /// the allocation-id cursor.
     salt: &'a mut SpliceIds,
+    /// The free names the splices renamed (#354).
+    names: &'a mut SplicedNames<'m>,
     /// Set once the budget cut a call off anywhere. The caller turns it into
     /// the `analysis-limit` Info: a *silent* truncation is what lets a
     /// component publish assurances over code that was never read.
@@ -2256,6 +2304,7 @@ fn expand_utility_calls(
     origins: &mut Vec<crate::engine::InlineOrigin>,
     regions: &mut crate::engine::setters::InlineRegions,
     salt: &mut SpliceIds,
+    names: &mut SplicedNames,
 ) -> bool {
     if registry.is_empty() {
         return false;
@@ -2266,6 +2315,7 @@ fn expand_utility_calls(
         max_depth,
         origins,
         salt,
+        names,
         truncated: false,
     };
     inline_in_cfg(render_cfg, &mut ctx, &mut regions.render);
@@ -2313,6 +2363,7 @@ fn expand_class_constructions(
     budget: usize,
     salt: &mut SpliceIds,
     files: &mut Vec<std::path::PathBuf>,
+    names: &mut SplicedNames,
 ) -> bool {
     if registry.is_empty() {
         return false;
@@ -2328,6 +2379,7 @@ fn expand_class_constructions(
         registry,
         bound,
         salt,
+        names,
         budget: budget * 8,
         truncated: false,
         within: Vec::new(),
@@ -2410,10 +2462,12 @@ fn bound_names(cfg: &CFG, out: &mut HashSet<crate::ir::types::Var>) {
 }
 
 /// [`expand_class_constructions`]'s walk.
-struct ClassPass<'r, 's> {
+struct ClassPass<'r, 's, 'm> {
     registry: &'r FunctionRegistry,
     bound: HashSet<crate::ir::types::Var>,
     salt: &'s mut SpliceIds,
+    /// The free names the construction bodies renamed (#354).
+    names: &'s mut SplicedNames<'m>,
     budget: usize,
     truncated: bool,
     /// The classes whose bodies the walk is in.
@@ -2422,7 +2476,7 @@ struct ClassPass<'r, 's> {
     files: Vec<std::path::PathBuf>,
 }
 
-impl ClassPass<'_, '_> {
+impl ClassPass<'_, '_, '_> {
     /// Every block of `cfg`; one inside a spliced region resolves through
     /// the file its body came from (ADR-027 §3–§4).
     fn cfg(
@@ -2468,10 +2522,24 @@ impl ClassPass<'_, '_> {
             return;
         }
         self.budget -= 1;
-        let (_, off) = self.salt.take(&class.body_cfg, &[], 0);
-        let mut body = crate::ir::remap_cfg(class.body_cfg.clone(), off);
+        let (s, off) = self.salt.take(&class.body_cfg, &[], 0);
         let params = class.params.clone();
         let from = class.file.clone();
+        // A free name of the body is its file's binding, never a module
+        // `const` the component binds it to (#354).
+        let own: HashSet<Var> = params.iter().cloned().collect();
+        let isolated = self.names.isolated(&from);
+        let rename: HashMap<Var, Var> = compute_free_vars(&class.body_cfg)
+            .into_iter()
+            .filter(|v| !own.contains(v) && isolated.contains(v))
+            .map(|v| {
+                let fresh = format!("{v}{}{s}", crate::ir::splice::SPLICE_MARK);
+                (v, fresh)
+            })
+            .collect();
+        self.names.record(&from, &rename, &own);
+        let mut body =
+            crate::ir::rename_vars_cfg(crate::ir::remap_cfg(class.body_cfg.clone(), off), &rename);
         if !self.files.contains(&from) {
             self.files.push(from.clone());
         }
@@ -2495,7 +2563,7 @@ impl ClassPass<'_, '_> {
 /// inlining never explodes the IR even with deep utility chains.
 fn inline_in_cfg(
     cfg: &mut CFG,
-    ctx: &mut InlineCtx<'_>,
+    ctx: &mut InlineCtx<'_, '_>,
     regions: &mut Vec<crate::engine::setters::InlineRegion>,
 ) {
     // Ancestry by block range: a splice's blocks sit one utility deeper than
@@ -2543,9 +2611,15 @@ fn inline_in_cfg(
             Stmt::Let { var, .. } => Some(var.clone()),
             _ => None,
         };
-        if let Some((range, exported, from)) =
-            splice_one_call(cfg, block_id, stmt_idx, ctx.registry, &res_file, ctx.salt)
-        {
+        if let Some((range, exported, from)) = splice_one_call(
+            cfg,
+            block_id,
+            stmt_idx,
+            ctx.registry,
+            &res_file,
+            ctx.salt,
+            ctx.names,
+        ) {
             ctx.origins.push(crate::engine::InlineOrigin {
                 name: name.clone(),
                 from: from.clone(),
@@ -2644,6 +2718,7 @@ fn splice_one_call(
     registry: &FunctionRegistry,
     caller_file: &std::path::Path,
     salt: &mut SpliceIds,
+    names: &mut SplicedNames,
 ) -> Option<(
     std::ops::Range<BlockId>,
     crate::ir::types::Symbol,
@@ -2666,10 +2741,13 @@ fn splice_one_call(
 
     let (s, off) = salt.take(&utility.body_cfg, &[], 0);
     // The caller's own bindings, so a free name of the utility cannot be
-    // captured by one of them (#141).
-    let caller_bound = crate::ir::bound_vars(cfg, &[]);
+    // captured by one of them (#141), nor by a module `const` the component
+    // binds it to when the utility's file binds it otherwise (#354).
+    let mut caller_bound = crate::ir::bound_vars(cfg, &[]);
+    caller_bound.extend(names.isolated(&utility.file));
     let rename =
         crate::ir::callee_rename_map(&utility.body_cfg, &[], &utility.params, s, &caller_bound);
+    let own = crate::ir::bound_vars(&utility.body_cfg, &utility.params);
     let body = crate::ir::remap_cfg(utility.body_cfg, off);
     let range = crate::ir::splice_callee_into_cfg(
         cfg,
@@ -2683,6 +2761,7 @@ fn splice_one_call(
             rename: &rename,
         },
     )?;
+    names.record(&utility.file, &rename, &own);
     // The EXPORTED name (`utility.name`), not the local callee: an aliased
     // import must chain under the identity a team's rule names (ADR-027 §3).
     Some((range, utility.name, utility.file))

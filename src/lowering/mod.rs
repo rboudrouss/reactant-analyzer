@@ -216,18 +216,16 @@ fn build_react_ns(program: &Program) -> HashSet<String> {
     ns
 }
 
-/// Module-level bindings of `program` that are proven React contexts.
+/// The module-level `const`s of `program` whose kind is known
+/// ([`ModuleConstInit`]), its proven React contexts among them.
 ///
 /// The cross-file pass in [`crate::resolver::lower_files_with`] needs this for
-/// *every* file, including files with no component of their own — a
-/// `contexts/ctx.ts` that only exports the context is the common shape.
-pub(crate) fn scan_context_names(program: &Program, file: &Path) -> HashSet<String> {
-    let react_ns = build_react_ns(program);
-    collect_module_consts(program, &react_ns, file)
-        .into_iter()
-        .filter(|(_, init)| matches!(init, ModuleConstInit::Context(_)))
-        .map(|(name, _)| name)
-        .collect()
+/// *every* file, including files with no component of their own: a
+/// `contexts/ctx.ts` that only exports the context, or the file of a hook
+/// another file's component inlines, whose body reads its own file's
+/// `const`s (#354).
+pub(crate) fn module_consts(program: &Program, file: &Path) -> HashMap<Var, ModuleConstInit> {
+    collect_module_consts(program, &build_react_ns(program), file)
 }
 
 /// Local names bound to React's `createContext`, including an aliased import

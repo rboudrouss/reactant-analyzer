@@ -430,7 +430,7 @@ carries an Error.
   effect [#32](https://github.com/rboudrouss/reactant-analyzer/issues/32); on a conditionally re-bound closure (`let cb = a ? f : g`)
   [#35](https://github.com/rboudrouss/reactant-analyzer/issues/35).
 - **Module-level constants** read as ⊤ when the initializer is a call (`const X = f()`)
-  [#34](https://github.com/rboudrouss/reactant-analyzer/issues/34), or when the hook was inlined from another file [#36](https://github.com/rboudrouss/reactant-analyzer/issues/36).
+  [#34](https://github.com/rboudrouss/reactant-analyzer/issues/34), or when it is imported from another file [#36](https://github.com/rboudrouss/reactant-analyzer/issues/36).
 - **`useReducer`**: a `dispatch` stores what the reducer returns, and the reducer runs in its own
   scope, `(state, action)` bound and every other name ⊤. An action's members (`action.type`) are
   not read, so a reducer that returns its state on one action and a fresh object on another may
@@ -742,9 +742,9 @@ function the closure reads is ⊤. A factory returning one of several closures l
 analysis does not see [#344](https://github.com/rboudrouss/reactant-analyzer/issues/344): the
 closure is chosen once per program run, and the IR's only "one of them" is a branch the
 `conditional-hook` rule reads as a render path. So does a package's factory (zustand's `create`).
-A hook inlined from another file reads the component file's module `const`s, not its own: a name
-both files bind is read as the component's
-[#354](https://github.com/rboudrouss/reactant-analyzer/issues/354), [#36](https://github.com/rboudrouss/reactant-analyzer/issues/36). `node_modules` is never lowered, and the
+A body inlined from another file reads its free names as its own file binds them (#354): its
+file's module `const`s, and ⊤ for a name it imports, even one the component's file binds to a
+`const` (a `const` imported from another file is ⊤ in every body). `node_modules` is never lowered, and the
 `SummaryRegistry` is the supported extension point [#51](https://github.com/rboudrouss/reactant-analyzer/issues/51).
 
 Utility inlining is statement position only [#52](https://github.com/rboudrouss/reactant-analyzer/issues/52), runs once per
