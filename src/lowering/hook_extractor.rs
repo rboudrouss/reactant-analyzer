@@ -553,6 +553,7 @@ impl Extractor<'_, '_> {
                 });
             }
             Stmt::MemberWrite {
+                id,
                 obj,
                 key,
                 rhs,
@@ -565,6 +566,7 @@ impl Extractor<'_, '_> {
                 };
                 let rhs = self.stage_hooks(rhs, span, out);
                 out.push(Stmt::MemberWrite {
+                    id,
                     obj: rewrite_expr(obj, &self.state_temps),
                     key: match key {
                         MemberKey::Field(f) => MemberKey::Field(f),

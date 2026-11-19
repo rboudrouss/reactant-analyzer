@@ -313,6 +313,14 @@ impl CallRelation {
         if let Some(body) = self.cfgs.get(&site) {
             let mut anchors: Vec<(ExprId, usize)> = Vec::new();
             body.for_each_expr(&mut |e| collect_anchors(e, &mut anchors));
+            // A member write hands its value on at its own site (#339).
+            for block in body.blocks.values() {
+                for stmt in &block.stmts {
+                    if let crate::ir::stmt::Stmt::MemberWrite { id, .. } = stmt {
+                        anchors.push((*id, 1));
+                    }
+                }
+            }
             // What module scope holds, which a call of module code or a value
             // read off a module binding may reach (#335).
             let mut module = false;

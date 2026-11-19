@@ -275,7 +275,7 @@ impl BlockBuilder {
     }
 
     /// The site of the next call this file lowers ([`Expr::Call`]).
-    pub(super) fn next_call_id(&mut self) -> ExprId {
+    pub(super) fn next_call_id(&self) -> ExprId {
         self.ctx.ids.next_call()
     }
 
@@ -1525,6 +1525,7 @@ pub(super) fn build_fields_cfg(
         };
         let span = builder.span_at(span.start);
         builder.push_stmt(Stmt::MemberWrite {
+            id: builder.next_call_id(),
             obj: Expr::Var(THIS.to_string()),
             key: key.clone(),
             rhs,

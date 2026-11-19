@@ -725,26 +725,33 @@ fn exec_stmt_core<T: Transfer>(
         // object(s) the variable may point to — the write may run on one path
         // among several and the Loc set may name several allocation sites, so
         // join, never replace.
-        Stmt::MemberWrite { obj, key, rhs, .. } => {
-            // An accessor a class defines on its instance (#335) runs at any
-            // read or write of its member, by whoever makes it, as a
-            // literal's does: its closure escapes where it is defined,
-            // anchored at its own site, since a write has no anchor.
+        Stmt::MemberWrite {
+            id, obj, key, rhs, ..
+        } => {
+            let placed = ctx.resolve_locs(obj, env);
             let rhs_sites = match (key, rhs) {
+                // An accessor a class defines on its instance (#335) runs at
+                // any read or write of its member, by whoever makes it, as a
+                // literal's does: its closure escapes where it is defined,
+                // anchored at its own site.
                 (MemberKey::Field(k), Expr::FnLit { id, .. }) if accessor_of(k).is_some() => {
+                    escape_at(transfer, rhs, env, ctx, Some((*id, 0)))
+                }
+                // An object the heap does not place (the global object, a
+                // parameter's member, the result of a call no body ran) is
+                // one code the analysis does not see may read, and call what
+                // it holds, at any time: what is written there is handed to
+                // that code here, a setter included, as an argument of a call
+                // it does not see is (#254, #339).
+                _ if placed.as_ref().is_none_or(|s| s.open) => {
                     escape_at(transfer, rhs, env, ctx, Some((*id, 0)))
                 }
                 _ => alloc_literal(transfer, rhs, env, ctx),
             };
-            // An object the heap does not place (a parameter's member, the
-            // result of a call no body ran) is one code the analysis does not see may
-            // read: what is written there escapes (#254). So is a ref: it
-            // outlives the render, and a context value or a module binding
-            // may hand it where no row follows (#268).
-            let placed = ctx.resolve_locs(obj, env);
-            if placed
-                .as_ref()
-                .is_none_or(|s| s.open || ctx.heap.persists(s))
+            // What is written into a ref escapes too: it outlives the render,
+            // and a context value or a module binding may hand it where no
+            // row follows (#268).
+            if placed.as_ref().is_some_and(|s| ctx.heap.persists(s))
                 && let Some(sites) = &rhs_sites
             {
                 ctx.heap.escape(sites);

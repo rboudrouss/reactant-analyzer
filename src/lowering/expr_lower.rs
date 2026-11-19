@@ -175,6 +175,7 @@ pub(super) fn lower_class(class: &Class, builder: &mut BlockBuilder) -> Expr {
                     } else {
                         let key = method_key(&m.key, m.kind, builder);
                         methods.push(Stmt::MemberWrite {
+                            id: builder.next_call_id(),
                             obj: this(),
                             key,
                             rhs: body,
@@ -418,6 +419,7 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                 && let Some((obj, key)) = lower_member_target_expr(&un.argument, builder)
             {
                 builder.push_stmt(Stmt::MemberWrite {
+                    id: builder.next_call_id(),
                     obj,
                     key,
                     rhs: Expr::Lit(Prim::Unit),
@@ -491,6 +493,7 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
             SimpleAssignmentTarget::StaticMemberExpression(m) => {
                 let obj = lower_expr(&m.object, builder);
                 builder.push_stmt(Stmt::MemberWrite {
+                    id: builder.next_call_id(),
                     obj,
                     key: MemberKey::Field(m.property.name.to_string()),
                     rhs: opaque(),
@@ -502,6 +505,7 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                 let obj = lower_expr(&m.object, builder);
                 let idx = lower_expr(&m.expression, builder);
                 builder.push_stmt(Stmt::MemberWrite {
+                    id: builder.next_call_id(),
                     obj,
                     key: MemberKey::Index(idx),
                     rhs: opaque(),
@@ -766,6 +770,7 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                             (opaque.clone(), opaque)
                         };
                         builder.push_stmt(Stmt::MemberWrite {
+                            id: builder.next_call_id(),
                             obj,
                             key,
                             rhs,
@@ -1602,6 +1607,7 @@ fn lower_assignment_target(
         // Member targets nested in a pattern (`[obj.f] = xs`).
         _ => match assign_target_member(target, builder) {
             Some((obj, key)) => builder.push_stmt(Stmt::MemberWrite {
+                id: builder.next_call_id(),
                 obj,
                 key,
                 rhs,
@@ -1720,6 +1726,7 @@ fn lower_logical_assignment(assign: &AssignmentExpression, builder: &mut BlockBu
             span,
         },
         (None, Some((obj, key))) => Stmt::MemberWrite {
+            id: builder.next_call_id(),
             obj,
             key,
             rhs: value,

@@ -191,8 +191,10 @@ there reaches — everything `escape` reached through members and captures, or
 what an in-cycle callee (an array method, a timer) ran it as. The anchor is
 the call's id (position `CALLEE` for a callee escaped past the inlining
 budget), a `new`'s id, the props object of a JSX element (position: the
-prop's index), a hook the expansion left (its hook site), or an effect's
-hook site (position `CLEANUP`: its returned cleanup). May, except
+prop's index), a hook the expansion left (its hook site), an effect's
+hook site (position `CLEANUP`: its returned cleanup), or a member write's
+site (position 0: the value written into an object the heap does not place,
+#339). May, except
 `Escapes::sure()`: every evaluation handed a value surely its one setter or
 one function to an in-cycle callee that runs it (`[setN].forEach(cb)`), never
 code the analysis does not see, and some evaluation ran outside an escaped
