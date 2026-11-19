@@ -336,14 +336,14 @@ pub(crate) fn body_writes(comp: &AnalysisResult<StateValue>, body: &CFG) -> Vec<
         .0
 }
 
-/// One variable that denotes a state setter, and how surely.
+/// One setter a variable may denote. A may fact only: whether a call through
+/// the variable surely writes is the call relation's `sure` (ADR-047), never
+/// read here (#313).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SetterProp {
     /// The component that owns the slot.
     pub component: ComponentId,
     pub label: HookLabel,
-    /// The variable surely is that setter — a must.
-    pub must_write: bool,
 }
 
 /// Collect the names and member paths in `cfg` whose abstract value at some
@@ -356,13 +356,11 @@ pub(crate) struct SetterProp {
 ///
 /// Used by cross-component rules to find props that are parent setters.
 ///
-/// No block wins: a name's row is every setter some block exit binds it to
-/// (the may side), and a setter is a `must_write` only when every exit
-/// binding the name to anything but ⊥ surely writes it (the must side, #233).
-/// A member path is visited once per object its root may point to, so
-/// `t[1]` of `c ? [v, setV] : [v, noop]` is the setter at one visit and a
-/// closure at the other — a possible write, never a certain one. Blocks are
-/// visited in `CFG::blocks` order, so the rows are deterministic (#120).
+/// No block wins: a name's row is every setter some block exit binds it to,
+/// the may side, and the only one (#233, #313). A member path is visited once
+/// per object its root may point to, so `t[1]` of `c ? [v, setV] : [v, noop]`
+/// is the setter at one visit. Blocks are visited in `CFG::blocks` order, so
+/// the rows are deterministic (#120).
 /// `params` are the body's parameters: the props object, whose members
 /// (`props.f`) are the parent's props literal's (#243).
 pub(crate) fn collect_component_setter_vars(
@@ -387,35 +385,22 @@ fn setter_vars_over<'b>(
     heap: &Heap,
 ) -> HashMap<Var, Vec<SetterProp>> {
     let mut result: HashMap<Var, Vec<SetterProp>> = HashMap::new();
-    let mut unsure: HashSet<Var> = HashSet::new();
     for (cfg, params, block_states) in bodies {
         for_each_converged_path(cfg, params, block_states, heap, |name, ev| {
             let props = setter_of(ev);
             if props.is_empty() {
-                if !ev.as_val().is_bottom_value() {
-                    unsure.insert(name.clone());
-                }
                 return;
             }
             let row = result.entry(name.clone()).or_default();
             for p in props {
-                match row
-                    .iter_mut()
-                    .find(|q| (q.component, q.label) == (p.component, p.label))
-                {
-                    Some(q) => q.must_write &= p.must_write,
-                    None => row.push(p),
+                if !row.contains(&p) {
+                    row.push(p);
                 }
             }
         });
     }
-    for (name, row) in &mut result {
+    for row in result.values_mut() {
         row.sort_by_key(|p| (p.component, p.label));
-        if row.len() > 1 || unsure.contains(name) {
-            for p in row.iter_mut() {
-                p.must_write = false;
-            }
-        }
     }
     result
 }
@@ -651,28 +636,17 @@ pub(crate) fn callee_path(fn_: &Expr) -> Option<Var> {
     }
 }
 
-/// The setters a value with these contents may be. A value that may be
-/// several (two call sites, two setters) is each of them, and surely none:
-/// `must_write` needs one, and a value that may be something else than a
-/// setter (#233) is none surely.
+/// The setters a value with these contents may be: a value that may be
+/// several (two call sites, two setters) is each of them.
 fn setter_of(ev: &EnvVal<StateValue>) -> Vec<SetterProp> {
-    let val = ev.as_val();
-    let mut out: Vec<SetterProp> = val
+    let mut out: Vec<SetterProp> = ev
+        .as_val()
         .setters()
         .into_iter()
-        .map(|(component, label)| SetterProp {
-            component,
-            label,
-            must_write: val.surely_setter(),
-        })
+        .map(|(component, label)| SetterProp { component, label })
         .collect();
     out.sort_by_key(|p| (p.component, p.label));
-    out.dedup_by_key(|p| (p.component, p.label));
-    if out.len() > 1 {
-        for p in &mut out {
-            p.must_write = false;
-        }
-    }
+    out.dedup();
     out
 }
 

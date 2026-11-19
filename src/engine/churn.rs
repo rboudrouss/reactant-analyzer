@@ -270,16 +270,19 @@ fn initial_only_slots(result: &ProgramAnalysisResult) -> HashSet<QualifiedSlot> 
 /// (#144, #280). The slot starts at an integer within ±2^50, its setter
 /// reaches nothing the rows do not describe, and each write of it
 /// program-wide, an event handler's included, stores its own read plus an
-/// integer step `δ`, 1 ≤ |δ| ≤ 2^20, of one sign for all of them, once per run
-/// of its body. A handler waits for no user when something dispatches its
-/// event, which code the analysis does not see may do (a computed `el[m]()`,
-/// a bound `click`, a library), so its write is in the batch it may restore
-/// (#313). Value steps start from the committed value and updaters add to the
-/// running one, so a batch moves the slot strictly one way and no write in it
-/// restores where it started; and the integers it holds stay exact, below
-/// 2^51, for 2^30 batches per write, far past the 50 nested updates React
-/// stops a loop at, the cutoff a loop claim rests on. A start the bound misses
-/// is not claimed: `n + 1` is `n` from 2^53 on, and at ±∞.
+/// integer step `δ`, 1 ≤ |δ| ≤ 2^20, of one sign for all of them. A handler
+/// waits for no user when something dispatches its event, which code the
+/// analysis does not see may do (a computed `el[m]()`, a bound `click`, a
+/// library), so its write is in the batch it may restore (#313). Value steps
+/// start from the committed value and updaters add to the running one, so a
+/// batch moves the slot strictly one way and no write in it restores where it
+/// started, however many writes of it run in the batch: `same_tick` is a may
+/// fact (#313), a write it pairs with nothing may still run twice, which only
+/// adds steps of the same sign. The integers it holds stay exact, below 2^51,
+/// for 2^30 / k batches when a batch runs k writes of the slot — past the 50
+/// nested updates React stops a loop at, the cutoff a loop claim rests on,
+/// unless one batch runs 2^24 of them. A start the bound misses is not
+/// claimed: `n + 1` is `n` from 2^53 on, and at ±∞.
 fn stepping_slots(result: &ProgramAnalysisResult) -> HashSet<QualifiedSlot> {
     const START: f64 = (1u64 << 50) as f64;
     const STEP: f64 = (1u64 << 20) as f64;
