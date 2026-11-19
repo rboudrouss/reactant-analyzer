@@ -1,3 +1,4 @@
+pub mod assumptions;
 pub mod config;
 pub mod domains;
 pub mod driver;

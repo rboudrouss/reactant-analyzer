@@ -45,6 +45,7 @@ export function parse(argv) {
       project: null,
       rule: [],
       ignoreRule: [],
+      assume: [],
     },
   };
 
@@ -85,10 +86,11 @@ export function parse(argv) {
       if (v == null) throw new UsageError(`${a}: missing value`);
       const into = a === "--entry" ? out.options.entry : out.options.excludeDir;
       into.push(...v.split(",").map((s) => s.trim()));
-    } else if (a === "--rule" || a === "--ignore-rule") {
+    } else if (a === "--rule" || a === "--ignore-rule" || a === "--assume") {
       const v = args.shift();
       if (v == null) throw new UsageError(`${a}: missing value`);
-      (a === "--rule" ? out.options.rule : out.options.ignoreRule).push(v);
+      const into = { "--rule": "rule", "--ignore-rule": "ignoreRule", "--assume": "assume" }[a];
+      out.options[into].push(v);
     } else if (a === "--config") {
       out.configPath = args.shift();
       if (out.configPath == null) throw new UsageError("--config: missing value");

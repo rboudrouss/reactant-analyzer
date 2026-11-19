@@ -53,6 +53,13 @@ on a program React settles; 323 oracle cases, none a known false negative.
   kind of analysis, the heaviest components and call sites, and a live line
   every 30 s; the corpus workflow runs with it.
 - This changelog.
+- Assumptions are configuration ([#336](https://github.com/rboudrouss/reactant-analyzer/issues/336),
+  ADR-048): `reactant.config.json`'s `assumptions` section and `--assume <name>` declare a statement
+  about your program the analysis takes as true, off by default; the human output prints `1 assumption
+  in force: …` next to the summary and the JSON document gains an always-present `assumptions` array
+  (names). First member, `plainObjectsRunNoAccessor`: no accessor sits on `Object.prototype` and no
+  prototype is set on a props or ref object, which recovers the findings a polyfill's variable-named
+  getter hides, at the price of the loop through a getter on `Object.prototype`.
 
 ### Changed
 

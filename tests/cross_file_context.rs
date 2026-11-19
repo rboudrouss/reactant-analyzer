@@ -61,6 +61,7 @@ fn provider_findings(tmp: &Tmp) -> Vec<(String, u64)> {
         entry: vec![],
         exclude_dirs: vec![],
         follow_imports: false,
+        assumptions: Default::default(),
         format: reactant::driver::ReportFormat::Json,
         per_component: false,
         fail_on: reactant::driver::FailOn::Error,

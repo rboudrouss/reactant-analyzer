@@ -21,6 +21,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::assumptions::Assumptions;
 use crate::engine::{ComponentRegistry, Config, RootStrategy, SymbolGraph};
 use crate::project::{self, ProjectKind};
 use crate::resolver::{DefaultFileDiscoverer, FileSystem, analyze_lowered, lower_files_with};
@@ -72,6 +73,9 @@ pub struct CheckOptions {
     /// treating discovery as the sole producer of lowered files (#138). The
     /// report still covers only the components defined in the named paths.
     pub follow_imports: bool,
+    /// The assumptions the run declares (config section and `--assume`
+    /// merged, ADR-048): taken as true by the analysis, stated in the output.
+    pub assumptions: Assumptions,
     pub format: ReportFormat,
     /// `--per-component`: one row per component a finding is reported
     /// through, instead of one row per finding (#271).
@@ -357,6 +361,7 @@ pub fn run_check(
             exit_code: EXIT_OK,
             file_table: lowered.file_table,
             blind_spots: blind,
+            assumptions: opts.assumptions,
             followed: opts.follow_imports.then(|| Followed {
                 files: followed_files.len(),
                 examples: followed_files.iter().take(3).map(|p| display(p)).collect(),
@@ -380,6 +385,7 @@ pub fn run_check(
     // noise. `Config::default()` stays empty so unit tests keep their baselines.
     let config = Config {
         summary_registry: crate::registry::SummaryRegistry::new_with_common(),
+        assumptions: opts.assumptions,
         ..Config::default()
     };
     drop(lowering);
@@ -510,6 +516,7 @@ pub fn run_check(
         exit_code,
         file_table: program_result.file_table,
         blind_spots: blind,
+        assumptions: opts.assumptions,
         followed: opts.follow_imports.then(|| Followed {
             files: followed_files.len(),
             examples: followed_files.iter().take(3).map(|p| display(p)).collect(),
@@ -589,6 +596,10 @@ pub fn run_help(color: bool) -> String {
         (
             "--follow-imports",
             "also analyze what the named paths import",
+        ),
+        (
+            "--assume <name>",
+            "take a statement about the program as true (repeatable)",
         ),
         ("--format <fmt>", "human or json (default: human)"),
         (
