@@ -447,6 +447,10 @@ on a program React settles; 323 oracle cases, none a known false negative.
   it does not see, a bare setter included: `setter-in-render` (or the loop
   rule, in an effect) reports it at the write, a Warning, where the render
   calling it back through that object was silent (#339).
+- A setter stored in a ref (`r.current = setN`, `useRef(setN)`) and called
+  back through `r.current(…)` — in the render, or in an effect whose deps it
+  moves — is reported, a `setter-in-render` or `infinite-loop` Warning, as a
+  setter stored in an object literal is; it was silent (#351).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

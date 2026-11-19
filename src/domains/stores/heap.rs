@@ -67,8 +67,9 @@ pub enum HeapValue {
 /// ([`Heap::alloc_obj`]), and reads before its own escape see its members.
 ///
 /// `persists`: the object outlives every render — `useRef`'s (#268). A
-/// member keeps the sites written there, so a call through it runs what was
-/// stored, and no value: a literal stored there was fresh in the render that
+/// member keeps what a call through it runs — the sites written there and
+/// the setters (#351), an identity React keeps across renders — and no other
+/// part of the value: a literal stored there was fresh in the render that
 /// built it, not in the one reading it, so a read through it is unknown.
 ///
 /// An accessor (#321) is an entry under its [`accessor_key`]: the closure a
@@ -118,11 +119,15 @@ impl Members {
     /// A weak write of `value` into `member`, or, `None`, under a key that
     /// may be any member: the values join and the sites unite, as two
     /// bindings of a name do at an env join. An object that persists keeps
-    /// the sites only.
+    /// the sites and the setters only.
     pub fn write(&mut self, member: Option<&Symbol>, value: &EnvVal<StateValue>) {
         let kept;
         let value = if self.persists {
-            kept = EnvVal::located(value.sites().cloned(), StateValue::bottom());
+            let setters = StateValue {
+                setter: value.as_val().setter,
+                ..StateValue::bottom()
+            };
+            kept = EnvVal::located(value.sites().cloned(), setters);
             &kept
         } else {
             value
@@ -1166,5 +1171,25 @@ mod tests {
         let j = a.join(&b);
         assert!(a.leq(&j) && b.leq(&j));
         assert!(!b.leq(&a), "a member moved: the heap is not below");
+    }
+
+    #[test]
+    fn a_ref_member_keeps_the_sites_and_the_setters_written_there() {
+        // #351: a setter keeps its identity across renders, a value does not.
+        let set = crate::test_support::cid(0);
+        let mut r = Members {
+            persists: true,
+            ..Members::default()
+        };
+        let written =
+            StateValue::component_setter(set, 0).join(&StateValue::number(Interval::point(1.0)));
+        let at = Sites::closed([ExprId(3)]);
+        r.write(
+            Some(&"current".to_string()),
+            &EnvVal::located(Some(at.clone()), written),
+        );
+        let held = &r.named["current"];
+        assert_eq!(held.sites(), Some(&at));
+        assert_eq!(held.as_val(), StateValue::component_setter(set, 0));
     }
 }
