@@ -26,8 +26,8 @@ use crate::{
         hook_ir::HookIR,
     },
     lowering::{
-        ResolvedImport, lower_custom_hooks_with_resolver, lower_program_with_resolver,
-        scan_context_names, utility_lowerer::lower_utilities_with_resolver,
+        ResolvedImport, lower_program_with_resolver, scan_context_names,
+        utility_lowerer::lower_utilities_with_resolver,
     },
 };
 
@@ -299,6 +299,10 @@ pub fn lower_files_with(
     // below: a context is only provable once every file has been scanned.
     let mut contexts: HashMap<PathBuf, HashSet<String>> = HashMap::new();
     let mut file_imports: Vec<(PathBuf, HashMap<String, ResolvedImport>)> = Vec::new();
+    // Hooks bound to a module call's value, and what each file's hook
+    // extraction reads: the function called may be another file's (#344).
+    let mut hook_names = HashMap::new();
+    let mut hook_values = Vec::new();
 
     for path in files {
         // One spelling for every registry key. `discover` hands back paths
@@ -350,13 +354,16 @@ pub fn lower_files_with(
             &mut lowered.file_table,
             resolver,
         ));
-        lowered.hooks.extend(lower_custom_hooks_with_resolver(
+        let (hooks, names, values) = crate::lowering::lower_file_hooks(
             &ret.program,
             &source,
             path,
             &mut lowered.file_table,
             resolver,
-        ));
+        );
+        lowered.hooks.extend(hooks);
+        hook_names.insert(path.clone(), names);
+        hook_values.extend(values);
         lowered.utilities.extend(lower_utilities_with_resolver(
             &ret.program,
             &source,
@@ -387,6 +394,12 @@ pub fn lower_files_with(
 
     resolve_imported_contexts(&mut lowered, &contexts, &file_imports);
     resolve_imported_utilities(&mut lowered, &file_imports);
+    lowered.hooks.extend(crate::lowering::lower_hook_values(
+        &hook_values,
+        &lowered.utilities,
+        &hook_names,
+        &lowered.module_table.re_export_graph(),
+    ));
     lowered
 }
 
@@ -1303,5 +1316,43 @@ export function App() {
             resolver.resolve(Path::new("/repo/other.tsx"), "@x"),
             Some(PathBuf::from("/outer.tsx"))
         );
+    }
+
+    /// #344: a hook bound to what another file's function returns is that
+    /// function's closure, keyed by the binding's file, its body read in the
+    /// factory's file; two bindings of one factory are two hooks.
+    #[test]
+    fn a_hook_value_s_factory_may_be_another_file_s() {
+        let fs = Arc::new(MemFileSystem::from_map([
+            (
+                PathBuf::from("/p/App.tsx"),
+                "import { make } from \"./make\";\n\
+                 export const useA = make(1);\nexport const useB = make(2);"
+                    .to_string(),
+            ),
+            (
+                PathBuf::from("/p/make.tsx"),
+                "import { useState } from \"react\";\n\
+                 export function make(step) {\n  return () => useState(step);\n}"
+                    .to_string(),
+            ),
+        ]));
+        let files = [PathBuf::from("/p/App.tsx"), PathBuf::from("/p/make.tsx")];
+        let resolver = DefaultImportResolver::new(fs.clone());
+        let lowered = lower_files_with(fs.as_ref(), &files, &resolver);
+        for name in ["useA", "useB"] {
+            let hook = lowered
+                .hooks
+                .iter()
+                .find(|h| h.name == name)
+                .unwrap_or_else(|| panic!("{name} lowered"));
+            assert_eq!(hook.file, Path::new("/p/App.tsx"));
+            assert_eq!(hook.body_file(), Path::new("/p/make.tsx"));
+            assert!(
+                matches!(hook.hooks[..], [crate::ir::HookEntry::State { .. }]),
+                "{:?}",
+                hook.hooks
+            );
+        }
     }
 }

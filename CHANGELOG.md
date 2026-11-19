@@ -438,9 +438,14 @@ on a program React settles; 323 oracle cases, none a known false negative.
   closure that function returns, run as the hook's body, with the call's
   arguments for its parameters: its state and its effects are analysed, and a
   loop in them, silent behind an `analysis-limit` Info, is reported. So is a
-  program wrapper around a hook (`const useX = wrap(useY)`). A factory
-  imported from another file, or returning one of several closures, still
-  leaves the hook unseen (#342, #344).
+  program wrapper around a hook (`const useX = wrap(useY)`) (#342).
+- The function a hook value calls may be another file's, imported directly or
+  through a re-export (`import { make } from "./make"; const useX = make()`):
+  its closure is the hook's body, its own hooks named as its file names them,
+  an argument a `const` primitive of the binding's file (any other name is
+  any value there). A loop in it, silent behind an `analysis-limit` Info, is
+  reported. A factory returning one of several closures still leaves the hook
+  unseen (#344).
 - A value written into an object the analysis does not place — the global
   object (`globalThis.set = setN`, `window.x = f`, a name bound to it), a
   parameter's member, what a call it does not run returns — is handed to code

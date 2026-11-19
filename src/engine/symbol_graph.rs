@@ -351,6 +351,7 @@ mod tests {
             hooks: vec![],
             hook_provenance: vec![],
             alias_of: None,
+            body_file: None,
         }
     }
 
