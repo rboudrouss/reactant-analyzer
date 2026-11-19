@@ -181,3 +181,81 @@ fn a_row_lists_what_the_call_ran_and_sure_is_one_target() {
     assert_eq!(row("setA").setters.len(), 1);
     assert!(row("setA").sure() && !row("setA").open);
 }
+
+/// The calls of every function literal written in `cfg`, nested ones
+/// included.
+fn calls_in_closures(cfg: &CFG, out: &mut Vec<ExprId>) {
+    fn walk(e: &Expr, out: &mut Vec<ExprId>) {
+        if let Expr::FnLit { body_cfg, .. } = e {
+            body_cfg.for_each_expr(&mut |x| {
+                calls_in(x, out);
+                walk(x, out);
+            });
+        }
+        e.for_each_child(&mut |c| walk(c, out));
+    }
+    cfg.for_each_expr(&mut |e| walk(e, out));
+}
+
+#[test]
+fn a_call_only_an_escaped_closure_makes_is_never_sure() {
+    // `runNow` is code the analysis does not see: the closure runs at a
+    // time nothing knows, so its one setter is no certain write (ADR-047).
+    let prog = analyze(
+        r#"
+        import { useState } from "react";
+        import { runNow } from "lib";
+        export function App() {
+          const [n, setN] = useState(0);
+          runNow(() => setN(1));
+          return <div>{n}</div>;
+        }
+        "#,
+    );
+    let result = &prog.components[&prog.component_named("App").unwrap()];
+    let mut inner = Vec::new();
+    calls_in_closures(&result.render_cfg, &mut inner);
+    let rows: Vec<_> = inner
+        .iter()
+        .filter_map(|id| result.calls.targets(*id))
+        .collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].escaped && !rows[0].placed);
+    assert!(rows[0].setters.len() == 1 && !rows[0].open && !rows[0].sure());
+}
+
+/// Every fixture directory and the oracle cases: no row only escaped
+/// closures evaluated is `sure`, the one column an Error reads, so no Error
+/// rests on one; and such rows exist, one target each, which the guard is
+/// what keeps from being sure.
+#[test]
+fn no_row_only_escaped_closures_evaluated_is_sure_in_any_fixture_or_case() {
+    use reactant::project;
+    use reactant::resolver::{DefaultFileDiscoverer, FileDiscoverer, OsFileSystem, analyze_files};
+    use std::sync::Arc;
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut single_target = 0;
+    for dir in ["tests/fixtures", "oracle/cases"] {
+        let dir = root.join(dir);
+        let fs = Arc::new(OsFileSystem);
+        let ctx = project::build_context(&dir, None, fs.clone());
+        let files = DefaultFileDiscoverer::new(fs).discover(&dir);
+        let (prog, _) = analyze_files(
+            &files,
+            ctx.resolver.as_ref(),
+            RootStrategy::Heuristic,
+            Config::default(),
+        );
+        for result in prog.components.values() {
+            for id in result.calls.call_ids() {
+                let t = result.calls.targets(id).unwrap();
+                if !t.placed {
+                    assert!(!t.sure(), "{dir:?}: {id:?} {t:?}");
+                    single_target +=
+                        usize::from(t.escaped && t.setters.len() + t.bodies.len() == 1 && !t.open);
+                }
+            }
+        }
+    }
+    assert!(single_target > 0);
+}

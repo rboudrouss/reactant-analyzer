@@ -181,8 +181,10 @@ fixpoint reached has a row; a call of a body no pass ran has none.
 | `setters` | the slots a call of the callee may write, with their owner | may |
 | `bodies` | the function bodies the callee may be, by allocation site (`body(site)` gives the CFG); past the inlining budget, the ones it stands for | may |
 | `open` | the callee may be something neither list names — code the analysis does not see, a builtin; what such code may call escaped, so it adds no target | may |
-| `sure()` | every evaluation that reached the call saw exactly one target, surely — one setter, or one body of a value surely that function — and a closed callee | must |
+| `sure()` | every evaluation that reached the call saw exactly one target, surely — one setter, or one body of a value surely that function — and a closed callee, and some evaluation is `placed` | must |
 | `written` | per setter, the value the slot write stored | may (over-approximation) |
+| `escaped` | some evaluation ran in a closure code the analysis does not see may call (`run_escaped`): at an unknown time, a render included | may |
+| `placed` | some evaluation ran outside such a closure, where the pass knows when; a row without one is never `sure` (#313) | exact |
 
 `Escapes { setters, bodies }`, per (anchor, position): what the value handed
 there reaches — everything `escape` reached through members and captures, or
@@ -193,7 +195,8 @@ prop's index), a hook the expansion left (its hook site), or an effect's
 hook site (position `CLEANUP`: its returned cleanup). May, except
 `Escapes::sure()`: every evaluation handed a value surely its one setter or
 one function to an in-cycle callee that runs it (`[setN].forEach(cb)`), never
-code the analysis does not see — must.
+code the analysis does not see, and some evaluation ran outside an escaped
+closure — must.
 
 Readers (ADR-047 §4, amended by P10): the writer walk, and the walks the
 engine runs over a body for the rules (`setters::body_writes`,

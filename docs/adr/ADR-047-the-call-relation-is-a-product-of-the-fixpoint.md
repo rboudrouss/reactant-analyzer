@@ -59,6 +59,16 @@ spellings.
    handed write is then placed as a call's is. A rule reads `CallRelation::body` and
    `slot_name` for a body's CFG and a slot's printed name, nothing else of the relation.
 
+7. **A row only escaped closures evaluated is never `sure`** (#313, amends §3). A call
+   evaluated while running closures code the analysis does not see may call (`run_escaped`:
+   unknown time, unknown arguments, a render included) is no certain write of any region that
+   may read its row, even when it sees one setter. Each evaluation carries its origin
+   (`Evaluation::escaped`); the row keeps whether some evaluation ran there (`escaped`) and
+   whether some ran where the pass knows when (`placed`), and `sure` needs `placed`, for
+   `Targets` and `Escapes` alike. A row the pass also evaluated at a known call keeps its
+   `sure`: the target is the same one, and the row is placed at that call. The invariant holds
+   in the relation, whatever reader places the row.
+
 ## Consequences
 
 - A reader of "what does this call run" asks the fixpoint's answer, so a shape the fixpoint

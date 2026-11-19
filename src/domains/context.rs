@@ -303,6 +303,12 @@ pub struct AnalysisCtx<'a, D: AbstractDomain> {
     /// `useEffectEvent` hands back throws when called there, so no call of
     /// one is sure to run its body ([`Heap::is_event`]).
     pub render: bool,
+    /// This context runs closures code the analysis does not see may call
+    /// (`run_escaped`): at a time it does not know (during a render
+    /// included), with arguments it does not know. A call only such runs
+    /// evaluate is no certain write of any region, so the call relation never
+    /// makes its row `sure` (ADR-047 §7).
+    pub escaped: bool,
 }
 
 /// What each call of a local function a pass ran returned, by call site
@@ -395,6 +401,7 @@ impl<'a, D: AbstractDomain> AnalysisCtx<'a, D> {
             calls: None,
             returns: Returns::default(),
             render: false,
+            escaped: false,
         }
     }
 

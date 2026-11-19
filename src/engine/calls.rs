@@ -73,14 +73,22 @@ pub struct Targets {
     /// The value each setter target stored, as the slot write computed it
     /// (an updater's return, a reducer's, the argument), joined.
     pub written: BTreeMap<Slot, StateValue>,
+    /// Some evaluation ran in a closure code the analysis does not see may
+    /// call (`run_escaped`): at a time nothing knows, a render included.
+    pub escaped: bool,
+    /// Some evaluation ran outside such a closure, where the pass knows when
+    /// the call runs. A row without one is never `sure`: its write is no
+    /// certain write of any region that may read the row (#313).
+    pub placed: bool,
 }
 
 impl Targets {
     /// The call surely runs its one target at every evaluation that reached
-    /// it — writes its one setter, or runs its one body: the must column,
-    /// the only one an Error may read.
+    /// it — writes its one setter, or runs its one body — and some
+    /// evaluation ran where the pass knows when: the must column, the only
+    /// one an Error may read.
     pub fn sure(&self) -> bool {
-        self.sure == Some(true) && self.setters.len() + self.bodies.len() == 1
+        self.sure == Some(true) && self.placed && self.setters.len() + self.bodies.len() == 1
     }
 
     /// Join one evaluation into the row. `sure` is `None` for an evaluation
@@ -90,6 +98,8 @@ impl Targets {
         self.setters.extend(other.setters);
         self.bodies.extend(other.bodies);
         self.open |= other.open;
+        self.escaped |= other.escaped;
+        self.placed |= other.placed;
         self.sure = match (self.sure, other.sure) {
             (None, s) | (s, None) => s,
             (Some(a), Some(b)) => Some(a && b),
@@ -116,6 +126,9 @@ pub struct Evaluation {
     /// is surely that setter) or one body (a value surely that function).
     pub one_target: bool,
     pub written: BTreeMap<Slot, StateValue>,
+    /// The evaluation ran in a closure code the analysis does not see may
+    /// call ([`Targets::escaped`]).
+    pub escaped: bool,
 }
 
 /// What a value handed at one position may reach: every setter and every
@@ -134,14 +147,17 @@ pub struct Escapes {
     /// or function it lists to a callee that runs it (an array method).
     /// `Some(false)` once code the analysis does not see took it.
     sure: Option<bool>,
+    /// Some evaluation ran outside a closure code the analysis does not see
+    /// may call, as [`Targets::placed`].
+    pub placed: bool,
 }
 
 impl Escapes {
     /// What is handed here is surely its one target — one setter or one
-    /// body — which the callee runs: the must column, as [`Targets::sure`]
-    /// is for a call.
+    /// body — which the callee runs, and some evaluation ran where the pass
+    /// knows when: the must column, as [`Targets::sure`] is for a call.
     pub fn sure(&self) -> bool {
-        self.sure == Some(true) && self.setters.len() + self.bodies.len() == 1
+        self.sure == Some(true) && self.placed && self.setters.len() + self.bodies.len() == 1
     }
 }
 
@@ -260,11 +276,16 @@ impl CallRelation {
             open: eval.open,
             sure,
             written: eval.written,
+            escaped: eval.escaped,
+            placed: !eval.escaped && !eval.unreached,
         });
     }
 
     /// Join what the value at `pos` of `anchor` reached into its row: the
-    /// setters it may be (`direct`), those it holds (`held`), the bodies.
+    /// setters it may be (`direct`), those it holds (`held`), the bodies;
+    /// `escaped`: the evaluation ran in a closure code the analysis does not
+    /// see may call.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_escape(
         &mut self,
         anchor: ExprId,
@@ -273,8 +294,10 @@ impl CallRelation {
         held: impl IntoIterator<Item = Slot>,
         bodies: impl IntoIterator<Item = ExprId>,
         sure: bool,
+        escaped: bool,
     ) {
         let row = self.escapes.entry((anchor, pos)).or_default();
+        row.placed |= !escaped;
         for slot in direct {
             row.direct.insert(slot);
             row.setters.insert(slot);
@@ -320,6 +343,7 @@ impl CallRelation {
             row.setters.extend(e.setters.iter().copied());
             row.direct.extend(e.direct.iter().copied());
             row.bodies.extend(e.bodies.iter().copied());
+            row.placed |= e.placed;
             row.sure = match (row.sure, e.sure) {
                 (None, s) | (s, None) => s,
                 (Some(a), Some(b)) => Some(a && b),
@@ -432,5 +456,43 @@ mod tests {
             },
         );
         assert!(!two.targets(id).unwrap().sure());
+    }
+
+    #[test]
+    fn a_row_only_escaped_closures_evaluated_is_never_sure() {
+        let mut rel = CallRelation::default();
+        let id = ExprId(5);
+        let one = |escaped| Evaluation {
+            setters: BTreeSet::from([slot(0)]),
+            one_target: true,
+            escaped,
+            ..Evaluation::default()
+        };
+        rel.record_call(id, one(true));
+        let row = rel.targets(id).unwrap();
+        assert!(row.escaped && !row.placed && !row.sure());
+        // An unreached evaluation places nothing.
+        rel.record_call(
+            id,
+            Evaluation {
+                unreached: true,
+                ..Evaluation::default()
+            },
+        );
+        assert!(!rel.targets(id).unwrap().sure());
+        // The same one setter where the pass knows when: sure, joined in
+        // either order.
+        let mut other = CallRelation::default();
+        other.record_call(id, one(false));
+        other.join(&rel);
+        assert!(other.targets(id).unwrap().sure());
+        rel.record_call(id, one(false));
+        assert!(rel.targets(id).unwrap().sure());
+        // An escaped handing to an in-cycle callee is no placed one either.
+        let mut esc = CallRelation::default();
+        esc.record_escape(id, 0, [slot(0)], [], [], true, true);
+        assert!(!esc.escapes(id, 0).unwrap().sure());
+        esc.record_escape(id, 0, [slot(0)], [], [], true, false);
+        assert!(esc.escapes(id, 0).unwrap().sure());
     }
 }

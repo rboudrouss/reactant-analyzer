@@ -1174,6 +1174,8 @@ fn call_evaluation<T: Transfer>(
         open: ran.open && !surely_setter,
         unreached,
         one_target: one_setter || one_body,
+        // A call an escaped closure makes runs at a time nothing knows.
+        escaped: ctx.escaped,
         written: written
             .into_iter()
             .map(|(slot, v)| (slot, v.as_state_value().unwrap_or_else(StateValue::top)))
@@ -1336,7 +1338,8 @@ fn exec_callbacks_depth<T: Transfer>(
                             && value.as_ref().is_some_and(StateValue::surely_setter);
                         one_body || one_setter
                     };
-                    ctx.record(|r| r.record_escape(*id, i, applied, [], ran.bodies, sure));
+                    let escaped = ctx.escaped;
+                    ctx.record(|r| r.record_escape(*id, i, applied, [], ran.bodies, sure, escaped));
                     // An object the callee is handed is no function it runs:
                     // it may return what the object holds (`Array.from(hs)`)
                     // or keep it, so it is handed to code the analysis does
@@ -1599,6 +1602,7 @@ fn record_reach<D: AbstractDomain>(
             held,
             fns.iter().map(|(s, _)| *s),
             false,
+            ctx.escaped,
         );
     });
 }
@@ -1646,7 +1650,22 @@ pub(crate) fn seed_ref<T: Transfer>(
 /// ([`runs_in_owner`]); the closures handed back to this component escape
 /// here, at each round, since a child analysed by a run of this worklist
 /// may hand one back.
+///
+/// Unknown code may make these calls at any time, a render included: a call
+/// only such runs evaluate is never `sure` in the call relation
+/// ([`AnalysisCtx::escaped`]).
 pub(crate) fn run_escaped<T: Transfer>(
+    transfer: &T,
+    bodies: &[(&[Symbol], &CFG)],
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+) {
+    let outer = std::mem::replace(&mut ctx.escaped, true);
+    run_escaped_rounds(transfer, bodies, env, ctx);
+    ctx.escaped = outer;
+}
+
+fn run_escaped_rounds<T: Transfer>(
     transfer: &T,
     bodies: &[(&[Symbol], &CFG)],
     env: &AbstractEnv<T::Domain>,
