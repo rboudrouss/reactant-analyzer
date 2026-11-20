@@ -3286,7 +3286,9 @@ impl<'a> SetterWalk<'a> {
     /// the read's region and phase, wherever the accessor was defined —
     /// never placed; and module code the analysis does not run, when the
     /// receiver is read off a module binding (`via`, the statement's
-    /// expression), may call what the module scope holds.
+    /// expression), may call what the module scope holds. What they hand
+    /// code the analysis does not see is that code's to call there, or later
+    /// (#334).
     #[allow(clippy::too_many_arguments)]
     fn relation_accesses(
         &mut self,
@@ -3299,6 +3301,19 @@ impl<'a> SetterWalk<'a> {
         stmt_span: Option<SourceRange>,
     ) {
         let calls = self.calls;
+        if let Some(handed) = calls.handed(at) {
+            self.handed_row(
+                handed,
+                false,
+                via,
+                WalkClass::Unknown,
+                None,
+                depth,
+                found,
+                prov,
+                stmt_span,
+            );
+        }
         let Some(row) = calls.accesses(at) else {
             return;
         };
@@ -3401,14 +3416,35 @@ impl<'a> SetterWalk<'a> {
         let Some(row) = anchor.and_then(|(a, pos)| calls.escapes(a, pos)) else {
             return;
         };
-        let held_class = match arg.peel_ts() {
-            Expr::ObjectLit { .. } | Expr::ArrayLit { .. } | Expr::Spread(_) => WalkClass::Unknown,
-            _ => class,
-        };
         // A value read off a module binding may be anything the module scope
         // holds (#335); a module binding's own row is one of those, which
         // what `arg` spells reaches, never is.
         let module = anchor.is_some_and(|(a, _)| crate::engine::ModuleScope::is_anchor(a));
+        self.handed_row(
+            row, module, arg, class, placed, depth, found, prov, stmt_span,
+        );
+    }
+
+    /// [`Self::relation_handed`] for the row `row` of what `arg` handed;
+    /// `module`: the row is a module binding's own.
+    #[allow(clippy::too_many_arguments)]
+    fn handed_row(
+        &mut self,
+        row: &'a crate::engine::calls::Escapes,
+        module: bool,
+        arg: &'a Expr,
+        class: WalkClass,
+        placed: Option<(BlockId, usize)>,
+        depth: usize,
+        found: &mut Found,
+        prov: Option<BlockId>,
+        stmt_span: Option<SourceRange>,
+    ) {
+        let calls = self.calls;
+        let held_class = match arg.peel_ts() {
+            Expr::ObjectLit { .. } | Expr::ArrayLit { .. } | Expr::Spread(_) => WalkClass::Unknown,
+            _ => class,
+        };
         if row.module && !module {
             self.module_rows(arg, held_class, depth, found, prov, stmt_span);
         }

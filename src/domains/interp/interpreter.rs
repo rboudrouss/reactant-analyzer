@@ -660,9 +660,9 @@ fn run_accessors<T: Transfer>(
         ctx.heap.unseen_accessor(sites.as_ref(), key)
     };
     if unseen {
-        escape(transfer, obj, env, ctx);
+        escape_at_access(transfer, obj, env, ctx);
         if let Some(rhs) = written {
-            escape(transfer, rhs, env, ctx);
+            escape_at_access(transfer, rhs, env, ctx);
         }
     }
     let kind = match written {
@@ -1917,6 +1917,56 @@ fn exec_unseen_new<T: Transfer>(
     }
     ctx.returns.record(id, this.as_ref());
     this
+}
+
+/// [`escape`], to code the analysis does not see that a member access of
+/// the statement at hand runs (#334): an accessor no site places. It runs
+/// there, and may call what the value reaches, which the relation records at
+/// the statement ([`crate::engine::CallRelation::handed`]).
+fn escape_at_access<T: Transfer>(
+    transfer: &T,
+    expr: &Expr,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+) {
+    let sites = alloc_literal(transfer, expr, env, ctx);
+    let setters = call_targets(transfer, expr, env, ctx);
+    let module = reads_module(expr, ctx);
+    hand_at_access(sites.as_ref(), setters, module, ctx);
+}
+
+/// What [`escape_at_access`] hands: a value at `sites`, which may be the
+/// setters `direct`, read off a module binding when `module`.
+fn hand_at_access<D: AbstractDomain>(
+    sites: Option<&Sites>,
+    direct: Vec<Slot>,
+    module: bool,
+    ctx: &mut AnalysisCtx<D>,
+) {
+    if ctx.calls.is_some() {
+        let (held, fns) = sites.map(|s| ctx.heap.reach_of(s)).unwrap_or_default();
+        let (at, escaped) = (ctx.stmt, ctx.escaped);
+        ctx.record(|r| {
+            for (site, body) in &fns {
+                r.record_body(*site, body);
+            }
+            r.record_handed(
+                at,
+                direct.iter().copied(),
+                held,
+                fns.iter().map(|(s, _)| *s),
+                module,
+                escaped,
+            );
+        });
+    }
+    let mut setters = direct;
+    if let Some(sites) = sites {
+        setters.extend(ctx.heap.escape(sites));
+    }
+    for (owner, label) in setters {
+        ctx.write_slot(owner, label, D::top());
+    }
 }
 
 /// Code the analysis does not see receives the value of `expr` (#254): a

@@ -541,6 +541,12 @@ on a program React settles; 323 oracle cases, none a known false negative.
   keeps what the literal holds: `{ ...(c ? { f: () => setN(…) } : x) }`
   handed to code the analysis does not see hands `f` over, where it was
   silent (#363).
+- An accessor the analysis does not see, run at a read or a write of an
+  object it places, is handed that object at the read, and a setter the
+  value written: every setter and closure they reach may run there. A getter
+  installed on `Object.prototype` that calls a member of its receiver
+  (`(o as any).label` running `this.run()`), in the render, was silent; it is
+  a `setter-in-render` Warning (#334).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

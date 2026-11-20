@@ -267,7 +267,12 @@ that writes it (see *Cross-file limits*).
   that name: a getter or setter of a literal or a class, a descriptor of `Object.defineProperty`
   and its kin, any name under a computed accessor key or a `Proxy` trap
   [#334](https://github.com/rboudrouss/reactant-analyzer/issues/334). Such a read may be a new
-  value at any render (a Warning, never an Error) and the receiver escapes there. The names are
+  value at any render (a Warning, never an Error) and the receiver escapes there: that accessor
+  runs at the read with the receiver as `this`, so every setter and closure the receiver reaches
+  is a possible write of the read's region, and so is what a write hands such a setter.
+  That accessor may be module code too, which may call what a module binding holds; the analysis
+  reads it so only when the receiver is read off a module binding
+  [#372](https://github.com/rboudrouss/reactant-analyzer/issues/372). The names are
   program-wide: one getter named `length` in a test file makes every `x.length` off an unplaced
   value a possible change, a key no constant names (`xs[i]`) may be any accessor's unless it is
   known to be a number and no accessor's name spells one, and one `Proxy` (or computed accessor
