@@ -500,6 +500,12 @@ on a program React settles; 323 oracle cases, none a known false negative.
   the render, was silent; it is a `setter-in-render` Warning. A setter an
   object holds is now handed over wherever a method the analysis does not see
   is called off that object (#340).
+- A `for … of` or `for … in` whose head is a member or a pattern
+  (`for (o.f of xs)`, `for ([a, b] of pairs)`) writes it at each iteration,
+  and so does a write to a member under a type assertion (`(o.f as T) = …`,
+  `(o.f as T)++`) or an increment of a private field: the member, or the
+  names, kept their earlier value, and a closure stored there and called in
+  the render was silent (#340).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error
