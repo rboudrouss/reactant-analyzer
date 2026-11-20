@@ -682,6 +682,15 @@ pub fn must_on_all_paths(cfg: &CFG, blocks: &HashSet<BlockId>) -> MustResult<OnA
 pub struct ExitDominance {
     domtree: DominatorTree,
     exits: Vec<BlockId>,
+    /// The branches whose side is chosen once per program run
+    /// ([`EdgeKind::RunChoice`](crate::ir::cfg::EdgeKind::RunChoice)), each
+    /// with its sides, and what [`Self::may_be_skipped`] walks when a hook
+    /// sits on one of those sides. Empty for every CFG but the render of a
+    /// hook value with several closures (#344).
+    choices: Vec<(BlockId, Vec<BlockId>)>,
+    entry: BlockId,
+    succs: HashMap<BlockId, Vec<BlockId>>,
+    returns: HashSet<BlockId>,
 }
 
 impl ExitDominance {
@@ -699,22 +708,90 @@ impl ExitDominance {
             .map(|b| b.id)
             .filter(|id| reachable.contains(id))
             .collect();
+        let mut choices: Vec<(BlockId, Vec<BlockId>)> = Vec::new();
+        for e in cfg
+            .edges
+            .iter()
+            .filter(|e| e.kind == crate::ir::cfg::EdgeKind::RunChoice)
+        {
+            match choices.iter_mut().find(|(c, _)| *c == e.from) {
+                Some((_, sides)) => sides.push(e.to),
+                None => choices.push((e.from, vec![e.to])),
+            }
+        }
+        let (succs, returns) = match choices.is_empty() {
+            true => Default::default(),
+            false => (
+                cfg.successor_map(),
+                cfg.blocks
+                    .values()
+                    .filter(|b| matches!(b.term, Terminator::Return(..)))
+                    .map(|b| b.id)
+                    .collect(),
+            ),
+        };
         ExitDominance {
             domtree: DominatorTree::new(cfg),
             exits,
+            choices,
+            entry: cfg.entry,
+            succs,
+            returns,
         }
     }
 
-    /// `true` when `block` may be skipped on some render path — the *rule-facing*
-    /// negation of [`Self::certify`], and deliberately not its `MustResult::None`
-    /// case: a CFG with no reachable exit proves nothing in either direction, so
-    /// nothing is skippable there.
+    /// `true` when `block` may be skipped on some render of a program run —
+    /// the *rule-facing* negation of [`Self::certify`], and deliberately not
+    /// its `MustResult::None` case: a CFG with no reachable exit proves
+    /// nothing in either direction, so nothing is skippable there. A side of
+    /// a choice made once per run that `block` is on is the side every render
+    /// of the runs reaching `block` takes (#344): the question is asked of the
+    /// CFG without the choice's other sides, where a condition inside the
+    /// side still skips `block`. That is the one difference with `certify`,
+    /// which asks whether `block` runs on every render of *every* run.
     pub fn may_be_skipped(&self, block: BlockId) -> bool {
-        !self.exits.is_empty()
-            && self
+        if self.exits.is_empty() {
+            return false;
+        }
+        let cut: HashSet<(BlockId, BlockId)> = self
+            .choices
+            .iter()
+            .filter_map(|(choice, sides)| {
+                let taken = sides
+                    .iter()
+                    .find(|&&side| self.domtree.dominates(side, block))?;
+                Some(
+                    sides
+                        .iter()
+                        .filter(move |side| *side != taken)
+                        .map(move |&side| (*choice, side)),
+                )
+            })
+            .flatten()
+            .collect();
+        if cut.is_empty() {
+            return self
                 .exits
                 .iter()
-                .any(|&exit| !self.domtree.dominates(block, exit))
+                .any(|&exit| !self.domtree.dominates(block, exit));
+        }
+        // In the CFG without the cut sides: `block` is reached, and an exit
+        // is reached without passing through it.
+        let reach = |avoid: Option<BlockId>| {
+            let mut seen = HashSet::from([self.entry]);
+            let mut stack = vec![self.entry];
+            while let Some(b) = stack.pop() {
+                for &s in self.succs.get(&b).into_iter().flatten() {
+                    if Some(s) != avoid && !cut.contains(&(b, s)) && seen.insert(s) {
+                        stack.push(s);
+                    }
+                }
+            }
+            seen
+        };
+        block != self.entry
+            && reach(None).contains(&block)
+            && reach(Some(block)).iter().any(|b| self.returns.contains(b))
     }
 
     /// `All` iff `block` dominates every render exit (executes unconditionally);
@@ -1415,5 +1492,66 @@ mod tests {
         };
         assert_eq!(proof.evidence().block_id, Some(1));
         assert_eq!(proof.evidence().span.map(|s| s.line), Some(10));
+    }
+
+    /// #344: block 0 chooses once per run between the sides 1 and 2; side 2
+    /// branches on a real condition to 3 or 4. A block on side 1 runs on every
+    /// render of the runs that reach it; on side 2 only 2 does, 3 and 4 being
+    /// under the condition. The same CFG with plain branch edges skips them
+    /// all, and `certify` (every render of every run) holds for none.
+    #[test]
+    fn a_side_chosen_once_per_run_is_not_a_render_condition() {
+        let ret = || Terminator::Return(Expr::Lit(Prim::Unit), None);
+        let branch = |then_, else_| Terminator::Branch {
+            cond: Expr::Var("c".to_string()),
+            then_,
+            else_,
+            span: None,
+            chain_link: false,
+        };
+        let terms = [
+            (0, branch(1, 2)),
+            (1, ret()),
+            (2, branch(3, 4)),
+            (3, ret()),
+            (4, ret()),
+        ];
+        let blocks: std::collections::BTreeMap<BlockId, BasicBlock> = terms
+            .into_iter()
+            .map(|(id, term)| {
+                (
+                    id,
+                    BasicBlock {
+                        id,
+                        stmts: vec![],
+                        term,
+                    },
+                )
+            })
+            .collect();
+        let edge = |from, to, kind| Edge { from, to, kind };
+        let cfg = |choice: EdgeKind| CFG {
+            entry: 0,
+            blocks: std::collections::BTreeMap::clone(&blocks),
+            edges: vec![
+                edge(0, 1, choice.clone()),
+                edge(0, 2, choice),
+                edge(2, 3, EdgeKind::IfTrue),
+                edge(2, 4, EdgeKind::IfFalse),
+            ],
+        };
+        let chosen = ExitDominance::of(&cfg(EdgeKind::RunChoice));
+        assert!(!chosen.may_be_skipped(0));
+        assert!(!chosen.may_be_skipped(1));
+        assert!(!chosen.may_be_skipped(2));
+        assert!(chosen.may_be_skipped(3));
+        assert!(chosen.may_be_skipped(4));
+        for b in 1..=4 {
+            assert!(matches!(chosen.certify(b), MustResult::None), "{b}");
+        }
+        let plain = ExitDominance::of(&cfg(EdgeKind::IfTrue));
+        for b in 1..=4 {
+            assert!(plain.may_be_skipped(b), "{b}");
+        }
     }
 }
