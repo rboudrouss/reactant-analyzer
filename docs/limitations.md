@@ -824,10 +824,12 @@ explored), a setter both closures call is not a write on every render (a Warning
 closure alone would give an Error), a name a closure binds reads ⊤ where the other closures'
 side meets it (an effect's guard on it is not proven: a possible loop where React settles), and
 the choice reads as a condition of what the closures bind (`missing-deps` on a setter an effect
-calls); only `conditional-hook` takes the closure a hook sits in as the one every render runs. A closure that rebinds a parameter of the function while another
+calls) [#384](https://github.com/rboudrouss/reactant-analyzer/issues/384); only
+`conditional-hook` takes the closure a hook sits in as the one every render runs. A closure that rebinds a parameter of the function while another
 calls it as a hook leaves the hook unseen. A function returning another call's value (zustand's
 `create`: `createState ? createImpl(createState) : createImpl`) leaves a hook the analysis does
-not see, and so does a package's factory.
+not see [#383](https://github.com/rboudrouss/reactant-analyzer/issues/383), and so does a
+package's factory.
 A body inlined from another file reads its free names as its own file binds them (#354): its
 file's module `const`s, and ⊤ for a name it imports, even one the component's file binds to a
 `const` (a `const` imported from another file is ⊤ in every body). The hooks it brings into the
