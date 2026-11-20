@@ -113,6 +113,14 @@ on a program React settles; 323 oracle cases, none a known false negative.
   closures run in a child that does not own them: mantine 527 → 162 (time
   unchanged), twenty 4.8 M → 6 k in the prototype (body runs 46.1 M →
   8.3 M); findings unchanged.
+- Faster writer relation and `conditional-hook`: what the walks ask of a body
+  alone (its reachability, whether a block runs on every path) and the
+  render's dominators the guard witness reads are computed once per
+  component, and a value handed again to unseen code over unchanged objects
+  reuses the last walk; writer relation mantine 28.2 s → 25.1 s (total
+  192 s → 190 s), `@mantine/form` 15.0 s → 14.4 s, chakra-ui unchanged
+  (13.5 s), dub's `conditional-hook` 31 s → 4 s in the prototype; findings
+  unchanged.
 - `always-unstable-deps` also reports a dep that is a new reference at every
   render where it holds an object and a primitive otherwise
   (`items?.filter(f)`, `items && items.map(f)`, `c ? [x] : undefined`), with
