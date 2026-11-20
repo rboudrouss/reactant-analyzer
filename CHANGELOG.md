@@ -611,6 +611,10 @@ on a program React settles; 323 oracle cases, none a known false negative.
   `analysis-limit` Info, is reported, and its hooks are not
   `conditional-hook`s, since every render of a run calls the same closure
   (a condition inside the closure still is one) (#344).
+- A function bound through parentheses or a type assertion (`const create =
+  ((s) => …) as Create`, `const useX = (() => …) as () => number`) is the
+  function, hook or component it wraps: it was none of them, its calls were
+  opaque and a loop in it was silent (found with #383).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

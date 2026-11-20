@@ -82,6 +82,18 @@ mod tests {
         assert_eq!(names("const helper = (x) => x + 1;"), vec!["helper"]);
     }
 
+    /// Parentheses and type assertions bind the function they wrap (#383).
+    #[test]
+    fn a_function_behind_an_assertion_is_detected() {
+        assert_eq!(
+            names(
+                "const a = ((x) => x) as F;\nconst b = (function (x) { return x; }) satisfies F;\n\
+                 const c = ((x) => x)!;"
+            ),
+            vec!["a", "b", "c"]
+        );
+    }
+
     #[test]
     fn component_excluded() {
         assert!(names("function Counter() { return <div/>; }").is_empty());
