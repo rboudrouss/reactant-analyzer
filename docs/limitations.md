@@ -347,7 +347,10 @@ that writes it (see *Cross-file limits*).
   `Object.defineProperty.bind(…)`) makes every member one `Object.prototype` may hold, for
   accessors too, in the whole program — one `expect.any(Object)` in a test file is enough
   [#366](https://github.com/rboudrouss/reactant-analyzer/issues/366). Not seen: a library that
-  extends `Object.prototype` (as for accessors, #336). Otherwise, once a member reads as code the analysis does not
+  extends `Object.prototype` (as for accessors, #336), and `Object` reached otherwise than by
+  those spellings — as `x.constructor` (`({}).constructor` is `Object`), as `globalThis[k]`, or
+  through `eval` or `Function` [#368](https://github.com/rboudrouss/reactant-analyzer/issues/368).
+  Otherwise, once a member reads as code the analysis does not
   see, every later `form.m()` hands the object over again. What stays as
   before: a class's instance member keeps the instance as `this` wherever it is called
   (`const f = k.run; f()` too); `super` outside a class's instance member is opaque. A value
