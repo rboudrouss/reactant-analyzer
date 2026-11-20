@@ -37,13 +37,18 @@ export const IN_LOOP = 10;
  * `useRun(x)` is a hook from that package: after every commit it calls `x`,
  * or each function member of `x` (#254). `absent` is an export that is
  * `undefined` at run time (an optional export a package version lacks):
- * `absent?.(f())` never runs `f` (#301).
+ * `absent?.(f())` never runs `f` (#301). `bump` reads its `this`: called as
+ * a method, it calls the receiver's `set` with an updater (#340).
  */
 const EXT = {
   absent: undefined,
   runNow: (cb) => cb(),
   defer: (cb) => void Promise.resolve().then(cb),
   format: (x) => `<${x}>`,
+  bump() {
+    this.set((c) => c + 1);
+    return 1;
+  },
   // A package hook whose result is a new object at every call (#294).
   useFresh: () => ({}),
   useRun: (x) =>

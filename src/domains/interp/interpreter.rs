@@ -1580,22 +1580,18 @@ fn exec_callbacks_depth<T: Transfer>(
             let mut ran = Ran::default();
             if class == TriggerClass::Unknown {
                 if capped {
-                    if ctx.calls.is_some() {
-                        // What the call stands for, resolved without a run.
-                        ran = Ran::listing();
-                        exec_fn_value(transfer, fn_, Args::unknown(), env, ctx, depth, &mut ran);
-                    }
+                    // What the call stands for, resolved without a run: the
+                    // relation's row, and whether its receiver is handed on.
+                    ran = Ran::listing();
+                    exec_fn_value(transfer, fn_, Args::unknown(), env, ctx, depth, &mut ran);
                     escape(transfer, fn_, env, ctx);
                 } else {
                     // A method call binds `this` to what its receiver
                     // denotes (#338); any other call binds none.
-                    let receiver = match fn_.peel_ts() {
-                        Expr::FieldAccess { obj, .. } | Expr::IndexAccess { arr: obj, .. } => {
-                            let sites = alloc_literal(transfer, obj, env, ctx);
-                            Some(EnvVal::located(sites, transfer.eval_expr(obj, env, ctx)))
-                        }
-                        _ => None,
-                    };
+                    let receiver = fn_.method_receiver().map(|obj| {
+                        let sites = alloc_literal(transfer, obj, env, ctx);
+                        EnvVal::located(sites, transfer.eval_expr(obj, env, ctx))
+                    });
                     let args = match &tail {
                         Some(tail) => Args::then_any(&passed, tail),
                         None => Args::exactly(&passed),
@@ -1611,13 +1607,15 @@ fn exec_callbacks_depth<T: Transfer>(
                 // program, and `open` unless the callee is surely a setter.
                 ran.open = true;
             }
-            // A builtin the value layer does not model is handed the call's
-            // receiver as well as its arguments (#330): it may return it, an
-            // entry of it or a function calling it (`h.bind(null)`), so what
-            // it holds escapes there ([`receiver_use`]).
-            if ran.open
-                && let Expr::FieldAccess { obj, field } = fn_.peel_ts()
-                && receiver_use(transfer, obj, field, env, ctx) == ReceiverUse::Unmodelled
+            // A method call hands its callee the receiver, its `this`
+            // (#338), as well as its arguments. Code the analysis does not
+            // run there — a builtin the value layer does not model (#330),
+            // which may return it or a function calling it (`h.bind(null)`),
+            // or a method of code it does not see (#340) — holds it, and so
+            // does a body past the inlining budget that reads it, which runs
+            // later with `this` unknown: what it holds escapes at the call.
+            if let Some(obj) = fn_.method_receiver()
+                && hands_receiver(transfer, fn_, obj, &ran, env, ctx)
             {
                 escape_at(
                     transfer,
@@ -2346,8 +2344,9 @@ pub(crate) enum ReceiverUse {
     Unmodelled,
     /// A name the table does not know: a builtin where the receiver does not
     /// hold the method ([`receiver_use`]), else a method of code the
-    /// analysis does not see (a prop, a library object), handed its
-    /// arguments only. Not its receiver, though that is its `this` (#340).
+    /// analysis may not see (a prop, a library object). Where it does not
+    /// see it, that code is handed the receiver, its `this`, as well as its
+    /// arguments ([`hands_receiver`], #340).
     Unseen,
 }
 
@@ -2380,6 +2379,45 @@ fn receiver_use<T: Transfer>(
     match inherited {
         true => ReceiverUse::Unmodelled,
         false => named,
+    }
+}
+
+/// The receiver `obj` of a call through `fn_`, which ran `ran`, is handed to
+/// code the analysis does not run there (#330, #340): the callee may be such
+/// code — a builtin the value layer does not model ([`receiver_use`]), or a
+/// method no body of the program stands for, unless it is surely a setter,
+/// which reads no `this` — or it is a body past the inlining budget that
+/// reads its receiver ([`Ran::this`]), which runs later with `this` unknown.
+fn hands_receiver<T: Transfer>(
+    transfer: &T,
+    fn_: &Expr,
+    obj: &Expr,
+    ran: &Ran,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+) -> bool {
+    if ran.this {
+        return true;
+    }
+    if !ran.open {
+        return false;
+    }
+    let method = match fn_.peel_ts() {
+        Expr::FieldAccess { field, .. } => Some(Cow::Borrowed(field.as_str())),
+        Expr::IndexAccess { idx, .. } => member_key(idx, env).map(Cow::Owned),
+        _ => None,
+    };
+    let used = match &method {
+        Some(method) => receiver_use(transfer, obj, method, env, ctx),
+        None => ReceiverUse::Unseen,
+    };
+    match used {
+        ReceiverUse::Unmodelled => true,
+        ReceiverUse::Unseen => !transfer
+            .eval_expr(fn_, env, ctx)
+            .as_state_value()
+            .is_some_and(|v| v.surely_setter()),
+        ReceiverUse::Nothing | ReceiverUse::Itself | ReceiverUse::Entry => false,
     }
 }
 
@@ -2560,6 +2598,9 @@ pub(crate) struct Ran {
     /// The value may be an object, which no call runs.
     pub objects: bool,
     pub listing: bool,
+    /// A body the listing names reads its receiver (#340): run later, past
+    /// the budget, with `this` unknown, it needs the receiver handed over.
+    pub this: bool,
 }
 
 impl Ran {
@@ -2574,8 +2615,20 @@ impl Ran {
     /// The body at `site` runs (or would).
     fn body<D: AbstractDomain>(&mut self, site: ExprId, body: &Arc<CFG>, ctx: &AnalysisCtx<D>) {
         self.bodies.insert(site);
+        self.this |= self.listing && reads_receiver(body);
         ctx.record(|r| r.record_body(site, body));
     }
+}
+
+/// `body` binds `this` to its call's receiver ([`RECEIVER`]): lowering puts
+/// that binding first when the function reads `this` (#338).
+fn reads_receiver(body: &CFG) -> bool {
+    body.blocks.get(&body.entry).is_some_and(|block| {
+        matches!(
+            block.stmts.first(),
+            Some(Stmt::Let { rhs: Expr::Var(v), .. }) if v == RECEIVER
+        )
+    })
 }
 
 /// Execute every heap closure among `ids` for its effects. Used for B5
