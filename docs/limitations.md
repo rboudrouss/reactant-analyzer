@@ -68,9 +68,10 @@ that writes it (see *Cross-file limits*).
   `propertyIsEnumerable`, `isPrototypeOf` as a boolean. A builtin is known by its method name,
   or by its receiver: a method an object, an array or a function the analysis places does not
   hold as its own is its prototype's, so a name the table does not know hands the receiver over
-  as well (`[h].valueOf()`, `h.valueOf()`). The analysis keeps no member of a function, so a
-  method called off one the program wrote it into (`f.cancel = …; f.cancel()`) hands the function
-  over too, and it may run (a Warning React may not confirm). A method of code the analysis does not see
+  as well (`[h].valueOf()`, `h.valueOf()`). The analysis keeps no member of a function: a value
+  written there is handed over at the write, and a method called off one the program wrote it
+  into (`f.cancel = …; f.cancel()`) hands the function over too, so it may run (a Warning React
+  may not confirm). A method of code the analysis does not see
   (`props.onPick(x)`, a library object's) is handed its arguments only, not the object it is
   called on. A conversion the language makes implicitly, which runs a `toString` or a `valueOf`
   the program defines (`` `${o}` ``, `[o].join()`, `+o`), is not followed

@@ -742,8 +742,9 @@ fn exec_stmt_core<T: Transfer>(
                 // one code the analysis does not see may read, and call what
                 // it holds, at any time: what is written there is handed to
                 // that code here, a setter included, as an argument of a call
-                // it does not see is (#254, #339).
-                _ if placed.as_ref().is_none_or(|s| s.open) => {
+                // it does not see is (#254, #339). So is a function's member,
+                // which the heap does not hold (#330).
+                _ if placed.as_ref().is_none_or(|s| !ctx.heap.objects(s)) => {
                     escape_at(transfer, rhs, env, ctx, Some((*id, 0)))
                 }
                 _ => alloc_literal(transfer, rhs, env, ctx),
