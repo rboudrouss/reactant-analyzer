@@ -464,7 +464,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             &hooks,
             &render_cfg,
             &config.function_registry,
-            &comp_file,
+            |label| inline_regions.entry_file(label, &comp_file),
         ),
         inter,
     );
@@ -532,7 +532,8 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             .render
             .iter()
             .chain(inline_regions.bodies.values().flatten())
-            .map(|r| r.from.as_path());
+            .map(|r| r.from.as_path())
+            .chain(inline_regions.entry_files.values().map(|f| f.as_path()));
         let classes = class_files.iter().map(std::path::PathBuf::as_path);
         let mut names = program.modules.names(
             std::iter::once(comp_file.as_path())
@@ -1919,9 +1920,15 @@ fn expand_custom_hooks(
 
         // The inlined entries sit one hook deeper: their ancestry is this
         // call's plus this hook, so a call of `name` among them is recursion.
+        // They are written in the hook's body file, through which the names
+        // they call or construct resolve (#356); a hook they call in turn
+        // records its own file for its entries.
         let inner = chain.enter(&name);
         for h in &remapped {
             ancestry.insert(h.label(), inner.clone());
+            regions
+                .entry_files
+                .insert(h.label(), hook_ir.body_file().to_path_buf());
         }
 
         // Replace the Custom entry with the hook's remapped sub-entries.
@@ -2390,23 +2397,26 @@ fn expand_class_constructions(
         let label = hook.label();
         let none = Vec::new();
         let body_regions = regions.bodies.get(&label).unwrap_or(&none);
+        // An entry a hook's splice brought in resolves through the file it
+        // is written in (#356).
+        let file = regions.entry_file(label, caller_file);
         match hook {
             HookEntry::Effect { body_cfg, .. }
             | HookEntry::Memo { body_cfg, .. }
             | HookEntry::Callback { body_cfg, .. }
             | HookEntry::Handler { body_cfg, .. } => {
-                pass.cfg(body_cfg, body_regions, caller_file);
+                pass.cfg(body_cfg, body_regions, file);
             }
             HookEntry::State { init, reducer, .. } => {
-                pass.expr(init, caller_file);
+                pass.expr(init, file);
                 if let Some(r) = reducer {
-                    pass.expr(r, caller_file);
+                    pass.expr(r, file);
                 }
             }
-            HookEntry::Ref { init, .. } => pass.expr(init, caller_file),
+            HookEntry::Ref { init, .. } => pass.expr(init, file),
             HookEntry::Custom { args, .. } => {
                 for a in args {
-                    pass.expr(a, caller_file);
+                    pass.expr(a, file);
                 }
             }
         }

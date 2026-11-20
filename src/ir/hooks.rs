@@ -158,6 +158,16 @@ impl DepsArg {
             DepsArg::Absent => DepsArg::Absent,
         }
     }
+
+    /// Every expression the argument holds: a list's visible elements, an
+    /// opaque argument itself.
+    pub fn exprs(&self) -> &[Expr] {
+        match self {
+            DepsArg::List(l) => &l.elems,
+            DepsArg::Opaque(e) => std::slice::from_ref(e),
+            DepsArg::Absent => &[],
+        }
+    }
 }
 
 /// A written dependency array, with whatever lowering could keep of it.
@@ -414,6 +424,24 @@ impl HookEntry {
             | HookEntry::State { .. }
             | HookEntry::Ref { .. }
             | HookEntry::Custom { .. } => &[],
+        }
+    }
+
+    /// Every expression the entry holds outside [`Self::body_cfg`], which the
+    /// render evaluates at the call: a `useState` or `useRef` initial value, a
+    /// `useReducer`'s reducer, a deps argument, a custom hook's arguments.
+    /// Exhaustive for the reason [`Self::body_cfg`] is.
+    pub fn call_exprs(&self) -> Vec<&Expr> {
+        match self {
+            HookEntry::State { init, reducer, .. } => {
+                std::iter::once(init).chain(reducer).collect()
+            }
+            HookEntry::Ref { init, .. } => vec![init],
+            HookEntry::Effect { deps, .. }
+            | HookEntry::Memo { deps, .. }
+            | HookEntry::Callback { deps, .. } => deps.exprs().iter().collect(),
+            HookEntry::Custom { args, deps, .. } => args.iter().chain(deps.exprs()).collect(),
+            HookEntry::Handler { .. } => Vec::new(),
         }
     }
 

@@ -744,7 +744,13 @@ closure is chosen once per program run, and the IR's only "one of them" is a bra
 `conditional-hook` rule reads as a render path. So does a package's factory (zustand's `create`).
 A body inlined from another file reads its free names as its own file binds them (#354): its
 file's module `const`s, and ⊤ for a name it imports, even one the component's file binds to a
-`const` (a `const` imported from another file is ⊤ in every body). `node_modules` is never lowered, and the
+`const` (a `const` imported from another file is ⊤ in every body). The hooks it brings into the
+component name the reducers and classes of the file they are written in, or one it imports (#356);
+a name that file does not bind is a reducer or class the analysis does not see, and so is one the
+component's render binds as a local, whatever the hook's file binds it to. A utility a custom hook
+of any file calls, in its body or in its effects, memos and callbacks, is not inlined: it is a call
+the analysis does not run, and what it is handed escapes there
+[#358](https://github.com/rboudrouss/reactant-analyzer/issues/358). `node_modules` is never lowered, and the
 `SummaryRegistry` is the supported extension point [#51](https://github.com/rboudrouss/reactant-analyzer/issues/51).
 
 Utility inlining is statement position only [#52](https://github.com/rboudrouss/reactant-analyzer/issues/52), runs once per
