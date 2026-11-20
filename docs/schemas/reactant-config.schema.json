@@ -118,6 +118,14 @@
       "description": "The assumptions a run declares: all off unless declared.",
       "type": "object",
       "properties": {
+        "foreignRealmFiles": {
+          "description": "Globs, matched against each file's path relative to the project root,\nof the files that do not share a JavaScript realm with the app\n(polyfills, server code, SDKs, tests). Those files are still analysed\nand reported, and the reads in them still see every accessor of the\nprogram; the reads in the other files no longer see the accessors\nthese install. Recovers the findings such an accessor hides; misses a\nloop through one that the app really reads. Empty by default.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
         "plainObjectsRunNoAccessor": {
           "description": "No accessor of the program is ever installed on `Object.prototype`,\nand no prototype is ever set on a props or ref object. Recovers the\nfindings a polyfill's variable-named getter hides; misses a loop that\nreally runs through such a getter.",
           "type": "boolean",

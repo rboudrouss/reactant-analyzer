@@ -440,6 +440,65 @@ impl ReExportGraph {
     }
 }
 
+/// The accessor facts a program's readers read (#334): one fact, unless the
+/// run declares files outside the app's realm ([`Assumption::ForeignRealmFiles`],
+/// #379). Then a read in an app file reads the join of the app files' facts,
+/// and a read in a foreign file reads the whole program's: the declaration
+/// says what the foreign files do not do to the app, not what the app and
+/// the other foreign files do to them.
+#[derive(Debug, Clone, Default)]
+pub struct ProgramAccessors {
+    app: std::sync::Arc<AccessorNames>,
+    foreign: Option<ForeignReaders>,
+}
+
+#[derive(Debug, Clone)]
+struct ForeignReaders {
+    files: HashSet<PathBuf>,
+    whole: std::sync::Arc<AccessorNames>,
+}
+
+impl ProgramAccessors {
+    /// The join `app` of the files that read it, and `whole` of every file,
+    /// for the readers in `foreign_files`.
+    pub fn new(app: AccessorNames, foreign_files: HashSet<PathBuf>, whole: AccessorNames) -> Self {
+        ProgramAccessors {
+            app: std::sync::Arc::new(app),
+            foreign: (!foreign_files.is_empty()).then(|| ForeignReaders {
+                files: foreign_files,
+                whole: std::sync::Arc::new(whole),
+            }),
+        }
+    }
+
+    /// These facts under the assumptions the run declares ([`AccessorNames::under`]).
+    pub fn under(mut self, assumptions: &Assumptions) -> Self {
+        self.app = std::sync::Arc::new((*self.app).clone().under(assumptions));
+        if let Some(f) = &mut self.foreign {
+            f.whole = std::sync::Arc::new((*f.whole).clone().under(assumptions));
+        }
+        self
+    }
+
+    /// What a read in `file` reads.
+    pub fn read_in(&self, file: &Path) -> &std::sync::Arc<AccessorNames> {
+        match &self.foreign {
+            Some(f) if f.files.contains(file) => &f.whole,
+            _ => &self.app,
+        }
+    }
+}
+
+impl From<AccessorNames> for ProgramAccessors {
+    /// One fact for every reader.
+    fn from(names: AccessorNames) -> Self {
+        ProgramAccessors {
+            app: std::sync::Arc::new(names),
+            foreign: None,
+        }
+    }
+}
+
 /// `path → ModuleFacts` for every successfully lowered file.
 ///
 /// Empty when the IR was built by hand (unit tests) — every query then
@@ -490,22 +549,39 @@ impl ModuleTable {
     }
 
     /// The member names some lowered module defines an accessor of (#334).
-    pub fn accessor_names(&self) -> AccessorNames {
-        let mut out = AccessorNames::default();
+    ///
+    /// The one place the per-file facts are joined into the program's. A
+    /// file `foreign` names does not share a realm with the files that read
+    /// the fact ([`Assumption::ForeignRealmFiles`], #379): what it defines,
+    /// installs and supplies, and whether it re-prototypes, are all left out
+    /// of what the other files read ([`ProgramAccessors::read_in`]). That it
+    /// was scanned is not: the program's files were read.
+    pub fn accessor_names(&self, foreign: &dyn Fn(&Path) -> bool) -> ProgramAccessors {
+        let mut app = AccessorNames::default();
+        let mut whole = AccessorNames::default();
+        let mut foreign_files: HashSet<PathBuf> = HashSet::new();
         for (path, facts) in &self.files {
+            let is_foreign = foreign(path);
             if crate::profile::on() && facts.accessors.contributes() {
                 eprintln!(
-                    "[profile] accessor-fact {} {}",
+                    "[profile] accessor-fact{} {} {}",
+                    if is_foreign { "-foreign" } else { "" },
                     path.display(),
                     facts.accessors.summary()
                 );
             }
-            out.extend(&facts.accessors);
+            whole.extend(&facts.accessors);
+            if is_foreign {
+                foreign_files.insert(path.clone());
+                app.scanned |= facts.accessors.scanned;
+            } else {
+                app.extend(&facts.accessors);
+            }
         }
         if crate::profile::on() {
-            eprintln!("[profile] accessor-fact <program> {}", out.summary());
+            eprintln!("[profile] accessor-fact <program> {}", app.summary());
         }
-        out
+        ProgramAccessors::new(app, foreign_files, whole)
     }
 
     /// `true` iff any lowered module declares `directive`.
@@ -630,6 +706,68 @@ mod tests {
             installed
                 .under(&Assumptions::default())
                 .may_run_off_plain(AccessKey::Named("p"))
+        );
+    }
+
+    /// The join leaves a foreign file's four sets out of what the app files
+    /// read, and gives its own readers the whole program's.
+    #[test]
+    fn a_foreign_file_feeds_no_fact_the_app_reads() {
+        let mut polyfill = defining(&["p"], true);
+        polyfill.install(None);
+        polyfill.reprototype();
+        let mut table = ModuleTable::default();
+        for (file, accessors) in [
+            ("src/App.tsx", defining(&["a"], false)),
+            ("src/polyfills/p.ts", polyfill),
+        ] {
+            table.insert(
+                PathBuf::from(file),
+                ModuleFacts {
+                    accessors,
+                    ..Default::default()
+                },
+            );
+        }
+        let reads = |facts: &ProgramAccessors, file: &str, key: AccessKey<'static>| {
+            (
+                facts.read_in(Path::new(file)).may_run(key),
+                facts.read_in(Path::new(file)).may_run_off_plain(key),
+            )
+        };
+        let under =
+            |foreign: &[&str]| table.accessor_names(&|f| foreign.iter().any(|g| f.starts_with(g)));
+
+        // Nothing foreign: every reader reads the join of every file.
+        let all = under(&[]);
+        assert_eq!(
+            reads(&all, "src/App.tsx", AccessKey::Named("x")),
+            (true, true)
+        );
+        assert_eq!(
+            reads(&all, "src/polyfills/p.ts", AccessKey::Named("x")),
+            (true, true)
+        );
+
+        // The polyfill declared foreign: the app reads only its own names,
+        // the polyfill's readers still read the whole program's.
+        let split = under(&["src/polyfills"]);
+        assert_eq!(
+            reads(&split, "src/App.tsx", AccessKey::Named("a")),
+            (true, false)
+        );
+        assert_eq!(
+            reads(&split, "src/App.tsx", AccessKey::Named("x")),
+            (false, false)
+        );
+        assert_eq!(
+            reads(&split, "src/polyfills/p.ts", AccessKey::Named("x")),
+            (true, true)
+        );
+        // A file the table does not know reads the app's.
+        assert_eq!(
+            reads(&split, "src/other.ts", AccessKey::Named("x")),
+            (false, false)
         );
     }
 

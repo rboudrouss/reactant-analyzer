@@ -325,7 +325,7 @@ fn render_assumptions(out: &mut String, report: &CheckReport, p: &Palette) {
     if in_force.is_empty() {
         return;
     }
-    let statements: Vec<&str> = in_force.iter().map(|a| a.statement()).collect();
+    let statements = report.assumptions.statements();
     let _ = writeln!(
         out,
         "{}   {} {} in force: {}{}",
