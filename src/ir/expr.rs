@@ -142,6 +142,23 @@ pub const RECEIVER: &str = "@this";
 /// Never a source name: no identifier holds a `.`.
 pub const NEW_INSTANCE: &str = "new.instance";
 
+/// The members a conversion of an object to a primitive reads and calls, with
+/// the object as `this` (#360): `OrdinaryToPrimitive` calls `valueOf` and
+/// `toString` (ECMA-262 §7.1.1.1), and `Symbol.toPrimitive`, a symbol no
+/// constant names, is a member written under a computed key, which a read of
+/// either name may select ([`crate::domains::stores::Members::others`]).
+pub const TO_PRIMITIVE: [&str; 2] = ["valueOf", "toString"];
+
+/// An operand a converting position converts ([`Expr::conversions`]).
+#[derive(Debug, Clone, Copy)]
+pub enum Converted<'e> {
+    /// The value of the operand.
+    Value(&'e Expr),
+    /// Every entry of the arrays the operand denotes, as `join` converts
+    /// them (`Array.prototype.join`, ECMA-262 §23.1.3.18).
+    Entries(&'e Expr),
+}
+
 /// The two halves of an accessor: a getter runs at every read of its member,
 /// a setter at every write, with the value written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -801,6 +818,61 @@ impl Expr {
         }
     }
 
+    /// The operands this expression converts to a primitive (#360), each
+    /// running the [`TO_PRIMITIVE`] members of the objects it denotes: both
+    /// operands of `+` (a template literal lowers to it), of the other
+    /// arithmetic, bitwise and shift operators and of `<`, `<=`, `>`, `>=`;
+    /// both of `==` / `!=` unless one spells `null` or `undefined`, which
+    /// never converts; the key of `k in o` and of `o[k]`; the argument of unary
+    /// `-`, `+`, `~`; and, for `xs.join(sep)`, every entry of the array `xs`
+    /// and `sep`. A member write `o[k] = v` converts `k` too
+    /// ([`crate::ir::stmt::Stmt::MemberWrite`]). Nothing else converts here:
+    /// `===`, `!==`, `typeof`, `!`, `&&`, `||`, `??`, `instanceof`, a
+    /// condition, a `switch`. A call the analysis does not run (`String(o)`,
+    /// `JSON.stringify(o)`) is handed its arguments, which escape there.
+    pub fn conversions(&self) -> [Option<Converted<'_>>; 2] {
+        let nullish = |e: &Expr| matches!(e.peel_ts(), Expr::Lit(Prim::Null | Prim::Unit));
+        match self {
+            Expr::BinOp { op, lhs, rhs } => match op {
+                BinOp::Add
+                | BinOp::Sub
+                | BinOp::Mul
+                | BinOp::Div
+                | BinOp::Mod
+                | BinOp::Pow
+                | BinOp::Lt
+                | BinOp::Gt
+                | BinOp::Leq
+                | BinOp::Geq
+                | BinOp::BitAnd
+                | BinOp::BitOr
+                | BinOp::BitXor
+                | BinOp::Shl
+                | BinOp::Shr
+                | BinOp::UShr => [Some(Converted::Value(lhs)), Some(Converted::Value(rhs))],
+                BinOp::LooseEq | BinOp::LooseNeq if nullish(lhs) || nullish(rhs) => [None, None],
+                BinOp::LooseEq | BinOp::LooseNeq => {
+                    [Some(Converted::Value(lhs)), Some(Converted::Value(rhs))]
+                }
+                BinOp::In => [Some(Converted::Value(lhs)), None],
+                BinOp::And | BinOp::Or | BinOp::Eq | BinOp::Neq | BinOp::InstanceOf => [None, None],
+            },
+            Expr::UnaryOp {
+                op: UnaryOp::Neg | UnaryOp::Plus | UnaryOp::BitNot,
+                arg,
+            } => [Some(Converted::Value(arg)), None],
+            Expr::IndexAccess { idx, .. } => [Some(Converted::Value(idx)), None],
+            Expr::Call { fn_, args, .. } => match fn_.peel_ts() {
+                Expr::FieldAccess { obj, field } if field == "join" => [
+                    Some(Converted::Entries(obj)),
+                    args.first().map(Converted::Value),
+                ],
+                _ => [None, None],
+            },
+            _ => [None, None],
+        }
+    }
+
     /// [`Expr::peel_ts`] for an owned value — for the callers that destructure
     /// the peeled expression rather than borrowing it.
     pub fn peel_ts_owned(self) -> Expr {
@@ -884,5 +956,60 @@ mod accessor_tests {
         assert_eq!(found(vec![get(1), spread]), None);
         assert_eq!(found(vec![data, set]), None);
         assert_eq!(found(vec![other]), None);
+    }
+
+    #[test]
+    fn the_converting_positions_are_the_operators_keys_and_join_entries() {
+        // #360: which operands a conversion runs the members of.
+        let v = |n: &str| Box::new(Expr::Var(n.into()));
+        let bin = |op| Expr::BinOp {
+            op,
+            lhs: v("a"),
+            rhs: v("b"),
+        };
+        let names = |e: &Expr| -> Vec<String> {
+            e.conversions()
+                .into_iter()
+                .flatten()
+                .map(|c| match c {
+                    Converted::Value(Expr::Var(x)) => x.clone(),
+                    Converted::Entries(Expr::Var(x)) => format!("[{x}]"),
+                    _ => "?".to_string(),
+                })
+                .collect()
+        };
+        let converting = [BinOp::Add, BinOp::Mul, BinOp::Lt, BinOp::BitOr];
+        for op in converting.into_iter().chain([BinOp::LooseEq]) {
+            assert_eq!(names(&bin(op)), ["a", "b"]);
+        }
+        let none = [BinOp::Eq, BinOp::Neq, BinOp::And, BinOp::Or];
+        for op in none.into_iter().chain([BinOp::InstanceOf]) {
+            assert!(names(&bin(op)).is_empty());
+        }
+        assert_eq!(names(&bin(BinOp::In)), ["a"]);
+        let null_eq = Expr::BinOp {
+            op: BinOp::LooseEq,
+            lhs: v("a"),
+            rhs: Box::new(Expr::Lit(Prim::Null)),
+        };
+        assert!(names(&null_eq).is_empty(), "`a == null` converts nothing");
+        let unary = |op| Expr::UnaryOp { op, arg: v("a") };
+        assert_eq!(names(&unary(UnaryOp::Plus)), ["a"]);
+        assert!(names(&unary(UnaryOp::TypeOf)).is_empty());
+        assert!(names(&unary(UnaryOp::Not)).is_empty());
+        let index = Expr::IndexAccess {
+            arr: v("t"),
+            idx: v("k"),
+        };
+        assert_eq!(names(&index), ["k"]);
+        let join = Expr::Call {
+            id: ExprId(1),
+            fn_: Box::new(Expr::FieldAccess {
+                obj: v("xs"),
+                field: "join".into(),
+            }),
+            args: vec![Expr::Var("sep".into())],
+        };
+        assert_eq!(names(&join), ["[xs]", "sep"]);
     }
 }

@@ -199,11 +199,12 @@ pub struct CallRelation {
     /// position, a spliced copy's or one lowering gave none — shares a row:
     /// a may join, never `sure`.
     accesses: HashMap<Option<crate::ir::SourceRange>, Targets>,
-    /// What the member reads and writes of a statement hand code the
-    /// analysis does not see, by the statement's position, as
+    /// What the member reads and writes and the conversions of a statement
+    /// hand code the analysis does not see, by the statement's position, as
     /// [`Self::accesses`] is keyed: the receiver of an accessor the heap
-    /// does not place (#334), and the value a write hands such a setter.
-    /// That code runs there, and may call what the value reaches.
+    /// does not place (#334) or of a conversion method it does not place
+    /// (#360), and the value a write hands such a setter. That code runs
+    /// there, and may call what the value reaches.
     handed: HashMap<Option<crate::ir::SourceRange>, Escapes>,
     /// The half and the member of each accessor body an access ran: what a
     /// write inside it says runs it.
@@ -236,8 +237,8 @@ impl CallRelation {
         self.accesses.get(&at)
     }
 
-    /// What the accesses of the statement at `at` hand code the analysis
-    /// does not see ([`Self::handed`]); `None` when nothing.
+    /// What the accesses and conversions of the statement at `at` hand code
+    /// the analysis does not see ([`Self::handed`]); `None` when nothing.
     pub fn handed(&self, at: Option<crate::ir::SourceRange>) -> Option<&Escapes> {
         self.handed.get(&at)
     }
@@ -365,7 +366,7 @@ impl CallRelation {
             // read off a module binding may reach (#335).
             let mut module = false;
             // The accessors its member reads and writes run (#337), and what
-            // they hand code the analysis does not see (#334).
+            // they and its conversions hand code the analysis does not see.
             let mut accessed = BTreeSet::new();
             for at in positions(body) {
                 if let Some(t) = self.accesses.get(&at) {

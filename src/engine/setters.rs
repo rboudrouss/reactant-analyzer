@@ -3286,9 +3286,9 @@ impl<'a> SetterWalk<'a> {
     /// the read's region and phase, wherever the accessor was defined —
     /// never placed; and module code the analysis does not run, when the
     /// receiver is read off a module binding (`via`, the statement's
-    /// expression), may call what the module scope holds. What they hand
-    /// code the analysis does not see is that code's to call there, or later
-    /// (#334).
+    /// expression), may call what the module scope holds. What they and the
+    /// statement's conversions hand code the analysis does not see is that
+    /// code's to call there, or later (#334, #360).
     #[allow(clippy::too_many_arguments)]
     fn relation_accesses(
         &mut self,

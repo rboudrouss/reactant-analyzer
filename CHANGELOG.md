@@ -547,6 +547,19 @@ on a program React settles; 323 oracle cases, none a known false negative.
   installed on `Object.prototype` that calls a member of its receiver
   (`(o as any).label` running `this.run()`), in the render, was silent; it is
   a `setter-in-render` Warning (#334).
+- A conversion the language makes implicitly calls the `valueOf`,
+  `toString` or `Symbol.toPrimitive` of the object converted, own or
+  inherited from a literal named as its `__proto__`, with that object as
+  `this`: a template literal, `+`, the other arithmetic, bitwise and
+  relational operators, `==` against anything but `null`, unary `+`/`-`/`~`,
+  a computed key (`o[k]`, `k in o`), and the entries of an array `join` or a
+  conversion joins. `` `${o}` ``, `o + 1`, `+o`, `o < 2`, `o == 1`,
+  `[o].join()` and `` `${[o]}` `` with a `toString` or `valueOf` that writes
+  state, in the render, were silent; they are a `setter-in-render` Warning.
+  An object whose prototype the analysis does not place (a class instance,
+  a spread of an unplaced value) is handed to the conversion it may run, and
+  so is a literal to a `toString` getter installed on `Object.prototype`
+  (#360).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

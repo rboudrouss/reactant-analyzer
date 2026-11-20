@@ -73,9 +73,28 @@ that writes it (see *Cross-file limits*).
   into (`f.cancel = …; f.cancel()`) hands the function over too, so it may run (a Warning React
   may not confirm). A method of code the analysis does not see
   (`props.onPick(x)`, a library object's) is handed the object it is called on as well as its
-  arguments (#340, below). A conversion the language makes implicitly, which runs a `toString` or a `valueOf`
-  the program defines (`` `${o}` ``, `[o].join()`, `+o`), is not followed
-  [#360](https://github.com/rboudrouss/reactant-analyzer/issues/360). The writer relation reads one
+  arguments (#340, below). A conversion the language makes implicitly is a call of the `valueOf`,
+  `toString` and `Symbol.toPrimitive` (a member under a computed key) of each object the operand
+  may be, own or inherited from a literal its `__proto__` names, with the object as `this`, at the
+  conversion [#360](https://github.com/rboudrouss/reactant-analyzer/issues/360). The converting
+  positions are the operands of `+` (a template literal), of the other arithmetic, bitwise and
+  shift operators and of `<`, `<=`, `>`, `>=`; both of `==` and `!=` unless one is a `null` or
+  `undefined` literal; the key of `k in o`, of `o[k]` and of `o[k] = v`; the operand of
+  unary `-`, `+`, `~`; and every entry of an array `join` or a conversion joins (`[o].join()`,
+  `` `${[o]}` ``). `===`, `!==`, `typeof`, `!`, `&&`, `||`, `??`, `instanceof`, a condition and a
+  `switch` convert nothing. A callee the analysis does not run (`String(o)`, `JSON.stringify(o)`,
+  `"a".concat(o)`, `[o].toString()`) is handed its arguments and its receiver, so a `toJSON` or
+  `toString` they reach runs there. A literal or a plain object that holds none of those members
+  converts through `Object.prototype`'s, a function through `Function.prototype`'s: nothing of the
+  program runs. An object whose prototype the analysis does not place — a class instance or a
+  class, an object a spread of something unplaced filled, a library's object — may inherit one it
+  does not see, which is handed the object, as a method call's receiver is (a Warning React may
+  not confirm: `` `${{ ...props.a, onClick }}` `` reports what `onClick` writes). A value the
+  analysis does not place came from code that holds it already. Two conversions are not followed:
+  a computed key of an object literal or a class (`{ [k]: v }`)
+  [#370](https://github.com/rboudrouss/reactant-analyzer/issues/370), and a host element's
+  attribute, which React DOM converts to a string (`<div title={o}>`)
+  [#371](https://github.com/rboudrouss/reactant-analyzer/issues/371). The writer relation reads one
   the render hands to such a callee or hook — a literal, or a name bound to one or to a
   `useCallback` value, or one held by an object or array it hands over — as a possible render write
   [#262](https://github.com/rboudrouss/reactant-analyzer/issues/262),
@@ -467,7 +486,8 @@ that writes it (see *Cross-file limits*).
   `Symbol()`, an import, a local closure, a method on a receiver of unknown kind
   (`value.startsAt.getTime()` on a prop, `form.watch("x")`). A global is recognised by name when nothing in its module binds it,
   and the conversions a builtin makes on an object argument (`toString`, `toJSON`) are taken as
-  deterministic. Whether the result is a new reference is the value's question, so `find`, `at`,
+  deterministic: a statement about the content they compute, not about the closures they run,
+  which run where the conversion is (#360, above). Whether the result is a new reference is the value's question, so `find`, `at`,
   `reduce` and `Map.get` are left out [#224](https://github.com/rboudrouss/reactant-analyzer/issues/224).
 
 ## Why reactant may warn wrongly (false positives)
