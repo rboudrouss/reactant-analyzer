@@ -129,6 +129,30 @@ on a program React settles; 323 oracle cases, none a known false negative.
   cases go from a false Warning to silent; locally excalidraw body runs
   24 923 → 22 856, one Warning added (`props.elements`, a getter of that name
   installed on `window.h`), the other small repos unchanged (#336).
+- A member an object literal does not hold reads `undefined` where its
+  prototype, `Object.prototype`, cannot hold it: not one of that object's
+  own members (`toString`, `valueOf`, …), nor one the program may give an
+  existing object (a descriptor of any kind, a member of a literal it makes a
+  prototype, a write on `Object.prototype` or on a value that may be it),
+  nor any once the program sets a prototype that may be any object. It read
+  as anything, so `const { cb } = opts; cb?.(form)` with `cb` absent handed
+  `form` to code the analysis does not see, and with #340 every later method
+  call off `form` handed it over again; a default (`const { g = h } = {}`)
+  is now surely taken. `@mantine/form` 183 → 31 rows and 27 s → 15 s,
+  mantine 1137 → 947 rows and 586 s → 232 s (its churn graph 332 s → 10 s),
+  the other local corpus repos unchanged; the two entries below move no
+  corpus row (#340, #336).
+- A branch on a test of a value that is no name — an optional call's link
+  (`opts.cb?.(x)`), `opts.cb == null`, `if (opts.cb)` — is decided by that
+  value, as a name's test already was: a value that is only `null` or
+  `undefined` skips the call, one that is only an object or a function always
+  takes it. `opts.cb?.(form)` with `cb` absent hands `form` to nothing, and
+  `opts.size?.() ?? fallback` with `size` a function never runs `fallback`
+  (#340).
+- A call of a value that can only be `null` or `undefined` (`opts.cb(form)`
+  with `cb` absent) throws: it runs no body, hands nothing to code the
+  analysis does not see and writes nothing, where it read as a call of such
+  code; its arguments still run (#340).
 
 ### Removed
 
@@ -500,6 +524,12 @@ on a program React settles; 323 oracle cases, none a known false negative.
   the render, was silent; it is a `setter-in-render` Warning. A setter an
   object holds is now handed over wherever a method the analysis does not see
   is called off that object (#340).
+- A `for … of` or `for … in` whose head is a member or a pattern
+  (`for (o.f of xs)`, `for ([a, b] of pairs)`) writes it at each iteration,
+  and so does a write to a member under a type assertion (`(o.f as T) = …`,
+  `(o.f as T)++`) or an increment of a private field: the member, or the
+  names, kept their earlier value, and a closure stored there and called in
+  the render was silent (#340).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

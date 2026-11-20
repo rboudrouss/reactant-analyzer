@@ -76,6 +76,13 @@ pub struct ModuleFacts {
 /// off one runs only an accessor a descriptor installed, on it or on
 /// `Object.prototype`, or one of a prototype the program set on it
 /// ([`AccessorNames::may_run_off_plain`], #336).
+///
+/// The same holds of an object literal of the program, whose prototype is
+/// `Object.prototype` too: a member it does not hold as its own is one
+/// `Object.prototype` holds ([`OBJECT_PROTOTYPE_MEMBERS`]), one the program
+/// supplies to an object that exists — as an accessor or as data — or any
+/// once the program sets a prototype that may be any object; anything else
+/// reads `undefined` ([`AccessorNames::literal_may_inherit`], #340).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AccessorNames {
     /// Every name an accessor of the program may have.
@@ -84,6 +91,15 @@ pub struct AccessorNames {
     /// (`Object.defineProperty` and its kin, `__defineGetter__`), and the
     /// accessors of a literal the program makes another object's prototype.
     installed: NameSet,
+    /// The names the program may give an object that exists, an accessor or
+    /// data alike: every name `installed` holds, a data descriptor's, a data
+    /// member of a literal it makes a prototype, and a member it writes on
+    /// what may be `Object.prototype` — any name once such a value flows
+    /// anywhere but into a member access, a comparison or `Object.create`.
+    supplied: NameSet,
+    /// Built from the program's files: an `AccessorNames` no scan built
+    /// knows nothing of what they supply.
+    scanned: bool,
     /// The program makes something other than a literal an object's
     /// prototype (`Object.setPrototypeOf(o, p)`, `o.__proto__ = p`): any
     /// object of the program, a `Proxy` included, may then be on any chain.
@@ -103,6 +119,24 @@ struct NameSet {
     numeric: bool,
     any: bool,
 }
+
+/// The members `Object.prototype` holds (ECMA-262 §20.1.3 and Annex B.2.2):
+/// what a read off an object whose prototype it is finds there when the
+/// object does not hold the member as its own.
+pub const OBJECT_PROTOTYPE_MEMBERS: &[&str] = &[
+    "constructor",
+    "hasOwnProperty",
+    "isPrototypeOf",
+    "propertyIsEnumerable",
+    "toLocaleString",
+    "toString",
+    "valueOf",
+    "__proto__",
+    "__defineGetter__",
+    "__defineSetter__",
+    "__lookupGetter__",
+    "__lookupSetter__",
+];
 
 /// What a member read or write selects, as far as the accessors of the
 /// program it may run go (#336).
@@ -173,6 +207,15 @@ impl NameSet {
 }
 
 impl AccessorNames {
+    /// The names of a program whose files are yet to be scanned: what they
+    /// supply is then known ([`AccessorNames::literal_may_inherit`]).
+    pub fn scanned() -> Self {
+        AccessorNames {
+            scanned: true,
+            ..AccessorNames::default()
+        }
+    }
+
     /// An accessor of `member` (`None`: a name no constant spells).
     pub fn define(&mut self, member: Option<&str>) {
         self.all.add(member);
@@ -184,6 +227,13 @@ impl AccessorNames {
     pub fn install(&mut self, member: Option<&str>) {
         self.all.add(member);
         self.installed.add(member);
+        self.supplied.add(member);
+    }
+
+    /// A data member `member` given to an object that may exist before it,
+    /// `Object.prototype` included.
+    pub fn supply(&mut self, member: Option<&str>) {
+        self.supplied.add(member);
     }
 
     /// The program makes something other than a literal an object's
@@ -196,6 +246,8 @@ impl AccessorNames {
     pub fn extend(&mut self, other: &AccessorNames) {
         self.all.extend(&other.all);
         self.installed.extend(&other.installed);
+        self.supplied.extend(&other.supplied);
+        self.scanned |= other.scanned;
         self.reprototyped |= other.reprototyped;
         self.plain_runs_none |= other.plain_runs_none;
     }
@@ -219,6 +271,24 @@ impl AccessorNames {
     pub fn may_run_off_plain(&self, key: AccessKey<'_>) -> bool {
         !self.plain_runs_none
             && (self.installed.may_name(key) || (self.reprototyped && self.may_run(key)))
+    }
+
+    /// May an object literal of the program that holds no member `key` as
+    /// its own, nor a `__proto__`, read something there (#340)? Its
+    /// prototype is `Object.prototype`, whose own prototype is `null`: only a
+    /// member that one holds, or one the program supplies to an object that
+    /// exists, or any when the program sets a prototype that may be any
+    /// object, or when these names know nothing of the program. A key no
+    /// constant names may be any of those. No assumption is read: a literal
+    /// is not an object the library builds.
+    pub fn literal_may_inherit(&self, key: AccessKey<'_>) -> bool {
+        let AccessKey::Named(member) = key else {
+            return true;
+        };
+        !self.scanned
+            || self.reprototyped
+            || OBJECT_PROTOTYPE_MEMBERS.contains(&member)
+            || self.supplied.may_name(key)
     }
 
     /// No accessor of the program may run at any read.

@@ -96,6 +96,12 @@ pub struct Members {
     /// [`AccessorNames::may_run_off_plain`]). A property of the site, kept
     /// from either side as `array` is.
     pub plain: bool,
+    /// An object literal of the program with no `__proto__` member: its
+    /// prototype is `Object.prototype`, so a member it does not hold reads
+    /// `undefined` unless that prototype may hold it (#340,
+    /// [`AccessorNames::literal_may_inherit`]). A property of the site, kept
+    /// from either side as `array` is.
+    pub literal: bool,
 }
 
 impl Members {
@@ -224,6 +230,13 @@ impl Members {
         self.open || self.unseen
     }
 
+    /// A member `named` does not record is surely not this object's own: a
+    /// literal no unseen code holds, which nothing wrote under a key no
+    /// constant names, outliving no render.
+    fn lacks_for_sure(&self) -> bool {
+        self.literal && !self.is_open() && self.others.is_none() && !self.persists && !self.array
+    }
+
     /// What a member `named` lacks may hold: `undefined`, one of `others`, or
     /// anything when the object is open.
     fn lacking(&self) -> EnvVal<StateValue> {
@@ -277,6 +290,7 @@ impl Members {
             persists: self.persists || other.persists,
             array: self.array || other.array,
             plain: self.plain || other.plain,
+            literal: self.literal || other.literal,
         }
     }
 
@@ -295,6 +309,7 @@ impl Members {
             && (!self.persists || other.persists)
             && (!self.array || other.array)
             && (!self.plain || other.plain)
+            && (!self.literal || other.literal)
     }
 }
 
@@ -341,6 +356,10 @@ pub struct Heap {
     accessors: bool,
     defined: std::sync::Arc<AccessorNames>,
 }
+
+/// What a member read finds where nothing holds it.
+static UNDEFINED: std::sync::LazyLock<EnvVal<StateValue>> =
+    std::sync::LazyLock::new(|| EnvVal::Val(StateValue::undefined()));
 
 /// What a getter no recorded run bounds returns: anything, a new object
 /// included, and never a must-fresh one.
@@ -672,7 +691,9 @@ impl Heap {
     /// site that records it, in site order, and whether it may also be what
     /// no entry says — the sites are open, or one of them is not an object
     /// recording the member (#240). An object that does not name the member
-    /// may still hold it among its `others` (#76).
+    /// may still hold it among its `others` (#76); a literal that surely
+    /// does not hold it reads `undefined` there, unless its prototype may
+    /// hold it (#340).
     ///
     /// `None` is a key no constant names (`xs[i]`, `o[c ? "a" : "b"]`): it
     /// may select any member, so the read is every entry of every object, and
@@ -711,6 +732,15 @@ impl Heap {
                 }
                 Some(HeapValue::Obj(obj)) if !getters.is_empty() => {
                     open |= obj.is_open() || obj.persists;
+                }
+                // A literal that does not hold the member reads its
+                // prototype's, `Object.prototype`'s: `undefined` unless that
+                // one may hold it (#340).
+                Some(HeapValue::Obj(obj))
+                    if obj.lacks_for_sure()
+                        && !self.defined.literal_may_inherit(AccessKey::Named(member)) =>
+                {
+                    entries.push(&UNDEFINED);
                 }
                 _ => open = true,
             }
@@ -1098,6 +1128,36 @@ mod tests {
         assert!(got.as_val().undef, "absent from the other object: {got:?}");
         assert!(a.leq(&j) && b.leq(&j));
         assert!(!j.leq(&a), "the join holds others `a` does not");
+    }
+
+    /// #340: a member a literal does not hold reads `undefined`, closed,
+    /// unless its prototype may hold it or the heap knows nothing of the
+    /// program; an object that is no literal (a class's instance) stays open.
+    #[test]
+    fn a_member_a_literal_lacks_reads_undefined_unless_its_prototype_may_hold_it() {
+        let sites = Sites::closed([ExprId(7)]);
+        let lit = |literal: bool| {
+            let mut members = Members::exactly(HashMap::new());
+            members.literal = literal;
+            HeapValue::Obj(members)
+        };
+        let mut program = AccessorNames::scanned();
+        program.supply(Some("g"));
+        let mut h = Heap::new().with_defined(Arc::new(program));
+        h.insert(ExprId(7), lit(true));
+        let (entries, open) = h.members(&sites, Some("f"));
+        assert!(!open);
+        assert!(entries.len() == 1 && entries[0].as_val().is_nullish_only());
+        assert!(h.member_sites(&sites, Some("f")).is_none());
+        for name in ["g", "toString"] {
+            assert!(h.members(&sites, Some(name)).1, "{name}");
+        }
+        assert!(h.members(&sites, None).1, "a key no constant names");
+        h.insert(ExprId(7), lit(false));
+        assert!(h.members(&sites, Some("f")).1, "no literal");
+        let mut unknown = Heap::new();
+        unknown.insert(ExprId(7), lit(true));
+        assert!(unknown.members(&sites, Some("f")).1, "no scan");
     }
 
     #[test]
