@@ -1521,7 +1521,9 @@ fn assign_target_member(
 
 /// The expression a type wrapper around a write target holds
 /// (`(obj.f as T)`, `(obj.f)!`, `<T>obj.f`).
-fn type_wrapped_target<'a, 'b>(target: &'b SimpleAssignmentTarget<'a>) -> Option<&'b Expression<'a>> {
+fn type_wrapped_target<'a, 'b>(
+    target: &'b SimpleAssignmentTarget<'a>,
+) -> Option<&'b Expression<'a>> {
     match target {
         SimpleAssignmentTarget::TSAsExpression(t) => Some(&t.expression),
         SimpleAssignmentTarget::TSSatisfiesExpression(t) => Some(&t.expression),
