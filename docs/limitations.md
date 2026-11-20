@@ -344,7 +344,8 @@ that writes it (see *Cross-file limits*).
   library that
   extends `Object.prototype` (as for accessors, #336), and an alias of `Object` or of its
   reflective functions (`const O = Object; O.prototype.f = …`, `Object[k]`, `const { defineProperty
-  } = Object`), read as another object. Otherwise, once a member reads as code the analysis does not
+  } = Object`), read as another object
+  [#366](https://github.com/rboudrouss/reactant-analyzer/issues/366). Otherwise, once a member reads as code the analysis does not
   see, every later `form.m()` hands the object over again. What stays as
   before: a class's instance member keeps the instance as `this` wherever it is called
   (`const f = k.run; f()` too); `super` outside a class's instance member is opaque. A value
