@@ -406,6 +406,7 @@ pub fn lower_files_with(
         &hook_values,
         &lowered.utilities,
         &hook_names,
+        &file_imports,
         &lowered.module_table.re_export_graph(),
     ));
     lowered

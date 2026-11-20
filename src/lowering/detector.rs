@@ -99,7 +99,9 @@ fn consider_var<'a>(
     // A `const Foo: React.FC = ...` annotation feeds the component return-type rule.
     let type_ann = vd.type_annotation.as_deref();
     let Some(init) = &vd.init else { return };
-    match init {
+    // Parentheses and type assertions change no value: `const create = ((s)
+    // => …) as Create` (zustand's `create`, #383) binds the arrow.
+    match init.get_inner_expression() {
         Expression::ArrowFunctionExpression(arrow) => {
             consider_arrow(name, arrow, type_ann, classify, out);
         }

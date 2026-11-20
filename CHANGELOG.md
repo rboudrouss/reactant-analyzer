@@ -611,6 +611,20 @@ on a program React settles; 323 oracle cases, none a known false negative.
   `analysis-limit` Info, is reported, and its hooks are not
   `conditional-hook`s, since every render of a run calls the same closure
   (a condition inside the closure still is one) (#344).
+- A function bound through parentheses or a type assertion (`const create =
+  ((s) => …) as Create`, `const useX = (() => …) as () => number`) is the
+  function, hook or component it wraps: it was none of them, its calls were
+  opaque and a loop in it was silent (found with #383).
+- A hook that calls another file's hook of its own name (a `useStore`
+  wrapping an imported `useStore as useBase`, zustand's `useStore =
+  create(…)` running its `react.ts`'s `useStore`) runs it: the recursion guard
+  took the homonym for the hook itself, so it stayed a hook the analysis does
+  not see and a loop in it was silent (found with #383).
+- A hook value whose function hands back another program call's value
+  (zustand's own `create`: `s ? createImpl(s) : createImpl`), up to three
+  calls deep, or a program function by name, in the same file or another,
+  runs what that call returns or that function: a loop in it, silent behind
+  an `analysis-limit` Info, is reported (#383).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

@@ -812,12 +812,20 @@ alias, a no-op arm included (`isBrowser ? useLayoutEffect : () => {}`), is a hoo
 not see. A module `const` binding a hook name to what a call returns (`const useX = make(a)`) is the
 closure the function returns, run as the hook's body, when the function is one of the program's —
 the same file's, or another file's reached through an import and its re-exports (#342, #344) — and
-every `return` of it hands back a closure it writes, directly or through names bound only to
-closures: the parameters hold the call's arguments (a name or a primitive as written, ⊤ for
-anything else or a parameter some body reassigns; when the function is another file's, a name is
-the primitive the binding file's `const` holds, ⊤ otherwise), a call of a parameter is a call of
-the hook its argument names, and every other local of the function the closure reads is ⊤. When
-it may return one of several closures (#344), the hook's body branches on ⊤ to each, a choice
+every `return` of it hands back, directly or through names bound only to such values, a closure it
+writes, a function of the program by name (its own body, called with the hook's arguments), or a
+call of a function of the program (what that call may return, its parameters bound from the
+call's arguments as below, up to three calls deep; a deeper or recursive chain fails closed)
+(#383): the parameters hold the call's arguments (a name or a primitive as written, ⊤ for
+anything else or a parameter some body reassigns; a name handed to a function of another file is
+⊤ there, except at the module call itself, where it is the primitive the binding file's `const`
+holds), a call of a parameter is a call of the hook its argument names, and every other local of
+the function the closure reads is ⊤. A returned parameter, a returned call of a parameter or of a
+package's function, and candidates written in two different files (a body reads one file's names)
+leave a hook the analysis does not see; so does a hook bound to a call of a call's value
+(zustand's curried `create<T>()(fn)`) [#386](https://github.com/rboudrouss/reactant-analyzer/issues/386).
+When it may return one of several closures (#344), the
+hook's body branches on ⊤ to each, a choice
 made once per program run: every value is the join over the closures, so the correlation "the
 same closure on every render" is lost (render 1 through one, render 2 through the other is
 explored), a setter both closures call is not a write on every render (a Warning where one
@@ -825,11 +833,11 @@ closure alone would give an Error), a name a closure binds reads ⊤ where the o
 side meets it (an effect's guard on it is not proven: a possible loop where React settles), and
 the choice reads as a condition of what the closures bind (`missing-deps` on a setter an effect
 calls) [#384](https://github.com/rboudrouss/reactant-analyzer/issues/384); only
-`conditional-hook` takes the closure a hook sits in as the one every render runs. A closure that rebinds a parameter of the function while another
-calls it as a hook leaves the hook unseen. A function returning another call's value (zustand's
-`create`: `createState ? createImpl(createState) : createImpl`) leaves a hook the analysis does
-not see [#383](https://github.com/rboudrouss/reactant-analyzer/issues/383), and so does a
-package's factory.
+`conditional-hook` takes the closure a hook sits in as the one every render runs. zustand's own
+`create` (`createState ? createImpl(createState) : createImpl`) is such a choice: a `useStore =
+create(…)` of the program runs `createImpl`'s closure or `createImpl` itself, and a fact of the
+closure alone (`always-unstable-deps` on a fresh selector) is lost to the join (#384). A package's
+factory leaves a hook the analysis does not see (#51).
 A body inlined from another file reads its free names as its own file binds them (#354): its
 file's module `const`s, and ⊤ for a name it imports, even one the component's file binds to a
 `const` (a `const` imported from another file is ⊤ in every body). The hooks it brings into the
