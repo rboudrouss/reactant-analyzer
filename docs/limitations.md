@@ -350,7 +350,9 @@ that writes it (see *Cross-file limits*).
   a body (a module function read as a member, a package's or a prop's method) hands that code
   its receiver as well as its arguments, and so does a method past the inlining budget that reads
   `this`, which runs later with `this` unknown
-  [#340](https://github.com/rboudrouss/reactant-analyzer/issues/340). Every setter and closure the
+  [#340](https://github.com/rboudrouss/reactant-analyzer/issues/340) — a getter or a setter read or
+  written past the budget too, which is handed the value written as well
+  [#373](https://github.com/rboudrouss/reactant-analyzer/issues/373). Every setter and closure the
   receiver reaches is then a possible write there (a Warning, never an Error), React confirming
   it or not: a module function that only reads `this.k` off an object that also holds a setter
   is reported. The cost falls on objects whose methods read as code the analysis does not see

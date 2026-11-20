@@ -577,6 +577,11 @@ on a program React settles; 323 oracle cases, none a known false negative.
   stores in a module binding, read or converted off a literal in the render,
   was silent unless the literal itself was read off a module binding; it is
   a `setter-in-render` Warning (#372).
+- A getter or a setter past the inlining budget runs later, as a method
+  there does: it is handed its receiver when it reads `this`, and a setter
+  the value written. `o.run = () => setN(n + 1)` three calls deep, with a
+  setter `run` that calls what it is given, was silent; it is a
+  `setter-in-render` Warning (#373).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

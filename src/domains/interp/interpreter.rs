@@ -636,7 +636,9 @@ pub(crate) fn receiver_kind<T: Transfer>(
 /// getters, whose returns the heap keeps as what the read is
 /// ([`Heap::record_getter`]), or its setters, handed the value. Past the
 /// inlining budget none runs, and the read may be anything; every accessor
-/// escaped at its literal, so its body still runs, at an unknown time.
+/// escaped at its literal, so its body still runs, at an unknown time,
+/// handed what a method's is there (#340, #373): the value written, and the
+/// receiver when it reads `this`.
 ///
 /// Where the heap places nothing — an object no site places, a member a
 /// placed one does not hold, which its prototype may — the read or the write
@@ -718,22 +720,37 @@ fn run_accessors<T: Transfer>(
     if accessors.is_empty() {
         return;
     }
-    let written = written.map(|rhs| {
+    let value = written.map(|rhs| {
         let at = alloc_literal(transfer, rhs, env, ctx);
         EnvVal::located(at, transfer.eval_expr(rhs, env, ctx))
     });
-    let args = written.as_slice();
+    let args = value.as_slice();
     // The accessor's `this` is the object read or written (#338).
     let receiver = EnvVal::located(Some(sites), transfer.eval_expr(obj, env, ctx));
+    let mut reads_this = false;
     for site in accessors {
-        run_accessor(transfer, site, args, &receiver, env, ctx, depth);
+        reads_this |= run_accessor(transfer, site, args, &receiver, env, ctx, depth);
+    }
+    // Past the inlining budget the accessors run later, as a method does
+    // there (#340, #373): handed the value written, and the receiver when
+    // one reads it.
+    if depth >= MAX_INLINE_DEPTH
+        && let Some(rhs) = written
+    {
+        escape_at_access(transfer, rhs, env, ctx);
+    }
+    if reads_this {
+        escape_at_access(transfer, obj, env, ctx);
     }
 }
 
 /// Run the accessor at `site` on `receiver`, its `this`: a getter when
 /// `args` is empty, whose return the heap keeps as what the read is
 /// ([`Heap::record_getter`]), else a setter handed the value written. Past
-/// the inlining budget it runs nothing, and the read may be anything.
+/// the inlining budget it runs nothing, and the read may be anything: the
+/// body runs later, with its receiver and its argument unknown, as a
+/// method's does there (#340, #373). Returns whether it is such a body that
+/// reads its receiver, which the access then hands over.
 ///
 /// [`Heap::record_getter`]: crate::domains::stores::Heap::record_getter
 fn run_accessor<T: Transfer>(
@@ -744,19 +761,21 @@ fn run_accessor<T: Transfer>(
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
-) {
-    let returned = match depth >= MAX_INLINE_DEPTH {
-        true => None,
-        false => exec_heap_fns(
-            transfer,
-            Sites::closed([site]),
-            Args::exactly(args).on(Some(receiver)),
-            env,
-            ctx,
-            depth,
-            &mut Ran::default(),
-        ),
+) -> bool {
+    // Past the inlining budget the body is listed, not run.
+    let mut ran = match depth >= MAX_INLINE_DEPTH {
+        true => Ran::listing(),
+        false => Ran::default(),
     };
+    let returned = exec_heap_fns(
+        transfer,
+        Sites::closed([site]),
+        Args::exactly(args).on(Some(receiver)),
+        env,
+        ctx,
+        depth,
+        &mut ran,
+    );
     if args.is_empty() {
         let read = returned.and_then(|r| {
             let sites = r.sites().cloned();
@@ -766,6 +785,7 @@ fn run_accessor<T: Transfer>(
         });
         ctx.heap.record_getter(site, read.as_ref());
     }
+    ran.this
 }
 
 /// Run what the converting positions of `expr` run ([`Expr::conversions`]).
@@ -864,6 +884,8 @@ fn run_conversion<T: Transfer>(
         // Code the heap does not place may run: a prototype's member, an
         // accessor of the program it does not see (#334).
         let mut unplaced = found.handed;
+        // A getter past the inlining budget that reads its receiver (#373).
+        let mut reads_this = false;
         for member in TO_PRIMITIVE {
             if ctx.heap.has_accessors() {
                 let mut getters: Vec<ExprId> = ctx
@@ -876,7 +898,7 @@ fn run_conversion<T: Transfer>(
                 for site in getters {
                     ctx.record(|r| r.record_accessor(site, Accessor::Get, Some(member)));
                     bodies.insert(site);
-                    run_accessor(transfer, site, &[], &receiver, env, ctx, depth);
+                    reads_this |= run_accessor(transfer, site, &[], &receiver, env, ctx, depth);
                 }
                 unplaced |= ctx.heap.members(&sites, Some(member)).1
                     && ctx
@@ -892,7 +914,7 @@ fn run_conversion<T: Transfer>(
             .collect();
         methods.sort();
         methods.dedup();
-        let mut handed = unplaced;
+        let mut handed = unplaced || reads_this;
         if !methods.is_empty() {
             // Past the inlining budget the methods are listed, not run, and
             // one that reads its receiver runs later with `this` unknown.
