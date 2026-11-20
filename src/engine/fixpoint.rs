@@ -1216,7 +1216,9 @@ fn forwarded_props(
 }
 
 /// [`analyze_program_defining`] a program whose files define no accessor
-/// and no module scope (a hand-built registry).
+/// and no module scope (a hand-built registry). No file was scanned, so
+/// nothing is known of what the program supplies to `Object.prototype`: a
+/// member an object literal lacks keeps the open reading (#340).
 pub fn analyze_program(
     registry: ComponentRegistry,
     hook_registry: HookRegistry,

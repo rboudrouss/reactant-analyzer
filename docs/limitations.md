@@ -338,8 +338,10 @@ that writes it (see *Cross-file limits*).
   instance keep the open reading. `const { cb } = opts; cb?.(form)` with `cb` absent is then
   skipped, and so is `opts.cb?.(form)`: the test of a link, or of an `if`, that is no name is
   decided by its value, as a name's is by its narrowing (only `null` or `undefined` is nullish and
-  falsy, only an object or a function neither)
-  [#340](https://github.com/rboudrouss/reactant-analyzer/issues/340). Not seen: a library that
+  falsy, only an object or a function neither); `opts.cb(form)` throws, and a call of a value that
+  is only `null` or `undefined` runs no body, hands nothing over and writes nothing, its arguments
+  still running [#340](https://github.com/rboudrouss/reactant-analyzer/issues/340). Not seen: a
+  library that
   extends `Object.prototype` (as for accessors, #336), and an alias of `Object` or of its
   reflective functions (`const O = Object; O.prototype.f = …`, `Object[k]`, `const { defineProperty
   } = Object`), read as another object. Otherwise, once a member reads as code the analysis does not

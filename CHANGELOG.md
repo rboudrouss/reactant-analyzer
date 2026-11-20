@@ -146,6 +146,10 @@ on a program React settles; 323 oracle cases, none a known false negative.
   takes it. `opts.cb?.(form)` with `cb` absent hands `form` to nothing, and
   `opts.size?.() ?? fallback` with `size` a function never runs `fallback`
   (#340).
+- A call of a value that can only be `null` or `undefined` (`opts.cb(form)`
+  with `cb` absent) throws: it runs no body, hands nothing to code the
+  analysis does not see and writes nothing, where it read as a call of such
+  code; its arguments still run (#340).
 
 ### Removed
 

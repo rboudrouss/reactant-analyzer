@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use reactant::{
     engine::{
         AnalysisResult, ComponentRegistry, Config, FunctionRegistry, HookRegistry,
-        ProgramAnalysisResult, RootStrategy, analyze_program,
+        ProgramAnalysisResult, RootStrategy, analyze_program_defining,
     },
     ir::{
         cfg::CFG,
@@ -16,7 +16,8 @@ use reactant::{
         hooks::HookEntry,
         types::{BlockId, ExprId},
     },
-    lowering::{lower_custom_hooks, lower_program, lower_utilities},
+    lowering::{collect_module_facts, lower_custom_hooks, lower_program, lower_utilities},
+    resolver::ImportResolver,
 };
 
 fn analyze(src: &str) -> ProgramAnalysisResult {
@@ -37,12 +38,25 @@ fn analyze(src: &str) -> ProgramAnalysisResult {
         function_registry: FunctionRegistry::from_functions(utilities),
         ..Default::default()
     };
-    analyze_program(
+    // What the file's accessors define and supply, as a run reads it.
+    let facts = collect_module_facts(&ret.program, path, &NoImports);
+    analyze_program_defining(
         ComponentRegistry::from_components(components),
         HookRegistry::from_hooks(hooks),
         RootStrategy::Heuristic,
         &config,
+        facts.accessors,
+        Default::default(),
     )
+}
+
+/// One file: no import resolves.
+struct NoImports;
+
+impl ImportResolver for NoImports {
+    fn resolve(&self, _from: &std::path::Path, _specifier: &str) -> Option<std::path::PathBuf> {
+        None
+    }
 }
 
 /// The ids of the calls written in `e`, not in a function literal's body.
@@ -215,6 +229,38 @@ fn a_callback_read_through_a_member_is_its_body_from_the_first_pass() {
     });
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert!(rows[0].bodies.len() == 1 && !rows[0].open, "{:?}", rows[0]);
+}
+
+#[test]
+fn a_call_of_a_member_a_literal_lacks_runs_nothing() {
+    // `opts.onTick` is `undefined`: the call throws, so it runs no body and
+    // is no call of code the analysis does not see (#340).
+    let prog = analyze(
+        r#"
+        import { useState } from "react";
+        export function App() {
+          const [n, setN] = useState(0);
+          const opts: any = { a: 1 };
+          opts.onTick(setN);
+          return <div>{n}</div>;
+        }
+        "#,
+    );
+    let result = &prog.components[&prog.component_named("App").unwrap()];
+    let mut rows = Vec::new();
+    result.render_cfg.for_each_expr(&mut |e| {
+        if let Expr::Call { id, fn_, .. } = e
+            && matches!(fn_.as_ref(), Expr::FieldAccess { field, .. } if field == "onTick")
+        {
+            rows.push(result.calls.targets(*id).unwrap().clone());
+        }
+    });
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let row = &rows[0];
+    assert!(
+        row.bodies.is_empty() && !row.open && row.setters.is_empty(),
+        "{row:?}"
+    );
 }
 
 /// The calls of every function literal written in `cfg`, nested ones

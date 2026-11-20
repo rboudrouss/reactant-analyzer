@@ -1457,6 +1457,26 @@ fn call_evaluation<T: Transfer>(
     }
 }
 
+/// Can `fn_` only be `null` or `undefined` here — a member a literal does
+/// not hold, a name bound to nothing else? A name some setter or
+/// `useCallback` label binds is a function, whatever its value says.
+fn surely_nullish_callee<T: Transfer>(
+    transfer: &T,
+    fn_: &Expr,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+) -> bool {
+    if let Expr::Var(name) = fn_.peel_ts()
+        && (env.setter_labels(name).is_some() || env.callback_labels(name).is_some())
+    {
+        return false;
+    }
+    transfer
+        .eval_expr(fn_, env, ctx)
+        .as_state_value()
+        .is_some_and(|v| !v.is_bottom_value() && v.is_nullish_only())
+}
+
 /// The bodies `ran` lists surely run when called here: none is a function
 /// `useEffectEvent` hands back called in a render, where React throws
 /// instead ([`Heap::alloc_event`]).
@@ -1554,6 +1574,19 @@ fn exec_callbacks_depth<T: Transfer>(
             let class = classify_callee(fn_, env, ctx.query.dispatches());
             // Descend the receiver: handles chains like `a.then(x).then(y)`.
             exec_callbacks_depth(transfer, fn_, env, ctx, depth);
+            // A callee that can only be `null` or `undefined` throws once
+            // the arguments are evaluated: it runs no body, is handed
+            // nothing and writes nothing (#340).
+            if surely_nullish_callee(transfer, fn_, env, ctx) {
+                for arg in args.iter().filter(|a| !matches!(a, Expr::FnLit { .. })) {
+                    exec_callbacks_depth(transfer, arg, env, ctx, depth);
+                }
+                if ctx.calls.is_some() {
+                    let eval = call_evaluation(transfer, fn_, env, ctx, Ran::default(), Vec::new());
+                    ctx.record(|r| r.record_call(*id, eval));
+                }
+                return None;
+            }
             let runs_args = class == TriggerClass::InCycle && !capped;
             let binds_args = class == TriggerClass::Unknown && !capped;
             // What a local callee's parameters are bound to (#253): the
