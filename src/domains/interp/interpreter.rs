@@ -775,7 +775,7 @@ fn run_conversions<T: Transfer>(
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
 ) {
-    for converted in expr.conversions().into_iter().flatten() {
+    for converted in expr.conversions() {
         run_conversion(transfer, converted, env, ctx, depth);
     }
 }
@@ -800,7 +800,11 @@ fn run_conversion<T: Transfer>(
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
 ) {
-    let (Converted::Value(operand) | Converted::Entries(operand)) = converted;
+    let (Converted::Value(operand)
+    | Converted::Entries(operand)
+    | Converted::Prop(operand)
+    | Converted::Props(operand)
+    | Converted::Key(operand)) = converted;
     if matches!(operand.peel_ts(), Expr::Lit(_)) {
         return;
     }
@@ -815,6 +819,22 @@ fn run_conversion<T: Transfer>(
                 transfer.eval_expr(operand, env, ctx),
             ));
         }
+        Converted::Prop(_) => {
+            work.extend(members_of(&sites, None, ctx));
+            work.push(EnvVal::located(
+                Some(sites),
+                transfer.eval_expr(operand, env, ctx),
+            ));
+        }
+        Converted::Props(_) => {
+            if let Some(props) = members_of::<T::Domain>(&sites, None, ctx) {
+                if let Some(inner) = props.sites() {
+                    work.extend(members_of(inner, None, ctx));
+                }
+                work.push(props);
+            }
+        }
+        Converted::Key(_) => work.extend(members_of(&sites, Some("key"), ctx)),
         Converted::Entries(_) => {
             let arrays = sites
                 .ids
@@ -912,6 +932,24 @@ fn run_conversion<T: Transfer>(
 /// A heap value, as a value of the domain `D`.
 fn lift<D: AbstractDomain>(value: EnvVal<StateValue>) -> EnvVal<D> {
     EnvVal::located(value.sites().cloned(), D::from_state_value(value.as_val()))
+}
+
+/// What `member` of the objects at `sites` may be (`None`: any member), as
+/// one value of the domain `D` ([`Heap::members`]); `None` when nothing is
+/// there.
+///
+/// [`Heap::members`]: crate::domains::stores::Heap::members
+fn members_of<D: AbstractDomain>(
+    sites: &Sites,
+    member: Option<&str>,
+    ctx: &AnalysisCtx<D>,
+) -> Option<EnvVal<D>> {
+    let (values, _) = ctx.heap.members(sites, member);
+    values
+        .into_iter()
+        .cloned()
+        .reduce(|a, b| a.join(&b))
+        .map(lift)
 }
 
 /// Fire the side effects of an expression evaluated in *effect position* — a
@@ -1929,6 +1967,9 @@ fn exec_callbacks_depth<T: Transfer>(
         }
         Expr::CompApp { props, .. } => {
             exec_callbacks_depth(transfer, props, env, ctx, depth);
+            // The JSX runtime converts the element's key where it creates
+            // it, before the child renders (#371).
+            run_conversions(transfer, expr, env, ctx, depth);
             // Fire inter-component inlining for CompApp inside children/fields.
             if !capped {
                 transfer.eval_expr(expr, env, ctx);
@@ -2008,10 +2049,20 @@ fn exec_callbacks_depth<T: Transfer>(
         }
         // A native element hands React the props it invokes (`on*`, `ref`).
         // A child component receives its props through its own analysis.
+        //
+        // React DOM converts the props it writes to the DOM to strings
+        // (#371): where it mounts the element, in `completeWork`, in the
+        // render phase of the commit that mounts it; where a later commit
+        // changes a prop, in that commit's mutation phase. The analysis runs
+        // both here, in the render: what a conversion writes at a commit
+        // schedules a render as a write of the render does, so a write that
+        // changes the state loops in both, and one that does not settles in
+        // both.
         Expr::NativeElem { props, .. } => {
             expr.for_each_child(&mut |c| {
                 exec_callbacks_depth(transfer, c, env, ctx, depth);
             });
+            run_conversions(transfer, expr, env, ctx, depth);
             if let Expr::ObjectLit { id, fields, .. } = props.peel_ts() {
                 for (i, (name, val)) in fields.iter().enumerate() {
                     if crate::lowering::hook_extractor::invoked_prop(true, name) {

@@ -564,6 +564,13 @@ on a program React settles; 323 oracle cases, none a known false negative.
   where it is evaluated: `{ [k]: v }` and `class { [k]() {} }` with a `k`
   whose `toString` writes state, in the render, were silent; they are a
   `setter-in-render` Warning (#370).
+- React converts an element's props to strings: the JSX runtime an
+  element's `key`, React DOM every prop of a host element it writes to the
+  DOM but the `on*` handlers, the `ref` and the children (a `<textarea>`'s
+  child is its value), and each member of a `style` object. `<div
+  title={o}>`, `<div style={{ width: o }}>` and `<Item key={o} />` with an
+  `o` whose `toString` writes state were silent; they are a
+  `setter-in-render` Warning (#371).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

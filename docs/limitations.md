@@ -92,9 +92,15 @@ that writes it (see *Cross-file limits*).
   class, an object a spread of something unplaced filled, a library's object — may inherit one it
   does not see, which is handed the object, as a method call's receiver is (a Warning React may
   not confirm: `` `${{ ...props.a, onClick }}` `` reports what `onClick` writes). A value the
-  analysis does not place came from code that holds it already. One conversion is not followed:
-  a host element's attribute, which React DOM converts to a string (`<div title={o}>`)
-  [#371](https://github.com/rboudrouss/reactant-analyzer/issues/371). The writer relation reads one
+  analysis does not place came from code that holds it already. React converts an element's props
+  too [#371](https://github.com/rboudrouss/reactant-analyzer/issues/371): the JSX runtime an
+  element's `key` (a component's included, and a key a spread brings), React DOM every prop of a
+  host element it writes to the DOM — all but the `on*` handlers, the `ref` and the children,
+  except a `<textarea>`'s — and each member of a prop's object (a `style`'s values, `__html`), and
+  for a spread every member it brings. React DOM converts them where it mounts the element and at
+  a commit that changes the prop; the analysis converts them where the element is built, at every
+  render, in the render phase: a prop React converts only at the mount, or only when it changes,
+  or tests only for truthiness (`hidden`, `disabled`) is a Warning React may not confirm. The writer relation reads one
   the render hands to such a callee or hook — a literal, or a name bound to one or to a
   `useCallback` value, or one held by an object or array it hands over — as a possible render write
   [#262](https://github.com/rboudrouss/reactant-analyzer/issues/262),
