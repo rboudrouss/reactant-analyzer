@@ -103,6 +103,10 @@ on a program React settles; 323 oracle cases, none a known false negative.
   closure the child lets escape runs once in the parent, not again in each
   analysis of the child; `@mantine/form` 13.6 s → 9.8 s, mantine 365 s →
   200 s, corpus findings unchanged.
+- Faster heap work: heaps cloned from one another share their cells until
+  one side writes one, and a join or an order test visits only the cells two
+  heaps do not share (ADR-045); mantine 252 s → 184 s, `@mantine/form`
+  16.6 s → 14.5 s, findings unchanged.
 - `always-unstable-deps` also reports a dep that is a new reference at every
   render where it holds an object and a primitive otherwise
   (`items?.filter(f)`, `items && items.map(f)`, `c ? [x] : undefined`), with

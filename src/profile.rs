@@ -4,7 +4,9 @@
 //! the run keeps a stack of phases and charges each its exclusive time,
 //! counts the body runs by nesting depth and by the fixpoint pass that
 //! started them, and records each component analysis (root, child, probe,
-//! intra) with the size of the heap it was handed. At exit it prints the
+//! intra) with the size of the heap it was handed, and named counters
+//! ([`count`]: heap cells joined, member reads that may run an accessor). It
+//! also prints each file's accessor fact. At exit it prints the
 //! tables; every 30 s it prints one line (total runs, the top phases, the
 //! analysis stack), so a run killed by a time limit still says what it was
 //! doing.
@@ -73,6 +75,7 @@ struct Profile {
     open: Vec<Open>,
     analyses: HashMap<(ComponentId, &'static str), Analyses>,
     sites: HashMap<(ComponentId, ComponentId, u32, u32), u64>,
+    counts: HashMap<&'static str, u64>,
 }
 
 thread_local! {
@@ -144,6 +147,9 @@ impl Profile {
             "[profile] escaped closures run: {} by their owner, {} by another component",
             self.escaped_owned, self.escaped_foreign
         );
+        for (c, n) in top_n(&self.counts, usize::MAX) {
+            eprintln!("[profile] count {c} {n}");
+        }
         let mut kinds: HashMap<&'static str, (u64, u64)> = HashMap::new();
         for ((_, kind), a) in &self.analyses {
             let k = kinds.entry(*kind).or_default();
@@ -335,6 +341,14 @@ pub fn escaped_run(owned: bool) {
         true => p.escaped_owned += 1,
         false => p.escaped_foreign += 1,
     });
+}
+
+/// Add `n` to the counter `name`, printed at exit.
+pub fn count(name: &'static str, n: u64) {
+    if !on() {
+        return;
+    }
+    with(|p| *p.counts.entry(name).or_default() += n);
 }
 
 /// `caller` analysed `child` for the element at `line:col`.

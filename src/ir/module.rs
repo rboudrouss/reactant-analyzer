@@ -207,6 +207,36 @@ impl NameSet {
 }
 
 impl AccessorNames {
+    /// Whether this fact says anything (profiling).
+    pub fn contributes(&self) -> bool {
+        self.reprototyped
+            || [&self.all, &self.installed, &self.supplied]
+                .iter()
+                .any(|s| s.any || !s.names.is_empty())
+    }
+
+    /// One line for the profile: each set's names (or `*`), and the flags.
+    pub fn summary(&self) -> String {
+        let set = |s: &NameSet| match s.any {
+            true => "*".to_string(),
+            false => format!(
+                "{:?}",
+                s.names
+                    .iter()
+                    .take(12)
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+            ),
+        };
+        format!(
+            "all={} installed={} supplied={} reprototyped={}",
+            set(&self.all),
+            set(&self.installed),
+            set(&self.supplied),
+            self.reprototyped
+        )
+    }
+
     /// The names of a program whose files are yet to be scanned: what they
     /// supply is then known ([`AccessorNames::literal_may_inherit`]).
     pub fn scanned() -> Self {
@@ -462,8 +492,18 @@ impl ModuleTable {
     /// The member names some lowered module defines an accessor of (#334).
     pub fn accessor_names(&self) -> AccessorNames {
         let mut out = AccessorNames::default();
-        for facts in self.files.values() {
+        for (path, facts) in &self.files {
+            if crate::profile::on() && facts.accessors.contributes() {
+                eprintln!(
+                    "[profile] accessor-fact {} {}",
+                    path.display(),
+                    facts.accessors.summary()
+                );
+            }
             out.extend(&facts.accessors);
+        }
+        if crate::profile::on() {
+            eprintln!("[profile] accessor-fact <program> {}", out.summary());
         }
         out
     }

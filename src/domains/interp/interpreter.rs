@@ -661,6 +661,8 @@ fn run_accessors<T: Transfer>(
     if !ctx.heap.has_accessors() {
         return;
     }
+    let _profile = crate::profile::pass("accessors");
+    crate::profile::count("access:checked", 1);
     let (constant, index) = match key {
         Key::Field(field) => (Some(Cow::Borrowed(field)), None),
         Key::Index(idx) => (member_key(idx, env).map(Cow::Owned), Some(idx)),
@@ -673,6 +675,7 @@ fn run_accessors<T: Transfer>(
         ctx.heap.unseen_accessor(sites.as_ref(), key)
     };
     if unseen {
+        crate::profile::count("access:unseen", 1);
         escape_at_access(transfer, obj, env, ctx);
         if let Some(rhs) = written {
             escape_at_access(transfer, rhs, env, ctx);
@@ -720,6 +723,7 @@ fn run_accessors<T: Transfer>(
     if accessors.is_empty() {
         return;
     }
+    crate::profile::count("access:placed-run", 1);
     let value = written.map(|rhs| {
         let at = alloc_literal(transfer, rhs, env, ctx);
         EnvVal::located(at, transfer.eval_expr(rhs, env, ctx))
@@ -796,7 +800,13 @@ fn run_conversions<T: Transfer>(
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
 ) {
-    for converted in expr.conversions() {
+    let mut conversions = expr.conversions().peekable();
+    if conversions.peek().is_none() {
+        return;
+    }
+    let _profile = crate::profile::pass("conversions");
+    for converted in conversions {
+        crate::profile::count("conversions", 1);
         run_conversion(transfer, converted, env, ctx, depth);
     }
 }
@@ -2469,9 +2479,11 @@ fn run_escaped_rounds<T: Transfer>(
                 .unwrap_or_default();
             ctx.heap.escape(&Sites::closed(handed));
         }
-        let pending: Vec<_> = ctx
-            .heap
-            .escaped_fns()
+        let found = {
+            let _profile = crate::profile::phase("escaped-fns");
+            ctx.heap.escaped_fns()
+        };
+        let pending: Vec<_> = found
             .into_iter()
             .filter(|id| ran.insert(*id) && !runs_in_owner(*id, ctx))
             .collect();

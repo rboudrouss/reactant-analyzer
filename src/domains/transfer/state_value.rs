@@ -12,7 +12,11 @@ use crate::{
         },
         stores::{AbstractEnv, EnvVal, Heap, HeapValue, Sites, member_key},
     },
-    engine::{component_registry::ChildLookup, purity::Kind},
+    engine::{
+        component_cache::{CacheKey, CacheProps},
+        component_registry::ChildLookup,
+        purity::Kind,
+    },
     ir::{
         ComponentId,
         bindings::binding_of,
@@ -715,6 +719,7 @@ fn eval_comp_app(
 
     // Evaluate props → abstract map (EnvVals, preserving heap Locs for FnLit props)
     let abstract_props_full = eval_props_map(props_expr, env, ctx);
+    let profile = crate::profile::phase("child:input");
 
     // Flatten to StateValues for cache lookup and call graph recording
     let abstract_props: HashMap<Symbol, StateValue> = abstract_props_full
@@ -734,6 +739,7 @@ fn eval_comp_app(
     record_call_site(inter, child, abstract_props, span);
     record_site_input(inter, child, span, &abstract_props_full, &props_heap);
     let passed: Vec<ExprId> = props_heap.iter().map(|(id, _)| *id).collect();
+    drop(profile);
     run_child(
         inter,
         child,
@@ -757,6 +763,7 @@ fn flow_back(
     passed: &[ExprId],
     ctx: &mut AnalysisCtx<StateValue>,
 ) {
+    let _profile = crate::profile::phase("child:flow-back");
     let results = inter.results.borrow();
     let Some(result) = results.get(&child) else {
         return;
@@ -771,11 +778,12 @@ fn run_child(
     inter: &crate::domains::InterCtx<'_>,
     child: ComponentId,
     child_ir: &crate::ir::ComponentIR,
-    cache_key: &HashMap<Symbol, StateValue>,
+    cache_key: &CacheProps,
     abstract_props_full: HashMap<Symbol, EnvVal<StateValue>>,
     props_heap: Heap,
     span: Option<crate::ir::SourceRange>,
 ) {
+    let profile = crate::profile::phase("child:input");
     // Cache lookup (strict equality)
     if inter.cache.borrow().contains(child, cache_key) {
         inter.stats.borrow_mut().cache_hits += 1;
@@ -806,6 +814,7 @@ fn run_child(
     let Some(input) = input else {
         return;
     };
+    drop(profile);
 
     if crate::profile::on() {
         let (line, col) = span.map_or((0, 0), |s| (s.line, s.col));
@@ -842,36 +851,36 @@ fn record_site_input(
 
 /// What a child's analysis depends on, as the cache compares it: the props'
 /// values and the contents of the heap they reach — a closure's captured
-/// values, an object's members — under keys no prop name can take. Two
-/// renders passing `() => setN(n + 1)` pass the same reference, but the
-/// child runs the body under each `n`: a key without the captures answered
-/// the first one's result for every later `n`, and the loop it drives was
-/// never seen.
-fn props_cache_key(
-    props: &HashMap<Symbol, StateValue>,
-    reached: &Heap,
-) -> HashMap<Symbol, StateValue> {
-    let mut key = props.clone();
+/// values, an object's members — each under a key of its own kind
+/// ([`CacheKey`]). Two renders passing `() => setN(n + 1)` pass the same
+/// reference, but the child runs the body under each `n`: a key without
+/// the captures answered the first one's result for every later `n`, and
+/// the loop it drives was never seen.
+fn props_cache_key(props: &HashMap<Symbol, StateValue>, reached: &Heap) -> CacheProps {
+    let mut key: CacheProps = props
+        .iter()
+        .map(|(k, v)| (CacheKey::Prop(k.clone()), v.clone()))
+        .collect();
     for (id, hv) in reached.iter() {
         match hv {
             HeapValue::Fn { captured, .. } => key.extend(
                 captured
                     .iter()
-                    .map(|(v, val)| (format!("@{}:{v}", id.0), val.clone())),
+                    .map(|(v, val)| (CacheKey::Capture(*id, v.clone()), val.clone())),
             ),
             HeapValue::Obj(obj) => {
                 key.extend(
                     obj.named
                         .iter()
-                        .map(|(m, ev)| (format!("@{}.{m}", id.0), ev.as_val())),
+                        .map(|(m, ev)| (CacheKey::Member(*id, m.clone()), ev.as_val())),
                 );
                 key.extend(
                     obj.others
                         .iter()
-                        .map(|ev| (format!("@{}.*", id.0), ev.as_val())),
+                        .map(|ev| (CacheKey::Others(*id), ev.as_val())),
                 );
                 if obj.is_open() {
-                    key.insert(format!("@{}.?", id.0), StateValue::top());
+                    key.insert(CacheKey::Open(*id), StateValue::top());
                 }
             }
         }
