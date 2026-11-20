@@ -129,6 +129,16 @@ on a program React settles; 323 oracle cases, none a known false negative.
   cases go from a false Warning to silent; locally excalidraw body runs
   24 923 → 22 856, one Warning added (`props.elements`, a getter of that name
   installed on `window.h`), the other small repos unchanged (#336).
+- A member an object literal does not hold reads `undefined` where its
+  prototype, `Object.prototype`, cannot hold it: not one of that object's
+  own members (`toString`, `valueOf`, …), nor one the program may give an
+  existing object (a descriptor of any kind, a member of a literal it makes a
+  prototype, a write on `Object.prototype` or on a value that may be it),
+  nor any once the program sets a prototype that may be any object. It read
+  as anything, so `const { cb } = opts; cb?.(form)` with `cb` absent handed
+  `form` to code the analysis does not see, and with #340 every later method
+  call off `form` handed it over again; a default (`const { g = h } = {}`)
+  is now surely taken (#340, #336).
 
 ### Removed
 

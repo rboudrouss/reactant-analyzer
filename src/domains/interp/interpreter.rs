@@ -984,7 +984,15 @@ pub(crate) fn alloc_literal<T: Transfer>(
             return Some(Sites::closed([*id]));
         }
         Expr::ObjectLit { id, fields } => {
-            let mut members = Members::default();
+            // A literal's prototype is `Object.prototype` unless it names
+            // one; a class's value, lowered as a literal, is a function.
+            let literal = !fields
+                .iter()
+                .any(|(key, _)| key == "__proto__" || key == crate::ir::expr::CONSTRUCT_KEY);
+            let mut members = Members {
+                literal,
+                ..Members::default()
+            };
             for (i, (key, value)) in fields.iter().enumerate() {
                 if key.starts_with(SPREAD_KEY_PREFIX) {
                     let source = alloc_literal(transfer, value, env, ctx);

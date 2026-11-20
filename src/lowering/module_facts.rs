@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use oxc_ast::ast::*;
 use oxc_ast_visit::{Visit, walk};
+use oxc_span::GetSpan;
 
 use crate::ir::ModuleFacts;
 use crate::ir::module::{AccessorNames, ReExports, ValueRef};
@@ -133,20 +134,33 @@ pub fn collect_module_facts(
 /// sets (`Object.setPrototypeOf`, `Reflect.setPrototypeOf`, a write of
 /// `__proto__`): a literal brings its own accessors, `null` none, anything
 /// else any object of the program.
+///
+/// Apart again (#340): the data members the program may give an object that
+/// exists, `Object.prototype` included — a descriptor of any kind, a member of
+/// a literal it makes a prototype, a write of a member of a value that may be
+/// `Object.prototype` ([`may_be_object_prototype`]), and any member once such
+/// a value goes anywhere but into a member access, a comparison or
+/// `Object.create`'s prototype.
 pub(crate) fn accessor_names(program: &Program) -> AccessorNames {
-    let mut scan = AccessorScan::default();
+    let mut scan = AccessorScan {
+        found: AccessorNames::scanned(),
+        held: HashSet::new(),
+    };
     scan.visit_program(program);
     scan.found
 }
 
-#[derive(Default)]
 struct AccessorScan {
     found: AccessorNames,
+    /// The spans of the values that may be `Object.prototype` read where
+    /// they do not escape: a member access's object, a comparison's operand,
+    /// `Object.create`'s prototype.
+    held: HashSet<oxc_span::Span>,
 }
 
 impl AccessorScan {
     /// `proto` (`None`: not written) is made an existing object's
-    /// prototype. A literal puts its own accessors on that object's chain,
+    /// prototype. A literal puts its own members on that object's chain,
     /// and its own prototype's when it names one; `null` puts none; any other
     /// value may be any object of the program.
     fn prototype(&mut self, proto: Option<&Expression>) {
@@ -154,8 +168,12 @@ impl AccessorScan {
             Some(Expression::NullLiteral(_)) => {}
             Some(Expression::ObjectExpression(obj)) => {
                 for p in &obj.properties {
-                    let ObjectPropertyKind::ObjectProperty(p) = p else {
-                        continue;
+                    let p = match p {
+                        ObjectPropertyKind::ObjectProperty(p) => p,
+                        ObjectPropertyKind::SpreadProperty(_) => {
+                            self.found.supply(None);
+                            continue;
+                        }
                     };
                     if p.kind != PropertyKind::Init {
                         self.found.install(key_name(&p.key).as_deref());
@@ -165,11 +183,64 @@ impl AccessorScan {
                         && key_name(&p.key).is_some_and(|k| k == "__proto__")
                     {
                         self.prototype(Some(&p.value));
+                    } else {
+                        self.found.supply(key_name(&p.key).as_deref());
                     }
                 }
             }
             _ => self.found.reprototype(),
         }
+    }
+
+    /// `e` is read where it does not escape.
+    fn hold(&mut self, e: &Expression) {
+        self.held.insert(e.get_inner_expression().span());
+    }
+}
+
+/// May `e` be `Object.prototype`? A read of `__proto__` off anything, a
+/// call of a `getPrototypeOf`, and `prototype` off `Object`, off a
+/// `constructor` read, or off a value no name spells. `Foo.prototype` is not:
+/// a name other than `Object` is read as not being it, as an
+/// `Object.defineProperty` is recognised by its name (#336).
+fn may_be_object_prototype(e: &Expression) -> bool {
+    fn named(object: &Expression, key: &str) -> bool {
+        match key {
+            "__proto__" => true,
+            "prototype" => match object.get_inner_expression() {
+                Expression::Identifier(id) => id.name == "Object",
+                Expression::StaticMemberExpression(m) => {
+                    matches!(m.property.name.as_str(), "Object" | "constructor")
+                }
+                Expression::ComputedMemberExpression(m) => const_name(&m.expression)
+                    .is_none_or(|k| matches!(k.as_str(), "Object" | "constructor")),
+                _ => true,
+            },
+            _ => false,
+        }
+    }
+    fn member(m: &MemberExpression) -> bool {
+        match m {
+            MemberExpression::StaticMemberExpression(s) => named(&s.object, &s.property.name),
+            MemberExpression::ComputedMemberExpression(c) => {
+                const_name(&c.expression).is_some_and(|k| named(&c.object, &k))
+            }
+            MemberExpression::PrivateFieldExpression(_) => false,
+        }
+    }
+    fn call(c: &CallExpression) -> bool {
+        matches!(
+            c.callee.get_inner_expression(),
+            Expression::StaticMemberExpression(m) if m.property.name == "getPrototypeOf"
+        )
+    }
+    match e {
+        Expression::CallExpression(c) => call(c),
+        Expression::ChainExpression(c) => match &c.expression {
+            ChainElement::CallExpression(c) => call(c),
+            other => other.as_member_expression().is_some_and(member),
+        },
+        other => other.as_member_expression().is_some_and(member),
     }
 }
 
@@ -236,35 +307,52 @@ impl<'a> Visit<'a> for AccessorScan {
                 Expression::Identifier(id) => Some(id.name.as_str()),
                 _ => None,
             };
+            // A descriptor call's target gets the members its descriptors
+            // name, which the arms below count, and no other.
+            if let (Some("Object" | "Reflect"), "defineProperty" | "defineProperties") =
+                (on, m.property.name.as_str())
+                && let Some(target) = arg(0)
+            {
+                self.hold(target);
+            }
             match (on, m.property.name.as_str()) {
                 (Some("Object" | "Reflect"), "defineProperty") => {
-                    if may_hold_accessor(arg(2)) {
-                        self.found.install(arg(1).and_then(const_name).as_deref());
+                    let member = arg(1).and_then(const_name);
+                    match may_hold_accessor(arg(2)) {
+                        true => self.found.install(member.as_deref()),
+                        false => self.found.supply(member.as_deref()),
                     }
                 }
                 // The descriptors are the second argument of both;
-                // `Object.create`'s land on the object it creates only.
+                // `Object.create`'s land on the object it creates only,
+                // whose prototype it only reads.
                 (Some("Object"), method @ ("defineProperties" | "create")) => {
-                    let mut add = |member: Option<&str>| match method {
-                        "create" => self.found.define(member),
-                        _ => self.found.install(member),
+                    if method == "create"
+                        && let Some(proto) = arg(0)
+                    {
+                        self.hold(proto);
+                    }
+                    let mut add = |member: Option<&str>, accessor: bool| match (method, accessor) {
+                        ("create", true) => self.found.define(member),
+                        ("create", false) => {}
+                        (_, true) => self.found.install(member),
+                        (_, false) => self.found.supply(member),
                     };
                     match arg(1).map(Expression::get_inner_expression) {
                         Some(Expression::ObjectExpression(obj)) => {
                             for p in &obj.properties {
                                 match p {
-                                    ObjectPropertyKind::SpreadProperty(_) => add(None),
-                                    ObjectPropertyKind::ObjectProperty(p) => {
-                                        if may_hold_accessor(Some(&p.value)) {
-                                            add(key_name(&p.key).as_deref());
-                                        }
-                                    }
+                                    ObjectPropertyKind::SpreadProperty(_) => add(None, true),
+                                    ObjectPropertyKind::ObjectProperty(p) => add(
+                                        key_name(&p.key).as_deref(),
+                                        may_hold_accessor(Some(&p.value)),
+                                    ),
                                 }
                             }
                         }
                         // `Object.create(proto)` installs no member.
                         None => {}
-                        Some(_) => add(None),
+                        Some(_) => add(None, true),
                     }
                 }
                 (Some("Object" | "Reflect"), "setPrototypeOf") => self.prototype(arg(1)),
@@ -289,6 +377,80 @@ impl<'a> Visit<'a> for AccessorScan {
             self.prototype(Some(&it.right));
         }
         walk::walk_assignment_expression(self, it);
+    }
+
+    // A value that may be `Object.prototype` escapes wherever nothing below
+    // holds it: bound, passed, stored, returned — any member may then be
+    // written on it.
+    fn visit_expression(&mut self, it: &Expression<'a>) {
+        if may_be_object_prototype(it) && !self.held.contains(&it.span()) {
+            self.found.supply(None);
+        }
+        walk::walk_expression(self, it);
+    }
+
+    fn visit_static_member_expression(&mut self, it: &StaticMemberExpression<'a>) {
+        self.hold(&it.object);
+        walk::walk_static_member_expression(self, it);
+    }
+
+    fn visit_computed_member_expression(&mut self, it: &ComputedMemberExpression<'a>) {
+        self.hold(&it.object);
+        walk::walk_computed_member_expression(self, it);
+    }
+
+    fn visit_binary_expression(&mut self, it: &BinaryExpression<'a>) {
+        if it.operator.is_equality()
+            || matches!(it.operator, BinaryOperator::Instanceof | BinaryOperator::In)
+        {
+            self.hold(&it.left);
+            self.hold(&it.right);
+        }
+        walk::walk_binary_expression(self, it);
+    }
+
+    // Every place a member is written: an assignment, an update, a
+    // destructuring target, a `for … of` head.
+    fn visit_simple_assignment_target(&mut self, it: &SimpleAssignmentTarget<'a>) {
+        if let Some(m) = it.as_member_expression()
+            && may_be_object_prototype(m.object().get_inner_expression())
+        {
+            let member = match m {
+                MemberExpression::StaticMemberExpression(s) => Some(s.property.name.to_string()),
+                MemberExpression::ComputedMemberExpression(c) => const_name(&c.expression),
+                MemberExpression::PrivateFieldExpression(p) => Some(format!("#{}", p.field.name)),
+            };
+            self.found.supply(member.as_deref());
+        }
+        walk::walk_simple_assignment_target(self, it);
+    }
+
+    // `const { prototype: p } = Object` binds what may be `Object.prototype`.
+    fn visit_binding_property(&mut self, it: &BindingProperty<'a>) {
+        if key_name(&it.key).is_some_and(|k| k == "prototype" || k == "__proto__") {
+            self.found.supply(None);
+        }
+        walk::walk_binding_property(self, it);
+    }
+
+    fn visit_assignment_target_property_property(
+        &mut self,
+        it: &AssignmentTargetPropertyProperty<'a>,
+    ) {
+        if key_name(&it.name).is_some_and(|k| k == "prototype" || k == "__proto__") {
+            self.found.supply(None);
+        }
+        walk::walk_assignment_target_property_property(self, it);
+    }
+
+    fn visit_assignment_target_property_identifier(
+        &mut self,
+        it: &AssignmentTargetPropertyIdentifier<'a>,
+    ) {
+        if matches!(it.binding.name.as_str(), "prototype" | "__proto__") {
+            self.found.supply(None);
+        }
+        walk::walk_assignment_target_property_identifier(self, it);
     }
 
     fn visit_new_expression(&mut self, it: &NewExpression<'a>) {
@@ -510,6 +672,63 @@ mod tests {
         for set in ["Object.setPrototypeOf(o, t);", "o[\"__proto__\"] = t;"] {
             assert!(off_plain(&format!("{proxy}\n{set}"), "p"), "{set}");
         }
+    }
+
+    /// What a literal that does not hold `f` may read there (#340): only a
+    /// member `Object.prototype` holds or one the program may supply to an
+    /// object that exists, as data or as an accessor.
+    #[test]
+    fn a_literal_inherits_only_what_the_program_may_supply() {
+        use crate::ir::module::AccessKey;
+        let inherits = |src: &str, name: &str| {
+            facts_of(src)
+                .accessors
+                .literal_may_inherit(AccessKey::Named(name))
+        };
+        for src in [
+            "const o = { a: 1 }; o.f = 2;",
+            "Foo.prototype.f = () => 1;",
+            "window.HTMLElement.prototype.f = () => {};",
+            "jest.spyOn(HTMLElement.prototype, 'f');",
+            "Object.prototype.hasOwnProperty.call(o, 'f');",
+            "const c = Object.getPrototypeOf(o) === Object.prototype;",
+            "const k = Object.create(Object.getPrototypeOf(o));",
+            "Object.defineProperty(t, \"g\", { value: 1 });",
+            "Object.defineProperty(Object.prototype, \"g\", { get: () => 1 });",
+            "class K { f() {} get g() { return 1; } }",
+            "const { [k]: v } = Object;",
+        ] {
+            assert!(!inherits(src, "f"), "{src}");
+        }
+        for name in ["toString", "valueOf", "constructor", "__proto__"] {
+            assert!(inherits("", name), "{name}");
+        }
+        for src in [
+            "Object.prototype.f = () => 1;",
+            "Object.prototype[\"f\"] = 1;",
+            "Object.prototype[k] = 1;",
+            "o.__proto__.f = 1;",
+            "Object.getPrototypeOf(o).f = 1;",
+            "o.constructor.prototype.f = 1;",
+            "globalThis.Object.prototype.f++;",
+            "({ a: Object.prototype.f } = x);",
+            "const p = Object.prototype; p.f = 1;",
+            "Object.assign(Object.prototype, { f: 1 });",
+            "const { prototype } = Object;",
+            "Object.defineProperty(t, \"f\", { value: 1 });",
+            "Object.defineProperty(t, k, { value: 1 });",
+            "Object.defineProperties(t, { f: { value: 1 } });",
+            "Object.defineProperty(Object.prototype, \"f\", { get: () => 1 });",
+            "Object.setPrototypeOf(o, { f: 1 });",
+            "o.__proto__ = { f() {} };",
+            "Object.setPrototypeOf(o, p);",
+        ] {
+            assert!(inherits(src, "f"), "{src}");
+        }
+        // Names no scan built know nothing of the program.
+        assert!(
+            crate::ir::module::AccessorNames::default().literal_may_inherit(AccessKey::Named("f"))
+        );
     }
 
     #[test]
