@@ -1,7 +1,29 @@
+//! The abstract heap: one cell per allocation site ([`Heap`]).
+//!
+//! The cells are a persistent map (ADR-045, amended for the heap): a clone
+//! shares every cell, a write copies the one cell it changes, and
+//! [`Heap::join`], [`Heap::widen`] and [`Heap::leq`] walk only the cells two
+//! heaps do not share (`OrdMap::diff` skips shared subtrees and compares two
+//! cells by allocation). Skipping a cell `c` both hold is exact by three
+//! lattice laws: the cell join is idempotent (`c ⊔ c = c`), the cell
+//! widening leaves an unchanged cell as it is (`c ∇ (c ⊔ c) = c`), and the
+//! cell order is reflexive (`c ⊑ c`). They hold value by value: a
+//! [`StateValue`]'s components join by hull, union or `||`, its interval
+//! widens only a bound that grows and its other widenings are joins, and
+//! `v ⊑ w` is `v ⊔ w == w`, reflexive since no interval bound is `NaN`
+//! (#217); sites unite and object members merge from those. Equality is the
+//! domain's, which every reader respects (an interval's `-0` bit is read
+//! only where `0` is in its bounds). Tested here
+//! (`a_cell_is_its_own_join_and_widening_and_below_itself`, and the joins of
+//! heaps sharing a cell against the same joins visiting every cell) and per
+//! value domain (`stability::join_idempotent_commutative`, `widen_equals_join`).
+
 use std::{
     collections::{BTreeSet, HashMap},
     sync::Arc,
 };
+
+use imbl::{OrdMap, ordmap::DiffItem};
 
 use crate::{
     domains::{AbstractDomain, impls::StateValue},
@@ -313,8 +335,24 @@ impl Members {
     }
 }
 
+/// One heap cell, shared between the heaps cloned from one another until one
+/// of them writes it (ADR-045, amended for the heap). Two cells are equal when
+/// they are the same allocation: what lets a join or an order test skip what
+/// two heaps share (see the module doc).
+#[derive(Debug, Clone)]
+struct Cell(Arc<HeapValue>);
+
+impl PartialEq for Cell {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 /// Abstract heap: maps allocation-site `ExprId`s to `HeapValue`s.
 /// Populated by `eval_expr` for `FnLit`/`ObjectLit`/`ArrayLit` nodes.
+///
+/// The cells are a persistent map (an [`OrdMap`] of shared cells): a clone
+/// is O(1) and shares every cell until one side writes it.
 ///
 /// `escaped` are the sites code the analysis does not see holds a reference
 /// to (#254): an argument of a callee it does not run, a hook's argument, a
@@ -346,7 +384,7 @@ impl Members {
 /// hold (its prototype's), may run one ([`Heap::unseen_accessor`]).
 #[derive(Debug, Default)]
 pub struct Heap {
-    cells: HashMap<ExprId, HeapValue>,
+    cells: OrdMap<ExprId, Cell>,
     escaped: BTreeSet<ExprId>,
     assigned: AbstractEnv<StateValue>,
     written: HashMap<ExprId, Members>,
@@ -582,11 +620,11 @@ impl Heap {
         sites
             .ids
             .iter()
-            .any(|id| matches!(self.cells.get(id), Some(HeapValue::Obj(o)) if o.persists))
+            .any(|id| matches!(self.get(*id), Some(HeapValue::Obj(o)) if o.persists))
     }
 
     pub fn insert(&mut self, id: ExprId, val: HeapValue) {
-        self.cells.insert(id, val);
+        self.cells.insert(id, Cell(Arc::new(val)));
     }
 
     /// An object literal evaluated at site `id`: what the literal puts
@@ -599,14 +637,14 @@ impl Heap {
             members.overlay(written);
         }
         self.accessors |= members.named.keys().any(|k| accessor_of(k).is_some());
-        self.cells.insert(id, HeapValue::Obj(members));
+        self.insert(id, HeapValue::Obj(members));
     }
 
     /// Apply `write` to the object at site `id`, and keep it for the
     /// objects the site allocates next.
     /// A write may define an accessor: a class's, on its instance (#335).
     pub fn write_after(&mut self, id: ExprId, write: impl Fn(&mut Members)) {
-        if let Some(HeapValue::Obj(obj)) = self.cells.get_mut(&id) {
+        if let Some(HeapValue::Obj(obj)) = self.get_mut(id) {
             write(obj);
             self.accessors |= obj.named.keys().any(|k| accessor_of(k).is_some());
             write(self.written.entry(id).or_default());
@@ -628,10 +666,15 @@ impl Heap {
             if !seen.insert(id) {
                 continue;
             }
-            if let Some(HeapValue::Obj(obj)) = self.cells.get_mut(&id) {
+            if let Some(HeapValue::Obj(obj)) = self.get(id) {
                 stack.extend(obj.values().filter_map(EnvVal::locs).flatten().copied());
                 held.extend(obj.values().flat_map(|ev| ev.as_val().setters()));
-                obj.unseen = true;
+                // A cell another heap shares is copied only to change it.
+                if !obj.unseen
+                    && let Some(HeapValue::Obj(obj)) = self.get_mut(id)
+                {
+                    obj.unseen = true;
+                }
             }
         }
         held
@@ -674,13 +717,25 @@ impl Heap {
     /// they escape: a member written after the object escaped is reachable
     /// too.
     pub fn escaped_fns(&self) -> Vec<ExprId> {
-        let reached = self.reachable(self.escaped.iter().copied());
-        let mut fns: Vec<ExprId> = reached
-            .cells
-            .iter()
-            .filter(|(_, hv)| matches!(hv, HeapValue::Fn { .. }))
-            .map(|(id, _)| *id)
-            .collect();
+        // [`Heap::reachable`]'s walk, keeping the closures' sites only.
+        let mut seen = std::collections::HashSet::new();
+        let mut fns: Vec<ExprId> = Vec::new();
+        let mut stack: Vec<ExprId> = self.escaped.iter().copied().collect();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            match self.get(id) {
+                Some(HeapValue::Obj(obj)) => {
+                    stack.extend(obj.values().filter_map(EnvVal::locs).flatten().copied());
+                }
+                Some(HeapValue::Fn { captured_locs, .. }) => {
+                    fns.push(id);
+                    stack.extend(captured_locs.values().flat_map(|s| s.ids.iter().copied()));
+                }
+                None => {}
+            }
+        }
         fns.sort();
         fns
     }
@@ -744,7 +799,7 @@ impl Heap {
             owner,
             captured_slots,
             ..
-        }) = self.cells.get(&of)
+        }) = self.get(of)
         else {
             return false;
         };
@@ -757,18 +812,18 @@ impl Heap {
             captured_slots: captured_slots.clone(),
             event: true,
         };
-        self.cells.insert(id, event);
+        self.insert(id, event);
         true
     }
 
     /// The function at `id` is one `useEffectEvent` hands back
     /// ([`Heap::alloc_event`]).
     pub fn is_event(&self, id: ExprId) -> bool {
-        matches!(self.cells.get(&id), Some(HeapValue::Fn { event: true, .. }))
+        matches!(self.get(id), Some(HeapValue::Fn { event: true, .. }))
     }
 
     pub fn get(&self, id: ExprId) -> Option<&HeapValue> {
-        self.cells.get(&id)
+        self.cells.get(&id).map(|c| &*c.0)
     }
 
     /// What `member` of a value pointing to `sites` may be: the entry of each
@@ -920,10 +975,10 @@ impl Heap {
             if out.cells.contains_key(&id) {
                 continue;
             }
-            let Some(hv) = self.get(id) else {
+            let Some(cell) = self.cells.get(&id) else {
                 continue;
             };
-            match hv {
+            match &*cell.0 {
                 HeapValue::Obj(obj) => {
                     stack.extend(obj.values().filter_map(EnvVal::locs).flatten().copied());
                 }
@@ -931,7 +986,8 @@ impl Heap {
                     stack.extend(captured_locs.values().flat_map(|s| s.ids.iter().copied()));
                 }
             }
-            out.insert(id, hv.clone());
+            // The part shares its cells with the whole.
+            out.cells.insert(id, cell.clone());
         }
         out.accessors = self.accessors;
         out.defined = self.defined.clone();
@@ -981,12 +1037,15 @@ impl Heap {
         false
     }
 
+    /// The cell at `id`, to change it: copied first when another heap
+    /// shares it.
     pub fn get_mut(&mut self, id: ExprId) -> Option<&mut HeapValue> {
-        self.cells.get_mut(&id)
+        self.cells.get_mut(&id).map(|c| Arc::make_mut(&mut c.0))
     }
 
+    /// The cells, in site order.
     pub fn iter(&self) -> impl Iterator<Item = (&ExprId, &HeapValue)> {
-        self.cells.iter()
+        self.cells.iter().map(|(id, c)| (id, &*c.0))
     }
 
     /// Pointwise join: union of keys, join values at shared keys.
@@ -1011,74 +1070,23 @@ impl Heap {
             "heap:join cells",
             (self.cells.len() + other.cells.len()) as u64,
         );
+        // Only the cells the two heaps do not share: a cell both hold is its
+        // own join and its own widening (see the module doc).
         let mut result = self.cells.clone();
-        for (id, val) in &other.cells {
-            match result.get(id) {
-                None => {
-                    result.insert(*id, val.clone());
+        for item in self.cells.diff(&other.cells) {
+            match item {
+                DiffItem::Add(id, theirs) => {
+                    result.insert(*id, theirs.clone());
                 }
-                Some(HeapValue::Fn {
-                    params,
-                    body_cfg,
-                    captured: cap_self,
-                    captured_locs: locs_self,
-                    owner,
-                    captured_slots: slots_self,
-                    event,
-                }) => {
-                    if let HeapValue::Fn {
-                        captured: cap_other,
-                        captured_locs: locs_other,
-                        captured_slots: slots_other,
-                        ..
-                    } = val
-                    {
-                        let mut joined_cap = cap_self.clone();
-                        for (k, v) in cap_other {
-                            let cur = map_get_or(&joined_cap, k, StateValue::bottom);
-                            let next = match widen {
-                                true => cur.widen(&cur.join(v)),
-                                false => cur.join(v),
-                            };
-                            joined_cap.insert(k.clone(), next);
-                        }
-                        let joined_locs = locs_self
-                            .keys()
-                            .chain(locs_other.keys())
-                            .filter_map(|k| {
-                                let s = Sites::join_opt(locs_self.get(k), locs_other.get(k))?;
-                                Some((k.clone(), s))
-                            })
-                            .collect();
-                        // A certificate survives only where both agree.
-                        let joined_slots = slots_self
-                            .iter()
-                            .filter(|(k, l)| slots_other.get(*k) == Some(*l))
-                            .map(|(k, l)| (k.clone(), *l))
-                            .collect();
-                        result.insert(
-                            *id,
-                            HeapValue::Fn {
-                                params: params.clone(),
-                                body_cfg: Arc::clone(body_cfg),
-                                captured: joined_cap,
-                                captured_locs: joined_locs,
-                                owner: *owner,
-                                captured_slots: joined_slots,
-                                event: *event,
-                            },
-                        );
+                DiffItem::Update {
+                    old: (_, mine),
+                    new: (id, theirs),
+                } => {
+                    if let Some(merged) = merge_cell(&mine.0, &theirs.0, widen) {
+                        result.insert(*id, Cell(Arc::new(merged)));
                     }
                 }
-                Some(HeapValue::Obj(mine)) => {
-                    if let HeapValue::Obj(theirs) = val {
-                        let merged = match widen {
-                            true => mine.widen(&mine.join(theirs)),
-                            false => mine.join(theirs),
-                        };
-                        result.insert(*id, HeapValue::Obj(merged));
-                    }
-                }
+                DiffItem::Remove(..) => {}
             }
         }
         let mut assigned = self.assigned.clone();
@@ -1130,34 +1138,17 @@ impl Heap {
     pub fn leq(&self, other: &Self) -> bool {
         let _profile = crate::profile::phase("heap:leq");
         crate::profile::count("heap:leq cells", self.cells.len() as u64);
+        // A cell both heaps share is below itself (the order is reflexive);
+        // a cell only `self` holds is below nothing.
         self.escaped.is_subset(&other.escaped)
-            && self
-                .cells
-                .iter()
-                .all(|(id, hv)| match (hv, other.cells.get(id)) {
-                    (
-                        HeapValue::Fn {
-                            captured: a,
-                            captured_locs: la,
-                            ..
-                        },
-                        Some(HeapValue::Fn {
-                            captured: b,
-                            captured_locs: lb,
-                            ..
-                        }),
-                    ) => {
-                        a.iter().all(|(k, v)| {
-                            let w = map_get_or(b, k, StateValue::bottom);
-                            v.join(&w) == w
-                        }) && la.iter().all(|(k, s)| {
-                            lb.get(k)
-                                .is_some_and(|t| s.ids.is_subset(&t.ids) && (!s.open || t.open))
-                        })
-                    }
-                    (HeapValue::Obj(a), Some(HeapValue::Obj(b))) => a.leq(b),
-                    _ => false,
-                })
+            && self.cells.diff(&other.cells).all(|item| match item {
+                DiffItem::Add(..) => true,
+                DiffItem::Remove(..) => false,
+                DiffItem::Update {
+                    old: (_, a),
+                    new: (_, b),
+                } => cell_leq(&a.0, &b.0),
+            })
             && self
                 .written
                 .iter()
@@ -1172,6 +1163,104 @@ impl Heap {
                     .names()
                     .all(|var| !theirs.join_binding_from(var, &self.assigned))
             }
+    }
+}
+
+/// One cell of `self` below the cell of `other` at the same site
+/// ([`Heap::leq`]).
+fn cell_leq(hv: &HeapValue, other: &HeapValue) -> bool {
+    match (hv, other) {
+        (
+            HeapValue::Fn {
+                captured: a,
+                captured_locs: la,
+                ..
+            },
+            HeapValue::Fn {
+                captured: b,
+                captured_locs: lb,
+                ..
+            },
+        ) => {
+            a.iter().all(|(k, v)| {
+                let w = map_get_or(b, k, StateValue::bottom);
+                v.join(&w) == w
+            }) && la.iter().all(|(k, s)| {
+                lb.get(k)
+                    .is_some_and(|t| s.ids.is_subset(&t.ids) && (!s.open || t.open))
+            })
+        }
+        (HeapValue::Obj(a), HeapValue::Obj(b)) => a.leq(b),
+        _ => false,
+    }
+}
+
+/// The join (`widen`: the widening) of two cells at one site
+/// ([`Heap::join`]); `None` keeps `mine`, a cell of another kind than
+/// `theirs`.
+fn merge_cell(mine: &HeapValue, theirs: &HeapValue, widen: bool) -> Option<HeapValue> {
+    match mine {
+        HeapValue::Fn {
+            params,
+            body_cfg,
+            captured: cap_self,
+            captured_locs: locs_self,
+            owner,
+            captured_slots: slots_self,
+            event,
+        } => {
+            let HeapValue::Fn {
+                captured: cap_other,
+                captured_locs: locs_other,
+                captured_slots: slots_other,
+                ..
+            } = theirs
+            else {
+                return None;
+            };
+            let mut joined_cap = cap_self.clone();
+            for (k, v) in cap_other {
+                let cur = map_get_or(&joined_cap, k, StateValue::bottom);
+                let next = match widen {
+                    true => cur.widen(&cur.join(v)),
+                    false => cur.join(v),
+                };
+                joined_cap.insert(k.clone(), next);
+            }
+            let joined_locs = locs_self
+                .keys()
+                .chain(locs_other.keys())
+                .filter_map(|k| {
+                    let s = Sites::join_opt(locs_self.get(k), locs_other.get(k))?;
+                    Some((k.clone(), s))
+                })
+                .collect();
+            // A certificate survives only where both agree.
+            let joined_slots = slots_self
+                .iter()
+                .filter(|(k, l)| slots_other.get(*k) == Some(*l))
+                .map(|(k, l)| (k.clone(), *l))
+                .collect();
+            Some(HeapValue::Fn {
+                params: params.clone(),
+                body_cfg: Arc::clone(body_cfg),
+                captured: joined_cap,
+                captured_locs: joined_locs,
+                owner: *owner,
+                captured_slots: joined_slots,
+                event: *event,
+            })
+        }
+        HeapValue::Obj(mine) => {
+            let HeapValue::Obj(theirs) = theirs else {
+                return None;
+            };
+            let merged = match widen {
+                true => mine.widen(&mine.join(theirs)),
+                false => mine.join(theirs),
+            };
+            Some(HeapValue::Obj(merged))
+        }
     }
 }
 
@@ -1484,5 +1573,170 @@ mod tests {
         assert_eq!(sites(all), BTreeSet::from([ExprId(8), ExprId(9)]));
         let click = h.spread_members(&Sites::closed([ExprId(2)]), Some("onClick"));
         assert_eq!(sites(click), BTreeSet::from([ExprId(8)]));
+    }
+
+    /// Cells of every shape the join and the order read: a closure with
+    /// captures of each kind of value, sites open and closed, a slot
+    /// certificate; objects with sites, `others` and every flag; an interval
+    /// whose `-0` bit is set off `0` (a join rewrites it, equal still).
+    fn cells() -> Vec<HeapValue> {
+        let set = crate::test_support::cid(0);
+        let num = |lo: f64, hi: f64, may_neg_zero: bool| {
+            StateValue::number(Interval {
+                lo,
+                hi,
+                is_int: true,
+                may_neg_zero,
+            })
+        };
+        let captured = HashMap::from([
+            ("n".to_string(), num(1.0, 2.0, true)),
+            ("s".to_string(), StateValue::str_singleton("a".to_string())),
+            ("set".to_string(), StateValue::component_setter(set, 0)),
+            (
+                "u".to_string(),
+                StateValue::undefined().join(&StateValue::null()),
+            ),
+            ("t".to_string(), StateValue::top()),
+        ]);
+        let closure = HeapValue::Fn {
+            params: vec!["e".to_string()],
+            body_cfg: Arc::new(crate::test_support::single_block_cfg(vec![])),
+            captured,
+            captured_locs: HashMap::from([
+                ("o".to_string(), Sites::closed([ExprId(1), ExprId(2)])),
+                ("p".to_string(), Sites::closed([ExprId(3)]).opened()),
+            ]),
+            owner: set,
+            captured_slots: HashMap::from([("n".to_string(), 0)]),
+            event: false,
+        };
+        let located = |ids: &[u64], v: StateValue| {
+            EnvVal::located(Some(Sites::closed(ids.iter().map(|i| ExprId(*i)))), v)
+        };
+        let mut object = Members::exactly(HashMap::from([
+            ("f".to_string(), located(&[4], StateValue::top())),
+            ("x".to_string(), EnvVal::Val(num(-1.0, 0.0, true))),
+        ]));
+        object.others = Some(located(&[5], StateValue::str_singleton("b".to_string())));
+        let flagged = Members {
+            open: true,
+            unseen: true,
+            persists: true,
+            array: true,
+            plain: true,
+            literal: true,
+            ..object.clone()
+        };
+        vec![closure, HeapValue::Obj(object), HeapValue::Obj(flagged)]
+    }
+
+    /// Two cells that are each below the other, and the same certificates.
+    fn same_cell(a: &HeapValue, b: &HeapValue) -> bool {
+        let slots = |hv: &HeapValue| match hv {
+            HeapValue::Fn { captured_slots, .. } => Some(captured_slots.clone()),
+            HeapValue::Obj(_) => None,
+        };
+        cell_leq(a, b) && cell_leq(b, a) && slots(a) == slots(b)
+    }
+
+    #[test]
+    fn a_cell_is_its_own_join_and_widening_and_below_itself() {
+        // What lets `Heap::join`, `Heap::widen` and `Heap::leq` skip a cell
+        // two heaps share: the cell join is idempotent, the widening leaves
+        // an unchanged cell as it is, and the cell order is reflexive.
+        for cell in cells() {
+            assert!(cell_leq(&cell, &cell.clone()), "{cell:?}");
+            for widen in [false, true] {
+                let merged = merge_cell(&cell, &cell.clone(), widen).expect("same kind");
+                assert!(same_cell(&merged, &cell), "widen={widen}: {merged:?}");
+            }
+        }
+    }
+
+    /// `heap` with every cell a copy of its own: nothing shared with
+    /// `heap`, so a join or an order test with it visits every cell.
+    fn unshared(heap: &Heap) -> Heap {
+        let mut copy = heap.clone();
+        for (id, hv) in heap.iter() {
+            copy.insert(*id, hv.clone());
+        }
+        copy
+    }
+
+    /// Each cell of `a` the same as `b`'s, and the same sites.
+    fn same_heap(a: &Heap, b: &Heap) -> bool {
+        a.cells.keys().eq(b.cells.keys())
+            && a.iter().all(|(id, hv)| same_cell(hv, b.get(*id).unwrap()))
+    }
+
+    /// `a` and `b` hold one allocation at `id`.
+    fn shares(a: &Heap, b: &Heap, id: u64) -> bool {
+        let at = |h: &Heap| h.cells.get(&ExprId(id)).cloned();
+        at(a).is_some() && at(a) == at(b)
+    }
+
+    #[test]
+    fn two_heaps_sharing_a_cell_join_and_compare_over_the_others() {
+        let mut base = Heap::new();
+        for (id, cell) in (10..).zip(cells()) {
+            base.insert(ExprId(id), cell);
+        }
+        let (mut one, mut two) = (base.clone(), base.clone());
+        one.insert(ExprId(20), obj(1.0).get(ExprId(7)).unwrap().clone());
+        two.insert(ExprId(20), obj(2.0).get(ExprId(7)).unwrap().clone());
+        two.insert(ExprId(21), obj(3.0).get(ExprId(7)).unwrap().clone());
+        assert!(shares(&one, &two, 10) && !shares(&one, &two, 20));
+        for widen in [false, true] {
+            let skipped = one.merge(&two, widen);
+            let visited = one.merge(&unshared(&two), widen);
+            assert!(same_heap(&skipped, &visited), "widen={widen}");
+            assert!(shares(&skipped, &base, 10), "a shared cell is kept as is");
+            assert!(one.leq(&skipped) && two.leq(&skipped));
+        }
+        assert!(
+            !one.leq(&two) && !two.leq(&one),
+            "20 differs, 21 is two's only"
+        );
+        assert_eq!(one.leq(&base), one.leq(&unshared(&base)));
+        assert!(base.leq(&one) && base.leq(&unshared(&one)));
+    }
+
+    #[test]
+    fn a_cell_shared_through_a_clone_stays_shared_after_a_write_elsewhere() {
+        let mut first = Heap::new();
+        for (id, cell) in (10..).zip(cells()) {
+            first.insert(ExprId(id), cell);
+        }
+        let mut second = first.clone();
+        // A write into the object at 11 copies that cell only.
+        second.write_after(ExprId(11), |m| {
+            m.write(
+                Some(&"x".to_string()),
+                &EnvVal::Val(StateValue::number(Interval::point(5.0))),
+            )
+        });
+        assert!(shares(&first, &second, 10) && shares(&first, &second, 12));
+        assert!(!shares(&first, &second, 11));
+        for widen in [false, true] {
+            let skipped = first.merge(&second, widen);
+            let visited = first.merge(&unshared(&second), widen);
+            assert!(same_heap(&skipped, &visited), "widen={widen}");
+        }
+        assert!(first.leq(&second) && !second.leq(&first));
+        assert_eq!(
+            second.leq(&first.join(&second)),
+            unshared(&second).leq(&first.join(&second))
+        );
+        // Escaping a shared object copies it before marking it, and only
+        // when the mark changes it: the other heap's object is not held by
+        // unseen code, and one already held stays shared.
+        let mut third = first.clone();
+        third.escape(&Sites::closed([ExprId(11), ExprId(12)]));
+        let unseen =
+            |h: &Heap, id: u64| matches!(h.get(ExprId(id)), Some(HeapValue::Obj(o)) if o.unseen);
+        assert!(unseen(&third, 11) && !unseen(&first, 11));
+        assert!(!shares(&first, &third, 11));
+        assert!(unseen(&first, 12) && shares(&first, &third, 12));
     }
 }
