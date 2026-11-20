@@ -149,13 +149,41 @@ pub struct InterCtx<'a> {
     /// for it to run (`interp::run_escaped`): from then on
     /// they are escaped in every analysis of their owner.
     pub handed: &'a RefCell<HandedBack>,
+    /// The child each props object is the input of
+    /// ([`InterCtx::props_object`]): the owner L3's walk reads for a site no
+    /// component's range holds ([`InterCtx::site_owner`], ADR-049).
+    pub props_owners: &'a RefCell<PropsOwners>,
 }
 
 /// Per owner, the closures handed back to it ([`InterCtx::handed`]).
 pub type HandedBack =
     std::collections::HashMap<ComponentId, std::collections::BTreeSet<crate::ir::types::ExprId>>;
 
+/// Per props object, the child it is the input of ([`InterCtx::props_owners`]).
+///
+/// A run-wide table on the `InterCtx`, beside the input tables that mint the
+/// ids (`inputs`, `site_inputs`): one entry per child input, written once
+/// and read by the walk alone. On the heap it would be cloned, joined and
+/// keyed with every cell for a fact that never changes; a thread-local
+/// would outlive the analysis on a thread that runs many (the tests, the
+/// wasm build).
+pub type PropsOwners = std::collections::HashMap<crate::ir::types::ExprId, ComponentId>;
+
 impl<'a> InterCtx<'a> {
+    /// A new props object, the input of `child`: a fresh site, which no
+    /// component's range holds, recorded as `child`'s.
+    pub fn props_object(&self, child: ComponentId) -> crate::ir::types::ExprId {
+        let id = crate::ir::types::ExprId::fresh();
+        self.props_owners.borrow_mut().insert(id, child);
+        id
+    }
+
+    /// The component site `id` belongs to: the one whose range holds it, or
+    /// the child whose input the props object at `id` is.
+    pub fn site_owner(&self, id: crate::ir::types::ExprId) -> Option<ComponentId> {
+        ComponentId::site_owner(id).or_else(|| self.props_owners.borrow().get(&id).copied())
+    }
+
     /// Create a child context for inlining a nested component.
     /// Shares all RefCell state; new call_stack with parent pushed.
     pub fn child(&self, child: ComponentId) -> InterCtx<'a> {
@@ -179,6 +207,7 @@ impl<'a> InterCtx<'a> {
             hook_registry: self.hook_registry,
             program: self.program,
             handed: self.handed,
+            props_owners: self.props_owners,
         }
     }
 
