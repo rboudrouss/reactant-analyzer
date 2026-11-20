@@ -255,6 +255,12 @@ impl DominatorTree {
     pub fn dominates(&self, a: BlockId, b: BlockId) -> bool {
         self.dom.get(&b).is_some_and(|dom_b| dom_b.contains(&a))
     }
+
+    /// Every block dominating `b`, `b` included: [`compute_dominators`]'s
+    /// set for `b`.
+    pub fn dominators(&self, b: BlockId) -> Option<&HashSet<BlockId>> {
+        self.dom.get(&b)
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

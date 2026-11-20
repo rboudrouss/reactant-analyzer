@@ -20,7 +20,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::{
     domains::{Stability, StateValue},
-    engine::{AnalysisResult, DominatorTree, HookKind, ProgramAnalysisResult, compute_dominators},
+    engine::{AnalysisResult, DominatorTree, HookKind, ProgramAnalysisResult},
     ir::{
         ComponentId, SourceRange,
         cfg::{CFG, Terminator},
@@ -498,12 +498,19 @@ impl<'a> RuleCtx<'a> {
         // the enumeration and its own `DominatorTree`, which could disagree with
         // `ExitDominance` about reachability.
         let dominance = ExitDominance::of(cfg);
+        // The guard witness reads the same dominators, and a successor
+        // table built at the first hook it blames: once per component, not
+        // once per hook (dub spent 31 s re-deriving them).
+        let succs = std::cell::OnceCell::new();
         cfg_hook_calls(self.comp)
             .filter(|call| !matches!(call.kind, HookKind::Handler))
             .filter(|call| dominance.may_be_skipped(call.block_id))
             .map(|call| {
                 let mut notes = Vec::new();
-                if let Some((_, guard_span)) = guard_site(cfg, call.block_id) {
+                let succs = succs.get_or_init(|| cfg.successor_map());
+                if let Some((_, guard_span)) =
+                    guard_site(cfg, &dominance.domtree, succs, call.block_id)
+                {
                     let step = Step::Branch {
                         desc: "a condition evaluated here, so some render paths skip the hook"
                             .to_string(),
@@ -1209,8 +1216,9 @@ fn try_extract_setter_call<'e>(
     }
 }
 
-/// `true` iff `to` is reachable from `from` by following CFG edges.
-fn reaches(cfg: &CFG, from: BlockId, to: BlockId) -> bool {
+/// `true` iff `to` is reachable from `from` by following the edges of
+/// `succs` ([`CFG::successor_map`]).
+fn reaches(succs: &HashMap<BlockId, Vec<BlockId>>, from: BlockId, to: BlockId) -> bool {
     let mut seen = HashSet::new();
     let mut stack = vec![from];
     while let Some(b) = stack.pop() {
@@ -1218,7 +1226,7 @@ fn reaches(cfg: &CFG, from: BlockId, to: BlockId) -> bool {
             return true;
         }
         if seen.insert(b) {
-            stack.extend(cfg.successors(b));
+            stack.extend(succs.get(&b).into_iter().flatten().copied());
         }
     }
     false
@@ -1228,9 +1236,17 @@ fn reaches(cfg: &CFG, from: BlockId, to: BlockId) -> bool {
 /// conditional (a successor that never reaches `block`). Moved in from the
 /// former `conditional_hook::guard_site` — the guard-blaming witness for
 /// [`RuleCtx::hook_is_conditional`].
-fn guard_site(cfg: &CFG, block: BlockId) -> Option<(BlockId, Option<SourceRange>)> {
-    let doms = compute_dominators(cfg);
-    let dominators = doms.get(&block)?;
+///
+/// `dom` and `succs` are `cfg`'s dominators and successor table, built once
+/// by the caller for every hook it blames: both are functions of `cfg`
+/// alone, which the caller borrows unchanged across its hooks.
+fn guard_site(
+    cfg: &CFG,
+    dom: &DominatorTree,
+    succs: &HashMap<BlockId, Vec<BlockId>>,
+    block: BlockId,
+) -> Option<(BlockId, Option<SourceRange>)> {
+    let dominators = dom.dominators(block)?;
     dominators
         .iter()
         .filter(|&&d| {
@@ -1239,9 +1255,13 @@ fn guard_site(cfg: &CFG, block: BlockId) -> Option<(BlockId, Option<SourceRange>
                     cfg.blocks.get(&d).map(|b| &b.term),
                     Some(Terminator::Branch { .. })
                 )
-                && cfg.successors(d).iter().any(|&s| !reaches(cfg, s, block))
+                && succs
+                    .get(&d)
+                    .into_iter()
+                    .flatten()
+                    .any(|&s| !reaches(succs, s, block))
         })
-        .max_by_key(|&&d| doms.get(&d).map_or(0, |s| s.len()))
+        .max_by_key(|&&d| dom.dominators(d).map_or(0, HashSet::len))
         .map(|&d| {
             let guard = cfg.blocks.get(&d);
             let span = guard
