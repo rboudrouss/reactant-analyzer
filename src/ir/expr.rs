@@ -92,6 +92,10 @@ pub enum UnaryOp {
     TypeOf,
     /// Unary `+x` — numeric coercion, not the identity (`+"5"` is the number 5).
     Plus,
+    /// The property key a computed key (`{ [x]: v }`, `class { [x]() {} }`)
+    /// converts its expression to, where it is evaluated (#370): a string or
+    /// a symbol.
+    ToKey,
     /// An operator whose concrete semantics are not modeled by the abstract
     /// domain. Evaluated as ⊤ — never as the identity, which would falsify the
     /// operand's value.
@@ -157,6 +161,57 @@ pub enum Converted<'e> {
     /// Every entry of the arrays the operand denotes, as `join` converts
     /// them (`Array.prototype.join`, ECMA-262 §23.1.3.18).
     Entries(&'e Expr),
+    /// A host element's prop React DOM writes to the DOM (#371): its value,
+    /// set as a string attribute (`setValueForAttribute`), and each of its
+    /// members, as a `style` object's (`setValueForStyle`) and
+    /// `dangerouslySetInnerHTML`'s `__html` are written.
+    Prop(&'e Expr),
+    /// A spread of a host element's props (#371): every member of the
+    /// objects the operand denotes, each a [`Converted::Prop`].
+    Props(&'e Expr),
+    /// The member `key` of the objects the operand denotes: a spread of a
+    /// component's props gives the element the key the JSX runtime converts
+    /// (#371).
+    Key(&'e Expr),
+}
+
+/// A JSX prop whose function value may be invoked: a native element's `on*`
+/// events and `ref` (the only native props React calls), and any prop a
+/// component receives (the child may call whatever it is given).
+pub fn invoked_prop(native: bool, name: &str) -> bool {
+    !native || is_event_prop(name) || name == "ref"
+}
+
+/// An event handler's prop name: `on` and a capital (`onClick`).
+pub fn is_event_prop(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next() == Some('o')
+        && chars.next() == Some('n')
+        && chars.next().is_some_and(|c| c.is_ascii_uppercase())
+}
+
+/// What an element's prop `name`, holding `value`, converts to a string
+/// (#371), `host` for a host element of tag `tag`: its `key`, which the JSX
+/// runtime converts where the element is created (`jsx`: `"" + config.key`),
+/// and for a host element every prop React DOM writes to the DOM
+/// (`setProp`, `setInitialProperties`) — all but the handlers and the `ref`
+/// it invokes and the `children` it reconciles, which it never converts
+/// (`setProp`'s `children` arm sets a string or a number only, and an object
+/// child throws), except a `<textarea>`'s, its default value
+/// (`initTextarea`). A spread hands over every one of its members.
+fn prop_conversion<'e>(host: Option<&str>, name: &str, value: &'e Expr) -> Option<Converted<'e>> {
+    if name.starts_with(SPREAD_KEY_PREFIX) {
+        return Some(match host {
+            Some(_) => Converted::Props(value),
+            None => Converted::Key(value),
+        });
+    }
+    match host {
+        _ if name == "key" => Some(Converted::Value(value)),
+        Some(tag) if name == "children" => (tag == "textarea").then_some(Converted::Prop(value)),
+        Some(_) if !invoked_prop(true, name) => Some(Converted::Prop(value)),
+        _ => None,
+    }
 }
 
 /// The two halves of an accessor: a getter runs at every read of its member,
@@ -824,13 +879,51 @@ impl Expr {
     /// arithmetic, bitwise and shift operators and of `<`, `<=`, `>`, `>=`;
     /// both of `==` / `!=` unless one spells `null` or `undefined`, which
     /// never converts; the key of `k in o` and of `o[k]`; the argument of unary
-    /// `-`, `+`, `~`; and, for `xs.join(sep)`, every entry of the array `xs`
-    /// and `sep`. A member write `o[k] = v` converts `k` too
+    /// `-`, `+`, `~`; a computed key of an object literal or a class
+    /// ([`UnaryOp::ToKey`], #370); for `xs.join(sep)`, every entry of the array `xs`
+    /// and `sep`; and an element's props React converts to a string
+    /// (`prop_conversion`, #371). A member write `o[k] = v` converts `k` too
     /// ([`crate::ir::stmt::Stmt::MemberWrite`]). Nothing else converts here:
     /// `===`, `!==`, `typeof`, `!`, `&&`, `||`, `??`, `instanceof`, a
     /// condition, a `switch`. A call the analysis does not run (`String(o)`,
     /// `JSON.stringify(o)`) is handed its arguments, which escape there.
-    pub fn conversions(&self) -> [Option<Converted<'_>>; 2] {
+    pub fn conversions(&self) -> impl Iterator<Item = Converted<'_>> {
+        let (host, props, children): (_, &[(String, Expr)], &[Expr]) = match self {
+            Expr::NativeElem {
+                tag,
+                props,
+                children,
+                ..
+            } => (Some(tag.as_str()), props.object_fields(), children),
+            Expr::CompApp { props, .. } => (None, props.object_fields(), &[]),
+            _ => (None, &[], &[]),
+        };
+        let children = match host {
+            Some("textarea") => children,
+            _ => &[],
+        };
+        self.operator_conversions()
+            .into_iter()
+            .flatten()
+            .chain(
+                props
+                    .iter()
+                    .filter_map(move |(name, value)| prop_conversion(host, name, value)),
+            )
+            .chain(children.iter().map(Converted::Prop))
+    }
+
+    /// The fields of an object literal, through TS annotations; none for any
+    /// other expression.
+    fn object_fields(&self) -> &[(String, Expr)] {
+        match self.peel_ts() {
+            Expr::ObjectLit { fields, .. } => fields,
+            _ => &[],
+        }
+    }
+
+    /// [`Expr::conversions`] of an operator, a key, a `join`.
+    fn operator_conversions(&self) -> [Option<Converted<'_>>; 2] {
         let nullish = |e: &Expr| matches!(e.peel_ts(), Expr::Lit(Prim::Null | Prim::Unit));
         match self {
             Expr::BinOp { op, lhs, rhs } => match op {
@@ -858,7 +951,7 @@ impl Expr {
                 BinOp::And | BinOp::Or | BinOp::Eq | BinOp::Neq | BinOp::InstanceOf => [None, None],
             },
             Expr::UnaryOp {
-                op: UnaryOp::Neg | UnaryOp::Plus | UnaryOp::BitNot,
+                op: UnaryOp::Neg | UnaryOp::Plus | UnaryOp::BitNot | UnaryOp::ToKey,
                 arg,
             } => [Some(Converted::Value(arg)), None],
             Expr::IndexAccess { idx, .. } => [Some(Converted::Value(idx)), None],
@@ -969,11 +1062,12 @@ mod accessor_tests {
         };
         let names = |e: &Expr| -> Vec<String> {
             e.conversions()
-                .into_iter()
-                .flatten()
                 .map(|c| match c {
                     Converted::Value(Expr::Var(x)) => x.clone(),
                     Converted::Entries(Expr::Var(x)) => format!("[{x}]"),
+                    Converted::Prop(Expr::Var(x)) => format!("prop {x}"),
+                    Converted::Props(Expr::Var(x)) => format!("props {x}"),
+                    Converted::Key(Expr::Var(x)) => format!("key of {x}"),
                     _ => "?".to_string(),
                 })
                 .collect()
@@ -995,6 +1089,11 @@ mod accessor_tests {
         assert!(names(&null_eq).is_empty(), "`a == null` converts nothing");
         let unary = |op| Expr::UnaryOp { op, arg: v("a") };
         assert_eq!(names(&unary(UnaryOp::Plus)), ["a"]);
+        assert_eq!(
+            names(&unary(UnaryOp::ToKey)),
+            ["a"],
+            "a computed key (#370)"
+        );
         assert!(names(&unary(UnaryOp::TypeOf)).is_empty());
         assert!(names(&unary(UnaryOp::Not)).is_empty());
         let index = Expr::IndexAccess {
@@ -1011,5 +1110,49 @@ mod accessor_tests {
             args: vec![Expr::Var("sep".into())],
         };
         assert_eq!(names(&join), ["[xs]", "sep"]);
+        // #371: what an element's props convert.
+        let props = |names: &[&str]| {
+            Box::new(Expr::ObjectLit {
+                id: ExprId(2),
+                fields: names
+                    .iter()
+                    .map(|n| (n.to_string(), Expr::Var(format!("v_{n}"))))
+                    .collect(),
+            })
+        };
+        let all = [
+            "title", "style", "key", "ref", "onClick", "children", "...7",
+        ];
+        let host = |tag: &str| Expr::NativeElem {
+            tag: tag.into(),
+            props: props(&all),
+            children: vec![Expr::Var("c".into())],
+            span: None,
+            prop_spans: vec![],
+        };
+        assert_eq!(
+            names(&host("div")),
+            ["prop v_title", "prop v_style", "v_key", "props v_...7"],
+            "handlers, `ref` and children are never converted"
+        );
+        assert_eq!(
+            names(&host("textarea")),
+            [
+                "prop v_title",
+                "prop v_style",
+                "v_key",
+                "prop v_children",
+                "props v_...7",
+                "prop c"
+            ],
+            "a textarea's child is its default value"
+        );
+        let component = Expr::CompApp {
+            name: "C".into(),
+            props: props(&all),
+            span: None,
+            origin: None,
+        };
+        assert_eq!(names(&component), ["v_key", "key of v_...7"]);
     }
 }

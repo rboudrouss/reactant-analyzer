@@ -281,19 +281,7 @@ fn collect_handlers_in_expr(
     }
 }
 
-/// A JSX prop whose function value may be invoked: a native element's `on*`
-/// events and `ref` (the only native props React calls), and any prop a
-/// component receives (the child may call whatever it is given).
-pub(crate) fn invoked_prop(native: bool, name: &str) -> bool {
-    !native || is_event_prop(name) || name == "ref"
-}
-
-pub(crate) fn is_event_prop(name: &str) -> bool {
-    let mut chars = name.chars();
-    chars.next() == Some('o')
-        && chars.next() == Some('n')
-        && chars.next().is_some_and(|c| c.is_ascii_uppercase())
-}
+pub(crate) use crate::ir::expr::{invoked_prop, is_event_prop};
 
 pub(crate) fn prop_to_event(name: &str) -> String {
     // "onClick" → "click",  "onChange" → "change"

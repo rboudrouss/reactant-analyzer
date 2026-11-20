@@ -833,6 +833,46 @@ impl Heap {
         unbounded
     }
 
+    /// What a spread of the objects at `sites` hands over as `member` (`None`:
+    /// every member), as [`Heap::members`] reads it, except that a member a
+    /// props object holds under a spread key (`<C {...rest} />`, the
+    /// spread's source) is no member: it stands for the members of what it
+    /// spreads, read in turn (#371).
+    pub fn spread_members(&self, sites: &Sites, member: Option<&str>) -> Vec<&EnvVal<StateValue>> {
+        let mut stack: Vec<ExprId> = sites.ids.iter().copied().collect();
+        let mut seen = BTreeSet::new();
+        let mut out = Vec::new();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(HeapValue::Obj(obj)) = self.get(id) else {
+                continue;
+            };
+            let spreads: Vec<&EnvVal<StateValue>> = obj
+                .named
+                .iter()
+                .filter(|(k, _)| k.starts_with(crate::ir::expr::SPREAD_KEY_PREFIX))
+                .map(|(_, v)| v)
+                .collect();
+            let (values, _) = self.members(&Sites::closed([id]), member);
+            out.extend(
+                values
+                    .into_iter()
+                    .filter(|v| !spreads.iter().any(|s| std::ptr::eq(*s, *v))),
+            );
+            for source in spreads {
+                stack.extend(
+                    source
+                        .sites()
+                        .into_iter()
+                        .flat_map(|s| s.ids.iter().copied()),
+                );
+            }
+        }
+        out
+    }
+
     /// The allocation sites `member` of a value pointing to `sites` may be
     /// ([`Heap::members`]), open when it may also be something no site
     /// places; `None` when no entry places any.
@@ -1390,5 +1430,35 @@ mod tests {
         let plain = at(6);
         assert!(!plain.handed, "Object.prototype's");
         assert!(plain.entries.is_none());
+    }
+
+    #[test]
+    fn a_spread_hands_over_the_members_of_its_source_not_the_source() {
+        // #371: a props object holds a spread's source under its key.
+        let to = |id: u64| EnvVal::located(Some(Sites::closed([ExprId(id)])), StateValue::top());
+        let mut h = Heap::new();
+        h.insert(
+            ExprId(1),
+            HeapValue::Obj(Members::exactly(HashMap::from([(
+                "onClick".to_string(),
+                to(8),
+            )]))),
+        );
+        h.insert(
+            ExprId(2),
+            HeapValue::Obj(Members::at_least(HashMap::from([
+                ("title".to_string(), to(9)),
+                ("...5".to_string(), to(1)),
+            ]))),
+        );
+        let sites = |vs: Vec<&EnvVal<StateValue>>| -> BTreeSet<ExprId> {
+            vs.into_iter()
+                .flat_map(|v| v.sites().into_iter().flat_map(|s| s.ids.iter().copied()))
+                .collect()
+        };
+        let all = h.spread_members(&Sites::closed([ExprId(2)]), None);
+        assert_eq!(sites(all), BTreeSet::from([ExprId(8), ExprId(9)]));
+        let click = h.spread_members(&Sites::closed([ExprId(2)]), Some("onClick"));
+        assert_eq!(sites(click), BTreeSet::from([ExprId(8)]));
     }
 }
