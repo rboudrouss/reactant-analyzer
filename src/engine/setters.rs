@@ -6,6 +6,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::ir::ComponentId;
@@ -133,6 +134,53 @@ pub(crate) struct WriterTables<'a> {
     outer_fns: HashMap<Var, Arc<CFG>>,
     callback_bodies: HashMap<HookLabel, Arc<CFG>>,
     handlers: HashSet<Var>,
+    /// What the walks of this component ask of a body alone, once per body.
+    facts: BodyFacts,
+}
+
+/// The answers a walk asks of a body that depend on the body alone — its
+/// [`Reachability`], and whether a block of it runs on every path
+/// ([`on_all_paths`]) — computed once for every walk of one component.
+///
+/// The key is the body's address, which names one body as long as no body
+/// is freed while the tables live: two bodies alive at once have two
+/// addresses. That holds because every body a walk enters is borrowed
+/// unchanged for at least the tables' lifetime: the render and the hook
+/// bodies the tables borrow, the region a caller walks and the call
+/// relation's bodies (every caller passes its component's, and keeps both
+/// alive while it holds the tables), a function literal's body inside one
+/// of those, or a body the tables own (`callback_bodies`, `outer_fns`). So
+/// two walks of one component that enter the same body read the answer
+/// either would have computed: the body has not changed, and nothing else
+/// goes into it.
+#[derive(Default)]
+struct BodyFacts {
+    on_all: RefCell<HashMap<(usize, BlockId), bool>>,
+    reach: RefCell<HashMap<usize, Rc<Reachability>>>,
+}
+
+impl BodyFacts {
+    /// `on_all_paths(body, {block})`.
+    fn on_all(&self, body: &CFG, block: BlockId) -> bool {
+        let key = (body as *const CFG as usize, block);
+        if let Some(&known) = self.on_all.borrow().get(&key) {
+            return known;
+        }
+        let answer = on_all_paths(body, &HashSet::from([block]));
+        self.on_all.borrow_mut().insert(key, answer);
+        answer
+    }
+
+    /// `Reachability::of(body)`.
+    fn reach(&self, body: &CFG) -> Rc<Reachability> {
+        let key = body as *const CFG as usize;
+        if let Some(known) = self.reach.borrow().get(&key) {
+            return Rc::clone(known);
+        }
+        let answer = Rc::new(Reachability::of(body));
+        self.reach.borrow_mut().insert(key, Rc::clone(&answer));
+        answer
+    }
 }
 
 /// What one walk records besides the setter sites.
@@ -180,6 +228,7 @@ impl<'a> WriterTables<'a> {
             outer_fns,
             callback_bodies: callback_bodies(hooks),
             handlers: crate::lowering::hook_extractor::handler_names(render, hooks),
+            facts: BodyFacts::default(),
         }
     }
 
@@ -307,6 +356,7 @@ impl<'a> WriterTables<'a> {
             summaries: RefCell::default(),
             listening: false,
             accessor: None,
+            facts: &self.facts,
         };
         walk.cfg(cfg, depth, &mut found, WalkClass::Sync, None, None);
         found
@@ -1672,7 +1722,7 @@ pub(crate) fn collect_slot_writers(
                 sync_blocks.entry(s.slot).or_default().push(b);
             }
         }
-        let reach = Reachability::of(cfg);
+        let reach = tables.facts.reach(cfg);
         // What a name a write passes surely holds where it runs (#280): its
         // one binding in this body, run before the write and shadowed by no
         // nested body; or, in a body that runs after the render, its
@@ -1974,6 +2024,8 @@ struct SetterWalk<'a> {
     /// where the literal is written: every site it finds runs at a read or a
     /// write of that member.
     accessor: Option<AccessorOf>,
+    /// The component's [`BodyFacts`], shared by its walks.
+    facts: &'a BodyFacts,
 }
 
 /// A body on the walk's stack.
@@ -2184,12 +2236,11 @@ impl Found {
         mode: WalkClass,
         at: Option<(BlockId, usize)>,
         prov: Option<BlockId>,
+        facts: &BodyFacts,
     ) {
         for site in inner.setters {
             let sync = site.class == WalkClass::Sync;
-            let every_call = site
-                .at
-                .is_some_and(|(b, _)| on_all_paths(body, &HashSet::from([b])));
+            let every_call = site.at.is_some_and(|(b, _)| facts.on_all(body, b));
             self.setters.push(FoundSite {
                 class: if sync { mode } else { site.class },
                 at: if sync && every_call { at } else { None },
@@ -2213,9 +2264,7 @@ impl Found {
         }
         for store in inner.stores {
             let sync = store.class == WalkClass::Sync;
-            let every_call = store
-                .at
-                .is_some_and(|(b, _)| on_all_paths(body, &HashSet::from([b])));
+            let every_call = store.at.is_some_and(|(b, _)| facts.on_all(body, b));
             self.stores.push(StoreSite {
                 class: if sync { mode } else { store.class },
                 at: if sync && every_call { at } else { None },
@@ -2707,7 +2756,7 @@ impl<'a> SetterWalk<'a> {
         // A block that reaches itself is a loop body: everything in it runs
         // 0..N times per tick, whichever CFG the loop happens to live in — the
         // caller's, or a helper's the walk pulled in.
-        let reach = Reachability::of(cfg);
+        let reach = self.facts.reach(cfg);
         // Blocks this body reaches only across an `await` (#117, ADR-035). A
         // write there runs on a later turn of the event loop, so it is
         // `Deferred` however the walk entered the body — the same summary a
@@ -3077,7 +3126,7 @@ impl<'a> SetterWalk<'a> {
                         prov,
                         stmt_span,
                     );
-                    found.absorb(inner, body_cfg, mode, None, prov);
+                    found.absorb(inner, body_cfg, mode, None, prov, self.facts);
                 }
             }
         }
@@ -3280,7 +3329,7 @@ impl<'a> SetterWalk<'a> {
             if matches!(reached, Reached::Other) {
                 inner.spelled(spelling.as_deref());
             }
-            found.absorb(inner, body, mode, at, prov);
+            found.absorb(inner, body, mode, at, prov, self.facts);
         }
         if row.module {
             self.module_rows(fn_, mode, depth, found, prov, stmt_span);
@@ -3366,7 +3415,7 @@ impl<'a> SetterWalk<'a> {
             if matches!(reached, Reached::Other) {
                 inner.spelled(name.as_deref());
             }
-            found.absorb(inner, body, mode, None, prov);
+            found.absorb(inner, body, mode, None, prov, self.facts);
         }
         if row.module {
             self.module_rows(via, mode, depth, found, prov, stmt_span);
@@ -3534,6 +3583,7 @@ impl<'a> SetterWalk<'a> {
                 if here { class } else { held_class },
                 placed,
                 prov,
+                self.facts,
             );
         }
     }
@@ -3595,7 +3645,7 @@ impl<'a> SetterWalk<'a> {
                     prov,
                     stmt_span,
                 );
-                found.absorb(inner, body_cfg, class, None, prov);
+                found.absorb(inner, body_cfg, class, None, prov, self.facts);
             }
         }
         let spelling = callee_path(arg);
@@ -3643,7 +3693,7 @@ impl<'a> SetterWalk<'a> {
                 prov,
                 stmt_span,
             );
-            found.absorb(inner, body, WalkClass::Unknown, None, prov);
+            found.absorb(inner, body, WalkClass::Unknown, None, prov, self.facts);
         }
     }
 

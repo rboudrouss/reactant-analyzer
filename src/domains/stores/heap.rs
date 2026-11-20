@@ -393,6 +393,21 @@ pub struct Heap {
     /// write runs one, which [`Heap::has_accessors`] lets a caller skip.
     accessors: bool,
     defined: std::sync::Arc<AccessorNames>,
+    /// The last [`Heap::hand_over`], kept with the cells it left. A cache,
+    /// not a fact of the heap: never cloned, joined or compared.
+    hand_memo: Option<Box<HandMemo>>,
+}
+
+/// What [`Heap::reach_of`] finds: the setters and the closures reached.
+type Reach = (Vec<(ComponentId, HookLabel)>, Vec<ReachedFn>);
+
+/// One [`Heap::hand_over`] and the cells after it.
+#[derive(Debug)]
+struct HandMemo {
+    sites: Sites,
+    cells: OrdMap<ExprId, Cell>,
+    reach: Option<Reach>,
+    held: Vec<(ComponentId, HookLabel)>,
 }
 
 impl Clone for Heap {
@@ -407,6 +422,7 @@ impl Clone for Heap {
             returned: self.returned.clone(),
             accessors: self.accessors,
             defined: self.defined.clone(),
+            hand_memo: None,
         }
     }
 }
@@ -680,12 +696,58 @@ impl Heap {
         held
     }
 
+    /// A value at `sites` handed to code the analysis does not see:
+    /// [`Heap::reach_of`] when `reach` (what the call relation records),
+    /// then [`Heap::escape`], whose setters come second.
+    ///
+    /// When the last hand-over was of the same sites and the cells are the
+    /// ones it left (pointer for pointer: no cell changed since), both
+    /// answers are that hand-over's and the escape is already done. Exact
+    /// because an escape changes only the `unseen` marks and the escaped
+    /// set: the walks of both read neither, so they find on these cells
+    /// what they found before the marks; every object the escape reaches is
+    /// marked already and the sites are escaped already, so a second escape
+    /// would change nothing.
+    pub fn hand_over(
+        &mut self,
+        sites: &Sites,
+        reach: bool,
+    ) -> (Option<Reach>, Vec<(ComponentId, HookLabel)>) {
+        if let Some(memo) = self.hand_memo_for(sites, reach) {
+            return (memo.reach.clone().filter(|_| reach), memo.held.clone());
+        }
+        let reached = reach.then(|| self.reach_of(sites));
+        let held = self.escape(sites);
+        self.hand_memo = Some(Box::new(HandMemo {
+            sites: sites.clone(),
+            cells: self.cells.clone(),
+            reach: reached.clone(),
+            held: held.clone(),
+        }));
+        (reached, held)
+    }
+
+    /// The last hand-over, when [`Heap::hand_over`] of `sites` may answer
+    /// with it.
+    fn hand_memo_for(&self, sites: &Sites, reach: bool) -> Option<&HandMemo> {
+        self.hand_memo.as_deref().filter(|memo| {
+            memo.sites == *sites
+                && memo.cells.ptr_eq(&self.cells)
+                && (memo.reach.is_some() || !reach)
+                && sites.ids.iter().all(|id| self.escaped.contains(id))
+        })
+    }
+
     /// What a value at `sites` reaches, as [`Heap::escape`] and
     /// [`Heap::escaped_fns`] walk it, without escaping anything: the
     /// setters the objects on the way hold, and the closures (by site, with
     /// their bodies) reached through members and captures. What the call
     /// relation records of a value handed to a callee (ADR-047).
-    pub fn reach_of(&self, sites: &Sites) -> (Vec<(ComponentId, HookLabel)>, Vec<ReachedFn>) {
+    ///
+    /// It reads neither the `unseen` marks nor the escaped set, which is
+    /// what lets [`Heap::hand_over`] reuse an answer across an escape: a
+    /// change that makes it read either must invalidate that memo.
+    pub fn reach_of(&self, sites: &Sites) -> Reach {
         let mut stack: Vec<ExprId> = sites.ids.iter().copied().collect();
         let mut seen = BTreeSet::new();
         let (mut setters, mut fns) = (Vec::new(), Vec::new());
@@ -1136,6 +1198,7 @@ impl Heap {
                     Arc::new(both)
                 }
             },
+            hand_memo: None,
         }
     }
 
@@ -1772,5 +1835,83 @@ mod tests {
         assert!(unseen(&third, 11) && !unseen(&first, 11));
         assert!(!shares(&first, &third, 11));
         assert!(unseen(&first, 12) && shares(&first, &third, 12));
+    }
+
+    #[test]
+    fn a_hand_over_across_an_escape_answers_what_a_fresh_walk_does() {
+        // The object at 2 holds a setter, the closure at 1 and the object at
+        // 3, which holds a setter too and is what the closure captures.
+        let comp = crate::test_support::cid(0);
+        let setter = |label: HookLabel| EnvVal::Val(StateValue::component_setter(comp, label));
+        let mut heap = Heap::new();
+        heap.insert(
+            ExprId(1),
+            HeapValue::Fn {
+                params: vec![],
+                body_cfg: Arc::new(crate::test_support::single_block_cfg(vec![])),
+                captured: HashMap::new(),
+                captured_locs: HashMap::from([("o".to_string(), Sites::closed([ExprId(3)]))]),
+                owner: comp,
+                captured_slots: HashMap::new(),
+                event: false,
+            },
+        );
+        heap.insert(
+            ExprId(2),
+            HeapValue::Obj(Members::exactly(HashMap::from([
+                ("set".to_string(), setter(0)),
+                (
+                    "f".to_string(),
+                    EnvVal::located(Some(Sites::closed([ExprId(1)])), StateValue::top()),
+                ),
+                (
+                    "next".to_string(),
+                    EnvVal::located(Some(Sites::closed([ExprId(3)])), StateValue::top()),
+                ),
+            ]))),
+        );
+        heap.insert(
+            ExprId(3),
+            HeapValue::Obj(Members::exactly(HashMap::from([(
+                "set".to_string(),
+                setter(1),
+            )]))),
+        );
+        let handed = Sites::closed([ExprId(2)]);
+        let sorted = |(mut setters, fns): Reach| {
+            setters.sort();
+            let mut sites: Vec<ExprId> = fns.iter().map(|(site, _)| *site).collect();
+            sites.sort();
+            (setters, sites)
+        };
+        let fresh = |heap: &Heap| {
+            let reach = sorted(heap.reach_of(&handed));
+            let mut held = heap.clone().escape(&handed);
+            held.sort();
+            (reach, held)
+        };
+        let before = fresh(&heap);
+        assert_eq!(before.0, (vec![(comp, 0), (comp, 1)], vec![ExprId(1)]));
+        let (reach, mut held) = heap.hand_over(&handed, true);
+        held.sort();
+        assert_eq!((sorted(reach.unwrap()), held), before);
+        let unseen =
+            |h: &Heap, id: u64| matches!(h.get(ExprId(id)), Some(HeapValue::Obj(o)) if o.unseen);
+        assert!(unseen(&heap, 2) && unseen(&heap, 3));
+        // An escape of a site the hand-over reached grows the escaped set and
+        // changes no cell: the memo still answers, and what it answers is a
+        // fresh walk's over the marked cells.
+        let cells = heap.cells.clone();
+        heap.escape(&Sites::closed([ExprId(3)]));
+        assert!(heap.cells.ptr_eq(&cells) && heap.escaped.contains(&ExprId(3)));
+        assert!(heap.hand_memo_for(&handed, true).is_some());
+        let after = fresh(&heap);
+        assert_eq!(after, before);
+        let (reach, mut held) = heap.hand_over(&handed, true);
+        held.sort();
+        assert_eq!((sorted(reach.unwrap()), held), after);
+        // A write into a reached object is a changed cell: no memo.
+        heap.write_after(ExprId(3), |m| m.write(Some(&"set".to_string()), &setter(2)));
+        assert!(heap.hand_memo_for(&handed, true).is_none());
     }
 }

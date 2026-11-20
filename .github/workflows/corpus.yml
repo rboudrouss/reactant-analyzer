@@ -38,7 +38,7 @@ jobs:
   measure:
     name: corpus measure
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
