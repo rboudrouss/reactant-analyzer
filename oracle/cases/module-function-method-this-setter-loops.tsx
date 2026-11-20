@@ -1,8 +1,8 @@
 // oracle: react=loop
-// oracle: known=fn #340
 // A function of the module, the method of a literal: the call binds `this` to
 // the literal, which code the analysis does not run then reads (#338). The
-// component reads `run` as no body, and the receiver is not handed to it.
+// component reads `run` as no body, so the receiver is handed to it with the
+// setter it holds (#340): a Warning.
 import { useState } from "react";
 
 function run(this: { set: (f: (c: number) => number) => void }) {

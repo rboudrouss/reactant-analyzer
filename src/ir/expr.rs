@@ -791,6 +791,16 @@ impl Expr {
         e
     }
 
+    /// The receiver a call through this callee binds as `this` (#338): the
+    /// object of a member read, `r` in `r.m` and `r[k]`. `None` for a callee
+    /// called plainly.
+    pub fn method_receiver(&self) -> Option<&Expr> {
+        match self.peel_ts() {
+            Expr::FieldAccess { obj, .. } | Expr::IndexAccess { arr: obj, .. } => Some(obj),
+            _ => None,
+        }
+    }
+
     /// [`Expr::peel_ts`] for an owned value — for the callers that destructure
     /// the peeled expression rather than borrowing it.
     pub fn peel_ts_owned(self) -> Expr {

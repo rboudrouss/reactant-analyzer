@@ -337,6 +337,13 @@ impl StateValue {
             .only(KindMask::NUM | KindMask::BOOL | KindMask::STR | KindMask::NULL | KindMask::UNDEF)
     }
 
+    /// True when the value can only be `null` or `undefined` (or ⊥): a value
+    /// with no member, which a read or a call of throws on.
+    pub fn is_nullish_only(&self) -> bool {
+        self.populated_kinds()
+            .only(KindMask::NULL | KindMask::UNDEF)
+    }
+
     /// True when the value can only be a reference: `Object.is` then compares
     /// identities, and the reference's change component is the whole story of
     /// when the value differs. Anything else is compared by value.
