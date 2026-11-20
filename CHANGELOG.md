@@ -560,6 +560,10 @@ on a program React settles; 323 oracle cases, none a known false negative.
   a spread of an unplaced value) is handed to the conversion it may run, and
   so is a literal to a `toString` getter installed on `Object.prototype`
   (#360).
+- A computed key of an object literal or a class converts its expression
+  where it is evaluated: `{ [k]: v }` and `class { [k]() {} }` with a `k`
+  whose `toString` writes state, in the render, were silent; they are a
+  `setter-in-render` Warning (#370).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

@@ -92,6 +92,10 @@ pub enum UnaryOp {
     TypeOf,
     /// Unary `+x` — numeric coercion, not the identity (`+"5"` is the number 5).
     Plus,
+    /// The property key a computed key (`{ [x]: v }`, `class { [x]() {} }`)
+    /// converts its expression to, where it is evaluated (#370): a string or
+    /// a symbol.
+    ToKey,
     /// An operator whose concrete semantics are not modeled by the abstract
     /// domain. Evaluated as ⊤ — never as the identity, which would falsify the
     /// operand's value.
@@ -824,7 +828,8 @@ impl Expr {
     /// arithmetic, bitwise and shift operators and of `<`, `<=`, `>`, `>=`;
     /// both of `==` / `!=` unless one spells `null` or `undefined`, which
     /// never converts; the key of `k in o` and of `o[k]`; the argument of unary
-    /// `-`, `+`, `~`; and, for `xs.join(sep)`, every entry of the array `xs`
+    /// `-`, `+`, `~`; a computed key of an object literal or a class
+    /// ([`UnaryOp::ToKey`], #370); and, for `xs.join(sep)`, every entry of the array `xs`
     /// and `sep`. A member write `o[k] = v` converts `k` too
     /// ([`crate::ir::stmt::Stmt::MemberWrite`]). Nothing else converts here:
     /// `===`, `!==`, `typeof`, `!`, `&&`, `||`, `??`, `instanceof`, a
@@ -858,7 +863,7 @@ impl Expr {
                 BinOp::And | BinOp::Or | BinOp::Eq | BinOp::Neq | BinOp::InstanceOf => [None, None],
             },
             Expr::UnaryOp {
-                op: UnaryOp::Neg | UnaryOp::Plus | UnaryOp::BitNot,
+                op: UnaryOp::Neg | UnaryOp::Plus | UnaryOp::BitNot | UnaryOp::ToKey,
                 arg,
             } => [Some(Converted::Value(arg)), None],
             Expr::IndexAccess { idx, .. } => [Some(Converted::Value(idx)), None],
@@ -995,6 +1000,11 @@ mod accessor_tests {
         assert!(names(&null_eq).is_empty(), "`a == null` converts nothing");
         let unary = |op| Expr::UnaryOp { op, arg: v("a") };
         assert_eq!(names(&unary(UnaryOp::Plus)), ["a"]);
+        assert_eq!(
+            names(&unary(UnaryOp::ToKey)),
+            ["a"],
+            "a computed key (#370)"
+        );
         assert!(names(&unary(UnaryOp::TypeOf)).is_empty());
         assert!(names(&unary(UnaryOp::Not)).is_empty());
         let index = Expr::IndexAccess {

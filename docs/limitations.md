@@ -79,7 +79,9 @@ that writes it (see *Cross-file limits*).
   conversion [#360](https://github.com/rboudrouss/reactant-analyzer/issues/360). The converting
   positions are the operands of `+` (a template literal), of the other arithmetic, bitwise and
   shift operators and of `<`, `<=`, `>`, `>=`; both of `==` and `!=` unless one is a `null` or
-  `undefined` literal; the key of `k in o`, of `o[k]` and of `o[k] = v`; the operand of
+  `undefined` literal; the key of `k in o`, of `o[k]` and of `o[k] = v`; a computed key of an
+  object literal or a class (`{ [k]: v }`, `class { [k]() {} }`), where it is evaluated
+  [#370](https://github.com/rboudrouss/reactant-analyzer/issues/370); the operand of
   unary `-`, `+`, `~`; and every entry of an array `join` or a conversion joins (`[o].join()`,
   `` `${[o]}` ``). `===`, `!==`, `typeof`, `!`, `&&`, `||`, `??`, `instanceof`, a condition and a
   `switch` convert nothing. A callee the analysis does not run (`String(o)`, `JSON.stringify(o)`,
@@ -90,10 +92,8 @@ that writes it (see *Cross-file limits*).
   class, an object a spread of something unplaced filled, a library's object — may inherit one it
   does not see, which is handed the object, as a method call's receiver is (a Warning React may
   not confirm: `` `${{ ...props.a, onClick }}` `` reports what `onClick` writes). A value the
-  analysis does not place came from code that holds it already. Two conversions are not followed:
-  a computed key of an object literal or a class (`{ [k]: v }`)
-  [#370](https://github.com/rboudrouss/reactant-analyzer/issues/370), and a host element's
-  attribute, which React DOM converts to a string (`<div title={o}>`)
+  analysis does not place came from code that holds it already. One conversion is not followed:
+  a host element's attribute, which React DOM converts to a string (`<div title={o}>`)
   [#371](https://github.com/rboudrouss/reactant-analyzer/issues/371). The writer relation reads one
   the render hands to such a callee or hook — a literal, or a name bound to one or to a
   `useCallback` value, or one held by an object or array it hands over — as a possible render write

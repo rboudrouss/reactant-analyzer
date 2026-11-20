@@ -31,13 +31,20 @@ fn opaque() -> Expr {
     Expr::SummaryVal(SummaryValue::Top)
 }
 
-/// Lower an expression the enclosing composite cannot represent, keeping it as
-/// a statement so its reads and side effects stay visible. Dropping a
-/// sub-expression outright is not an over-approximation: the deps rules consume
-/// a missing read as "this variable is not used" — a claim, not ignorance.
-fn lower_for_effect(expr: &Expression, builder: &mut BlockBuilder) {
+/// Lower a computed key (`{ [k]: v }`, `class { [k]() {} }`), which the
+/// enclosing composite cannot represent, as a statement of its own: the key
+/// converted to a property key ([`IrUnaryOp::ToKey`]), which runs what the
+/// conversion of `k` runs (#370), where it is evaluated. Its reads stay
+/// visible too: dropping a sub-expression outright is not an
+/// over-approximation, the deps rules consume a missing read as "this
+/// variable is not used" — a claim, not ignorance.
+fn lower_key_for_effect(expr: &Expression, builder: &mut BlockBuilder) {
     let span = builder.span_at(expr.span().start);
-    lower_expr_stmt(expr, span, builder);
+    let key = Expr::UnaryOp {
+        op: IrUnaryOp::ToKey,
+        arg: Box::new(lower_expr(expr, builder)),
+    };
+    builder.push_stmt(Stmt::ExprStmt(key, span));
 }
 
 /// Lower `expr` evaluated for its effect, as the statement `expr;` at `span`.
@@ -140,13 +147,14 @@ pub(super) fn lower_class(class: &Class, builder: &mut BlockBuilder) -> Expr {
     let this = || Expr::Var(crate::ir::expr::THIS.to_string());
 
     // A computed member name (`class X { [k]() {} }`) is an expression that
-    // runs where the class is defined — its reads have to survive.
+    // runs where the class is defined, converted to a property key there —
+    // its reads and its conversion have to survive.
     let computed_key = |key: &PropertyKey, builder: &mut BlockBuilder| {
         if let PropertyKey::StaticIdentifier(_) | PropertyKey::StringLiteral(_) = key {
             return;
         }
         if let Some(e) = key.as_expression() {
-            lower_for_effect(e, builder);
+            lower_key_for_effect(e, builder);
         }
     };
 
@@ -605,7 +613,7 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                                 if named.is_none()
                                     && let Some(e) = p.key.as_expression()
                                 {
-                                    lower_for_effect(e, builder);
+                                    lower_key_for_effect(e, builder);
                                 }
                                 let kind = match p.kind {
                                     PropertyKind::Set => Accessor::Set,
@@ -615,12 +623,12 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                             }
                             Some(name) => name,
                             // Computed key (`{ [k]: v }`): the key expression
-                            // runs, and `v` is still in the object — under a
-                            // synthetic name, since the real one is unknown:
-                            // it may be any member (#76).
+                            // runs and converts (#370), and `v` is still in
+                            // the object — under a synthetic name, since the
+                            // real one is unknown: it may be any member (#76).
                             None => {
                                 if let Some(e) = p.key.as_expression() {
-                                    lower_for_effect(e, builder);
+                                    lower_key_for_effect(e, builder);
                                 }
                                 synthetic_key(builder, COMPUTED_KEY_PREFIX)
                             }
@@ -2346,6 +2354,29 @@ mod tests {
                 compute_free_vars(&build(source)).contains("opts"),
                 "read of `opts` must survive lowering: {source}"
             );
+        }
+    }
+
+    /// #370: a computed key of a literal, an accessor or a class member is
+    /// converted where it is evaluated, a statement the converting positions
+    /// read ([`Expr::conversions`]).
+    #[test]
+    fn a_computed_key_converts_where_it_is_evaluated() {
+        for source in [
+            "function f(k) { g({ [k]: 1 }); }",
+            "function f(k) { g({ get [k]() { return 1; } }); }",
+            "function f(k) { class C { [k]() {} } g(C); }",
+            "function f(k) { class C { [k] = 1; } g(C); }",
+        ] {
+            let cfg = build(source);
+            let converted = cfg.blocks.values().flat_map(|b| &b.stmts).any(|s| {
+                matches!(
+                    s,
+                    Stmt::ExprStmt(Expr::UnaryOp { op: IrUnaryOp::ToKey, arg }, _)
+                        if matches!(arg.as_ref(), Expr::Var(v) if v == "k")
+                )
+            });
+            assert!(converted, "the key `k` must convert: {source}");
         }
     }
 
