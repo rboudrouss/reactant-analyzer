@@ -69,6 +69,14 @@ spellings.
    `sure`: the target is the same one, and the row is placed at that call. The invariant holds
    in the relation, whatever reader places the row.
 
+8. **A module call's value that is one of several closures is a choice made once per run**
+   (#344). A hook bound to it (`const useX = make(debug)`) runs a body that branches on ⊤ to
+   each closure, the branch's edges `EdgeKind::RunChoice`: the fixpoint and every must fact
+   read it as the branch it is (a join over the closures, a meet for must facts), and only
+   `ExitDominance::may_be_skipped` takes the side a hook sits on as the one every render of the
+   run takes. The marker is on the edges, which splicing keeps; a construction site that does
+   not write it builds a plain branch, which only costs `conditional-hook` precision.
+
 ## Consequences
 
 - A reader of "what does this call run" asks the fixpoint's answer, so a shape the fixpoint

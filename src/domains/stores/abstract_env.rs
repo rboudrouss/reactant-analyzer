@@ -479,7 +479,9 @@ impl<D: AbstractDomain> AbstractEnv<D> {
 
     /// Pointwise join over the entries that differ: a name both sides bind
     /// to the same value keeps it (the join is idempotent), and a name only
-    /// one side binds joins with `D::top()`.
+    /// one side binds joins with `D::top()`, whichever side it is: `⊤` keeps
+    /// what a value names (`StateValue`'s setters, #344), so a name bound
+    /// on the right only was a setter whose write the join lost.
     fn join_stabs(a: &Map<Var, D>, b: &Map<Var, D>) -> Map<Var, D> {
         let mut out = a.clone();
         for item in a.diff(b) {
@@ -493,8 +495,8 @@ impl<D: AbstractDomain> AbstractEnv<D> {
                 DiffItem::Remove(k, v) => {
                     out.insert(k.clone(), v.join(&D::top()));
                 }
-                DiffItem::Add(k, _) => {
-                    out.insert(k.clone(), D::top());
+                DiffItem::Add(k, w) => {
+                    out.insert(k.clone(), D::top().join(w));
                 }
             }
         }
@@ -552,8 +554,8 @@ impl<D: AbstractDomain> AbstractEnv<D> {
             }
         }
         for item in self.stabs.diff(&other.stabs) {
-            if let DiffItem::Add(k, _) = item {
-                stabs.insert(k.clone(), D::top());
+            if let DiffItem::Add(k, w) = item {
+                stabs.insert(k.clone(), D::top().join(w));
             }
         }
         AbstractEnv {
@@ -621,6 +623,25 @@ mod tests {
     use crate::domains::Stability;
 
     type Env = AbstractEnv<Stability>;
+
+    /// A name one side of a join binds is that side's value joined with ⊤,
+    /// on either side: `⊤ ⊔ setter` still names the setter, which a join
+    /// with the binding side on the right dropped (#344).
+    #[test]
+    fn a_name_one_side_binds_joins_with_top_on_either_side() {
+        use crate::domains::{AbstractDomain, StateValue, impls::SetterVal};
+        let setter = StateValue {
+            setter: SetterVal::one(crate::test_support::named("App"), 1),
+            ..StateValue::bottom()
+        };
+        let mut bound = AbstractEnv::<StateValue>::new();
+        bound.extend("setN".to_string(), setter.clone());
+        let unbound = AbstractEnv::<StateValue>::new();
+        let want = setter.join(&StateValue::top());
+        assert_eq!(bound.join(&unbound).lookup("setN"), want);
+        assert_eq!(unbound.join(&bound).lookup("setN"), want);
+        assert_eq!(unbound.widen_to(&bound, &[]).lookup("setN"), want);
+    }
 
     #[test]
     fn a_nullish_side_opens_no_sites() {

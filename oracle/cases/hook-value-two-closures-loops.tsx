@@ -1,9 +1,8 @@
 // oracle: react=loop
-// oracle: known=fn #344
-// #342's remainder. `make` returns one of two closures, picked once at module
-// time: a hook bound to a join of closures stays one the analysis does not
-// see, since the hooks of each closure would sit under a branch the hook
-// rules read as a render path.
+// #344. `make` returns one of two closures, picked once at module time: the
+// hook's body runs one of them, chosen once per program run, so the loop in
+// the closure the program picks is found and the hooks of a closure are not
+// read as conditional ones.
 import { useState, useEffect } from "react";
 
 const DEBUG = false;
