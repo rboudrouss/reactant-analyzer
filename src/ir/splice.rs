@@ -604,8 +604,8 @@ pub fn bound_vars(cfg: &CFG, params: &[Var]) -> HashSet<Var> {
 }
 
 /// Fresh-name map for the variables a splice must rename: everything bound
-/// inside `cfg`, plus any *free* variable of `cfg` that `caller_bound` also
-/// binds.
+/// inside `cfg`, plus any *free* variable of `cfg` or of its `hooks` that
+/// `caller_bound` also binds.
 ///
 /// The bound half keeps the splice hygienic — a callee local `data` must not
 /// clobber a caller `data` in the flat abstract environment.
@@ -644,12 +644,20 @@ pub fn callee_rename_map(
     // names it reads — the ones most likely to be captured — are not in `cfg`
     // at all. The same rename map is applied to those sub-bodies, so it has to
     // be built from them too.
+    // So are the expressions an entry holds at its call (a `useReducer`'s
+    // reducer, an initial value, deps, a nested hook's arguments): a reducer
+    // the callee's file defines is not a local of the caller's (#356).
     let bodies = std::iter::once(cfg).chain(hooks.iter().filter_map(|h| h.body_cfg()));
+    let mut free: HashSet<Var> = HashSet::new();
     for body in bodies {
-        for free in crate::ir::free_vars::compute_free_vars(body) {
-            if !rename.contains(&free) && caller_bound.contains(&free) {
-                rename.insert(free);
-            }
+        free.extend(crate::ir::free_vars::compute_free_vars(body));
+    }
+    for e in hooks.iter().flat_map(HookEntry::call_exprs) {
+        crate::ir::free_vars::collect_used_vars(e, &mut free);
+    }
+    for name in free {
+        if !rename.contains(&name) && caller_bound.contains(&name) {
+            rename.insert(name);
         }
     }
     rename
@@ -1227,6 +1235,39 @@ mod tests {
 
     fn all_stmts(cfg: &CFG) -> Vec<&Stmt> {
         cfg.blocks.values().flat_map(|b| b.stmts.iter()).collect()
+    }
+
+    /// A free name a hook entry reads at its call — `useReducer`'s reducer, a
+    /// nested hook's argument — is the callee's, renamed away from a local
+    /// of the caller like a free name of its body (#356, #141); one the
+    /// caller does not bind keeps its name.
+    #[test]
+    fn a_free_name_an_entry_reads_at_its_call_is_isolated_from_the_caller() {
+        use crate::ir::hooks::{DepsArg, HookEntry};
+        let hooks = vec![
+            HookEntry::State {
+                label: 0,
+                init: Expr::Lit(Prim::Int(0)),
+                reducer: Some(Expr::Var("reducer".into())),
+                span: None,
+            },
+            HookEntry::Custom {
+                label: 1,
+                name: "useInner".into(),
+                args: vec![Expr::Var("step".into()), Expr::Var("other".into())],
+                deps: DepsArg::Absent,
+                binding: None,
+                import_source: None,
+                resolved_file: None,
+                span: None,
+            },
+        ];
+        let callee = caller(vec![]);
+        let bound: HashSet<Var> = ["reducer", "step"].iter().map(|s| s.to_string()).collect();
+        let rename = callee_rename_map(&callee, &hooks, &[], 5, &bound);
+        assert_eq!(rename.get("reducer").map(String::as_str), Some("reducer#5"));
+        assert_eq!(rename.get("step").map(String::as_str), Some("step#5"));
+        assert!(!rename.contains_key("other"), "{rename:?}");
     }
 
     /// A callee whose entry block is missing is not spliceable — and bailing

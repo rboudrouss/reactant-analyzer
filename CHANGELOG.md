@@ -462,6 +462,11 @@ on a program React settles; 323 oracle cases, none a known false negative.
   constant drives is reported where it was missed (#354), and a hook whose
   own constant settles it is no longer a possible loop (#36). A name its file
   imports or keeps in a module `let` is never the component's `const` either.
+- A name a custom hook's `useReducer`, `useState`, `useRef`, deps or nested
+  hook call reads is never a local of the calling component, as a name its
+  body reads already was: a loop the hook's own reducer, or the value it
+  hands the hook it calls, drives is reported where a homonym of the
+  component hid it (#356).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error
