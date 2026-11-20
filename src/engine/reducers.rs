@@ -101,13 +101,15 @@ impl<'a> Reducers<'a> {
 ///
 /// An inline function literal is its own body; a name is, in scope order, a
 /// render binding certified to one function literal, then a module function
-/// of `file` (or one it imports). A name the render scope binds any other way
-/// shadows the module and stays opaque.
-pub fn resolve_reducers(
+/// of the file the entry is written in, `file(label)` (or one that file
+/// imports): a hook of another file names its own file's reducer (#356). A
+/// name the render scope binds any other way shadows the module and stays
+/// opaque, as does a name the entry's file does not bind.
+pub fn resolve_reducers<'f>(
     hooks: &[HookEntry],
     render_cfg: &CFG,
     functions: &FunctionRegistry,
-    file: &Path,
+    file: impl Fn(HookLabel) -> &'f Path,
 ) -> HashMap<HookLabel, Reducer> {
     let hook_bodies: Vec<&CFG> = hooks.iter().filter_map(|h| h.body_cfg()).collect();
     let body = |params: &[Var], body: Arc<CFG>| Reducer::Body {
@@ -134,7 +136,7 @@ pub fn resolve_reducers(
                         body(params, Arc::new(cfg.clone()))
                     } else if local_bindings(render_cfg).contains_key(v.as_str()) {
                         Reducer::Opaque
-                    } else if let Some(f) = functions.resolve(file, v) {
+                    } else if let Some(f) = functions.resolve(file(label), v) {
                         body(&f.params, Arc::new(f.body_cfg.clone()))
                     } else {
                         Reducer::Opaque
