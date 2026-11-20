@@ -235,11 +235,10 @@ that writes it (see *Cross-file limits*).
   [#73](https://github.com/rboudrouss/reactant-analyzer/issues/73).
 - An object spread copies what the heap knows of its source: `{ ...opts }.foo` is `opts.foo`, and
   a spread of a value the heap does not place may overwrite every member before it, which stay
-  possible. A spread of a value placed only in part (`...(c ? { f } : x)`, `x` any object) does
-  not keep what the placed part holds: handed to code the analysis does not see, the object does
-  not hand `f` over, a missed write
-  [#363](https://github.com/rboudrouss/reactant-analyzer/issues/363) (`c ? { f } : null` is
-  handled: a `null` side places nothing, #340). A computed key resolves when a literal spells it (`{ [1]: a }`, `o["k"]`) or, in a
+  possible. A spread of a value placed only in part (`...(c ? { f } : x)`, `x` any object) is
+  both: what the placed objects hold, each member possibly anything as well
+  [#363](https://github.com/rboudrouss/reactant-analyzer/issues/363) (a `null` side places
+  nothing, #340). A computed key resolves when a literal spells it (`{ [1]: a }`, `o["k"]`) or, in a
   read or a destructuring, when its value is one string (`const { [k]: v } = o`); in an object
   literal it may be any member. Not modeled: an array entry past a spread (its index is ⊤)
   [#76](https://github.com/rboudrouss/reactant-analyzer/issues/76). A spread argument
@@ -340,12 +339,18 @@ that writes it (see *Cross-file limits*).
   decided by its value, as a name's is by its narrowing (only `null` or `undefined` is nullish and
   falsy, only an object or a function neither); `opts.cb(form)` throws, and a call of a value that
   is only `null` or `undefined` runs no body, hands nothing over and writes nothing, its arguments
-  still running [#340](https://github.com/rboudrouss/reactant-analyzer/issues/340). Not seen: a
-  library that
-  extends `Object.prototype` (as for accessors, #336), and an alias of `Object` or of its
-  reflective functions (`const O = Object; O.prototype.f = …`, `Object[k]`, `const { defineProperty
-  } = Object`), read as another object
-  [#366](https://github.com/rboudrouss/reactant-analyzer/issues/366). Otherwise, once a member reads as code the analysis does not
+  still running [#340](https://github.com/rboudrouss/reactant-analyzer/issues/340). `Object` and
+  `Reflect` are followed where they are spelled (or read as a member of that name,
+  `globalThis.Object`) and read as a member access's object, a comparison's or a `typeof`'s
+  operand or a callee, and their reflective functions where they are called: any other read
+  (`const O = Object`, `const { defineProperty } = Object`, `Object[k]`, `f(Object)`, an export,
+  `Object.defineProperty.bind(…)`) makes every member one `Object.prototype` may hold, for
+  accessors too, in the whole program — one `register(Object)` in any analysed file is enough
+  [#366](https://github.com/rboudrouss/reactant-analyzer/issues/366). Not seen: a library that
+  extends `Object.prototype` (as for accessors, #336), and `Object` reached otherwise than by
+  those spellings — as `x.constructor` (`({}).constructor` is `Object`), as `globalThis[k]`, or
+  through `eval` or `Function` [#368](https://github.com/rboudrouss/reactant-analyzer/issues/368).
+  Otherwise, once a member reads as code the analysis does not
   see, every later `form.m()` hands the object over again. What stays as
   before: a class's instance member keeps the instance as `this` wherever it is called
   (`const f = k.run; f()` too); `super` outside a class's instance member is opaque. A value
