@@ -138,7 +138,10 @@ on a program React settles; 323 oracle cases, none a known false negative.
   as anything, so `const { cb } = opts; cb?.(form)` with `cb` absent handed
   `form` to code the analysis does not see, and with #340 every later method
   call off `form` handed it over again; a default (`const { g = h } = {}`)
-  is now surely taken (#340, #336).
+  is now surely taken. `@mantine/form` 183 → 31 rows and 27 s → 15 s,
+  mantine 1137 → 947 rows and 586 s → 232 s (its churn graph 332 s → 10 s),
+  the other local corpus repos unchanged; the two entries below move no
+  corpus row (#340, #336).
 - A branch on a test of a value that is no name — an optional call's link
   (`opts.cb?.(x)`), `opts.cb == null`, `if (opts.cb)` — is decided by that
   value, as a name's test already was: a value that is only `null` or
