@@ -474,6 +474,19 @@ on a program React settles; 323 oracle cases, none a known false negative.
   hands the hook it calls, drives is reported where a homonym of the
   component hid it, and a module `const` of the hook's file it hands on is
   that `const`, not any value: no `missing-deps` for it (#356).
+- A method an object, an array or a function of the program does not hold
+  as its own is a builtin of its prototype, whatever its name: unless the
+  analysis models it, the receiver is handed to it. A closure reached through
+  `[h].valueOf()`, `h.valueOf()` or `{ f: h }.valueOf()` and called, in the
+  render or an effect, was silent; it is a Warning, and so is a setter a
+  class holds as a static member, reached through a static method called off
+  the class (`K.run()`). `hasOwnProperty`, `propertyIsEnumerable` and
+  `isPrototypeOf` return a boolean and hand nothing over (#330).
+- A value written into a member of a function (`f.go = setN`, `f.go = h`)
+  is handed to code the analysis does not see at the write, as one written
+  into an object it does not place: the analysis keeps no member of a
+  function, and the call back through it (`f.go(…)`), in the render or an
+  effect, was silent (#330).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

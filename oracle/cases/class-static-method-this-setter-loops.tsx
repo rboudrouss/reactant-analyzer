@@ -1,8 +1,9 @@
 // oracle: react=loop
-// oracle: known=fn #340
 // A static method's `this` is the class it is called off (#338). The static
-// member is kept under a synthetic key, so `K.run` resolves to no body, and
-// the receiver is not handed to it.
+// member is kept under a synthetic key, so `K.run` resolves to no body. The
+// class holds no member named `run`, so the method may be its prototype's, a
+// builtin the analysis does not model: `K` is handed to it, and the setter it
+// holds with it (#330). A Warning.
 import { useState } from "react";
 
 export function App() {
