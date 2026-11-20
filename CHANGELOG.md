@@ -600,6 +600,11 @@ on a program React settles; 323 oracle cases, none a known false negative.
   the value written. `o.run = () => setN(n + 1)` three calls deep, with a
   setter `run` that calls what it is given, was silent; it is a
   `setter-in-render` Warning (#373).
+- A name one side of a branch binds and the other does not (hooks after an
+  early return, on one side of a custom hook's condition) keeps the setter it
+  holds where the sides meet, whichever side binds it: the effect's write was
+  lost when the binding side came second, and its loop was silent (found with
+  #344).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error
