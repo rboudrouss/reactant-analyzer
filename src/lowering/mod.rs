@@ -409,6 +409,10 @@ pub fn lower_custom_hooks_with_resolver(
             &values,
             &functions,
             &HashMap::from([(file.to_path_buf(), names)]),
+            &[(
+                file.to_path_buf(),
+                build_resolved_imports(program, file, resolver),
+            )],
             &crate::ir::module::ReExportGraph::default(),
         ));
     }
@@ -450,10 +454,19 @@ pub struct HookValueSite {
     name: String,
     /// The function called: the file's own, or where its import resolves.
     callee: ResolvedImport,
-    /// The call's arguments, as a body of the callee's file reads them: as
-    /// [`cfg_builder::module_args`] keeps them when the callee is the file's
-    /// own; else a name is the primitive the file's `const` binds it to, and
-    /// ⊤ when it binds none — a name of this file is not one of the callee's.
+    /// What it is called with: as [`cfg_builder::module_args`] keeps the
+    /// arguments when the callee is the file's own; else a name is the
+    /// primitive the file's `const` binds it to, and ⊤ when it binds none — a
+    /// name of this file is not one of the callee's.
+    call: ModuleCall,
+}
+
+/// A call of a program function made once, at module time, as a body of the
+/// function's file reads it (#342, #383).
+#[derive(Debug, Clone)]
+struct ModuleCall {
+    /// The arguments: a primitive, a name of the function's module or a
+    /// member chain off one, as written, and ⊤ for anything else.
     args: Vec<crate::ir::Expr>,
     /// What a call of each argument is: `Some(Some(hook))` the hook it names,
     /// `Some(None)` no hook (a plain value), `None` unknown (an argument that
@@ -618,124 +631,106 @@ fn hook_value_site(
         file: file.to_path_buf(),
         name: value.name,
         callee,
-        args,
-        hooks,
+        call: ModuleCall { args, hooks },
     })
 }
 
-/// The hooks `values` bind, each the closure the function it calls returns
+/// The hooks `values` bind, each what the function it calls returns
 /// (`lower_hook_value`): the function is one of `functions`, found where
 /// the call names it — the binding's file, or the file an import resolves
 /// to, through its re-exports — and its closure is read with the names of
-/// its own file (`names`). A value whose function is none of them builds no
-/// hook: it stays one the analysis does not see.
+/// its own file (`names`). Each file's resolved `imports` find a function a
+/// factory's `return` names (#383). A value whose function is none of them
+/// builds no hook: it stays one the analysis does not see.
 pub fn lower_hook_values(
     values: &[HookValueSite],
     functions: &[crate::ir::FunctionIR],
     names: &HashMap<std::path::PathBuf, HookNames>,
+    imports: &[(std::path::PathBuf, HashMap<String, ResolvedImport>)],
     re_exports: &crate::ir::module::ReExportGraph,
 ) -> Vec<HookIR> {
     if values.is_empty() {
         return Vec::new();
     }
-    let defined: HashMap<(&Path, &str), &crate::ir::FunctionIR> = functions
-        .iter()
-        .map(|f| ((f.file.as_path(), f.name.as_str()), f))
-        .collect();
-    let defines = |f: &Path, n: &str| defined.contains_key(&(f, n));
+    let program = Functions {
+        defined: functions
+            .iter()
+            .map(|f| ((f.file.as_path(), f.name.as_str()), f))
+            .collect(),
+        imports: imports.iter().map(|(f, m)| (f.as_path(), m)).collect(),
+        re_exports,
+        names,
+    };
     values
         .iter()
         .filter_map(|value| {
-            let (file, name) =
-                re_exports.origin(&value.callee.file, &value.callee.imported, &defines)?;
-            let factory = defined.get(&(file.as_path(), name.as_str()))?;
-            lower_hook_value(value, factory, names.get(&factory.file)?)
+            let factory = program.origin(&value.callee.file, &value.callee.imported)?;
+            lower_hook_value(value, factory, &program)
         })
         .collect()
 }
 
-/// The hook `value` binds: the closure `factory` returns, run as a custom
-/// hook's body. Every parameter of `factory` holds the module call's argument
-/// ([`HookValueSite::args`]) — ⊤ when a statement of `factory` reassigns
-/// it, a default included — and a call of it in the closure is a call of the
-/// hook the argument names; every other local of `factory` the closure reads
-/// is ⊤, since it lives as long as the module and any call may move it. The
-/// closure's own hooks are those its file (`names`) names. When `factory`
-/// may return one of several closures, the body runs one of them, chosen
-/// once per program run ([`choice_of`], #344).
-/// `None`, the hook staying one the analysis does not see, unless every
-/// return of `factory` is one of the closures it writes.
+/// The program's functions a hook value's body is found among (#344, #383).
+struct Functions<'a> {
+    /// The lowered functions, by file and name.
+    defined: HashMap<(&'a Path, &'a str), &'a crate::ir::FunctionIR>,
+    /// Each file's imports, resolved.
+    imports: HashMap<&'a Path, &'a HashMap<String, ResolvedImport>>,
+    re_exports: &'a crate::ir::module::ReExportGraph,
+    /// What each file's hook extraction reads.
+    names: &'a HashMap<std::path::PathBuf, HookNames>,
+}
+
+impl<'a> Functions<'a> {
+    /// The function `file` exports as `name`, through its re-exports.
+    fn origin(&self, file: &Path, name: &str) -> Option<&'a crate::ir::FunctionIR> {
+        let defines = |f: &Path, n: &str| self.defined.contains_key(&(f, n));
+        let (file, name) = self.re_exports.origin(file, name, &defines)?;
+        self.defined.get(&(file.as_path(), name.as_str())).copied()
+    }
+
+    /// The function a name of `file`'s module scope is: one `file` writes,
+    /// or one an import of `file` resolves to.
+    fn named(&self, file: &Path, name: &str) -> Option<&'a crate::ir::FunctionIR> {
+        match self.imports.get(file).and_then(|m| m.get(name)) {
+            Some(import) => self.origin(&import.file, &import.imported),
+            None => self.defined.get(&(file, name)).copied(),
+        }
+    }
+}
+
+/// The hook `value` binds: what `factory` returns ([`returned_closures`]),
+/// run as a custom hook's body — one function, or one of several chosen once
+/// per program run ([`choice_of`], #344). Its own hooks are those its file
+/// names. `None`, the hook staying one the analysis does not see, unless
+/// every return of `factory` is a function the analysis reads, all written in
+/// one file: a body reads one file's names.
 fn lower_hook_value(
     value: &HookValueSite,
     factory: &crate::ir::FunctionIR,
-    names: &HookNames,
+    program: &Functions,
 ) -> Option<HookIR> {
-    use crate::ir::{Expr, Stmt, expr::SummaryValue, free_vars::compute_free_vars};
-    let (params, cfg) = (&factory.params, &factory.body_cfg);
-    let closures = returned_closures(cfg)?;
-    // Assigned by `factory` or by any body nested in it, the closure's own
-    // calls included: what a render reads there is no longer the argument.
-    let reassigned = assigned_below(cfg, true);
-    // A name a closure binds itself is not `factory`'s there.
-    let owns: Vec<HashSet<Var>> = closures
-        .iter()
-        .map(|(own_params, body)| crate::ir::bound_vars(body, own_params))
-        .collect();
-    let mut prelude = Vec::new();
-    let mut bound = HashMap::new();
-    for (i, param) in params.iter().enumerate() {
-        let owners = owns.iter().filter(|own| own.contains(param)).count();
-        if owners == closures.len() {
-            continue;
-        }
-        let reassigned = reassigned.contains(param.as_str());
-        let rhs = match value.args.get(i) {
-            _ if reassigned => Expr::SummaryVal(SummaryValue::Top),
-            Some(arg) => arg.clone(),
-            None => Expr::Lit(Prim::Unit),
-        };
-        let hook = match value.hooks.get(i) {
-            _ if reassigned => None,
-            Some(Some(hook)) => Some(hook.clone()),
-            Some(None) => None,
-            None => Some(None),
-        };
-        if let Some(hook) = hook {
-            // One closure calls its own binding of the name, another the
-            // argument: the hook map is one for the whole body.
-            if owners > 0 {
-                return None;
-            }
-            bound.insert(param.clone(), hook);
-        }
-        prelude.push(Stmt::Let {
-            var: param.clone(),
-            rhs,
-            span: None,
-        });
+    let candidates = returned_closures(program, factory, &value.call, 0)?;
+    let file = &candidates.first()?.from.file;
+    if candidates.iter().any(|c| &c.from.file != file) {
+        return None;
     }
-    let locals = crate::ir::bound_vars(cfg, &[]);
-    let captured: std::collections::BTreeSet<String> = closures
-        .iter()
-        .flat_map(|(own_params, body)| {
-            compute_free_vars(body)
-                .into_iter()
-                .filter(|v| locals.contains(v) && !params.contains(v) && !own_params.contains(v))
-        })
+    let names = program.names.get(file)?;
+    let written: Vec<&crate::ir::FunctionIR> = std::iter::once(factory)
+        .chain(candidates.iter().map(|c| c.from))
         .collect();
-    prelude.extend(captured.into_iter().map(|var| Stmt::Let {
-        var,
-        rhs: Expr::SummaryVal(SummaryValue::Top),
-        span: None,
-    }));
-    let (closure_params, mut body_cfg) = choice_of(closures, prelude)?;
-
+    let (closure_params, mut body_cfg, bound) = choice_of(candidates)?;
+    let ids = cfg_builder::ExprIds::above(
+        written
+            .iter()
+            .map(|f| &f.body_cfg)
+            .chain(std::iter::once(&body_cfg)),
+    );
     let imports = hook_extractor::ImportCtx {
         bound: &bound,
         ..names.imports()
     };
-    let (mut hooks, hook_provenance, mut next_label) =
-        extract_hooks(&mut body_cfg, &imports, &cfg_builder::ExprIds::above(cfg));
+    let (mut hooks, hook_provenance, mut next_label) = extract_hooks(&mut body_cfg, &imports, &ids);
     extract_handlers(&body_cfg, &mut hooks, &mut next_label);
     extract_subscriptions(&mut hooks, &mut next_label);
     Some(HookIR {
@@ -747,8 +742,147 @@ fn lower_hook_value(
         hooks,
         hook_provenance,
         alias_of: None,
-        body_file: (factory.file != value.file).then(|| factory.file.clone()),
+        body_file: (file != &value.file).then(|| file.clone()),
     })
+}
+
+/// A function a hook value may be (#342, #344, #383).
+struct ValueBody<'a> {
+    params: Vec<Var>,
+    body: crate::ir::cfg::CFG,
+    /// Binds what the body reads of the function that returned it.
+    prelude: Vec<crate::ir::Stmt>,
+    /// What a call of each name `prelude` binds is.
+    bound: HashMap<Var, Option<hook_extractor::ResolvedHookCall>>,
+    /// The function it is written in.
+    from: &'a crate::ir::FunctionIR,
+}
+
+impl<'a> ValueBody<'a> {
+    /// A function of the program handed back as a value: its own body.
+    fn function(f: &'a crate::ir::FunctionIR) -> Self {
+        ValueBody {
+            params: f.params.clone(),
+            body: f.body_cfg.clone(),
+            prelude: Vec::new(),
+            bound: HashMap::new(),
+            from: f,
+        }
+    }
+
+    /// The closure (`params`, `body`) `f`, called with `call`, returns. Each
+    /// parameter of `f` it reads holds the call's argument — ⊤ when `f` or a
+    /// body nested in it reassigns it (`reassigned`), a default included —
+    /// and a call of it is a call of the hook the argument names; each other
+    /// local of `f` it reads is ⊤, since it lives as long as the module and
+    /// any call may move it (#342).
+    fn closure(
+        f: &'a crate::ir::FunctionIR,
+        call: &ModuleCall,
+        reassigned: &HashSet<&str>,
+        params: &[Var],
+        body: &crate::ir::cfg::CFG,
+    ) -> Self {
+        use crate::ir::{Expr, Stmt, expr::SummaryValue, free_vars::compute_free_vars};
+        let reads: HashSet<Var> = compute_free_vars(body)
+            .into_iter()
+            .filter(|v| !params.contains(v))
+            .collect();
+        let mut prelude = Vec::new();
+        let mut bound = HashMap::new();
+        for (i, param) in f.params.iter().enumerate() {
+            if !reads.contains(param) {
+                continue;
+            }
+            let reassigned = reassigned.contains(param.as_str());
+            let rhs = match call.args.get(i) {
+                _ if reassigned => Expr::SummaryVal(SummaryValue::Top),
+                Some(arg) => arg.clone(),
+                None => Expr::Lit(Prim::Unit),
+            };
+            let hook = match call.hooks.get(i) {
+                _ if reassigned => None,
+                Some(Some(hook)) => Some(hook.clone()),
+                Some(None) => None,
+                None => Some(None),
+            };
+            if let Some(hook) = hook {
+                bound.insert(param.clone(), hook);
+            }
+            prelude.push(Stmt::Let {
+                var: param.clone(),
+                rhs,
+                span: None,
+            });
+        }
+        let locals = crate::ir::bound_vars(&f.body_cfg, &[]);
+        let captured: std::collections::BTreeSet<&Var> = reads
+            .iter()
+            .filter(|v| locals.contains(*v) && !f.params.contains(v))
+            .collect();
+        prelude.extend(captured.into_iter().map(|var| Stmt::Let {
+            var: var.clone(),
+            rhs: Expr::SummaryVal(SummaryValue::Top),
+            span: None,
+        }));
+        ValueBody {
+            params: params.to_vec(),
+            body: body.clone(),
+            prelude,
+            bound,
+            from: f,
+        }
+    }
+}
+
+/// The call of `g` with `args` that `f`, itself called with `call`, makes, as
+/// `g`'s file reads it (#383): a parameter of `f` is what `call` hands it (⊤
+/// when `f` reassigns it), a primitive and a name of `f`'s module are as
+/// written, anything else is ⊤ — a local of `f` included, as a closure reads
+/// it — and a name is ⊤ in another file, whose names are not `f`'s. `None`
+/// when a spread hides which parameter takes what.
+fn call_of(
+    program: &Functions,
+    f: &crate::ir::FunctionIR,
+    call: &ModuleCall,
+    local: &dyn Fn(&str) -> bool,
+    reassigned: &HashSet<&str>,
+    args: &[crate::ir::Expr],
+    g: &crate::ir::FunctionIR,
+) -> Option<ModuleCall> {
+    use crate::ir::{Expr, expr::SummaryValue};
+    let imports = program.names.get(&f.file)?.imports();
+    let top = || Expr::SummaryVal(SummaryValue::Top);
+    let (args, hooks) = args
+        .iter()
+        .map(|arg| {
+            let (arg, hook) = match arg.peel_ts() {
+                Expr::Spread(_) => return None,
+                lit @ Expr::Lit(_) => (lit.clone(), Some(None)),
+                Expr::Var(v) => match f.params.iter().position(|p| p == v) {
+                    Some(_) if reassigned.contains(v.as_str()) => (top(), None),
+                    Some(i) => (
+                        call.args.get(i).cloned().unwrap_or(Expr::Lit(Prim::Unit)),
+                        call.hooks.get(i).cloned().unwrap_or(Some(None)),
+                    ),
+                    None if local(v) => (top(), None),
+                    None => (
+                        arg.peel_ts().clone(),
+                        Some(imports.classify_callee(arg.peel_ts())),
+                    ),
+                },
+                _ => (top(), None),
+            };
+            let named = matches!(arg.peel_ts(), Expr::Var(_) | Expr::FieldAccess { .. });
+            Some(match named && g.file != f.file {
+                true => (top(), hook),
+                false => (arg, hook),
+            })
+        })
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .unzip();
+    Some(ModuleCall { args, hooks })
 }
 
 /// Every name a body nested in `cfg` assigns, and `cfg` itself when `own`.
@@ -769,21 +903,39 @@ fn assigned_below(cfg: &crate::ir::cfg::CFG, own: bool) -> HashSet<&str> {
         .collect()
 }
 
-/// The parameters and body of every function literal a reachable `return`
-/// of `cfg` may hand back, in source order: written there, or through a
-/// name each right-hand side of which is one (`const f = …`, the arms of a
-/// `cond ? a : b`). `None` when a return may be anything else, or a name it
-/// returns is assigned in a nested body (a call may move it before the
-/// return).
-fn returned_closures(cfg: &crate::ir::cfg::CFG) -> Option<Vec<(Vec<Var>, crate::ir::cfg::CFG)>> {
+/// How many calls deep a returned call is followed (#383): zustand's `create`
+/// needs one; a factory that calls itself reaches the bound and fails closed.
+const MAX_CALLS: usize = 3;
+
+/// Every function `f`, called with `call`, may return, in source order. A
+/// reachable `return` hands back, written there or through a name each
+/// right-hand side of which is one (`const f = …`, the arms of a `cond ? a :
+/// b`): a function literal, which reads `f` as [`ValueBody::closure`] binds
+/// it; a function of the program, by name (`createImpl` handed back as a
+/// value), its own body; or a call of one, what it may return called with
+/// [`call_of`]'s arguments, at most [`MAX_CALLS`] calls deep (#383). `None`
+/// when a return may be anything else — a parameter, a name a nested body
+/// assigns (a call may move it before the return), a call of anything but a
+/// program function.
+fn returned_closures<'a>(
+    program: &Functions<'a>,
+    f: &'a crate::ir::FunctionIR,
+    call: &ModuleCall,
+    depth: usize,
+) -> Option<Vec<ValueBody<'a>>> {
     use crate::ir::{Expr, Terminator};
     const MAX_HOPS: usize = 8;
+    let cfg = &f.body_cfg;
     let bindings = crate::ir::bindings::local_bindings(cfg);
     let nested = assigned_below(cfg, false);
-    let mut found: std::collections::BTreeMap<
-        crate::ir::types::ExprId,
-        (Vec<Var>, crate::ir::cfg::CFG),
-    > = std::collections::BTreeMap::new();
+    // Assigned by `f` or by any body nested in it, the closure's own calls
+    // included: what a render reads there is no longer the argument.
+    let reassigned = assigned_below(cfg, true);
+    let local = |v: &str| bindings.contains_key(v) || f.params.iter().any(|p| p == v);
+    // By the site that hands each back: a literal's or a call's id, or past
+    // both a function's name.
+    let mut found: std::collections::BTreeMap<(u64, &str), Vec<ValueBody<'a>>> =
+        std::collections::BTreeMap::new();
     let reachable = cfg.reachable_blocks();
     let mut todo: Vec<(&Expr, usize)> = cfg
         .blocks
@@ -802,39 +954,70 @@ fn returned_closures(cfg: &crate::ir::cfg::CFG) -> Option<Vec<(Vec<Var>, crate::
                 params,
                 body_cfg,
             } => {
-                found
-                    .entry(*id)
-                    .or_insert_with(|| (params.clone(), (**body_cfg).clone()));
+                found.entry((id.0, "")).or_insert_with(|| {
+                    vec![ValueBody::closure(f, call, &reassigned, params, body_cfg)]
+                });
             }
-            Expr::Var(v) if hops < MAX_HOPS && !nested.contains(v.as_str()) => {
+            Expr::Var(v) if f.params.contains(v) => return None,
+            Expr::Var(v) if local(v) => {
+                if hops >= MAX_HOPS || nested.contains(v.as_str()) {
+                    return None;
+                }
                 if seen.insert(v.as_str()) {
-                    let rhs = bindings.get(v.as_str())?;
-                    todo.extend(rhs.iter().map(|e| (*e, hops + 1)));
+                    todo.extend(bindings[v.as_str()].iter().map(|e| (*e, hops + 1)));
+                }
+            }
+            Expr::Var(v) => {
+                let g = program.named(&f.file, v)?;
+                found
+                    .entry((u64::MAX, v.as_str()))
+                    .or_insert_with(|| vec![ValueBody::function(g)]);
+            }
+            Expr::Call { id, fn_, args } if depth < MAX_CALLS => {
+                let Expr::Var(name) = fn_.peel_ts() else {
+                    return None;
+                };
+                if local(name) {
+                    return None;
+                }
+                let g = program.named(&f.file, name)?;
+                if let std::collections::btree_map::Entry::Vacant(slot) = found.entry((id.0, "")) {
+                    let inner = call_of(program, f, call, &local, &reassigned, args, g)?;
+                    slot.insert(returned_closures(program, g, &inner, depth + 1)?);
                 }
             }
             _ => return None,
         }
     }
-    (!found.is_empty()).then(|| found.into_values().collect())
+    let candidates: Vec<ValueBody<'a>> = found.into_values().flatten().collect();
+    (!candidates.is_empty()).then_some(candidates)
 }
 
-/// The body that runs one of `closures` (each its parameters and body),
-/// `prelude` first. One closure is that body. Several are a branch on ⊤ to
-/// each, its sides [`RunChoice`](crate::ir::cfg::EdgeKind::RunChoice)
-/// edges — the factory returned one of them at module time, and every render
-/// of the run calls that one (#344) — the body's parameters positional, each
-/// closure binding its own from them. A name a closure binds that another
-/// one or the prelude binds too is renamed in it, as a splice renames a
-/// callee's (`n#c1`): closures capture variables, and the body's exit, where
-/// the sides meet, would hand one closure's effects the other's `n`.
+/// The body that runs one of `candidates`, its prelude first, with what a
+/// call of each name the preludes bind is. One candidate is that body.
+/// Several are a branch on ⊤ to each, its sides
+/// [`RunChoice`](crate::ir::cfg::EdgeKind::RunChoice) edges — the factory
+/// returned one of them at module time, and every render of the run calls
+/// that one (#344) — the body's parameters positional, each candidate
+/// binding its own from them. A name a candidate binds that another one binds
+/// or reads too is renamed in it, as a splice renames a callee's (`n#c1`):
+/// closures capture variables, and the body's exit, where the sides meet,
+/// would hand one closure's effects the other's `n`. Each side's allocation
+/// and call sites are past the sides before it, as each copy a splice makes
+/// is: one closure may be two candidates (`d ? g(1) : g(2)`, #383).
+#[allow(clippy::type_complexity)]
 fn choice_of(
-    closures: Vec<(Vec<Var>, crate::ir::cfg::CFG)>,
-    mut prelude: Vec<crate::ir::Stmt>,
-) -> Option<(Vec<Var>, crate::ir::cfg::CFG)> {
+    candidates: Vec<ValueBody>,
+) -> Option<(
+    Vec<Var>,
+    crate::ir::cfg::CFG,
+    HashMap<Var, Option<hook_extractor::ResolvedHookCall>>,
+)> {
     use crate::ir::{
         Expr, Stmt,
         cfg::{BasicBlock, CFG, Edge, EdgeKind, Terminator},
         expr::SummaryValue,
+        free_vars::compute_free_vars,
     };
     let with_first = |body: &mut CFG, mut first: Vec<Stmt>| -> Option<()> {
         let entry = body.blocks.get_mut(&body.entry)?;
@@ -842,38 +1025,43 @@ fn choice_of(
         entry.stmts = first;
         Some(())
     };
-    if let [_] = closures.as_slice() {
-        let (params, mut body) = closures.into_iter().next()?;
-        with_first(&mut body, prelude)?;
-        return Some((params, body));
+    if let [_] = candidates.as_slice() {
+        let c = candidates.into_iter().next()?;
+        let mut body = c.body;
+        with_first(&mut body, c.prelude)?;
+        return Some((c.params, body, c.bound));
     }
-    let arity = closures.iter().map(|(p, _)| p.len()).max().unwrap_or(0);
+    let arity = candidates.iter().map(|c| c.params.len()).max().unwrap_or(0);
     let params: Vec<Var> = (0..arity).map(|i| format!("__closure_arg{i}")).collect();
     let mut merged = CFG {
         entry: 0,
         blocks: std::collections::BTreeMap::new(),
         edges: Vec::new(),
     };
-    let binds: Vec<HashSet<Var>> = closures
+    let binds: Vec<HashSet<Var>> = candidates
         .iter()
-        .map(|(own, body)| crate::ir::bound_vars(body, own))
+        .map(|c| {
+            let mut own = crate::ir::bound_vars(&c.body, &c.params);
+            own.extend(c.prelude.iter().filter_map(|s| match s {
+                Stmt::Let { var, .. } => Some(var.clone()),
+                _ => None,
+            }));
+            own
+        })
         .collect();
-    let mut binders: HashMap<&Var, usize> = HashMap::new();
-    for var in prelude.iter().filter_map(|s| match s {
-        Stmt::Let { var, .. } => Some(var),
-        _ => None,
-    }) {
-        *binders.entry(var).or_default() += 1;
-    }
-    for var in binds.iter().flatten() {
-        *binders.entry(var).or_default() += 1;
-    }
+    let reads: Vec<HashSet<Var>> = candidates
+        .iter()
+        .map(|c| compute_free_vars(&c.body))
+        .collect();
     let renames: Vec<HashMap<Var, Var>> = binds
         .iter()
         .enumerate()
         .map(|(i, own)| {
             own.iter()
-                .filter(|v| binders.get(v).is_some_and(|n| *n > 1))
+                .filter(|v| {
+                    (0..binds.len())
+                        .any(|j| j != i && (binds[j].contains(*v) || reads[j].contains(*v)))
+                })
                 .map(|v| {
                     (
                         v.clone(),
@@ -883,19 +1071,36 @@ fn choice_of(
                 .collect()
         })
         .collect();
+    let renamed = |rename: &HashMap<Var, Var>, v: Var| rename.get(&v).cloned().unwrap_or(v);
+    let mut bound = HashMap::new();
     let mut arms = Vec::new();
-    for ((own, body), rename) in closures.into_iter().zip(&renames) {
+    for (c, rename) in candidates.into_iter().zip(&renames) {
         let next = merged.blocks.keys().next_back().map_or(0, |b| b + 1);
-        let mut body = crate::ir::rename_vars_cfg(body, rename).shifted(next);
-        let lets = own
-            .iter()
-            .zip(&params)
-            .map(|(p, arg)| Stmt::Let {
-                var: rename.get(p).unwrap_or(p).clone(),
-                rhs: Expr::Var(arg.clone()),
-                span: None,
+        let sites = crate::ir::Offsets {
+            labels: 0,
+            ids: crate::ir::alloc_id_span(&merged),
+            calls: crate::ir::call_id_span(&merged),
+        };
+        let body = crate::ir::rename_vars_cfg(c.body, rename);
+        let mut body = crate::ir::remap_cfg(body, sites).shifted(next);
+        let mut lets: Vec<Stmt> = c
+            .prelude
+            .into_iter()
+            .map(|s| match s {
+                Stmt::Let { var, rhs, span } => Stmt::Let {
+                    var: renamed(rename, var),
+                    rhs,
+                    span,
+                },
+                s => s,
             })
             .collect();
+        lets.extend(c.params.iter().zip(&params).map(|(p, arg)| Stmt::Let {
+            var: renamed(rename, p.clone()),
+            rhs: Expr::Var(arg.clone()),
+            span: None,
+        }));
+        bound.extend(c.bound.into_iter().map(|(v, h)| (renamed(rename, v), h)));
         with_first(&mut body, lets)?;
         arms.push(body.entry);
         merged.blocks.extend(body.blocks);
@@ -916,7 +1121,7 @@ fn choice_of(
             id,
             BasicBlock {
                 id,
-                stmts: std::mem::take(&mut prelude),
+                stmts: Vec::new(),
                 term: Terminator::Branch {
                     cond: Expr::SummaryVal(SummaryValue::Top),
                     then_: arm,
@@ -936,7 +1141,7 @@ fn choice_of(
     }
     merged.entry = first;
     debug_assert!(merged.validate().is_ok(), "{:?}", merged.validate());
-    Some((params, merged))
+    Some((params, merged, bound))
 }
 
 /// The hook names `program` defines: its `use*` functions, and the
@@ -1255,6 +1460,99 @@ mod tests {
             assert!(bound.contains(name), "{name}: {bound:?}");
         }
         assert!(!bound.contains("n") && !bound.contains("k"), "{bound:?}");
+    }
+
+    /// #383: a factory handing back another program call's value is what
+    /// that call returns, the callee's parameters bound from the factory's
+    /// (its argument as the module call wrote it), through a chain of calls;
+    /// one handing back a program function by name is that function.
+    #[test]
+    fn a_factory_returning_a_call_or_a_function_runs_what_it_hands_back() {
+        use crate::ir::{Expr, cfg::EdgeKind};
+        let hooks = lowered_hooks(
+            "function impl(step) { return () => step; }\n\
+             function mid(s) { return impl(s); }\n\
+             function create(s) { return mid(s); }\n\
+             function counter(k) { return k; }\n\
+             function pick() { return counter; }\n\
+             const useA = create(2);\nconst useB = pick();",
+        );
+        let a = hooks.iter().find(|h| h.name == "useA").expect("useA");
+        assert!(
+            entry_lets(a)
+                .iter()
+                .any(|(v, e)| v == "step" && matches!(e, Expr::Lit(Prim::Int(2)))),
+            "{:?}",
+            entry_lets(a)
+        );
+        let b = hooks.iter().find(|h| h.name == "useB").expect("useB");
+        assert_eq!(b.params, ["k"]);
+        assert!(
+            !b.body_cfg
+                .edges
+                .iter()
+                .any(|e| e.kind == EdgeKind::RunChoice)
+        );
+    }
+
+    /// #383: one closure two calls hand back is two candidates, each its own
+    /// argument and its own allocation sites.
+    #[test]
+    fn one_closure_two_calls_return_is_two_candidates() {
+        use crate::ir::{Expr, Stmt};
+        let hooks = lowered_hooks(
+            "function g(s) { return () => ({ s }); }\n\
+             function two(d) { return d ? g(1) : g(2); }\n\
+             const useA = two(true);",
+        );
+        let h = hooks.iter().find(|h| h.name == "useA").expect("useA");
+        let lets: Vec<(String, Expr)> = h
+            .body_cfg
+            .blocks
+            .values()
+            .flat_map(|b| &b.stmts)
+            .filter_map(|s| match s {
+                Stmt::Let { var, rhs, .. } => Some((var.clone(), rhs.clone())),
+                _ => None,
+            })
+            .collect();
+        for (var, n) in [("s#c0", 1), ("s#c1", 2)] {
+            assert!(
+                lets.iter()
+                    .any(|(v, e)| v == var && matches!(e, Expr::Lit(Prim::Int(k)) if *k == n)),
+                "{var}: {lets:?}"
+            );
+        }
+        let mut sites = Vec::new();
+        h.body_cfg.for_each_expr(&mut |e| {
+            if let Expr::ObjectLit { id, .. } = e {
+                sites.push(*id);
+            }
+        });
+        sites.sort();
+        sites.dedup();
+        assert_eq!(sites.len(), 2, "{sites:?}");
+    }
+
+    /// #383: a returned call of a parameter, of a package's function, of a
+    /// function calling itself (past the bound), or a returned parameter a
+    /// statement may move: no body, the hook stays opaque.
+    #[test]
+    fn a_returned_call_the_analysis_does_not_follow_builds_no_hook() {
+        let hooks = lowered_hooks(
+            "import { ext } from \"pkg\";\n\
+             function param(b) { return b(); }\n\
+             function pkg(s) { return ext(s); }\n\
+             function again(n) { return again(n); }\n\
+             function moved(h) { if (h) h = () => 0; return h; }\n\
+             const useA = param(() => () => 0);\nconst useB = pkg(1);\n\
+             const useC = again(1);\nconst useD = moved(1);",
+        );
+        assert!(
+            hooks.is_empty(),
+            "{:?}",
+            hooks.iter().map(|h| &h.name).collect::<Vec<_>>()
+        );
     }
 
     /// A factory that returns its parameter, a closure or a value, a name

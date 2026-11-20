@@ -620,6 +620,11 @@ on a program React settles; 323 oracle cases, none a known false negative.
   create(…)` running its `react.ts`'s `useStore`) runs it: the recursion guard
   took the homonym for the hook itself, so it stayed a hook the analysis does
   not see and a loop in it was silent (found with #383).
+- A hook value whose function hands back another program call's value
+  (zustand's own `create`: `s ? createImpl(s) : createImpl`), up to three
+  calls deep, or a program function by name, in the same file or another,
+  runs what that call returns or that function: a loop in it, silent behind
+  an `analysis-limit` Info, is reported (#383).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error
