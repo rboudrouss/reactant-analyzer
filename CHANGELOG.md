@@ -530,6 +530,13 @@ on a program React settles; 323 oracle cases, none a known false negative.
   `(o.f as T)++`) or an increment of a private field: the member, or the
   names, kept their earlier value, and a closure stored there and called in
   the render was silent (#340).
+- What the program may put on `Object.prototype` follows `Object` and
+  `Reflect` only where they are spelled as such: any other read of either (an
+  alias `const O = Object`, a destructuring `const { defineProperty } =
+  Object`, `Object[k]`, an argument, an export) or of one of their reflective
+  functions (`Object.defineProperty.bind(…)`) means any member may be there,
+  as a getter or as data. A getter installed through such an alias and read
+  off a literal, a props object or a ref, in the render, was silent (#366).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error
