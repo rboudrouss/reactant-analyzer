@@ -271,6 +271,7 @@ fn solve<T: Transfer>(
 
     while let Some((_, b)) = pending.pop_first() {
         let mut env = entries[&b].clone();
+        let mut ruled_out = None;
         // The change bound of the conditions this block's writes run under.
         let pc = bound_under(selecting.get(&b), &cond_bounds);
         if let Some(block) = cfg.blocks.get(&b) {
@@ -314,11 +315,18 @@ fn solve<T: Transfer>(
                 }
                 // A condition is evaluated, so its calls run; its change
                 // bound is what the blocks it selects run under.
-                Terminator::Branch { cond, span, .. } => {
+                Terminator::Branch {
+                    cond,
+                    span,
+                    then_,
+                    else_,
+                    ..
+                } => {
                     let outer = std::mem::replace(&mut ctx.stmt, *span);
                     exec_expr_effects(transfer, cond, &mut env, ctx, depth);
                     ctx.stmt = outer;
                     ctx.heap.share_assigned(&mut env);
+                    ruled_out = ruled_out_side(transfer, cond, *then_, *else_, &env, ctx);
                     let bound = condition_bound(transfer, cond, cfg, &env, ctx);
                     if cond_bounds.get(&b) != Some(&bound) {
                         cond_bounds.insert(b, bound);
@@ -335,6 +343,9 @@ fn solve<T: Transfer>(
         }
 
         for (succ, out) in outgoing(cfg, b, &env) {
+            if ruled_out == Some(succ) {
+                continue;
+            }
             let next = match entries.get(&succ) {
                 None => out,
                 Some(existing) if back.contains(&(b, succ)) => {
@@ -356,6 +367,60 @@ fn solve<T: Transfer>(
         exits.insert(b, env);
     }
     Run { exits, ret }
+}
+
+/// The side of a branch the tested value rules out where no name's
+/// narrowing does ([`outgoing`]): the operand of a nullish test, or the
+/// tested value, is no name — `opts.f == null`, an optional chain's link
+/// (`opts.f?.(x)`), `if (o.f)` (#340). A value that is only `null` or
+/// `undefined` is nullish and falsy, one that is only a reference (an object,
+/// a function) neither; anything else, ⊥ included, rules out no side. Like a
+/// narrowing, it holds under this env only: a later run of the branch under a
+/// larger one decides again.
+fn ruled_out_side<T: Transfer>(
+    transfer: &T,
+    cond: &Expr,
+    then_: BlockId,
+    else_: BlockId,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+) -> Option<BlockId> {
+    use crate::ir::expr::{BinOp, Prim, UnaryOp};
+    if then_ == else_ {
+        return None;
+    }
+    let mut value = |e: &Expr| {
+        if matches!(e.peel_ts(), Expr::Var(_)) {
+            return None;
+        }
+        let v = transfer.eval_expr(e, env, ctx).as_state_value()?;
+        (!v.is_bottom_value()).then_some(v)
+    };
+    let nullish = |v: &StateValue| match v.is_nullish_only() {
+        true => Some(true),
+        false => (!v.null && !v.undef).then_some(false),
+    };
+    let truthy = |v: &StateValue| match (v.is_nullish_only(), v.is_reference_only()) {
+        (true, _) => Some(false),
+        (false, true) => Some(true),
+        (false, false) => None,
+    };
+    let holds = match cond {
+        Expr::BinOp {
+            op: op @ (BinOp::LooseEq | BinOp::LooseNeq),
+            lhs,
+            rhs,
+        } if matches!(rhs.as_ref(), Expr::Lit(Prim::Null | Prim::Unit)) => {
+            nullish(&value(lhs)?)? == matches!(op, BinOp::LooseEq)
+        }
+        Expr::UnaryOp {
+            op: UnaryOp::Not,
+            arg,
+        } => !truthy(&value(arg)?)?,
+        Expr::BinOp { .. } | Expr::UnaryOp { .. } => return None,
+        tested => truthy(&value(tested)?)?,
+    };
+    Some(if holds { else_ } else { then_ })
 }
 
 /// The may bound on the change trace of a branch condition: the renders at

@@ -139,6 +139,13 @@ on a program React settles; 323 oracle cases, none a known false negative.
   `form` to code the analysis does not see, and with #340 every later method
   call off `form` handed it over again; a default (`const { g = h } = {}`)
   is now surely taken (#340, #336).
+- A branch on a test of a value that is no name — an optional call's link
+  (`opts.cb?.(x)`), `opts.cb == null`, `if (opts.cb)` — is decided by that
+  value, as a name's test already was: a value that is only `null` or
+  `undefined` skips the call, one that is only an object or a function always
+  takes it. `opts.cb?.(form)` with `cb` absent hands `form` to nothing, and
+  `opts.size?.() ?? fallback` with `size` a function never runs `fallback`
+  (#340).
 
 ### Removed
 

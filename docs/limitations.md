@@ -336,8 +336,10 @@ that writes it (see *Cross-file limits*).
   prototype that may be any object; a literal with a `__proto__:` member, one unseen code holds,
   one written under a key no constant names, a spread of what the heap does not place and a class's
   instance keep the open reading. `const { cb } = opts; cb?.(form)` with `cb` absent is then
-  skipped [#340](https://github.com/rboudrouss/reactant-analyzer/issues/340); `opts.cb?.(form)`
-  is not, since only the test of a name decides a branch. Not seen: a library that
+  skipped, and so is `opts.cb?.(form)`: the test of a link, or of an `if`, that is no name is
+  decided by its value, as a name's is by its narrowing (only `null` or `undefined` is nullish and
+  falsy, only an object or a function neither)
+  [#340](https://github.com/rboudrouss/reactant-analyzer/issues/340). Not seen: a library that
   extends `Object.prototype` (as for accessors, #336), and an alias of `Object` or of its
   reflective functions (`const O = Object; O.prototype.f = …`, `Object[k]`, `const { defineProperty
   } = Object`), read as another object. Otherwise, once a member reads as code the analysis does not
