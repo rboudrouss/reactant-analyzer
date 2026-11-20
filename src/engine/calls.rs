@@ -199,6 +199,13 @@ pub struct CallRelation {
     /// position, a spliced copy's or one lowering gave none — shares a row:
     /// a may join, never `sure`.
     accesses: HashMap<Option<crate::ir::SourceRange>, Targets>,
+    /// What the member reads and writes and the conversions of a statement
+    /// hand code the analysis does not see, by the statement's position, as
+    /// [`Self::accesses`] is keyed: the receiver of an accessor the heap
+    /// does not place (#334) or of a conversion method it does not place
+    /// (#360), and the value a write hands such a setter. That code runs
+    /// there, and may call what the value reaches.
+    handed: HashMap<Option<crate::ir::SourceRange>, Escapes>,
     /// The half and the member of each accessor body an access ran: what a
     /// write inside it says runs it.
     accessors: HashMap<ExprId, crate::engine::setters::AccessorOf>,
@@ -228,6 +235,38 @@ impl CallRelation {
     /// (#337); `None` when none may run an accessor.
     pub fn accesses(&self, at: Option<crate::ir::SourceRange>) -> Option<&Targets> {
         self.accesses.get(&at)
+    }
+
+    /// What the accesses and conversions of the statement at `at` hand code
+    /// the analysis does not see ([`Self::handed`]); `None` when nothing.
+    pub fn handed(&self, at: Option<crate::ir::SourceRange>) -> Option<&Escapes> {
+        self.handed.get(&at)
+    }
+
+    /// Join into the row of the statement at `at` a value handed there to
+    /// code the analysis does not see: the setters it may be (`direct`) and
+    /// hold (`held`), the bodies it reaches, and whether it is read off a
+    /// module binding. Never `sure`: that code may call any of them, or none.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_handed(
+        &mut self,
+        at: Option<crate::ir::SourceRange>,
+        direct: impl IntoIterator<Item = Slot>,
+        held: impl IntoIterator<Item = Slot>,
+        bodies: impl IntoIterator<Item = ExprId>,
+        module: bool,
+        escaped: bool,
+    ) {
+        let row = self.handed.entry(at).or_default();
+        row.placed |= !escaped;
+        row.module |= module;
+        for slot in direct {
+            row.direct.insert(slot);
+            row.setters.insert(slot);
+        }
+        row.setters.extend(held);
+        row.bodies.extend(bodies);
+        row.sure = Some(false);
     }
 
     /// The half and the member of the accessor body at `site`, when an
@@ -288,11 +327,13 @@ impl CallRelation {
         self.writes_in(site, memo, &mut Vec::new()).0
     }
 
-    /// [`Self::writes_of`], with the bodies being computed on `stack`. A
-    /// body met again on the stack answers nothing yet, and every body above
-    /// it is then partial until that one completes: an answer is kept only
-    /// once every cycle it touched is closed (the second component: the
-    /// lowest stack index touched, `usize::MAX` for none).
+    /// [`Self::writes_of`], with the bodies being computed on `stack`, a
+    /// Tarjan stack: a body stays there until the cycle it is in completes. A
+    /// body met again there answers nothing yet, and every body above it is
+    /// then partial until that one completes (the second component: the
+    /// lowest stack index touched, `usize::MAX` for none). The bodies of one
+    /// cycle each reach the others, so they write the same slots: the answer
+    /// of the first of them, once complete, is every one's, kept for each.
     fn writes_in(
         &self,
         site: ExprId,
@@ -324,12 +365,18 @@ impl CallRelation {
             // What module scope holds, which a call of module code or a value
             // read off a module binding may reach (#335).
             let mut module = false;
-            // The accessors its member reads and writes run (#337).
+            // The accessors its member reads and writes run (#337), and what
+            // they and its conversions hand code the analysis does not see.
             let mut accessed = BTreeSet::new();
             for at in positions(body) {
                 if let Some(t) = self.accesses.get(&at) {
                     accessed.extend(t.bodies.iter().copied());
                     module |= t.module;
+                }
+                if let Some(e) = self.handed.get(&at) {
+                    out.extend(e.setters.iter().copied());
+                    accessed.extend(e.bodies.iter().copied());
+                    module |= e.module;
                 }
             }
             inner.extend(accessed);
@@ -361,9 +408,10 @@ impl CallRelation {
             out.extend(w);
             low = low.min(l);
         }
-        stack.pop();
         if low >= me {
-            memo.insert(site, out.clone());
+            for member in stack.drain(me..) {
+                memo.insert(member, out.clone());
+            }
             (out, usize::MAX)
         } else {
             (out, low)
@@ -455,6 +503,16 @@ impl CallRelation {
         }
         for (at, t) in &other.accesses {
             self.accesses.entry(*at).or_default().join(t.clone());
+        }
+        for (at, e) in &other.handed {
+            self.record_handed(
+                *at,
+                e.direct.iter().copied(),
+                e.setters.iter().copied(),
+                e.bodies.iter().copied(),
+                e.module,
+                !e.placed,
+            );
         }
         for (site, a) in &other.accessors {
             self.accessors.entry(*site).or_insert_with(|| a.clone());

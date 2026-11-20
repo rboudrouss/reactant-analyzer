@@ -18,8 +18,8 @@ use crate::{
         bindings::binding_of,
         cfg::{CFG, EdgeKind, Terminator},
         expr::{
-            Accessor, CONSTRUCT_KEY, Expr, MarkerVal, NEW_INSTANCE, RECEIVER, SPREAD_KEY_PREFIX,
-            SummaryValue, THIS, accessor_of, is_synthetic_key,
+            Accessor, CONSTRUCT_KEY, Converted, Expr, MarkerVal, NEW_INSTANCE, RECEIVER,
+            SPREAD_KEY_PREFIX, SummaryValue, THIS, TO_PRIMITIVE, accessor_of, is_synthetic_key,
         },
         module::AccessKey,
         stmt::{MemberKey, Stmt},
@@ -507,6 +507,11 @@ fn exec_full_stmt<T: Transfer>(
                 exec_callbacks_depth(transfer, idx, env, ctx, depth);
             }
             exec_callbacks_depth(transfer, rhs, env, ctx, depth);
+            // The key converts to a property key once the value is
+            // evaluated (#360).
+            if let MemberKey::Index(idx) = key {
+                run_conversion(transfer, Converted::Value(idx), env, ctx, depth);
+            }
             if let Some(root) = module_root(obj) {
                 hold_in_module(transfer, root, rhs, env, ctx);
             }
@@ -524,10 +529,11 @@ fn exec_full_stmt<T: Transfer>(
     }
 }
 
-/// Run the getters the member reads of `expr` run, and nothing else (#321):
-/// what a hook's entry keeps as written, whose calls run in render
-/// statements of their own ([`QueryContext::hook_reads`]). A function
-/// literal is not entered: its reads run when it is called.
+/// Run the getters the member reads of `expr` run, and what its converting
+/// positions run (#360), and nothing else (#321): what a hook's entry keeps
+/// as written, whose calls run in render statements of their own
+/// ([`QueryContext::hook_reads`]). A function literal is not entered: its
+/// reads run when it is called.
 ///
 /// [`QueryContext::hook_reads`]: crate::domains::context::QueryContext::hook_reads
 fn run_member_reads<T: Transfer>(
@@ -537,9 +543,6 @@ fn run_member_reads<T: Transfer>(
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
 ) {
-    if !ctx.heap.has_accessors() {
-        return;
-    }
     match expr {
         Expr::FnLit { .. } => {}
         Expr::FieldAccess { obj, field } => {
@@ -549,9 +552,17 @@ fn run_member_reads<T: Transfer>(
         Expr::IndexAccess { arr, idx } => {
             run_member_reads(transfer, arr, env, ctx, depth);
             run_member_reads(transfer, idx, env, ctx, depth);
+            run_conversions(transfer, expr, env, ctx, depth);
             run_accessors(transfer, arr, Key::Index(idx), None, env, ctx, depth);
         }
-        other => other.for_each_child(&mut |c| run_member_reads(transfer, c, env, ctx, depth)),
+        // A call runs in a statement of its own, its conversions with it.
+        Expr::Call { .. } => {
+            expr.for_each_child(&mut |c| run_member_reads(transfer, c, env, ctx, depth));
+        }
+        other => {
+            other.for_each_child(&mut |c| run_member_reads(transfer, c, env, ctx, depth));
+            run_conversions(transfer, other, env, ctx, depth);
+        }
     }
 }
 
@@ -660,9 +671,9 @@ fn run_accessors<T: Transfer>(
         ctx.heap.unseen_accessor(sites.as_ref(), key)
     };
     if unseen {
-        escape(transfer, obj, env, ctx);
+        escape_at_access(transfer, obj, env, ctx);
         if let Some(rhs) = written {
-            escape(transfer, rhs, env, ctx);
+            escape_at_access(transfer, rhs, env, ctx);
         }
     }
     let kind = match written {
@@ -714,28 +725,193 @@ fn run_accessors<T: Transfer>(
     // The accessor's `this` is the object read or written (#338).
     let receiver = EnvVal::located(Some(sites), transfer.eval_expr(obj, env, ctx));
     for site in accessors {
-        let returned = match depth >= MAX_INLINE_DEPTH {
-            true => None,
-            false => exec_heap_fns(
+        run_accessor(transfer, site, args, &receiver, env, ctx, depth);
+    }
+}
+
+/// Run the accessor at `site` on `receiver`, its `this`: a getter when
+/// `args` is empty, whose return the heap keeps as what the read is
+/// ([`Heap::record_getter`]), else a setter handed the value written. Past
+/// the inlining budget it runs nothing, and the read may be anything.
+///
+/// [`Heap::record_getter`]: crate::domains::stores::Heap::record_getter
+fn run_accessor<T: Transfer>(
+    transfer: &T,
+    site: ExprId,
+    args: &[EnvVal<T::Domain>],
+    receiver: &EnvVal<T::Domain>,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+    depth: usize,
+) {
+    let returned = match depth >= MAX_INLINE_DEPTH {
+        true => None,
+        false => exec_heap_fns(
+            transfer,
+            Sites::closed([site]),
+            Args::exactly(args).on(Some(receiver)),
+            env,
+            ctx,
+            depth,
+            &mut Ran::default(),
+        ),
+    };
+    if args.is_empty() {
+        let read = returned.and_then(|r| {
+            let sites = r.sites().cloned();
+            r.as_val()
+                .as_state_value()
+                .map(|v| EnvVal::located(sites, v))
+        });
+        ctx.heap.record_getter(site, read.as_ref());
+    }
+}
+
+/// Run what the converting positions of `expr` run ([`Expr::conversions`]).
+fn run_conversions<T: Transfer>(
+    transfer: &T,
+    expr: &Expr,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+    depth: usize,
+) {
+    for converted in expr.conversions().into_iter().flatten() {
+        run_conversion(transfer, converted, env, ctx, depth);
+    }
+}
+
+/// A conversion to a primitive of what `converted` denotes (#360) reads the
+/// [`TO_PRIMITIVE`] members of each object the heap places it at, own or
+/// inherited ([`Heap::conversion`]), and calls what they hold with the object
+/// as `this` (#338): the getters it reads and the methods it calls run here,
+/// a call of them anchored at this statement, as a member read's getters
+/// are (#337); an array's entries convert in turn. A getter the program
+/// defines and the heap does not place (#334), or a prototype the heap does
+/// not place, is code the analysis does not see, handed the object as a
+/// method call's receiver is (#330). Where the heap places nothing, the
+/// operand came from code that holds it already, and nothing runs.
+///
+/// [`TO_PRIMITIVE`]: crate::ir::expr::TO_PRIMITIVE
+/// [`Heap::conversion`]: crate::domains::stores::Heap::conversion
+fn run_conversion<T: Transfer>(
+    transfer: &T,
+    converted: Converted<'_>,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+    depth: usize,
+) {
+    let (Converted::Value(operand) | Converted::Entries(operand)) = converted;
+    if matches!(operand.peel_ts(), Expr::Lit(_)) {
+        return;
+    }
+    let Some(sites) = alloc_literal(transfer, operand, env, ctx) else {
+        return;
+    };
+    let mut work: Vec<EnvVal<T::Domain>> = Vec::new();
+    match converted {
+        Converted::Value(_) => {
+            work.push(EnvVal::located(
+                Some(sites),
+                transfer.eval_expr(operand, env, ctx),
+            ));
+        }
+        Converted::Entries(_) => {
+            let arrays = sites
+                .ids
+                .iter()
+                .copied()
+                .filter(|id| matches!(ctx.heap.get(*id), Some(HeapValue::Obj(m)) if m.array));
+            if let Some(entries) = ctx.heap.conversion(&Sites::closed(arrays)).entries {
+                work.push(lift(entries));
+            }
+        }
+    }
+    let mut seen: HashSet<ExprId> = HashSet::new();
+    let mut bodies: BTreeSet<ExprId> = BTreeSet::new();
+    let mut open = false;
+    while let Some(receiver) = work.pop() {
+        let Some(sites) = receiver.sites().cloned() else {
+            continue;
+        };
+        if sites.ids.iter().all(|id| seen.contains(id)) {
+            continue;
+        }
+        seen.extend(sites.ids.iter().copied());
+        let found = ctx.heap.conversion(&sites);
+        let holders = Sites::closed(found.holders.iter().copied());
+        let mut handed = found.handed;
+        for member in TO_PRIMITIVE {
+            if ctx.heap.has_accessors() {
+                let mut getters: Vec<ExprId> = ctx
+                    .heap
+                    .accessors(&holders, Accessor::Get, Some(member))
+                    .ids
+                    .into_iter()
+                    .collect();
+                getters.sort();
+                for site in getters {
+                    ctx.record(|r| r.record_accessor(site, Accessor::Get, Some(member)));
+                    bodies.insert(site);
+                    run_accessor(transfer, site, &[], &receiver, env, ctx, depth);
+                }
+                handed |= ctx.heap.members(&sites, Some(member)).1
+                    && ctx
+                        .heap
+                        .unseen_accessor(Some(&sites), AccessKey::Named(member));
+            }
+        }
+        let mut methods: Vec<ExprId> = TO_PRIMITIVE
+            .iter()
+            .flat_map(|member| ctx.heap.member_sites(&holders, Some(*member)))
+            .flat_map(|s| s.ids)
+            .filter(|id| matches!(ctx.heap.get(*id), Some(HeapValue::Fn { .. })))
+            .collect();
+        methods.sort();
+        methods.dedup();
+        if !methods.is_empty() {
+            // Past the inlining budget the methods are listed, not run, and
+            // one that reads its receiver runs later with `this` unknown.
+            let mut ran = match depth >= MAX_INLINE_DEPTH {
+                true => Ran::listing(),
+                false => Ran::default(),
+            };
+            exec_heap_fns(
                 transfer,
-                Sites::closed([site]),
-                Args::exactly(args).on(Some(&receiver)),
+                Sites::closed(methods),
+                Args::unknown().on(Some(&receiver)),
                 env,
                 ctx,
                 depth,
-                &mut Ran::default(),
-            ),
-        };
-        if written.is_none() {
-            let read = returned.and_then(|r| {
-                let sites = r.sites().cloned();
-                r.as_val()
-                    .as_state_value()
-                    .map(|v| EnvVal::located(sites, v))
-            });
-            ctx.heap.record_getter(site, read.as_ref());
+                &mut ran,
+            );
+            handed |= ran.this;
+            bodies.extend(ran.bodies);
+        }
+        if handed {
+            let module = reads_module(operand, ctx);
+            hand_at_access(Some(&sites), Vec::new(), module, ctx);
+        }
+        open |= handed;
+        if let Some(entries) = found.entries {
+            work.push(lift(entries));
         }
     }
+    if open || !bodies.is_empty() {
+        let eval = crate::engine::calls::Evaluation {
+            bodies,
+            open,
+            module: open && reads_module(operand, ctx),
+            escaped: ctx.escaped,
+            ..Default::default()
+        };
+        let at = ctx.stmt;
+        ctx.record(|r| r.record_access(at, eval));
+    }
+}
+
+/// A heap value, as a value of the domain `D`.
+fn lift<D: AbstractDomain>(value: EnvVal<StateValue>) -> EnvVal<D> {
+    EnvVal::located(value.sites().cloned(), D::from_state_value(value.as_val()))
 }
 
 /// Fire the side effects of an expression evaluated in *effect position* — a
@@ -1679,6 +1855,8 @@ fn exec_callbacks_depth<T: Transfer>(
                     }
                 }
             }
+            // `xs.join(sep)` converts the entries and the separator (#360).
+            run_conversions(transfer, expr, env, ctx, depth);
             if let Some(receiver) = crate::ir::expr::mutation_receiver(expr) {
                 havoc_members(transfer, receiver, args, env, ctx);
             }
@@ -1776,6 +1954,7 @@ fn exec_callbacks_depth<T: Transfer>(
         Expr::IndexAccess { arr, idx } => {
             exec_callbacks_depth(transfer, arr, env, ctx, depth);
             exec_callbacks_depth(transfer, idx, env, ctx, depth);
+            run_conversions(transfer, expr, env, ctx, depth);
             run_accessors(transfer, arr, Key::Index(idx), None, env, ctx, depth);
             None
         }
@@ -1843,11 +2022,13 @@ fn exec_callbacks_depth<T: Transfer>(
             None
         }
         // Bare FnLit outside a call: never runs by itself — not descended.
-        // Everything else: generic child descent.
+        // Everything else: generic child descent, then what an operator
+        // converting its operands runs (#360).
         other => {
             other.for_each_child(&mut |c| {
                 exec_callbacks_depth(transfer, c, env, ctx, depth);
             });
+            run_conversions(transfer, other, env, ctx, depth);
             None
         }
     }
@@ -1917,6 +2098,57 @@ fn exec_unseen_new<T: Transfer>(
     }
     ctx.returns.record(id, this.as_ref());
     this
+}
+
+/// [`escape`], to code the analysis does not see that a member access or a
+/// conversion of the statement at hand runs (#334, #360): an accessor or a
+/// conversion method no site places. It runs there, and may call what the
+/// value reaches, which the relation records at the statement
+/// ([`crate::engine::CallRelation::handed`]).
+fn escape_at_access<T: Transfer>(
+    transfer: &T,
+    expr: &Expr,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+) {
+    let sites = alloc_literal(transfer, expr, env, ctx);
+    let setters = call_targets(transfer, expr, env, ctx);
+    let module = reads_module(expr, ctx);
+    hand_at_access(sites.as_ref(), setters, module, ctx);
+}
+
+/// What [`escape_at_access`] hands: a value at `sites`, which may be the
+/// setters `direct`, read off a module binding when `module`.
+fn hand_at_access<D: AbstractDomain>(
+    sites: Option<&Sites>,
+    direct: Vec<Slot>,
+    module: bool,
+    ctx: &mut AnalysisCtx<D>,
+) {
+    if ctx.calls.is_some() {
+        let (held, fns) = sites.map(|s| ctx.heap.reach_of(s)).unwrap_or_default();
+        let (at, escaped) = (ctx.stmt, ctx.escaped);
+        ctx.record(|r| {
+            for (site, body) in &fns {
+                r.record_body(*site, body);
+            }
+            r.record_handed(
+                at,
+                direct.iter().copied(),
+                held,
+                fns.iter().map(|(s, _)| *s),
+                module,
+                escaped,
+            );
+        });
+    }
+    let mut setters = direct;
+    if let Some(sites) = sites {
+        setters.extend(ctx.heap.escape(sites));
+    }
+    for (owner, label) in setters {
+        ctx.write_slot(owner, label, D::top());
+    }
 }
 
 /// Code the analysis does not see receives the value of `expr` (#254): a
