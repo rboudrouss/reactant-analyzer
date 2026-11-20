@@ -1601,36 +1601,49 @@ fn call_span(cfg: &CFG, hooks: &[HookEntry]) -> u64 {
 }
 
 /// The recursion guard both splices share (custom hooks, utilities): the
-/// names whose inlining produced a call, outermost first (empty for the
-/// component's own code). A call is cut to ⊤ only when its callee is in its
-/// own ancestry — exactly self- or mutual recursion. A name inlined
-/// *elsewhere* is no reason to cut: a guard remembering every name ever
-/// inlined left a sibling second call opaque, and every write through it
-/// invisible (#185, #232). Each inlining strictly lengthens the chain with a
-/// name not already in it, so chains are bounded by the number of names.
-#[derive(Clone, Default)]
-struct Ancestry(std::rc::Rc<Vec<String>>);
+/// callees whose inlining produced a call, outermost first (empty for the
+/// component's own code) — a hook by its registry key, a utility by its
+/// name. A call is cut to ⊤ only when its callee is in its own ancestry —
+/// exactly self- or mutual recursion. A callee inlined *elsewhere* is no
+/// reason to cut: a guard remembering every name ever inlined left a sibling
+/// second call opaque, and every write through it invisible (#185, #232).
+/// Each inlining strictly lengthens the chain with a callee not already in
+/// it, so chains are bounded by the number of callees.
+#[derive(Clone)]
+struct Ancestry<K = String>(std::rc::Rc<Vec<K>>);
 
-impl Ancestry {
+impl<K> Default for Ancestry<K> {
+    fn default() -> Self {
+        Ancestry(Default::default())
+    }
+}
+
+impl<K: Clone> Ancestry<K> {
     /// A call of `callee` here would re-enter an enclosing inlining.
-    fn recurses(&self, callee: &str) -> bool {
+    fn recurses<Q: ?Sized>(&self, callee: &Q) -> bool
+    where
+        K: PartialEq<Q>,
+    {
         self.0.iter().any(|n| n == callee)
     }
 
     /// The ancestry of the code an inlining of `callee` from here produces.
-    fn enter(&self, callee: &str) -> Ancestry {
+    fn enter(&self, callee: K) -> Ancestry<K> {
         Ancestry(std::rc::Rc::new(
             self.0
                 .iter()
                 .cloned()
-                .chain(std::iter::once(callee.to_string()))
+                .chain(std::iter::once(callee))
                 .collect(),
         ))
     }
 }
 
 /// Guard strategy: every entry carries its [`Ancestry`]. A `Custom` entry is
-/// skipped (cut to ⊤) only when its ancestry recurses on its name.
+/// skipped (cut to ⊤) only when its ancestry holds the hook it resolves to:
+/// two files' hooks of one name are two hooks (a hook wrapping another
+/// file's `useStore`, zustand's `useStore = create(…)` running its file's
+/// `useStore`, #383).
 #[allow(clippy::too_many_arguments)]
 fn expand_custom_hooks(
     hooks: &mut Vec<HookEntry>,
@@ -1648,7 +1661,8 @@ fn expand_custom_hooks(
     };
 
     // Ancestry by entry label; an entry with no row is the component's own.
-    let mut ancestry: HashMap<HookLabel, Ancestry> = HashMap::new();
+    let mut ancestry: HashMap<HookLabel, Ancestry<crate::engine::hook_registry::HookKey>> =
+        HashMap::new();
 
     let mut i = 0;
     while i < hooks.len() {
@@ -1671,13 +1685,7 @@ fn expand_custom_hooks(
             }
         };
         let custom_label = hooks[i].label();
-
-        // Recursion guard: skip a call of a hook this entry is already inside.
         let chain = ancestry.get(&custom_label).cloned().unwrap_or_default();
-        if chain.recurses(&name) {
-            i += 1;
-            continue;
-        }
 
         // The call's own import settles the body, through re-exports; only
         // an unimported name falls back to the name (ADR-013, #226).
@@ -1731,6 +1739,13 @@ fn expand_custom_hooks(
             i += 1;
             continue;
         };
+
+        // Recursion guard: skip a call of a hook this entry is already inside.
+        let key = (hook_ir.file.clone(), hook_ir.name.clone());
+        if chain.recurses(&key) {
+            i += 1;
+            continue;
+        }
 
         // An alias of React's effect hooks is that hook: the call's own entry,
         // its arguments the caller's, at the caller's label and position.
@@ -1931,11 +1946,11 @@ fn expand_custom_hooks(
         }));
 
         // The inlined entries sit one hook deeper: their ancestry is this
-        // call's plus this hook, so a call of `name` among them is recursion.
-        // They are written in the hook's body file, through which the names
-        // they call or construct resolve (#356); a hook they call in turn
-        // records its own file for its entries.
-        let inner = chain.enter(&name);
+        // call's plus this hook, so a call of this hook among them is
+        // recursion. They are written in the hook's body file, through which
+        // the names they call or construct resolve (#356); a hook they call
+        // in turn records its own file for its entries.
+        let inner = chain.enter(key);
         for h in &remapped {
             ancestry.insert(h.label(), inner.clone());
             regions
@@ -2652,7 +2667,7 @@ fn inline_in_cfg(
                 .iter()
                 .position(|r| r.start <= block_id && block_id < r.end);
             scopes.push((range.end..range.end + 1, chain.clone()));
-            scopes.push((range.clone(), chain.enter(&name)));
+            scopes.push((range.clone(), chain.enter(name.clone())));
             regions.push(crate::engine::setters::InlineRegion {
                 start: range.start,
                 end: range.end,

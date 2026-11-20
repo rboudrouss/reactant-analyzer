@@ -615,6 +615,11 @@ on a program React settles; 323 oracle cases, none a known false negative.
   ((s) => …) as Create`, `const useX = (() => …) as () => number`) is the
   function, hook or component it wraps: it was none of them, its calls were
   opaque and a loop in it was silent (found with #383).
+- A hook that calls another file's hook of its own name (a `useStore`
+  wrapping an imported `useStore as useBase`, zustand's `useStore =
+  create(…)` running its `react.ts`'s `useStore`) runs it: the recursion guard
+  took the homonym for the hook itself, so it stayed a hook the analysis does
+  not see and a loop in it was silent (found with #383).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error
