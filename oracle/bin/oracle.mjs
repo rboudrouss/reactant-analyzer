@@ -60,6 +60,17 @@ function startPool(opts) {
   return new ReactPool({ size: jobs });
 }
 
+/**
+ * A program that changed the realm of its worker (realm.mjs) got that worker replaced: say so, and
+ * which program, so that a verdict that ever depends on a neighbour leaves a trail.
+ */
+function reportRespawns(pool, programs) {
+  console.log(`${pool.respawned} workers respawned after a program changed the realm`);
+  for (const [name, changed] of programs) {
+    if (changed?.length) console.log(`  ${name}: ${changed.slice(0, 3).join(", ")}${changed.length > 3 ? `, +${changed.length - 3} more` : ""}`);
+  }
+}
+
 function requireBinary() {
   const bin = reactantBinary();
   if (!existsSync(bin)) {
@@ -71,11 +82,14 @@ function requireBinary() {
 async function cmdRun(opts) {
   requireBinary();
   const pool = startPool(opts);
+  const ran = [];
   for (const f of opts._) {
     const r = await check(pool, readFileSync(f, "utf8"));
     console.log(`── ${f}\n${describe(r)}\n`);
+    ran.push([f, r.react.realmChanged]);
   }
   await pool.close();
+  reportRespawns(pool, ran);
 }
 
 /** `// oracle: react=loop` and `// oracle: known=fn #168` headers. */
@@ -112,6 +126,7 @@ async function cmdCases(opts) {
   }
   await pool.close();
   console.log(`\n${files.length} cases, ${failures} failing`);
+  reportRespawns(pool, results.map(([f, r]) => [f, r.react.realmChanged]));
   process.exit(failures ? 1 : 0);
 }
 
@@ -152,6 +167,7 @@ async function cmdFuzz(opts) {
   const secs = ((Date.now() - started) / 1000).toFixed(1);
   console.log(`seed ${seed}, ${count} programs in ${secs}s`);
   console.log(VERDICTS.map((v) => `${v}=${tally[v]}`).join("  "));
+  reportRespawns(pool, results.map((r, i) => [`program #${i}`, r.react.realmChanged]));
   const fns = results.filter((r) => r.verdict === "fn");
   if (fns.length) {
     const share = (p) => fns.filter(p).length;
