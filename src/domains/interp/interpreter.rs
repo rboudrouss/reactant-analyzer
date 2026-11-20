@@ -1068,7 +1068,15 @@ pub(crate) fn alloc_literal<T: Transfer>(
         }
         // A new array of the running call's arguments (#324).
         Expr::Arguments { id, from } => (*id, arguments_members(transfer, *from, env, ctx)),
-        // A memo, or a callback, points where its recompute's value does.
+        // A memo, or a callback, points where its recompute's value does. A
+        // callback read before its first recompute (in the first render
+        // pass) points where one recompute at the read hands it back, as a
+        // name holding it runs its body (#340): its own sites are known
+        // before any pass, a memo's only by running its body.
+        Expr::CallbackVal(label) if !ctx.memo.recomputed(*label) => {
+            let query = ctx.query;
+            return callback_sites(transfer, query.callback(*label)?, env, ctx);
+        }
         Expr::MemoVal(label) | Expr::CallbackVal(label) => {
             return ctx.memo.sites(*label).cloned();
         }
@@ -1118,6 +1126,36 @@ pub(crate) fn alloc_literal<T: Transfer>(
     };
     ctx.heap.alloc_obj(id, members);
     Some(Sites::closed([id]))
+}
+
+/// Where one recompute of the `useCallback` `hook` in `env` points the
+/// function it hands back (#320): a literal's closure, allocated at the
+/// hook's site with what it captures there, as an inline arrow is; or the
+/// argument's sites. `None` for any other hook.
+pub(crate) fn callback_sites<T: Transfer>(
+    transfer: &T,
+    hook: &crate::ir::HookEntry,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+) -> Option<Sites> {
+    match hook {
+        crate::ir::HookEntry::Callback {
+            label,
+            body_cfg,
+            params,
+            literal: true,
+            ..
+        } => {
+            let body = ctx
+                .query
+                .callback_body(*label)
+                .unwrap_or_else(|| Arc::new(body_cfg.clone()));
+            let id = ctx.component.hook_site(*label);
+            ctx.heap.alloc_fn(id, params, &body, env, ctx.component);
+            Some(Sites::closed([id]))
+        }
+        _ => alloc_literal(transfer, hook.callback_argument()?, env, ctx),
+    }
 }
 
 /// What a literal's entry holds: its allocation sites and its value.

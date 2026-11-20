@@ -16,7 +16,7 @@ use reactant::{
         hooks::HookEntry,
         types::{BlockId, ExprId},
     },
-    lowering::{lower_program, lower_utilities},
+    lowering::{lower_custom_hooks, lower_program, lower_utilities},
 };
 
 fn analyze(src: &str) -> ProgramAnalysisResult {
@@ -31,6 +31,7 @@ fn analyze(src: &str) -> ProgramAnalysisResult {
         .parse();
     assert!(ret.diagnostics.is_empty(), "{:?}", ret.diagnostics);
     let components = lower_program(&ret.program, src, path, &mut Default::default());
+    let hooks = lower_custom_hooks(&ret.program, src, path, &mut Default::default());
     let utilities = lower_utilities(&ret.program, src, path, &mut Default::default());
     let config = Config {
         function_registry: FunctionRegistry::from_functions(utilities),
@@ -38,7 +39,7 @@ fn analyze(src: &str) -> ProgramAnalysisResult {
     };
     analyze_program(
         ComponentRegistry::from_components(components),
-        HookRegistry::new(),
+        HookRegistry::from_hooks(hooks),
         RootStrategy::Heuristic,
         &config,
     )
@@ -180,6 +181,40 @@ fn a_row_lists_what_the_call_ran_and_sure_is_one_target() {
     // `setA(1)`: exactly the one setter, surely.
     assert_eq!(row("setA").setters.len(), 1);
     assert!(row("setA").sure() && !row("setA").open);
+}
+
+#[test]
+fn a_callback_read_through_a_member_is_its_body_from_the_first_pass() {
+    // `$errors.setErrors` is the hook's `useCallback`, read through the
+    // object the hook returns: the closure at the hook's site in every pass,
+    // the first one included, before any recompute placed it (#340). Never
+    // code the analysis does not see.
+    let prog = analyze(
+        r#"
+        import { useState, useCallback } from "react";
+        function useErrors() {
+          const [e, setE] = useState(0);
+          const setErrors = useCallback((x: number) => setE(x), []);
+          return { e, setErrors };
+        }
+        export function App() {
+          const $errors = useErrors();
+          $errors.setErrors(1);
+          return <div>{$errors.e}</div>;
+        }
+        "#,
+    );
+    let result = &prog.components[&prog.component_named("App").unwrap()];
+    let mut rows = Vec::new();
+    result.render_cfg.for_each_expr(&mut |e| {
+        if let Expr::Call { id, fn_, .. } = e
+            && matches!(fn_.as_ref(), Expr::FieldAccess { field, .. } if field == "setErrors")
+        {
+            rows.push(result.calls.targets(*id).unwrap().clone());
+        }
+    });
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].bodies.len() == 1 && !rows[0].open, "{:?}", rows[0]);
 }
 
 /// The calls of every function literal written in `cfg`, nested ones

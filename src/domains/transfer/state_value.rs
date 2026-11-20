@@ -7,8 +7,8 @@ use crate::{
         AbstractDomain, AnalysisCtx, Transfer,
         impls::{BoolVal, Interval, SetterVal, Stability, StateValue, StrConst},
         interp::{
-            access_key, alloc_literal, call_targets, closure_env, escape, exec_stmt_with_callbacks,
-            receiver_kind, returned_sites, run_cfg,
+            access_key, alloc_literal, call_targets, callback_sites, closure_env, escape,
+            exec_stmt_with_callbacks, receiver_kind, returned_sites, run_cfg,
         },
         stores::{AbstractEnv, EnvVal, Heap, HeapValue, Sites, member_key},
     },
@@ -79,25 +79,16 @@ impl Transfer for StateValueTransfer {
                 (deps, run.ret, sites)
             }
             HookEntry::Callback {
-                label,
-                body_cfg,
-                params,
                 literal: true,
                 deps,
                 ..
             } => {
-                let body = ctx
-                    .query
-                    .callback_body(*label)
-                    .unwrap_or_else(|| std::sync::Arc::new(body_cfg.clone()));
-                let id = ctx.component.hook_site(*label);
-                ctx.heap.alloc_fn(id, params, &body, env, ctx.component);
-                let sites = Some(Sites::closed([id]));
+                let sites = callback_sites(self, memo, env, ctx);
                 (deps, StateValue::reference(Stability::PerRender), sites)
             }
             HookEntry::Callback { deps, .. } => match memo.callback_argument() {
                 Some(arg) => {
-                    let sites = alloc_literal(self, arg, env, ctx);
+                    let sites = callback_sites(self, memo, env, ctx);
                     (deps, eval_state_value(arg, env, ctx), sites)
                 }
                 None => (deps, StateValue::top(), None),
