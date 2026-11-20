@@ -235,11 +235,10 @@ that writes it (see *Cross-file limits*).
   [#73](https://github.com/rboudrouss/reactant-analyzer/issues/73).
 - An object spread copies what the heap knows of its source: `{ ...opts }.foo` is `opts.foo`, and
   a spread of a value the heap does not place may overwrite every member before it, which stay
-  possible. A spread of a value placed only in part (`...(c ? { f } : x)`, `x` any object) does
-  not keep what the placed part holds: handed to code the analysis does not see, the object does
-  not hand `f` over, a missed write
-  [#363](https://github.com/rboudrouss/reactant-analyzer/issues/363) (`c ? { f } : null` is
-  handled: a `null` side places nothing, #340). A computed key resolves when a literal spells it (`{ [1]: a }`, `o["k"]`) or, in a
+  possible. A spread of a value placed only in part (`...(c ? { f } : x)`, `x` any object) is
+  both: what the placed objects hold, each member possibly anything as well
+  [#363](https://github.com/rboudrouss/reactant-analyzer/issues/363) (a `null` side places
+  nothing, #340). A computed key resolves when a literal spells it (`{ [1]: a }`, `o["k"]`) or, in a
   read or a destructuring, when its value is one string (`const { [k]: v } = o`); in an object
   literal it may be any member. Not modeled: an array entry past a spread (its index is ⊤)
   [#76](https://github.com/rboudrouss/reactant-analyzer/issues/76). A spread argument

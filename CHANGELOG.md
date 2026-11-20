@@ -537,6 +537,10 @@ on a program React settles; 323 oracle cases, none a known false negative.
   functions (`Object.defineProperty.bind(…)`) means any member may be there,
   as a getter or as data. A getter installed through such an alias and read
   off a literal, a props object or a ref, in the render, was silent (#366).
+- A spread of a value that may be an object literal or any other object
+  keeps what the literal holds: `{ ...(c ? { f: () => setN(…) } : x) }`
+  handed to code the analysis does not see hands `f` over, where it was
+  silent (#363).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error
