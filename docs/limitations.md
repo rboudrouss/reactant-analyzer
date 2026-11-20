@@ -345,7 +345,7 @@ that writes it (see *Cross-file limits*).
   operand or a callee, and their reflective functions where they are called: any other read
   (`const O = Object`, `const { defineProperty } = Object`, `Object[k]`, `f(Object)`, an export,
   `Object.defineProperty.bind(…)`) makes every member one `Object.prototype` may hold, for
-  accessors too, in the whole program — one `expect.any(Object)` in a test file is enough
+  accessors too, in the whole program — one `register(Object)` in any analysed file is enough
   [#366](https://github.com/rboudrouss/reactant-analyzer/issues/366). Not seen: a library that
   extends `Object.prototype` (as for accessors, #336), and `Object` reached otherwise than by
   those spellings — as `x.constructor` (`({}).constructor` is `Object`), as `globalThis[k]`, or
