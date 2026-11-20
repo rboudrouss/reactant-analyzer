@@ -1575,10 +1575,10 @@ fn exec_callbacks_depth<T: Transfer>(
             // A builtin the value layer does not model is handed the call's
             // receiver as well as its arguments (#330): it may return it, an
             // entry of it or a function calling it (`h.bind(null)`), so what
-            // it holds escapes there ([`ReceiverUse`]).
+            // it holds escapes there ([`receiver_use`]).
             if ran.open
                 && let Expr::FieldAccess { obj, field } = fn_.peel_ts()
-                && ReceiverUse::of(field) == ReceiverUse::Unmodelled
+                && receiver_use(transfer, obj, field, env, ctx) == ReceiverUse::Unmodelled
             {
                 escape_at(
                     transfer,
@@ -2305,10 +2305,43 @@ pub(crate) enum ReceiverUse {
     /// A builtin the value layer does not model: it may return the receiver,
     /// some of its entries or a function calling it, so the receiver escapes.
     Unmodelled,
-    /// No builtin: a method of code the analysis does not see (a prop, a
-    /// library object), handed its arguments only. Not its receiver, though
-    /// that is its `this` (#340).
+    /// A name the table does not know: a builtin where the receiver does not
+    /// hold the method ([`receiver_use`]), else a method of code the
+    /// analysis does not see (a prop, a library object), handed its
+    /// arguments only. Not its receiver, though that is its `this` (#340).
     Unseen,
+}
+
+/// What the method `obj.method` does with its receiver: what
+/// [`ReceiverUse::of`] reads in its name, except that a method some object or
+/// function the heap places `obj` at does not hold as its own is its
+/// prototype's there, a builtin of the language (`[h].valueOf()`), which a
+/// name the table does not know leaves unmodelled (#330).
+fn receiver_use<T: Transfer>(
+    transfer: &T,
+    obj: &Expr,
+    method: &str,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+) -> ReceiverUse {
+    let named = ReceiverUse::of(method);
+    if named != ReceiverUse::Unseen {
+        return named;
+    }
+    let Some(sites) = alloc_literal(transfer, obj, env, ctx) else {
+        return named;
+    };
+    let inherited = sites.ids.iter().any(|id| match ctx.heap.get(*id) {
+        Some(HeapValue::Obj(o)) => {
+            !o.named.contains_key(method) && o.accessors(Accessor::Get, Some(method)).is_empty()
+        }
+        Some(HeapValue::Fn { .. }) => true,
+        None => false,
+    });
+    match inherited {
+        true => ReceiverUse::Unmodelled,
+        false => named,
+    }
 }
 
 impl ReceiverUse {
@@ -2318,6 +2351,7 @@ impl ReceiverUse {
             | "indexOf" | "lastIndexOf" | "includes" | "push" | "unshift" | "join" => {
                 ReceiverUse::Nothing
             }
+            "hasOwnProperty" | "propertyIsEnumerable" | "isPrototypeOf" => ReceiverUse::Nothing,
             "sort" | "reverse" | "fill" | "copyWithin" => ReceiverUse::Itself,
             "at" | "find" | "findLast" | "pop" | "shift" | "get" => ReceiverUse::Entry,
             "concat" | "entries" | "filter" | "flat" | "keys" | "reduce" | "reduceRight"

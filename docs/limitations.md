@@ -64,9 +64,17 @@ that writes it (see *Cross-file limits*).
   unknown time even when the result is never called (a Warning React may not confirm), and a
   write through `bind`, `call` or `apply` is never an Error. Only `at`, `find`, `findLast`, `pop`,
   `shift`, `get` (an entry of the receiver) and `sort`, `reverse`, `fill`, `copyWithin` (the
-  receiver, its positions lost) are read for what they return. The builtins are known by method
-  name; a method of code the analysis does not see (`props.onPick(x)`, a library object's) is
-  handed its arguments only, not the object it is called on. The writer relation reads one
+  receiver, its positions lost) are read for what they return, and `hasOwnProperty`,
+  `propertyIsEnumerable`, `isPrototypeOf` as a boolean. A builtin is known by its method name,
+  or by its receiver: a method an object, an array or a function the analysis places does not
+  hold as its own is its prototype's, so a name the table does not know hands the receiver over
+  as well (`[h].valueOf()`, `h.valueOf()`). The analysis keeps no member of a function, so a
+  method called off one the program wrote it into (`f.cancel = …; f.cancel()`) hands the function
+  over too, and it may run (a Warning React may not confirm). A method of code the analysis does not see
+  (`props.onPick(x)`, a library object's) is handed its arguments only, not the object it is
+  called on. A conversion the language makes implicitly, which runs a `toString` or a `valueOf`
+  the program defines (`` `${o}` ``, `[o].join()`, `+o`), is not followed
+  [#360](https://github.com/rboudrouss/reactant-analyzer/issues/360). The writer relation reads one
   the render hands to such a callee or hook — a literal, or a name bound to one or to a
   `useCallback` value, or one held by an object or array it hands over — as a possible render write
   [#262](https://github.com/rboudrouss/reactant-analyzer/issues/262),
@@ -304,8 +312,10 @@ that writes it (see *Cross-file limits*).
   is sound because a plain call's `this` is `undefined` in a module and the global object in
   sloppy code, and what `call`, `apply`, `bind` or code the analysis does not see hand a function
   as `this` escaped there — except a receiver: a method call the analysis does not resolve to a
-  body (a module function or a static method read as a member, a library's method) hands that
-  code its arguments, not its receiver, so a setter only the receiver holds is not reported
+  body (a module function read as a member, a library's method) hands that code its arguments,
+  not its receiver, so a setter only the receiver holds is not reported (a static method called
+  off a class is: the class holds no member of that name, so the receiver is handed over as to a
+  builtin, #330)
   [#340](https://github.com/rboudrouss/reactant-analyzer/issues/340). Handing it would flood: a
   hook's `useCallback` returned in an object reads as no body through the member. What stays as
   before: a class's instance member keeps the instance as `this` wherever it is called
