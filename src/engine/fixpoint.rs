@@ -247,6 +247,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         let cells = initial_heap.iter().count();
         crate::profile::analysis(comp_id, &comp.name, kind, cells as u64, closures as u64)
     });
+    let expand = crate::profile::phase("expand");
     let ComponentIR {
         file: comp_file,
         name: _,
@@ -692,10 +693,13 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         }
     }
     let state_init = state.clone();
+    drop(expand);
 
     loop {
+        let profile = crate::profile::phase("converge");
         let mut state_store = state.clone();
         let heap_before = heap.clone();
+        drop(profile);
 
         // ── Render pass ───────────────────────────────────────────────────────
         // Use initial_env as entry: child analyses start with props bound.
@@ -896,6 +900,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             state_from_handlers = state_from_handlers.join(&out);
         }
 
+        let _converge = crate::profile::phase("converge");
         // ── Convergence check ─────────────────────────────────────────────────
         let new_state_incycle = state_from_render.join(&state_from_effects);
         // Include cross-component state updates made by child effects/callbacks.
@@ -1123,7 +1128,9 @@ fn compute_relations(
     // program writes, this one's inlined bodies included, is a cell (#224).
     let mut written = crate::engine::render_deps::written_names(result);
     written.extend(program.written.iter().cloned());
+    let render_deps = crate::profile::phase("triggers:render-deps");
     let sources = crate::engine::render_deps::render_deps(result, &written).effect_deps;
+    drop(render_deps);
     let relation = {
         let mut scratch = result.heap.clone();
         crate::engine::triggers::collect_effect_triggers(

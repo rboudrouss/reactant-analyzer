@@ -1596,7 +1596,9 @@ pub(crate) fn collect_slot_writers(
     };
 
     // The syntax tables every walk of the component reads.
+    let profile = crate::profile::phase("writers:tables");
     let tables = WriterTables::of(render_cfg, hooks, hook_provenance, envs.component);
+    drop(profile);
 
     // A write reached through a function name is authored where that function
     // is defined, and a name can carry a closure out of the region it was
@@ -1646,7 +1648,10 @@ pub(crate) fn collect_slot_writers(
             WriterRegion::Effect(l) => Some(envs.component.hook_site(l)),
             _ => None,
         };
+        let profile = crate::profile::phase("writers:sites");
         let (mut sites, store_sites) = tables.write_sites(cfg, calls, cleanup, dispatches);
+        drop(profile);
+        let _rows = crate::profile::phase("writers:rows");
         // One source site is one row. A local helper called twice pulls its
         // inner write in twice, and both copies name the same source span —
         // the same write, not two. They collapse, but their facts join first:
@@ -1761,6 +1766,7 @@ pub(crate) fn collect_slot_writers(
             // a value that may be something else may write none: the walk
             // placed a site only where the relation is sure of its one slot.
             let block = at.map(|(b, _)| b);
+            let classify = crate::profile::phase("writers:classify");
             let mut written = match reducers.get(target_owner, slot) {
                 Some(reducer) => written::dispatched(&reducer),
                 None if site.applied => written::carried(),
@@ -1777,6 +1783,7 @@ pub(crate) fn collect_slot_writers(
             if written.expr.as_ref().is_some_and(reads_hidden) {
                 written.expr = None;
             }
+            drop(classify);
             let setter = row_name(calls, site.slot, site.var);
             out.push(SlotWriter {
                 slot,

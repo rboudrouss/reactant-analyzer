@@ -344,7 +344,7 @@ impl Members {
 /// heap of one program ([`Heap::with_defined`]). A read or a write of such a
 /// name on an object no site places, or of a member a placed object does not
 /// hold (its prototype's), may run one ([`Heap::unseen_accessor`]).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct Heap {
     cells: HashMap<ExprId, HeapValue>,
     escaped: BTreeSet<ExprId>,
@@ -355,6 +355,22 @@ pub struct Heap {
     /// write runs one, which [`Heap::has_accessors`] lets a caller skip.
     accessors: bool,
     defined: std::sync::Arc<AccessorNames>,
+}
+
+impl Clone for Heap {
+    fn clone(&self) -> Self {
+        let _profile = crate::profile::phase("heap:clone");
+        crate::profile::count("heap:clone cells", self.cells.len() as u64);
+        Heap {
+            cells: self.cells.clone(),
+            escaped: self.escaped.clone(),
+            assigned: self.assigned.clone(),
+            written: self.written.clone(),
+            returned: self.returned.clone(),
+            accessors: self.accessors,
+            defined: self.defined.clone(),
+        }
+    }
 }
 
 /// What a conversion of objects to a primitive consults ([`Heap::conversion`]).
@@ -897,6 +913,7 @@ impl Heap {
     /// an object prop (`api={{ tick: cb }}`) is as callable as one passed
     /// directly (#216), and so is one a closure prop calls (#254).
     pub fn reachable(&self, roots: impl IntoIterator<Item = ExprId>) -> Heap {
+        let _profile = crate::profile::phase("heap:reachable");
         let mut out = Heap::new();
         let mut stack: Vec<ExprId> = roots.into_iter().collect();
         while let Some(id) = stack.pop() {
@@ -989,6 +1006,11 @@ impl Heap {
     }
 
     fn merge(&self, other: &Self, widen: bool) -> Self {
+        let _profile = crate::profile::phase("heap:join");
+        crate::profile::count(
+            "heap:join cells",
+            (self.cells.len() + other.cells.len()) as u64,
+        );
         let mut result = self.cells.clone();
         for (id, val) in &other.cells {
             match result.get(id) {
@@ -1106,6 +1128,8 @@ impl Heap {
     /// captures and an object's members each below the other's, and every
     /// escaped site of `self` escaped in `other`.
     pub fn leq(&self, other: &Self) -> bool {
+        let _profile = crate::profile::phase("heap:leq");
+        crate::profile::count("heap:leq cells", self.cells.len() as u64);
         self.escaped.is_subset(&other.escaped)
             && self
                 .cells
