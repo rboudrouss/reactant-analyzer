@@ -107,6 +107,12 @@ on a program React settles; 323 oracle cases, none a known false negative.
   one side writes one, and a join or an order test visits only the cells two
   heaps do not share (ADR-045); mantine 252 s → 184 s, `@mantine/form`
   16.6 s → 14.5 s, findings unchanged.
+- Faster where a parent's closure that reads the parent's props escapes in a
+  child: it runs once in the parent, no longer in each analysis of the child,
+  since a props object belongs to the child it is the input of (ADR-049);
+  closures run in a child that does not own them: mantine 527 → 162 (time
+  unchanged), twenty 4.8 M → 6 k in the prototype (body runs 46.1 M →
+  8.3 M); findings unchanged.
 - `always-unstable-deps` also reports a dep that is a new reference at every
   render where it holds an object and a primitive otherwise
   (`items?.filter(f)`, `items && items.map(f)`, `c ? [x] : undefined`), with

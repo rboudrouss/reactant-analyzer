@@ -2520,9 +2520,13 @@ fn run_escaped_rounds<T: Transfer>(
 /// closure (it escapes only under a later, larger join of C's input, or P is
 /// a probe's caller) is not trusted to.
 ///
-/// Soundness. Write f for the closure.
+/// Soundness (ADR-049). Write f for the closure.
 /// - What f does to C: nothing, by the walk. A name f did not capture is not
-///   in its scope ([`closure_env`]), so C's bindings are not either.
+///   in its scope ([`closure_env`]), so C's bindings are not either. A props
+///   object is the site of the child it is the input of
+///   ([`crate::domains::InterCtx::site_owner`]): C's own counts as C's,
+///   another component's is that component's object, whose members the walk
+///   follows in C's heap, where C's writes into it are.
 /// - What f does to P and everything else it reaches: P's run is above the
 ///   run here. Same body, every parameter ⊤ in both, its captures joined
 ///   with P's live values over P's converged stores where the run here had
@@ -2543,7 +2547,11 @@ fn runs_in_owner<D: AbstractDomain>(id: ExprId, ctx: &AnalysisCtx<D>) -> bool {
     let Some(HeapValue::Fn { owner, .. }) = ctx.heap.get(id) else {
         return false;
     };
-    if *owner == ctx.component || ctx.heap.may_touch(id, ctx.component) {
+    if *owner == ctx.component {
+        return false;
+    }
+    let site_owner = |s: ExprId| inter.site_owner(s);
+    if ctx.heap.may_touch(id, ctx.component, site_owner) {
         return false;
     }
     let mut handed = inter.handed.borrow_mut();

@@ -996,12 +996,19 @@ impl Heap {
 
     /// Whether a run of the closure at `closure` may read or write something
     /// of `component`, through what it captured and the members of the
-    /// objects on the way ([`Heap::reachable`]'s walk): a site of its range, a
-    /// closure it owns, one of its setters, or a site no component's range
-    /// holds — a props object, which the walk cannot attribute, so it counts.
-    /// A name the closure did not capture is not its own, so the caller's
-    /// scope is not among what it reaches.
-    pub fn may_touch(&self, closure: ExprId, component: ComponentId) -> bool {
+    /// objects on the way ([`Heap::reachable`]'s walk): a site `site_owner`
+    /// gives to `component` (one of its range, or its own props object), a
+    /// closure it owns, one of its setters, or a site `site_owner` gives to
+    /// no one, which counts. Another component's site, its props object
+    /// among them, is not `component`'s: the walk goes on through its members
+    /// (ADR-049). A name the closure did not capture is not its own, so the
+    /// caller's scope is not among what it reaches.
+    pub fn may_touch(
+        &self,
+        closure: ExprId,
+        component: ComponentId,
+        site_owner: impl Fn(ExprId) -> Option<ComponentId>,
+    ) -> bool {
         let own = |v: &StateValue| v.setters().iter().any(|(o, _)| *o == component);
         let mut stack = vec![closure];
         let mut seen = BTreeSet::new();
@@ -1009,7 +1016,7 @@ impl Heap {
             if !seen.insert(id) {
                 continue;
             }
-            match ComponentId::site_owner(id) {
+            match site_owner(id) {
                 Some(owner) if owner != component => {}
                 _ => return true,
             }
@@ -1438,23 +1445,50 @@ mod tests {
     }
 
     #[test]
-    fn a_closure_touches_a_component_through_its_sites_setters_and_unowned_sites() {
+    fn a_closure_touches_a_component_through_its_sites_setters_and_props_object() {
         use crate::test_support::cid;
         let (parent, child) = (cid(0), cid(1));
         let located =
             |id: u64| EnvVal::located(Some(Sites::closed([ExprId(id)])), StateValue::top());
+        let (parent_props, child_props, unowned) =
+            (ExprId::fresh(), ExprId::fresh(), ExprId::fresh());
+        let site_owner = |id: ExprId| {
+            ComponentId::site_owner(id)
+                .or((id == parent_props).then_some(parent))
+                .or((id == child_props).then_some(child))
+        };
         // Only the parent's own: nothing of the child.
         let (h, f) = parent_closure(parent, EnvVal::Val(StateValue::top()));
-        assert!(!h.may_touch(f, child));
+        assert!(!h.may_touch(f, child, site_owner));
         // A site of the child's range.
         let (h, f) = parent_closure(parent, located(child.site_base() + 3));
-        assert!(h.may_touch(f, child));
+        assert!(h.may_touch(f, child, site_owner));
         // A setter of the child.
         let (h, f) = parent_closure(parent, EnvVal::Val(StateValue::component_setter(child, 0)));
-        assert!(h.may_touch(f, child));
-        // A site no range holds (a props object): not attributable, counted.
-        let (h, f) = parent_closure(parent, located(ExprId::fresh().0));
-        assert!(h.may_touch(f, child));
+        assert!(h.may_touch(f, child, site_owner));
+        // The child's props object.
+        let (h, f) = parent_closure(parent, located(child_props.0));
+        assert!(h.may_touch(f, child, site_owner));
+        // The parent's props object: the parent's, and nothing of the child
+        // through its members.
+        let (mut h, f) = parent_closure(parent, located(parent_props.0));
+        h.insert(
+            parent_props,
+            HeapValue::Obj(Members::exactly(HashMap::new())),
+        );
+        assert!(!h.may_touch(f, child, site_owner));
+        // … unless a member holds something of the child.
+        h.insert(
+            parent_props,
+            HeapValue::Obj(Members::exactly(HashMap::from([(
+                "on".to_string(),
+                EnvVal::Val(StateValue::component_setter(child, 0)),
+            )]))),
+        );
+        assert!(h.may_touch(f, child, site_owner));
+        // A site no one owns: counted.
+        let (h, f) = parent_closure(parent, located(unowned.0));
+        assert!(h.may_touch(f, child, site_owner));
     }
 
     #[test]
