@@ -848,12 +848,13 @@ fn run_conversion<T: Transfer>(
             ));
         }
         Converted::Props(_) => {
-            if let Some(props) = members_of::<T::Domain>(&sites, None, ctx) {
-                if let Some(inner) = props.sites() {
+            let props = members_of::<T::Domain>(&sites, None, ctx);
+            for prop in &props {
+                if let Some(inner) = prop.sites() {
                     work.extend(members_of(inner, None, ctx));
                 }
-                work.push(props);
             }
+            work.extend(props);
         }
         Converted::Key(_) => work.extend(members_of(&sites, Some("key"), ctx)),
         Converted::Entries(_) => {
@@ -966,21 +967,23 @@ fn lift<D: AbstractDomain>(value: EnvVal<StateValue>) -> EnvVal<D> {
 }
 
 /// What `member` of the objects at `sites` may be (`None`: any member), as
-/// one value of the domain `D` ([`Heap::members`]); `None` when nothing is
-/// there.
+/// values of the domain `D`, as React receives them from a spread of them
+/// ([`Heap::spread_members`]): one per entry, since React DOM converts each
+/// prop on its own — a prop's object handed to code the analysis does not
+/// see hands over what that object reaches, not what its sibling props do.
 ///
-/// [`Heap::members`]: crate::domains::stores::Heap::members
+/// [`Heap::spread_members`]: crate::domains::stores::Heap::spread_members
 fn members_of<D: AbstractDomain>(
     sites: &Sites,
     member: Option<&str>,
     ctx: &AnalysisCtx<D>,
-) -> Option<EnvVal<D>> {
-    let (values, _) = ctx.heap.members(sites, member);
-    values
+) -> Vec<EnvVal<D>> {
+    ctx.heap
+        .spread_members(sites, member)
         .into_iter()
         .cloned()
-        .reduce(|a, b| a.join(&b))
         .map(lift)
+        .collect()
 }
 
 /// Fire the side effects of an expression evaluated in *effect position* — a
