@@ -486,8 +486,7 @@ on a program React settles; 323 oracle cases, none a known false negative.
   its closure is the hook's body, its own hooks named as its file names them,
   an argument a `const` primitive of the binding's file (any other name is
   any value there). A loop in it, silent behind an `analysis-limit` Info, is
-  reported. A factory returning one of several closures still leaves the hook
-  unseen (#344).
+  reported (#344).
 - A value written into an object the analysis does not place — the global
   object (`globalThis.set = setN`, `window.x = f`, a name bound to it), a
   parameter's member, what a call it does not run returns — is handed to code
@@ -605,6 +604,13 @@ on a program React settles; 323 oracle cases, none a known false negative.
   holds where the sides meet, whichever side binds it: the effect's write was
   lost when the binding side came second, and its loop was silent (found with
   #344).
+- A hook value whose function may return one of several closures (`if
+  (debug) return () => 0; return () => { useState… }`, or `debug ? a : b`),
+  in the same file or another, runs the one the program picks at module
+  time: every closure is analysed, a loop in one, silent behind an
+  `analysis-limit` Info, is reported, and its hooks are not
+  `conditional-hook`s, since every render of a run calls the same closure
+  (a condition inside the closure still is one) (#344).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

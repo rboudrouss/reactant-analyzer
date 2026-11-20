@@ -150,3 +150,61 @@ fn a_factory_of_another_file_builds_the_hook_too() {
         );
     }
 }
+
+/// #344: a factory returning one of several closures builds a body that runs
+/// the one picked at module time: a loop in any of them is found, a closure
+/// that settles stays silent, and no hook of a closure is conditional, since
+/// every render of a run calls the same closure.
+#[test]
+fn a_factory_returning_one_of_several_closures_builds_the_hook() {
+    for case in [
+        "hook-value-two-closures-loops",
+        "hook-value-two-closures-first-loops",
+        "hook-value-two-closures-ternary-both-loops",
+        "hook-value-imported-two-closures-loops",
+    ] {
+        let found = findings(case);
+        assert!(
+            found.iter().any(|f| f.starts_with("infinite-loop:")),
+            "{case}: {found:?}"
+        );
+        assert!(
+            !found.iter().any(|f| f.starts_with("conditional-hook:")),
+            "{case}: {found:?}"
+        );
+    }
+    // React settles. A closure's own names read ⊤ where the other closure's
+    // side meets it, so the guard is not proven: a possible loop, never a
+    // certain one.
+    let found = findings("hook-value-two-closures-settles");
+    assert!(
+        !found
+            .iter()
+            .any(|f| f == "infinite-loop:error" || f.starts_with("conditional-hook:")),
+        "{found:?}"
+    );
+}
+
+/// #344: a hook under a condition inside one of the closures stays a
+/// conditional hook, an Error at that hook alone.
+#[test]
+fn a_hook_under_a_condition_inside_a_chosen_closure_is_still_conditional() {
+    let out = reactant(std::path::Path::new(
+        "tests/fixtures/hook_value_choice/guarded",
+    ));
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("JSON");
+    let conditional: Vec<(String, u64)> = doc["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|d| d["rule"].as_str() == Some("conditional-hook"))
+        .map(|d| {
+            (
+                d["severity"].as_str().unwrap().to_string(),
+                d["line"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(conditional, [("error".to_string(), 15)], "{doc:#}");
+}
