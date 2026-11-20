@@ -472,7 +472,8 @@ on a program React settles; 323 oracle cases, none a known false negative.
   hook call reads is never a local of the calling component, as a name its
   body reads already was: a loop the hook's own reducer, or the value it
   hands the hook it calls, drives is reported where a homonym of the
-  component hid it (#356).
+  component hid it, and a module `const` of the hook's file it hands on is
+  that `const`, not any value: no `missing-deps` for it (#356).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error
