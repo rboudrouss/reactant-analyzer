@@ -208,3 +208,58 @@ fn a_hook_under_a_condition_inside_a_chosen_closure_is_still_conditional() {
         .collect();
     assert_eq!(conditional, [("error".to_string(), 15)], "{doc:#}");
 }
+
+/// #383: a factory handing back another program call's value, or a program
+/// function by name, builds the hook from what that call or function is — a
+/// loop in it is found, through a chain of calls and across files, and a
+/// closure that settles stays silent; one under a choice of candidates is a
+/// possible loop, one alone a certain one.
+#[test]
+fn a_factory_returning_another_call_s_value_builds_the_hook() {
+    for (case, level) in [
+        ("hook-value-factory-returns-call-loops", "warning"),
+        ("hook-value-factory-returns-function-loops", "warning"),
+        ("hook-value-factory-returns-imported-call-loops", "error"),
+        ("hook-value-factory-call-chain-loops", "error"),
+        ("hook-value-closure-calls-homonym-hook-loops", "warning"),
+    ] {
+        let found = findings(case);
+        assert!(
+            found.contains(&format!("infinite-loop:{level}")),
+            "{case}: {found:?}"
+        );
+        assert!(
+            !found.iter().any(|f| f.starts_with("conditional-hook:")),
+            "{case}: {found:?}"
+        );
+    }
+    for case in [
+        "hook-value-factory-returns-call-settles",
+        "hook-value-factory-returns-function-settles",
+        "hook-value-factory-returns-imported-call-settles",
+        "hook-value-factory-call-chain-settles",
+        "hook-value-factory-calls-parameter-settles",
+    ] {
+        let found = findings(case);
+        assert!(
+            !found.iter().any(|f| f.starts_with("infinite-loop:")),
+            "{case}: {found:?}"
+        );
+    }
+}
+
+/// A hook read through a type assertion, and a hook wrapping another file's
+/// hook of its own name, are hooks the analysis reads (#383).
+#[test]
+fn a_hook_behind_an_assertion_or_a_homonym_is_read() {
+    for case in [
+        "hook-bound-through-type-assertion-loops",
+        "cross-file-hook-wraps-homonym-loops",
+    ] {
+        let found = findings(case);
+        assert!(
+            found.iter().any(|f| f.starts_with("infinite-loop:")),
+            "{case}: {found:?}"
+        );
+    }
+}
