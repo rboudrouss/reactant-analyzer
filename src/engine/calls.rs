@@ -326,11 +326,13 @@ impl CallRelation {
         self.writes_in(site, memo, &mut Vec::new()).0
     }
 
-    /// [`Self::writes_of`], with the bodies being computed on `stack`. A
-    /// body met again on the stack answers nothing yet, and every body above
-    /// it is then partial until that one completes: an answer is kept only
-    /// once every cycle it touched is closed (the second component: the
-    /// lowest stack index touched, `usize::MAX` for none).
+    /// [`Self::writes_of`], with the bodies being computed on `stack`, a
+    /// Tarjan stack: a body stays there until the cycle it is in completes. A
+    /// body met again there answers nothing yet, and every body above it is
+    /// then partial until that one completes (the second component: the
+    /// lowest stack index touched, `usize::MAX` for none). The bodies of one
+    /// cycle each reach the others, so they write the same slots: the answer
+    /// of the first of them, once complete, is every one's, kept for each.
     fn writes_in(
         &self,
         site: ExprId,
@@ -405,9 +407,10 @@ impl CallRelation {
             out.extend(w);
             low = low.min(l);
         }
-        stack.pop();
         if low >= me {
-            memo.insert(site, out.clone());
+            for member in stack.drain(me..) {
+                memo.insert(member, out.clone());
+            }
             (out, usize::MAX)
         } else {
             (out, low)

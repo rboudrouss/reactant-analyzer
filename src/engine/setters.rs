@@ -3301,6 +3301,10 @@ impl<'a> SetterWalk<'a> {
         stmt_span: Option<SourceRange>,
     ) {
         let calls = self.calls;
+        // Code the analysis does not see runs what it is handed, so no path
+        // through those bodies is placed: what they write is read off the
+        // relation ([`Self::past_budget`]), never walked, a cost each level
+        // of such bodies would otherwise multiply.
         if let Some(handed) = calls.handed(at) {
             self.handed_row(
                 handed,
@@ -3308,7 +3312,7 @@ impl<'a> SetterWalk<'a> {
                 via,
                 WalkClass::Unknown,
                 None,
-                depth,
+                0,
                 found,
                 prov,
                 stmt_span,
