@@ -571,6 +571,12 @@ on a program React settles; 323 oracle cases, none a known false negative.
   title={o}>`, `<div style={{ width: o }}>` and `<Item key={o} />` with an
   `o` whose `toString` writes state were silent; they are a
   `setter-in-render` Warning (#371).
+- An accessor the analysis does not see, run at a read or a conversion, may
+  be module code, which may call what any module binding holds: a getter a
+  module installs on `Object.prototype` that calls a closure the render
+  stores in a module binding, read or converted off a literal in the render,
+  was silent unless the literal itself was read off a module binding; it is
+  a `setter-in-render` Warning (#372).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

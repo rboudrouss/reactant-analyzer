@@ -693,13 +693,14 @@ fn run_accessors<T: Transfer>(
     accessors.sort();
     // The read is a call of the accessors it runs, anchored where it is
     // (#337): their bodies run in this statement's region and phase, and
-    // an accessor the analysis does not see — module code included, when
-    // the receiver is read off a module binding — may run here.
+    // an accessor the analysis does not see may run here — module code
+    // included, a descriptor a module installs at load, which may call what
+    // a module binding holds (#372).
     if unseen || !accessors.is_empty() {
         let eval = crate::engine::calls::Evaluation {
             bodies: accessors.iter().copied().collect(),
             open: unseen,
-            module: unseen && reads_module(obj, ctx),
+            module: unseen,
             escaped: ctx.escaped,
             ..Default::default()
         };
@@ -849,6 +850,7 @@ fn run_conversion<T: Transfer>(
     let mut seen: HashSet<ExprId> = HashSet::new();
     let mut bodies: BTreeSet<ExprId> = BTreeSet::new();
     let mut open = false;
+    let mut module = false;
     while let Some(receiver) = work.pop() {
         let Some(sites) = receiver.sites().cloned() else {
             continue;
@@ -859,7 +861,9 @@ fn run_conversion<T: Transfer>(
         seen.extend(sites.ids.iter().copied());
         let found = ctx.heap.conversion(&sites);
         let holders = Sites::closed(found.holders.iter().copied());
-        let mut handed = found.handed;
+        // Code the heap does not place may run: a prototype's member, an
+        // accessor of the program it does not see (#334).
+        let mut unplaced = found.handed;
         for member in TO_PRIMITIVE {
             if ctx.heap.has_accessors() {
                 let mut getters: Vec<ExprId> = ctx
@@ -874,7 +878,7 @@ fn run_conversion<T: Transfer>(
                     bodies.insert(site);
                     run_accessor(transfer, site, &[], &receiver, env, ctx, depth);
                 }
-                handed |= ctx.heap.members(&sites, Some(member)).1
+                unplaced |= ctx.heap.members(&sites, Some(member)).1
                     && ctx
                         .heap
                         .unseen_accessor(Some(&sites), AccessKey::Named(member));
@@ -888,6 +892,7 @@ fn run_conversion<T: Transfer>(
             .collect();
         methods.sort();
         methods.dedup();
+        let mut handed = unplaced;
         if !methods.is_empty() {
             // Past the inlining budget the methods are listed, not run, and
             // one that reads its receiver runs later with `this` unknown.
@@ -912,15 +917,19 @@ fn run_conversion<T: Transfer>(
             hand_at_access(Some(&sites), Vec::new(), module, ctx);
         }
         open |= handed;
+        module |= unplaced;
         if let Some(entries) = found.entries {
             work.push(lift(entries));
         }
     }
     if open || !bodies.is_empty() {
+        // That code may be module code, which may call what a module binding
+        // holds (#372), as may a body the operand read off a module binding
+        // is handed to.
         let eval = crate::engine::calls::Evaluation {
             bodies,
             open,
-            module: open && reads_module(operand, ctx),
+            module: module || (open && reads_module(operand, ctx)),
             escaped: ctx.escaped,
             ..Default::default()
         };
