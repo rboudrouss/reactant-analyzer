@@ -12,6 +12,61 @@ use crate::ir::ModuleFacts;
 use crate::ir::module::{AccessorNames, ReExports, ValueRef};
 use crate::resolver::ImportResolver;
 
+/// A binding whose value is one of React's wrappers around a name (#64):
+/// `const X = memo(Y)` and `export default forwardRef(Y)` render `Y`, so `X`
+/// (the default) stands for `Y` as `export { Y as X }` makes it — the
+/// definition of this file, or the one an import resolves `Y` to. A `Y` the
+/// file neither declares nor imports from a program file gives no edge: the
+/// element stays unseen. Through a `forwardRef`, `Y`'s second parameter is
+/// what its lowering left it, ⊤: `Y` may also be rendered on its own, where
+/// React passes `undefined`.
+fn wrapper_aliases(
+    program: &Program,
+    file: &Path,
+    bindings: &HashMap<String, super::ResolvedImport>,
+    out: &mut Vec<(String, PathBuf, String)>,
+) {
+    let wrappers = super::react_wrappers::ReactWrappers::of(program);
+    let declared: HashSet<String> = super::top_level_binding_names(program)
+        .into_iter()
+        .collect();
+    let target = |e: &Expression| -> Option<(PathBuf, String)> {
+        let Expression::Identifier(id) = wrappers.peel(e)?.inner else {
+            return None;
+        };
+        let name = id.name.as_str();
+        match declared.contains(name) {
+            true => Some((file.to_path_buf(), name.to_string())),
+            false => bindings
+                .get(name)
+                .map(|r| (r.file.clone(), r.imported.clone())),
+        }
+    };
+    for stmt in &program.body {
+        let decl = match stmt {
+            Statement::VariableDeclaration(d) => d,
+            Statement::ExportNamedDeclaration(exp) => match &exp.declaration {
+                Some(Declaration::VariableDeclaration(d)) => d,
+                _ => continue,
+            },
+            Statement::ExportDefaultDeclaration(exp) => {
+                if let Some((from, name)) = exp.declaration.as_expression().and_then(target) {
+                    out.push(("default".to_string(), from, name));
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        for vd in &decl.declarations {
+            if let BindingPattern::BindingIdentifier(id) = &vd.id
+                && let Some((from, name)) = vd.init.as_ref().and_then(target)
+            {
+                out.push((id.name.to_string(), from, name));
+            }
+        }
+    }
+}
+
 /// Read `file`'s directive prologue and its resolved module edges.
 ///
 /// Edges are **value** imports only: `import type { T } from "./t"` is erased
@@ -94,7 +149,10 @@ pub fn collect_module_facts(
             _ => {}
         }
     }
-    if !re_exports.star.is_empty() {
+    wrapper_aliases(program, file, &bindings, &mut re_exports.named);
+    // A name the module declares is its own: never a star target's, and
+    // never its default, which a default import asks for under any name.
+    if !re_exports.star.is_empty() || re_exports.named.iter().any(|(e, _, _)| e == "default") {
         re_exports.declared = super::top_level_binding_names(program)
             .into_iter()
             .collect();
@@ -974,6 +1032,38 @@ mod tests {
             "a namespace re-export is not a star"
         );
         assert!(r.declared.contains("local"));
+    }
+
+    /// A React wrapper around a name stands for that name (#64): the file's
+    /// own definition, or the one its import resolves; a package's name and
+    /// a function literal give no edge. A forwarded default records the
+    /// module's own names, which are never its default.
+    #[test]
+    fn a_wrapper_of_a_name_is_a_re_export_of_it() {
+        let f = facts_of(
+            r#"
+            import { memo, forwardRef } from "react";
+            import { Row } from "./row";
+            import { Pkg } from "some-package";
+            function Cell() { return null; }
+            export const MemoCell = memo(Cell);
+            const MemoRow = memo(forwardRef(Row));
+            const MemoPkg = memo(Pkg);
+            const Inline = memo(() => null);
+            export default memo(Row);
+        "#,
+        );
+        let r = &f.re_exports;
+        let at = |n: &str| PathBuf::from(format!("/root/{n}.tsx"));
+        assert_eq!(
+            r.named,
+            vec![
+                ("MemoCell".to_string(), at("a"), "Cell".to_string()),
+                ("MemoRow".to_string(), at("row"), "Row".to_string()),
+                ("default".to_string(), at("row"), "Row".to_string()),
+            ]
+        );
+        assert!(r.declared.contains("Cell") && r.declared.contains("MemoPkg"));
     }
 
     #[test]

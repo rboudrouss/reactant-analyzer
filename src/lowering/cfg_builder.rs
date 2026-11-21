@@ -1176,9 +1176,16 @@ fn lower_binding_pattern(
 /// body read `arguments` (`own_arguments`) binds it first, to the array of
 /// every argument: an arrow reads its enclosing function's. `own_arguments`
 /// is the body of a function that binds its own, `None` for an arrow.
+///
+/// `forward_ref`: React calls the function as `forwardRef`'s render (#64),
+/// `render(props, ref)`, whatever the element's argument list: the second
+/// parameter is bound to the first's `ref` member, `null` when it is
+/// `undefined` (react-dom 19.3.1 `coerceRef`), before its own default — which
+/// therefore never applies.
 pub(super) fn inject_param_preamble(
     params: &FormalParameters,
     own_arguments: Option<&FunctionBody>,
+    forward_ref: bool,
     builder: &mut BlockBuilder,
 ) -> Vec<String> {
     if let Some(body) = own_arguments
@@ -1201,6 +1208,21 @@ pub(super) fn inject_param_preamble(
             _ => format!("__p{}", i),
         };
         names.push(name.clone());
+        if forward_ref && i == 1 {
+            // At the parameter, like any statement: a row about the read is
+            // located, and no relation keyed by position confuses it with
+            // another body's.
+            let span = builder.span_at(p.span.start);
+            builder.push_stmt(Stmt::Let {
+                var: name.clone(),
+                rhs: Expr::FieldAccess {
+                    obj: Box::new(Expr::Var(names[0].clone())),
+                    field: "ref".to_string(),
+                },
+                span,
+            });
+            lower_default_with(&name, span, true, builder, |_| Expr::Lit(Prim::Null));
+        }
         if let Some(init) = p.initializer.as_deref() {
             lower_default(&name, init, true, builder);
         }
@@ -1254,6 +1276,18 @@ pub(super) fn lower_default(
     builder: &mut BlockBuilder,
 ) {
     let span = builder.span_at(init.span().start);
+    lower_default_with(source, span, store, builder, |b| lower_expr(init, b));
+}
+
+/// [`lower_default`] with the default's value lowered by `value`, in the
+/// block that runs it.
+fn lower_default_with(
+    source: &str,
+    span: Option<crate::ir::SourceRange>,
+    store: bool,
+    builder: &mut BlockBuilder,
+    value: impl FnOnce(&mut BlockBuilder) -> Expr,
+) {
     let then_ = builder.new_block();
     let join = builder.new_block();
     let test = builder.seal_with(Terminator::Branch {
@@ -1270,7 +1304,7 @@ pub(super) fn lower_default(
     builder.add_edge(test, then_, EdgeKind::IfTrue);
     builder.add_edge(test, join, EdgeKind::IfFalse);
     builder.start_block(then_);
-    let value = lower_expr(init, builder);
+    let value = value(builder);
     builder.push_stmt(match store {
         true => Stmt::Assign {
             var: source.to_string(),
@@ -1412,7 +1446,40 @@ pub fn build_fn_body_cfg(
     arrow: bool,
     ctx: &LowerCtx,
 ) -> (Vec<String>, CFG) {
-    build_body_cfg(params, body, kind, arrow, &ctx.nested(arrow))
+    build_body_cfg(params, body, kind, arrow, false, &ctx.nested(arrow))
+}
+
+/// How a top-level function's body is lowered ([`build_candidate_cfg`]).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct BodyShape {
+    /// A concise arrow (`x => expr`).
+    pub expression: bool,
+    /// An arrow, which binds no `arguments` or `this` of its own.
+    pub arrow: bool,
+    /// What a call of it evaluates to.
+    pub kind: FnKind,
+    /// React calls it as `forwardRef`'s render ([`inject_param_preamble`]).
+    pub forward_ref: bool,
+}
+
+/// A detector's function ([`Candidate`](super::Candidate)) lowered to its
+/// CFG.
+pub(super) fn build_candidate_cfg(
+    params: &FormalParameters,
+    body: &FunctionBody,
+    shape: BodyShape,
+    ctx: &LowerCtx,
+) -> (Vec<String>, CFG) {
+    let BodyShape {
+        expression,
+        arrow,
+        kind,
+        forward_ref,
+    } = shape;
+    match expression {
+        true => expr_body_cfg(params, body, kind, forward_ref, &ctx.nested(true)),
+        false => build_body_cfg(params, body, kind, arrow, forward_ref, &ctx.nested(arrow)),
+    }
 }
 
 /// [`build_fn_body_cfg`] for a class's instance method or accessor (#335):
@@ -1423,7 +1490,7 @@ pub(super) fn build_member_body_cfg(
     kind: FnKind,
     ctx: &LowerCtx,
 ) -> (Vec<String>, CFG) {
-    build_body_cfg(params, body, kind, false, ctx)
+    build_body_cfg(params, body, kind, false, false, ctx)
 }
 
 /// A function body under `ctx`. A non-arrow function binds its own
@@ -1439,6 +1506,7 @@ fn build_body_cfg(
     body: &FunctionBody,
     kind: FnKind,
     arrow: bool,
+    forward_ref: bool,
     ctx: &LowerCtx,
 ) -> (Vec<String>, CFG) {
     let mut builder = BlockBuilder::new(ctx);
@@ -1450,7 +1518,8 @@ fn build_body_cfg(
             span: None,
         });
     }
-    let param_names = inject_param_preamble(params, (!arrow).then_some(body), &mut builder);
+    let param_names =
+        inject_param_preamble(params, (!arrow).then_some(body), forward_ref, &mut builder);
     if kind == FnKind::Generator {
         builder.may_stop();
     }
@@ -1481,7 +1550,7 @@ pub(super) fn build_construct_cfg(
     builder.start_block(0);
     let body = ctor.and_then(|f| f.body.as_deref());
     let params = match (ctor, body) {
-        (Some(f), Some(body)) => inject_param_preamble(&f.params, Some(body), &mut builder),
+        (Some(f), Some(body)) => inject_param_preamble(&f.params, Some(body), false, &mut builder),
         _ => Vec::new(),
     };
     builder.push_stmt(Stmt::Let {
@@ -1626,10 +1695,20 @@ pub fn build_expr_fn_body_cfg(
     kind: FnKind,
     ctx: &LowerCtx,
 ) -> (Vec<String>, CFG) {
-    let ctx = &ctx.nested(true);
+    expr_body_cfg(params, body, kind, false, &ctx.nested(true))
+}
+
+/// A concise arrow's body under `ctx`.
+fn expr_body_cfg(
+    params: &FormalParameters,
+    body: &FunctionBody,
+    kind: FnKind,
+    forward_ref: bool,
+    ctx: &LowerCtx,
+) -> (Vec<String>, CFG) {
     let mut builder = BlockBuilder::new(ctx);
     builder.start_block(0);
-    let param_names = inject_param_preamble(params, None, &mut builder);
+    let param_names = inject_param_preamble(params, None, forward_ref, &mut builder);
     if let Some(Statement::ExpressionStatement(es)) = body.statements.first() {
         let expr = lower_expr(&es.expression, &mut builder);
         if !builder.is_terminated() {

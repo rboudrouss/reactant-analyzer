@@ -9,7 +9,7 @@ pub type HookCandidate<'a> = Candidate<'a>;
 /// Detect all user-defined custom hook functions (`use*`) in `program`.
 /// Excludes React built-in hooks.
 pub fn detect_custom_hooks<'a>(program: &'a Program<'a>) -> Vec<HookCandidate<'a>> {
-    detector::detect_fns(program, classify, Some(default))
+    detector::detect_fns(program, classify, Some(default), None)
 }
 
 /// A function is a custom hook iff its name follows the hook convention. The
@@ -24,10 +24,11 @@ fn classify(item: &FnItem) -> bool {
 fn default<'a>(
     exp: &'a ExportDefaultDeclaration<'a>,
     classify: Classify,
+    _: Option<&super::react_wrappers::ReactWrappers>,
     out: &mut Vec<Candidate<'a>>,
 ) {
     if let ExportDefaultDeclarationKind::FunctionDeclaration(func) = &exp.declaration {
-        detector::consider_fn(func, None, None, classify, out);
+        detector::consider_fn(func, None, None, None, classify, out);
     }
 }
 

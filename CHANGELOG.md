@@ -655,6 +655,18 @@ on a program React settles; 323 oracle cases, none a known false negative.
   timing. Cost on 11 small repositories and mantine: 1,353 → 3,005 rows, all
   Warnings, most on closures that package components call on events only
   (#325).
+- A component written inside React's `memo(…)` or `forwardRef(…)` (nested
+  ones too, `memo(forwardRef(…))`) is analysed: it was no component, so
+  every rule was silent on its body, and a parent rendering it saw an unseen
+  child whose props ran at an unknown time. `forwardRef`'s second parameter
+  is the element's `ref`; `const X = memo(Y)` and `export default
+  forwardRef(Y)` stand for `Y`, defined in the file or imported. Only
+  React's own `memo` / `forwardRef` count; other higher-order components
+  (`styled`, a library's `factory`) stay unseen. On 11 small repositories
+  and mantine: 483 more components analysed, 3,005 → 3,177 rows, all
+  Warnings (−239: a prop the now-seen child calls from an event; +411: the
+  new components' own findings, and closures they forward to a package's
+  component) (#64, #394).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

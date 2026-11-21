@@ -20,7 +20,7 @@ pub type UtilityCandidate<'a> = Candidate<'a>;
 /// (by React convention) a component, never a utility, so there is nothing to
 /// classify here.
 pub fn detect_utilities<'a>(program: &'a Program<'a>) -> Vec<UtilityCandidate<'a>> {
-    detector::detect_fns(program, classify, None)
+    detector::detect_fns(program, classify, None, None)
 }
 
 /// A function is a utility iff its name is neither a hook nor a component and
