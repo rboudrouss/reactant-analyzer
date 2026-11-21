@@ -60,6 +60,15 @@ on a program React settles; 323 oracle cases, none a known false negative.
   (names). First member, `plainObjectsRunNoAccessor`: no accessor sits on `Object.prototype` and no
   prototype is set on a props or ref object, which recovers the findings a polyfill's variable-named
   getter hides, at the price of the loop through a getter on `Object.prototype`.
+- Second assumption, `foreignRealmFiles`
+  ([#379](https://github.com/rboudrouss/reactant-analyzer/issues/379),
+  [#377](https://github.com/rboudrouss/reactant-analyzer/issues/377)): a list of globs, in the config
+  (`"assumptions": { "foreignRealmFiles": ["**/polyfills/**", "apps/server/**"] }`) or
+  `--assume foreignRealmFiles=<glob>` (repeatable, adds to the config), naming the files that do not
+  share a JavaScript realm with the app. The accessors they install no longer make a read in the other
+  files a possible call; the declared files are still analysed and reported, and their own reads still
+  see every accessor of the program. The output states the globs (`N assumptions in force: …`, and
+  `assumption_values` in the JSON, present only when a valued assumption is).
 
 ### Changed
 

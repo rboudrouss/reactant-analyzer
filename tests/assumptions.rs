@@ -84,7 +84,9 @@ impl Project {
             .join(format!("reactant-assume-{}-{run}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         for (name, text) in files {
-            std::fs::write(dir.join(name), text).unwrap();
+            let file = dir.join(name);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, text).unwrap();
         }
         Project(dir)
     }
@@ -273,4 +275,187 @@ fn the_config_schema_holds_the_section() {
     let section = &schema["$defs"]["Assumptions"];
     assert!(section["properties"][NAME].is_object(), "{schema:#}");
     assert_eq!(section["additionalProperties"], false);
+}
+
+// ── foreignRealmFiles (#379) ─────────────────────────────────────────────────
+
+const FOREIGN: &str = "foreignRealmFiles";
+
+/// A polyfill installing a getter under a name no constant spells, on
+/// `Object.prototype`: the program-wide accessor fact becomes "any name".
+const POLYFILL: &str = r#"const names = ["hide", "other"];
+for (const name of names) {
+  Object.defineProperty(Object.prototype, name, {
+    get() {
+      return {};
+    },
+    configurable: true,
+  });
+}
+"#;
+
+/// A child reading a prop its parent does not pass, in an effect's deps: it
+/// loops only if some getter of the program runs at the read.
+const APP: &str = r#"import { useEffect, useState } from "react";
+
+function C({ hide }: { hide?: object }) {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    setN((c) => c + 1);
+  }, [hide]);
+  return <div>{n}</div>;
+}
+
+export function App() {
+  return <C />;
+}
+"#;
+
+fn values(doc: &serde_json::Value) -> Option<Vec<String>> {
+    doc.get("assumption_values")?[FOREIGN]
+        .as_array()
+        .map(|globs| {
+            globs
+                .iter()
+                .map(|g| g.as_str().unwrap().to_string())
+                .collect()
+        })
+}
+
+/// The documented trade-off, pinned on both sides. By default the polyfill's
+/// getter may run at the app's read, so the loop is reported; with the file
+/// declared foreign the app no longer reads it, nothing is reported, and the
+/// output says what was assumed.
+#[test]
+fn a_foreign_polyfill_feeds_no_fact_the_app_reads() {
+    let p = Project::new(&[("src/polyfill.ts", POLYFILL), ("src/App.tsx", APP)]);
+    let off = p.json(&[]);
+    assert_eq!(loops(&off), ["infinite-loop:warning"], "off");
+    assert!(assumptions(&off).is_empty(), "off");
+    assert!(
+        off.get("assumption_values").is_none(),
+        "off: byte-identical"
+    );
+
+    let on = p.json(&["--assume", "foreignRealmFiles=src/polyfill.ts"]);
+    assert!(loops(&on).is_empty(), "on, {:?}", loops(&on));
+    assert_eq!(assumptions(&on), [FOREIGN], "on");
+    assert_eq!(values(&on), Some(vec!["src/polyfill.ts".to_string()]));
+}
+
+/// A glob that names no file declares a premise that changes nothing: the
+/// loop stays, and the output still states it.
+#[test]
+fn a_glob_matching_no_file_changes_nothing_and_is_stated() {
+    let p = Project::new(&[("src/polyfill.ts", POLYFILL), ("src/App.tsx", APP)]);
+    let on = p.json(&["--assume", "foreignRealmFiles=src/elsewhere/**"]);
+    assert_eq!(loops(&on), ["infinite-loop:warning"]);
+    assert_eq!(assumptions(&on), [FOREIGN]);
+}
+
+/// Globs are read from the project root, the config's list and the flags add
+/// up, and the human output prints them once.
+#[test]
+fn the_globs_come_from_the_config_and_the_flag_and_are_stated_once() {
+    let config = r#"{ "assumptions": { "foreignRealmFiles": ["**/polyfills/**"] } }"#;
+    let p = Project::new(&[
+        ("src/polyfills/install.ts", POLYFILL),
+        ("src/App.tsx", APP),
+        ("reactant.config.json", config),
+    ]);
+    let doc = p.json(&["--assume", "foreignRealmFiles=apps/server/**"]);
+    assert!(loops(&doc).is_empty(), "{:?}", loops(&doc));
+    assert_eq!(
+        values(&doc),
+        Some(vec![
+            "apps/server/**".to_string(),
+            "**/polyfills/**".to_string()
+        ])
+    );
+    let human = String::from_utf8(
+        p.run(&["--assume", "foreignRealmFiles=**/polyfills/**"])
+            .stdout,
+    )
+    .unwrap();
+    let line =
+        "1 assumption in force: files matching **/polyfills/** do not share a realm with the app";
+    assert_eq!(human.matches(line).count(), 1, "{human}");
+}
+
+/// An empty list declares nothing.
+#[test]
+fn an_empty_list_is_no_assumption() {
+    let p = Project::new(&[
+        ("src/polyfill.ts", POLYFILL),
+        ("src/App.tsx", APP),
+        (
+            "reactant.config.json",
+            r#"{ "assumptions": { "foreignRealmFiles": [] } }"#,
+        ),
+    ]);
+    let doc = p.json(&[]);
+    assert_eq!(loops(&doc), ["infinite-loop:warning"]);
+    assert!(assumptions(&doc).is_empty());
+    assert!(doc.get("assumption_values").is_none());
+}
+
+/// The inverse: a declared file is still analysed and reported, and its own
+/// reads still see what it installs. The getter on `Object.prototype` and
+/// the component that reads it share the declared file, so the loop is
+/// reported; so is a loop through an accessor on a placed object.
+#[test]
+fn a_declared_file_still_reads_its_own_accessors() {
+    for case in [OBJECT_PROTOTYPE_GETTER, PLACED_ACCESSOR_LOOPS[0]] {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("oracle/cases/{case}.tsx")),
+        )
+        .unwrap();
+        let p = Project::new(&[("src/own/Own.tsx", &src), ("src/Other.tsx", APP)]);
+        let on = p.json(&["--assume", "foreignRealmFiles=src/own/**"]);
+        let own: Vec<_> = on["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|d| d["rule"].as_str().unwrap().contains("loop"))
+            .filter(|d| d["file"].as_str().unwrap().contains("Own.tsx"))
+            .collect();
+        assert_eq!(own.len(), 1, "{case}: {own:?}");
+        assert_eq!(assumptions(&on), [FOREIGN], "{case}");
+    }
+}
+
+#[test]
+fn a_malformed_declaration_is_an_error_never_no_premise() {
+    let p = Project::case("plain-ref-defined-accessor-loops");
+    for bad in [
+        "foreignRealmFiles",
+        "foreignRealmFiles=",
+        "plainObjectsRunNoAccessor=1",
+    ] {
+        let out = p.run(&["--assume", bad]);
+        assert_eq!(out.status.code(), Some(2), "{bad}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("--assume"),
+            "{bad}"
+        );
+    }
+    let p = Project::case_with_config(
+        "plain-ref-defined-accessor-loops",
+        Some(r#"{ "assumptions": { "foreignRealmFiles": "src/**" } }"#),
+    );
+    assert_eq!(p.run(&[]).status.code(), Some(2));
+}
+
+#[test]
+fn the_config_schema_holds_the_list_of_globs() {
+    let schema = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("docs/schemas/reactant-config.schema.json"),
+    )
+    .unwrap();
+    let schema: serde_json::Value = serde_json::from_str(&schema).unwrap();
+    let list = &schema["$defs"]["Assumptions"]["properties"][FOREIGN];
+    assert_eq!(list["type"], "array", "{schema:#}");
+    assert_eq!(list["items"]["type"], "string");
 }

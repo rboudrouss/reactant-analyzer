@@ -10,6 +10,7 @@
 //! Out of scope (deliberately): evaluating `vite.config.*` / `next.config.*`
 //! for `resolve.alias` / `webpack` overrides (requires running JS).
 
+pub(crate) mod glob;
 pub mod nextjs;
 pub mod paths_resolver;
 pub mod tsconfig;

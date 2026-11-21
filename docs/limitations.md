@@ -315,7 +315,9 @@ that writes it (see *Cross-file limits*).
   a possible call again (declaring
   [`plainObjectsRunNoAccessor`](usage.md#assumptions) takes that reading off, at the price of the
   loop through a getter on `Object.prototype`: an assumption, off by default and stated in the
-  output, [ADR-048](adr/ADR-048-assumptions-are-configuration.md)). The props of a component no element of the analysis renders, the state
+  output, [ADR-048](adr/ADR-048-assumptions-are-configuration.md); declaring the files that share no
+  realm with the app, [`foreignRealmFiles`](usage.md#foreignrealmfiles), takes their accessors out of
+  what the other files' reads see, [#379](https://github.com/rboudrouss/reactant-analyzer/issues/379)). The props of a component no element of the analysis renders, the state
   and context values and a callback's arguments keep the program-wide reading. Not seen:
   a getter defined by code the analysis does not read (a library, a skipped file), which is still
   read as the receiver's member, a prototype set under a key no constant spells (`o[k] = p`) or

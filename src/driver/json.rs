@@ -14,6 +14,7 @@ use crate::rules::{Diagnostic, Note, ResolveTarget, Severity, Step};
 
 use super::locations::LocationIndex;
 use super::report::CheckReport;
+use crate::assumptions::Assumption;
 
 #[derive(Serialize)]
 struct JsonReport<'a> {
@@ -27,6 +28,11 @@ struct JsonReport<'a> {
     /// The assumptions the run declared (ADR-048), by name: the premises the
     /// findings were computed under. Always present, empty by default.
     assumptions: Vec<&'static str>,
+    /// The value of each valued assumption in force (`foreignRealmFiles`:
+    /// its globs), by name. Present only when one is: a run that declares
+    /// none is byte-identical to one before the field existed.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    assumption_values: std::collections::BTreeMap<&'static str, &'a [String]>,
     /// Present only under `--follow-imports` (#138): what the run read beyond
     /// the named paths, and what it found there and is not reporting.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -310,6 +316,17 @@ pub fn render(
             .in_force()
             .iter()
             .map(|a| a.name())
+            .collect(),
+        assumption_values: report
+            .assumptions
+            .holds(Assumption::ForeignRealmFiles)
+            .then(|| {
+                (
+                    Assumption::ForeignRealmFiles.name(),
+                    report.assumptions.foreign_realm_files.as_slice(),
+                )
+            })
+            .into_iter()
             .collect(),
         followed: report.followed.as_ref().map(|f| JsonFollowed {
             files: f.files,

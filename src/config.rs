@@ -18,7 +18,7 @@ use serde::Deserialize;
 #[cfg(feature = "schema-gen")]
 use schemars::JsonSchema;
 
-use crate::assumptions::{Assumption, Assumptions};
+use crate::assumptions::Assumptions;
 use crate::project::strip_jsonc;
 use crate::rules::Severity;
 
@@ -257,12 +257,14 @@ pub struct CheckArgsPartial {
     pub project: Option<ProjectConfig>,
 }
 
-/// The assumptions `--assume <name>` arguments declare. An unknown name is an
-/// error naming the valid ones: a misspelt premise must not run as no premise.
-pub fn parse_assumptions(names: &[String]) -> Result<Assumptions, String> {
+/// The assumptions `--assume <name>[=<value>]` arguments declare. An unknown
+/// name is an error naming the valid ones: a misspelt premise must not run as
+/// no premise.
+pub fn parse_assumptions(args: &[String]) -> Result<Assumptions, String> {
     let mut out = Assumptions::default();
-    for name in names {
-        out.declare(Assumption::parse(name).map_err(|e| format!("`--assume {name}`: {e}"))?);
+    for arg in args {
+        out.declare_arg(arg)
+            .map_err(|e| format!("`--assume {arg}`: {e}"))?;
     }
     Ok(out)
 }
@@ -371,6 +373,7 @@ pub fn discover(root: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::assumptions::Assumption;
 
     fn parse(src: &str) -> Result<ReactantConfig, String> {
         serde_json::from_str(&strip_jsonc(src)).map_err(|e| e.to_string())
@@ -438,6 +441,44 @@ mod tests {
         );
         let cfg = parse(r#"{ "assumptions": {} }"#).unwrap();
         assert!(cfg.assumptions.in_force().is_empty());
+    }
+
+    #[test]
+    fn foreign_realm_files_are_a_list_of_globs() {
+        let cfg = parse(
+            r#"{ "assumptions": { "foreignRealmFiles": ["**/polyfills/**", "apps/server/**"] } }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.assumptions.foreign_realm_files,
+            ["**/polyfills/**", "apps/server/**"]
+        );
+        assert_eq!(cfg.assumptions.in_force(), [Assumption::ForeignRealmFiles]);
+        // An empty list declares nothing.
+        let cfg = parse(r#"{ "assumptions": { "foreignRealmFiles": [] } }"#).unwrap();
+        assert!(cfg.assumptions.in_force().is_empty());
+        // A glob is a string, not a flag.
+        assert!(parse(r#"{ "assumptions": { "foreignRealmFiles": true } }"#).is_err());
+    }
+
+    #[test]
+    fn the_flag_adds_globs_to_the_config_list() {
+        let cfg = parse(r#"{ "assumptions": { "foreignRealmFiles": ["a/**"] } }"#).unwrap();
+        let mut partial = CheckArgsPartial {
+            assumptions: parse_assumptions(&[
+                "foreignRealmFiles=b/**".to_string(),
+                "foreignRealmFiles=c/**".to_string(),
+            ])
+            .unwrap(),
+            ..Default::default()
+        };
+        partial.merge(&cfg);
+        assert_eq!(
+            partial.assumptions.foreign_realm_files,
+            ["b/**", "c/**", "a/**"]
+        );
+        let err = parse_assumptions(&["foreignRealmFiles".to_string()]).unwrap_err();
+        assert!(err.contains("needs a glob"), "{err}");
     }
 
     #[test]

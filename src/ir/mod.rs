@@ -22,7 +22,7 @@ pub use expr::{BinOp, CompOrigin, Expr, Prim, UnaryOp};
 pub use function_ir::FunctionIR;
 pub use hook_ir::HookIR;
 pub use hooks::HookEntry;
-pub use module::{ModuleFacts, ModuleTable};
+pub use module::{ModuleFacts, ModuleTable, ProgramAccessors};
 pub use names::{SourceNames, is_lowering_temp, source_name};
 pub use remap::{
     Offsets, alloc_id_span, call_id_span, graft_spans, remap_cfg, remap_expr, remap_hooks,
