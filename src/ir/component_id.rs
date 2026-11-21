@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::ir::expr::{CompOrigin, ElementOrigin};
 use crate::ir::module::ReExportGraph;
@@ -123,6 +123,11 @@ pub struct ComponentTable {
     /// The program's re-exports: how an import of a barrel reaches the file
     /// that defines the component ([`Self::element`]).
     re_exports: Arc<ReExportGraph>,
+    /// What [`Self::element`] found behind each barrel origin: the walk runs
+    /// once per origin, not at every evaluation of an element (a design
+    /// system's `export *` tree is hundreds of files). Reset by anything that
+    /// changes the answer.
+    behind_barrels: Arc<Mutex<HashMap<CompOrigin, Option<ComponentId>>>>,
 }
 
 /// Which component of the program a JSX element instantiates
@@ -168,6 +173,7 @@ impl ComponentTable {
         *self.name_counts.entry(origin.name.clone()).or_default() += 1;
         self.by_origin.insert(origin.clone(), id);
         self.origins.insert(id, origin);
+        self.behind_barrels = Arc::default();
     }
 
     /// The `(file, name)` pair `id` names. `None` for an id this table never
@@ -251,6 +257,7 @@ impl ComponentTable {
     /// Follow imports of a barrel through `re_exports` ([`Self::element`]).
     pub fn set_re_exports(&mut self, re_exports: ReExportGraph) {
         self.re_exports = Arc::new(re_exports);
+        self.behind_barrels = Arc::default();
     }
 
     /// Which component the element `<name/>` instantiates, given what its own
@@ -276,16 +283,22 @@ impl ComponentTable {
                 if let Some(id) = self.id_of(o) {
                     return ElementTarget::Component(id);
                 }
-                let defines = |file: &Path, name: &str| {
-                    self.by_origin.contains_key(&CompOrigin {
-                        file: file.to_path_buf(),
-                        name: name.to_string(),
-                    })
-                };
-                self.re_exports
-                    .origin(&o.file, &o.name, &defines)
-                    .and_then(|(file, name)| self.id_of(&CompOrigin { file, name }))
-                    .map_or(ElementTarget::Unresolved, ElementTarget::Component)
+                let mut behind = self
+                    .behind_barrels
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let found = *behind.entry(o.clone()).or_insert_with(|| {
+                    let defines = |file: &Path, name: &str| {
+                        self.by_origin.contains_key(&CompOrigin {
+                            file: file.to_path_buf(),
+                            name: name.to_string(),
+                        })
+                    };
+                    self.re_exports
+                        .origin(&o.file, &o.name, &defines)
+                        .and_then(|(file, name)| self.id_of(&CompOrigin { file, name }))
+                });
+                found.map_or(ElementTarget::Unresolved, ElementTarget::Component)
             }
             None => {
                 let mut named = self.ids_named(name);
