@@ -15,6 +15,18 @@ use crate::ir::types::Symbol;
 /// Composite key shared by every keyed registry.
 pub type RegistryKey = (PathBuf, Symbol);
 
+/// What a bare name settles among a registry's definitions
+/// ([`KeyedRegistry::by_name`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByName<'a> {
+    /// No file defines the name.
+    None,
+    /// Exactly one file does.
+    One(&'a RegistryKey),
+    /// Several do, and the name alone does not say which is meant.
+    Several,
+}
+
 /// Map from `(file, name)` to a lowered IR value `V`, with the shared lookup
 /// and enumeration primitives the concrete registries build on.
 #[derive(Debug, Clone)]
@@ -64,6 +76,17 @@ impl<V> KeyedRegistry<V> {
         let mut matches: Vec<&RegistryKey> = self.map.keys().filter(|(_, n)| n == name).collect();
         matches.sort();
         matches.into_iter().next().and_then(|k| self.map.get(k))
+    }
+
+    /// The definition a name names when nothing but the name is known: the
+    /// one file defining it, never the first of several (#7, #389).
+    pub fn by_name(&self, name: &str) -> ByName<'_> {
+        let mut matches = self.map.keys().filter(|(_, n)| n == name);
+        match (matches.next(), matches.next()) {
+            (None, _) => ByName::None,
+            (Some(key), None) => ByName::One(key),
+            (Some(_), Some(_)) => ByName::Several,
+        }
     }
 
     /// Every `(file, name)` key, sorted.
