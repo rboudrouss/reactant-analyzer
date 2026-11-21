@@ -59,6 +59,7 @@ fn leaf_component(name: &str) -> ComponentIR {
         hooks: vec![],
         hook_provenance: vec![],
         module_consts: Default::default(),
+        ref_passing: Default::default(),
     }
 }
 
@@ -98,6 +99,7 @@ fn heuristic_detects_parent_not_child_as_root() {
             hooks: vec![],
             hook_provenance: vec![],
             module_consts: Default::default(),
+            ref_passing: Default::default(),
         }
     };
     let child = leaf_component("Child");
@@ -161,6 +163,7 @@ fn analyze_program_populates_call_graph_for_parent_child() {
             hooks: vec![],
             hook_provenance: vec![],
             module_consts: Default::default(),
+            ref_passing: Default::default(),
         }
     };
     let child = leaf_component("Child");
@@ -255,6 +258,7 @@ fn setter_prop_propagates_to_shared_state() {
                 span: None,
             }],
             module_consts: Default::default(),
+            ref_passing: Default::default(),
         }
     };
 
@@ -315,6 +319,7 @@ fn setter_prop_propagates_to_shared_state() {
                 span: None,
             }],
             module_consts: Default::default(),
+            ref_passing: Default::default(),
         }
     };
 
@@ -373,6 +378,7 @@ fn recursive_component_does_not_crash() {
             hooks: vec![],
             hook_provenance: vec![],
             module_consts: Default::default(),
+            ref_passing: Default::default(),
         }
     };
     let reg = ComponentRegistry::from_components(vec![tree_node]);
@@ -882,6 +888,7 @@ fn prop_drilling_direct_ir() {
                 span: None,
             }],
             module_consts: Default::default(),
+            ref_passing: Default::default(),
         }
     };
     // Middle: return <Leaf action={props.action} />  param = "props"
@@ -925,6 +932,7 @@ fn prop_drilling_direct_ir() {
             hooks: vec![],
             hook_provenance: vec![],
             module_consts: Default::default(),
+            ref_passing: Default::default(),
         }
     };
     // Root: const [v, setV] = useState(0); return <Middle action={setV} />
@@ -978,6 +986,7 @@ fn prop_drilling_direct_ir() {
                 span: None,
             }],
             module_consts: Default::default(),
+            ref_passing: Default::default(),
         }
     };
 

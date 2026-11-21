@@ -343,6 +343,7 @@ mod tests {
             hooks: vec![],
             hook_provenance: vec![],
             module_consts: Default::default(),
+            ref_passing: Default::default(),
         }
     }
 

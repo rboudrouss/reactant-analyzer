@@ -3,41 +3,61 @@ use oxc_ast::ast::*;
 use super::Candidate;
 use super::body_scan::scan_body;
 use super::detector::{self, Classify, FnItem};
+use super::react_wrappers::ReactWrappers;
 
 /// A React component function detected in the AST, ready for lowering.
 pub type ComponentCandidate<'a> = Candidate<'a>;
 
 /// Detect all React component functions in `program`.
 pub fn detect_components<'a>(program: &'a Program<'a>) -> Vec<ComponentCandidate<'a>> {
-    detector::detect_fns(program, classify, Some(default))
+    let wrappers = ReactWrappers::of(program);
+    detector::detect_fns(program, classify, Some(default), Some(&wrappers))
 }
 
-/// A function is a component iff [`is_component`] accepts its name, body (for
-/// the JSX-return rule) and return type (for the TS annotation rule).
+/// A function is a component iff React renders it as one — it is the
+/// argument of a `memo` or `forwardRef` (#64), whatever its name and body —
+/// or [`is_component`] accepts its name, body (for the JSX-return rule) and
+/// return type (for the TS annotation rule).
 fn classify(item: &FnItem) -> bool {
-    is_component(item.name, &item.body.statements, item.return_type)
+    item.wrapped.is_some() || is_component(item.name, &item.body.statements, item.return_type)
 }
 
 /// `export default function App()` / `export default () => <.../>` — the most
-/// common component shape. Anonymous default exports get the name `DefaultExport`.
+/// common component shape —, and either through React's wrappers
+/// (`export default memo(function App() {…})`, #64). Anonymous default exports
+/// get the name `DefaultExport`.
 fn default<'a>(
     exp: &'a ExportDefaultDeclaration<'a>,
     classify: Classify,
+    wrappers: Option<&ReactWrappers>,
     out: &mut Vec<Candidate<'a>>,
 ) {
+    let named = |func: &'a Function<'a>| {
+        func.id
+            .as_ref()
+            .map(|id| id.name.as_str())
+            .unwrap_or("DefaultExport")
+    };
     match &exp.declaration {
         ExportDefaultDeclarationKind::FunctionDeclaration(func) => {
-            let name = func
-                .id
-                .as_ref()
-                .map(|id| id.name.as_str())
-                .unwrap_or("DefaultExport");
-            detector::consider_fn(func, Some(name), None, classify, out);
+            detector::consider_fn(func, Some(named(func)), None, None, classify, out);
         }
         ExportDefaultDeclarationKind::ArrowFunctionExpression(arrow) => {
-            detector::consider_arrow("DefaultExport", arrow, None, classify, out);
+            detector::consider_arrow("DefaultExport", arrow, None, None, classify, out);
         }
-        _ => {}
+        other => {
+            let Some(w) = other
+                .as_expression()
+                .and_then(|e| wrappers.and_then(|w| w.peel(e)))
+            else {
+                return;
+            };
+            let name = match w.inner {
+                Expression::FunctionExpression(func) => named(func),
+                _ => "DefaultExport",
+            };
+            detector::consider_fn_expr(name, w.inner, None, Some(w.call), classify, out);
+        }
     }
 }
 
@@ -350,5 +370,26 @@ mod tests {
     fn var_react_fc_annotation() {
         let src = "const Stub: React.FC = () => null as any;";
         assert_eq!(names(src), vec!["Stub"]);
+    }
+
+    /// #64: the function React's `memo` / `forwardRef` wraps is a component
+    /// under its binding's name (the default export's under its own, or
+    /// `DefaultExport`), whatever its body; a wrapper of a name adds none
+    /// (it is a re-export, `module_facts`), nor does a program's `memo`.
+    #[test]
+    fn a_wrapped_function_is_a_component() {
+        let src = "import React, { memo, forwardRef } from 'react';\n\
+                   export const A = memo(function Inner() { return null; });\n\
+                   const B = React.forwardRef<HTMLDivElement, P>((p, r) => null);\n\
+                   const C = memo(forwardRef((p, r) => <i/>), (a, b) => true);\n\
+                   function D() { return <b/>; }\n\
+                   const E = memo(D);\n\
+                   export default memo(function Page() { return null; });";
+        assert_eq!(names(src), vec!["A", "B", "C", "D", "Page"]);
+        assert_eq!(
+            names("import { memo } from 'react'; export default memo(() => null);"),
+            vec!["DefaultExport"]
+        );
+        assert!(names("function memo(f) { return f; }\nconst A = memo(() => null);").is_empty());
     }
 }

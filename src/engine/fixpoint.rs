@@ -1211,8 +1211,13 @@ fn forwarded_props(
         }
         false
     };
+    // A `forwardRef` render's `ref` is the member its props keep the
+    // element's under: the caller's element held it as `ref`.
     let prop_of = |e: &Expr| match e.peel_ts() {
-        Expr::FieldAccess { obj, field } if is_props(obj) => Some(field.clone()),
+        Expr::FieldAccess { obj, field } if is_props(obj) => Some(match field.as_str() {
+            crate::ir::expr::FORWARDED_REF_KEY => "ref".to_string(),
+            _ => field.clone(),
+        }),
         _ => None,
     };
     fields
@@ -2839,6 +2844,7 @@ mod tests {
             hooks,
             hook_provenance: vec![],
             module_consts: Default::default(),
+            ref_passing: Default::default(),
         }
     }
 
@@ -3178,6 +3184,7 @@ mod tests {
             hooks: vec![],
             hook_provenance: vec![],
             module_consts: Default::default(),
+            ref_passing: Default::default(),
         };
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         assert_eq!(

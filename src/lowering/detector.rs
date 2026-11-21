@@ -3,15 +3,17 @@
 //!
 //! All three scan a `Program` for top-level function-like bindings and keep the
 //! ones a per-detector predicate accepts. They differ only in that predicate
-//! ([`Classify`]) and in how they treat `export default` ([`DefaultHandler`]) —
-//! everything else (the dispatch over function declarations, `const`/`let`
-//! arrow & function-expression bindings, and named exports, plus the
-//! [`Candidate`] construction) is identical and lives here.
+//! ([`Classify`]), in how they treat `export default` ([`DefaultHandler`]),
+//! and in whether React's component wrappers are followed ([`ReactWrappers`],
+//! the component detector only) — everything else (the dispatch over function
+//! declarations, `const`/`let` arrow & function-expression bindings, and named
+//! exports, plus the [`Candidate`] construction) is identical and lives here.
 
 use oxc_ast::ast::*;
 
 use super::Candidate;
 use super::cfg_builder::FnKind;
+use super::react_wrappers::{ReactWrappers, Wrapper};
 
 /// A top-level function-like binding the walker found: its name, parameters,
 /// body, and (folded) return-type annotation. A detector's [`Classify`] reads
@@ -29,6 +31,8 @@ pub(crate) struct FnItem<'a> {
     pub kind: FnKind,
     /// See [`Candidate::arrow`](crate::lowering::Candidate::arrow).
     pub arrow: bool,
+    /// See [`Candidate::wrapped`](crate::lowering::Candidate::wrapped).
+    pub wrapped: Option<Wrapper>,
 }
 
 /// Predicate deciding whether a walked function is a candidate of this kind.
@@ -36,37 +40,44 @@ pub(crate) type Classify = fn(&FnItem) -> bool;
 
 /// How a detector treats `export default`. Runs in source order alongside the
 /// other statements. `None` (utility) ignores default exports entirely.
-pub(crate) type DefaultHandler =
-    for<'a> fn(&'a ExportDefaultDeclaration<'a>, Classify, &mut Vec<Candidate<'a>>);
+pub(crate) type DefaultHandler = for<'a> fn(
+    &'a ExportDefaultDeclaration<'a>,
+    Classify,
+    Option<&ReactWrappers>,
+    &mut Vec<Candidate<'a>>,
+);
 
 /// Collect every top-level function-like binding `classify` accepts, in source
 /// order. Visits function declarations, `const`/`let` bindings initialised to an
-/// arrow or function expression, and named exports of either; `export default`
-/// goes through `default` (the detectors differ on it).
+/// arrow or function expression — or, with `wrappers`, to one of React's
+/// wrappers around one (`const X = memo(() => …)`, #64) —, and named exports
+/// of either; `export default` goes through `default` (the detectors differ on
+/// it).
 pub(crate) fn detect_fns<'a>(
     program: &'a Program<'a>,
     classify: Classify,
     default: Option<DefaultHandler>,
+    wrappers: Option<&ReactWrappers>,
 ) -> Vec<Candidate<'a>> {
     let mut out = Vec::new();
     for stmt in &program.body {
         match stmt {
             Statement::FunctionDeclaration(func) => {
-                consider_fn(func, None, None, classify, &mut out)
+                consider_fn(func, None, None, None, classify, &mut out)
             }
             Statement::VariableDeclaration(decl) => {
                 for vd in &decl.declarations {
-                    consider_var(vd, classify, &mut out);
+                    consider_var(vd, classify, wrappers, &mut out);
                 }
             }
             Statement::ExportNamedDeclaration(exp) => {
                 if let Some(decl) = &exp.declaration {
-                    consider_decl(decl, classify, &mut out);
+                    consider_decl(decl, classify, wrappers, &mut out);
                 }
             }
             Statement::ExportDefaultDeclaration(exp) => {
                 if let Some(handler) = default {
-                    handler(exp, classify, &mut out);
+                    handler(exp, classify, wrappers, &mut out);
                 }
             }
             _ => {}
@@ -75,12 +86,19 @@ pub(crate) fn detect_fns<'a>(
     out
 }
 
-fn consider_decl<'a>(decl: &'a Declaration<'a>, classify: Classify, out: &mut Vec<Candidate<'a>>) {
+fn consider_decl<'a>(
+    decl: &'a Declaration<'a>,
+    classify: Classify,
+    wrappers: Option<&ReactWrappers>,
+    out: &mut Vec<Candidate<'a>>,
+) {
     match decl {
-        Declaration::FunctionDeclaration(func) => consider_fn(func, None, None, classify, out),
+        Declaration::FunctionDeclaration(func) => {
+            consider_fn(func, None, None, None, classify, out)
+        }
         Declaration::VariableDeclaration(vd) => {
             for vd in &vd.declarations {
-                consider_var(vd, classify, out);
+                consider_var(vd, classify, wrappers, out);
             }
         }
         _ => {}
@@ -90,6 +108,7 @@ fn consider_decl<'a>(decl: &'a Declaration<'a>, classify: Classify, out: &mut Ve
 fn consider_var<'a>(
     vd: &'a VariableDeclarator<'a>,
     classify: Classify,
+    wrappers: Option<&ReactWrappers>,
     out: &mut Vec<Candidate<'a>>,
 ) {
     let BindingPattern::BindingIdentifier(id) = &vd.id else {
@@ -101,12 +120,28 @@ fn consider_var<'a>(
     let Some(init) = &vd.init else { return };
     // Parentheses and type assertions change no value: `const create = ((s)
     // => …) as Create` (zustand's `create`, #383) binds the arrow.
-    match init.get_inner_expression() {
+    let (init, wrapped) = match wrappers.and_then(|w| w.peel(init)) {
+        Some(w) => (w.inner, Some(w.call)),
+        None => (init.get_inner_expression(), None),
+    };
+    consider_fn_expr(name, init, type_ann, wrapped, classify, out);
+}
+
+/// Consider `expr`, bound to `name`, when it is a function literal.
+pub(crate) fn consider_fn_expr<'a>(
+    name: &'a str,
+    expr: &'a Expression<'a>,
+    type_ann: Option<&'a TSTypeAnnotation<'a>>,
+    wrapped: Option<Wrapper>,
+    classify: Classify,
+    out: &mut Vec<Candidate<'a>>,
+) {
+    match expr {
         Expression::ArrowFunctionExpression(arrow) => {
-            consider_arrow(name, arrow, type_ann, classify, out);
+            consider_arrow(name, arrow, type_ann, wrapped, classify, out);
         }
         Expression::FunctionExpression(func) => {
-            consider_fn(func, Some(name), type_ann, classify, out);
+            consider_fn(func, Some(name), type_ann, wrapped, classify, out);
         }
         _ => {}
     }
@@ -120,6 +155,7 @@ pub(crate) fn consider_fn<'a>(
     func: &'a Function<'a>,
     name_override: Option<&'a str>,
     extra_type_ann: Option<&'a TSTypeAnnotation<'a>>,
+    wrapped: Option<Wrapper>,
     classify: Classify,
     out: &mut Vec<Candidate<'a>>,
 ) {
@@ -138,6 +174,7 @@ pub(crate) fn consider_fn<'a>(
             expression: false,
             kind: FnKind::of(func.r#async, func.generator),
             arrow: false,
+            wrapped,
         },
         classify,
         out,
@@ -150,6 +187,7 @@ pub(crate) fn consider_arrow<'a>(
     name: &'a str,
     arrow: &'a ArrowFunctionExpression<'a>,
     extra_type_ann: Option<&'a TSTypeAnnotation<'a>>,
+    wrapped: Option<Wrapper>,
     classify: Classify,
     out: &mut Vec<Candidate<'a>>,
 ) {
@@ -162,6 +200,7 @@ pub(crate) fn consider_arrow<'a>(
             expression: arrow.expression,
             kind: FnKind::of(arrow.r#async, false),
             arrow: true,
+            wrapped,
         },
         classify,
         out,
@@ -177,6 +216,7 @@ fn push_if<'a>(item: FnItem<'a>, classify: Classify, out: &mut Vec<Candidate<'a>
             expression: item.expression,
             kind: item.kind,
             arrow: item.arrow,
+            wrapped: item.wrapped,
         });
     }
 }

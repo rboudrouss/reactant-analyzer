@@ -8,6 +8,7 @@ pub mod hook_detector;
 pub mod hook_extractor;
 pub mod import_resolution;
 pub mod module_facts;
+pub mod react_wrappers;
 pub mod utility_detector;
 pub mod utility_lowerer;
 
@@ -36,7 +37,7 @@ use oxc_ast::ast::{
 
 use crate::{
     ir::{
-        component::{ComponentIR, ModuleConstInit},
+        component::{ComponentIR, ModuleConstInit, RefPassing},
         expr::Prim,
         hook_ir::HookIR,
         types::Var,
@@ -147,6 +148,10 @@ pub struct Candidate<'a> {
     pub kind: cfg_builder::FnKind,
     /// An arrow function, which binds no `arguments` of its own (#324).
     pub arrow: bool,
+    /// The React wrapper the function is the argument of (`memo(f)`,
+    /// `forwardRef(f)`, #64): React renders it as a component, and through a
+    /// `forwardRef` calls it with the element's `ref` second.
+    pub wrapped: Option<react_wrappers::Wrapper>,
 }
 
 impl Candidate<'_> {
@@ -172,11 +177,18 @@ impl Candidate<'_> {
         kind: cfg_builder::FnKind,
         ctx: &LowerCtx,
     ) -> (Vec<String>, crate::ir::cfg::CFG) {
-        if self.expression {
-            cfg_builder::build_expr_fn_body_cfg(self.params, self.body, kind, ctx)
-        } else {
-            cfg_builder::build_fn_body_cfg(self.params, self.body, kind, self.arrow, ctx)
-        }
+        let forward_ref = self.wrapped == Some(react_wrappers::Wrapper::ForwardRef);
+        cfg_builder::build_candidate_cfg(
+            self.params,
+            self.body,
+            cfg_builder::BodyShape {
+                expression: self.expression,
+                arrow: self.arrow,
+                kind,
+                forward_ref,
+            },
+            ctx,
+        )
     }
 
     /// The default of each parameter, aligned with [`Self::build_cfg`]'s
@@ -1238,9 +1250,16 @@ pub fn lower_program_with_resolver(
         current_file: Some(file),
         bound: hook_extractor::ImportCtx::unbound(),
     };
+    let forward_ref_targets =
+        react_wrappers::ReactWrappers::of(program).forward_ref_targets(program);
     let components = detect_components(program)
         .into_iter()
         .map(|candidate| {
+            let ref_passing = match candidate.wrapped {
+                Some(react_wrappers::Wrapper::ForwardRef) => RefPassing::Argument,
+                _ if forward_ref_targets.contains(candidate.name.as_str()) => RefPassing::Either,
+                _ => RefPassing::Prop,
+            };
             let (param_names, mut render_cfg) = candidate.build_render_cfg(&ctx);
             let (mut hooks, hook_provenance, mut next_label) =
                 extract_hooks(&mut render_cfg, &imports, &ctx.ids);
@@ -1258,6 +1277,7 @@ pub fn lower_program_with_resolver(
                 file: file.to_path_buf(),
                 name: candidate.name,
                 param,
+                ref_passing,
                 dom_props,
                 render_cfg,
                 hooks,
