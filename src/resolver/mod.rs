@@ -520,9 +520,10 @@ pub fn analyze_lowered(
         FunctionRegistry::from_functions_and_imports(lowered.utilities, lowered.utility_imports);
     config.class_registry =
         FunctionRegistry::from_functions_and_imports(lowered.classes, lowered.class_imports);
-    let registry = ComponentRegistry::from_components(lowered.components);
-    let hook_registry = HookRegistry::from_hooks(lowered.hooks)
-        .with_re_exports(lowered.module_table.re_export_graph());
+    let re_exports = lowered.module_table.re_export_graph();
+    let registry =
+        ComponentRegistry::from_components(lowered.components).with_re_exports(re_exports.clone());
+    let hook_registry = HookRegistry::from_hooks(lowered.hooks).with_re_exports(re_exports);
     let foreign = &config.assumptions.foreign_realm_files;
     let accessors = lowered.module_table.accessor_names(&|file| {
         crate::project::glob::path_matches_any(foreign, &config.project_root, file)

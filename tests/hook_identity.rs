@@ -212,19 +212,35 @@ fn a_barrel_import_does_not_reach_a_homonym_off_its_chain() {
     );
 }
 
-/// ADR-013: a call with no import falls back to the name, first match by
-/// path included.
+/// ADR-013: a call with no import falls back to the name — when one file
+/// defines it.
 #[test]
-fn an_unimported_name_still_falls_back_to_the_first_homonym() {
+fn an_unimported_name_falls_back_to_the_one_homonym() {
     let tmp = Tmp::new("no-import");
+    tmp.write("App.tsx", &app(""));
+    tmp.write("a/useThing.ts", BUGGY);
+
+    let found = findings(&tmp);
+    assert!(
+        app_defect(&found),
+        "no import: the name settles on `a/useThing.ts`; got {found:?}"
+    );
+}
+
+/// #389: with several homonyms nothing says which one an unimported call
+/// means, so it binds none — not the first by path: the hook stays one the
+/// analysis does not see, and `a/useThing.ts`'s defect is not the app's.
+#[test]
+fn an_unimported_name_binds_none_of_several_homonyms() {
+    let tmp = Tmp::new("no-import-collision");
     tmp.write("App.tsx", &app(""));
     tmp.write("a/useThing.ts", BUGGY);
     tmp.write("b/useThing.ts", CLEAN);
 
     let found = findings(&tmp);
     assert!(
-        app_defect(&found),
-        "no import: the name settles on `a/useThing.ts`; got {found:?}"
+        !app_defect(&found),
+        "no import, two homonyms: neither is bound; got {found:?}"
     );
 }
 

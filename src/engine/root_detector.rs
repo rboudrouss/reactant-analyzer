@@ -4,22 +4,36 @@ use std::sync::Arc;
 use crate::{
     engine::component_registry::ComponentRegistry,
     ir::{
-        ComponentId,
+        ComponentId, ElementTarget,
         cfg::CFG,
         component::ComponentIR,
-        expr::{CompOrigin, Expr},
+        expr::{ElementOrigin, Expr},
         hooks::HookEntry,
         types::Symbol,
     },
 };
 
-/// One `<Child/>` a body instantiates: how the callee was written, and the
-/// component the call site's own file proved it names (`None` when nothing
-/// there settles it).
+/// One `<Child/>` a body instantiates: how the callee was written, and what
+/// the call site's own file proved it names (`None` when the file neither
+/// declares nor imports it).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CompAppRef {
     pub name: Symbol,
-    pub origin: Option<Arc<CompOrigin>>,
+    pub origin: Option<Arc<ElementOrigin>>,
+}
+
+impl CompAppRef {
+    /// The components the reference may instantiate
+    /// ([`crate::ir::ComponentTable::element`]): the one it settles to, every
+    /// component of that name when it is ambiguous, none when it is imported
+    /// from code the analysis does not see (#389) or leads to no component.
+    pub(crate) fn candidates(&self, table: &crate::ir::ComponentTable) -> Vec<ComponentId> {
+        match table.element(&self.name, self.origin.as_deref()) {
+            ElementTarget::Component(id) => vec![id],
+            ElementTarget::Ambiguous => table.ids_named(&self.name).collect(),
+            ElementTarget::Unseen | ElementTarget::Unresolved => Vec::new(),
+        }
+    }
 }
 
 /// Strategy for selecting root components (entry points for top-down analysis).
@@ -68,14 +82,10 @@ impl RootStrategy {
                 }
                 let table = registry.table();
                 let mut referenced: HashSet<ComponentId> = HashSet::new();
+                // A reference nothing settles may mean every component of
+                // that name, so none of them is provably a root.
                 for r in &refs {
-                    match &r.origin {
-                        Some(o) => referenced.extend(table.id_of(o)),
-                        // Nothing settles the reference, so every component of
-                        // that name may be the one meant and none of them is
-                        // provably a root.
-                        None => referenced.extend(table.ids_named(&r.name)),
-                    }
+                    referenced.extend(r.candidates(table));
                 }
                 table.ids().filter(|id| !referenced.contains(id)).collect()
             }

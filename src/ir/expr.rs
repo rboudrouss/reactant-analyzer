@@ -363,6 +363,28 @@ pub struct CompOrigin {
     pub name: Symbol,
 }
 
+/// What a JSX callee's own file proves its name stands for (#389).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ElementOrigin {
+    /// A definition of the program: the file's own top-level name, or the
+    /// export an import the resolver maps to a file names.
+    Program(CompOrigin),
+    /// An import from a specifier the resolver maps to no file (a package,
+    /// an unmapped alias, a missing file): code the analysis does not see,
+    /// never a same-named component of the program.
+    Unseen,
+}
+
+impl ElementOrigin {
+    /// The program definition, unless the name is imported from unseen code.
+    pub fn program(&self) -> Option<&CompOrigin> {
+        match self {
+            ElementOrigin::Program(o) => Some(o),
+            ElementOrigin::Unseen => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Expr {
     // Primitive literals
@@ -492,11 +514,11 @@ pub enum Expr {
         /// else to point: unlike `NativeElem`, whose handler props are reached
         /// through `HookEntry::Handler`, a component element owns no hook.
         span: Option<SourceRange>,
-        /// Which component `name` was *proven* to name, when the file's
-        /// imports (or its own declarations) settle it — the same fact
-        /// `HookEntry::Custom::resolved_file` records for a custom hook call.
-        /// `None` is ignorance, never a proven negative.
-        origin: Option<Arc<CompOrigin>>,
+        /// What the file's imports (or its own declarations) prove `name`
+        /// stands for — the same fact `HookEntry::Custom::resolved_file` and
+        /// `import_source` record for a custom hook call. `None`: the file
+        /// neither declares nor imports the name.
+        origin: Option<Arc<ElementOrigin>>,
     },
     NativeElem {
         tag: Symbol,

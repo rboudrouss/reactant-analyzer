@@ -17,8 +17,8 @@ pub mod types;
 
 pub use cfg::{BasicBlock, CFG, Edge, EdgeKind, Terminator};
 pub use component::{ComponentIR, ContextId, ModuleConstInit};
-pub use component_id::{ComponentId, ComponentTable};
-pub use expr::{BinOp, CompOrigin, Expr, Prim, UnaryOp};
+pub use component_id::{ComponentId, ComponentTable, ElementTarget};
+pub use expr::{BinOp, CompOrigin, ElementOrigin, Expr, Prim, UnaryOp};
 pub use function_ir::FunctionIR;
 pub use hook_ir::HookIR;
 pub use hooks::HookEntry;

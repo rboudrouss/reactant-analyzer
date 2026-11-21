@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use crate::ir::module::ReExportGraph;
 use crate::ir::{hook_ir::HookIR, types::Symbol};
-use crate::registry::KeyedRegistry;
+use crate::registry::{ByName, KeyedRegistry};
 
 /// Key for [`HookRegistry`]: `(file, name)`. Two hooks named `useData`
 /// in different files coexist without overwriting.
@@ -53,7 +53,11 @@ impl HookRegistry {
     /// - imported from a specifier the resolver could not map (`import_source`
     ///   set): `None`, for the `SummaryRegistry` or ⊤ — a homonym in the
     ///   walked tree is not the package's hook;
-    /// - no import at all: the name-only fallback ADR-013 accepts.
+    /// - no import at all: the one hook of that name in the program, the
+    ///   name-only fallback ADR-013 accepts — `None` when several files
+    ///   define it, since nothing says which is meant (#389).
+    ///
+    /// The same rule as [`crate::engine::ComponentRegistry::resolve_child`].
     pub fn resolve_call(
         &self,
         name: &Symbol,
@@ -68,7 +72,10 @@ impl HookRegistry {
                 self.hooks.get(&key)
             }
             (None, Some(_)) => None,
-            (None, None) => self.get_by_name(name),
+            (None, None) => match self.hooks.by_name(name) {
+                ByName::One(key) => self.hooks.get(key),
+                ByName::None | ByName::Several => None,
+            },
         }
     }
 
@@ -149,6 +156,25 @@ mod tests {
         assert!(
             reg.resolve_call(&name, None, None).is_some(),
             "no import: the ADR-013 name fallback"
+        );
+    }
+
+    /// #389: with no import, the name settles a hook only when one file
+    /// defines it — never the first of several by path.
+    #[test]
+    fn an_unimported_name_binds_only_a_unique_hook() {
+        let name = "useThing".to_string();
+        let one = HookRegistry::from_hooks(vec![hook_in("/a/useThing.ts", "useThing")]);
+        assert!(one.resolve_call(&name, None, None).is_some());
+        let two = HookRegistry::from_hooks(vec![
+            hook_in("/a/useThing.ts", "useThing"),
+            hook_in("/b/useThing.ts", "useThing"),
+        ]);
+        assert!(two.resolve_call(&name, None, None).is_none());
+        assert!(
+            two.resolve_call(&name, None, Some(Path::new("/b/useThing.ts")))
+                .is_some_and(|h| h.file == Path::new("/b/useThing.ts")),
+            "an import still settles the collision"
         );
     }
 

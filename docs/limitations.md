@@ -865,24 +865,43 @@ share a name changes how a component is *shown* (`Name@file` tells the two
 apart) but never which findings it has
 ([ADR-040](adr/ADR-040-component-identity-is-an-interned-id.md)).
 
-A JSX callee is resolved through the file that writes it: that file's own
-declarations first, then its imports, alias included. When neither settles the
-name — a namespace import, a component reached through a re-export barrel, a
-component built dynamically — and **several** analysed files define it, the
-reference names no one in particular. The child is then treated as
-unanalysable, like any callee outside the run, rather than resolved to the file
-that happens to sort first: props and setters stop flowing into it, and
-cross-component findings through that reference are missed. The run says so, as
-an `analysis-limit` on the parent (`--info`), and an explicit import from the
-defining file resolves it [#7](https://github.com/rboudrouss/reactant-analyzer/issues/7).
+A JSX callee is resolved through the file that writes it, and only there: the
+file's own top-level declarations, then its imports, alias included, followed
+through a barrel's re-exports to the definition. A name imported from a
+specifier the resolver cannot map (a package, an unknown alias, a missing file)
+is that package's component, which the analysis does not see — never a
+same-named component of the analysed tree, whose body would run in its place
+[#389](https://github.com/rboudrouss/reactant-analyzer/issues/389). Only a name
+the file neither declares nor imports falls back to the name, and only when
+exactly one analysed file defines it. A member name (`<UI.Button>`, a namespace
+import) is never resolved. A name bound inside a body (`const Icon = item.icon;
+<Icon />`) is not a declaration of the file and still takes the name fallback,
+which may run a same-named component in place of the value
+[#392](https://github.com/rboudrouss/reactant-analyzer/issues/392).
 
-A custom hook call is resolved the same way, through its import. A hook
-imported from a specifier the resolver cannot map (a package, an unknown alias)
-is never bound to a same-named hook of the analysed tree: it takes its
-`SummaryRegistry` entry, or stays opaque. Only a call with no import at all falls
-back to the name, first file by path on a collision
+Every other child is unanalysable, like any callee outside the run: a package's
+component, an import that leads to no component the analysis holds (a value it
+does not read as a component, a re-export it cannot follow), and a name
+**several** analysed files define with nothing to say which is meant — rather
+than the file that happens to sort first. Props and setters stop flowing into
+it: they may be called at any time with anything, so the state they write is
+unknown, but the loop that write drives is not reported yet
+[#325](https://github.com/rboudrouss/reactant-analyzer/issues/325), and
+cross-component findings through that reference are missed. The run says so,
+as an `analysis-limit` on the parent (`--info`), and an explicit import from
+the defining file resolves an ambiguous name
+[#7](https://github.com/rboudrouss/reactant-analyzer/issues/7).
+
+A custom hook call is resolved the same way, through its import and the
+re-exports it leads through. A hook imported from a specifier the resolver
+cannot map (a package, an unknown alias) is never bound to a same-named hook of
+the analysed tree: it takes its `SummaryRegistry` entry, or stays opaque. Only a
+call with no import at all falls back to the name, and only when exactly one
+analysed file defines that hook; on a collision it stays opaque
 ([ADR-013](adr/ADR-013-cross-file-analysis.md),
-[#226](https://github.com/rboudrouss/reactant-analyzer/issues/226)).
+[#226](https://github.com/rboudrouss/reactant-analyzer/issues/226), #389). A
+member call (`api.useQuery()`) is such a call, whatever `api` is
+[#392](https://github.com/rboudrouss/reactant-analyzer/issues/392).
 
 Discovery is the sole producer of analyzed files, so on a **narrowed** run
 (`reactant check src/features`) an import resolved outside the named paths is

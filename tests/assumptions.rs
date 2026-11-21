@@ -343,6 +343,66 @@ fn a_foreign_polyfill_feeds_no_fact_the_app_reads() {
     assert_eq!(values(&on), Some(vec!["src/polyfill.ts".to_string()]));
 }
 
+/// #389: an app imports `Trans` from a package while a declared file defines
+/// a `Trans` of its own. The app's element is the package's component, which
+/// the analysis does not see — never the declared homonym, whose analysis
+/// reads the whole program's fact and whose heap, joined back into its
+/// parents', would make every member read of the app a hand-over (S34's
+/// probe4: `Child` reported under the polyfill's "any name" fact).
+#[test]
+fn a_package_homonym_in_a_declared_file_feeds_no_fact_to_the_app() {
+    const APP: &str = r#"import { useState } from 'react';
+import { Trans } from '@lingui/react/macro';
+import { useHot } from './useHot';
+function Label() {
+  return <Trans>hello</Trans>;
+}
+function Child({ setOpen }: { setOpen: (b: boolean) => void }) {
+  useHot({ keys: 'esc', callback: () => setOpen(false) });
+  return <div onClick={() => setOpen(true)}><Label /></div>;
+}
+export function Parent() {
+  const [open, setOpen] = useState(false);
+  return <>{String(open)}<Child setOpen={setOpen} /></>;
+}
+"#;
+    const USE_HOT: &str = r#"export const useHot = ({ keys, callback, options }: { keys: string; callback: () => void; options?: { a?: boolean } }) => {
+  const a = options?.a ? 1 : 0;
+  return [keys.length + a, callback];
+};
+"#;
+    const INSTALL: &str = r#"export function install(target: object, name: string) {
+  Object.defineProperty(target, name, { get() { return 1; } });
+}
+"#;
+    const SDK_TRANS: &str = r#"export const Trans = ({ children }: { children?: string }) => <span>{children}</span>;
+"#;
+    let p = Project::new(&[
+        ("app/App.tsx", APP),
+        ("app/useHot.ts", USE_HOT),
+        ("poly/install.ts", INSTALL),
+        ("sdk/Trans.tsx", SDK_TRANS),
+    ]);
+    let handed = |doc: &serde_json::Value| -> Vec<String> {
+        doc["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|d| d["rule"].as_str() == Some("cross-setter-in-render"))
+            .map(|d| d["message"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let off = p.json(&[]);
+    assert_eq!(handed(&off).len(), 1, "off: the polyfill's any-name fact");
+    let on = p.json(&[
+        "--assume",
+        "foreignRealmFiles=poly/**",
+        "--assume",
+        "foreignRealmFiles=sdk/**",
+    ]);
+    assert!(handed(&on).is_empty(), "on: {:?}", handed(&on));
+}
+
 /// A glob that names no file declares a premise that changes nothing: the
 /// loop stays, and the output still states it.
 #[test]

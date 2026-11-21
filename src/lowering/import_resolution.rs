@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use oxc_ast::ast::{ImportDeclarationSpecifier, Program, Statement};
 
-use crate::ir::expr::CompOrigin;
+use crate::ir::expr::{CompOrigin, ElementOrigin};
 use crate::ir::types::Symbol;
 use crate::resolver::ImportResolver;
 
@@ -142,18 +142,28 @@ pub fn build_resolved_imports(
     current_file: &Path,
     resolver: &dyn ImportResolver,
 ) -> HashMap<String, ResolvedImport> {
-    let mut map = HashMap::new();
+    import_bindings(program, current_file, resolver)
+        .into_iter()
+        .filter_map(|(local, resolved)| Some((local, resolved?)))
+        .collect()
+}
+
+/// Every named and default import binding of `program`, with the definition
+/// it resolves to — `None` when the resolver maps its specifier to no file.
+fn import_bindings(
+    program: &Program,
+    current_file: &Path,
+    resolver: &dyn ImportResolver,
+) -> Vec<(String, Option<ResolvedImport>)> {
+    let mut out = Vec::new();
     for stmt in &program.body {
         let Statement::ImportDeclaration(decl) = stmt else {
-            continue;
-        };
-        let source = decl.source.value.as_str();
-        let Some(resolved) = resolver.resolve(current_file, source) else {
             continue;
         };
         let Some(specifiers) = &decl.specifiers else {
             continue;
         };
+        let resolved = resolver.resolve(current_file, decl.source.value.as_str());
         for spec in specifiers {
             let (local, imported) = match spec {
                 ImportDeclarationSpecifier::ImportSpecifier(s) => {
@@ -164,16 +174,15 @@ pub fn build_resolved_imports(
                 }
                 ImportDeclarationSpecifier::ImportNamespaceSpecifier(_) => continue,
             };
-            map.insert(
+            out.push((
                 local.to_string(),
-                ResolvedImport {
-                    file: resolved.clone(),
-                    imported,
-                },
-            );
+                resolved
+                    .clone()
+                    .map(|file| ResolvedImport { file, imported }),
+            ));
         }
     }
-    map
+    out
 }
 
 /// Build a map from locally-bound import name → resolved absolute file path,
@@ -204,8 +213,7 @@ pub fn build_resolved_import_map(
         .collect()
 }
 
-/// Local binding name → the component that name was proven to stand for, for
-/// one file.
+/// Local binding name → what that name was proven to stand for, for one file.
 ///
 /// The map a JSX callee is stamped with at lowering ([`Expr::CompApp::origin`]).
 /// `Arc` because every body of the file — every nested `FnLit`, every hook
@@ -213,50 +221,53 @@ pub fn build_resolved_import_map(
 ///
 /// [`Expr::CompApp::origin`]: crate::ir::expr::Expr::CompApp
 #[derive(Debug, Clone, Default)]
-pub struct JsxOrigins(Arc<HashMap<Symbol, Arc<CompOrigin>>>);
+pub struct JsxOrigins(Arc<HashMap<Symbol, Arc<ElementOrigin>>>);
 
 impl JsxOrigins {
-    /// The component `local` was proven to name here, or `None` when nothing
-    /// in this file settles it.
-    pub fn get(&self, local: &str) -> Option<&Arc<CompOrigin>> {
+    /// What `local` was proven to name here, or `None` when this file
+    /// neither declares nor imports it.
+    pub fn get(&self, local: &str) -> Option<&Arc<ElementOrigin>> {
         self.0.get(local)
     }
 }
 
-/// Resolve every name `file` could write as a JSX callee to the component it
-/// names: its own top-level declarations, plus every import the resolver maps
-/// to a real file.
+/// Resolve every name `file` could write as a JSX callee to what it names:
+/// its own top-level declarations and the imports the resolver maps to a
+/// real file are program definitions; an import the resolver maps to no file
+/// (a package, an unmapped alias, a missing file) is unseen code, which no
+/// same-named component of the program stands for (#389).
 ///
 /// Imports are laid down last on purpose — not because a file can both declare
 /// and import one name (that is a redeclaration error), but so the rule is
 /// stated once rather than depending on which pass ran first.
 ///
-/// A name absent from the map is *unresolved*, not absent from the program:
-/// namespace imports, re-export barrels and npm packages all land there, and
-/// the engine falls back to resolution by name.
+/// A name absent from the map is one the file neither declares nor imports
+/// (a namespace member, a global, a binding of a body): the engine falls back
+/// to resolution by name.
 pub fn build_jsx_origins(
     program: &Program,
     current_file: &Path,
     resolver: &dyn ImportResolver,
 ) -> JsxOrigins {
-    let mut map: HashMap<Symbol, Arc<CompOrigin>> = HashMap::new();
+    let mut map: HashMap<Symbol, Arc<ElementOrigin>> = HashMap::new();
     for name in super::top_level_binding_names(program) {
         map.insert(
             name.clone(),
-            Arc::new(CompOrigin {
+            Arc::new(ElementOrigin::Program(CompOrigin {
                 file: current_file.to_path_buf(),
                 name,
-            }),
+            })),
         );
     }
-    for (local, origin) in build_resolved_imports(program, current_file, resolver) {
-        map.insert(
-            local,
-            Arc::new(CompOrigin {
-                file: origin.file,
-                name: origin.imported,
+    for (local, resolved) in import_bindings(program, current_file, resolver) {
+        let origin = match resolved {
+            Some(r) => ElementOrigin::Program(CompOrigin {
+                file: r.file,
+                name: r.imported,
             }),
-        );
+            None => ElementOrigin::Unseen,
+        };
+        map.insert(local, Arc::new(origin));
     }
     JsxOrigins(Arc::new(map))
 }
