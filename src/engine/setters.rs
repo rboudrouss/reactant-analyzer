@@ -1592,6 +1592,43 @@ fn class_phase(class: WalkClass, region: WriterRegion) -> WriterPhase {
     }
 }
 
+/// The lexical region `hook`'s body is, with the parameters no env binds (a
+/// callback's): what the relations of a component walk besides its render.
+/// A function a component element receives is a handler region unless the
+/// element instantiates a child the analysis does not see
+/// ([`CallRelation::unseen_element`]): that child receives it as an unseen
+/// callee receives an argument, and the walk reaches it at the element, at
+/// an unknown time (#325).
+fn hook_region<'h>(
+    hook: &'h HookEntry,
+    calls: &CallRelation,
+) -> Option<(WriterRegion, &'h CFG, &'h [Var])> {
+    match hook {
+        HookEntry::Effect {
+            label, body_cfg, ..
+        } => Some((WriterRegion::Effect(*label), body_cfg, &[])),
+        HookEntry::Memo {
+            label, body_cfg, ..
+        } => Some((WriterRegion::Memo(*label), body_cfg, &[])),
+        HookEntry::Callback {
+            label,
+            body_cfg,
+            params,
+            ..
+        } => Some((WriterRegion::Callback(*label), body_cfg, params)),
+        HookEntry::Handler {
+            label,
+            body_cfg,
+            element,
+            ..
+        } => match element.is_some_and(|props| calls.unseen_element(props)) {
+            true => None,
+            false => Some((WriterRegion::Handler(*label), body_cfg, &[])),
+        },
+        _ => None,
+    }
+}
+
 /// The slot → writers relation, computed once at convergence over the
 /// post-expansion CFGs and stored on `AnalysisResult` (ADR-027 §1).
 ///
@@ -1889,23 +1926,8 @@ pub(crate) fn collect_slot_writers(
     let mut stores: Vec<SlotWriter> = Vec::new();
     push_sites(WriterRegion::Render, render_cfg, &[], &mut out, &mut stores);
     for hook in hooks {
-        let (region, body, params) = match hook {
-            HookEntry::Effect {
-                label, body_cfg, ..
-            } => (WriterRegion::Effect(*label), body_cfg, &[][..]),
-            HookEntry::Memo {
-                label, body_cfg, ..
-            } => (WriterRegion::Memo(*label), body_cfg, &[][..]),
-            HookEntry::Callback {
-                label,
-                body_cfg,
-                params,
-                ..
-            } => (WriterRegion::Callback(*label), body_cfg, &params[..]),
-            HookEntry::Handler {
-                label, body_cfg, ..
-            } => (WriterRegion::Handler(*label), body_cfg, &[][..]),
-            _ => continue,
+        let Some((region, body, params)) = hook_region(hook, calls) else {
+            continue;
         };
         push_sites(region, body, params, &mut out, &mut stores);
     }
@@ -3145,12 +3167,20 @@ impl<'a> SetterWalk<'a> {
         }
         // A JSX prop React or the child may invoke runs as a listener, the
         // class extraction gives a literal there (`extract_handlers`); what
-        // any other value there holds is walked the same way (#239).
+        // any other value there holds is walked the same way (#239). A child
+        // the analysis does not see takes every prop as an unseen callee
+        // takes an argument: it may call it at any time, a render included
+        // (#325). The literal is no handler region there (`hook_region`), so
+        // it is walked here.
         if let Expr::NativeElem { props, .. } | Expr::CompApp { props, .. } = expr
             && let Expr::ObjectLit { id, fields, .. } = props.peel_ts()
         {
             let native = matches!(expr, Expr::NativeElem { .. });
-            let class = self.listener_class();
+            let unseen = !native && self.calls.unseen_element(*id);
+            let class = match unseen {
+                true => WalkClass::Unknown,
+                false => self.listener_class(),
+            };
             for (i, (name, val)) in fields.iter().enumerate() {
                 if !crate::lowering::hook_extractor::invoked_prop(native, name) {
                     continue;
@@ -3158,15 +3188,17 @@ impl<'a> SetterWalk<'a> {
                 // A literal there, or a name the render binds to one or to a
                 // `useCallback`, is a handler region of its own
                 // (`extract_handlers`): only what anything else holds.
-                let reified = match val.peel_ts() {
-                    Expr::FnLit { .. } => true,
-                    Expr::Var(v) => self.handlers.contains(v),
-                    _ => false,
-                };
+                let reified = !unseen
+                    && match val.peel_ts() {
+                        Expr::FnLit { .. } => true,
+                        Expr::Var(v) => self.handlers.contains(v),
+                        _ => false,
+                    };
                 if !reified {
                     // ⊤ here only because the program dispatches events
                     // (#219): the rows say so.
-                    let outer = std::mem::replace(&mut self.listening, self.dispatches);
+                    let listening = self.dispatches && !unseen;
+                    let outer = std::mem::replace(&mut self.listening, listening);
                     self.relation_handed(
                         Some((*id, i)),
                         val,
@@ -3837,20 +3869,8 @@ pub fn collect_slot_reads(comp: &AnalysisResult<StateValue>) -> Vec<SlotRead> {
     };
     push(WriterRegion::Render, render_cfg, &mut out);
     for hook in hooks {
-        let (region, body) = match hook {
-            HookEntry::Effect {
-                label, body_cfg, ..
-            } => (WriterRegion::Effect(*label), body_cfg),
-            HookEntry::Memo {
-                label, body_cfg, ..
-            } => (WriterRegion::Memo(*label), body_cfg),
-            HookEntry::Callback {
-                label, body_cfg, ..
-            } => (WriterRegion::Callback(*label), body_cfg),
-            HookEntry::Handler {
-                label, body_cfg, ..
-            } => (WriterRegion::Handler(*label), body_cfg),
-            _ => continue,
+        let Some((region, body, _)) = hook_region(hook, &comp.calls) else {
+            continue;
         };
         push(region, body, &mut out);
     }

@@ -485,6 +485,7 @@ fn remap_hook_entry(entry: HookEntry, off: Offsets) -> HookEntry {
             params,
             span,
             dom_event,
+            element,
         } => HookEntry::Handler {
             label: label + off.labels,
             event,
@@ -492,6 +493,7 @@ fn remap_hook_entry(entry: HookEntry, off: Offsets) -> HookEntry {
             params,
             span,
             dom_event,
+            element: element.map(|id| ExprId(id.0 + off.ids)),
         },
     }
 }

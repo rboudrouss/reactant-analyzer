@@ -14,7 +14,7 @@ pub(crate) use interpreter::bind_params;
 pub(crate) use interpreter::call_targets;
 pub(crate) use interpreter::callback_sites;
 pub(crate) use interpreter::closure_env;
-pub(crate) use interpreter::escape;
+pub(crate) use interpreter::escape_at;
 pub(crate) use interpreter::exec_body;
 pub(crate) use interpreter::exec_fn_value;
 pub(crate) use interpreter::exec_stmt_with_callbacks;

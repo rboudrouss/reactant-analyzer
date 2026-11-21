@@ -357,6 +357,7 @@ mod tests {
             params: vec![],
             span: None,
             dom_event: true,
+            element: None,
         };
         assert_eq!(client_only_hook(&handler, None), None);
     }
