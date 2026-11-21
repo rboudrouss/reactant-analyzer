@@ -157,8 +157,9 @@ that writes it (see *Cross-file limits*).
   claimed [#325](https://github.com/rboudrouss/reactant-analyzer/issues/325). The cost is a
   Warning on every closure handed to a package's component that calls it on events only (a
   library `<Button onClick>`); no package component carries a timing summary yet, and a
-  declaration of the ones that run their props from listeners is the route to remove them
-  ([#297](https://github.com/rboudrouss/reactant-analyzer/issues/297)). A rest parameter (`(...fs)`) and `arguments` are the arrays of the call's arguments
+  per-prop declaration of the ones that run their props from listeners is the route to remove
+  them ([#394](https://github.com/rboudrouss/reactant-analyzer/issues/394), through
+  [#297](https://github.com/rboudrouss/reactant-analyzer/issues/297)'s declarations). A rest parameter (`(...fs)`) and `arguments` are the arrays of the call's arguments
   [#324](https://github.com/rboudrouss/reactant-analyzer/issues/324); from a spread on an argument
   may sit at any position, and `fs.length` / `arguments.length` are not modelled, so a guard on
   them never rules a write out. Utility *inlining* is statement-position only [#52](https://github.com/rboudrouss/reactant-analyzer/issues/52). A setter
