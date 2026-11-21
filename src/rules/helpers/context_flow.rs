@@ -209,7 +209,8 @@ fn context_reads(
 /// row, so **over**-inclusion is the safe direction and a missed component is
 /// the forbidden one. A resolved reference contributes the one component its
 /// origin proves; an unresolved one contributes every component that could be
-/// the one it wrote (#7).
+/// the one it wrote (#7); one imported from unseen code contributes none, as
+/// what it instantiates is no component of the program (#389).
 fn unreached_component_refs(prog: &ProgramAnalysisResult) -> HashSet<ComponentId> {
     let mut refs = HashSet::new();
     for (id, comp) in &prog.components {
@@ -225,10 +226,7 @@ fn unreached_component_refs(prog: &ProgramAnalysisResult) -> HashSet<ComponentId
     let table = &prog.component_table;
     let mut out: HashSet<ComponentId> = HashSet::new();
     for r in &refs {
-        match &r.origin {
-            Some(o) => out.extend(table.id_of(o)),
-            None => out.extend(table.ids_named(&r.name)),
-        }
+        out.extend(r.candidates(table));
     }
     out
 }

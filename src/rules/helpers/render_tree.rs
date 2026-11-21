@@ -19,7 +19,7 @@ use crate::engine::render_deps::{
     written_names,
 };
 use crate::engine::{ProgramAnalysisResult, WriterRegion};
-use crate::ir::{ComponentId, HookLabel, SourceRange, Symbol};
+use crate::ir::{ComponentId, ElementOrigin, ElementTarget, HookLabel, SourceRange, Symbol};
 use crate::lowering::hook_extractor::{is_event_prop, prop_to_event};
 
 /// Depth past which the descent stops (as if the element were opaque).
@@ -769,9 +769,16 @@ pub(in crate::rules) fn resolve(
     program: &ProgramAnalysisResult,
 ) -> Option<ComponentId> {
     let table = &program.component_table;
-    // Only a proven origin: a name match could pick a same-named component of
+    // Only a proven origin (through a barrel's re-exports, as the engine
+    // resolves it): a name match could pick a same-named component of
     // another file, and a wrong child hides the real one's uses. An element
     // the registry does not hold (a `memo` wrapper, a library component, an
     // unresolved import) is opaque.
-    site.origin.as_deref().and_then(|o| table.id_of(o))
+    let origin = site.origin.as_deref();
+    match table.element(&site.name, origin) {
+        ElementTarget::Component(id) if matches!(origin, Some(ElementOrigin::Program(_))) => {
+            Some(id)
+        }
+        _ => None,
+    }
 }

@@ -634,6 +634,16 @@ on a program React settles; 323 oracle cases, none a known false negative.
   calls deep, or a program function by name, in the same file or another,
   runs what that call returns or that function: a loop in it, silent behind
   an `analysis-limit` Info, is reported (#383).
+- A JSX element whose name is imported from a package (or any specifier the
+  resolver maps to no file) is that package's component, which the analysis
+  does not see, never a same-named component of the program: twenty's 83
+  `<Trans>` from `@lingui/react/macro` ran twenty-sdk's `Trans` instead.
+  One rule for every reader of the component tree: an import is followed
+  through a barrel's re-exports, and only a name the file neither declares
+  nor imports falls back to the one component or custom hook of that name,
+  none when several files define it. A child imported through a barrel is
+  no longer analysed a second time as a root, which overwrote its parent's
+  result and silenced its loop (#389).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

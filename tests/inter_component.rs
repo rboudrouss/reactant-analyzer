@@ -650,13 +650,20 @@ export function App() {
 }
 
 /// `files` (`(path, source)`), each lowered on its own as the driver does:
-/// every file numbers its allocation sites from zero.
+/// every file numbers its allocation sites from zero. Imports resolve among
+/// `files`, as the driver's resolver maps them on disk.
 fn analyze_files(files: &[(&str, &str)]) -> ProgramAnalysisResult {
     use oxc_allocator::Allocator;
     use oxc_parser::{ParseOptions, Parser};
     use oxc_span::SourceType;
-    use reactant::lowering::lower_program;
+    use reactant::lowering::lower_program_with_resolver;
+    use reactant::resolver::{DefaultImportResolver, MemFileSystem};
 
+    let resolver = DefaultImportResolver::new(std::sync::Arc::new(MemFileSystem::from_map(
+        files
+            .iter()
+            .map(|(path, src)| (std::path::PathBuf::from(path), src.to_string())),
+    )));
     let mut table = Default::default();
     let mut components = Vec::new();
     for (path, src) in files {
@@ -665,11 +672,12 @@ fn analyze_files(files: &[(&str, &str)]) -> ProgramAnalysisResult {
             .with_options(ParseOptions::default())
             .parse();
         assert!(ret.diagnostics.is_empty(), "{:?}", ret.diagnostics);
-        components.extend(lower_program(
+        components.extend(lower_program_with_resolver(
             &ret.program,
             src,
             std::path::Path::new(path),
             &mut table,
+            &resolver,
         ));
     }
     analyze_program(
