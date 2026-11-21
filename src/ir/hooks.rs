@@ -4,7 +4,7 @@ use crate::ir::{
     cfg::CFG,
     expr::Expr,
     source_range::SourceRange,
-    types::{HookLabel, Symbol, Var},
+    types::{ExprId, HookLabel, Symbol, Var},
 };
 
 /// Provenance of one hook call: `label → (origin hook, source, direct|inlined)`.
@@ -340,6 +340,13 @@ pub enum HookEntry {
         /// component may call it whenever it runs), nor an
         /// `addEventListener` callback, whose timing `registrations` decides.
         dom_event: bool,
+        /// A function a component element receives: the allocation site of
+        /// that element's props object. Its body is a handler region only
+        /// where the element's child is analysed, whose own regions say when
+        /// it calls it; an element the analysis does not see takes it as an
+        /// unseen callee takes an argument (#325). `None` for a host
+        /// element's prop and a registered listener.
+        element: Option<ExprId>,
     },
 }
 

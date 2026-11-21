@@ -7,7 +7,7 @@ use crate::{
         AbstractDomain, AnalysisCtx, Transfer,
         impls::{BoolVal, Interval, SetterVal, Stability, StateValue, StrConst},
         interp::{
-            access_key, alloc_literal, call_targets, callback_sites, closure_env, escape,
+            access_key, alloc_literal, call_targets, callback_sites, closure_env, escape_at,
             exec_stmt_with_callbacks, receiver_kind, returned_sites, run_cfg,
         },
         stores::{AbstractEnv, EnvVal, Heap, HeapValue, Sites, member_key},
@@ -503,17 +503,28 @@ pub(crate) fn returns_no_input(
 /// [`AnalysisCtx::write_slot`] — an own slot in `ctx.state`, a forwarded
 /// ancestor's in the `SharedStateStore` its fixpoint imports: the fallback
 /// wherever the run falls short, so no slot is written less than it was.
+///
+/// The relation records each prop at the element (ADR-047: the props object,
+/// the prop's index) and, when the child is `unseen` — the program does not
+/// analyse it, rather than this pass alone — marks the element so: that code
+/// may call what a prop reaches at any time, a render included, so the writer
+/// walk reads the position as an unseen callee's argument, never as an event
+/// handler (#325).
 fn havoc_setter_props(
     props_expr: &Expr,
+    unseen: bool,
     env: &AbstractEnv<StateValue>,
     ctx: &mut AnalysisCtx<StateValue>,
 ) {
-    let Expr::ObjectLit { fields, .. } = props_expr else {
+    let Expr::ObjectLit { id, fields } = props_expr else {
         return;
     };
+    if unseen {
+        ctx.record(|r| r.mark_unseen_element(*id));
+    }
     let mut setters: Vec<(ComponentId, crate::ir::types::HookLabel)> = Vec::new();
-    for (_, v) in fields {
-        escape(&StateValueTransfer, v, env, ctx);
+    for (i, (_, v)) in fields.iter().enumerate() {
+        escape_at(&StateValueTransfer, v, env, ctx, Some((*id, i)));
         // Bare setter prop (`<X onOpenChange={setOpen}/>`): the value
         // carries its owner (`StateSetter` always evals to a
         // `component_setter`, intra included).
@@ -655,8 +666,11 @@ fn eval_comp_app(
     let Some(inter) = ctx.inter else {
         // Intra-component analysis: every child is unanalyzable, so any
         // setter escaping into props may be invoked with any argument —
-        // same argument as the unknown-child branch below (TODO.md B).
-        havoc_setter_props(props_expr, env, ctx);
+        // same argument as the unknown-child branch below (TODO.md B). A
+        // pass that only skips the children the program analyses (the
+        // post-render pass) leaves them seen.
+        let unseen = !ctx.query.resolves_children();
+        havoc_setter_props(props_expr, unseen, env, ctx);
         return;
     };
     // What this element hands its child, and what the child writes back
@@ -695,25 +709,31 @@ fn eval_comp_app(
                 };
                 refs.insert((inter.component, name.clone()));
             }
-            havoc_setter_props(props_expr, env, ctx);
+            havoc_setter_props(props_expr, true, env, ctx);
             return;
         }
     };
 
-    // Recursion guard — before the IR clone, which is not free.
+    // Recursion guard — before the IR clone, which is not free. The child is
+    // not run with what this element hands it: those props are handed to
+    // code the analysis does not run here, as an unresolved child's are
+    // (#325).
     if inter.is_recursive(child) {
-        let mut stats = inter.stats.borrow_mut();
-        stats.recursion_cutoffs += 1;
-        stats
-            .recursive_component_refs
-            .insert((inter.component, child));
+        {
+            let mut stats = inter.stats.borrow_mut();
+            stats.recursion_cutoffs += 1;
+            stats
+                .recursive_component_refs
+                .insert((inter.component, child));
+        }
+        havoc_setter_props(props_expr, true, env, ctx);
         return;
     }
     // Unreachable — `resolve_child` just resolved it — but an unknown child may
     // invoke any setter it received, so the fallback is the unknown-child one,
     // never a silent skip.
     let Some(child_ir) = inter.registry.ir_of(child).cloned() else {
-        havoc_setter_props(props_expr, env, ctx);
+        havoc_setter_props(props_expr, true, env, ctx);
         return;
     };
 

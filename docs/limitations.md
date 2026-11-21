@@ -147,9 +147,18 @@ that writes it (see *Cross-file limits*).
   name. `setter-in-render` and the cross-component arm read a JSX prop's or a registered
   listener's write as the event handler it is even in a program that dispatches events itself,
   where the loop rules read it as ⊤ ([#219](https://github.com/rboudrouss/reactant-analyzer/issues/219)):
-  a render that dispatches an event to such a listener is not their finding. A child component
-  the analysis does not resolve is read as calling the props it is handed on an event only
-  [#325](https://github.com/rboudrouss/reactant-analyzer/issues/325). A rest parameter (`(...fs)`) and `arguments` are the arrays of the call's arguments
+  a render that dispatches an event to such a listener is not their finding. Only React DOM's
+  handlers are listeners by default: a host element's `on*` prop, and a component's prop where
+  the analysis runs the component, whose own bodies say when it calls it. A child component the
+  analysis does not see — a package's, an element value it does not resolve, a name several files
+  define, a component rendering itself — may call what it is handed at any time, a render
+  included: each prop is handed to unseen code, as an unknown callee's argument is, so a setter
+  it holds or a closure writing one is a Warning (`setter-in-render`), and a loop through it is
+  claimed [#325](https://github.com/rboudrouss/reactant-analyzer/issues/325). The cost is a
+  Warning on every closure handed to a package's component that calls it on events only (a
+  library `<Button onClick>`); no package component carries a timing summary yet, and a
+  declaration of the ones that run their props from listeners is the route to remove them
+  ([#297](https://github.com/rboudrouss/reactant-analyzer/issues/297)). A rest parameter (`(...fs)`) and `arguments` are the arrays of the call's arguments
   [#324](https://github.com/rboudrouss/reactant-analyzer/issues/324); from a spread on an argument
   may sit at any position, and `fs.length` / `arguments.length` are not modelled, so a guard on
   them never rules a write out. Utility *inlining* is statement-position only [#52](https://github.com/rboudrouss/reactant-analyzer/issues/52). A setter
@@ -885,8 +894,9 @@ does not read as a component, a re-export it cannot follow), and a name
 **several** analysed files define with nothing to say which is meant — rather
 than the file that happens to sort first. Props and setters stop flowing into
 it: they may be called at any time with anything, so the state they write is
-unknown, but the loop that write drives is not reported yet
-[#325](https://github.com/rboudrouss/reactant-analyzer/issues/325), and
+unknown, and a write through one is a write of unknown timing, a render
+included, which the loop rules read
+[#325](https://github.com/rboudrouss/reactant-analyzer/issues/325);
 cross-component findings through that reference are missed. The run says so,
 as an `analysis-limit` on the parent (`--info`), and an explicit import from
 the defining file resolves an ambiguous name

@@ -960,6 +960,7 @@ pub fn rename_hook_entry(entry: HookEntry, ren: &HashMap<Var, Var>) -> HookEntry
             params,
             span,
             dom_event,
+            element,
         } => {
             // The body scope shadows its own params, as a callback's does.
             let inner = without(ren, &params);
@@ -970,6 +971,7 @@ pub fn rename_hook_entry(entry: HookEntry, ren: &HashMap<Var, Var>) -> HookEntry
                 params,
                 span,
                 dom_event,
+                element,
             }
         }
         HookEntry::Custom {

@@ -209,9 +209,27 @@ pub struct CallRelation {
     /// The half and the member of each accessor body an access ran: what a
     /// write inside it says runs it.
     accessors: HashMap<ExprId, crate::engine::setters::AccessorOf>,
+    /// The JSX elements, by their props object, some evaluation of which
+    /// instantiates a child the analysis does not see (#325): a package's
+    /// component, an element value it does not resolve, an ambiguous name.
+    /// Each function prop is handed there to unseen code, at an unknown time.
+    unseen: BTreeSet<ExprId>,
 }
 
 impl CallRelation {
+    /// Some evaluation of the element whose props object is `props`
+    /// instantiated a child the analysis does not see.
+    pub fn mark_unseen_element(&mut self, props: ExprId) {
+        self.unseen.insert(props);
+    }
+
+    /// The element whose props object is `props` may instantiate a child the
+    /// analysis does not see ([`Self::mark_unseen_element`]): what it hands
+    /// its child is handed to unseen code, as an unseen callee's argument is.
+    pub fn unseen_element(&self, props: ExprId) -> bool {
+        self.unseen.contains(&props)
+    }
+
     /// The module bindings some write of the program stored a setter or a
     /// closure in (#335): the anchors whose row ([`Self::escapes`] at
     /// position 0) says what each may hold, which a call of module code the
@@ -536,6 +554,7 @@ impl CallRelation {
             self.slot_names.entry(*slot).or_insert_with(|| name.clone());
         }
         self.module.extend(other.module.iter().copied());
+        self.unseen.extend(other.unseen.iter().copied());
     }
 }
 

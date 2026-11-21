@@ -63,6 +63,7 @@ fn collect_subscriptions_in_expr(
             params: params.to_vec(),
             span: stmt_span,
             dom_event: false,
+            element: None,
         });
         collect_subscriptions_in_expr(fn_, stmt_span, out, next_label);
         for arg in args.iter().skip(2) {
@@ -222,6 +223,7 @@ fn collect_handlers_in_expr(
                                     .find(|(k, _)| k == name)
                                     .and_then(|(_, s)| *s),
                                 dom_event: is_event_prop(name),
+                                element: None,
                             });
                         }
                     } else {
@@ -240,9 +242,11 @@ fn collect_handlers_in_expr(
         // heuristic, TODO.md B). Only FnLits — inline or locally bound —
         // resolve through `handler_body`, so module-level components passed
         // as props (`component={Page}`) never match. Non-function values
-        // recurse for nested JSX (incl. `children`).
+        // recurse for nested JSX (incl. `children`). Whether the body is a
+        // handler region is the element's resolution's to say, which the
+        // engine knows: the entry names the element (#325).
         Expr::CompApp { props, span, .. } => {
-            if let Expr::ObjectLit { fields, .. } = props.as_ref() {
+            if let Expr::ObjectLit { id, fields } = props.as_ref() {
                 for (name, val) in fields {
                     if let Some((params, body_cfg)) = handler_body(val, var_bodies) {
                         let label = *next_label;
@@ -257,6 +261,7 @@ fn collect_handlers_in_expr(
                             // nearest true one, and beats no position at all.
                             span: *span,
                             dom_event: false,
+                            element: Some(*id),
                         });
                     } else {
                         collect_handlers_in_expr(val, var_bodies, found, next_label);

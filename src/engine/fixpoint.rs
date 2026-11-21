@@ -565,6 +565,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         hands_back: &hands_back,
         hook_reads: &hook_reads,
         module: &module_names,
+        resolves_children: inter.is_some(),
     };
     // A `useCallback` value is placed where its recompute hands it back (a
     // literal's closure at the hook's site, or the argument's sites, #320),
@@ -3304,6 +3305,7 @@ mod tests {
                 params: vec![],
                 span: None,
                 dom_event: true,
+                element: None,
             },
         ];
         let comp = component(
@@ -3359,6 +3361,7 @@ mod tests {
                 params: vec!["v".to_string()],
                 span: None,
                 dom_event: true,
+                element: None,
             },
         ];
         let comp = component(
@@ -3420,6 +3423,7 @@ mod tests {
                 params: vec![],
                 span: None,
                 dom_event: true,
+                element: None,
             },
         ];
         let comp = component(
@@ -3562,6 +3566,7 @@ mod tests {
                 params: vec![],
                 span: None,
                 dom_event: true,
+                element: None,
             },
         ];
         let comp = component(
@@ -3633,6 +3638,7 @@ mod tests {
                 params: vec![],
                 span: None,
                 dom_event: true,
+                element: None,
             },
         ];
         let comp = component(
@@ -3779,6 +3785,7 @@ mod tests {
                 params: vec![],
                 span: None,
                 dom_event: true,
+                element: None,
             },
         ];
         let render_stmts = vec![
@@ -3827,6 +3834,7 @@ mod tests {
                 params: vec![],
                 span: None,
                 dom_event: true,
+                element: None,
             },
         ];
         let comp = component(hooks, vec![]);

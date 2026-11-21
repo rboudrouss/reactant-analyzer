@@ -2304,7 +2304,7 @@ fn reads_module<D: AbstractDomain>(expr: &Expr, ctx: &AnalysisCtx<D>) -> bool {
 
 /// [`escape`], recording what the value reached at `at` — an anchor and a
 /// position of the call relation (ADR-047) — when the context records one.
-fn escape_at<T: Transfer>(
+pub(crate) fn escape_at<T: Transfer>(
     transfer: &T,
     expr: &Expr,
     env: &AbstractEnv<T::Domain>,

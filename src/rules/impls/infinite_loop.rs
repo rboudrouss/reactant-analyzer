@@ -1772,6 +1772,7 @@ mod tests {
                     params: vec![],
                     span: None,
                     dom_event: true,
+                    element: None,
                 });
             }
             let result = analyze_component(comp, &StateValueTransfer, &Config::default());
