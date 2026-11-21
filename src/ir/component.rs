@@ -56,6 +56,22 @@ pub struct ContextId {
     pub origin_name: String,
 }
 
+/// How React hands a component the `ref` of the element it renders (#64).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RefPassing {
+    /// As a prop: `props.ref` (a function component of React 19).
+    #[default]
+    Prop,
+    /// As the second argument of a `forwardRef` render, which receives its
+    /// props without `ref` (react-dom 19.3.1 `updateForwardRef`): `props.ref`
+    /// is `undefined`.
+    Argument,
+    /// Either, by element: a function a `forwardRef(Y)` wraps and that is
+    /// also rendered by its own name. `props.ref` is the element's `ref` or
+    /// `undefined`.
+    Either,
+}
+
 #[derive(Debug, Clone)]
 pub struct ComponentIR {
     /// Source file this component was lowered from. Used as part of the
@@ -64,6 +80,9 @@ pub struct ComponentIR {
     pub file: PathBuf,
     pub name: Symbol,
     pub param: Var,
+    /// How the element's `ref` reaches the component: the props a child's
+    /// analysis starts from are shaped by it.
+    pub ref_passing: RefPassing,
     /// Names of props whose TypeScript type is a DOM interface
     /// (`HTMLCanvasElement`, `SVGElement`, `Node`…). Mutating these is
     /// imperative DOM manipulation, not a write into React-owned data —

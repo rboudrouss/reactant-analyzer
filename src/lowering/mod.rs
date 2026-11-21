@@ -37,7 +37,7 @@ use oxc_ast::ast::{
 
 use crate::{
     ir::{
-        component::{ComponentIR, ModuleConstInit},
+        component::{ComponentIR, ModuleConstInit, RefPassing},
         expr::Prim,
         hook_ir::HookIR,
         types::Var,
@@ -1250,9 +1250,16 @@ pub fn lower_program_with_resolver(
         current_file: Some(file),
         bound: hook_extractor::ImportCtx::unbound(),
     };
+    let forward_ref_targets =
+        react_wrappers::ReactWrappers::of(program).forward_ref_targets(program);
     let components = detect_components(program)
         .into_iter()
         .map(|candidate| {
+            let ref_passing = match candidate.wrapped {
+                Some(react_wrappers::Wrapper::ForwardRef) => RefPassing::Argument,
+                _ if forward_ref_targets.contains(candidate.name.as_str()) => RefPassing::Either,
+                _ => RefPassing::Prop,
+            };
             let (param_names, mut render_cfg) = candidate.build_render_cfg(&ctx);
             let (mut hooks, hook_provenance, mut next_label) =
                 extract_hooks(&mut render_cfg, &imports, &ctx.ids);
@@ -1270,6 +1277,7 @@ pub fn lower_program_with_resolver(
                 file: file.to_path_buf(),
                 name: candidate.name,
                 param,
+                ref_passing,
                 dom_props,
                 render_cfg,
                 hooks,

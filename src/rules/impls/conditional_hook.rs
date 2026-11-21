@@ -475,6 +475,7 @@ mod tests {
             hooks,
             hook_provenance: vec![],
             module_consts: Default::default(),
+            ref_passing: Default::default(),
         };
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         assert!(
@@ -576,6 +577,7 @@ mod tests {
             hooks,
             hook_provenance: vec![],
             module_consts: Default::default(),
+            ref_passing: Default::default(),
         };
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         assert!(

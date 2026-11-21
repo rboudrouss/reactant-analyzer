@@ -17,7 +17,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use oxc_ast::ast::{Argument, Expression, ImportDeclarationSpecifier, Program, Statement};
+use oxc_ast::ast::{
+    Argument, BindingPattern, Declaration, Expression, ImportDeclarationSpecifier, Program,
+    Statement,
+};
 
 /// One of React's component wrappers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +132,58 @@ impl ReactWrappers {
         }
         call.map(|call| Wrapped { inner, call })
     }
+
+    /// The top-level bindings that are a wrapper around a name, in source
+    /// order: `const X = memo(Y)`, `export const X = forwardRef(Y)` as `("X",
+    /// …)`, `export default memo(Y)` as `("default", …)`.
+    pub(crate) fn name_wrappers<'e, 'a>(
+        &self,
+        program: &'e Program<'a>,
+    ) -> Vec<(String, Wrapped<'e, 'a>)> {
+        let mut out = Vec::new();
+        for stmt in &program.body {
+            let decl = match stmt {
+                Statement::VariableDeclaration(d) => d,
+                Statement::ExportNamedDeclaration(exp) => match &exp.declaration {
+                    Some(Declaration::VariableDeclaration(d)) => d,
+                    _ => continue,
+                },
+                Statement::ExportDefaultDeclaration(exp) => {
+                    if let Some(w) = exp.declaration.as_expression().and_then(|e| self.peel(e))
+                        && matches!(w.inner, Expression::Identifier(_))
+                    {
+                        out.push(("default".to_string(), w));
+                    }
+                    continue;
+                }
+                _ => continue,
+            };
+            for vd in &decl.declarations {
+                if let BindingPattern::BindingIdentifier(id) = &vd.id
+                    && let Some(w) = vd.init.as_ref().and_then(|e| self.peel(e))
+                    && matches!(w.inner, Expression::Identifier(_))
+                {
+                    out.push((id.name.to_string(), w));
+                }
+            }
+        }
+        out
+    }
+
+    /// The names a `forwardRef` wraps at the top level of the file
+    /// (`const X = forwardRef(Y)`): React calls such a `Y` with the
+    /// element's `ref` second and its props without it, and the file may
+    /// still render `Y` itself.
+    pub(crate) fn forward_ref_targets(&self, program: &Program) -> HashSet<String> {
+        self.name_wrappers(program)
+            .into_iter()
+            .filter(|(_, w)| w.call == Wrapper::ForwardRef)
+            .filter_map(|(_, w)| match w.inner {
+                Expression::Identifier(id) => Some(id.name.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -187,6 +242,24 @@ mod tests {
                 ("E".into(), None),
             ]
         );
+    }
+
+    /// The own bindings a `forwardRef` wraps by name, through composition.
+    #[test]
+    fn forward_ref_targets_are_the_names_a_forward_ref_wraps() {
+        let alloc = Allocator::default();
+        let src = "import { memo, forwardRef } from 'react';\n\
+                   import { Far } from './far';\n\
+                   function A() {}\nfunction B() {}\nfunction C() {}\n\
+                   const X = forwardRef(A);\n\
+                   export const Y = memo(forwardRef(B));\n\
+                   const Z = memo(C);\n\
+                   export default forwardRef(Far);";
+        let ret = Parser::new(&alloc, src, SourceType::tsx()).parse();
+        let w = ReactWrappers::of(&ret.program);
+        let mut got: Vec<_> = w.forward_ref_targets(&ret.program).into_iter().collect();
+        got.sort();
+        assert_eq!(got, vec!["A", "B", "Far"]);
     }
 
     /// A wrapper is React's only through the file's own proof: a program

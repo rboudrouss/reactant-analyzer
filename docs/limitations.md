@@ -998,16 +998,20 @@ calls a hook outside a nested function, or carries a component return type.
 React's wrappers are followed [#64](https://github.com/rboudrouss/reactant-analyzer/issues/64):
 a function written inside `memo(…)` or `forwardRef(…)` (nested ones too, `memo(forwardRef(…))`,
 through parentheses and type assertions) is a component under its binding's name, whatever its
-body, and `forwardRef`'s second parameter is the element's `ref` (`null` when none is passed). A
+body, and `forwardRef`'s second parameter is the element's `ref` (`null` when none is passed),
+the props it receives being without `ref` (`props.ref` is `undefined`, as in React). A
 wrapper of a name (`const X = memo(Y)`, `export default forwardRef(Y)`) stands for `Y`, as a
-re-export does: the file's own component, or the one `Y`'s import resolves. Only React's own
+re-export does: the file's own component, or the one `Y`'s import resolves; a `forwardRef` of an
+imported name stands for nothing (the other file cannot know how `ref` reaches its function),
+an unseen child. Only React's own
 wrappers count — `memo` / `forwardRef` imported from `react`, or a member of a binding of
 `react` (`React`, unbound, as the global); a program's or a package's function of that name is
-not React's. Three approximations, each sound: `memo` is read as its component rendered with
+not React's. Two approximations, each sound: `memo` is read as its component rendered with
 every parent render (the bailout, and `areEqual`, are a skipped render, a sub-case — a loop the
-memo breaks may still be a Warning); the props a `forwardRef` render receives still hold `ref`
-(React removes it); and the `Y` of `forwardRef(Y)` keeps its second parameter unknown, since it
-may also be rendered on its own, where React passes `undefined`. Other higher-order components
+memo breaks may still be a Warning); and the `Y` of `forwardRef(Y)` keeps its second parameter
+unknown and reads `props.ref` as the element's `ref` or `undefined`, since it may also be
+rendered on its own, where React passes `undefined` second and the `ref` as a prop. A
+component analysed as a root has unknown props, `props.ref` included. Other higher-order components
 (`styled(…)`, `React.lazy`, a library's `factory(…)`, `withX(…)`) are calls whose result the
 analysis does not see: an element of one is an unseen child
 [#325](https://github.com/rboudrouss/reactant-analyzer/issues/325).

@@ -12,7 +12,11 @@ use crate::{
         AnalysisResult, AnalysisStats, ComponentCache, ComponentCallGraph, ComponentRegistry,
         HookRegistry, ProgramReducers, Reducer, Reducers, fixpoint::Config,
     },
-    ir::{ComponentId, component::ComponentIR, expr::is_synthetic_key},
+    ir::{
+        ComponentId,
+        component::{ComponentIR, RefPassing},
+        expr::{FORWARDED_REF_KEY, is_synthetic_key},
+    },
 };
 
 // ── AnalyzeChildFn ─────────────────────────────────────────────────────────────
@@ -233,9 +237,31 @@ impl<'a> InterCtx<'a> {
         // A spread prop (`{...rest}`, kept under its synthetic key) may pass
         // any member.
         let spread = input.props.keys().any(|k| is_synthetic_key(k));
+        let mut passed = input.props;
+        // How React hands the element's `ref` over (#64): a `forwardRef`
+        // render gets it second and its props without it, which the
+        // preamble reads from the member it is kept under; a function that
+        // may be one gets `undefined` or the element's.
+        match ir.ref_passing {
+            RefPassing::Prop => {}
+            RefPassing::Argument => {
+                let undefined = || EnvVal::Val(StateValue::undefined());
+                // An element with no spread that passes no `ref` passes
+                // `undefined`; with one, the spread may carry it.
+                if let Some(r) = passed.remove("ref").or_else(|| (!spread).then(undefined)) {
+                    passed.insert(FORWARDED_REF_KEY.to_string(), r);
+                }
+                passed.insert("ref".to_string(), undefined());
+            }
+            RefPassing::Either => {
+                if let Some(r) = passed.get_mut("ref") {
+                    *r = r.join(&EnvVal::Val(StateValue::undefined()));
+                }
+            }
+        }
         let mut props = match spread {
-            true => Members::at_least(input.props),
-            false => Members::exactly(input.props),
+            true => Members::at_least(passed),
+            false => Members::exactly(passed),
         };
         // React builds it: a plain object (#336).
         props.plain = true;

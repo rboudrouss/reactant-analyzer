@@ -1179,9 +1179,11 @@ fn lower_binding_pattern(
 ///
 /// `forward_ref`: React calls the function as `forwardRef`'s render (#64),
 /// `render(props, ref)`, whatever the element's argument list: the second
-/// parameter is bound to the first's `ref` member, `null` when it is
-/// `undefined` (react-dom 19.3.1 `coerceRef`), before its own default — which
-/// therefore never applies.
+/// parameter is bound to the element's `ref`, `null` when it is `undefined`
+/// (react-dom 19.3.1 `coerceRef`), before its own default — which therefore
+/// never applies. The props the render receives lack `ref`: the element's
+/// is read from the member a child's props keep it under
+/// ([`crate::ir::expr::FORWARDED_REF_KEY`]), where `props.ref` is absent.
 pub(super) fn inject_param_preamble(
     params: &FormalParameters,
     own_arguments: Option<&FunctionBody>,
@@ -1217,7 +1219,7 @@ pub(super) fn inject_param_preamble(
                 var: name.clone(),
                 rhs: Expr::FieldAccess {
                     obj: Box::new(Expr::Var(names[0].clone())),
-                    field: "ref".to_string(),
+                    field: crate::ir::expr::FORWARDED_REF_KEY.to_string(),
                 },
                 span,
             });

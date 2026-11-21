@@ -17,9 +17,11 @@ use crate::resolver::ImportResolver;
 /// (the default) stands for `Y` as `export { Y as X }` makes it — the
 /// definition of this file, or the one an import resolves `Y` to. A `Y` the
 /// file neither declares nor imports from a program file gives no edge: the
-/// element stays unseen. Through a `forwardRef`, `Y`'s second parameter is
-/// what its lowering left it, ⊤: `Y` may also be rendered on its own, where
-/// React passes `undefined`.
+/// element stays unseen. Through a `forwardRef`, `Y` is called with `ref`
+/// second and its props without it, and the file marks its own `Y` for that
+/// ([`ReactWrappers::forward_ref_targets`], [`crate::ir::component::RefPassing::Either`]):
+/// a `Y` imported from another file has no mark, so a `forwardRef` of it
+/// gives no edge.
 fn wrapper_aliases(
     program: &Program,
     file: &Path,
@@ -30,39 +32,20 @@ fn wrapper_aliases(
     let declared: HashSet<String> = super::top_level_binding_names(program)
         .into_iter()
         .collect();
-    let target = |e: &Expression| -> Option<(PathBuf, String)> {
-        let Expression::Identifier(id) = wrappers.peel(e)?.inner else {
-            return None;
+    for (alias, wrapped) in wrappers.name_wrappers(program) {
+        let Expression::Identifier(id) = wrapped.inner else {
+            continue;
         };
         let name = id.name.as_str();
-        match declared.contains(name) {
+        let target = match declared.contains(name) {
             true => Some((file.to_path_buf(), name.to_string())),
+            false if wrapped.call == super::react_wrappers::Wrapper::ForwardRef => None,
             false => bindings
                 .get(name)
                 .map(|r| (r.file.clone(), r.imported.clone())),
-        }
-    };
-    for stmt in &program.body {
-        let decl = match stmt {
-            Statement::VariableDeclaration(d) => d,
-            Statement::ExportNamedDeclaration(exp) => match &exp.declaration {
-                Some(Declaration::VariableDeclaration(d)) => d,
-                _ => continue,
-            },
-            Statement::ExportDefaultDeclaration(exp) => {
-                if let Some((from, name)) = exp.declaration.as_expression().and_then(target) {
-                    out.push(("default".to_string(), from, name));
-                }
-                continue;
-            }
-            _ => continue,
         };
-        for vd in &decl.declarations {
-            if let BindingPattern::BindingIdentifier(id) = &vd.id
-                && let Some((from, name)) = vd.init.as_ref().and_then(target)
-            {
-                out.push((id.name.to_string(), from, name));
-            }
+        if let Some((from, name)) = target {
+            out.push((alias, from, name));
         }
     }
 }
@@ -1035,9 +1018,10 @@ mod tests {
     }
 
     /// A React wrapper around a name stands for that name (#64): the file's
-    /// own definition, or the one its import resolves; a package's name and
-    /// a function literal give no edge. A forwarded default records the
-    /// module's own names, which are never its default.
+    /// own definition, or the one its import resolves; a package's name, a
+    /// function literal and a `forwardRef` of an imported name (the other
+    /// file has no mark of how `ref` reaches it) give no edge. A forwarded
+    /// default records the module's own names, which are never its default.
     #[test]
     fn a_wrapper_of_a_name_is_a_re_export_of_it() {
         let f = facts_of(
@@ -1047,6 +1031,7 @@ mod tests {
             import { Pkg } from "some-package";
             function Cell() { return null; }
             export const MemoCell = memo(Cell);
+            const FwdCell = memo(forwardRef(Cell));
             const MemoRow = memo(forwardRef(Row));
             const MemoPkg = memo(Pkg);
             const Inline = memo(() => null);
@@ -1059,7 +1044,7 @@ mod tests {
             r.named,
             vec![
                 ("MemoCell".to_string(), at("a"), "Cell".to_string()),
-                ("MemoRow".to_string(), at("row"), "Row".to_string()),
+                ("FwdCell".to_string(), at("a"), "Cell".to_string()),
                 ("default".to_string(), at("row"), "Row".to_string()),
             ]
         );

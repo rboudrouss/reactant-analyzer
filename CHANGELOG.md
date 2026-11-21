@@ -659,8 +659,10 @@ on a program React settles; 323 oracle cases, none a known false negative.
   ones too, `memo(forwardRef(…))`) is analysed: it was no component, so
   every rule was silent on its body, and a parent rendering it saw an unseen
   child whose props ran at an unknown time. `forwardRef`'s second parameter
-  is the element's `ref`; `const X = memo(Y)` and `export default
-  forwardRef(Y)` stand for `Y`, defined in the file or imported. Only
+  is the element's `ref` and its props are without it (`props.ref` is
+  `undefined`, as in React: a test of it is read on the arm React takes);
+  `const X = memo(Y)` and `export default forwardRef(Y)` stand for `Y`,
+  defined in the file (a `forwardRef` of an imported `Y` stays unseen). Only
   React's own `memo` / `forwardRef` count; other higher-order components
   (`styled`, a library's `factory`) stay unseen. On 11 small repositories
   and mantine: 483 more components analysed, 3,005 → 3,177 rows, all
