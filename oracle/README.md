@@ -36,7 +36,12 @@ Two rules of the runner follow:
   program's own function components (the element type changes); a function
   exported by an imported package is left as it is, since a library may compare
   element types (`<Routes>` accepts only `<Route>` children). `inLoop` and the
-  ≥ 10 renders rule therefore speak of the program's components only.
+  ≥ 10 renders rule therefore speak of the program's components only. A
+  program's `memo(…)` / `forwardRef(…)` element is counted through the
+  function it renders, the wrapper rebuilt around the counter, under the
+  outermost `displayName` or else the function's name: a case names the
+  wrapped function, or sets `displayName`, after the binding the analyzer
+  reports it under.
 - **An update-depth error that escapes is a `loop`.** React throws "Maximum
   update depth exceeded" at the caller of `setState`; with a library that
   notifies from a promise or a real macrotask, that caller is outside any

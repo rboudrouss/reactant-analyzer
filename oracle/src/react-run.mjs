@@ -3,7 +3,8 @@
 //
 // The source is compiled as written and run unchanged. Two things are
 // instrumented, neither visible to the program: the JSX runtime wraps every
-// function component to count its renders, and the timer functions the program
+// function component (and the function a `memo` or `forwardRef` element
+// renders) to count its renders, and the timer functions the program
 // sees are a virtual clock the runner drains one callback at a time.
 
 import { createRequire } from "node:module";
@@ -119,28 +120,69 @@ function markForeign(value, seen) {
   for (const key of Object.keys(value)) markForeign(value[key], seen);
 }
 
+const MEMO = Symbol.for("react.memo");
+const FORWARD_REF = Symbol.for("react.forward_ref");
+
+/**
+ * The function React calls to render `type` — a function component, or the
+ * function a `memo` or `forwardRef` wraps (#64) — when the program defined it.
+ */
+function renderFn(type) {
+  if (typeof type === "function") return type.prototype && type.prototype.isReactComponent ? null : type;
+  if (type === null || typeof type !== "object") return null;
+  if (type.$$typeof === MEMO) return renderFn(type.type);
+  if (type.$$typeof === FORWARD_REF) return typeof type.render === "function" ? type.render : null;
+  return null;
+}
+
+/** The name a component is counted under: its own, the outermost wrapper's first. */
+function nameOf(type) {
+  if (typeof type === "function") return type.displayName || type.name;
+  if (type.$$typeof === MEMO) return type.displayName || nameOf(type.type);
+  return type.displayName || type.render.displayName || type.render.name;
+}
+
+/**
+ * `fn` counted under `name`. Every argument is passed on: a `forwardRef`'s
+ * render takes the element's `ref` second (two parameters, which React's
+ * check of a render function asks for).
+ */
+function countedFn(fn, name) {
+  return function (props, second) {
+    if (run) {
+      run.renders[name] = (run.renders[name] ?? 0) + 1;
+      run.stepRenders[name] = (run.stepRenders[name] ?? 0) + 1;
+      run.total += 1;
+      if (++run.step > RENDER_BUDGET) throw new RenderBudgetExceeded();
+    }
+    return fn(props, second);
+  };
+}
+
+/** `type` with the function it renders replaced by `fn`, the wrappers rebuilt around it. */
+function rewrap(type, fn) {
+  if (typeof type === "function") return fn;
+  if (type.$$typeof === MEMO) return React.memo(rewrap(type.type, fn), type.compare);
+  return React.forwardRef(fn);
+}
+
 const wrappers = new WeakMap();
 function counted(type) {
-  if (typeof type !== "function" || foreign.has(type) || (type.prototype && type.prototype.isReactComponent)) return type;
+  const fn = renderFn(type);
+  if (!fn || foreign.has(fn)) return type;
   let w = wrappers.get(type);
   if (!w) {
-    const name = type.displayName || type.name || "Anonymous";
+    const name = nameOf(type) || "Anonymous";
     // React warns once per component name for the life of the process
     // ("Cannot update a component while rendering a different component"),
     // and a worker runs many programs: the name React sees is made unique
     // to the run, so no program's warnings depend on the ones before it.
     const displayName = `${name}#${runs}`;
-    w = function (props) {
-      if (run) {
-        run.renders[name] = (run.renders[name] ?? 0) + 1;
-        run.stepRenders[name] = (run.stepRenders[name] ?? 0) + 1;
-        run.total += 1;
-        if (++run.step > RENDER_BUDGET) throw new RenderBudgetExceeded();
-      }
-      return type(props);
-    };
-    Object.defineProperty(w, "name", { value: name });
-    w.displayName = displayName;
+    const inner = countedFn(fn, name);
+    Object.defineProperty(inner, "name", { value: name });
+    inner.displayName = displayName;
+    w = rewrap(type, inner);
+    if (w !== inner) w.displayName = displayName;
     wrappers.set(type, w);
   }
   return w;
