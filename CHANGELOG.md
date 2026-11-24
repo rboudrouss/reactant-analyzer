@@ -191,7 +191,7 @@ on a program React settles; 323 oracle cases, none a known false negative.
   every hand-over message now ends with "if it runs it only from event
   handlers, there is nothing to fix". Same findings, same sites: 11 small
   repos and mantine 3,177 → 2,792 rows (mantine 2,002 → 1,712); on the whole
-  corpus, estimated from the CI artifact, 9,446 → 6,832 (twenty 3,826 → 2,290,
+  corpus, measured on CI, 9,446 → 6,832 (twenty 3,826 → 2,290,
   dub 2,443 → 1,750) (#377).
 
 ### Removed
