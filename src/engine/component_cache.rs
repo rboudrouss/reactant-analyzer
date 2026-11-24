@@ -2,15 +2,36 @@ use std::collections::HashMap;
 
 use crate::{
     domains::{AbstractDomain, impls::StateValue},
-    ir::{ComponentId, types::Symbol},
+    ir::{
+        ComponentId,
+        types::{ExprId, Symbol},
+    },
 };
 
 const DEFAULT_MAX_PER_COMPONENT: usize = 5;
 
+/// One entry of a child's input as the cache compares it: a prop, or what
+/// the heap the props reach holds at a site — a closure's capture, an
+/// object's member, what its members no constant names hold (`others`), its
+/// being open. Each kind of entry is its own key, so no prop name or member
+/// name can stand for another entry.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CacheKey {
+    Prop(Symbol),
+    Capture(ExprId, Symbol),
+    Member(ExprId, Symbol),
+    Others(ExprId),
+    Open(ExprId),
+}
+
+/// A child's input as the cache compares it.
+pub type CacheProps = HashMap<CacheKey, StateValue>;
+
 #[derive(Debug)]
 pub struct CacheEntry {
-    /// Abstract props at the call site (evaluated in parent's abstract env).
-    pub props: HashMap<Symbol, StateValue>,
+    /// Abstract props at the call site (evaluated in parent's abstract env),
+    /// with what the heap they reach holds.
+    pub props: CacheProps,
 }
 
 /// Per-component record of the abstract props a child was already analysed
@@ -51,7 +72,7 @@ impl ComponentCache {
     }
 
     /// Whether `comp` was already analysed under props equal to `props`.
-    pub fn contains(&self, comp: ComponentId, props: &HashMap<Symbol, StateValue>) -> bool {
+    pub fn contains(&self, comp: ComponentId, props: &CacheProps) -> bool {
         self.entries
             .get(&comp)
             .is_some_and(|entries| entries.iter().any(|e| props_equal(&e.props, props)))
@@ -59,11 +80,11 @@ impl ComponentCache {
 
     /// Record that `comp` was analysed under `props`. On overflow, evicts by
     /// joining all entries.
-    pub fn insert(&mut self, comp: ComponentId, props: HashMap<Symbol, StateValue>) {
+    pub fn insert(&mut self, comp: ComponentId, props: CacheProps) {
         let entries = self.entries.entry(comp).or_default();
         if entries.len() >= self.max_per_component {
             // Evict: join all existing props + new props into a single degraded entry.
-            let all_props: Vec<&HashMap<Symbol, StateValue>> = entries
+            let all_props: Vec<&CacheProps> = entries
                 .iter()
                 .map(|e| &e.props)
                 .chain(std::iter::once(&props))
@@ -84,7 +105,7 @@ impl ComponentCache {
 }
 
 /// Strict equality: same keys, each value pair satisfies leq in both directions.
-fn props_equal(a: &HashMap<Symbol, StateValue>, b: &HashMap<Symbol, StateValue>) -> bool {
+fn props_equal(a: &CacheProps, b: &CacheProps) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -106,8 +127,8 @@ fn props_equal(a: &HashMap<Symbol, StateValue>, b: &HashMap<Symbol, StateValue>)
 }
 
 /// Pointwise join of props maps.  Keys absent in some entry are treated as `Top`.
-fn join_all_props(all: &[&HashMap<Symbol, StateValue>]) -> HashMap<Symbol, StateValue> {
-    let mut result: HashMap<Symbol, StateValue> = HashMap::new();
+fn join_all_props(all: &[&CacheProps]) -> CacheProps {
+    let mut result = CacheProps::new();
     for props in all {
         for k in props.keys() {
             result.entry(k.clone()).or_insert(StateValue::bottom());
@@ -128,24 +149,33 @@ fn join_all_props(all: &[&HashMap<Symbol, StateValue>]) -> HashMap<Symbol, State
 mod tests {
     use super::*;
     use crate::domains::impls::{Stability, StateValue};
-    use std::collections::HashMap;
 
-    fn stable_props() -> HashMap<Symbol, StateValue> {
-        let mut m = HashMap::new();
-        m.insert(
-            "onClick".to_string(),
-            StateValue::reference(Stability::Stable),
-        );
-        m
+    fn prop(name: &str) -> CacheKey {
+        CacheKey::Prop(name.to_string())
     }
 
-    fn unstable_props() -> HashMap<Symbol, StateValue> {
-        let mut m = HashMap::new();
-        m.insert(
-            "onClick".to_string(),
-            StateValue::reference(Stability::PerRender),
-        );
-        m
+    fn stable_props() -> CacheProps {
+        CacheProps::from([(prop("onClick"), StateValue::reference(Stability::Stable))])
+    }
+
+    fn unstable_props() -> CacheProps {
+        CacheProps::from([(prop("onClick"), StateValue::reference(Stability::PerRender))])
+    }
+
+    #[test]
+    fn a_member_named_like_another_entry_is_its_own_key() {
+        // A member named `*` is not the object's `others`, a member named
+        // `?` not its being open, a prop not a member of the heap.
+        let at = ExprId(4);
+        let one = |k: CacheKey| CacheProps::from([(k, StateValue::top())]);
+        let mut cache = ComponentCache::new();
+        let c = crate::test_support::cid(0);
+        cache.insert(c, one(CacheKey::Others(at)));
+        cache.insert(c, one(CacheKey::Open(at)));
+        cache.insert(c, one(CacheKey::Member(at, "x".to_string())));
+        assert!(!cache.contains(c, &one(CacheKey::Member(at, "*".to_string()))));
+        assert!(!cache.contains(c, &one(CacheKey::Member(at, "?".to_string()))));
+        assert!(!cache.contains(c, &one(prop("@4.x"))));
     }
 
     #[test]
@@ -192,8 +222,7 @@ mod tests {
         cache.insert(crate::test_support::cid(3), stable_props());
         cache.insert(crate::test_support::cid(3), unstable_props());
         // Third insert → overflow → evict to 1 degraded entry
-        let mut other_props = HashMap::new();
-        other_props.insert("label".to_string(), StateValue::top());
+        let other_props = CacheProps::from([(prop("label"), StateValue::top())]);
         cache.insert(crate::test_support::cid(3), other_props);
         // After eviction: exactly 1 entry remains
         assert_eq!(cache.cache_size(crate::test_support::cid(3)), 1);
@@ -205,8 +234,7 @@ mod tests {
         // A lookup with any props that are ≤ Top should hit.
         let mut cache = ComponentCache::with_max(1);
         // First insert with Top props
-        let mut top_props = HashMap::new();
-        top_props.insert("x".to_string(), StateValue::top());
+        let top_props = CacheProps::from([(prop("x"), StateValue::top())]);
         cache.insert(crate::test_support::cid(3), top_props.clone());
         // Lookup with Top = exact match
         assert!(cache.contains(crate::test_support::cid(3), &top_props));

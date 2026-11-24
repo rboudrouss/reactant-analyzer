@@ -51,3 +51,18 @@ cheap next to hashing one.
 - An env that rebinds a name in a shared leaf still copies that leaf (≤16
   entries) and the path above it; a body whose blocks each rebind many names
   keeps a correspondingly larger share of its own.
+
+## Amendment (2026-11-20): the heap's cells too
+
+The heap's cells take the same map: an `OrdMap` from site to a cell behind an
+`Arc`, two cells equal when they are one allocation. A heap clone (a child's
+input, a pass's `heap_before`, a kept result) is O(1), a write or an escape
+copies only the cell it changes, and `join`, `widen` and `leq` walk only the
+cells two heaps do not share. Skipping a shared cell is exact by three laws of
+the cell domain — the join is idempotent, the plain widening leaves an
+unchanged cell as it is (`c ∇ (c ⊔ c) = c`; the env's threshold widening above
+still visits every name), the order is reflexive — stated and tested in
+`heap.rs`'s module doc. Iteration becomes site order (it was a randomly seeded
+`HashMap`'s, so no output depended on it). Measured on the build host, output
+byte-identical: mantine 252 s → 184 s, `@mantine/form` 16.6 s → 14.5 s, the
+heap work on mantine 62.5 s → 7.1 s.
