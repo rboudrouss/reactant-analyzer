@@ -801,7 +801,7 @@ fn run_child(
             Some(stored) if stored.covers(&abstract_props_full, &props_heap) => None,
             Some(stored) => Some(stored.join(&abstract_props_full, &props_heap)),
             None => Some(crate::domains::ChildInput {
-                props_id: ExprId::fresh(),
+                props_id: inter.props_object(child),
                 props: abstract_props_full,
                 heap: props_heap,
             }),
@@ -840,7 +840,7 @@ fn record_site_input(
     let site = sites
         .entry((child, inter.component, span))
         .or_insert_with(|| crate::domains::ChildInput {
-            props_id: ExprId::fresh(),
+            props_id: inter.props_object(child),
             props: props.clone(),
             heap: heap.clone(),
         });

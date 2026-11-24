@@ -77,7 +77,9 @@ impl ComponentId {
     }
 
     /// The component whose range holds site `id`; `None` below the first
-    /// range: a fresh id (a child's props object) is no component's.
+    /// range: a fresh id (a child's props object) is in no component's range,
+    /// and its child is the program analysis's to say
+    /// ([`InterCtx::site_owner`](crate::domains::InterCtx::site_owner)).
     pub fn site_owner(id: super::types::ExprId) -> Option<ComponentId> {
         let range = id.0 >> 32;
         (range > 0)
