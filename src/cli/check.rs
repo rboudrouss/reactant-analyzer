@@ -59,6 +59,12 @@ pub struct CheckArgs {
     #[arg(long)]
     pub follow_imports: bool,
 
+    /// Take a statement about the program as true (repeatable; adds to the
+    /// config's `assumptions`; stated in the output). Off by default. Names:
+    /// plainObjectsRunNoAccessor
+    #[arg(long, value_name = "NAME")]
+    pub assume: Vec<String>,
+
     /// Output format (default: human)
     // No clap default_value on this and the two Options below: a default
     // would always yield `Some`, making "flag absent" indistinguishable from
@@ -122,9 +128,18 @@ pub fn run(mut args: CheckArgs) -> i32 {
             Err(code) => return code,
         };
 
+    let assumptions = match reactant::config::parse_assumptions(&args.assume) {
+        Ok(a) => a,
+        Err(err) => {
+            eprintln!("[error] {err}");
+            return EXIT_USAGE;
+        }
+    };
+
     // Precedence merge + override resolution: one shared mechanism
     // (reactant::config), loudly validated before any work.
     let mut partial = CheckArgsPartial {
+        assumptions,
         info: args.info,
         show_clean: args.show_clean,
         trace: args.trace,
@@ -176,6 +191,7 @@ pub fn run(mut args: CheckArgs) -> i32 {
         entry: partial.entry.clone(),
         exclude_dirs: partial.exclude_dirs.clone(),
         follow_imports: partial.follow_imports,
+        assumptions: partial.assumptions,
         format: match partial.format.unwrap_or(FormatConfig::Human) {
             FormatConfig::Human => driver::ReportFormat::Human,
             FormatConfig::Json => driver::ReportFormat::Json,

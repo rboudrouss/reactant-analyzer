@@ -99,6 +99,7 @@ pub fn render(
                 p.yellow, report.files_analyzed, p.reset
             );
         }
+        render_assumptions(&mut out, report, &p);
         render_blind_spots(&mut out, report, &p);
         render_followed(&mut out, report, &p);
         return out;
@@ -311,9 +312,33 @@ pub fn render(
             p.reset
         );
     }
+    render_assumptions(&mut out, report, &p);
     render_blind_spots(&mut out, report, &p);
     render_followed(&mut out, report, &p);
     out
+}
+
+/// The premises the run declared (ADR-048), printed under every summary and
+/// not behind `--info`: they change what the findings above mean.
+fn render_assumptions(out: &mut String, report: &CheckReport, p: &Palette) {
+    let in_force = report.assumptions.in_force();
+    if in_force.is_empty() {
+        return;
+    }
+    let statements: Vec<&str> = in_force.iter().map(|a| a.statement()).collect();
+    let _ = writeln!(
+        out,
+        "{}   {} {} in force: {}{}",
+        p.dim,
+        in_force.len(),
+        if in_force.len() == 1 {
+            "assumption"
+        } else {
+            "assumptions"
+        },
+        statements.join("; "),
+        p.reset
+    );
 }
 
 /// What the run did not read, printed under every summary — with findings on

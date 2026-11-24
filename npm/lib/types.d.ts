@@ -43,6 +43,11 @@ export interface Options {
   /** Run only these rules. */
   rule?: string[] | string;
   ignoreRule?: string[] | string;
+  /**
+   * Take a statement about the program as true (names of the config's
+   * `assumptions`). Stated in the output; off by default.
+   */
+  assume?: string[] | string;
   format?: "human" | "json";
   /** Which severity makes `exitCode` non-zero. Defaults to `"warning"`. */
   failOn?: "error" | "warning" | "never";

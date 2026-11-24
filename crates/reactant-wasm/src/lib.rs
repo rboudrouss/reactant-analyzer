@@ -130,6 +130,9 @@ struct Options {
     exclude_dir: Vec<String>,
     #[serde(default)]
     follow_imports: bool,
+    /// `--assume` names (ADR-048).
+    #[serde(default)]
+    assume: Vec<String>,
     #[serde(default)]
     format: Option<String>,
     #[serde(default)]
@@ -273,6 +276,7 @@ fn check_options(o: &Options, cfg: &config::ReactantConfig) -> Result<CheckOptio
         entry: o.entry.clone(),
         exclude_dirs: o.exclude_dir.clone(),
         follow_imports: o.follow_imports,
+        assumptions: config::parse_assumptions(&o.assume).map_err(|e| format!("[error] {e}\n"))?,
         format: match o.format.as_deref() {
             None => None,
             Some("human") => Some(FormatConfig::Human),
@@ -305,6 +309,7 @@ fn check_options(o: &Options, cfg: &config::ReactantConfig) -> Result<CheckOptio
         entry: partial.entry,
         exclude_dirs: partial.exclude_dirs,
         follow_imports: partial.follow_imports,
+        assumptions: partial.assumptions,
         format: match partial.format.unwrap_or(FormatConfig::Human) {
             FormatConfig::Human => driver::ReportFormat::Human,
             FormatConfig::Json => driver::ReportFormat::Json,

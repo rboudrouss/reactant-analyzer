@@ -51,6 +51,9 @@ pub struct Config {
     /// Cap on transitive utility-inlining depth, to bound CFG growth when
     /// utilities chain or recurse.
     pub max_inline_depth: usize,
+    /// What the run takes as true of the program, and never otherwise
+    /// (ADR-048). Read where the fact it replaces is decided, not here.
+    pub assumptions: crate::assumptions::Assumptions,
 }
 
 impl Default for Config {
@@ -61,6 +64,7 @@ impl Default for Config {
             function_registry: FunctionRegistry::new(),
             class_registry: FunctionRegistry::new(),
             max_inline_depth: 8,
+            assumptions: Default::default(),
         }
     }
 }
@@ -1204,6 +1208,7 @@ pub fn analyze_program_defining(
     use std::cell::RefCell;
     use std::collections::HashMap;
 
+    let accessors = accessors.under(&config.assumptions);
     let cache = RefCell::new(ComponentCache::new());
     let shared_state = RefCell::new(SharedStateStore::new());
     let reducers: crate::engine::ProgramReducers = RefCell::new(HashMap::new());

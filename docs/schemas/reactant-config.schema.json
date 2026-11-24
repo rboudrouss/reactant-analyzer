@@ -18,6 +18,10 @@
       ],
       "default": null
     },
+    "assumptions": {
+      "description": "Statements about the analysed program the analysis takes as true\n(ADR-048). All off by default; the run states the ones in force.",
+      "$ref": "#/$defs/Assumptions"
+    },
     "entry": {
       "type": "array",
       "default": [],
@@ -110,6 +114,18 @@
   },
   "additionalProperties": false,
   "$defs": {
+    "Assumptions": {
+      "description": "The assumptions a run declares: all off unless declared.",
+      "type": "object",
+      "properties": {
+        "plainObjectsRunNoAccessor": {
+          "description": "No accessor of the program is ever installed on `Object.prototype`,\nand no prototype is ever set on a props or ref object. Recovers the\nfindings a polyfill's variable-named getter hides; misses a loop that\nreally runs through such a getter.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
     "FailOnConfig": {
       "type": "string",
       "enum": [

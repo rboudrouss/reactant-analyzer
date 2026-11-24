@@ -21,7 +21,7 @@ const BOOL_OPTIONS = [
   "perComponent",
   "color",
 ];
-const LIST_OPTIONS = ["entry", "excludeDir", "rule", "ignoreRule"];
+const LIST_OPTIONS = ["entry", "excludeDir", "rule", "ignoreRule", "assume"];
 const ENUM_OPTIONS = {
   format: ["human", "json"],
   failOn: ["error", "warning", "never"],

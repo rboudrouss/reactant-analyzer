@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 
+use crate::assumptions::Assumptions;
 use crate::ir::FileTable;
 use crate::resolver::ParseError;
 use crate::rules::{Diagnostic, SafeCheck};
@@ -43,6 +44,9 @@ pub struct CheckReport {
     /// "no issues found" is a claim about the code, and it may only be made
     /// about code the analyzer actually read.
     pub blind_spots: Vec<BlindSpot>,
+    /// The assumptions this run declared (ADR-048): the premises its findings
+    /// were computed under, stated in every format whatever the findings.
+    pub assumptions: Assumptions,
     /// Set by `--follow-imports`: what the run pulled in beyond the paths the
     /// user named, and what it found there but is not showing (#138).
     pub followed: Option<Followed>,
