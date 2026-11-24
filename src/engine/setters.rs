@@ -1273,9 +1273,24 @@ pub struct InlineRegions {
     /// longer cover every spliced statement, so `Direct` is unprovable in
     /// the render CFG — its unchained rows read `Unknown` (fail-closed).
     pub render_poisoned: bool,
+    /// The file each hook entry a custom hook's splice brought in is written
+    /// in, by the entry's label (#356): where the names its body and
+    /// arguments call or construct resolve, as [`InlineRegion::from`] is for
+    /// a render region. An entry with no row is the component's own.
+    pub entry_files: HashMap<HookLabel, std::path::PathBuf>,
 }
 
 impl InlineRegions {
+    /// The file the hook entry `label` is written in: the file its splice
+    /// recorded ([`Self::entry_files`]), else the component's, `own`.
+    pub fn entry_file<'a>(
+        &'a self,
+        label: HookLabel,
+        own: &'a std::path::Path,
+    ) -> &'a std::path::Path {
+        self.entry_files.get(&label).map_or(own, |f| f.as_path())
+    }
+
     /// The wrapper chain for a site at `block` of `cfg` (`None` = render),
     /// outermost first; empty = outside every region.
     fn chain(&self, cfg: Option<HookLabel>, block: BlockId) -> Vec<Symbol> {
