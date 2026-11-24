@@ -44,13 +44,16 @@ use crate::{
 pub struct ExprIds(Rc<Cell<u64>>, Rc<Cell<u64>>);
 
 impl ExprIds {
-    /// The counter for ids minted in `cfg` after its file's lowering: every
-    /// one above the allocation and call sites `cfg` already holds.
-    pub(super) fn above(cfg: &crate::ir::cfg::CFG) -> Self {
-        ExprIds(
-            Rc::new(Cell::new(crate::ir::alloc_id_span(cfg))),
-            Rc::new(Cell::new(crate::ir::call_id_span(cfg))),
-        )
+    /// The counter for ids minted in a body made of `cfgs` after their files'
+    /// lowering: every one above the allocation and call sites they already
+    /// hold.
+    pub(super) fn above<'c>(cfgs: impl IntoIterator<Item = &'c crate::ir::cfg::CFG>) -> Self {
+        let (mut allocs, mut calls) = (0, 0);
+        for cfg in cfgs {
+            allocs = allocs.max(crate::ir::alloc_id_span(cfg));
+            calls = calls.max(crate::ir::call_id_span(cfg));
+        }
+        ExprIds(Rc::new(Cell::new(allocs)), Rc::new(Cell::new(calls)))
     }
 
     pub(super) fn next(&self) -> ExprId {
