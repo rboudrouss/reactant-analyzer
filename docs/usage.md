@@ -434,6 +434,18 @@ Semantics:
   differ from the diagnostic's `file` when the step lives in a cross-file
   inlined hook/utility. `message` is the rendered prose (same text as
   `--trace`).
+- `setters`: present only on a `setter-in-render` or `cross-setter-in-render`
+  row that says setters are "handed to a callee … with no timing summary":
+  every setter that hand-over carries, where the message names the first
+  three and counts the rest. One statement of a component that hands setters
+  to code the analysis does not see is one row, not one per setter and per
+  parent *(added by #377)*. Each entry is `{ "name", "parent", "through",
+  "var" }`: the setter's name (`null` for a slot bound to no name), the parent
+  component whose state it sets (`null` for the row's own), the value it was
+  handed through when that is not the setter, and the name the row's component
+  holds a parent's setter by (what a one-setter row's `var` says). The row's
+  `var` and `hook_label` are its first entry's. A setter *called* during
+  render keeps one row per setter, without `setters`.
 - `line` is 1-indexed, `col` is 0-indexed; both `null` when the diagnostic has
   no source range.
 - `severity` ∈ `"error" | "warning" | "info"`. Info entries appear only with

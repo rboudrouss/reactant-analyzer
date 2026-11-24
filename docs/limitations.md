@@ -713,7 +713,10 @@ carries an Error.
 - **`setter-in-render`** warns when a setter reaches a callee with no timing summary
   (`composeEventHandlers(a, cb)`, `@mantine/form`'s `form.watch(path, cb)`). ⊤ includes the render
   pass, so the row is sound and the wording says so: it never claims the setter was called in the
-  render body, and it never reaches Error. react-hook-form's `handleSubmit` and `@mantine/form`'s
+  render body, and it never reaches Error. One statement of a component that hands setters over is
+  one row (`cross-setter-in-render` for a parent's), whatever the number of setters and parents it
+  reaches: the message counts them and names the first three, the JSON's `setters` lists them all
+  [#377](https://github.com/rboudrouss/reactant-analyzer/issues/377). react-hook-form's `handleSubmit` and `@mantine/form`'s
   `onSubmit` are narrowed because a member of a `useForm()` return is a *contract*, where a bare name
   would be a guess, and ADR-034 §2 allows narrowing off ⊤ only on the first. Three things keep it ⊤
   deliberately: a library with no table, a handler this body invokes itself, and a name bound more

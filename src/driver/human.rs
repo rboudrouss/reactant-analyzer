@@ -208,6 +208,18 @@ pub fn render(
             if trace && names.len() > MAX_NAMED {
                 let _ = writeln!(out, "       {}in: {}{}", p.dim, names.join(", "), p.reset);
             }
+            // A hand-over row that counts its setters names them all under
+            // `--trace` (#377).
+            if trace && d.setters.len() > crate::rules::SetterRef::NAMED {
+                let setters: Vec<String> = d.setters.iter().map(|s| s.entry(true)).collect();
+                let _ = writeln!(
+                    out,
+                    "       {}setters: {}{}",
+                    p.dim,
+                    setters.join(", "),
+                    p.reset
+                );
+            }
             if trace {
                 // Depth gate (ADR-019): pathological chains stay bounded.
                 const MAX_STEPS: usize = 8;

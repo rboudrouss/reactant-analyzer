@@ -70,6 +70,51 @@ pub struct Diagnostic {
     pub range: Option<SourceRange>,
     /// Secondary evidence items explaining the causal chain.
     pub notes: Vec<Note>,
+    /// The setters a hand-over row stands for (#377), in the order its
+    /// message names them; empty on every other row.
+    pub setters: Vec<SetterRef>,
+}
+
+/// One setter a hand-over row stands for (#377): a statement that hands
+/// values to code the analysis does not see is one row, which lists every
+/// setter they carry, each as the message would name it alone.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SetterRef {
+    /// The setter's name, printed; `None` for a slot the source binds to no
+    /// name.
+    pub name: Option<String>,
+    /// The component whose state it sets, when that is not the row's own
+    /// (`cross-setter-in-render`).
+    pub parent: Option<String>,
+    /// What it was handed through, printed, when that is not the setter.
+    pub through: Option<String>,
+    /// The name the component holds it by at the hand-over, for a parent's
+    /// setter: what a one-setter row's `var` says.
+    pub var: Option<Var>,
+}
+
+impl SetterRef {
+    /// A hand-over row's message names up to this many setters and counts
+    /// the rest.
+    pub const NAMED: usize = 3;
+
+    /// The setter in a list: `` `setN` ``, `` `setN` of `Parent` ``, and
+    /// `` through `payload` `` after it when `through` asks.
+    pub fn entry(&self, through: bool) -> String {
+        let name = self
+            .name
+            .as_deref()
+            .map_or_else(|| "a state setter".to_string(), |n| format!("`{n}`"));
+        let parent = self
+            .parent
+            .as_deref()
+            .map_or_else(String::new, |p| format!(" of `{p}`"));
+        let via = match (&self.through, through) {
+            (Some(t), true) => format!(" through `{t}`"),
+            _ => String::new(),
+        };
+        format!("{name}{parent}{via}")
+    }
 }
 
 impl Diagnostic {
@@ -85,6 +130,7 @@ impl Diagnostic {
             var: None,
             range: None,
             notes: vec![],
+            setters: vec![],
         }
     }
 
@@ -125,6 +171,12 @@ impl Diagnostic {
 
     pub fn with_range(mut self, range: SourceRange) -> Self {
         self.range = Some(range);
+        self
+    }
+
+    /// A setter this hand-over row stands for (#377).
+    pub fn with_setter(mut self, setter: SetterRef) -> Self {
+        self.setters.push(setter);
         self
     }
 
@@ -175,6 +227,7 @@ impl Diagnostic {
             var: None,
             range: prov.range,
             notes: prov.notes.clone(),
+            setters: vec![],
         }
     }
 

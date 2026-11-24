@@ -323,6 +323,7 @@ impl RuleRegistry {
                 &a.message,
                 &a.var,
                 a.hook_label,
+                &a.setters,
             )
                 .cmp(&(
                     &b.rule,
@@ -331,6 +332,7 @@ impl RuleRegistry {
                     &b.message,
                     &b.var,
                     b.hook_label,
+                    &b.setters,
                 ))
         });
         safe_checks.sort_by(|a, b| a.rule.cmp(b.rule));

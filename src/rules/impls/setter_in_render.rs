@@ -17,7 +17,7 @@ use crate::ir::hooks::HookEntry;
 use crate::rules::api::query::must_render_write;
 use crate::rules::helpers::eval_in_exit_env;
 use crate::rules::{
-    Diagnostic, ExitDominance, MustResult, Rule, Severity, must_alias_scopes,
+    Diagnostic, ExitDominance, MustResult, Rule, SetterRef, Severity, must_alias_scopes,
     must_dominates_all_exits, must_state_vals,
 };
 
@@ -72,8 +72,60 @@ impl Rule for SetterInRender {
         let exit_dom = ExitDominance::of(&comp_result.render_cfg);
         let mut out = self.render_writes(ctx, &exit_dom);
         out.extend(self.memo_writes(ctx, &exit_dom));
-        out
+        group_hand_overs(out, &ctx.program().display_name(ctx.component()))
     }
+}
+
+/// One row per hand-over (#377): the rows of one rule that hand setters to
+/// code with no timing summary at one site of this component become one row
+/// listing them all. The key is (rule, site), within the component the rule
+/// runs on: the claim is about one statement of that component handing
+/// values to one unseen callee, and the setters those values carry are what
+/// it hands, not separate findings — every other row, a setter called
+/// during render included, keeps one row per setter. A row with no site is
+/// never grouped. The setters are listed in their sorted order, each once;
+/// `var`, `hook_label` and the witness are the first one's, its peers'
+/// distinct witness steps follow.
+fn group_hand_overs(rows: Vec<Diagnostic>, component: &str) -> Vec<Diagnostic> {
+    let mut out: Vec<Diagnostic> = Vec::with_capacity(rows.len());
+    let mut groups: Vec<Vec<Diagnostic>> = Vec::new();
+    let mut at: HashMap<(std::borrow::Cow<'static, str>, crate::ir::SourceRange), usize> =
+        HashMap::new();
+    for d in rows {
+        let Some(range) = d.range.filter(|_| !d.setters.is_empty()) else {
+            out.push(d);
+            continue;
+        };
+        match at.entry((d.rule.clone(), range)) {
+            std::collections::hash_map::Entry::Occupied(g) => groups[*g.get()].push(d),
+            std::collections::hash_map::Entry::Vacant(g) => {
+                g.insert(groups.len());
+                groups.push(vec![d]);
+            }
+        }
+    }
+    for mut group in groups {
+        group.sort_by(|a, b| {
+            (&a.setters, a.hook_label, &a.var).cmp(&(&b.setters, b.hook_label, &b.var))
+        });
+        let mut rest = group.into_iter();
+        let Some(mut row) = rest.next() else { continue };
+        for d in rest {
+            for s in d.setters {
+                if !row.setters.contains(&s) {
+                    row.setters.push(s);
+                }
+            }
+            for n in d.notes {
+                if !row.notes.contains(&n) {
+                    row.notes.push(n);
+                }
+            }
+        }
+        row.message = hand_over_message(&row.setters, component);
+        out.push(row);
+    }
+    out
 }
 
 impl SetterInRender {
@@ -202,28 +254,37 @@ impl SetterInRender {
                 wording.name = Some(names.name(&name).into_owned());
             }
             let setter = wording.setter();
-            let (rule_name, message) = match (w.owner, &wording.through) {
+            let handed = (!sync)
+                .then(|| wording.handed(w, w.owner.map(|p| result.display_name(p))))
+                .flatten();
+            let (rule_name, message) = match (w.owner, &wording.through, &handed) {
+                // Handed to code with no timing summary: the row of its site
+                // (`group_hand_overs`).
+                (_, _, Some(h)) => (
+                    hand_over_rule(h),
+                    hand_over_message(std::slice::from_ref(h), &result.display_name(component)),
+                ),
                 // A write in an accessor's body the render's read or write
                 // runs (#337).
-                (None, _) if sync && wording.accessor().is_some() => {
+                (None, _, _) if sync && wording.accessor().is_some() => {
                     ("setter-in-render", sync_accessor_message(&wording))
                 }
-                (None, None) if sync => (
+                (None, None, _) if sync => (
                     "setter-in-render",
                     format!(
                         "{setter} called directly in the render body, \
                          move this call into a useEffect or an event handler"
                     ),
                 ),
-                (None, Some(through)) if sync => (
+                (None, Some(through), _) if sync => (
                     "setter-in-render",
                     format!(
                         "{setter} called in the render body through `{through}`, \
                          move this call into a useEffect or an event handler"
                     ),
                 ),
-                (None, _) => ("setter-in-render", unknown_phase_message(&wording)),
-                (Some(parent), through) if sync => (
+                (None, _, _) => ("setter-in-render", unknown_accessor_message(&wording)),
+                (Some(parent), through, _) if sync => (
                     "cross-setter-in-render",
                     format!(
                         "{} called during render of `{}`{}, which triggers a parent \
@@ -235,26 +296,19 @@ impl SetterInRender {
                             .map_or_else(String::new, |t| format!(" through `{t}`"))
                     ),
                 ),
-                (Some(parent), _) => (
-                    "cross-setter-in-render",
-                    match wording.accessor() {
-                        Some((accessor, verb)) => format!(
+                (Some(parent), _, _) => {
+                    let (accessor, verb) = wording.accessor().unwrap_or_default();
+                    (
+                        "cross-setter-in-render",
+                        format!(
                             "{} is called{} in {accessor}. If the render {verb} it, `{}` \
                              re-renders its parent on every render",
                             wording.of_parent(&result.display_name(parent)),
                             wording.through_link(),
                             result.display_name(component)
                         ),
-                        None => format!(
-                            "{} is handed to a callee{} with no timing summary. If that \
-                             callee runs it during render, `{}` re-renders its parent on \
-                             every render",
-                            wording.of_parent(&result.display_name(parent)),
-                            wording.through_clause(),
-                            result.display_name(component)
-                        ),
-                    },
-                ),
+                    )
+                }
             };
             let mut d = match proof {
                 Some(proof) => Diagnostic::error(rule_name, proof, message),
@@ -266,6 +320,9 @@ impl SetterInRender {
             };
             if let Some(r) = w.span {
                 d = d.with_range(r);
+            }
+            if let Some(h) = handed {
+                d = d.with_setter(h);
             }
             // Witness (ADR-019): the render-time setter call itself.
             d = d.with_step(
@@ -386,8 +443,15 @@ impl SetterInRender {
                         _ => None,
                     });
                 let wording = Wording::of(w, comp_result, names);
-                let (rule_name, message) = match w.owner {
-                    None if sync => (
+                let handed = (!sync && w.owner.is_none())
+                    .then(|| wording.handed(w, None))
+                    .flatten();
+                let (rule_name, message) = match (w.owner, &handed) {
+                    (_, Some(h)) => (
+                        hand_over_rule(h),
+                        hand_over_message(std::slice::from_ref(h), &result.display_name(component)),
+                    ),
+                    (None, _) if sync => (
                         "setter-in-render",
                         format!(
                             "{} called in a useMemo body{}, which runs during render: \
@@ -399,8 +463,8 @@ impl SetterInRender {
                                 .map_or_else(String::new, |t| format!(" through `{t}`"))
                         ),
                     ),
-                    None => ("setter-in-render", unknown_phase_message(&wording)),
-                    Some(parent) => (
+                    (None, _) => ("setter-in-render", unknown_accessor_message(&wording)),
+                    (Some(parent), _) => (
                         "cross-setter-in-render",
                         format!(
                             "{} called in a useMemo body{} during render of `{}`, which \
@@ -425,6 +489,9 @@ impl SetterInRender {
                 if let Some(r) = w.span {
                     d = d.with_range(r);
                 }
+                if let Some(h) = handed {
+                    d = d.with_setter(h);
+                }
                 d = d.with_step(
                     wording.step(w),
                     None,
@@ -437,26 +504,112 @@ impl SetterInRender {
     }
 }
 
-/// The `Unknown`-phase wording. A ⊤ row is not a call in the render body: the
-/// setter reached a callee the analyzer has no summary for (`handleSubmit(cb)`,
-/// `composeEventHandlers(a, cb)`), so every phase is possible and the render
-/// pass is one of them. Saying "called directly in the render body" of that row
-/// would state as fact the one thing the walk could not establish.
-fn unknown_phase_message(wording: &Wording) -> String {
-    if let Some((accessor, verb)) = wording.accessor() {
-        return format!(
-            "{} is called{} in {accessor}. If the render {verb} it, this re-renders on \
-             every render",
-            wording.setter(),
-            wording.through_link()
-        );
-    }
+/// The `Unknown`-phase wording of a write in an accessor's body (#321): it
+/// runs wherever its member is read or written, the render included.
+fn unknown_accessor_message(wording: &Wording) -> String {
+    let (accessor, verb) = wording.accessor().unwrap_or_default();
     format!(
-        "{} is handed to a callee{} with no timing summary. If that callee \
-         runs it during render, this re-renders on every render",
+        "{} is called{} in {accessor}. If the render {verb} it, this re-renders on \
+         every render",
         wording.setter(),
-        wording.through_clause()
+        wording.through_link()
     )
+}
+
+/// The rule a hand-over row of `setter` belongs to: a parent's setter is
+/// `cross-setter-in-render`'s.
+fn hand_over_rule(setter: &SetterRef) -> &'static str {
+    match setter.parent {
+        None => "setter-in-render",
+        Some(_) => "cross-setter-in-render",
+    }
+}
+
+/// The wording of a hand-over row (#377). A ⊤ row is not a call in the
+/// render body: the setters reached a callee the analyzer has no summary for
+/// (`handleSubmit(cb)`, `composeEventHandlers(a, cb)`, a package's `<Button
+/// onClick>`), so every phase is possible and the render pass is one of them.
+/// Saying "called directly in the render body" of that row would state as
+/// fact the one thing the walk could not establish. One setter is named as
+/// a write's message names it; several are counted, and the first
+/// [`SetterRef::NAMED`] listed (the row's `setters` holds them all). What
+/// they went through is said once when they share it. `component` is the
+/// component the rule runs on, which a parent's setter re-renders the
+/// parent from.
+fn hand_over_message(setters: &[SetterRef], component: &str) -> String {
+    let through = setters.first().and_then(|s| s.through.as_ref());
+    let shared = setters.iter().all(|s| s.through.as_ref() == through);
+    let clause = through
+        .filter(|_| shared)
+        .map_or_else(String::new, |t| format!(" through `{t}`,"));
+    let parents = setters.first().is_some_and(|s| s.parent.is_some());
+    let (head, it, them, renders) = match setters {
+        [s] => (
+            match &s.parent {
+                None => format!("{} is", setter_phrase(s.name.as_deref())),
+                Some(p) => format!(
+                    "{} is",
+                    parent_setter_phrase(s.name.as_deref(), s.through.is_some(), p)
+                ),
+            },
+            "it",
+            "it",
+            match parents {
+                false => "this re-renders on every render".to_string(),
+                true => format!("`{component}` re-renders its parent on every render"),
+            },
+        ),
+        _ => (
+            match parents {
+                false => format!("{} setters are", setters.len()),
+                true => format!("{} state setters of parent components are", setters.len()),
+            },
+            "one of them",
+            "them",
+            match parents {
+                false => "this re-renders on every render".to_string(),
+                true => format!("`{component}` re-renders that setter's parent on every render"),
+            },
+        ),
+    };
+    let list = match setters {
+        [_] => String::new(),
+        _ => {
+            let named: Vec<String> = setters
+                .iter()
+                .take(SetterRef::NAMED)
+                .map(|s| s.entry(!shared))
+                .collect();
+            let list = match (setters.len() - named.len(), named.split_last()) {
+                (0, Some((last, init))) => format!("{} and {last}", init.join(", ")),
+                (more, _) => format!("{} and {more} more", named.join(", ")),
+            };
+            format!(" ({list})")
+        }
+    };
+    format!(
+        "{head} handed to a callee{clause} with no timing summary{list}. If that callee runs \
+         {it} during render, {renders}; if it runs {them} only from event handlers, there is \
+         nothing to fix"
+    )
+}
+
+/// "setter `setN`", or "a state setter" for a slot the source binds to no
+/// name.
+fn setter_phrase(name: Option<&str>) -> String {
+    match name {
+        Some(n) => format!("setter `{n}`"),
+        None => "a state setter".to_string(),
+    }
+}
+
+/// A parent's setter: the prop the component holds it by when the prop is
+/// that setter (`through` is false), else the setter.
+fn parent_setter_phrase(name: Option<&str>, through: bool, parent: &str) -> String {
+    match (name, through) {
+        (Some(n), false) => format!("prop `{n}` (a state setter of parent `{parent}`)"),
+        _ => format!("{} of parent `{parent}`", setter_phrase(name)),
+    }
 }
 
 /// The wording of a write in an accessor's body that a member read or write
@@ -530,27 +683,26 @@ impl Wording {
 
     /// "setter `setN`", or "a state setter".
     fn setter(&self) -> String {
-        match &self.name {
-            Some(n) => format!("setter `{n}`"),
-            None => "a state setter".to_string(),
-        }
+        setter_phrase(self.name.as_deref())
     }
 
     /// A parent's setter: the prop this component calls when the prop is
     /// that setter, else the setter.
     fn of_parent(&self, parent: &str) -> String {
-        match (&self.name, &self.through) {
-            (Some(n), None) => format!("prop `{n}` (a state setter of parent `{parent}`)"),
-            _ => format!("{} of parent `{parent}`", self.setter()),
-        }
+        parent_setter_phrase(self.name.as_deref(), self.through.is_some(), parent)
     }
 
-    /// " through `payload`," when the write went through a value that is not
-    /// the setter.
-    fn through_clause(&self) -> String {
-        self.through
-            .as_ref()
-            .map_or_else(String::new, |t| format!(" through `{t}`,"))
+    /// The setter a hand-over row of `w` stands for (#377), `parent` the
+    /// display name of the component whose slot it writes when that is not
+    /// this one. `None` for a write in an accessor's body, which runs at a
+    /// member's read or write and is no hand-over.
+    fn handed(&self, w: &SlotWriter, parent: Option<String>) -> Option<SetterRef> {
+        self.accessor.is_none().then(|| SetterRef {
+            name: self.name.clone(),
+            var: parent.as_ref().map(|_| w.setter.clone()),
+            parent,
+            through: self.through.clone(),
+        })
     }
 
     /// The witness step of the row's call: a call of the setter, or, for a
@@ -794,6 +946,57 @@ mod tests {
                 render_stmts,
             ))
         }
+    }
+
+    fn handed(name: Option<&str>, parent: Option<&str>, through: Option<&str>) -> SetterRef {
+        SetterRef {
+            name: name.map(str::to_string),
+            parent: parent.map(str::to_string),
+            through: through.map(str::to_string),
+            var: parent.map(|_| "onX".to_string()),
+        }
+    }
+
+    #[test]
+    fn a_hand_over_names_one_setter_as_a_write_does_and_counts_several() {
+        // #377: one setter reads as the row of its write.
+        assert_eq!(
+            hand_over_message(&[handed(Some("setN"), Some("P"), None)], "C"),
+            "prop `setN` (a state setter of parent `P`) is handed to a callee with no timing \
+             summary. If that callee runs it during render, `C` re-renders its parent on every \
+             render; if it runs it only from event handlers, there is nothing to fix"
+        );
+        // What they went through, said once when they share it.
+        let shared = [
+            handed(Some("setA"), None, Some("payload")),
+            handed(None, None, Some("payload")),
+        ];
+        assert!(
+            hand_over_message(&shared, "C").starts_with(
+                "2 setters are handed to a callee through `payload`, with no timing summary \
+                 (`setA` and a state setter). If that callee runs one of them"
+            ),
+            "{}",
+            hand_over_message(&shared, "C")
+        );
+        // Else on each, and past three, counted.
+        let mixed = [
+            handed(Some("setA"), Some("P"), Some("o")),
+            handed(Some("setB"), Some("P"), None),
+            handed(Some("setC"), Some("Q"), None),
+            handed(Some("setD"), Some("Q"), None),
+            handed(Some("setE"), Some("Q"), None),
+        ];
+        assert!(
+            hand_over_message(&mixed, "C").starts_with(
+                "5 state setters of parent components are handed to a callee with no timing \
+                 summary (`setA` of `P` through `o`, `setB` of `P`, `setC` of `Q` and 2 more). \
+                 If that callee runs one of them during render, `C` re-renders that setter's \
+                 parent on every render"
+            ),
+            "{}",
+            hand_over_message(&mixed, "C")
+        );
     }
 
     #[test]
