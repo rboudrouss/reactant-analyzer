@@ -2,9 +2,21 @@ import { useEffect, useState } from "react";
 
 // `??` holds neither `null` nor `undefined` on its kept side (#303): `p` is
 // the mapped array or `[]`, a new array at every render whatever `a` is.
+// `a` is a prop, whose `map` may be any object's (#312): possibly new.
 export function ChainCoalesceLoop({ a }: { a?: number[] }) {
   const [n, setN] = useState(0);
   const p = a?.map((x) => x + 1) ?? [];
+  useEffect(() => {
+    setN((c) => c + 1);
+  }, [p]);
+  return <div>{n}</div>;
+}
+
+// The same chain off a string or nothing: `p` is the split array or `[]`.
+export function ChainCoalesceSplitLoop({ c }: { c?: boolean }) {
+  const [n, setN] = useState(0);
+  const s = c ? "a,b" : undefined;
+  const p = s?.split(",") ?? [];
   useEffect(() => {
     setN((c) => c + 1);
   }, [p]);

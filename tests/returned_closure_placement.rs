@@ -23,13 +23,16 @@ fn reactant(dir: &std::path::Path) -> Output {
         .expect("run reactant binary")
 }
 
+/// One directory per call: two tests of this binary run at the same time,
+/// and a directory keyed by the program's text alone is removed under the
+/// other test's analyzer (an empty stdout, "EOF while parsing a value").
+static RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// The loop findings (`rule:severity`) of the program `src`.
 fn findings_of(src: &str, tag: &str) -> Vec<String> {
-    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "reactant-ret-{}-{tag}-{}",
-        std::process::id(),
-        src.len() as u64 * 31 + src.bytes().map(u64::from).sum::<u64>()
-    ));
+    let run = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("reactant-ret-{}-{run}-{tag}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("a.tsx"), src).unwrap();
     let out = reactant(&dir);

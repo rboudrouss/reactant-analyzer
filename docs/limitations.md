@@ -449,6 +449,20 @@ carries an Error.
   [#307](https://github.com/rboudrouss/reactant-analyzer/issues/307). And so is `JSON.parse(text)`
   when the text always encodes a primitive: its text is not read
   [#306](https://github.com/rboudrouss/reactant-analyzer/issues/306).
+- **An array method off a receiver of unknown kind** — `items.map(f)`, `xs.filter(g)`,
+  `s.split(",")` on a prop, a state value, a parameter or a hook's result — may be a new
+  reference at every render, a possible re-run (Warning) with no `always-unstable-deps` row, even
+  when the receiver is always an array and the loop certain: any object may have a method of
+  that name, which may return its receiver (ts-results' `None.map`, an Immutable collection, the
+  program's own class). The kind is known for an array literal, a builtin's new array
+  (`Object.keys(o)`, `Array.from(x)`, an array method off a known array, `split` off a string), a
+  string, and a name or a memo every value of which is one; a state slot's or a prop's is not,
+  except a child's prop the analysis places at the literal its one parent passes, nor a name
+  that may also be `null` or `undefined` (`(c ? [x] : undefined)?.map(f)`). An object
+  whose own `map` the program defines still reads as possibly new, since the call is not
+  resolved to its method; and the other way, an array whose `map` the program replaces (on
+  the array or on `Array.prototype`) reads as the builtin's
+  [#312](https://github.com/rboudrouss/reactant-analyzer/issues/312).
 - **Optional chains** branch on every `?.` link that skips a call or an index, even when the left
   side is never nullish (`setN?.(x)`, a local function, a callback prop every parent passes): a
   write in the skipped part is a possible one, a Warning, not an Error

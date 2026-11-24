@@ -62,10 +62,24 @@ fn assert_must_fresh_loop(component: &str) {
     );
 }
 
-/// The issue's program: `a?.map(f) ?? []` is a new array whatever `a` is.
+/// `s?.split(",") ?? []` is a new array whatever `s` is.
 #[test]
 fn a_chain_coalesced_to_a_literal_is_fresh_at_every_render() {
-    assert_must_fresh_loop("ChainCoalesceLoop");
+    assert_must_fresh_loop("ChainCoalesceSplitLoop");
+}
+
+/// The issue's program, `a?.map(f) ?? []` off a prop: `a` may be any object
+/// with a `map` (#312), so the loop is possible, not certain.
+#[test]
+fn a_chain_off_a_receiver_of_unknown_kind_may_be_fresh() {
+    let all = findings();
+    let (level, message) = finding("ChainCoalesceLoop", "infinite-loop").unwrap_or_default();
+    assert_eq!(level, "warning", "{all:?}");
+    assert!(message.contains("may differ at any render"), "{message}");
+    assert!(
+        finding("ChainCoalesceLoop", "always-unstable-deps").is_none(),
+        "{all:?}"
+    );
 }
 
 /// `(c ? [1] : undefined) ?? []`, which predates #301.

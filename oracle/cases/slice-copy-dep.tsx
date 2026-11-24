@@ -1,6 +1,7 @@
 // oracle: react=loop
-// #22: `items` can only be an array, so `items.slice()` is a new array at
-// every render: the effect re-runs after every commit and flips `t`.
+// #22: `items` is an array, so `items.slice()` is a new array at every
+// render: the effect re-runs after every commit and flips `t`. A state slot's
+// kind is not known to the analysis (#312): a possible loop.
 import { useEffect, useState } from "react";
 
 export function App() {
