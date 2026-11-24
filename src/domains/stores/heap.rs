@@ -401,6 +401,17 @@ impl Heap {
                 .all(|id| matches!(self.get(*id), Some(HeapValue::Obj(m)) if m.plain))
     }
 
+    /// Does the heap hold the members of everything `sites` may name: closed
+    /// sites, each an object? It records no member of a function, so a write
+    /// there lands nowhere it reads (#330).
+    pub fn objects(&self, sites: &Sites) -> bool {
+        !sites.open
+            && sites
+                .ids
+                .iter()
+                .all(|id| matches!(self.get(*id), Some(HeapValue::Obj(_))))
+    }
+
     /// Is every object `sites` may name an array, and nothing else (#336,
     /// #312)?
     pub fn arrays(&self, sites: &Sites) -> bool {
