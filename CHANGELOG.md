@@ -182,7 +182,9 @@ on a program React settles; 323 oracle cases, none a known false negative.
   code; its arguments still run (#340).
 - A statement that hands setters to a callee with no timing summary is one
   `setter-in-render` / `cross-setter-in-render` row per component, not one
-  per setter and per parent: the message counts them and names the first
+  per setter and per parent (**breaking** for a consumer that reads one
+  setter per row: such a row's `var` and `hook_label` are its first setter's,
+  the others are in `setters`): the message counts them and names the first
   three ("61 state setters of parent components are handed to a callee with
   no timing summary (`setOpened` of `StoryBase`, … and 58 more)"), the JSON's
   new `setters` field lists every one (`name`, `parent`, `through`, `var`), and
