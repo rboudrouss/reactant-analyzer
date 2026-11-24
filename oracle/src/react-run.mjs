@@ -10,7 +10,7 @@ import { createRequire } from "node:module";
 import { JSDOM } from "jsdom";
 import { transformSync } from "esbuild";
 import { splitFiles, ENTRY } from "./files.mjs";
-import { packageOf } from "./packages.mjs";
+import { packageOf, PACKAGES } from "./packages.mjs";
 
 const require = createRequire(import.meta.url);
 
@@ -98,6 +98,15 @@ function library(id) {
     libraries.set(id, exports);
   }
   return libraries.get(id);
+}
+
+/**
+ * Loads every package a program may import. A package may set up state of its own in the realm
+ * (react-router marks `window`), and the realm a program starts in must not depend on whether
+ * an earlier program was the first to import it (realm.mjs).
+ */
+export function preloadLibraries() {
+  for (const id of PACKAGES) library(id);
 }
 
 /** Registers the functions of a module's exports, through the plain objects it nests. */

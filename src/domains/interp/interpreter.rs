@@ -271,6 +271,7 @@ fn solve<T: Transfer>(
 
     while let Some((_, b)) = pending.pop_first() {
         let mut env = entries[&b].clone();
+        let mut ruled_out = None;
         // The change bound of the conditions this block's writes run under.
         let pc = bound_under(selecting.get(&b), &cond_bounds);
         if let Some(block) = cfg.blocks.get(&b) {
@@ -314,11 +315,18 @@ fn solve<T: Transfer>(
                 }
                 // A condition is evaluated, so its calls run; its change
                 // bound is what the blocks it selects run under.
-                Terminator::Branch { cond, span, .. } => {
+                Terminator::Branch {
+                    cond,
+                    span,
+                    then_,
+                    else_,
+                    ..
+                } => {
                     let outer = std::mem::replace(&mut ctx.stmt, *span);
                     exec_expr_effects(transfer, cond, &mut env, ctx, depth);
                     ctx.stmt = outer;
                     ctx.heap.share_assigned(&mut env);
+                    ruled_out = ruled_out_side(transfer, cond, *then_, *else_, &env, ctx);
                     let bound = condition_bound(transfer, cond, cfg, &env, ctx);
                     if cond_bounds.get(&b) != Some(&bound) {
                         cond_bounds.insert(b, bound);
@@ -335,6 +343,9 @@ fn solve<T: Transfer>(
         }
 
         for (succ, out) in outgoing(cfg, b, &env) {
+            if ruled_out == Some(succ) {
+                continue;
+            }
             let next = match entries.get(&succ) {
                 None => out,
                 Some(existing) if back.contains(&(b, succ)) => {
@@ -356,6 +367,60 @@ fn solve<T: Transfer>(
         exits.insert(b, env);
     }
     Run { exits, ret }
+}
+
+/// The side of a branch the tested value rules out where no name's
+/// narrowing does ([`outgoing`]): the operand of a nullish test, or the
+/// tested value, is no name — `opts.f == null`, an optional chain's link
+/// (`opts.f?.(x)`), `if (o.f)` (#340). A value that is only `null` or
+/// `undefined` is nullish and falsy, one that is only a reference (an object,
+/// a function) neither; anything else, ⊥ included, rules out no side. Like a
+/// narrowing, it holds under this env only: a later run of the branch under a
+/// larger one decides again.
+fn ruled_out_side<T: Transfer>(
+    transfer: &T,
+    cond: &Expr,
+    then_: BlockId,
+    else_: BlockId,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+) -> Option<BlockId> {
+    use crate::ir::expr::{BinOp, Prim, UnaryOp};
+    if then_ == else_ {
+        return None;
+    }
+    let mut value = |e: &Expr| {
+        if matches!(e.peel_ts(), Expr::Var(_)) {
+            return None;
+        }
+        let v = transfer.eval_expr(e, env, ctx).as_state_value()?;
+        (!v.is_bottom_value()).then_some(v)
+    };
+    let nullish = |v: &StateValue| match v.is_nullish_only() {
+        true => Some(true),
+        false => (!v.null && !v.undef).then_some(false),
+    };
+    let truthy = |v: &StateValue| match (v.is_nullish_only(), v.is_reference_only()) {
+        (true, _) => Some(false),
+        (false, true) => Some(true),
+        (false, false) => None,
+    };
+    let holds = match cond {
+        Expr::BinOp {
+            op: op @ (BinOp::LooseEq | BinOp::LooseNeq),
+            lhs,
+            rhs,
+        } if matches!(rhs.as_ref(), Expr::Lit(Prim::Null | Prim::Unit)) => {
+            nullish(&value(lhs)?)? == matches!(op, BinOp::LooseEq)
+        }
+        Expr::UnaryOp {
+            op: UnaryOp::Not,
+            arg,
+        } => !truthy(&value(arg)?)?,
+        Expr::BinOp { .. } | Expr::UnaryOp { .. } => return None,
+        tested => truthy(&value(tested)?)?,
+    };
+    Some(if holds { else_ } else { then_ })
 }
 
 /// The may bound on the change trace of a branch condition: the renders at
@@ -984,7 +1049,15 @@ pub(crate) fn alloc_literal<T: Transfer>(
             return Some(Sites::closed([*id]));
         }
         Expr::ObjectLit { id, fields } => {
-            let mut members = Members::default();
+            // A literal's prototype is `Object.prototype` unless it names
+            // one; a class's value, lowered as a literal, is a function.
+            let literal = !fields
+                .iter()
+                .any(|(key, _)| key == "__proto__" || key == crate::ir::expr::CONSTRUCT_KEY);
+            let mut members = Members {
+                literal,
+                ..Members::default()
+            };
             for (i, (key, value)) in fields.iter().enumerate() {
                 if key.starts_with(SPREAD_KEY_PREFIX) {
                     let source = alloc_literal(transfer, value, env, ctx);
@@ -1384,6 +1457,26 @@ fn call_evaluation<T: Transfer>(
     }
 }
 
+/// Can `fn_` only be `null` or `undefined` here — a member a literal does
+/// not hold, a name bound to nothing else? A name some setter or
+/// `useCallback` label binds is a function, whatever its value says.
+fn surely_nullish_callee<T: Transfer>(
+    transfer: &T,
+    fn_: &Expr,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+) -> bool {
+    if let Expr::Var(name) = fn_.peel_ts()
+        && (env.setter_labels(name).is_some() || env.callback_labels(name).is_some())
+    {
+        return false;
+    }
+    transfer
+        .eval_expr(fn_, env, ctx)
+        .as_state_value()
+        .is_some_and(|v| !v.is_bottom_value() && v.is_nullish_only())
+}
+
 /// The bodies `ran` lists surely run when called here: none is a function
 /// `useEffectEvent` hands back called in a render, where React throws
 /// instead ([`Heap::alloc_event`]).
@@ -1481,6 +1574,19 @@ fn exec_callbacks_depth<T: Transfer>(
             let class = classify_callee(fn_, env, ctx.query.dispatches());
             // Descend the receiver: handles chains like `a.then(x).then(y)`.
             exec_callbacks_depth(transfer, fn_, env, ctx, depth);
+            // A callee that can only be `null` or `undefined` throws once
+            // the arguments are evaluated: it runs no body, is handed
+            // nothing and writes nothing (#340).
+            if surely_nullish_callee(transfer, fn_, env, ctx) {
+                for arg in args.iter().filter(|a| !matches!(a, Expr::FnLit { .. })) {
+                    exec_callbacks_depth(transfer, arg, env, ctx, depth);
+                }
+                if ctx.calls.is_some() {
+                    let eval = call_evaluation(transfer, fn_, env, ctx, Ran::default(), Vec::new());
+                    ctx.record(|r| r.record_call(*id, eval));
+                }
+                return None;
+            }
             let runs_args = class == TriggerClass::InCycle && !capped;
             let binds_args = class == TriggerClass::Unknown && !capped;
             // What a local callee's parameters are bound to (#253): the

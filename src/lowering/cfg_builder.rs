@@ -15,7 +15,7 @@ use crate::{
     },
     lowering::JsxOrigins,
     lowering::expr_lower::{
-        assign_target_ident, empty_cfg, lower_expr, lower_expr_stmt, property_name, rest_copy,
+        empty_cfg, lower_assignment_target, lower_expr, lower_expr_stmt, property_name, rest_copy,
     },
 };
 
@@ -952,16 +952,12 @@ fn lower_iter_loop(
                 lower_binding_pattern(&d.id, element.clone(), span, builder);
             }
         }
-        // Pre-declared target (`for (x of arr)`): re-assign the outer var.
-        // Member/pattern targets are not tracked as a single cell — skipped.
+        // Pre-declared target (`for (x of arr)`, `for (o.f of arr)`,
+        // `for ([a, b] of arr)`): written as an assignment's target is.
         other => {
-            if let Some(var) = other.as_assignment_target().and_then(assign_target_ident) {
+            if let Some(target) = other.as_assignment_target() {
                 let span = builder.span_at(other.span().start);
-                builder.push_stmt(Stmt::Assign {
-                    var,
-                    rhs: element,
-                    span,
-                });
+                lower_assignment_target(target, element, span, builder);
             }
         }
     }

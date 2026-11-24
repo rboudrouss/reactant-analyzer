@@ -513,7 +513,27 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                 });
                 opaque()
             }
-            _ => opaque(),
+            // `obj.#f++`, `(obj.f as T)++`: the same write.
+            other => {
+                let member = match other {
+                    SimpleAssignmentTarget::PrivateFieldExpression(p) => Some((
+                        lower_expr(&p.object, builder),
+                        MemberKey::Field(format!("#{}", p.field.name)),
+                    )),
+                    other => type_wrapped_target(other)
+                        .and_then(|e| lower_member_target_expr(e.get_inner_expression(), builder)),
+                };
+                if let Some((obj, key)) = member {
+                    builder.push_stmt(Stmt::MemberWrite {
+                        id: builder.next_call_id(),
+                        obj,
+                        key,
+                        rhs: opaque(),
+                        span: builder.span_at(upd.span.start),
+                    });
+                }
+                opaque()
+            }
         },
 
         // ── Short-circuit / ternary → block-splitting ─────────────────────────
@@ -1469,11 +1489,18 @@ pub(super) fn assign_target_ident(target: &AssignmentTarget) -> Option<String> {
 }
 
 /// Lower a member assignment target (`obj.f = …`, `arr[i] = …`) to its object
-/// expression and member key. `None` for identifier/pattern targets.
+/// expression and member key, under any type wrapper (`(obj.f as T) = …`).
+/// `None` for identifier/pattern targets.
 fn assign_target_member(
     target: &AssignmentTarget,
     builder: &mut BlockBuilder,
 ) -> Option<(Expr, MemberKey)> {
+    if let Some(wrapped) = target
+        .as_simple_assignment_target()
+        .and_then(type_wrapped_target)
+    {
+        return lower_member_target_expr(wrapped.get_inner_expression(), builder);
+    }
     match target {
         AssignmentTarget::StaticMemberExpression(m) => Some((
             lower_expr(&m.object, builder),
@@ -1488,6 +1515,20 @@ fn assign_target_member(
             lower_expr(&p.object, builder),
             MemberKey::Field(format!("#{}", p.field.name)),
         )),
+        _ => None,
+    }
+}
+
+/// The expression a type wrapper around a write target holds
+/// (`(obj.f as T)`, `(obj.f)!`, `<T>obj.f`).
+fn type_wrapped_target<'a, 'b>(
+    target: &'b SimpleAssignmentTarget<'a>,
+) -> Option<&'b Expression<'a>> {
+    match target {
+        SimpleAssignmentTarget::TSAsExpression(t) => Some(&t.expression),
+        SimpleAssignmentTarget::TSSatisfiesExpression(t) => Some(&t.expression),
+        SimpleAssignmentTarget::TSNonNullExpression(t) => Some(&t.expression),
+        SimpleAssignmentTarget::TSTypeAssertion(t) => Some(&t.expression),
         _ => None,
     }
 }
@@ -1508,6 +1549,10 @@ fn lower_member_target_expr(
             let idx = lower_expr(&m.expression, builder);
             Some((obj, MemberKey::Index(idx)))
         }
+        Expression::PrivateFieldExpression(p) => Some((
+            lower_expr(&p.object, builder),
+            MemberKey::Field(format!("#{}", p.field.name)),
+        )),
         _ => None,
     }
 }
@@ -1519,7 +1564,7 @@ fn lower_member_target_expr(
 /// Every leaf identifier is written on every path: a shape the walker cannot
 /// track precisely passes `opaque()` down rather than emitting nothing, because
 /// leaving a variable at its previous abstract value falsifies it.
-fn lower_assignment_target(
+pub(super) fn lower_assignment_target(
     target: &AssignmentTarget,
     rhs: Expr,
     span: Option<SourceRange>,

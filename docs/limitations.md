@@ -325,9 +325,28 @@ that writes it (see *Cross-file limits*).
   it or not: a module function that only reads `this.k` off an object that also holds a setter
   is reported. The cost falls on objects whose methods read as code the analysis does not see
   although the program wrote them, an object that was itself handed to such code: its members
-  may have been replaced there. A member a placed literal lacks reads as anything (it may be the
-  prototype's), so `opts.cb?.(form)` with `cb` absent hands `form` over, and every later
-  `form.m()` hands it over again. What stays as
+  may have been replaced there. A member an object literal the heap places does not hold reads
+  `undefined`, its prototype being `Object.prototype`, unless that prototype may hold it: a member
+  `Object.prototype` holds (`toString`, `valueOf`, `constructor`, …), a member some descriptor of
+  the program names (an accessor or data, on any object, since the analysis does not know the
+  target), a member of a literal the program makes a prototype, a member written on what may be
+  `Object.prototype` (`Object.prototype.f = …`, `x.__proto__.f`, `Object.getPrototypeOf(x).f`,
+  `x.constructor.prototype.f`), and any member once such a value is bound, passed or stored
+  anywhere but a member access, a comparison or `Object.create`, or once the program sets a
+  prototype that may be any object; a literal with a `__proto__:` member, one unseen code holds,
+  one written under a key no constant names, a spread of what the heap does not place and a class's
+  instance keep the open reading. `const { cb } = opts; cb?.(form)` with `cb` absent is then
+  skipped, and so is `opts.cb?.(form)`: the test of a link, or of an `if`, that is no name is
+  decided by its value, as a name's is by its narrowing (only `null` or `undefined` is nullish and
+  falsy, only an object or a function neither); `opts.cb(form)` throws, and a call of a value that
+  is only `null` or `undefined` runs no body, hands nothing over and writes nothing, its arguments
+  still running [#340](https://github.com/rboudrouss/reactant-analyzer/issues/340). Not seen: a
+  library that
+  extends `Object.prototype` (as for accessors, #336), and an alias of `Object` or of its
+  reflective functions (`const O = Object; O.prototype.f = …`, `Object[k]`, `const { defineProperty
+  } = Object`), read as another object
+  [#366](https://github.com/rboudrouss/reactant-analyzer/issues/366). Otherwise, once a member reads as code the analysis does not
+  see, every later `form.m()` hands the object over again. What stays as
   before: a class's instance member keeps the instance as `this` wherever it is called
   (`const f = k.run; f()` too); `super` outside a class's instance member is opaque. A value
   written into an object the heap does not place — the global object, a parameter's member, what
