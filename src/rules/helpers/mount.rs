@@ -39,7 +39,7 @@ use crate::{
 use super::local_bindings;
 use super::render_tree::RenderIndex;
 use super::setters::all_setter_labels;
-use crate::ir::{CompOrigin, ComponentId};
+use crate::ir::{ComponentId, ElementOrigin, ElementTarget};
 
 /// What the call sites prove about a consumer's mount lifetime, relative to
 /// the state slot feeding one of its seeding props.
@@ -361,7 +361,7 @@ fn collect_sites(
     // both made that product the dominant cost of the whole rules phase.
     let branches = branch_conditions(cfg);
     let mut push = |name: &Symbol,
-                    origin: Option<&CompOrigin>,
+                    origin: Option<&ElementOrigin>,
                     props: &Expr,
                     span: Option<SourceRange>,
                     block: Option<BlockId>| {
@@ -381,10 +381,12 @@ fn collect_sites(
         // component of that name, and every candidate has to carry the site.
         // The relation only ever *downgrades* a finding, and it downgrades
         // when EVERY site remounts — so an extra site can only keep a finding,
-        // never remove one (#95).
-        let targets: Vec<ComponentId> = match origin.and_then(|o| table.id_of(o)) {
-            Some(id) => vec![id],
-            None => table.ids_named(name).collect(),
+        // never remove one (#95). An element of unseen code mounts none of
+        // the program's components (#389).
+        let targets: Vec<ComponentId> = match table.element(name, origin) {
+            ElementTarget::Component(id) => vec![id],
+            ElementTarget::Unseen => Vec::new(),
+            ElementTarget::Ambiguous | ElementTarget::Unresolved => table.ids_named(name).collect(),
         };
         for id in targets {
             out.entry(id).or_default().push(site.clone());
@@ -394,7 +396,13 @@ fn collect_sites(
         e: &'a Expr,
         block: Option<BlockId>,
         nested: &mut Vec<&'a CFG>,
-        push: &mut impl FnMut(&Symbol, Option<&CompOrigin>, &Expr, Option<SourceRange>, Option<BlockId>),
+        push: &mut impl FnMut(
+            &Symbol,
+            Option<&ElementOrigin>,
+            &Expr,
+            Option<SourceRange>,
+            Option<BlockId>,
+        ),
     ) {
         match e {
             Expr::CompApp {

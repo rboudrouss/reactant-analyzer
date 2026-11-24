@@ -17,7 +17,7 @@ use std::sync::Arc;
 use crate::ir::{
     cfg::CFG,
     component::ComponentIR,
-    expr::{CompOrigin, Expr},
+    expr::{ElementOrigin, Expr},
     hook_ir::HookIR,
     hooks::HookEntry,
     types::Symbol,
@@ -160,6 +160,11 @@ impl SymbolGraph {
             // read here so the graph and the inliner cannot disagree about who
             // a `<Widget/>` is (#7).
             if let Some(origin) = &callee.origin {
+                // An element of unseen code names none of the program's
+                // components (#389).
+                let ElementOrigin::Program(origin) = origin.as_ref() else {
+                    continue;
+                };
                 let target = SymbolNode::new(
                     origin.file.clone(),
                     origin.name.clone(),
@@ -259,7 +264,7 @@ impl SymbolGraph {
 /// proved it names when the file's imports settle that.
 struct Callee {
     name: Symbol,
-    origin: Option<Arc<CompOrigin>>,
+    origin: Option<Arc<ElementOrigin>>,
 }
 
 fn collect_callees_in_hook_body(entry: &HookEntry, out: &mut Vec<Callee>) {

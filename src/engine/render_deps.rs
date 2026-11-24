@@ -46,8 +46,8 @@ use crate::engine::{
 use crate::ir::{
     cfg::{CFG, Terminator},
     expr::{
-        Accessor, CompOrigin, Expr, MarkerVal, Prim, SPREAD_KEY_PREFIX, SummaryValue, accessor_of,
-        mutation_receiver,
+        Accessor, ElementOrigin, Expr, MarkerVal, Prim, SPREAD_KEY_PREFIX, SummaryValue,
+        accessor_of, mutation_receiver,
     },
     free_vars::{collect_used_vars, compute_free_vars},
     hooks::HookEntry,
@@ -293,7 +293,7 @@ impl Relevance {
 #[derive(Debug, Clone)]
 pub struct ElementSite {
     pub name: Symbol,
-    pub origin: Option<Arc<CompOrigin>>,
+    pub origin: Option<Arc<ElementOrigin>>,
     pub span: Option<SourceRange>,
     /// Per explicit prop, what it may depend on (`children` included).
     pub props: Vec<(Symbol, Deps)>,

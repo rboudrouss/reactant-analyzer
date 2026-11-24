@@ -114,7 +114,7 @@ use crate::{
         written::{SiteEnvs, Written, churning_part, keeps_initial},
     },
     ir::{
-        CompOrigin, ComponentId, QualifiedSlot, SourceRange,
+        CompOrigin, ComponentId, ElementOrigin, ElementTarget, QualifiedSlot, SourceRange,
         bindings::{binds, local_bindings, must_param, nested_bodies},
         cfg::{CFG, Terminator},
         expr::{Expr, Prim, SPREAD_KEY_PREFIX, object_getter, object_member},
@@ -406,6 +406,13 @@ fn mounted_unplaced(result: &ProgramAnalysisResult) -> HashSet<ComponentId> {
     for r in &result.components {
         r.1.render_cfg.for_each_expr(&mut |e| {
             walk_elements(e, &mut |name, origin| {
+                // An element of unseen code mounts none of the program's
+                // components (#389).
+                let origin = match origin {
+                    Some(ElementOrigin::Unseen) => return,
+                    Some(ElementOrigin::Program(o)) => Some(o),
+                    None => None,
+                };
                 let by_origin = origin.and_then(|o| table.id_of(o));
                 match by_origin {
                     Some(child) if child == *r.0 => {
@@ -452,7 +459,7 @@ fn mounted_unplaced(result: &ProgramAnalysisResult) -> HashSet<ComponentId> {
 
 /// Every element under `e`, closures included: its tag as written and the
 /// component the lowering proved it names.
-fn walk_elements<'a>(e: &'a Expr, f: &mut dyn FnMut(&'a str, Option<&'a CompOrigin>)) {
+fn walk_elements<'a>(e: &'a Expr, f: &mut dyn FnMut(&'a str, Option<&'a ElementOrigin>)) {
     if let Expr::CompApp { name, origin, .. } = e {
         f(name, origin.as_deref());
     }
@@ -471,6 +478,7 @@ fn component_tree(result: &ProgramAnalysisResult) -> ComponentTree<'_> {
         }
         e.for_each_child(&mut |c| walk(c, closure, f));
     }
+    let table = &result.component_table;
     let mut tree: ComponentTree = HashMap::new();
     for (&parent, r) in &result.components {
         let cfg = &r.render_cfg;
@@ -490,15 +498,19 @@ fn component_tree(result: &ProgramAnalysisResult) -> ComponentTree<'_> {
                     else {
                         return;
                     };
-                    // As the engine resolves the child it analyses: the
-                    // proven origin, else the one component of that name.
-                    let table = &result.component_table;
-                    let child = match origin.as_deref().and_then(|o| table.id_of(o)) {
-                        Some(child) => child,
-                        None => match table.ids_named(name).collect::<Vec<_>>()[..] {
-                            [child] => child,
-                            _ => return,
-                        },
+                    // As the engine resolves the child it analyses — none for
+                    // an element of unseen code (#389) — and, for one whose
+                    // import leads to no component, the one component of
+                    // that name.
+                    let child = match table.element(name, origin.as_deref()) {
+                        ElementTarget::Component(child) => child,
+                        ElementTarget::Unseen | ElementTarget::Ambiguous => return,
+                        ElementTarget::Unresolved => {
+                            match table.ids_named(name).collect::<Vec<_>>()[..] {
+                                [child] => child,
+                                _ => return,
+                            }
+                        }
                     };
                     if child == parent {
                         return;

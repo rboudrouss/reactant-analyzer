@@ -21,7 +21,7 @@ use crate::{
         ComponentId,
         bindings::binding_of,
         cfg::CFG,
-        expr::{BinOp, CompOrigin, Expr, MarkerVal, Prim, SummaryValue, UnaryOp},
+        expr::{BinOp, ElementOrigin, Expr, MarkerVal, Prim, SummaryValue, UnaryOp},
         hooks::{Arity, DepsArg, HookEntry},
         stmt::Stmt,
         types::{ExprId, Symbol},
@@ -647,7 +647,7 @@ fn setter_calls_in_expr(
 fn eval_comp_app(
     name: &Symbol,
     props_expr: &Expr,
-    origin: Option<&CompOrigin>,
+    origin: Option<&ElementOrigin>,
     span: Option<crate::ir::SourceRange>,
     env: &AbstractEnv<StateValue>,
     ctx: &mut AnalysisCtx<StateValue>,

@@ -1,8 +1,12 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use crate::ir::module::ReExportGraph;
 use crate::ir::{
-    ComponentId, ComponentTable, component::ComponentIR, expr::CompOrigin, types::Symbol,
+    ComponentId, ComponentTable, ElementTarget,
+    component::ComponentIR,
+    expr::{CompOrigin, ElementOrigin},
+    types::Symbol,
 };
 use crate::registry::KeyedRegistry;
 
@@ -11,8 +15,10 @@ use crate::registry::KeyedRegistry;
 pub enum ChildLookup {
     /// Exactly one component can be meant.
     Resolved(ComponentKey),
-    /// No component of that name was lowered — an npm component, or a file
-    /// the run did not cover.
+    /// No component of the program is meant: the name is imported from code
+    /// the analysis does not see (an npm component), its import leads to no
+    /// lowered component, or no file defines it (a file the run did not
+    /// cover).
     Unknown,
     /// Several files define the name and nothing at the call site settles
     /// which. Distinct from [`Self::Unknown`] because the fix differs: the
@@ -62,6 +68,12 @@ impl ComponentRegistry {
         Self { entries, table }
     }
 
+    /// Follow imports of a barrel through `re_exports` ([`Self::resolve_child`]).
+    pub fn with_re_exports(mut self, re_exports: ReExportGraph) -> Self {
+        self.table.set_re_exports(re_exports);
+        self
+    }
+
     /// The identity table this registry minted.
     pub fn table(&self) -> &ComponentTable {
         &self.table
@@ -105,32 +117,22 @@ impl ComponentRegistry {
         self.entries.get(key).cloned()
     }
 
-    /// Which component a JSX callee instantiates.
+    /// Which component a JSX callee instantiates: [`ComponentTable::element`],
+    /// the rule every reader of the component tree applies, as a registry
+    /// key. `origin` is what the *call site's own file* proved about the
+    /// binding ([`ElementOrigin`], stamped at lowering); the name is only how
+    /// the child was written there.
     ///
-    /// `origin` is what the *call site's own file* proved about the binding
-    /// ([`CompOrigin`], stamped at lowering); the name is only how the child
-    /// was written there. Resolving from the name alone is exact when the name
-    /// is unique and a guess otherwise — and the guess used to be "the file
-    /// that sorts first", which quietly inlined an unrelated same-named
-    /// component and lost every finding that depended on the real one (#7).
-    /// So an unsettled name answers [`ChildLookup::Ambiguous`], which the
-    /// caller must treat like any other unanalysable child.
-    ///
-    /// An origin naming a file the registry has no such component in (a
-    /// re-export barrel, the one-level limit of #49) falls back to the name:
-    /// that path is no worse than having no origin at all.
-    pub fn resolve_child(&self, name: &Symbol, origin: Option<&CompOrigin>) -> ChildLookup {
-        if let Some(o) = origin {
-            let key = (o.file.clone(), o.name.clone());
-            if self.entries.contains(&key) {
-                return ChildLookup::Resolved(key);
-            }
-        }
-        let mut matches = self.entries.keys().filter(|(_, n)| n == name);
-        match (matches.next(), matches.next()) {
-            (Some(key), None) => ChildLookup::Resolved(key.clone()),
-            (Some(_), Some(_)) => ChildLookup::Ambiguous,
-            _ => ChildLookup::Unknown,
+    /// The caller treats every answer but `Resolved` as an unanalysable
+    /// child. The same rule as [`crate::engine::HookRegistry::resolve_call`].
+    pub fn resolve_child(&self, name: &Symbol, origin: Option<&ElementOrigin>) -> ChildLookup {
+        match self.table.element(name, origin) {
+            ElementTarget::Component(id) => self
+                .key_of(id)
+                .filter(|key| self.entries.contains(key))
+                .map_or(ChildLookup::Unknown, ChildLookup::Resolved),
+            ElementTarget::Ambiguous => ChildLookup::Ambiguous,
+            ElementTarget::Unseen | ElementTarget::Unresolved => ChildLookup::Unknown,
         }
     }
 
@@ -185,11 +187,11 @@ mod tests {
         }
     }
 
-    fn origin(file: &str, name: &str) -> CompOrigin {
-        CompOrigin {
+    fn origin(file: &str, name: &str) -> ElementOrigin {
+        ElementOrigin::Program(CompOrigin {
             file: PathBuf::from(file),
             name: name.to_string(),
-        }
+        })
     }
 
     fn two_widgets() -> ComponentRegistry {
@@ -252,13 +254,54 @@ mod tests {
     }
 
     /// A barrel: the origin resolves to a file that re-exports rather than
-    /// defines. Falling back to the name is no worse than having no origin.
+    /// defines, and its re-exports lead to the definition.
     #[test]
-    fn an_origin_pointing_at_no_component_falls_back_to_the_name() {
-        let reg = ComponentRegistry::from_components(vec![comp("/b/Widget.tsx", "Widget")]);
+    fn an_origin_at_a_barrel_follows_its_re_exports() {
+        use crate::ir::ModuleFacts;
+        use crate::ir::module::ReExports;
+        let mut table = crate::ir::ModuleTable::default();
+        table.insert(
+            PathBuf::from("/index.ts"),
+            ModuleFacts {
+                re_exports: ReExports {
+                    star: vec![PathBuf::from("/b/Widget.tsx")],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let reg = two_widgets().with_re_exports(table.re_export_graph());
         assert_eq!(
             reg.resolve_child(&"Widget".to_string(), Some(&origin("/index.ts", "Widget"))),
             ChildLookup::Resolved(("/b/Widget.tsx".into(), "Widget".to_string()))
+        );
+    }
+
+    /// #389: an origin the re-exports do not lead to a component settles no
+    /// child — not the one component of that name elsewhere.
+    #[test]
+    fn an_origin_pointing_at_no_component_never_falls_back_to_the_name() {
+        let reg = ComponentRegistry::from_components(vec![comp("/b/Widget.tsx", "Widget")]);
+        assert_eq!(
+            reg.resolve_child(&"Widget".to_string(), Some(&origin("/index.ts", "Widget"))),
+            ChildLookup::Unknown
+        );
+    }
+
+    /// #389: `import { Trans } from "@lingui/react/macro"` is lingui's
+    /// component, even when the program defines exactly one `Trans`.
+    #[test]
+    fn an_unseen_import_never_binds_by_name() {
+        let reg = ComponentRegistry::from_components(vec![comp("/sdk/Trans.tsx", "Trans")]);
+        let name = "Trans".to_string();
+        assert_eq!(
+            reg.resolve_child(&name, Some(&ElementOrigin::Unseen)),
+            ChildLookup::Unknown
+        );
+        assert_eq!(
+            reg.resolve_child(&name, None),
+            ChildLookup::Resolved(("/sdk/Trans.tsx".into(), name.clone())),
+            "no import at all: the name-only fallback"
         );
     }
 }

@@ -17,8 +17,11 @@
 //! this table, and nothing compares it.
 
 use std::collections::HashMap;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 
-use crate::ir::expr::CompOrigin;
+use crate::ir::expr::{CompOrigin, ElementOrigin};
+use crate::ir::module::ReExportGraph;
 
 /// A component's identity, interned in a [`ComponentTable`].
 ///
@@ -117,6 +120,32 @@ pub struct ComponentTable {
     /// [`Self::display_name`], precomputed because that answer is asked once
     /// per rendered finding.
     name_counts: HashMap<String, usize>,
+    /// The program's re-exports: how an import of a barrel reaches the file
+    /// that defines the component ([`Self::element`]).
+    re_exports: Arc<ReExportGraph>,
+    /// What [`Self::element`] found behind each barrel origin: the walk runs
+    /// once per origin, not at every evaluation of an element (a design
+    /// system's `export *` tree is hundreds of files). Reset by anything that
+    /// changes the answer.
+    behind_barrels: Arc<Mutex<HashMap<CompOrigin, Option<ComponentId>>>>,
+}
+
+/// Which component of the program a JSX element instantiates
+/// ([`ComponentTable::element`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElementTarget {
+    /// The element names this component.
+    Component(ComponentId),
+    /// The file neither declares nor imports the name, and several
+    /// components bear it: nothing says which is meant (#7).
+    Ambiguous,
+    /// The name is imported from code the analysis does not see (a package):
+    /// no component of the program, whatever the program names so (#389).
+    Unseen,
+    /// The file's declaration or import leads to no component the table
+    /// holds (a value the lowering made no component, a barrel's re-export
+    /// it cannot follow), or no file defines the name.
+    Unresolved,
 }
 
 impl ComponentTable {
@@ -144,6 +173,7 @@ impl ComponentTable {
         *self.name_counts.entry(origin.name.clone()).or_default() += 1;
         self.by_origin.insert(origin.clone(), id);
         self.origins.insert(id, origin);
+        self.behind_barrels = Arc::default();
     }
 
     /// The `(file, name)` pair `id` names. `None` for an id this table never
@@ -222,6 +252,63 @@ impl ComponentTable {
     /// Every component written `name`, in any file, in interning order.
     pub fn ids_named<'s>(&'s self, name: &'s str) -> impl Iterator<Item = ComponentId> + 's {
         self.ids().filter(move |id| self.name(*id) == Some(name))
+    }
+
+    /// Follow imports of a barrel through `re_exports` ([`Self::element`]).
+    pub fn set_re_exports(&mut self, re_exports: ReExportGraph) {
+        self.re_exports = Arc::new(re_exports);
+        self.behind_barrels = Arc::default();
+    }
+
+    /// Which component the element `<name/>` instantiates, given what its own
+    /// file proved about the name (`origin`, stamped at lowering). The one
+    /// rule the inliner and every reader of the component tree apply; the
+    /// import is the only route (#389):
+    ///
+    /// - a program definition: the component its file defines under that
+    ///   name, else the one its re-exports lead to (a barrel) — never a
+    ///   same-named component elsewhere, which would run another body in the
+    ///   real one's place;
+    /// - imported from unseen code: [`ElementTarget::Unseen`], whatever the
+    ///   program defines under that name;
+    /// - neither declared nor imported in the file: the one component of that
+    ///   name, the name-only fallback ADR-013 accepts — never the first of
+    ///   several (#7).
+    pub fn element(&self, name: &str, origin: Option<&ElementOrigin>) -> ElementTarget {
+        match origin {
+            Some(ElementOrigin::Unseen) => ElementTarget::Unseen,
+            Some(ElementOrigin::Program(o)) => {
+                // The file defines it: the common case, without the walk's
+                // bookkeeping.
+                if let Some(id) = self.id_of(o) {
+                    return ElementTarget::Component(id);
+                }
+                let mut behind = self
+                    .behind_barrels
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let found = *behind.entry(o.clone()).or_insert_with(|| {
+                    let defines = |file: &Path, name: &str| {
+                        self.by_origin.contains_key(&CompOrigin {
+                            file: file.to_path_buf(),
+                            name: name.to_string(),
+                        })
+                    };
+                    self.re_exports
+                        .origin(&o.file, &o.name, &defines)
+                        .and_then(|(file, name)| self.id_of(&CompOrigin { file, name }))
+                });
+                found.map_or(ElementTarget::Unresolved, ElementTarget::Component)
+            }
+            None => {
+                let mut named = self.ids_named(name);
+                match (named.next(), named.next()) {
+                    (Some(id), None) => ElementTarget::Component(id),
+                    (Some(_), Some(_)) => ElementTarget::Ambiguous,
+                    (None, _) => ElementTarget::Unresolved,
+                }
+            }
+        }
     }
 }
 
