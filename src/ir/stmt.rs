@@ -1,7 +1,7 @@
 use crate::ir::{
     expr::Expr,
     source_range::SourceRange,
-    types::{Symbol, Var},
+    types::{ExprId, Symbol, Var},
 };
 
 #[derive(Debug, Clone)]
@@ -20,6 +20,11 @@ pub enum Stmt {
     /// `obj.f++`, `delete obj.f`. The heap identity of `obj` is unchanged —
     /// that is the semantic payload: a mutation, not a rebinding.
     MemberWrite {
+        /// The write's site, numbered with the calls
+        /// ([`crate::ir::expr::CALL_SITES`]): where the value written is
+        /// handed to code the analysis does not see when the heap does not
+        /// place the object (#339), the anchor of what it reaches there.
+        id: ExprId,
         obj: Expr,
         key: MemberKey,
         rhs: Expr,

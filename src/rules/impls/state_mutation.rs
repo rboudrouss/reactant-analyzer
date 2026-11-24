@@ -240,6 +240,7 @@ impl<'a> Collector<'a> {
                         key,
                         rhs,
                         span,
+                        ..
                     } => {
                         let at = at(*span, i);
                         self.record_mutation(obj, scopes, at);

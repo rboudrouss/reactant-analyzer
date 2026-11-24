@@ -441,6 +441,12 @@ on a program React settles; 323 oracle cases, none a known false negative.
   program wrapper around a hook (`const useX = wrap(useY)`). A factory
   imported from another file, or returning one of several closures, still
   leaves the hook unseen (#342, #344).
+- A value written into an object the analysis does not place — the global
+  object (`globalThis.set = setN`, `window.x = f`, a name bound to it), a
+  parameter's member, what a call it does not run returns — is handed to code
+  it does not see, a bare setter included: `setter-in-render` (or the loop
+  rule, in an effect) reports it at the write, a Warning, where the render
+  calling it back through that object was silent (#339).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

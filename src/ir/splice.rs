@@ -715,11 +715,13 @@ fn rename_vars_stmt(stmt: Stmt, ren: &HashMap<Var, Var>) -> Stmt {
             span,
         },
         Stmt::MemberWrite {
+            id,
             obj,
             key,
             rhs,
             span,
         } => Stmt::MemberWrite {
+            id,
             obj: rename_vars_expr(obj, ren),
             key: match key {
                 MemberKey::Field(f) => MemberKey::Field(f),
@@ -1136,11 +1138,13 @@ fn subst_vars_cfg(cfg: CFG, subst: &HashMap<Var, Expr>) -> CFG {
                         span,
                     },
                     Stmt::MemberWrite {
+                        id,
                         obj,
                         key,
                         rhs,
                         span,
                     } => Stmt::MemberWrite {
+                        id,
                         obj: subst_vars_expr(obj, subst),
                         key: match key {
                             MemberKey::Field(f) => MemberKey::Field(f),

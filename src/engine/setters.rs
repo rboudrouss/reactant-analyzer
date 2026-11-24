@@ -2832,7 +2832,7 @@ impl<'a> SetterWalk<'a> {
         self.relation_accesses(stmt.span(), expr, depth, found, mode, prov, span);
         // `state.items.push(x)` reads `state`: the receiver of a member write
         // is the one read position the rhs does not carry.
-        if let Stmt::MemberWrite { obj, key, .. } = stmt {
+        if let Stmt::MemberWrite { id, obj, key, .. } = stmt {
             if self.store_scopes.is_some()
                 && crate::engine::store::member_write_writes(
                     obj,
@@ -2872,6 +2872,18 @@ impl<'a> SetterWalk<'a> {
                 self.accessor = outer;
                 return;
             }
+            // What a write hands to an object the heap does not place, code
+            // the analysis does not see may call at any time (#339).
+            self.relation_handed(
+                Some((*id, 0)),
+                expr,
+                WalkClass::Unknown,
+                None,
+                depth,
+                found,
+                prov,
+                span,
+            );
         }
         self.expr(expr, span, at, depth, found, mode, at_root, prov);
     }
