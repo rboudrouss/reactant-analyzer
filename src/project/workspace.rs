@@ -28,6 +28,8 @@ use std::sync::{Arc, Mutex};
 use serde::Deserialize;
 use serde::de::{Deserializer, MapAccess, SeqAccess, Visitor};
 
+use super::glob::{glob_matches, glob_segments, segment_matches};
+
 use crate::resolver::{FileSystem, ImportResolver, normalize, probe_module};
 
 /// Resolves bare specifiers naming a package of the importing file's
@@ -200,18 +202,6 @@ impl Workspace {
     }
 }
 
-/// A glob's path segments, `./` and repeated `**` collapsed.
-fn glob_segments(glob: &str) -> Vec<&str> {
-    let mut segs: Vec<&str> = Vec::new();
-    for seg in glob.split('/') {
-        if seg.is_empty() || seg == "." || (seg == "**" && segs.last() == Some(&"**")) {
-            continue;
-        }
-        segs.push(seg);
-    }
-    segs
-}
-
 /// Never a member: installed copies and dot-directories.
 fn walkable(name: &str) -> bool {
     name != "node_modules" && !name.starts_with('.')
@@ -240,34 +230,6 @@ fn expand(fs: &dyn FileSystem, dir: &Path, segs: &[&str], out: &mut BTreeSet<Pat
             expand(fs, &child, segs, out);
         } else if segment_matches(seg, name) {
             expand(fs, &child, rest, out);
-        }
-    }
-}
-
-/// Whether the relative path `rel` matches the glob `segs` (`**` spans any
-/// number of segments).
-fn glob_matches(segs: &[&str], rel: &[&str]) -> bool {
-    match segs.split_first() {
-        None => rel.is_empty(),
-        Some((&"**", rest)) => (0..=rel.len()).any(|skip| glob_matches(rest, &rel[skip..])),
-        Some((seg, rest)) => rel
-            .split_first()
-            .is_some_and(|(name, tail)| segment_matches(seg, name) && glob_matches(rest, tail)),
-    }
-}
-
-/// One path segment against a pattern whose `*` matches any run of
-/// characters.
-fn segment_matches(pattern: &str, name: &str) -> bool {
-    match pattern.split_once('*') {
-        None => pattern == name,
-        Some((head, tail)) => {
-            let Some(rest) = name.strip_prefix(head) else {
-                return false;
-            };
-            (0..=rest.len())
-                .filter(|&i| rest.is_char_boundary(i))
-                .any(|i| segment_matches(tail, &rest[i..]))
         }
     }
 }
@@ -510,28 +472,6 @@ mod tests {
             vec!["a/*", "b"]
         );
         assert!(pnpm_packages("catalog:\n  react: 19\n").is_empty());
-    }
-
-    #[test]
-    fn globs_match_like_the_package_managers() {
-        assert!(glob_matches(
-            &glob_segments("packages/*"),
-            &["packages", "ui"]
-        ));
-        assert!(!glob_matches(
-            &glob_segments("packages/*"),
-            &["packages", "ui", "x"]
-        ));
-        assert!(glob_matches(
-            &glob_segments("packages/**/**"),
-            &["packages", "a", "b"]
-        ));
-        assert!(glob_matches(
-            &glob_segments("**/test/**"),
-            &["packages", "test"]
-        ));
-        assert!(segment_matches("ui-*", "ui-kit"));
-        assert!(!segment_matches("ui-*", "core"));
     }
 
     #[test]

@@ -58,7 +58,7 @@ reactant check src/ --ignore-rule derived-state  # all but this one
 | `--all-roots` | Analyze every component as an entry point (`props = ⊤`). |
 | `--exclude-dir <names>` | Directory names never walked, matched at any depth. Repeatable or comma-separated. **Replaces** the default policy (see [Discovery](#plain-everything-else)) rather than adding to it; `node_modules/` and `.git/` are skipped regardless. |
 | `--follow-imports` | Also analyze the files the named paths import, transitively, so their hooks are read instead of treated as opaque. The report still covers only the paths you named. **Not a speed optimization**, see [Following imports](#following-imports---follow-imports). |
-| `--assume <name>` | Take a statement about your program as true (repeatable; adds to the config's `assumptions`). Off by default, stated in the output; an unknown name exits with code 2. See [Assumptions](#assumptions). |
+| `--assume <name[=value]>` | Take a statement about your program as true (repeatable; adds to the config's `assumptions`). `foreignRealmFiles` takes a glob: `--assume foreignRealmFiles=packages/server/**`. Off by default, stated in the output; an unknown name, or a value that does not fit, exits with code 2. See [Assumptions](#assumptions). |
 | `--verbose` | Debug output on stderr: symbol graph topo order, fixpoint stats, per-component iterations/widened labels. |
 | `--no-color` | Disable ANSI colors. Also honored: a non-empty `NO_COLOR` env var, or stdout not being a terminal. |
 | `--config <path>` | Config file to use (default: `<project root>/reactant.config.json` when present). Also accepted by `rules` and `explain` (their default root is the cwd). |
@@ -463,7 +463,9 @@ Semantics:
   declared: the premises its findings were computed under. Always present;
   empty unless the config or `--assume` declared one. A finding's level does
   not change under an assumption, so this array is the only place the premise
-  shows in the data: compare runs with it.
+  shows in the data: compare runs with it. A valued assumption's value is in
+  `assumption_values` (`{ "foreignRealmFiles": ["**/polyfills/**"] }`), a field
+  present only while one is in force.
 
 ## JavaScript API
 
@@ -727,6 +729,63 @@ the program says, and their loops stay reported
 Declare it when your program has none of these: no getter on
 `Object.prototype`, no prototype set on a props or ref object. A library you
 analyse that does one is a program that does.
+
+### `foreignRealmFiles`
+
+A list of globs naming the files that **do not share a JavaScript realm with the
+app** the analysis reports on: polyfills installed in a worker, server code, an
+SDK or CLI, a marketing site with its own bundle, test setup and mocks.
+
+```jsonc
+// reactant.config.json
+{ "assumptions": { "foreignRealmFiles": ["packages/server/**", "**/polyfills/**", "**/__mocks__/**"] } }
+```
+
+or `reactant check --assume foreignRealmFiles=packages/server/** --assume
+foreignRealmFiles='**/__mocks__/**'` (repeatable; the flags add to the config's
+list; an empty list declares nothing; a glob with no value is an error, exit 2).
+The human output prints `1 assumption in force: files matching … do not share a
+realm with the app`; the JSON lists the name in `assumptions` and the globs in
+`assumption_values`.
+
+**What it means.** By default, one accessor installed anywhere in the program
+(a polyfill looping over property names, `Object.defineProperty(proto, name, …)`
+with a variable `name`, a `Proxy`, an enum member named `Object` read as the
+global) makes every read of an absent member, in every component, a possible
+call of that accessor, and the receiver of the read is handed over to it. A
+file matching a glob no longer contributes to that program-wide fact: what it
+defines, installs and supplies, and whether it re-prototypes, are left out of
+what the *other* files' reads see. The file stays analysed and its components
+reported, and the reads **in it** still see every accessor of the program (the
+declaration says what it does not do to the app, not what the app or another
+declared file does to it).
+
+**What it recovers.** On `twenty` (9 globs: the server, the SDK, the third-party
+apps, the website, the front-component renderer's worker side, the mock service
+worker, the test mocks and setup) 42 files stop contributing, and the fact goes
+from "any name, any accessor, re-prototyped" to `all=["cache","history"]`,
+`installed=[]`, `supplied=[]`, re-prototyped (one error class of the front-end
+itself). The `cross-setter-in-render` rows go from 16,974 to 4,056 and the run's
+rows from 18,147 to 5,222. 13,205 rows leave (13,159 `cross-setter-in-render`
+and 19 `setter-in-render` hand-overs, 22 loop warnings, 5 others), and 280
+appear: no new (parent, child, setter) triple, but the same triples anchored at
+another read, and `always-unstable-deps` rows that name more dependencies once
+they are known to be fresh references.
+
+**What it misses.** A loop or a hand-over that really runs through an accessor
+one of the declared files installs, when that file does run in the app's realm.
+Declaring `packages/twenty-front/**` would be that mistake; so would declaring
+a polyfill the app imports.
+
+**Choosing the globs.** Run once with `REACTANT_PROFILE=1`: every file that
+makes the fact say something is printed (`accessor-fact <file> all=… installed=…
+supplied=… reprototyped=…`), and the `<program>` line is the join. Declare a file
+only if you know it is loaded in another realm than the front-end's components
+(another process, a Worker or an iframe, another bundle, or only under a test
+runner), not because it is inconvenient. Globs are read against the path from the
+project root (the first directory argument): `*` matches inside a path segment,
+`**` any number of segments, a directory is `dir/**`; a file outside the root
+matches none. Prefer the narrowest glob that covers the contributing files.
 
 ## Fixtures
 

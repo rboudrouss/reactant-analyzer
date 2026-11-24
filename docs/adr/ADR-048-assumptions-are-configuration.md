@@ -52,6 +52,22 @@ a switch, not a theory. An accessor on an object the analysis places (the ref it
 handed to `Object.setPrototypeOf`) is not unplaced: it keeps running as the heap says, with or
 without the assumption.
 
+## A valued assumption: `foreignRealmFiles` (#379)
+
+An assumption may carry a value, not only a flag: `"foreignRealmFiles": ["**/polyfills/**",
+"apps/server/**"]` (config) or `--assume foreignRealmFiles=<glob>` (repeatable, additive) names the
+files that **do not share a JavaScript realm with the app**. Globs are the workspace matcher's
+(`project::glob`, one matcher), read against the file's path from the project root; a file outside
+it matches none, and an empty list declares nothing. It is read where the per-file accessor facts
+are joined into the program's (`ModuleTable::accessor_names`, the only such place): a matching
+file's four sets (`all`, `installed`, `supplied`, `reprototyped`) are left out of what the other
+files' reads see, which is the whole statement "nothing this file does reaches a realm that reads
+the fact". The file stays analysed and reported, and its own reads see the **whole** program's fact:
+the declaration says what it does not do to the app, not what the app or another declared file does
+to it (two declared files may share a realm). The output states the globs once: the human line, and
+`assumption_values` (`{ "foreignRealmFiles": [...] }`) in the JSON beside the names-only
+`assumptions` array, present only when a valued assumption is in force.
+
 ## Why #297's declarations are members of the same section
 
 A declared library summary (#297) is also a statement about code the analysis does not read that
@@ -74,8 +90,8 @@ make a run's premises two lists to read.
 ## Consequences
 
 - A default run is byte-identical to the previous one, except for `"assumptions": []` in the JSON.
-- The `assumptions` array is additive to JSON schema v3; a consumer that compares runs compares
-  it too.
+- The `assumptions` array is additive to JSON schema v3, and so is `assumption_values`; a consumer
+  that compares runs compares them too.
 - A clean human summary under an assumption is followed by the line, so "no issues found" is
   never read without its premise.
 - A new assumption is one variant of `Assumption`, one field of `Assumptions`, one read.

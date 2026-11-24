@@ -14,7 +14,7 @@ use crate::{
         expr::{Expr, SummaryValue},
         free_vars::{compute_free_vars, free_paths_and_pinned},
         hooks::HookEntry,
-        module::AccessorNames,
+        module::{AccessorNames, ProgramAccessors},
         stmt::Stmt,
         types::{BlockId, HookLabel, Var},
     },
@@ -55,6 +55,10 @@ pub struct Config {
     /// What the run takes as true of the program, and never otherwise
     /// (ADR-048). Read where the fact it replaces is decided, not here.
     pub assumptions: crate::assumptions::Assumptions,
+    /// The directory the globs of an assumption about files are read
+    /// relative to (`foreignRealmFiles`, #379): the project root. A file
+    /// outside it matches no glob.
+    pub project_root: std::path::PathBuf,
 }
 
 impl Default for Config {
@@ -66,6 +70,7 @@ impl Default for Config {
             class_registry: FunctionRegistry::new(),
             max_inline_depth: 8,
             assumptions: Default::default(),
+            project_root: std::path::PathBuf::new(),
         }
     }
 }
@@ -83,8 +88,8 @@ pub struct ProgramFacts {
     pub written: HashSet<Var>,
     /// The member names some accessor of the program defines, read off every
     /// lowered file (#334): every heap of the program starts from it
-    /// ([`Heap::with_defined`]).
-    pub accessors: std::sync::Arc<AccessorNames>,
+    /// ([`Heap::with_defined`]) from what its component's file reads.
+    pub accessors: ProgramAccessors,
     /// The program's module scope (#335): the top-level bindings of its
     /// files, each a slot of a store no component owns.
     pub modules: std::sync::Arc<crate::engine::ModuleScope>,
@@ -101,12 +106,12 @@ impl ProgramFacts {
         components: &ComponentRegistry,
         hooks: &HookRegistry,
         utilities: &FunctionRegistry,
-        accessors: AccessorNames,
+        accessors: ProgramAccessors,
         modules: crate::engine::ModuleScope,
     ) -> Self {
         use crate::engine::render_deps::written_in;
         let mut facts = Self::of_utilities(utilities);
-        facts.accessors = std::sync::Arc::new(accessors);
+        facts.accessors = accessors;
         facts.modules = std::sync::Arc::new(modules);
         facts.relations_after_all = true;
         facts.dispatches =
@@ -232,7 +237,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
 ) -> AnalysisResult<StateValue> {
     // Every heap of the analysis knows what the program's accessors define
     // (#334), the scratch ones seeding a value below included.
-    let initial_heap = initial_heap.with_defined(program.accessors.clone());
+    let initial_heap = initial_heap.with_defined(program.accessors.read_in(&comp.file).clone());
     let _profile = crate::profile::on().then(|| {
         let kind = match inter {
             None => "intra",
@@ -1250,13 +1255,13 @@ pub fn analyze_program_defining(
     hook_registry: HookRegistry,
     strategy: RootStrategy,
     config: &Config,
-    accessors: AccessorNames,
+    accessors: impl Into<ProgramAccessors>,
     modules: crate::engine::ModuleScope,
 ) -> ProgramAnalysisResult {
     use std::cell::RefCell;
     use std::collections::HashMap;
 
-    let accessors = accessors.under(&config.assumptions);
+    let accessors = accessors.into().under(&config.assumptions);
     let cache = RefCell::new(ComponentCache::new());
     let shared_state = RefCell::new(SharedStateStore::new());
     let reducers: crate::engine::ProgramReducers = RefCell::new(HashMap::new());

@@ -523,7 +523,10 @@ pub fn analyze_lowered(
     let registry = ComponentRegistry::from_components(lowered.components);
     let hook_registry = HookRegistry::from_hooks(lowered.hooks)
         .with_re_exports(lowered.module_table.re_export_graph());
-    let accessors = lowered.module_table.accessor_names();
+    let foreign = &config.assumptions.foreign_realm_files;
+    let accessors = lowered.module_table.accessor_names(&|file| {
+        crate::project::glob::path_matches_any(foreign, &config.project_root, file)
+    });
     let modules =
         crate::engine::ModuleScope::of(&lowered.module_table).with_consts(lowered.module_consts);
     let mut result = analyze_program_defining(

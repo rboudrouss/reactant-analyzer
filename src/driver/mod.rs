@@ -361,7 +361,7 @@ pub fn run_check(
             exit_code: EXIT_OK,
             file_table: lowered.file_table,
             blind_spots: blind,
-            assumptions: opts.assumptions,
+            assumptions: opts.assumptions.clone(),
             followed: opts.follow_imports.then(|| Followed {
                 files: followed_files.len(),
                 examples: followed_files.iter().take(3).map(|p| display(p)).collect(),
@@ -385,7 +385,8 @@ pub fn run_check(
     // noise. `Config::default()` stays empty so unit tests keep their baselines.
     let config = Config {
         summary_registry: crate::registry::SummaryRegistry::new_with_common(),
-        assumptions: opts.assumptions,
+        assumptions: opts.assumptions.clone(),
+        project_root: project_root.clone(),
         ..Config::default()
     };
     drop(lowering);
@@ -516,7 +517,7 @@ pub fn run_check(
         exit_code,
         file_table: program_result.file_table,
         blind_spots: blind,
-        assumptions: opts.assumptions,
+        assumptions: opts.assumptions.clone(),
         followed: opts.follow_imports.then(|| Followed {
             files: followed_files.len(),
             examples: followed_files.iter().take(3).map(|p| display(p)).collect(),
@@ -598,7 +599,7 @@ pub fn run_help(color: bool) -> String {
             "also analyze what the named paths import",
         ),
         (
-            "--assume <name>",
+            "--assume <name[=value]>",
             "take a statement about the program as true (repeatable)",
         ),
         ("--format <fmt>", "human or json (default: human)"),
