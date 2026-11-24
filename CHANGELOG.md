@@ -456,6 +456,12 @@ on a program React settles; 323 oracle cases, none a known false negative.
   back through `r.current(…)` — in the render, or in an effect whose deps it
   moves — is reported, a `setter-in-render` or `infinite-loop` Warning, as a
   setter stored in an object literal is; it was silent (#351).
+- A body inlined from another file — a custom hook, a hook value's closure, a
+  utility, a class's construction — reads a module `const` as its own file
+  binds it, not as the component's file binds the same name: a loop its own
+  constant drives is reported where it was missed (#354), and a hook whose
+  own constant settles it is no longer a possible loop (#36). A name its file
+  imports or keeps in a module `let` is never the component's `const` either.
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

@@ -26,8 +26,7 @@ use crate::{
         hook_ir::HookIR,
     },
     lowering::{
-        ResolvedImport, lower_program_with_resolver, scan_context_names,
-        utility_lowerer::lower_utilities_with_resolver,
+        ResolvedImport, lower_program_with_resolver, utility_lowerer::lower_utilities_with_resolver,
     },
 };
 
@@ -261,6 +260,11 @@ pub struct LoweredProgram {
     /// The import edges that point at one of `classes`, as
     /// [`Self::utility_imports`] for utilities.
     pub class_imports: Vec<((PathBuf, String), (PathBuf, String))>,
+    /// Every lowered file's module `const`s of known kind, the contexts it
+    /// imports from another analysed file included: what a body written in
+    /// the file reads its free names as, wherever it is inlined (#354).
+    /// Each component of a file shares that file's table.
+    pub module_consts: HashMap<PathBuf, Arc<HashMap<String, ModuleConstInit>>>,
 }
 
 /// Parse and lower an explicit list of files with the given `ImportResolver`.
@@ -294,10 +298,11 @@ pub fn lower_files_with(
         utility_imports: Vec::new(),
         classes: Vec::new(),
         class_imports: Vec::new(),
+        module_consts: HashMap::new(),
     };
-    // Per-file context bindings and resolved imports, for the cross-file pass
+    // Per-file module consts and resolved imports, for the cross-file pass
     // below: a context is only provable once every file has been scanned.
-    let mut contexts: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+    let mut consts: HashMap<PathBuf, HashMap<String, ModuleConstInit>> = HashMap::new();
     let mut file_imports: Vec<(PathBuf, HashMap<String, ResolvedImport>)> = Vec::new();
     // Hooks bound to a module call's value, and what each file's hook
     // extraction reads: the function called may be another file's (#344).
@@ -384,7 +389,10 @@ pub fn lower_files_with(
             path.clone(),
             crate::lowering::collect_module_facts(&ret.program, path, resolver),
         );
-        contexts.insert(path.clone(), scan_context_names(&ret.program, path));
+        consts.insert(
+            path.clone(),
+            crate::lowering::module_consts(&ret.program, path),
+        );
         file_imports.push((
             path.clone(),
             crate::lowering::build_resolved_imports(&ret.program, path, resolver),
@@ -392,7 +400,7 @@ pub fn lower_files_with(
         lowered.file_count += 1;
     }
 
-    resolve_imported_contexts(&mut lowered, &contexts, &file_imports);
+    resolve_imported_contexts(&mut lowered, consts, &file_imports);
     resolve_imported_utilities(&mut lowered, &file_imports);
     lowered.hooks.extend(crate::lowering::lower_hook_values(
         &hook_values,
@@ -441,31 +449,36 @@ fn import_edges(
     edges
 }
 
-/// Mark a context imported from another analyzed file as a context *here*.
+/// Mark a context imported from another analyzed file as a context *here*,
+/// and keep every file's table ([`LoweredProgram::module_consts`]).
 ///
 /// `collect_module_consts` sees one file, so `import { Ctx } from "./ctx"` left
 /// `Ctx` unproven and every `<Ctx.Provider>` unreachable to the provider
 /// relation. Resolution has to happen once all files are lowered, which is
-/// here; the enriched map replaces the per-file `Arc` on every component of
-/// that file, so the role stays in the single table its consumers already read.
+/// here; the enriched table of a file is the one every component of that
+/// file shares, so the role stays in the single table its consumers already
+/// read, and the one a body of that file inlined elsewhere reads (#354).
 ///
 /// One level only: if the origin file re-exports the context from a third file,
 /// the chain is not followed (the re-export limit, #49).
 fn resolve_imported_contexts(
     lowered: &mut LoweredProgram,
-    contexts: &HashMap<PathBuf, HashSet<String>>,
+    mut consts: HashMap<PathBuf, HashMap<String, ModuleConstInit>>,
     file_imports: &[(PathBuf, HashMap<String, ResolvedImport>)],
 ) {
     // `local name → the origin cell it names`. The origin is exactly what the
     // match above already established, and dropping it was #109's defect.
-    let mut extra: HashMap<PathBuf, Vec<(String, crate::ir::ContextId)>> = HashMap::new();
+    let mut extra: Vec<(PathBuf, String, crate::ir::ContextId)> = Vec::new();
     for (file, imports) in file_imports {
         for (local, origin) in imports {
-            if contexts
-                .get(&origin.file)
-                .is_some_and(|names| names.contains(&origin.imported))
-            {
-                extra.entry(file.clone()).or_default().push((
+            if matches!(
+                consts
+                    .get(&origin.file)
+                    .and_then(|m| m.get(&origin.imported)),
+                Some(ModuleConstInit::Context(_))
+            ) {
+                extra.push((
+                    file.clone(),
                     local.clone(),
                     crate::ir::ContextId {
                         origin_file: origin.file.clone(),
@@ -475,23 +488,19 @@ fn resolve_imported_contexts(
             }
         }
     }
-    if extra.is_empty() {
-        return;
+    for (file, name, id) in extra {
+        if let Some(m) = consts.get_mut(&file) {
+            m.insert(name, ModuleConstInit::Context(id));
+        }
     }
-    // One rebuilt map per file, shared by that file's components as before.
-    let mut rebuilt: HashMap<PathBuf, Arc<HashMap<String, ModuleConstInit>>> = HashMap::new();
+    lowered.module_consts = consts
+        .into_iter()
+        .map(|(file, m)| (file, Arc::new(m)))
+        .collect();
     for comp in &mut lowered.components {
-        let Some(names) = extra.get(&comp.file) else {
-            continue;
-        };
-        let map = rebuilt.entry(comp.file.clone()).or_insert_with(|| {
-            let mut m = (*comp.module_consts).clone();
-            for (name, id) in names {
-                m.insert(name.clone(), ModuleConstInit::Context(id.clone()));
-            }
-            Arc::new(m)
-        });
-        comp.module_consts = Arc::clone(map);
+        if let Some(map) = lowered.module_consts.get(&comp.file) {
+            comp.module_consts = Arc::clone(map);
+        }
     }
 }
 
@@ -514,7 +523,8 @@ pub fn analyze_lowered(
     let hook_registry = HookRegistry::from_hooks(lowered.hooks)
         .with_re_exports(lowered.module_table.re_export_graph());
     let accessors = lowered.module_table.accessor_names();
-    let modules = crate::engine::ModuleScope::of(&lowered.module_table);
+    let modules =
+        crate::engine::ModuleScope::of(&lowered.module_table).with_consts(lowered.module_consts);
     let mut result = analyze_program_defining(
         registry,
         hook_registry,

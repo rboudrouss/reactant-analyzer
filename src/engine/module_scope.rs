@@ -20,10 +20,11 @@
 //! analysis orders the writes of two components, so a read may see any of
 //! them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use crate::ir::{ComponentId, ModuleTable, types::ExprId, types::Var};
+use crate::ir::{ComponentId, ModuleConstInit, ModuleTable, types::ExprId, types::Var};
 
 /// Every module binding of the program, with its anchor, as each file's code
 /// names it.
@@ -33,6 +34,8 @@ pub struct ModuleScope {
     /// own top-level ones, and those it imports from another analysed file —
     /// with the anchor each denotes.
     files: HashMap<PathBuf, HashMap<Var, ExprId>>,
+    /// Per analysed file: its module `const`s of known kind (#354).
+    consts: HashMap<PathBuf, Arc<HashMap<Var, ModuleConstInit>>>,
 }
 
 impl ModuleScope {
@@ -72,7 +75,26 @@ impl ModuleScope {
             }
             files.insert(path.clone(), names);
         }
-        ModuleScope { files }
+        ModuleScope {
+            files,
+            consts: HashMap::new(),
+        }
+    }
+
+    /// This scope, with every file's module `const`s
+    /// ([`crate::resolver::LoweredProgram::module_consts`]).
+    pub fn with_consts(self, consts: HashMap<PathBuf, Arc<HashMap<Var, ModuleConstInit>>>) -> Self {
+        ModuleScope { consts, ..self }
+    }
+
+    /// The module `const`s of `file`, when it is an analysed file.
+    pub fn consts(&self, file: &Path) -> Option<&HashMap<Var, ModuleConstInit>> {
+        self.consts.get(file).map(|m| m.as_ref())
+    }
+
+    /// The anchor of the module binding `name` denotes in `file`'s code.
+    fn anchor(&self, file: &Path, name: &str) -> Option<ExprId> {
+        self.files.get(file)?.get(name).copied()
     }
 
     /// What a body written in one of `files` names as a module binding, but
@@ -104,6 +126,84 @@ impl ModuleScope {
     /// Is `id` the anchor of a module binding?
     pub fn is_anchor(id: ExprId) -> bool {
         ComponentId::site_owner(id) == Some(ComponentId::MODULE)
+    }
+}
+
+/// The free names the splices into one component renamed (#141, #354).
+///
+/// A free name of a body denotes what its own file binds it to, wherever the
+/// body is inlined. A splice renames it, with the splice's salt, where the
+/// component would read it as its own: a binding of the caller (#141), and,
+/// for a body written in another file, a module `const` of either file, both
+/// of which the component's render binds by name. The renamed name keeps the
+/// binding it denotes: its file's `const`, and its module slot (#335).
+pub(crate) struct SplicedNames<'a> {
+    scope: &'a ModuleScope,
+    /// The component's file, and its module `const`s.
+    file: &'a Path,
+    consts: &'a HashMap<Var, ModuleConstInit>,
+    /// Each renamed name, with the file its body is written in and the name
+    /// it has there.
+    renamed: Vec<(Var, PathBuf, Var)>,
+}
+
+impl<'a> SplicedNames<'a> {
+    pub fn new(
+        scope: &'a ModuleScope,
+        file: &'a Path,
+        consts: &'a HashMap<Var, ModuleConstInit>,
+    ) -> Self {
+        SplicedNames {
+            scope,
+            file,
+            consts,
+            renamed: Vec::new(),
+        }
+    }
+
+    /// The module `const`s of `file`, the component's own included.
+    fn table(&self, file: &Path) -> Option<&HashMap<Var, ModuleConstInit>> {
+        match file == self.file {
+            true => Some(self.consts),
+            false => self.scope.consts(file),
+        }
+    }
+
+    /// The free names a body written in `from` may not read under their own
+    /// name, beside the caller's bindings: none in the component's file; in
+    /// another, the module `const`s of both files.
+    pub fn isolated(&self, from: &Path) -> HashSet<Var> {
+        if from == self.file {
+            return HashSet::new();
+        }
+        let own = self.scope.consts(from).into_iter().flat_map(|m| m.keys());
+        self.consts.keys().chain(own).cloned().collect()
+    }
+
+    /// Record the free names of a body written in `from` that `rename`
+    /// renamed: those the body's own names (`bound`) do not hold.
+    pub fn record(&mut self, from: &Path, rename: &HashMap<Var, Var>, bound: &HashSet<Var>) {
+        for (name, fresh) in rename {
+            if !bound.contains(name) {
+                self.renamed
+                    .push((fresh.clone(), from.to_path_buf(), name.clone()));
+            }
+        }
+    }
+
+    /// Each renamed name its body's file binds to a module `const`, with
+    /// that `const`.
+    pub fn consts(&self) -> impl Iterator<Item = (&Var, &ModuleConstInit)> {
+        self.renamed
+            .iter()
+            .filter_map(|(fresh, file, name)| Some((fresh, self.table(file)?.get(name)?)))
+    }
+
+    /// Each renamed name that denotes a module binding, with its anchor.
+    pub fn anchors(&self) -> impl Iterator<Item = (&Var, ExprId)> {
+        self.renamed
+            .iter()
+            .filter_map(|(fresh, file, name)| Some((fresh, self.scope.anchor(file, name)?)))
     }
 }
 
@@ -147,5 +247,40 @@ mod tests {
                 .names([Path::new("/a.tsx")], &declared)
                 .contains_key("s")
         );
+    }
+
+    #[test]
+    fn a_renamed_free_name_is_its_body_s_file_s_binding() {
+        use crate::ir::expr::Prim;
+        let mut table = ModuleTable::default();
+        table.insert(PathBuf::from("/app.tsx"), facts(&["STEP", "App"], &[]));
+        table.insert(PathBuf::from("/hook.tsx"), facts(&["STEP", "cache"], &[]));
+        let app = HashMap::from([("STEP".to_string(), ModuleConstInit::Prim(Prim::Int(0)))]);
+        let hook = HashMap::from([("STEP".to_string(), ModuleConstInit::Prim(Prim::Int(1)))]);
+        let scope = ModuleScope::of(&table).with_consts(HashMap::from([
+            (PathBuf::from("/app.tsx"), Arc::new(app.clone())),
+            (PathBuf::from("/hook.tsx"), Arc::new(hook)),
+        ]));
+        let mut names = SplicedNames::new(&scope, Path::new("/app.tsx"), &app);
+        assert!(names.isolated(Path::new("/app.tsx")).is_empty());
+        assert!(names.isolated(Path::new("/hook.tsx")).contains("STEP"));
+        // `n` is the body's own: not a free name.
+        let rename = HashMap::from([
+            ("STEP".to_string(), "STEP#0".to_string()),
+            ("cache".to_string(), "cache#0".to_string()),
+            ("n".to_string(), "n#0".to_string()),
+        ]);
+        let bound = HashSet::from(["n".to_string()]);
+        names.record(Path::new("/hook.tsx"), &rename, &bound);
+        let consts: Vec<_> = names.consts().collect();
+        assert!(
+            matches!(consts.as_slice(), [(v, ModuleConstInit::Prim(Prim::Int(1)))] if *v == "STEP#0"),
+            "the hook's file's value: {consts:?}"
+        );
+        let anchors: HashMap<&Var, ExprId> = names.anchors().collect();
+        let hook_names = scope.names([Path::new("/hook.tsx")], &HashSet::new());
+        assert_eq!(anchors[&"cache#0".to_string()], hook_names["cache"][0]);
+        assert_eq!(anchors[&"STEP#0".to_string()], hook_names["STEP"][0]);
+        assert!(!anchors.contains_key(&"n#0".to_string()));
     }
 }

@@ -1,9 +1,7 @@
 // @file App.tsx
 // oracle: react=loop
-// oracle: known=fn #354
-// A hook of another file reads its own file's `STEP` (1), but the analysis
-// seeds the component file's `const`s into the render, and that file binds
-// `STEP` to 0: the effect's write reads as one that settles.
+// #354. A hook of another file reads its own file's `STEP` (1), not the
+// component file's (0): the effect moves `n` by one on every run.
 import { useX } from "./hook";
 
 const STEP = 0;
