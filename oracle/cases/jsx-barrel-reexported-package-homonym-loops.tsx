@@ -1,11 +1,10 @@
 // @file App.tsx
 // oracle: react=loop
-// oracle: known=fn #325
 // #389. The barrel re-exports a package's component (React's `Profiler`, as
 // `Trans`), which calls `onRender` after every commit. The import leads to
 // code the analysis does not see, never to the program's own `Trans`, which
 // does not call it: an unresolved child, disclosed as an `analysis-limit`,
-// whose handed closure writes the state with no row yet (#325).
+// whose handed closure runs there at an unknown time (#325).
 import { useState } from "react";
 import { Trans } from "./ui";
 

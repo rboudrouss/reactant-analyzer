@@ -644,6 +644,17 @@ on a program React settles; 323 oracle cases, none a known false negative.
   none when several files define it. A child imported through a barrel is
   no longer analysed a second time as a root, which overwrote its parent's
   result and silenced its loop (#389).
+- A function handed as a prop to a child component the analysis does not see
+  (a package's component, an element value it does not resolve, a name several
+  files define, a component rendering itself, a context provider's `value`)
+  runs at an unknown time, a render included, as an unknown callee's argument
+  does: a setter it calls or holds is a `setter-in-render` Warning and a loop
+  through it is claimed, where it was read as an event handler and silent
+  (React's `<Profiler onRender>`, a child that calls its prop from an effect).
+  Host elements' `on*` props and a seen child's props keep their event
+  timing. Cost on 11 small repositories and mantine: 1,353 → 3,005 rows, all
+  Warnings, most on closures that package components call on events only
+  (#325).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

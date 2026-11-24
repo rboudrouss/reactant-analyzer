@@ -90,6 +90,15 @@ pub trait QueryContext {
     fn hands_back(&self, _label: crate::ir::types::HookLabel) -> Option<&crate::ir::expr::Expr> {
         None
     }
+
+    /// The analysis runs in a program that resolves this component's
+    /// elements to the components it analyses, even in a pass that does not
+    /// analyse them again: there an element's child is unseen only where its
+    /// resolution says so. `false`: no child is analysed, every element's is
+    /// code the analysis does not see (#325).
+    fn resolves_children(&self) -> bool {
+        false
+    }
 }
 
 // ── NullCtx ───────────────────────────────────────────────────────────────────
@@ -522,6 +531,8 @@ pub struct FixpointCtx<'a> {
         &'a std::collections::HashMap<crate::ir::types::HookLabel, Vec<crate::ir::expr::Expr>>,
     /// See `QueryContext::module_binding`.
     pub module: &'a std::collections::HashMap<crate::ir::types::Var, Vec<crate::ir::types::ExprId>>,
+    /// See `QueryContext::resolves_children`.
+    pub resolves_children: bool,
 }
 
 impl QueryContext for FixpointCtx<'_> {
@@ -560,5 +571,9 @@ impl QueryContext for FixpointCtx<'_> {
 
     fn module_binding(&self, name: &str) -> &[crate::ir::types::ExprId] {
         self.module.get(name).map_or(&[], Vec::as_slice)
+    }
+
+    fn resolves_children(&self) -> bool {
+        self.resolves_children
     }
 }
