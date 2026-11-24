@@ -16,6 +16,10 @@
 //! inlining depths — evaluates the same id each time, and every evaluation
 //! joins into its one row.
 //!
+//! A member access and a conversion have no id: their rows are keyed by the
+//! statement, as [`StmtAt`] places it — the body instance it is in, by the
+//! component whose IR holds that copy, and its span (#390).
+//!
 //! **Contract.** Every column is a *may* over-approximation of what the
 //! evaluations saw, except [`Targets::sure`], which is *must*: true only
 //! when every evaluation that reached the call saw exactly one target,
@@ -49,6 +53,51 @@ pub const CALLEE: usize = usize::MAX;
 /// The position [`Escapes`] records, at an effect's hook site, for the
 /// function the effect returns: its cleanup, which React calls.
 pub const CLEANUP: usize = usize::MAX - 1;
+
+/// Where a statement (or a terminator) is, as the rows of its member accesses
+/// and conversions are keyed ([`CallRelation::accesses`],
+/// [`CallRelation::handed`]): the copy of the statement — the component
+/// whose IR holds the body it is in — and its span (#390).
+///
+/// A copy is told by the site range its body is numbered in
+/// ([`ComponentId::site_owner`]): a component's render and hook bodies, the
+/// closures written in them and every body spliced into them are numbered in
+/// its range, so two components that splice one hook hold two copies of
+/// its statements, at one span. The interpreter and the readers place a
+/// statement the same way, from what they run or walk: a component's own
+/// body, or the body reached at a site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StmtAt {
+    /// The component whose range numbers the body; `None` below the first
+    /// range (a hand-built IR, a body no component holds).
+    body: Option<ComponentId>,
+    span: Option<crate::ir::SourceRange>,
+}
+
+impl StmtAt {
+    /// The statement at `span` of one of `component`'s own bodies: its
+    /// render or a hook body.
+    pub fn of_component(component: ComponentId, span: Option<crate::ir::SourceRange>) -> Self {
+        StmtAt {
+            body: ComponentId::site_owner(ExprId(component.site_base())),
+            span,
+        }
+    }
+
+    /// The statement at `span` of the body reached at `site`: a closure, a
+    /// `useCallback` body at its hook's site, an accessor.
+    pub fn of_site(site: ExprId, span: Option<crate::ir::SourceRange>) -> Self {
+        StmtAt {
+            body: ComponentId::site_owner(site),
+            span,
+        }
+    }
+
+    /// The statement at `span` of the same body.
+    pub fn with_span(self, span: Option<crate::ir::SourceRange>) -> Self {
+        StmtAt { span, ..self }
+    }
+}
 
 /// What one call may run, joined over every evaluation of it.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -192,20 +241,20 @@ pub struct CallRelation {
     /// closure at ([`crate::engine::ModuleScope`]), in order.
     module: BTreeSet<ExprId>,
     /// What the member reads and writes of a statement may run (#337), by
-    /// the statement's position: the accessors the heap placed there, as
+    /// the statement ([`StmtAt`]): the accessors the heap placed there, as
     /// bodies, and whether one it does not see may run (`open`), module
     /// code included (`module`). A member access has no id of its own, so
-    /// every access of one statement — and of every statement at that
-    /// position, a spliced copy's or one lowering gave none — shares a row:
+    /// every access of one statement — and of every statement of the same
+    /// copy at that span, one lowering gave none included — shares a row:
     /// a may join, never `sure`.
-    accesses: HashMap<Option<crate::ir::SourceRange>, Targets>,
+    accesses: HashMap<StmtAt, Targets>,
     /// What the member reads and writes and the conversions of a statement
-    /// hand code the analysis does not see, by the statement's position, as
+    /// hand code the analysis does not see, by the statement, as
     /// [`Self::accesses`] is keyed: the receiver of an accessor the heap
     /// does not place (#334) or of a conversion method it does not place
     /// (#360), and the value a write hands such a setter. That code runs
     /// there, and may call what the value reaches.
-    handed: HashMap<Option<crate::ir::SourceRange>, Escapes>,
+    handed: HashMap<StmtAt, Escapes>,
     /// The half and the member of each accessor body an access ran: what a
     /// write inside it says runs it.
     accessors: HashMap<ExprId, crate::engine::setters::AccessorOf>,
@@ -251,13 +300,13 @@ impl CallRelation {
 
     /// What the member reads and writes of the statement at `at` may run
     /// (#337); `None` when none may run an accessor.
-    pub fn accesses(&self, at: Option<crate::ir::SourceRange>) -> Option<&Targets> {
+    pub fn accesses(&self, at: StmtAt) -> Option<&Targets> {
         self.accesses.get(&at)
     }
 
     /// What the accesses and conversions of the statement at `at` hand code
     /// the analysis does not see ([`Self::handed`]); `None` when nothing.
-    pub fn handed(&self, at: Option<crate::ir::SourceRange>) -> Option<&Escapes> {
+    pub fn handed(&self, at: StmtAt) -> Option<&Escapes> {
         self.handed.get(&at)
     }
 
@@ -268,7 +317,7 @@ impl CallRelation {
     #[allow(clippy::too_many_arguments)]
     pub fn record_handed(
         &mut self,
-        at: Option<crate::ir::SourceRange>,
+        at: StmtAt,
         direct: impl IntoIterator<Item = Slot>,
         held: impl IntoIterator<Item = Slot>,
         bodies: impl IntoIterator<Item = ExprId>,
@@ -308,7 +357,7 @@ impl CallRelation {
 
     /// Join one evaluation of an accessing statement at `at` into its row.
     /// Never `sure`: the row joins every access there.
-    pub fn record_access(&mut self, at: Option<crate::ir::SourceRange>, eval: Evaluation) {
+    pub fn record_access(&mut self, at: StmtAt, eval: Evaluation) {
         self.accesses.entry(at).or_default().join(Targets {
             setters: eval.setters,
             bodies: eval.bodies,
@@ -386,7 +435,8 @@ impl CallRelation {
             // The accessors its member reads and writes run (#337), and what
             // they and its conversions hand code the analysis does not see.
             let mut accessed = BTreeSet::new();
-            for at in positions(body) {
+            for span in positions(body) {
+                let at = StmtAt::of_site(site, span);
                 if let Some(t) = self.accesses.get(&at) {
                     accessed.extend(t.bodies.iter().copied());
                     module |= t.module;
@@ -558,8 +608,8 @@ impl CallRelation {
     }
 }
 
-/// The positions of `body`'s statements and of its terminators that carry
-/// an expression: what [`CallRelation::accesses`] is keyed by.
+/// The spans of `body`'s statements and of its terminators that carry an
+/// expression: where, in the body, [`CallRelation::accesses`] is keyed.
 fn positions(body: &CFG) -> std::collections::HashSet<Option<crate::ir::SourceRange>> {
     use crate::ir::cfg::Terminator;
     let mut out = std::collections::HashSet::new();
@@ -673,6 +723,26 @@ mod tests {
             },
         );
         assert!(!two.targets(id).unwrap().sure());
+    }
+
+    #[test]
+    fn each_copy_of_a_statement_has_its_own_hand_over_row() {
+        let (a, b) = (ComponentId::from_index(0), ComponentId::from_index(1));
+        let at = |c| StmtAt::of_component(c, None);
+        let mut rel = CallRelation::default();
+        rel.record_handed(at(a), [slot(0)], [], [], false, false);
+        let mut other = CallRelation::default();
+        other.record_handed(at(b), [(b, 0)], [], [], false, false);
+        rel.join(&other);
+        // Two components' copies, at one span (none here): two rows.
+        assert_eq!(
+            rel.handed(at(a)).unwrap().setters,
+            BTreeSet::from([slot(0)])
+        );
+        assert_eq!(rel.handed(at(b)).unwrap().setters, BTreeSet::from([(b, 0)]));
+        // A closure `a` holds is `a`'s copy, whoever runs it.
+        assert_eq!(StmtAt::of_site(ExprId(a.site_base() + 7), None), at(a));
+        assert_ne!(StmtAt::of_site(ExprId(b.site_base() + 7), None), at(a));
     }
 
     #[test]

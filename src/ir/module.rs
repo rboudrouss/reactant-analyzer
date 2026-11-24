@@ -363,14 +363,17 @@ impl ModuleFacts {
 pub struct ReExports {
     /// `(exported, origin file, origin name)`: `export { a as b } from "./x"`,
     /// and an imported binding exported again (`import { a } from "./x";
-    /// export { a as b }`). A `default` origin is recorded under the exported
-    /// name, the convention a default import already follows.
+    /// export { a as b }`), and a binding of one of React's wrappers around a
+    /// name (`const b = memo(a)`, `export default memo(a)`, #64). A `default`
+    /// origin is recorded under the exported name, the convention a default
+    /// import already follows.
     pub named: Vec<(String, PathBuf, String)>,
     /// `export * from "./x"` targets, in source order.
     pub star: Vec<PathBuf>,
     /// The module's own top-level names, recorded only when `star` is
-    /// non-empty: a local export shadows a star re-export, and a declared name
-    /// stands in for "maybe exported locally" — stopping there is sound.
+    /// non-empty or a `default` is forwarded: a local export shadows a star
+    /// re-export and is not the default, and a declared name stands in for
+    /// "maybe exported locally" — stopping there is sound.
     pub declared: HashSet<String>,
 }
 
@@ -432,10 +435,16 @@ impl ReExportGraph {
         // A default import is asked for under its local name. A name the
         // module neither exports, declares nor reaches through a star would
         // not link as a named import, so it is the default: `export { default
-        // } from "./x"` forwards it to `./x`, under the same name.
+        // } from "./x"` forwards it to `./x`, under the same name; a default
+        // that names its definition (`export { a as default }`, `export
+        // default memo(a)`, #64) is that definition.
         found.or_else(|| {
-            let (_, from, _) = edges.named.iter().find(|(e, _, _)| e == "default")?;
-            self.walk(from, name, defines, seen)
+            let (_, from, imported) = edges.named.iter().find(|(e, _, _)| e == "default")?;
+            let next = match imported.as_str() {
+                "default" => name,
+                named => named,
+            };
+            self.walk(from, next, defines, seen)
         })
     }
 }
@@ -860,6 +869,25 @@ mod tests {
             g.origin(Path::new("/index.ts"), "useA", &defines),
             Some((PathBuf::from("/def.ts"), "useA".to_string()))
         );
+    }
+
+    /// A default that names its definition (`export default memo(Row)`,
+    /// #64) is that definition, under whatever name the import gives it; a
+    /// name the module declares is its own, not the default.
+    #[test]
+    fn a_default_naming_its_definition_is_that_definition() {
+        let mut r = ReExports {
+            named: vec![named("default", "/row.tsx", "Row")],
+            ..Default::default()
+        };
+        r.declared.insert("Card".to_string());
+        let g = graph(&[("/memo-row.tsx", r)]);
+        let defines = |f: &Path, n: &str| f == Path::new("/row.tsx") && n == "Row";
+        assert_eq!(
+            g.origin(Path::new("/memo-row.tsx"), "Anything", &defines),
+            Some((PathBuf::from("/row.tsx"), "Row".to_string()))
+        );
+        assert_eq!(g.origin(Path::new("/memo-row.tsx"), "Card", &defines), None);
     }
 
     /// A name a star re-export provides is that named export, not the default.

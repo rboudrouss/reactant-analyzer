@@ -655,6 +655,30 @@ on a program React settles; 323 oracle cases, none a known false negative.
   timing. Cost on 11 small repositories and mantine: 1,353 → 3,005 rows, all
   Warnings, most on closures that package components call on events only
   (#325).
+- A component written inside React's `memo(…)` or `forwardRef(…)` (nested
+  ones too, `memo(forwardRef(…))`) is analysed: it was no component, so
+  every rule was silent on its body, and a parent rendering it saw an unseen
+  child whose props ran at an unknown time. `forwardRef`'s second parameter
+  is the element's `ref` and its props are without it (`props.ref` is
+  `undefined`, as in React: a test of it is read on the arm React takes);
+  `const X = memo(Y)` and `export default forwardRef(Y)` stand for `Y`,
+  defined in the file (a `forwardRef` of an imported `Y` stays unseen). Only
+  React's own `memo` / `forwardRef` count; other higher-order components
+  (`styled`, a library's `factory`) stay unseen. On 11 small repositories
+  and mantine: 483 more components analysed, 3,005 → 3,177 rows, all
+  Warnings (−239: a prop the now-seen child calls from an event; +411: the
+  new components' own findings, and closures they forward to a package's
+  component) (#64, #394).
+- What a statement hands to code the analysis does not see at a member read,
+  a member write or a conversion (#334, #339, #360), and the accessors it
+  runs, are the hand-over of the copy of the statement that ran it, not of
+  every statement at its position: two components that inline one hook no
+  longer share what its statements hand over, so a child is no longer told
+  it holds the setter of a parent that never renders it, and a statement
+  lowering gave no position no longer shares one row with the whole program.
+  twenty: 18,809 → 3,826 rows (`cross-setter-in-render` 17,358 → 2,386,
+  all Warnings), unchanged under its `foreignRealmFiles` assumption; 11
+  small repositories and mantine unchanged (#390).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

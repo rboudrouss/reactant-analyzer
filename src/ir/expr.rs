@@ -118,6 +118,14 @@ pub const COMPUTED_KEY_PREFIX: &str = "[computed]";
 /// says which, and the member it defines ([`accessor_key`], #321).
 pub const ACCESSOR_KEY_PREFIX: &str = "[accessor]";
 
+/// The member of a `forwardRef` render's props object that holds the
+/// element's `ref` (#64): React removes `ref` from the props it hands the
+/// render and passes it second, so `props.ref` is `undefined` there and the
+/// render's second parameter reads this member instead
+/// ([`crate::ir::component::RefPassing::Argument`]). Not a valid property
+/// name of a destructuring or a dot access, and no lowering writes it.
+pub const FORWARDED_REF_KEY: &str = "[forwarded-ref]";
+
 /// The member of a class's value (its lowered `ObjectLit`) that holds its
 /// construction body (#335): a function whose parameters are the
 /// constructor's and whose body builds the instance [`NEW_INSTANCE`] binds —

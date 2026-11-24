@@ -445,9 +445,10 @@ that writes it (see *Cross-file limits*).
 - **Render cascades stop at what the analysis cannot see into.** `state-lifted-too-high` and
   `wasted-subtree-render` ([ADR-041](adr/ADR-041-render-dependence.md)) treat an element whose
   component does not resolve as a use, and never count it as wasted. That covers a library
-  component and a `memo`/`forwardRef` wrapper [#64](https://github.com/rboudrouss/reactant-analyzer/issues/64).
-  So a state lifted above a `memo` child, or a heavy `memo`-less library subtree next to a fast
-  input, goes unreported. A proven context's provider is followed to the consumers below it
+  component. A `memo` child is read as its component [#64](https://github.com/rboudrouss/reactant-analyzer/issues/64):
+  its bailout is not modelled, so it re-renders with its parent like any child, and
+  `wasted-subtree-render` may count one whose props stay equal. A heavy library subtree next to a
+  fast input goes unreported. A proven context's provider is followed to the consumers below it
   [#145](https://github.com/rboudrouss/reactant-analyzer/issues/145), but under it, such an element
   counts as a possible consumer. So does a component that reads a context through a custom hook,
   whatever context that is. A cascade through a context imported from a package, or re-exported
@@ -993,8 +994,30 @@ a class cannot call; `this.setState` and the lifecycle methods would be a second
 model, which is not planned (#178, same footing as #63 and #65). A function is a
 component when its name is capitalised and its body creates JSX anywhere,
 calls a hook outside a nested function, or carries a component return type.
+
+React's wrappers are followed [#64](https://github.com/rboudrouss/reactant-analyzer/issues/64):
+a function written inside `memo(…)` or `forwardRef(…)` (nested ones too, `memo(forwardRef(…))`,
+through parentheses and type assertions) is a component under its binding's name, whatever its
+body, and `forwardRef`'s second parameter is the element's `ref` (`null` when none is passed),
+the props it receives being without `ref` (`props.ref` is `undefined`, as in React). A
+wrapper of a name (`const X = memo(Y)`, `export default forwardRef(Y)`) stands for `Y`, as a
+re-export does: the file's own component, or the one `Y`'s import resolves; a `forwardRef` of an
+imported name stands for nothing (the other file cannot know how `ref` reaches its function),
+an unseen child. Only React's own
+wrappers count — `memo` / `forwardRef` imported from `react`, or a member of a binding of
+`react` (`React`, unbound, as the global); a program's or a package's function of that name is
+not React's. Two approximations, each sound: `memo` is read as its component rendered with
+every parent render (the bailout, and `areEqual`, are a skipped render, a sub-case — a loop the
+memo breaks may still be a Warning); and the `Y` of `forwardRef(Y)` keeps its second parameter
+unknown and reads `props.ref` as the element's `ref` or `undefined`, since it may also be
+rendered on its own, where React passes `undefined` second and the `ref` as a prop. A
+component analysed as a root has unknown props, `props.ref` included. Other higher-order components
+(`styled(…)`, `React.lazy`, a library's `factory(…)`, `withX(…)`) are calls whose result the
+analysis does not see: an element of one is an unseen child
+[#325](https://github.com/rboudrouss/reactant-analyzer/issues/325).
+
 Dynamic components (`const C = cond ? A : B; <C />`) [#63](https://github.com/rboudrouss/reactant-analyzer/issues/63);
-`React.memo` and `forwardRef` wrappers [#64](https://github.com/rboudrouss/reactant-analyzer/issues/64); anonymous default
+anonymous default
 exports, which get a generic name [#65](https://github.com/rboudrouss/reactant-analyzer/issues/65). Vite and the Next.js App
 Router are built in (ADR-016, ADR-026); TanStack Router has no built-in plugin
 [#66](https://github.com/rboudrouss/reactant-analyzer/issues/66), so see [plugins.md](plugins.md) for custom discovery in the

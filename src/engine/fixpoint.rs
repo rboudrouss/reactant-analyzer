@@ -617,7 +617,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 returns: Default::default(),
                 render,
                 escaped: false,
-                stmt: None,
+                stmt: crate::engine::calls::StmtAt::of_component(comp_id, None),
             };
             let envs = analyze_cfg(transfer, cfg, entry, &mut ac);
             if let Some(label) = effect {
@@ -751,7 +751,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 returns: std::mem::take(&mut returns),
                 render: true,
                 escaped: false,
-                stmt: None,
+                stmt: crate::engine::calls::StmtAt::of_component(comp_id, None),
             };
             let updates = hooks
                 .iter()
@@ -793,7 +793,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 returns,
                 render: true,
                 escaped: false,
-                stmt: None,
+                stmt: crate::engine::calls::StmtAt::of_component(comp_id, None),
             };
             for hook in &hooks {
                 if let HookEntry::Ref { label, init, .. } = hook {
@@ -900,7 +900,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 returns: Default::default(),
                 render: false,
                 escaped: false,
-                stmt: None,
+                stmt: crate::engine::calls::StmtAt::of_component(comp_id, None),
             };
             crate::domains::interp::run_escaped(transfer, &escaped_bodies, &env_exit, &mut ac);
             state_from_handlers = state_from_handlers.join(&out);
@@ -1211,8 +1211,13 @@ fn forwarded_props(
         }
         false
     };
+    // A `forwardRef` render's `ref` is the member its props keep the
+    // element's under: the caller's element held it as `ref`.
     let prop_of = |e: &Expr| match e.peel_ts() {
-        Expr::FieldAccess { obj, field } if is_props(obj) => Some(field.clone()),
+        Expr::FieldAccess { obj, field } if is_props(obj) => Some(match field.as_str() {
+            crate::ir::expr::FORWARDED_REF_KEY => "ref".to_string(),
+            _ => field.clone(),
+        }),
         _ => None,
     };
     fields
@@ -2839,6 +2844,7 @@ mod tests {
             hooks,
             hook_provenance: vec![],
             module_consts: Default::default(),
+            ref_passing: Default::default(),
         }
     }
 
@@ -3178,6 +3184,7 @@ mod tests {
             hooks: vec![],
             hook_provenance: vec![],
             module_consts: Default::default(),
+            ref_passing: Default::default(),
         };
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         assert_eq!(

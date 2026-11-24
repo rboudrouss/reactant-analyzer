@@ -966,6 +966,7 @@ mod tests {
             hooks,
             hook_provenance: vec![],
             module_consts: Default::default(),
+            ref_passing: Default::default(),
         };
         let config = Config {
             widen_threshold: 1,
@@ -1034,6 +1035,7 @@ mod tests {
             hooks,
             hook_provenance: vec![],
             module_consts: Default::default(),
+            ref_passing: Default::default(),
         };
         let config = Config {
             widen_threshold: 3,
@@ -1160,6 +1162,7 @@ mod tests {
             hooks,
             hook_provenance: vec![],
             module_consts: Default::default(),
+            ref_passing: Default::default(),
         }
     }
 
@@ -1524,6 +1527,7 @@ mod tests {
             hooks,
             hook_provenance: vec![],
             module_consts: Default::default(),
+            ref_passing: Default::default(),
         }
     }
 
