@@ -389,11 +389,14 @@ pub struct AnalysisCtx<'a, D: AbstractDomain> {
     /// evaluate is no certain write of any region, so the call relation never
     /// makes its row `sure` (ADR-047 §7).
     pub escaped: bool,
-    /// The position of the statement (or terminator) the pass is
-    /// evaluating, set by the solver: where a member read or write that may
-    /// run an accessor is anchored in the call relation (#337). `None` for
-    /// one lowering gave no position.
-    pub stmt: Option<crate::ir::SourceRange>,
+    /// The statement (or terminator) the pass is evaluating: where a member
+    /// read or write that may run an accessor, or hands a value over, is
+    /// anchored in the call relation (#337, #390). The solver sets its span;
+    /// its body is the component's own at the start, and the body a closure
+    /// is reached at while it runs ([`StmtAt::of_site`]).
+    ///
+    /// [`StmtAt::of_site`]: crate::engine::calls::StmtAt::of_site
+    pub stmt: crate::engine::calls::StmtAt,
 }
 
 /// What each call of a local function a pass ran returned, by call site
@@ -487,7 +490,7 @@ impl<'a, D: AbstractDomain> AnalysisCtx<'a, D> {
             returns: Returns::default(),
             render: false,
             escaped: false,
-            stmt: None,
+            stmt: crate::engine::calls::StmtAt::of_component(component, None),
         }
     }
 

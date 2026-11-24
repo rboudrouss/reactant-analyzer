@@ -180,6 +180,25 @@ pub(crate) fn run_body<T: Transfer>(
     }
 }
 
+/// [`run_body`] for the body reached at `site`: its statements are that
+/// body's, whichever component's analysis runs it — a parent's closure a
+/// child calls is the parent's copy (#390). What a reader entering the body
+/// at `site` reads.
+pub(crate) fn run_body_at<T: Transfer>(
+    transfer: &T,
+    site: ExprId,
+    body: &Arc<CFG>,
+    entry_env: AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+    depth: usize,
+) -> Run<T::Domain> {
+    let at = crate::engine::calls::StmtAt::of_site(site, None);
+    let outer = std::mem::replace(&mut ctx.stmt, at);
+    let run = run_body(transfer, body, entry_env, ctx, depth);
+    ctx.stmt = outer;
+    run
+}
+
 /// What one run of [`run_cfg`] over a body leaves behind, besides the writes
 /// it made through `ctx`.
 pub(crate) struct Run<D: AbstractDomain> {
@@ -277,7 +296,8 @@ fn solve<T: Transfer>(
         if let Some(block) = cfg.blocks.get(&b) {
             ctx.heap.share_assigned(&mut env);
             for stmt in &block.stmts {
-                let outer = std::mem::replace(&mut ctx.stmt, stmt.span());
+                let outer = ctx.stmt;
+                ctx.stmt = outer.with_span(stmt.span());
                 exec_full_stmt(transfer, stmt, &mut env, ctx, depth);
                 ctx.stmt = outer;
                 if under_condition(&pc)
@@ -302,7 +322,8 @@ fn solve<T: Transfer>(
                 // body's exit is a merge too: a return the other side of a
                 // branch answers with its own takes the branch's condition.
                 Terminator::Return(expr, span) => {
-                    let outer = std::mem::replace(&mut ctx.stmt, *span);
+                    let outer = ctx.stmt;
+                    ctx.stmt = outer.with_span(*span);
                     let returned = exec_callbacks_depth(transfer, expr, &env, ctx, depth);
                     ctx.stmt = outer;
                     let mut val = returned
@@ -322,7 +343,8 @@ fn solve<T: Transfer>(
                     else_,
                     ..
                 } => {
-                    let outer = std::mem::replace(&mut ctx.stmt, *span);
+                    let outer = ctx.stmt;
+                    ctx.stmt = outer.with_span(*span);
                     exec_expr_effects(transfer, cond, &mut env, ctx, depth);
                     ctx.stmt = outer;
                     ctx.heap.share_assigned(&mut env);
@@ -1779,18 +1801,26 @@ fn write_one_slot<T: Transfer>(
             for (param, val) in params.iter().zip([current, action]) {
                 scope.extend(param.clone(), val);
             }
-            exec_body_depth(transfer, &body, &scope, ctx, depth + 1)
+            // The reducer is the slot owner's hook entry's, whoever
+            // dispatches (#390).
+            let at = crate::engine::calls::StmtAt::of_component(owner, None);
+            let outer = std::mem::replace(&mut ctx.stmt, at);
+            let next = exec_body_depth(transfer, &body, &scope, ctx, depth + 1);
+            ctx.stmt = outer;
+            next
         }
         Some(Reducer::Opaque) => T::Domain::top(),
         None => match args.first() {
             // React calls an updater plainly, with the slot's value.
             Some(Expr::FnLit {
-                params, body_cfg, ..
+                id,
+                params,
+                body_cfg,
             }) => {
                 let mut sub_env = env.clone();
                 let given = [EnvVal::Val(current)];
                 bind_params(&mut sub_env, params, Args::exactly(&given));
-                exec_body_depth(transfer, body_cfg, &sub_env, ctx, depth + 1)
+                run_body_at(transfer, *id, body_cfg, sub_env, ctx, depth + 1).ret
             }
             Some(a) => transfer.eval_expr(a, env, ctx),
             None => T::Domain::top(),
@@ -2982,7 +3012,7 @@ pub(crate) fn exec_fn_value<T: Transfer>(
             }
             let mut sub_env = env.clone();
             bind_params(&mut sub_env, params, args);
-            let run = run_body(transfer, body_cfg, sub_env, ctx, depth + 1);
+            let run = run_body_at(transfer, *id, body_cfg, sub_env, ctx, depth + 1);
             let sites = returned_sites(transfer, body_cfg, &run.exits, ctx);
             Some(run.ret)
                 .filter(|v| !v.is_bottom())
@@ -3012,11 +3042,14 @@ pub(crate) fn exec_fn_value<T: Transfer>(
                 for label in labels {
                     match ctx.query.callback_body(label) {
                         Some(body_cfg) => {
-                            ran.body(ctx.component.hook_site(label), &body_cfg, ctx);
+                            let site = ctx.component.hook_site(label);
+                            ran.body(site, &body_cfg, ctx);
                             if ran.listing {
                                 continue;
                             }
-                            let ret = exec_body_depth(transfer, &body_cfg, env, ctx, depth + 1);
+                            let ret =
+                                run_body_at(transfer, site, &body_cfg, env.clone(), ctx, depth + 1)
+                                    .ret;
                             returned = Some(returned.map_or(ret.clone(), |r| r.join(&ret)));
                         }
                         None => open = true,
@@ -3121,7 +3154,7 @@ fn exec_heap_fns<T: Transfer>(
                 continue;
             }
             bind_params(&mut sub_env, &params, args);
-            let run = run_body(transfer, &body_cfg, sub_env, ctx, depth + 1);
+            let run = run_body_at(transfer, id, &body_cfg, sub_env, ctx, depth + 1);
             let sites = returned_sites(transfer, &body_cfg, &run.exits, ctx);
             placed = Some(match placed {
                 None => sites,

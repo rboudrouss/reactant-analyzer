@@ -17,7 +17,7 @@ use crate::{
     },
     engine::{
         AnalysisResult,
-        calls::{CallRelation, Slot},
+        calls::{CallRelation, Slot, StmtAt},
         dominance::on_all_paths,
         store::STORE_SLOT,
         timing::ArgTiming,
@@ -3389,6 +3389,13 @@ impl<'a> SetterWalk<'a> {
         stmt_span: Option<SourceRange>,
     ) {
         let calls = self.calls;
+        // The statement of the body the walk is in: the one entered at a
+        // site, else the component's own (its root, a dispatched handler),
+        // as the interpreter placed it (#390).
+        let at = match self.body_site {
+            Some(Some(site)) => StmtAt::of_site(site, at),
+            _ => StmtAt::of_component(self.tables.component, at),
+        };
         // Code the analysis does not see runs what it is handed, so no path
         // through those bodies is placed: what they write is read off the
         // relation ([`Self::past_budget`]), never walked, a cost each level
