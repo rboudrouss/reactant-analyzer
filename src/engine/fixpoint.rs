@@ -617,7 +617,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 returns: Default::default(),
                 render,
                 escaped: false,
-                stmt: None,
+                stmt: crate::engine::calls::StmtAt::of_component(comp_id, None),
             };
             let envs = analyze_cfg(transfer, cfg, entry, &mut ac);
             if let Some(label) = effect {
@@ -751,7 +751,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 returns: std::mem::take(&mut returns),
                 render: true,
                 escaped: false,
-                stmt: None,
+                stmt: crate::engine::calls::StmtAt::of_component(comp_id, None),
             };
             let updates = hooks
                 .iter()
@@ -793,7 +793,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 returns,
                 render: true,
                 escaped: false,
-                stmt: None,
+                stmt: crate::engine::calls::StmtAt::of_component(comp_id, None),
             };
             for hook in &hooks {
                 if let HookEntry::Ref { label, init, .. } = hook {
@@ -900,7 +900,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 returns: Default::default(),
                 render: false,
                 escaped: false,
-                stmt: None,
+                stmt: crate::engine::calls::StmtAt::of_component(comp_id, None),
             };
             crate::domains::interp::run_escaped(transfer, &escaped_bodies, &env_exit, &mut ac);
             state_from_handlers = state_from_handlers.join(&out);

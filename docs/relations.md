@@ -200,14 +200,25 @@ one function to an in-cycle callee that runs it (`[setN].forEach(cb)`), never
 code the analysis does not see, and some evaluation ran outside an escaped
 closure — must.
 
-`accesses(at)`, a `Targets` row per **statement position** (#337): what
+`accesses(at)`, a `Targets` row per **statement** (#337): what
 the member reads and writes of the statement (or terminator) at `at` may
 run — the accessor bodies the heap placed there (`bodies`), one it does not
 see (`open`), module code when the receiver is read off a module binding
-(`module`). A member access has no id, so every access of statements at
-one position shares a row, `None` included: may, never `sure`. The writer
-walk enters its bodies at that statement, in its region and phase; each
-body's half and member is `accessor(site)`.
+(`module`). `handed(at)`, an `Escapes` row per statement, keyed the same
+way: what its member accesses and conversions hand code the analysis does
+not see (#334, #360). A member access has no id, so the key `at`
+(`StmtAt`, #390) is the statement's copy and its span: the copy is the
+component whose site range numbers the body it is in — a component's
+render and hook bodies, the closures written there and every body spliced
+into them are numbered in its range, so two components that splice one
+hook hold two copies, two rows. The interpreter places a statement in the
+component's own body, or in the body reached at a site while that body
+runs, whichever analysis runs it; a reader does the same from its root or
+the site it enters. Within one copy every access at one span shares a row,
+`None` included (two splices of one hook in one component, statements
+lowering placed nowhere): may, never `sure`. The writer walk enters its
+bodies at that statement, in its region and phase; each body's half and
+member is `accessor(site)`.
 
 Readers (ADR-047 §4, amended by P10): the writer walk, and the walks the
 engine runs over a body for the rules (`setters::body_writes`,
