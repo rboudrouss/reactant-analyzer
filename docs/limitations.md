@@ -79,7 +79,9 @@ that writes it (see *Cross-file limits*).
   conversion [#360](https://github.com/rboudrouss/reactant-analyzer/issues/360). The converting
   positions are the operands of `+` (a template literal), of the other arithmetic, bitwise and
   shift operators and of `<`, `<=`, `>`, `>=`; both of `==` and `!=` unless one is a `null` or
-  `undefined` literal; the key of `k in o`, of `o[k]` and of `o[k] = v`; the operand of
+  `undefined` literal; the key of `k in o`, of `o[k]` and of `o[k] = v`; a computed key of an
+  object literal or a class (`{ [k]: v }`, `class { [k]() {} }`), where it is evaluated
+  [#370](https://github.com/rboudrouss/reactant-analyzer/issues/370); the operand of
   unary `-`, `+`, `~`; and every entry of an array `join` or a conversion joins (`[o].join()`,
   `` `${[o]}` ``). `===`, `!==`, `typeof`, `!`, `&&`, `||`, `??`, `instanceof`, a condition and a
   `switch` convert nothing. A callee the analysis does not run (`String(o)`, `JSON.stringify(o)`,
@@ -90,11 +92,15 @@ that writes it (see *Cross-file limits*).
   class, an object a spread of something unplaced filled, a library's object — may inherit one it
   does not see, which is handed the object, as a method call's receiver is (a Warning React may
   not confirm: `` `${{ ...props.a, onClick }}` `` reports what `onClick` writes). A value the
-  analysis does not place came from code that holds it already. Two conversions are not followed:
-  a computed key of an object literal or a class (`{ [k]: v }`)
-  [#370](https://github.com/rboudrouss/reactant-analyzer/issues/370), and a host element's
-  attribute, which React DOM converts to a string (`<div title={o}>`)
-  [#371](https://github.com/rboudrouss/reactant-analyzer/issues/371). The writer relation reads one
+  analysis does not place came from code that holds it already. React converts an element's props
+  too [#371](https://github.com/rboudrouss/reactant-analyzer/issues/371): the JSX runtime an
+  element's `key` (a component's included, and a key a spread brings), React DOM every prop of a
+  host element it writes to the DOM — all but the `on*` handlers, the `ref` and the children,
+  except a `<textarea>`'s — and each member of a prop's object (a `style`'s values, `__html`), and
+  for a spread every member it brings. React DOM converts them where it mounts the element and at
+  a commit that changes the prop; the analysis converts them where the element is built, at every
+  render, in the render phase: a prop React converts only at the mount, or only when it changes,
+  or tests only for truthiness (`hidden`, `disabled`) is a Warning React may not confirm. The writer relation reads one
   the render hands to such a callee or hook — a literal, or a name bound to one or to a
   `useCallback` value, or one held by an object or array it hands over — as a possible render write
   [#262](https://github.com/rboudrouss/reactant-analyzer/issues/262),
@@ -289,8 +295,9 @@ that writes it (see *Cross-file limits*).
   value at any render (a Warning, never an Error) and the receiver escapes there: that accessor
   runs at the read with the receiver as `this`, so every setter and closure the receiver reaches
   is a possible write of the read's region, and so is what a write hands such a setter.
-  That accessor may be module code too, which may call what a module binding holds; the analysis
-  reads it so only when the receiver is read off a module binding
+  That accessor may be module code too (a descriptor a module installs on `Object.prototype` at
+  load), which may call what any module binding holds: every setter and closure the program stores
+  in one is a possible write of the read's region as well
   [#372](https://github.com/rboudrouss/reactant-analyzer/issues/372). The names are
   program-wide: one getter named `length` in a test file makes every `x.length` off an unplaced
   value a possible change, a key no constant names (`xs[i]`) may be any accessor's unless it is
@@ -343,7 +350,9 @@ that writes it (see *Cross-file limits*).
   a body (a module function read as a member, a package's or a prop's method) hands that code
   its receiver as well as its arguments, and so does a method past the inlining budget that reads
   `this`, which runs later with `this` unknown
-  [#340](https://github.com/rboudrouss/reactant-analyzer/issues/340). Every setter and closure the
+  [#340](https://github.com/rboudrouss/reactant-analyzer/issues/340) — a getter or a setter read or
+  written past the budget too, which is handed the value written as well
+  [#373](https://github.com/rboudrouss/reactant-analyzer/issues/373). Every setter and closure the
   receiver reaches is then a possible write there (a Warning, never an Error), React confirming
   it or not: a module function that only reads `this.k` off an object that also holds a setter
   is reported. The cost falls on objects whose methods read as code the analysis does not see

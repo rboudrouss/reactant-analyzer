@@ -560,6 +560,28 @@ on a program React settles; 323 oracle cases, none a known false negative.
   a spread of an unplaced value) is handed to the conversion it may run, and
   so is a literal to a `toString` getter installed on `Object.prototype`
   (#360).
+- A computed key of an object literal or a class converts its expression
+  where it is evaluated: `{ [k]: v }` and `class { [k]() {} }` with a `k`
+  whose `toString` writes state, in the render, were silent; they are a
+  `setter-in-render` Warning (#370).
+- React converts an element's props to strings: the JSX runtime an
+  element's `key`, React DOM every prop of a host element it writes to the
+  DOM but the `on*` handlers, the `ref` and the children (a `<textarea>`'s
+  child is its value), and each member of a `style` object. `<div
+  title={o}>`, `<div style={{ width: o }}>` and `<Item key={o} />` with an
+  `o` whose `toString` writes state were silent; they are a
+  `setter-in-render` Warning (#371).
+- An accessor the analysis does not see, run at a read or a conversion, may
+  be module code, which may call what any module binding holds: a getter a
+  module installs on `Object.prototype` that calls a closure the render
+  stores in a module binding, read or converted off a literal in the render,
+  was silent unless the literal itself was read off a module binding; it is
+  a `setter-in-render` Warning (#372).
+- A getter or a setter past the inlining budget runs later, as a method
+  there does: it is handed its receiver when it reads `this`, and a setter
+  the value written. `o.run = () => setN(n + 1)` three calls deep, with a
+  setter `run` that calls what it is given, was silent; it is a
+  `setter-in-render` Warning (#373).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

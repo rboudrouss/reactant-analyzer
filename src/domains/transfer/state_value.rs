@@ -1300,7 +1300,8 @@ fn eval_unary(op: &UnaryOp, val: StateValue) -> StateValue {
             Some(i) => StateValue::number(i),
             None => coerce_to_number(&val).unwrap_or_else(StateValue::top),
         },
-        UnaryOp::Unknown => StateValue::top(),
+        // A string or a symbol, which the domain does not model.
+        UnaryOp::ToKey | UnaryOp::Unknown => StateValue::top(),
     }
 }
 

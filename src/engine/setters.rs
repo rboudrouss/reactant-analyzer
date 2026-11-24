@@ -3284,9 +3284,9 @@ impl<'a> SetterWalk<'a> {
     /// as the call relation answers it: each accessor body the heap placed
     /// runs here, in `mode` — a read is a call of the getters it runs, in
     /// the read's region and phase, wherever the accessor was defined —
-    /// never placed; and module code the analysis does not run, when the
-    /// receiver is read off a module binding (`via`, the statement's
-    /// expression), may call what the module scope holds. What they and the
+    /// never placed; and an accessor the heap does not place, which may be
+    /// module code (#372), may call what the module scope holds (`via`, the
+    /// statement's expression, spells the read). What they and the
     /// statement's conversions hand code the analysis does not see is that
     /// code's to call there, or later (#334, #360).
     #[allow(clippy::too_many_arguments)]

@@ -541,6 +541,6 @@ pub fn unary(op: &UnaryOp) -> Kind {
         UnaryOp::Not => Kind::Bool,
         UnaryOp::TypeOf => Kind::Str,
         UnaryOp::Neg | UnaryOp::Plus | UnaryOp::BitNot => Kind::Num,
-        UnaryOp::Unknown => Kind::Unknown,
+        UnaryOp::ToKey | UnaryOp::Unknown => Kind::Unknown,
     }
 }
