@@ -8,11 +8,14 @@ Each repo of the corpus is its own project and is analyzed in its own process
 a project, and it does not fit a CI runner. The merged file keeps the shape
 `corpus-baseline.py` and `corpus-diff.py` read: `diagnostics` concatenated,
 `files_analyzed` summed, `parse_errors` and `blind_spots` concatenated, and the
-numeric fields of `summary` summed.
+numeric fields of `summary` summed. Each run's own `summary` is kept under
+`summaries`, keyed by the run file's name (the repo's): its counts of the Info
+rows the run did not list are per repo, which `corpus-baseline.py` records.
 """
 
 import json
 import sys
+from pathlib import Path
 
 
 def main() -> int:
@@ -21,9 +24,11 @@ def main() -> int:
         return 2
     out, runs = sys.argv[1], sys.argv[2:]
     merged = None
+    summaries = {}
     for path in runs:
         with open(path) as fh:
             run = json.load(fh)
+        summaries[Path(path).stem] = dict(run.get("summary", {}))
         if merged is None:
             merged = run
             continue
@@ -38,6 +43,7 @@ def main() -> int:
                 merged["summary"][key] = merged["summary"].get(key, 0) + value
     if merged is None:
         return 2
+    merged["summaries"] = summaries
     with open(out, "w") as fh:
         json.dump(merged, fh)
     print(f"{out}: {len(runs)} runs, {len(merged['diagnostics'])} diagnostics")
