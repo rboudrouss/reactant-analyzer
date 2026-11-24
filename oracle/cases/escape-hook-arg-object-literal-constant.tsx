@@ -2,8 +2,9 @@
 // #264 negative: the closure inside the argument object writes a constant,
 // so the effect the hook runs it in stores the same value every time. The
 // walk now reads it as a possible render write of unknown timing, the same
-// Warning (fp) the direct form `useRun(() => setN(1))` gets since #262: a
-// closure handed to code with no timing summary may run during render.
+// row the direct form `useRun(() => setN(1))` gets since #262: a closure
+// handed to code with no timing summary may run during render. The row is an
+// Info hand-over (`tn`; a Warning, `fp`, before the Info level).
 import { useState } from "react";
 import { useRun } from "ext";
 

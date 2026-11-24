@@ -47,7 +47,7 @@ function describe(r) {
   const renders = Object.entries(r.react.renders).map(([k, n]) => `${k}×${n}`).join(" ");
   const lines = [
     `react:    ${r.react.verdict}${r.react.via ? ` (${r.react.via})` : ""}${r.react.inLoop?.length ? ` through ${r.react.inLoop.join(", ")}` : ""}  renders: ${renders || "-"}${r.react.warnings.length ? `  warnings: ${r.react.warnings.join(", ")}` : ""}`,
-    `reactant: ${r.claims.loops.length ? r.claims.loops.map((l) => `${l.severity} ${l.rule} on ${l.component}:${l.line ?? "?"}`).join("; ") : "no loop claim"}${r.claims.limits.length ? `  (+${r.claims.limits.length} analysis-limit)` : ""}`,
+    `reactant: ${r.claims.loops.length ? r.claims.loops.map((l) => `${l.severity} ${l.rule} on ${l.component}:${l.line ?? "?"}`).join("; ") : "no loop claim"}${r.claims.handOvers.length ? `  (+${r.claims.handOvers.length} info hand-over: ${r.claims.handOvers.map((l) => `${l.rule} on ${l.component}:${l.line ?? "?"}`).join("; ")})` : ""}${r.claims.limits.length ? `  (+${r.claims.limits.length} analysis-limit)` : ""}`,
     `verdict:  ${r.verdict}${r.why ? ` — ${r.why}` : ""}`,
   ];
   return lines.join("\n");
@@ -173,7 +173,7 @@ async function cmdFuzz(opts) {
     const share = (p) => fns.filter(p).length;
     console.log(
       `fn: ${share((r) => /\bfrom "ext"/.test(r.source))} through ext, ${share((r) => r.source.includes("// @file"))} multi-file, ` +
-        `${share((r) => r.claims.loops.length > 0)} claimed outside the loop, ${share((r) => r.disclosed)} disclosed (overlapping)`,
+        `${share((r) => r.claims.loops.length > 0)} claimed outside the loop, ${share((r) => r.limited)} with an analysis-limit (overlapping)`,
     );
   }
 

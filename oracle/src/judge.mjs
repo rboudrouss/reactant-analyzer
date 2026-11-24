@@ -2,7 +2,9 @@
 // (docs/semantics.md §5).
 //
 //   P1  React loops            ⇒ a loop claim at Warning or Error on a
-//       component that takes part in the loop (rendered in its last renders).
+//       component that takes part in the loop (rendered in its last renders),
+//       or, for a setter handed to package code the analysis does not see, the Info
+//       hand-over row on such a component that says so (`disclosed`).
 //   P2  an Error loop claim on a component React rendered ⇒ React does not
 //       settle (or, for `cross-setter-in-render`, React warned about the
 //       cross-render update the rule also names).
@@ -13,7 +15,7 @@
 // program (timers re-armed for ever) is neither: the rules do not claim it, and
 // it does not settle, so it refutes no Error either.
 
-export const VERDICTS = ["fn", "error-unsound", "parse-error", "fp", "tp", "tn", "perpetual", "invalid"];
+export const VERDICTS = ["fn", "error-unsound", "parse-error", "fp", "tp", "disclosed", "tn", "perpetual", "invalid"];
 /** The classes that break a stated invariant. */
 export const VIOLATIONS = new Set(["fn", "error-unsound", "parse-error"]);
 
@@ -29,12 +31,21 @@ export function judge(react, c) {
     const inLoop = new Set(react.inLoop);
     const located = c.loops.filter((l) => inLoop.has(l.component));
     if (located.length) return { verdict: "tp", why: claimText(located) };
-    const disclosed = c.limits.length > 0 || c.blindSpots > 0;
+    // No loop claim, but the analyzer said, on a component of the loop, that a
+    // setter goes to code it does not see: a limit it disclosed, not a silence.
+    const handed = c.handOvers.filter((l) => inLoop.has(l.component));
+    if (handed.length) {
+      return {
+        verdict: "disclosed",
+        why: `React loops (${react.via}) through ${react.inLoop.join(", ")}; only ${claimText(handed)}: a setter handed to package code the analysis does not see`,
+      };
+    }
+    const limited = c.limits.length > 0 || c.blindSpots > 0;
     const elsewhere = c.loops.length ? `; claims only outside the loop (${claimText(c.loops)})` : "";
     return {
       verdict: "fn",
-      disclosed,
-      why: `React loops (${react.via}) through ${react.inLoop.join(", ")}; no loop claim on them${elsewhere}${disclosed ? " (an analysis-limit was reported)" : ""}${c.components === 0 ? "; no component detected" : ""}`,
+      limited,
+      why: `React loops (${react.via}) through ${react.inLoop.join(", ")}; no loop claim on them${elsewhere}${limited ? " (an analysis-limit was reported)" : ""}${c.components === 0 ? "; no component detected" : ""}`,
     };
   }
 
