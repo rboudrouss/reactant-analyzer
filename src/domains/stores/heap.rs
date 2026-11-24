@@ -357,6 +357,22 @@ pub struct Heap {
     defined: std::sync::Arc<AccessorNames>,
 }
 
+/// What a conversion of objects to a primitive consults ([`Heap::conversion`]).
+#[derive(Debug, Default)]
+pub struct Conversion {
+    /// The objects whose own conversion members it may read and call — each
+    /// converted object, and each prototype a `__proto__` member places — the
+    /// converted object `this` in every call.
+    pub holders: BTreeSet<ExprId>,
+    /// What an array's entries may be: `Array.prototype.toString` joins
+    /// them, converting each.
+    pub entries: Option<EnvVal<StateValue>>,
+    /// Some object may inherit a conversion member from a prototype the heap
+    /// does not place: code the analysis does not see, called with that
+    /// object as `this`.
+    pub handed: bool,
+}
+
 /// What a member read finds where nothing holds it.
 static UNDEFINED: std::sync::LazyLock<EnvVal<StateValue>> =
     std::sync::LazyLock::new(|| EnvVal::Val(StateValue::undefined()));
@@ -440,6 +456,58 @@ impl Heap {
                 .ids
                 .iter()
                 .all(|id| matches!(self.get(*id), Some(HeapValue::Obj(m)) if m.array))
+    }
+
+    /// What a conversion to a primitive of the objects at `sites` consults
+    /// (#360): the [`TO_PRIMITIVE`] members each holds, or inherits from a
+    /// prototype its `__proto__` places ([`Conversion::holders`]); an
+    /// array's, `Array.prototype`'s, which convert its entries; a plain
+    /// object's or a literal's, `Object.prototype`'s, which call nothing of
+    /// the program. Any other prototype — of an object a spread of something
+    /// unplaced or unseen code filled, of a class instance, a class, a
+    /// library's object — is one the heap does not place
+    /// ([`Conversion::handed`]). A function's members are
+    /// `Function.prototype`'s: the heap holds none of its own (#330).
+    ///
+    /// [`TO_PRIMITIVE`]: crate::ir::expr::TO_PRIMITIVE
+    pub fn conversion(&self, sites: &Sites) -> Conversion {
+        let mut out = Conversion::default();
+        let mut stack: Vec<ExprId> = sites.ids.iter().copied().collect();
+        let mut seen = BTreeSet::new();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(HeapValue::Obj(obj)) = self.get(id) else {
+                continue;
+            };
+            out.holders.insert(id);
+            if obj.array {
+                for entry in obj.values() {
+                    out.entries = Some(match out.entries.take() {
+                        Some(e) => e.join(entry),
+                        None => entry.clone(),
+                    });
+                }
+            }
+            let own = crate::ir::expr::TO_PRIMITIVE
+                .iter()
+                .all(|m| obj.named.contains_key(*m));
+            if own || obj.array || obj.plain {
+                continue;
+            }
+            match obj.named.get("__proto__") {
+                Some(proto) => match proto.sites() {
+                    Some(s) => {
+                        stack.extend(s.ids.iter().copied());
+                        out.handed |= s.open;
+                    }
+                    None => out.handed |= !proto.as_val().is_nullish_only(),
+                },
+                None => out.handed |= !obj.literal || obj.is_open() || obj.persists,
+            }
+        }
+        out
     }
 
     /// One run of the getter at `site` returned `value` (`None`: it ran no
@@ -1262,5 +1330,65 @@ mod tests {
         let held = &r.named["current"];
         assert_eq!(held.sites(), Some(&at));
         assert_eq!(held.as_val(), StateValue::component_setter(set, 0));
+    }
+
+    #[test]
+    fn a_conversion_consults_the_prototypes_the_heap_places_and_hands_the_others() {
+        // #360: what `${o}` reads the conversion members of.
+        let to = |ids: &[u64]| {
+            EnvVal::located(
+                Some(Sites::closed(ids.iter().map(|i| ExprId(*i)))),
+                StateValue::top(),
+            )
+        };
+        let literal = |named: Vec<(&str, EnvVal<StateValue>)>| {
+            HeapValue::Obj(Members {
+                literal: true,
+                ..Members::exactly(named.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+            })
+        };
+        let mut h = Heap::new();
+        // 1: a literal with `toString`; 2: one whose `__proto__` is 1;
+        // 3: an array holding 1; 4: a class instance; 5: a literal a spread
+        // of something unplaced filled; 6: a plain literal.
+        h.insert(ExprId(1), literal(vec![("toString", to(&[9]))]));
+        h.insert(
+            ExprId(2),
+            HeapValue::Obj(Members::exactly(HashMap::from([(
+                "__proto__".to_string(),
+                to(&[1]),
+            )]))),
+        );
+        let mut array = Members::exactly(HashMap::from([("0".to_string(), to(&[1]))]));
+        array.array = true;
+        h.insert(ExprId(3), HeapValue::Obj(array));
+        h.insert(ExprId(4), HeapValue::Obj(Members::default()));
+        h.insert(
+            ExprId(5),
+            HeapValue::Obj(Members {
+                literal: true,
+                ..Members::at_least(HashMap::new())
+            }),
+        );
+        h.insert(ExprId(6), literal(vec![("a", to(&[9]))]));
+        let at = |id: u64| h.conversion(&Sites::closed([ExprId(id)]));
+
+        let own = at(1);
+        assert_eq!(own.holders, BTreeSet::from([ExprId(1)]));
+        assert!(!own.handed && own.entries.is_none());
+        let inherited = at(2);
+        assert_eq!(inherited.holders, BTreeSet::from([ExprId(1), ExprId(2)]));
+        assert!(!inherited.handed);
+        let array = at(3);
+        assert_eq!(
+            array.entries.as_ref().and_then(EnvVal::sites),
+            Some(&Sites::closed([ExprId(1)]))
+        );
+        assert!(!array.handed);
+        assert!(at(4).handed, "a class instance's prototype is not placed");
+        assert!(at(5).handed, "a spread of something unplaced may bring one");
+        let plain = at(6);
+        assert!(!plain.handed, "Object.prototype's");
+        assert!(plain.entries.is_none());
     }
 }
