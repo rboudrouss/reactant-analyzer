@@ -1,18 +1,18 @@
 {
-  "total": 24424,
-  "digest": "9108585a70914eaa063754d19b90be190fbeaadc8582efaf58143c1559e062b9",
+  "total": 9441,
+  "digest": "bc94f8f22abe7de9b10a7cc4f4684469240212f89e75ac1263889f8d5a6006d8",
   "by_rule": {
     "always-unstable-deps": 610,
     "conditional-hook": 10,
     "cross-component-infinite-loop": 296,
-    "cross-setter-in-render": 19124,
+    "cross-setter-in-render": 4152,
     "frozen-initial-state": 74,
     "infinite-loop": 543,
     "lazy-init": 223,
     "missing-cleanup": 4,
     "missing-deps": 498,
     "redundant-set-state": 5,
-    "setter-in-render": 2161,
+    "setter-in-render": 2150,
     "stale-closure": 1,
     "state-lifted-too-high": 180,
     "state-mutation": 18,
@@ -33,7 +33,7 @@
     "novel": 20,
     "precedent": 3,
     "shadcn-admin": 68,
-    "twenty": 18809,
+    "twenty": 3826,
     "zustand": 3
   },
   "corpus": "00e5fa79fa000c85"
