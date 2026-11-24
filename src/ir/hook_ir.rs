@@ -31,4 +31,16 @@ pub struct HookIR {
     /// useEffect`), which the IR lowers alike. A call is that hook's own
     /// call, with no body of its own.
     pub alias_of: Option<Symbol>,
+    /// The file the body is written in, whose top-level names and imports
+    /// its free names and calls denote, when it is not `file`: a hook `file`
+    /// binds to the closure a function of another file returns (#344).
+    pub body_file: Option<PathBuf>,
+}
+
+impl HookIR {
+    /// The file the body is written in ([`Self::body_file`]): where a
+    /// splice of it resolves names.
+    pub fn body_file(&self) -> &std::path::Path {
+        self.body_file.as_deref().unwrap_or(&self.file)
+    }
 }

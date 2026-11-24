@@ -1813,7 +1813,7 @@ fn expand_custom_hooks(
                     start: r.start,
                     end: r.end,
                     name: name.clone(),
-                    from: hook_ir.file.clone(),
+                    from: hook_ir.body_file().to_path_buf(),
                     parent,
                 });
             }
@@ -1850,10 +1850,10 @@ fn expand_custom_hooks(
         }
 
         // Provenance (ADR-019): the hook's body now lives inside this
-        // component's CFG; spans in it point into `hook_ir.file`.
+        // component's CFG; spans in it point into the file it is written in.
         origins.push(crate::engine::InlineOrigin {
             name: name.clone(),
-            from: hook_ir.file.clone(),
+            from: hook_ir.body_file().to_path_buf(),
             kind: crate::engine::InlineKind::Hook,
             bound: bound_temp,
         });

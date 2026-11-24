@@ -732,14 +732,19 @@ hook name to React hooks (`const useIsoEffect = isBrowser ? useLayoutEffect : us
 that hook only when every arm is one of React's effect hooks, which the IR lowers alike; any other
 alias, a no-op arm included (`isBrowser ? useLayoutEffect : () => {}`), is a hook the analysis does
 not see. A module `const` binding a hook name to what a call returns (`const useX = make(a)`) is the
-closure the function returns, run as the hook's body, when the function is one of the same file's
-and every `return` of it hands back that one closure (#342): the parameters hold the call's
-arguments (a name or a primitive as written, ⊤ for anything else or a parameter some body
-reassigns), a call of a parameter is a call of the hook its argument names, and every other local
-of the function the closure reads is ⊤. A factory imported from another file, or one returning one
-of several closures, leaves a hook the analysis does not see
-[#344](https://github.com/rboudrouss/reactant-analyzer/issues/344), and so does a package's
-(zustand's `create`). `node_modules` is never lowered, and the
+closure the function returns, run as the hook's body, when the function is one of the program's —
+the same file's, or another file's reached through an import and its re-exports (#342, #344) — and
+every `return` of it hands back that one closure: the parameters hold the call's arguments (a name
+or a primitive as written, ⊤ for anything else or a parameter some body reassigns; when the
+function is another file's, a name is the primitive the binding file's `const` holds, ⊤ otherwise),
+a call of a parameter is a call of the hook its argument names, and every other local of the
+function the closure reads is ⊤. A factory returning one of several closures leaves a hook the
+analysis does not see [#344](https://github.com/rboudrouss/reactant-analyzer/issues/344): the
+closure is chosen once per program run, and the IR's only "one of them" is a branch the
+`conditional-hook` rule reads as a render path. So does a package's factory (zustand's `create`).
+A hook inlined from another file reads the component file's module `const`s, not its own: a name
+both files bind is read as the component's
+[#354](https://github.com/rboudrouss/reactant-analyzer/issues/354), [#36](https://github.com/rboudrouss/reactant-analyzer/issues/36). `node_modules` is never lowered, and the
 `SummaryRegistry` is the supported extension point [#51](https://github.com/rboudrouss/reactant-analyzer/issues/51).
 
 Utility inlining is statement position only [#52](https://github.com/rboudrouss/reactant-analyzer/issues/52), runs once per

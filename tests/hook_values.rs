@@ -115,3 +115,38 @@ fn the_module_call_s_argument_and_the_factory_s_locals_are_read() {
         );
     }
 }
+
+/// #344: the function is another file's, imported directly or through a
+/// re-export; the closure's hooks are named by its own file, the arguments
+/// by the binding's.
+#[test]
+fn a_factory_of_another_file_builds_the_hook_too() {
+    for case in [
+        "hook-value-imported-factory-loops",
+        "hook-value-imported-factory-argument-loops",
+        "hook-value-reexported-factory-loops",
+        "hook-value-imported-wrapper-calls-program-hook-loops",
+    ] {
+        assert_eq!(
+            findings(case),
+            ["infinite-loop:error"],
+            "{case}: the closure's effect moves the slot it depends on"
+        );
+    }
+    // A module `let` argument is ⊤ in the factory's file: still a loop.
+    let found = findings("hook-value-imported-factory-let-argument-loops");
+    assert!(
+        found.iter().any(|f| f.starts_with("infinite-loop:")),
+        "{found:?}"
+    );
+    for case in [
+        "hook-value-imported-factory-settles",
+        "hook-value-imported-factory-argument-settles",
+    ] {
+        let found = findings(case);
+        assert!(
+            !found.iter().any(|f| f.starts_with("infinite-loop:")),
+            "{case}: {found:?}"
+        );
+    }
+}
