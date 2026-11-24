@@ -86,6 +86,22 @@ const caveat = blind.length
   : "";
 
 const s = report.summary ?? {};
+// The Info rows the run did not list (no `--info` in `args`): the limits the
+// analysis met, a setter handed to package code among them. A run that shows
+// nothing but hid some is not a clean bill: it says so.
+const limits = (() => {
+  const others = (s.hidden_infos ?? 0) - (s.hidden_hand_overs ?? 0);
+  const handed = s.hidden_hand_overs
+    ? `${s.hidden_hand_over_setters} setter(s) handed to package code the analysis does not see (${s.hidden_hand_overs} site(s))`
+    : "";
+  if (!handed) return `${others} info finding(s)`;
+  return others ? `${handed} and ${others} other info finding(s)` : handed;
+})();
+const hidden = !s.hidden_infos
+  ? ""
+  : (s.errors ?? 0) + (s.warnings ?? 0) === 0
+    ? `No error or warning, but the analysis is not exhaustive: it met ${s.hidden_infos} limit(s), ${limits}; add \`--info\` to \`args\` to list them.\n`
+    : `${limits} not shown (add \`--info\` to \`args\` to list them).\n`;
 const jsonPath = join(process.env.RUNNER_TEMP ?? ".", "reactant-report.json");
 writeFileSync(jsonPath, res.stdout);
 
@@ -101,13 +117,13 @@ if (process.env.GITHUB_STEP_SUMMARY) {
     process.env.GITHUB_STEP_SUMMARY,
     `### reactant\n\n${s.errors ?? 0} error(s), ${s.warnings ?? 0} warning(s) across ` +
       `${report.files_analyzed ?? 0} file(s), ${s.components_analyzed ?? 0} component(s) analyzed ` +
-      `(fail-on: ${failOn}).\n${caveat}`,
+      `(fail-on: ${failOn}).\n${hidden}${caveat}`,
   );
 }
 
 console.log(
   `reactant: ${s.errors ?? 0} error(s), ${s.warnings ?? 0} warning(s), ` +
-    `${s.infos ?? 0} info(s) — exit ${res.status}` +
+    `${s.infos ?? 0} info(s)${s.hidden_infos ? ` (+${s.hidden_infos} not shown)` : ""} — exit ${res.status}` +
     (blind.length ? ` — ${blind.length} blind spot(s), counts are a lower bound` : ""),
 );
 process.exit(res.status);

@@ -28,7 +28,9 @@ page is the second.
 `setter-in-render` and their cross-component forms) are tested against real
 React by the oracle under `oracle/` ([semantics.md](semantics.md),
 [ADR-043](adr/ADR-043-react-is-the-concrete-oracle.md)): a program that loops in
-React must get a finding on a component the loop re-renders, and an Error must
+React must get a finding on a component the loop re-renders — or, where the
+setter was handed to a package's code, the Info row that says so (the oracle's
+`disclosed`, see `setter-in-render` below) — and an Error must
 come with a program that does not settle. The programs the
 analyzer gets wrong today are listed, one per file, in `oracle/cases/` with
 their issue.
@@ -39,8 +41,10 @@ These drop or falsify information the analysis then relies on.
 
 None known.
 
-**How to tell in general.** A run that read everything it was pointed at ends
-with `✓ … no issues found.`. A run that did not never prints that line, and lists
+**How to tell in general.** A run that read everything it was pointed at, and
+met no limit (no Info row, shown or hidden), ends with `✓ … no issues found.`;
+one that met a limit says it was not exhaustive instead. A run that did not
+read everything never prints that line, and lists
 what it skipped under `not analyzed:` (`blind_spots` in the JSON schema). That
 covers the whole cross-file family: unloadable aliases, dropped files, and
 imports resolving outside the analysed set. A reference the analyzer could not
@@ -153,9 +157,10 @@ that writes it (see *Cross-file limits*).
   analysis does not see — a package's, an element value it does not resolve, a name several files
   define, a component rendering itself — may call what it is handed at any time, a render
   included: each prop is handed to unseen code, as an unknown callee's argument is, so a setter
-  it holds or a closure writing one is a Warning (`setter-in-render`), and a loop through it is
-  claimed [#325](https://github.com/rboudrouss/reactant-analyzer/issues/325). The cost is a
-  Warning on every closure handed to a package's component that calls it on events only (a
+  it holds or a closure writing one is reported (`setter-in-render`'s hand-over row: an Info for
+  a package's component, a Warning for any other child, see below)
+  [#325](https://github.com/rboudrouss/reactant-analyzer/issues/325). The cost is an
+  Info row on every closure handed to a package's component that calls it on events only (a
   library `<Button onClick>`); no package component carries a timing summary yet, and a
   per-prop declaration of the ones that run their props from listeners is the route to remove
   them ([#394](https://github.com/rboudrouss/reactant-analyzer/issues/394), through
@@ -700,7 +705,7 @@ carries an Error.
   revive each other's guard — and reads a guard inside a callback the render runs synchronously
   (`[1].forEach(() => { if (n !== 1) setN(1); })`) in the env of the callback's run
   [#269](https://github.com/rboudrouss/reactant-analyzer/issues/269); a callback handed to a
-  callee with no timing summary keeps its Warning. The compared expression must hold across the
+  callee with no timing summary keeps its hand-over row. The compared expression must hold across the
   passes: a literal, a prop, a slot no render write moves, or a builtin the purity table knows
   over those; a call of a function the analysis does not see (an import, a `RegExp`'s `exec`, a
   prop's method) keeps the Warning, and so does a name of a callback's own scope
@@ -710,10 +715,69 @@ carries an Error.
   a library that adds one, or a library with no entry at all, keeps firing. `formState`, `data` and
   `error` are excluded on purpose, being what those hooks exist to change
   [precision-log](precision-log.md#2026-09-03-a-library-contract-is-about-members).
-- **`setter-in-render`** warns when a setter reaches a callee with no timing summary
-  (`composeEventHandlers(a, cb)`, `@mantine/form`'s `form.watch(path, cb)`). ⊤ includes the render
+- **A name imported from a package denotes that package's export.** That is the premise every
+  registry summary stands on — React's hooks, the callback timing table, the store and router
+  tables — and the hand-over level below too. A program that replaces an export breaks it: after
+  `(React as any).useCallback = (f) => { f(); return f; }`, `React.useCallback(() => setS(s + 1), [])`
+  loops in React and the analyzer still reads React's `useCallback`, reporting only `missing-deps`
+  [#400](https://github.com/rboudrouss/reactant-analyzer/issues/400). The hand-over level fails
+  closed on the one violation the program shows in plain sight, a write whose receiver is rooted at
+  a package import (below); the registry does not yet (#400). Neither sees an export replaced
+  through an alias of the import (`const e = ext; e.hook = f`, then `ext.hook(cb)`: React loops and
+  the hand-over is an Info), through an object package code hands the program (a callback's
+  parameter, a call's result), or by another package.
+- **`setter-in-render`** reports a setter that reaches a callee with no timing summary
+  (`composeEventHandlers(a, cb)`, `@mantine/form`'s `form.watch(path, cb)`, a package's component,
+  a builtin the analysis does not model, a getter it cannot place, and what a generator yields to
+  the `for…of` that drives it, #317). ⊤ includes the render
   pass, so the row is sound and the wording says so: it never claims the setter was called in the
-  render body, and it never reaches Error. One statement of a component that hands setters over is
+  render body, and it never reaches Error. **Its level depends on whose code the setter goes to**
+  (#394, the user's decision of 2026-11-24, fail closed):
+  - **Info**, behind `--info` (or `"info": true` in the config), only where every callee that
+    receives the value at that site is provably a package's: a JSX element whose name the file
+    imports from a specifier the resolver maps to no file (#389), or a member element of an import
+    so (`<AlertDialogPrimitive.Root>`); a call or a `new` whose callee is a name imported so, or a
+    chain of static members rooted at one (`runNow(cb)`, `kit.run(cb)`; a computed member such as
+    `kit.list[0]` is not), read free and resolving to no program body; the arguments of a hook the
+    expansion left that is imported so (#254) — **unless the program writes into a package
+    import.** That reading stands on the premise the registry stands on (the bullet above: a name
+    imported from a package denotes that package's export), and fails closed on the one
+    violation the program shows in plain sight: when some write anywhere in the program has a
+    receiver rooted at a name its file imports from a package — `ext.hook = f`,
+    `(Ns as any).Comp = Local`, `React.flag = 1`, at any depth of member chain, through
+    parentheses, TS assertions and `!`, as a member write of any operator, an update, a
+    destructuring or `for … of` target, `Object.assign`, `Object.defineProperty` / `defineProperties`
+    / `setPrototypeOf`, the `Reflect` twins, `__defineGetter__` / `__defineSetter__`, whatever value
+    it writes — no callee is a package's and every hand-over is a Warning. So is it when `Object` or
+    `Reflect` is read anywhere but as the object of a member or the right of `instanceof`, since an
+    alias of either may be any of those calls. Module interop (CommonJS output, the oracle's
+    esbuild) reads every import, a bare name and a namespace member included, as a member of the
+    package's mutable exports object, which is why a bare name is no exception. The fact is
+    program-wide and syntactic, over every file and its module scope; `--verbose` names the first
+    such write. The message says "handed to package code the analysis does not see". That is a
+    limit of the analysis, not a defect it found.
+  - **Warning**, as before, for every other hand-over: a builtin the analysis does not model (`bind`,
+    `call`, `reduce`, `valueOf`, a conversion), a receiver handed at a member read or write, an
+    accessor or an unplaced heap object (`Object.prototype`, `globalThis`), a module function or a
+    package's function called as a literal's method, a body past the inlining budget, a generator's
+    `yield`, a child the analysis does not resolve (an element value, an ambiguous name, a recursion
+    cutoff, a program import that leads to no component), a callee that is a parameter, a prop, a
+    member of a hook's result or any other value, a name a body rebinds, a function the program
+    declares. Those are program code the analysis did not follow, a possible defect of the program.
+    A site that hands one setter each way is two rows, one per level, and a slot reached both ways
+    keeps its Warning. A tsconfig alias the run could not load also maps to no file, so its imports
+    read as a package's; the run then reports the alias as a blind spot.
+
+  Without `--info` the human summary ends with "N setter(s) handed to package code the analysis
+  does not see (M site(s)) … are not shown", and a run that shows nothing but hid Info rows does not
+  print "no issues found": it says the analysis is not exhaustive and names what it met. The JSON's
+  `summary.hidden_infos`, `hidden_hand_overs` and `hidden_hand_over_setters` count what was left
+  out; `--fail-on warning` does not count Info rows (no Info sets the exit code), and a per-rule
+  level cannot raise them. A loop proven through any such callee stays a Warning — an effect that
+  hands its own dep's setter to one (`useEffect(() => runNow(() => setN(n + 1)), [n])`) is
+  `infinite-loop`'s Warning. A program React loops on whose only row is an Info hand-over (a
+  package child that calls the prop from an effect) is not a silent miss: the oracle counts it
+  `disclosed`, apart from `tp` and `fn` ([semantics.md](semantics.md) §5). One statement of a component that hands setters over is
   one row (`cross-setter-in-render` for a parent's), whatever the number of setters and parents it
   reaches: the message counts them and names the first three, the JSON's `setters` lists them all
   [#377](https://github.com/rboudrouss/reactant-analyzer/issues/377). react-hook-form's `handleSubmit` and `@mantine/form`'s

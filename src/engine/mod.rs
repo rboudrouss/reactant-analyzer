@@ -53,7 +53,7 @@ pub use registrations::{Firing, Pairing, Registrar, Registration, Timing};
 pub use root_detector::RootStrategy;
 pub use seeds::{SeedSync, SlotSeed};
 pub use setters::{
-    BodyCall, SlotRead, SlotWriter, WriterPhase, WriterRegion, collect_body_calls,
+    BodyCall, Handover, SlotRead, SlotWriter, WriterPhase, WriterRegion, collect_body_calls,
     collect_slot_reads,
 };
 pub use store::STORE_SLOT;

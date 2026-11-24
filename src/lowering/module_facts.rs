@@ -9,7 +9,7 @@ use oxc_ast_visit::{Visit, walk};
 use oxc_span::GetSpan;
 
 use crate::ir::ModuleFacts;
-use crate::ir::module::{AccessorNames, ReExports, ValueRef};
+use crate::ir::module::{AccessorNames, MemberInstall, ReExports, ValueRef};
 use crate::resolver::ImportResolver;
 
 /// A binding whose value is one of React's wrappers around a name (#64):
@@ -155,7 +155,243 @@ pub fn collect_module_facts(
         accessors: accessor_names(program),
         bindings: super::top_level_binding_names(program),
         imported,
+        packages: package_imports(program, file, resolver),
+        member_install: member_install(program, &package_imports(program, file, resolver)),
     }
+}
+
+/// The first write of `program` whose receiver is rooted at a name it imports
+/// from a specifier the resolver maps to no file (`packages`): the one way the
+/// program shows, in plain sight, that it replaces part of a package's export
+/// ([`crate::engine::Handover`]). Every form that writes a member counts,
+/// whatever it writes: a member write (`p.x = v`, `p[k] = v`, any compound
+/// operator, an update, a destructuring or `for … of` target),
+/// `Object.assign`, `Object.defineProperty` / `defineProperties` /
+/// `setPrototypeOf`, `Reflect.set` / `defineProperty` / `setPrototypeOf`,
+/// `__defineGetter__` / `__defineSetter__`, through parentheses, TS
+/// assertions, non-null `!` and any depth of member chain. A read of `Object`
+/// or `Reflect` the scan does not follow (an alias, a value passed) may be any
+/// of those calls on any receiver: it counts too. Over the whole file, module
+/// scope included, which no pass interprets.
+fn member_install(program: &Program, packages: &[String]) -> Option<MemberInstall> {
+    let mut scan = InstallScan {
+        packages: packages.iter().map(String::as_str).collect(),
+        found: None,
+        source: program.source_text,
+    };
+    scan.visit_program(program);
+    scan.found
+}
+
+struct InstallScan<'s> {
+    packages: HashSet<&'s str>,
+    found: Option<MemberInstall>,
+    source: &'s str,
+}
+
+impl InstallScan<'_> {
+    /// `receiver` is rooted at a package import: a name, or a member chain
+    /// off one, through parentheses, TS assertions and non-null `!`.
+    fn rooted(&self, receiver: &Expression) -> bool {
+        match receiver.get_inner_expression() {
+            Expression::Identifier(id) => self.packages.contains(id.name.as_str()),
+            Expression::StaticMemberExpression(m) => self.rooted(&m.object),
+            Expression::ComputedMemberExpression(m) => self.rooted(&m.object),
+            Expression::ChainExpression(c) => c
+                .expression
+                .as_member_expression()
+                .is_some_and(|m| self.rooted(m.object())),
+            _ => false,
+        }
+    }
+
+    /// A write into `receiver` at `span`.
+    fn write(&mut self, receiver: &Expression, span: oxc_span::Span) {
+        if self.found.is_none() && self.rooted(receiver) {
+            self.note(span);
+        }
+    }
+
+    fn note(&mut self, span: oxc_span::Span) {
+        if self.found.is_some() {
+            return;
+        }
+        let start = span.start as usize;
+        let line = self.source[..start.min(self.source.len())]
+            .matches('\n')
+            .count()
+            + 1;
+        let text: String = self
+            .source
+            .get(start..(span.end as usize).min(self.source.len()))
+            .unwrap_or("")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(100)
+            .collect();
+        self.found = Some(MemberInstall { line, text });
+    }
+
+    /// Every member target of a destructuring `target`, written with an
+    /// unknown value.
+    fn pattern(&mut self, target: &AssignmentTarget, span: oxc_span::Span) {
+        match target {
+            AssignmentTarget::ArrayAssignmentTarget(a) => {
+                for t in a.elements.iter().flatten() {
+                    self.maybe_default(t, span);
+                }
+                if let Some(rest) = &a.rest {
+                    self.pattern(&rest.target, span);
+                }
+            }
+            AssignmentTarget::ObjectAssignmentTarget(o) => {
+                for p in &o.properties {
+                    if let AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) = p {
+                        self.maybe_default(&p.binding, span);
+                    }
+                }
+                if let Some(rest) = &o.rest {
+                    self.pattern(&rest.target, span);
+                }
+            }
+            other => {
+                if let Some(m) = other.as_member_expression() {
+                    self.write(m.object(), span);
+                }
+            }
+        }
+    }
+
+    fn maybe_default(&mut self, t: &AssignmentTargetMaybeDefault, span: oxc_span::Span) {
+        match t {
+            AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(d) => {
+                self.pattern(&d.binding, span)
+            }
+            other => {
+                if let Some(t) = other.as_assignment_target() {
+                    self.pattern(t, span);
+                }
+            }
+        }
+    }
+}
+
+impl<'a> Visit<'a> for InstallScan<'_> {
+    fn visit_assignment_expression(&mut self, it: &AssignmentExpression<'a>) {
+        match it.left.as_member_expression() {
+            Some(m) => self.write(m.object(), it.span),
+            None => self.pattern(&it.left, it.span),
+        }
+        walk::walk_assignment_expression(self, it);
+    }
+
+    fn visit_update_expression(&mut self, it: &UpdateExpression<'a>) {
+        if let Some(m) = it.argument.as_member_expression() {
+            self.write(m.object(), it.span);
+        }
+        walk::walk_update_expression(self, it);
+    }
+
+    fn visit_for_of_statement(&mut self, it: &ForOfStatement<'a>) {
+        if let Some(t) = it.left.as_assignment_target() {
+            self.pattern(t, it.span);
+        }
+        walk::walk_for_of_statement(self, it);
+    }
+
+    fn visit_call_expression(&mut self, it: &CallExpression<'a>) {
+        let target = it.arguments.first().and_then(Argument::as_expression);
+        if let Expression::StaticMemberExpression(m) = it.callee.get_inner_expression() {
+            let on = namespace(&m.object);
+            match (on, m.property.name.as_str()) {
+                (Some("Object"), "assign" | "defineProperties")
+                | (Some("Object" | "Reflect"), "defineProperty" | "setPrototypeOf")
+                | (Some("Reflect"), "set") => {
+                    if let Some(target) = target {
+                        self.write(target, it.span);
+                    }
+                }
+                (_, "__defineGetter__" | "__defineSetter__") => self.write(&m.object, it.span),
+                _ => {}
+            }
+        }
+        walk::walk_call_expression(self, it);
+    }
+
+    // `Object` or `Reflect` read anywhere but as the object of a static
+    // member: an alias or a value passed, which may be any of the calls
+    // above.
+    fn visit_identifier_reference(&mut self, it: &IdentifierReference<'a>) {
+        if matches!(it.name.as_str(), "Object" | "Reflect") {
+            self.note(it.span);
+        }
+    }
+
+    fn visit_static_member_expression(&mut self, it: &StaticMemberExpression<'a>) {
+        if let Expression::Identifier(id) = it.object.get_inner_expression()
+            && matches!(id.name.as_str(), "Object" | "Reflect")
+        {
+            return;
+        }
+        walk::walk_static_member_expression(self, it);
+    }
+
+    fn visit_binary_expression(&mut self, it: &BinaryExpression<'a>) {
+        // `x instanceof Object` reads the constructor, installs nothing.
+        if it.operator == BinaryOperator::Instanceof
+            && let Expression::Identifier(id) = it.right.get_inner_expression()
+            && matches!(id.name.as_str(), "Object" | "Reflect")
+        {
+            self.visit_expression(&it.left);
+            return;
+        }
+        walk::walk_binary_expression(self, it);
+    }
+
+    // Types are erased before anything runs.
+    fn visit_ts_type(&mut self, _it: &TSType<'a>) {}
+    fn visit_ts_type_annotation(&mut self, _it: &TSTypeAnnotation<'a>) {}
+    fn visit_ts_interface_declaration(&mut self, _it: &TSInterfaceDeclaration<'a>) {}
+    fn visit_ts_type_alias_declaration(&mut self, _it: &TSTypeAliasDeclaration<'a>) {}
+}
+
+/// The local names `program` imports as values from a specifier `resolver`
+/// maps to no file: a package's, a missing file's or an unmapped alias's,
+/// code the analysis does not see (#389's reading of an import).
+fn package_imports(program: &Program, file: &Path, resolver: &dyn ImportResolver) -> Vec<String> {
+    let mut out = Vec::new();
+    for stmt in &program.body {
+        let Statement::ImportDeclaration(decl) = stmt else {
+            continue;
+        };
+        if decl.import_kind != ImportOrExportKind::Value {
+            continue;
+        }
+        let Some(specifiers) = &decl.specifiers else {
+            continue;
+        };
+        if resolver.resolve(file, decl.source.value.as_str()).is_some() {
+            continue;
+        }
+        for spec in specifiers {
+            let local = match spec {
+                ImportDeclarationSpecifier::ImportSpecifier(s) => {
+                    if s.import_kind != ImportOrExportKind::Value {
+                        continue;
+                    }
+                    &s.local.name
+                }
+                ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => &s.local.name,
+                ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => &s.local.name,
+            };
+            out.push(local.to_string());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// The member names `program` defines an accessor of, anywhere in it (#334):

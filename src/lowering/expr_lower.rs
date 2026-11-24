@@ -1353,7 +1353,20 @@ fn lower_jsx_element(jsx: &JSXElement, builder: &mut BlockBuilder) -> Expr {
         // declarations, and nowhere else — resolving it later, from the bare
         // name, is how a same-named component in an unrelated file came to be
         // inlined in its place (#7).
-        let origin = builder.ctx.jsx.get(&name).cloned();
+        // A member name (`<Primitive.Root/>`) is no binding of the file; its
+        // root is, and a root imported from code the analysis does not see
+        // makes the member that code's too, as it makes a call of
+        // `Primitive.run` a package's (#394). A root the program binds leaves
+        // the member to resolution by name, as before.
+        let origin = builder.ctx.jsx.get(&name).cloned().or_else(|| {
+            let root = name.split('.').next().filter(|_| name.contains('.'))?;
+            builder
+                .ctx
+                .jsx
+                .get(root)
+                .filter(|o| o.program().is_none())
+                .cloned()
+        });
         Expr::CompApp {
             name,
             props: Box::new(props),

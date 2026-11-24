@@ -105,7 +105,9 @@ When every file was read, the run ends with a clean bill:
 ```
 
 That line is a claim about your code, so it is only printed when the run read
-everything it was pointed at. When something could not be read:
+everything it was pointed at and met no limit of the analysis (otherwise it
+says the analysis was not exhaustive, and `--info` lists the limits). When
+something could not be read:
 
 ```
 ⚠  37 file(s), no findings, but parts of this run were not analyzed,
@@ -293,7 +295,12 @@ limitations page.
 
 **`info` is a limit, or a motif that looks intended.** Behind `--info`: where
 the analysis stopped short, and patterns such as a `useState` seeded from a
-prop named `initial*`.
+prop named `initial*`. The largest share is a setter handed to a package's
+code (a package's component, a package function's callback): it may loop if
+that code calls it during render, so the default output says how many it does
+not show, and `--info` lists them. A run that hides Info rows never says "no
+issues found": it says the analysis was not exhaustive. A setter handed to
+the program's own code that the analysis does not follow is a Warning.
 
 ## It runs your render in its head until the values stop moving
 

@@ -134,9 +134,20 @@ pub struct Targets {
     /// module binding holds. That code may call what any module binding
     /// holds ([`CallRelation::module_anchors`]), here.
     pub module: bool,
+    /// `Some(true)`: at every evaluation that decided, the callee was read
+    /// off a name the body's files import from a specifier the resolver maps
+    /// to no file, free, or a member chain rooted at one — a package's code
+    /// ([`crate::engine::Handover`]). `None`: no evaluation decided.
+    package: Option<bool>,
 }
 
 impl Targets {
+    /// Every evaluation's callee was a package import
+    /// ([`Self::package`](Targets#structfield.package)).
+    pub fn package(&self) -> bool {
+        self.package == Some(true)
+    }
+
     /// The call surely runs its one target at every evaluation that reached
     /// it — writes its one setter, or runs its one body — and some
     /// evaluation ran where the pass knows when: the must column, the only
@@ -157,6 +168,10 @@ impl Targets {
         self.module |= other.module;
         self.sure = match (self.sure, other.sure) {
             (None, s) | (s, None) => s,
+            (Some(a), Some(b)) => Some(a && b),
+        };
+        self.package = match (self.package, other.package) {
+            (None, p) | (p, None) => p,
             (Some(a), Some(b)) => Some(a && b),
         };
         for (slot, v) in other.written {
@@ -186,6 +201,8 @@ pub struct Evaluation {
     pub escaped: bool,
     /// See [`Targets::module`].
     pub module: bool,
+    /// The callee was read off a package import ([`Targets::package`]).
+    pub package: bool,
 }
 
 /// What a value handed at one position may reach: every setter and every
@@ -262,21 +279,48 @@ pub struct CallRelation {
     /// instantiates a child the analysis does not see (#325): a package's
     /// component, an element value it does not resolve, an ambiguous name.
     /// Each function prop is handed there to unseen code, at an unknown time.
-    unseen: BTreeSet<ExprId>,
+    /// `true` while every such evaluation's child was a package's: its name
+    /// imported from a specifier the resolver maps to no file (#389).
+    unseen: BTreeMap<ExprId, bool>,
+    /// The hooks the expansion left, by their site: `true` while every pass
+    /// that reached the marker had the package imports intact
+    /// ([`crate::engine::ModuleScope::packages_intact`]).
+    left_hooks: BTreeMap<ExprId, bool>,
 }
 
 impl CallRelation {
+    /// A pass reached the marker of the left hook at `site`; `intact`: no
+    /// write of the program may replace a member of a package's object.
+    pub fn mark_left_hook(&mut self, site: ExprId, intact: bool) {
+        let all = self.left_hooks.entry(site).or_insert(true);
+        *all &= intact;
+    }
+
+    /// A package's hook at `site` is that package's code: every pass that
+    /// reached it had the package imports intact. `false` when none did.
+    pub fn left_hook_intact(&self, site: ExprId) -> bool {
+        self.left_hooks.get(&site).copied().unwrap_or(false)
+    }
+
     /// Some evaluation of the element whose props object is `props`
-    /// instantiated a child the analysis does not see.
-    pub fn mark_unseen_element(&mut self, props: ExprId) {
-        self.unseen.insert(props);
+    /// instantiated a child the analysis does not see; `package`: a
+    /// package's, by its import.
+    pub fn mark_unseen_element(&mut self, props: ExprId, package: bool) {
+        let all = self.unseen.entry(props).or_insert(true);
+        *all &= package;
     }
 
     /// The element whose props object is `props` may instantiate a child the
     /// analysis does not see ([`Self::mark_unseen_element`]): what it hands
     /// its child is handed to unseen code, as an unseen callee's argument is.
     pub fn unseen_element(&self, props: ExprId) -> bool {
-        self.unseen.contains(&props)
+        self.unseen.contains_key(&props)
+    }
+
+    /// Every child the element at `props` instantiates unseen is a
+    /// package's ([`crate::engine::Handover::Package`]).
+    pub fn unseen_package_element(&self, props: ExprId) -> bool {
+        self.unseen.get(&props).copied().unwrap_or(false)
     }
 
     /// The module bindings some write of the program stored a setter or a
@@ -367,6 +411,7 @@ impl CallRelation {
             escaped: eval.escaped,
             placed: !eval.escaped,
             module: eval.module,
+            package: Some(false),
         });
     }
 
@@ -504,6 +549,7 @@ impl CallRelation {
             escaped: eval.escaped,
             placed: !eval.escaped && !eval.unreached,
             module: eval.module,
+            package: Some(eval.package),
         });
     }
 
@@ -604,7 +650,12 @@ impl CallRelation {
             self.slot_names.entry(*slot).or_insert_with(|| name.clone());
         }
         self.module.extend(other.module.iter().copied());
-        self.unseen.extend(other.unseen.iter().copied());
+        for (props, package) in &other.unseen {
+            self.mark_unseen_element(*props, *package);
+        }
+        for (site, intact) in &other.left_hooks {
+            self.mark_left_hook(*site, *intact);
+        }
     }
 }
 

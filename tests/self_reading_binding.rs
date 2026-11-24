@@ -16,7 +16,8 @@ fn reactant(args: &[&str]) -> Output {
         .expect("run reactant binary")
 }
 
-/// Every (component, rule) of the fixture, once the run completed.
+/// Every (component, rule) of the fixture, its Info rows included (a value
+/// handed to a callee is a hand-over row), once the run completed.
 fn findings() -> Vec<(String, String)> {
     let out = reactant(&[
         "tests/fixtures/self_reading_binding",
@@ -26,6 +27,7 @@ fn findings() -> Vec<(String, String)> {
         "json",
         "--fail-on",
         "never",
+        "--info",
     ]);
     assert!(
         out.status.success(),

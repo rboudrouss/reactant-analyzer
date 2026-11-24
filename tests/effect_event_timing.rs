@@ -153,10 +153,9 @@ fn an_effect_event_runs_its_argument_where_its_value_is_called() {
 #[test]
 fn a_hook_named_use_effect_event_from_elsewhere_stays_unknown() {
     let r = parse_and_analyze(SRC);
-    assert_eq!(
-        setter_in_render(&r, "ForeignEvent"),
-        vec![Severity::Warning]
-    );
+    // Its argument is handed to code the analysis does not see: the
+    // hand-over row, an Info.
+    assert_eq!(setter_in_render(&r, "ForeignEvent"), vec![Severity::Info]);
 }
 
 /// [`parse_and_analyze`] with the summaries the CLI loads, React's
@@ -279,10 +278,10 @@ fn an_effect_event_called_in_an_effect_is_a_certain_loop() {
     }
     // A package's hook of that name is code the analysis does not see: its
     // argument is handed to it at the call, a possible write of unknown
-    // timing, never an Error.
+    // timing, never an Error: its hand-over row, an Info.
     assert_eq!(
         severities(&r, "ForeignInEffect", "setter-in-render"),
-        vec![Severity::Warning]
+        vec![Severity::Info]
     );
     assert!(severities(&r, "ForeignInEffect", "infinite-loop").is_empty());
 }

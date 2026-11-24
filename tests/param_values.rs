@@ -19,7 +19,17 @@ fn reactant(args: &[&str]) -> Output {
 
 /// Every (component, rule, severity) of the fixture.
 fn findings() -> Vec<(String, String, String)> {
-    let out = reactant(&[
+    findings_with(&[])
+}
+
+/// `findings` with the Info rows: a value handed to a callee with no timing
+/// summary is a hand-over row, an Info.
+fn findings_with_info() -> Vec<(String, String, String)> {
+    findings_with(&["--info"])
+}
+
+fn findings_with(extra: &[&str]) -> Vec<(String, String, String)> {
+    let mut args = vec![
         "tests/fixtures/param_values",
         "--config",
         "tests/fixtures/all-rules.json",
@@ -27,7 +37,9 @@ fn findings() -> Vec<(String, String, String)> {
         "json",
         "--fail-on",
         "never",
-    ]);
+    ];
+    args.extend_from_slice(extra);
+    let out = reactant(&args);
     let doc: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout))
         .expect("stdout must be valid JSON");
     doc["diagnostics"]
@@ -62,7 +74,7 @@ const SHAPES: &[&str] = &[
 
 #[test]
 fn a_call_through_a_parameter_in_the_render_writes_what_it_may_hold() {
-    let all = findings();
+    let all = findings_with_info();
     for shape in SHAPES {
         let component = format!("Render{shape}");
         assert!(

@@ -15,12 +15,12 @@
 //! again. `--fail-on` reads the unfiltered counts, so nothing about which
 //! findings exist changes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ir::FileId;
 use crate::rules::{Diagnostic, Severity};
 
-use super::report::ComponentReport;
+use super::report::{ComponentReport, Hidden};
 
 /// The key a finding is grouped by — exactly the key the corpus measurement
 /// uses, plus the rule. The message is part of it, so two findings that say
@@ -35,6 +35,35 @@ type Key<'a> = (
     &'a str,
     &'a [crate::rules::SetterRef],
 );
+
+fn key(d: &Diagnostic) -> Key<'_> {
+    (
+        d.rule.as_ref(),
+        d.range.map(|r| (r.file, r.line, r.col)),
+        d.message.as_str(),
+        &d.setters,
+    )
+}
+
+/// Count the Info rows a run without `--info` leaves out (`rows`, of every
+/// component the report covers) the way [`LocationIndex::build`] groups the
+/// rows it shows.
+pub fn hidden<'a>(rows: impl IntoIterator<Item = &'a Diagnostic>, per_component: bool) -> Hidden {
+    let mut seen: HashSet<Key> = HashSet::new();
+    let mut out = Hidden::default();
+    for d in rows {
+        let key = key(d);
+        if key.1.is_some() && !per_component && !seen.insert(key) {
+            continue;
+        }
+        out.infos += 1;
+        if !d.setters.is_empty() {
+            out.hand_overs += 1;
+            out.setters += d.setters.len();
+        }
+    }
+    out
+}
 
 /// One printed row: the components reporting the same finding.
 struct Group {
@@ -72,12 +101,7 @@ impl LocationIndex {
 
         for (ci, comp) in components.iter().enumerate() {
             for (di, d) in comp.diagnostics.iter().enumerate() {
-                let key: Key = (
-                    d.rule.as_ref(),
-                    d.range.map(|r| (r.file, r.line, r.col)),
-                    d.message.as_str(),
-                    &d.setters,
-                );
+                let key = key(d);
                 // A row with no range is its own group: two positions we
                 // cannot name are not evidence of one location.
                 let groupable = key.1.is_some() && !per_component;
@@ -190,6 +214,7 @@ mod tests {
             diagnostics,
             safe_checks: vec![],
             suspended_safe_checks: 0,
+            hidden_infos: 0,
         }
     }
 

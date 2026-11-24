@@ -29,6 +29,12 @@ fn report(fixture: &str) -> String {
     String::from_utf8_lossy(&reactant(fixture, &[]).stdout).into_owned()
 }
 
+/// `report` with the Info rows, where a setter handed to a callee with no
+/// timing summary is reported.
+fn report_info(fixture: &str) -> String {
+    String::from_utf8_lossy(&reactant(fixture, &["--info"]).stdout).into_owned()
+}
+
 const PHASE: &str = "tests/fixtures/setter_phase";
 const IDENTITY: &str = "tests/fixtures/setter_identity";
 const CAPTURE: &str = "tests/fixtures/setter_capture";
@@ -65,6 +71,8 @@ fn a_setter_call_inside_a_jsx_prop_value_is_a_render_write() {
 
 #[test]
 fn a_callee_with_no_timing_summary_warns_without_claiming_a_direct_call() {
+    // `compose` is the program's (`./util`): a Warning, which a package's
+    // callee would not be.
     let out = report(PHASE);
     let line = line_for(&out, "UnknownTiming");
     assert!(
@@ -93,10 +101,11 @@ fn a_write_a_known_registrar_deferred_is_not_a_render_write() {
 fn every_site_of_a_setter_is_judged_not_only_the_first() {
     // The rule kept one site per setter, the most synchronous: a site it
     // cleared — a settling guard, a timer — hid one it must report.
-    let out = report(PHASE);
+    // `runNow` is a package's (`some-pkg`): the hand-over is an Info.
+    let out = report_info(PHASE);
     let line = line_for(&out, "DeferredAndEscaped");
     assert!(
-        line.contains("warn") && line.contains("no timing summary"),
+        line.contains("info") && line.contains("package code the analysis does not see"),
         "`runNow(() => setN(n + 1))` may run during render:\n{out}"
     );
     // A second render-pass write of the slot also voids the first's
@@ -116,9 +125,10 @@ fn a_guard_inside_a_sync_callback_the_render_runs_is_read_by_the_settling_proof(
         assert!(!out.contains(name), "{name} settles:\n{out}");
     }
     assert!(line_for(&out, "SyncCallbackGrows").contains("setter-in-render"));
+    let out = report_info(PHASE);
     let line = line_for(&out, "EscapedCallbackGuard");
     assert!(
-        line.contains("warn") && line.contains("no timing summary"),
+        line.contains("info") && line.contains("package code the analysis does not see"),
         "an escaped callback's guard may read a stale value:\n{out}"
     );
 }

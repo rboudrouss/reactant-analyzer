@@ -109,11 +109,15 @@ pub fn render(
     // inlined it (#129, #271): each distinct location is printed once, under
     // the component whose row it is printed as, naming the others.
     let mut hidden_clean = 0usize;
+    // Of the components hidden for showing nothing, those that met a limit
+    // of the analysis (hidden Info rows): no error or warning, but not clean.
+    let mut hidden_limited = 0usize;
     let mut hidden_repeat = 0usize;
 
     for (ci, comp) in report.components.iter().enumerate() {
-        // A trivial component (no hooks, no findings) is never worth a line.
-        if comp.diagnostics.is_empty() && comp.hook_count == 0 {
+        // A trivial component (no hooks, no findings, nothing hidden) is
+        // never worth a line.
+        if comp.diagnostics.is_empty() && comp.hook_count == 0 && comp.hidden_infos == 0 {
             continue;
         }
         let file_suffix = comp
@@ -125,14 +129,31 @@ pub fn render(
         if comp.diagnostics.is_empty() {
             // Clean component (has hooks, no findings): hidden unless --show-clean.
             if !show_clean {
-                hidden_clean += 1;
+                match comp.hidden_infos {
+                    0 => hidden_clean += 1,
+                    _ => hidden_limited += 1,
+                }
                 continue;
             }
-            let _ = writeln!(
-                out,
-                "  {}{}{}  ({} hooks){}  {}✓{}",
-                p.bold, comp.name, p.reset, comp.hook_count, file_suffix, p.green, p.reset
-            );
+            // The tick only where nothing was hidden either: a component
+            // with Info rows left out met a limit of the analysis.
+            match comp.hidden_infos {
+                0 => {
+                    let _ = writeln!(
+                        out,
+                        "  {}{}{}  ({} hooks){}  {}✓{}",
+                        p.bold, comp.name, p.reset, comp.hook_count, file_suffix, p.green, p.reset
+                    );
+                }
+                n => {
+                    let _ = writeln!(
+                        out,
+                        "  {}{}{}  ({} hooks){}  {}no errors or warnings, {n} info finding(s) \
+                         not shown (--info){}",
+                        p.bold, comp.name, p.reset, comp.hook_count, file_suffix, p.dim, p.reset
+                    );
+                }
+            }
             render_safe_checks(&mut out, comp, info, &p);
             continue;
         }
@@ -270,12 +291,25 @@ pub fn render(
         );
     }
 
-    if hidden_clean > 0 && !show_clean {
-        let _ = writeln!(
-            out,
-            "{}   {} clean component(s) hidden, rerun with --show-clean{}",
-            p.dim, hidden_clean, p.reset
-        );
+    // "Clean" only for what met no limit either: a component whose only rows
+    // are hidden Infos is counted apart.
+    if !show_clean {
+        let _ = match (hidden_clean, hidden_limited) {
+            (0, 0) => Ok(()),
+            (n, 0) => writeln!(
+                out,
+                "{}   {n} clean component(s) hidden, rerun with --show-clean{}",
+                p.dim, p.reset
+            ),
+            (n, m) => writeln!(
+                out,
+                "{}   {} component(s) with no error or warning hidden, {m} of which met a limit \
+                 of the analysis; rerun with --show-clean{}",
+                p.dim,
+                n + m,
+                p.reset
+            ),
+        };
     }
 
     let _ = writeln!(out);
@@ -283,12 +317,38 @@ pub fn render(
         // Silence is only evidence when the analyzer read everything it needed
         // (#9, #47). With a blind spot on record it did not, so the green tick
         // — the one line a user reads — is withheld.
-        if report.blind_spots.is_empty() {
+        // Nor is it when Info rows were computed and not shown: those are
+        // the limits the analysis met, and a run that met one found nothing
+        // only as far as it could see.
+        if report.blind_spots.is_empty() && report.hidden.infos == 0 && locations.infos == 0 {
             let _ = writeln!(
                 out,
                 "{}✓  {} file(s) no issues found.{}",
                 p.green, report.files_analyzed, p.reset
             );
+        } else if report.blind_spots.is_empty() && report.hidden.infos == 0 {
+            // Under `--info`: the limits it met are the rows above.
+            let _ = writeln!(
+                out,
+                "{}⚠  {} file(s), no errors or warnings, but the analysis is not exhaustive: it \
+                 met {} limit(s), listed above.{}",
+                p.yellow, report.files_analyzed, locations.infos, p.reset
+            );
+        } else if report.blind_spots.is_empty() {
+            let _ = writeln!(
+                out,
+                "{}⚠  {} file(s), no errors or warnings, but the analysis is not exhaustive: it \
+                 met {} limit(s), {}; rerun with --info to list them.{}",
+                p.yellow,
+                report.files_analyzed,
+                report.hidden.infos,
+                limits(report.hidden),
+                p.reset
+            );
+            render_assumptions(&mut out, report, &p);
+            render_blind_spots(&mut out, report, &p);
+            render_followed(&mut out, report, &p);
+            return out;
         } else {
             let _ = writeln!(
                 out,
@@ -324,10 +384,49 @@ pub fn render(
             p.reset
         );
     }
+    render_hidden(&mut out, report, &p);
     render_assumptions(&mut out, report, &p);
     render_blind_spots(&mut out, report, &p);
     render_followed(&mut out, report, &p);
     out
+}
+
+/// What the run computed and does not show without `--info`, under the
+/// summary, when the summary line shows findings or a blind spot (a run with
+/// neither says it in its closing line). The hand-over rows are named apart:
+/// each is a setter handed to package code, which may loop if that code runs
+/// it during render, so the count of what is hidden is the default output's
+/// half of the claim.
+fn render_hidden(out: &mut String, report: &CheckReport, p: &Palette) {
+    let h = report.hidden;
+    if h.infos == 0 {
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "{}   {} {} not shown, rerun with --info to list them{}",
+        p.dim,
+        limits(h),
+        if h.infos == 1 { "is" } else { "are" },
+        p.reset
+    );
+}
+
+/// The hidden Info rows, named: the hand-overs to package code apart, with
+/// their setters and sites, then the others.
+fn limits(h: super::report::Hidden) -> String {
+    let others = h.infos - h.hand_overs;
+    let handed = |sites: usize| {
+        format!(
+            "{} setter(s) handed to package code the analysis does not see ({sites} site(s))",
+            h.setters
+        )
+    };
+    match (h.hand_overs, others) {
+        (0, n) => format!("{n} info finding(s)"),
+        (sites, 0) => handed(sites),
+        (sites, n) => format!("{} and {n} other info finding(s)", handed(sites)),
+    }
 }
 
 /// The premises the run declared (ADR-048), printed under every summary and

@@ -392,9 +392,11 @@ export function Parent() {
             .map(|d| d["message"].as_str().unwrap().to_string())
             .collect()
     };
-    let off = p.json(&[]);
+    // The hand-over row is an Info: both runs list them.
+    let off = p.json(&["--info"]);
     assert_eq!(handed(&off).len(), 1, "off: the polyfill's any-name fact");
     let on = p.json(&[
+        "--info",
         "--assume",
         "foreignRealmFiles=poly/**",
         "--assume",

@@ -51,7 +51,7 @@ reactant check src/ --ignore-rule derived-state  # all but this one
 | `--rule <name>` | Only report this diagnostic (repeatable), an off-by-default one included. An unknown name exits with code 2. |
 | `--ignore-rule <name>` | Suppress this diagnostic (repeatable). |
 | `--rule-option <rule>:<key>=<value>` | Set an option of a rule (repeatable), e.g. `--rule-option state-lifted-too-high:minDepth=2`. Beats the config's value for the same key. `reactant explain <rule>` lists what a rule accepts; an unknown key or an out-of-range value exits with code 2. |
-| `--info` | Also display `Info` diagnostics (known analysis limits: widening, recursion cutoff, unknown hooks; and patterns that look intentional: a seed-once prop name, a cheap pure initializer), plus, per shown component, the applicable checks that ran and found nothing (`verified: …`) or, where the analysis was truncated, the count withheld (`suspended: …`). See [The assurance channel](#the-assurance-channel---info). |
+| `--info` | Also display `Info` diagnostics (known analysis limits: widening, recursion cutoff, unknown hooks, a setter handed to a package's code; and patterns that look intentional: a seed-once prop name, a cheap pure initializer), plus, per shown component, the applicable checks that ran and found nothing (`verified: …`) or, where the analysis was truncated, the count withheld (`suspended: …`). See [The assurance channel](#the-assurance-channel---info). |
 | `--show-clean` | Show components with no findings (hidden by default). Without it, a trailing note reports how many clean components were hidden. |
 | `--trace` | Show each finding's witness chain (ADR-019): typed `→` steps explaining why the rule fired (e.g. `` `loadPrefs` resolves to an import from ./prefs.ts `` → `` `fetch` has side effects ``). Steps pointing into another file (cross-file inlining) show `file:line:col`. Capped at 8 steps (`… n more step(s)`). Hidden by default; a finding with steps shows a `(N trace step(s), rerun with --trace)` hint instead. `json` output always includes the chain. |
 | `--entry <names>` | Explicit root components. Repeatable or comma-separated (`--entry Foo,Bar`). On a name collision across files, use the qualified `Foo@path` form the output prints. A name matching no component is a usage error (exit 2). |
@@ -396,6 +396,7 @@ path from an entry leaves that subtree unclassified.
   "assumptions": [],
   "summary": {
     "errors": 0, "warnings": 1, "infos": 0,
+    "hidden_infos": 0, "hidden_hand_overs": 0, "hidden_hand_over_setters": 0,
     "components_analyzed": 5, "exit_code": 1
   }
 }
@@ -435,7 +436,9 @@ Semantics:
   inlined hook/utility. `message` is the rendered prose (same text as
   `--trace`).
 - `setters`: present only on a `setter-in-render` or `cross-setter-in-render`
-  row that says setters are "handed to a callee … with no timing summary":
+  row that says setters are "handed to a callee … with no timing summary" (a
+  `warning`) or "handed to package code the analysis does not see" (an `info`,
+  a limit of the analysis, listed under `--info`):
   every setter that hand-over carries, where the message names the first
   three and counts the rest. One statement of a component that hands setters
   to code the analysis does not see is one row, not one per setter and per
@@ -451,7 +454,16 @@ Semantics:
 - `severity` ∈ `"error" | "warning" | "info"`. Info entries appear only with
   `--info`.
 - `summary.errors`/`warnings`/`infos` count the objects in `diagnostics` by
-  `severity`. `summary.exit_code` mirrors the process exit code under the
+  `severity`. `summary.hidden_infos` counts the Info objects the run computed
+  and left out of `diagnostics` because `--info` was not given, as `infos`
+  would count them; it is `0` under `--info` *(added by #394)*.
+  `summary.hidden_hand_overs` and `summary.hidden_hand_over_setters` are, of
+  those, the hand-over rows of `setter-in-render` / `cross-setter-in-render`
+  (setters handed to package code) and the setters they list. The human output
+  of a run that shows no Error nor Warning but hid Info rows ends with "no
+  errors or warnings, but the analysis is not exhaustive: it met N limit(s),
+  …" rather than "no issues found", which only a run with no Info row prints.
+  `summary.exit_code` mirrors the process exit code under the
   active `--fail-on`, which reads the per-component findings.
 - stdout is exactly one JSON document; parse errors are both listed in
   `parse_errors` and kept off stdout.
@@ -586,11 +598,26 @@ rows instead.
 
 ### The last line, and when it is withheld
 
-A run that read everything it was pointed at ends with the clean bill:
+A run that read everything it was pointed at, and met no limit of the
+analysis, ends with the clean bill:
 
 ```
 ✓  37 file(s) no issues found.
 ```
+
+A run with no Error nor Warning that did meet one — an Info row, shown under
+`--info` or hidden without it, a setter handed to package code included —
+says so instead of the tick (#394):
+
+```
+⚠  1 file(s), no errors or warnings, but the analysis is not exhaustive: it met 1 limit(s),
+   1 setter(s) handed to package code the analysis does not see (1 site(s)); rerun with --info
+   to list them.
+```
+
+With findings shown, the line under the summary counts what `--info` would
+add: `   1 setter(s) handed to package code the analysis does not see (1
+site(s)) is not shown, rerun with --info to list them`.
 
 A run that did **not** never prints it, because "no issues found" is a claim
 about the code and the analyzer may only make it about code it actually read:

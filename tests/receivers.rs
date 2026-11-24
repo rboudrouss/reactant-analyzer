@@ -82,7 +82,9 @@ fn a_method_called_with_call_gets_its_argument_as_this() {
 fn a_method_the_analysis_does_not_see_is_handed_its_receiver() {
     // A module function read as a member and a package's function: no body
     // the component runs, so the receiver, their `this`, escapes there with
-    // the setter it holds (#340); a method the program defines does not.
+    // the setter it holds (#340); a method the program defines does not. A
+    // package's function called as a literal's method is called off the
+    // literal, not off its import: a Warning.
     for case in [
         "module-function-method-this-setter-loops",
         "package-method-this-setter-loops",
