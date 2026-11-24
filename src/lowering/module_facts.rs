@@ -141,10 +141,20 @@ pub fn collect_module_facts(
 /// `Object.prototype` ([`may_be_object_prototype`]), and any member once such
 /// a value goes anywhere but into a member access, a comparison or
 /// `Object.create`'s prototype.
+///
+/// All of this follows the reflective API by its spelling (#366): `Object` and
+/// `Reflect` (or a member of that name, `globalThis.Object`) read as a member
+/// access's object, a comparison's or a `typeof`'s operand or a callee, and
+/// their functions above read as a callee. Any other read of either —
+/// an alias, a destructuring, a computed member, an argument, an export —
+/// and any other read of one of those functions knows nothing: any name, any
+/// prototype.
 pub(crate) fn accessor_names(program: &Program) -> AccessorNames {
     let mut scan = AccessorScan {
         found: AccessorNames::scanned(),
         held: HashSet::new(),
+        followed: HashSet::new(),
+        called: HashSet::new(),
     };
     scan.visit_program(program);
     scan.found
@@ -156,6 +166,12 @@ struct AccessorScan {
     /// they do not escape: a member access's object, a comparison's operand,
     /// `Object.create`'s prototype.
     held: HashSet<oxc_span::Span>,
+    /// The spans of the reads of `Object` or `Reflect` the scan follows: a
+    /// member access's object, a comparison's or a `typeof`'s operand, a
+    /// callee (#366).
+    followed: HashSet<oxc_span::Span>,
+    /// The spans of the callees: where a [`reflective`] function is followed.
+    called: HashSet<oxc_span::Span>,
 }
 
 impl AccessorScan {
@@ -195,6 +211,56 @@ impl AccessorScan {
     /// `e` is read where it does not escape.
     fn hold(&mut self, e: &Expression) {
         self.held.insert(e.get_inner_expression().span());
+    }
+
+    /// `e` is read where the scan follows it, if it is `Object` or `Reflect`.
+    fn follow(&mut self, e: &Expression) {
+        self.followed.insert(e.get_inner_expression().span());
+    }
+
+    /// A read of `Object` or `Reflect` at `span` (`reads`): one the scan does
+    /// not follow knows nothing.
+    fn read(&mut self, reads: bool, span: oxc_span::Span) {
+        if reads && !self.followed.contains(&span) {
+            self.found.know_nothing();
+        }
+    }
+
+    /// A read of a [`reflective`] function at `span` (`reads`): one that is
+    /// not a callee knows nothing.
+    fn read_function(&mut self, reads: bool, span: oxc_span::Span) {
+        if reads && !self.called.contains(&span) {
+            self.found.know_nothing();
+        }
+    }
+}
+
+/// The namespace of the reflective API `e` reads: the global `Object` or
+/// `Reflect`, or a member of that name (`globalThis.Object`).
+fn namespace(e: &Expression) -> Option<&'static str> {
+    let name = match e.get_inner_expression() {
+        Expression::Identifier(id) => Some(id.name.to_string()),
+        Expression::StaticMemberExpression(m) => Some(m.property.name.to_string()),
+        Expression::ComputedMemberExpression(m) => const_name(&m.expression),
+        _ => None,
+    };
+    match name.as_deref() {
+        Some("Object") => Some("Object"),
+        Some("Reflect") => Some("Reflect"),
+        _ => None,
+    }
+}
+
+/// Is `member` off `object` a function of the reflective API the scan
+/// follows only where it is called (#366)? `__defineGetter__` and
+/// `__defineSetter__` off anything, the others off a [`namespace`].
+fn reflective(object: &Expression, member: &str) -> bool {
+    match member {
+        "__defineGetter__" | "__defineSetter__" => true,
+        "defineProperty" | "defineProperties" | "setPrototypeOf" | "getPrototypeOf" | "create" => {
+            namespace(object).is_some()
+        }
+        _ => false,
     }
 }
 
@@ -302,11 +368,10 @@ impl<'a> Visit<'a> for AccessorScan {
 
     fn visit_call_expression(&mut self, it: &CallExpression<'a>) {
         let arg = |i: usize| it.arguments.get(i).and_then(Argument::as_expression);
+        self.follow(&it.callee);
+        self.called.insert(it.callee.get_inner_expression().span());
         if let Expression::StaticMemberExpression(m) = it.callee.get_inner_expression() {
-            let on = match m.object.get_inner_expression() {
-                Expression::Identifier(id) => Some(id.name.as_str()),
-                _ => None,
-            };
+            let on = namespace(&m.object);
             // A descriptor call's target gets the members its descriptors
             // name, which the arms below count, and no other.
             if let (Some("Object" | "Reflect"), "defineProperty" | "defineProperties") =
@@ -391,12 +456,29 @@ impl<'a> Visit<'a> for AccessorScan {
 
     fn visit_static_member_expression(&mut self, it: &StaticMemberExpression<'a>) {
         self.hold(&it.object);
+        self.follow(&it.object);
+        let member = it.property.name.as_str();
+        self.read(matches!(member, "Object" | "Reflect"), it.span);
+        self.read_function(reflective(&it.object, member), it.span);
         walk::walk_static_member_expression(self, it);
     }
 
+    // `Object[k]` may be any of its functions, and the calls above are only
+    // followed under a static name.
     fn visit_computed_member_expression(&mut self, it: &ComputedMemberExpression<'a>) {
         self.hold(&it.object);
+        if let Some(member) = const_name(&it.expression) {
+            self.follow(&it.object);
+            if reflective(&it.object, &member) {
+                self.found.know_nothing();
+            }
+            self.read(matches!(member.as_str(), "Object" | "Reflect"), it.span);
+        }
         walk::walk_computed_member_expression(self, it);
+    }
+
+    fn visit_identifier_reference(&mut self, it: &IdentifierReference<'a>) {
+        self.read(matches!(it.name.as_str(), "Object" | "Reflect"), it.span);
     }
 
     fn visit_binary_expression(&mut self, it: &BinaryExpression<'a>) {
@@ -405,9 +487,27 @@ impl<'a> Visit<'a> for AccessorScan {
         {
             self.hold(&it.left);
             self.hold(&it.right);
+            self.follow(&it.left);
+            self.follow(&it.right);
         }
         walk::walk_binary_expression(self, it);
     }
+
+    fn visit_unary_expression(&mut self, it: &UnaryExpression<'a>) {
+        if it.operator == UnaryOperator::Typeof {
+            self.follow(&it.argument);
+        }
+        walk::walk_unary_expression(self, it);
+    }
+
+    // Types are erased before anything runs: `x: Object` reads nothing.
+    fn visit_ts_type(&mut self, _it: &TSType<'a>) {}
+    fn visit_ts_type_annotation(&mut self, _it: &TSTypeAnnotation<'a>) {}
+    fn visit_ts_type_parameter_instantiation(&mut self, _it: &TSTypeParameterInstantiation<'a>) {}
+    fn visit_ts_type_parameter_declaration(&mut self, _it: &TSTypeParameterDeclaration<'a>) {}
+    fn visit_ts_interface_declaration(&mut self, _it: &TSInterfaceDeclaration<'a>) {}
+    fn visit_ts_type_alias_declaration(&mut self, _it: &TSTypeAliasDeclaration<'a>) {}
+    fn visit_ts_class_implements(&mut self, _it: &TSClassImplements<'a>) {}
 
     // Every place a member is written: an assignment, an update, a
     // destructuring target, a `for … of` head.
@@ -454,6 +554,7 @@ impl<'a> Visit<'a> for AccessorScan {
     }
 
     fn visit_new_expression(&mut self, it: &NewExpression<'a>) {
+        self.follow(&it.callee);
         if let Expression::Identifier(id) = it.callee.get_inner_expression()
             && id.name == "Proxy"
             && may_hold_accessor(it.arguments.get(1).and_then(Argument::as_expression))
@@ -696,7 +797,7 @@ mod tests {
             "Object.defineProperty(t, \"g\", { value: 1 });",
             "Object.defineProperty(Object.prototype, \"g\", { get: () => 1 });",
             "class K { f() {} get g() { return 1; } }",
-            "const { [k]: v } = Object;",
+            "const { [k]: v } = obj;",
         ] {
             assert!(!inherits(src, "f"), "{src}");
         }
@@ -728,6 +829,60 @@ mod tests {
         // Names no scan built know nothing of the program.
         assert!(
             crate::ir::module::AccessorNames::default().literal_may_inherit(AccessKey::Named("f"))
+        );
+    }
+
+    /// The reflective API is followed where it is spelled (#366): any other
+    /// read of `Object`, `Reflect` or one of their functions may supply any
+    /// name, install any accessor and set any prototype.
+    #[test]
+    fn a_reflective_read_the_scan_does_not_follow_knows_nothing() {
+        use crate::ir::module::AccessKey;
+        let knows_nothing = |src: &str| {
+            let a = facts_of(src).accessors;
+            a.literal_may_inherit(AccessKey::Named("f"))
+                && a.may_run_off_plain(AccessKey::Named("f"))
+                && a.may_run(AccessKey::Named("f"))
+        };
+        for src in [
+            "const O = Object;",
+            "const { defineProperty } = Object;",
+            "const { setPrototypeOf: s } = Reflect;",
+            "Object[k].f = 1;",
+            "Object[\"defineProperty\"](o, \"g\", d);",
+            "f(Object);",
+            "function g(O = Object) {}",
+            "export { Object };",
+            "const o = { Object };",
+            "const d = Object.defineProperty;",
+            "const s = globalThis.Reflect.setPrototypeOf;",
+            "Object.defineProperty.call(null, o, \"g\", d);",
+            "(0, Object.defineProperties)(o, ds);",
+            "const g = o.__defineGetter__;",
+            "const R = window.Reflect;",
+            "f(Object.getPrototypeOf);",
+        ] {
+            assert!(knows_nothing(src), "{src}");
+        }
+        for src in [
+            "Object.keys(o); Object.entries(o).map(f); Object.assign(t, s);",
+            "Object.freeze(o); Object.fromEntries(xs); Object.values(o);",
+            "Object.prototype.hasOwnProperty.call(o, 'g');",
+            "const c = x instanceof Object || x.constructor === Object;",
+            "const t = typeof Object; const o = new Object(); const b = Object(x);",
+            "Object.defineProperty(o, \"g\", { value: 1 }); Reflect.has(o, 'g');",
+            "Object.getPrototypeOf(o) === Object.prototype;",
+            "const o: Object = {}; function h<T extends Object>(x: T): Object { return x as Object; }",
+            "interface I extends Object {} type T = typeof Object; class K implements Object {}",
+            "globalThis.Object.keys(o);",
+        ] {
+            assert!(!knows_nothing(src), "{src}");
+        }
+        // Followed where it is called through a member of the global.
+        assert!(
+            facts_of("globalThis.Object.defineProperty(o, \"f\", { get: () => 1 });")
+                .accessors
+                .may_run_off_plain(AccessKey::Named("f"))
         );
     }
 

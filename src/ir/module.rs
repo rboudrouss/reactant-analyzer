@@ -242,6 +242,14 @@ impl AccessorNames {
         self.reprototyped = true;
     }
 
+    /// The program reaches the reflective API where no scan follows it (an
+    /// alias of `Object`, `Object.defineProperty` passed on, #366): it may
+    /// install or supply any name, and set any prototype.
+    pub fn know_nothing(&mut self) {
+        self.install(None);
+        self.reprototype();
+    }
+
     /// The names either defines.
     pub fn extend(&mut self, other: &AccessorNames) {
         self.all.extend(&other.all);

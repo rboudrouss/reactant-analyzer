@@ -1251,24 +1251,30 @@ fn member_entry<T: Transfer>(
 /// copied — a member one of its objects lacks may keep what it held, and a
 /// member no constant names in it may land anywhere. Anything else may
 /// bring any member with any value: every member written before may be
-/// overwritten, and the object holds members no entry says.
+/// overwritten, and the object holds members no entry says. A source placed
+/// only in part is both: what its objects hold, joined with an object no
+/// entry bounds (#363).
 fn spread_into(members: &mut Members, source: Option<&Sites>, heap: &Heap) {
-    let objs: Option<Vec<&Members>> = match source {
-        Some(s) if !s.open && !s.ids.is_empty() => s
-            .ids
-            .iter()
-            .map(|id| match heap.get(*id) {
-                // An object unseen code holds may hold anything (#258).
-                Some(HeapValue::Obj(obj)) if !obj.unseen => Some(obj),
-                _ => None,
-            })
-            .collect(),
-        _ => None,
-    };
-    let Some(objs) = objs else {
+    let Some(source) = source else {
         members.write_unknown();
         return;
     };
+    let anything = Members::at_least(HashMap::new());
+    let mut objs: Vec<&Members> = Vec::new();
+    let mut open = source.open || source.ids.is_empty();
+    for id in &source.ids {
+        match heap.get(*id) {
+            // An object unseen code holds may hold anything as well (#258).
+            Some(HeapValue::Obj(obj)) => {
+                open |= obj.unseen;
+                objs.push(obj);
+            }
+            _ => open = true,
+        }
+    }
+    if open {
+        objs.push(&anything);
+    }
     let copied = objs
         .iter()
         .skip(1)
@@ -1298,7 +1304,7 @@ fn spread_into(members: &mut Members, source: Option<&Sites>, heap: &Heap) {
         members.named.insert(m, entry);
     }
     for name in read {
-        let (entries, open) = source.map_or((Vec::new(), true), |s| heap.members(s, Some(&name)));
+        let (entries, open) = heap.members(source, Some(&name));
         let mut value = entries
             .into_iter()
             .cloned()
