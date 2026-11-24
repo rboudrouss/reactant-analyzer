@@ -2220,8 +2220,13 @@ fn hand_at_access<D: AbstractDomain>(
     module: bool,
     ctx: &mut AnalysisCtx<D>,
 ) {
-    if ctx.calls.is_some() {
-        let (held, fns) = sites.map(|s| ctx.heap.reach_of(s)).unwrap_or_default();
+    let recording = ctx.calls.is_some();
+    let (reached, escaped_setters) = match sites {
+        Some(s) => ctx.heap.hand_over(s, recording),
+        None => (None, Vec::new()),
+    };
+    if recording {
+        let (held, fns) = reached.unwrap_or_default();
         let (at, escaped) = (ctx.stmt, ctx.escaped);
         ctx.record(|r| {
             for (site, body) in &fns {
@@ -2238,9 +2243,7 @@ fn hand_at_access<D: AbstractDomain>(
         });
     }
     let mut setters = direct;
-    if let Some(sites) = sites {
-        setters.extend(ctx.heap.escape(sites));
-    }
+    setters.extend(escaped_setters);
     for (owner, label) in setters {
         ctx.write_slot(owner, label, D::top());
     }
