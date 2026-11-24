@@ -43,6 +43,13 @@ pub trait QueryContext {
         None
     }
 
+    /// The `useCallback` hook `label` of the component, if the context
+    /// knows it: where one recompute of it points a value read before the
+    /// first recompute ran (#340).
+    fn callback(&self, _label: crate::ir::types::HookLabel) -> Option<&crate::ir::HookEntry> {
+        None
+    }
+
     /// The reducer of slot `(owner, label)` if it is a `useReducer` slot:
     /// a write through its `dispatch` stores `reducer(state, action)`.
     fn reducer(&self, _owner: ComponentId, _label: crate::ir::types::HookLabel) -> Option<Reducer> {
@@ -468,6 +475,8 @@ pub struct FixpointCtx<'a> {
         crate::ir::types::HookLabel,
         std::sync::Arc<crate::ir::cfg::CFG>,
     >,
+    /// The component's hooks, post-expansion (see `QueryContext::callback`).
+    pub hooks: &'a [crate::ir::HookEntry],
     /// `useReducer` reducers reachable from this component (see
     /// `QueryContext::reducer`).
     pub reducers: &'a Reducers<'a>,
@@ -492,6 +501,12 @@ impl QueryContext for FixpointCtx<'_> {
         label: crate::ir::types::HookLabel,
     ) -> Option<std::sync::Arc<crate::ir::cfg::CFG>> {
         self.callbacks.get(&label).cloned()
+    }
+
+    fn callback(&self, label: crate::ir::types::HookLabel) -> Option<&crate::ir::HookEntry> {
+        self.hooks
+            .iter()
+            .find(|h| matches!(h, crate::ir::HookEntry::Callback { label: l, .. } if *l == label))
     }
 
     fn reducer(&self, owner: ComponentId, label: crate::ir::types::HookLabel) -> Option<Reducer> {

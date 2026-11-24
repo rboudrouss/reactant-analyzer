@@ -487,6 +487,19 @@ on a program React settles; 323 oracle cases, none a known false negative.
   into an object it does not place: the analysis keeps no member of a
   function, and the call back through it (`f.go(…)`), in the render or an
   effect, was silent (#330).
+- A value that may be an object or `null`/`undefined` keeps the closures the
+  object holds: `{ ...(c ? { onDrag: () => setN(…) } : null) }` handed to
+  code the analysis does not see (a prop called in the render) hands them
+  over, where it was silent, and a method one instance of a class lacks in
+  an earlier pass no longer reads as code the analysis does not see (#340).
+- A method call whose callee the analysis does not run — a module function
+  read as a member, a package's function, a prop, a library object's method —
+  hands that code its receiver, its `this`, as well as its arguments, and so
+  does a method past the inlining budget that reads `this`.
+  `{ set: setN, run }.run()` with `run` a module function or a package's, in
+  the render, was silent; it is a `setter-in-render` Warning. A setter an
+  object holds is now handed over wherever a method the analysis does not see
+  is called off that object (#340).
 
 Earlier unreleased work, already on main: the concrete oracle (#191), one
 slot-write transfer and "warn unless convergence is proven" (#192), an Error

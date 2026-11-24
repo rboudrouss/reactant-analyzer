@@ -39,6 +39,12 @@ impl<D: AbstractDomain> MemoStore<D> {
         self.0.get(&label).and_then(EnvVal::sites)
     }
 
+    /// Some recompute of `label` ran: before the first one (the first render
+    /// pass), the store knows nothing of where it points.
+    pub fn recomputed(&self, label: HookLabel) -> bool {
+        self.0.contains_key(&label)
+    }
+
     /// Store a precomputed value for a label.
     pub fn set(&mut self, label: HookLabel, val: EnvVal<D>) {
         self.0.insert(label, val);

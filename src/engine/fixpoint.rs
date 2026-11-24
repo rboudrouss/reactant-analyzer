@@ -552,6 +552,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     };
     let query = FixpointCtx {
         callbacks: &callback_bodies,
+        hooks: &hooks,
         reducers: &reducers,
         dispatches,
         hook_args: &hook_args,

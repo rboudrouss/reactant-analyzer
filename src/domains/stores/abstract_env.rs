@@ -44,6 +44,15 @@ impl Sites {
         Sites { open: true, ..self }
     }
 
+    /// The join with `val`, a value with no site (`None`: a name not bound),
+    /// open unless `val` can only be `null` or `undefined` ([`EnvVal::join`]).
+    fn opened_unless<D: AbstractDomain>(self, val: Option<&D>) -> Self {
+        match val {
+            Some(v) if places_nothing(v) => self,
+            _ => self.opened(),
+        }
+    }
+
     /// The join of two optional site sets: `None` is a plain value, the
     /// open entry with no site.
     pub fn join_opt(a: Option<&Sites>, b: Option<&Sites>) -> Option<Sites> {
@@ -114,24 +123,47 @@ impl<D: AbstractDomain> EnvVal<D> {
     }
 
     /// Either entry: the join of the values and the union of the sites, open
-    /// where one side places nothing — the reading [`AbstractEnv::join`]
-    /// gives a name, its values and its locations joined apart.
+    /// where one side may be an object or a function no site places — the
+    /// reading [`AbstractEnv::join`] gives a name, its values and its
+    /// locations joined apart. A side that can only be `null` or `undefined`
+    /// (or ⊥) places nothing and has no member, so it leaves the other's
+    /// sites as they are (#340): a member one object lacks, joined with a
+    /// closure another holds, is that closure or `undefined`, never code no
+    /// site places. A primitive with members (`"ab".length`) still opens
+    /// them.
     pub fn join(&self, other: &Self) -> Self {
         let val = self.as_val().join(&other.as_val());
-        EnvVal::located(Sites::join_opt(self.sites(), other.sites()), val)
+        EnvVal::located(self.join_sites(other), val)
     }
 
     /// [`EnvVal::join`] with the values widened, `self` the earlier one.
     pub fn widen(&self, other: &Self) -> Self {
         let val = self.as_val().widen(&other.as_val());
-        EnvVal::located(Sites::join_opt(self.sites(), other.sites()), val)
+        EnvVal::located(self.join_sites(other), val)
+    }
+
+    fn join_sites(&self, other: &Self) -> Option<Sites> {
+        match (self.sites(), other.sites()) {
+            (Some(s), None) if places_nothing(&other.as_val()) => Some(s.clone()),
+            (None, Some(s)) if places_nothing(&self.as_val()) => Some(s.clone()),
+            (a, b) => Sites::join_opt(a, b),
+        }
     }
 
     /// `self ⊑ other`: a value below, and sites among the other's.
     pub fn leq(&self, other: &Self) -> bool {
         let (a, b) = (self.as_val(), other.as_val());
-        a.join(&b) == b && Sites::leq_opt(self.sites(), other.sites())
+        let sites = Sites::leq_opt(self.sites(), other.sites())
+            || (self.sites().is_none() && places_nothing(&a));
+        a.join(&b) == b && sites
     }
+}
+
+/// `val` can only be `null` or `undefined`: no object or function a site
+/// could place, and no member a read could find, so a side of a join that
+/// is `val` with no site opens none.
+fn places_nothing<D: AbstractDomain>(val: &D) -> bool {
+    val.as_state_value().is_some_and(|v| v.is_nullish_only())
 }
 
 /// A persistent map: O(1) clone, and a copy shares every node it does not
@@ -470,16 +502,19 @@ impl<D: AbstractDomain> AbstractEnv<D> {
     }
 
     /// Pointwise join of the sites, [`Sites::join_opt`]: a name one side
-    /// binds to no site (or not at all) keeps the other's, open (#240).
-    fn join_locs(a: &Map<Var, Sites>, b: &Map<Var, Sites>) -> Map<Var, Sites> {
-        let mut out = a.clone();
-        for item in a.diff(b) {
+    /// binds to no site (or not at all) keeps the other's, open (#240),
+    /// unless that side binds it to `null` or `undefined`, which places
+    /// nothing ([`EnvVal::join`], #340).
+    fn join_locs(a: &Self, b: &Self) -> Map<Var, Sites> {
+        let mut out = a.locs.clone();
+        for item in a.locs.diff(&b.locs) {
             let (k, joined) = match item {
                 DiffItem::Update {
                     old: (k, x),
                     new: (_, y),
                 } => (k, x.join(y)),
-                DiffItem::Add(k, s) | DiffItem::Remove(k, s) => (k, s.clone().opened()),
+                DiffItem::Add(k, s) => (k, s.clone().opened_unless(a.stabs.get(k))),
+                DiffItem::Remove(k, s) => (k, s.clone().opened_unless(b.stabs.get(k))),
             };
             out.insert(k.clone(), joined);
         }
@@ -490,7 +525,7 @@ impl<D: AbstractDomain> AbstractEnv<D> {
     pub fn join(&self, other: &Self) -> Self {
         AbstractEnv {
             stabs: Self::join_stabs(&self.stabs, &other.stabs),
-            locs: Self::join_locs(&self.locs, &other.locs),
+            locs: Self::join_locs(self, other),
             setter_bindings: join_labels(&self.setter_bindings, &other.setter_bindings),
             callback_bindings: join_labels(&self.callback_bindings, &other.callback_bindings),
             slot_bindings: agreed_slots(&self.slot_bindings, &other.slot_bindings),
@@ -523,7 +558,7 @@ impl<D: AbstractDomain> AbstractEnv<D> {
         }
         AbstractEnv {
             stabs,
-            locs: Self::join_locs(&self.locs, &other.locs),
+            locs: Self::join_locs(self, other),
             setter_bindings: join_labels(&self.setter_bindings, &other.setter_bindings),
             callback_bindings: join_labels(&self.callback_bindings, &other.callback_bindings),
             slot_bindings: agreed_slots(&self.slot_bindings, &other.slot_bindings),
@@ -561,7 +596,9 @@ impl<D: AbstractDomain> AbstractEnv<D> {
                     new: (_, b),
                 } => Sites::leq_opt(Some(a), Some(b)),
                 DiffItem::Remove(_, a) => Sites::leq_opt(Some(a), None),
-                DiffItem::Add(k, b) => !self.stabs.contains_key(k) || Sites::leq_opt(None, Some(b)),
+                DiffItem::Add(k, b) => {
+                    self.stabs.get(k).is_none_or(places_nothing) || Sites::leq_opt(None, Some(b))
+                }
             };
             if !below {
                 return false;
@@ -584,6 +621,34 @@ mod tests {
     use crate::domains::Stability;
 
     type Env = AbstractEnv<Stability>;
+
+    #[test]
+    fn a_nullish_side_opens_no_sites() {
+        use crate::domains::StateValue;
+        let closure = EnvVal::Loc {
+            sites: Sites::closed([ExprId(4)]),
+            val: StateValue::reference(Stability::PerRender),
+        };
+        let absent = EnvVal::Val(StateValue::undefined());
+        let joined = closure.join(&absent);
+        assert_eq!(joined.sites(), Some(&Sites::closed([ExprId(4)])));
+        assert!(absent.leq(&joined) && closure.leq(&joined));
+        // A primitive with members may be read for one no site holds.
+        let text = EnvVal::Val(StateValue::str_top());
+        assert!(closure.join(&text).sites().unwrap().open);
+        // The env reads a name the same way.
+        let mut a = AbstractEnv::<StateValue>::new();
+        a.extend("f".to_string(), StateValue::undefined());
+        let mut b = AbstractEnv::<StateValue>::new();
+        b.bind_locs("f".to_string(), Some(Sites::closed([ExprId(4)])));
+        b.extend("f".to_string(), StateValue::reference(Stability::PerRender));
+        let env = a.join(&b);
+        assert_eq!(
+            env.lookup_env_val("f").unwrap().sites(),
+            Some(&Sites::closed([ExprId(4)]))
+        );
+        assert!(a.leq(&env) && b.leq(&env));
+    }
 
     #[test]
     fn lookup_missing_returns_top() {
