@@ -419,6 +419,7 @@ pub fn lower_custom_hooks_with_resolver(
         react_ns: &react_ns,
         local_hooks: &local_hooks,
         current_file: Some(file),
+        bound: hook_extractor::ImportCtx::unbound(),
     };
     let mut out: Vec<HookIR> = candidates
         .into_iter()
@@ -465,15 +466,168 @@ pub fn lower_custom_hooks_with_resolver(
         hook_provenance: vec![],
         alias_of: Some(hook),
     }));
+    out.extend(
+        hook_values(program)
+            .iter()
+            .filter_map(|(value, factory)| lower_hook_value(value, factory, &ctx, &imports, file)),
+    );
     ctx.name_temps(source, files);
     out
+}
+
+/// The hooks `program` binds to the value a call of one of its own functions
+/// returns at module time (#342), each with that function.
+fn hook_values<'a>(program: &'a Program<'a>) -> Vec<(hook_detector::HookValue<'a>, Candidate<'a>)> {
+    let values = hook_detector::detect_hook_values(program);
+    if values.is_empty() {
+        return Vec::new();
+    }
+    let mut functions = detect_utilities(program);
+    values
+        .into_iter()
+        .filter_map(|value| {
+            let at = functions.iter().position(|f| f.name == value.callee)?;
+            Some((value, functions.swap_remove(at)))
+        })
+        .collect()
+}
+
+/// The hook `value` binds: the closure `factory` returns, run as a custom
+/// hook's body. Every parameter of `factory` holds the module call's argument
+/// ([`cfg_builder::module_args`]) — ⊤ when a statement of `factory` reassigns
+/// it, a default included — and a call of it in the closure is a call of the
+/// hook the argument names; every other local of `factory` the closure reads
+/// is ⊤, since it lives as long as the module and any call may move it.
+/// `None`, the hook staying one the analysis does not see, unless every
+/// return of `factory` is the one closure.
+fn lower_hook_value(
+    value: &hook_detector::HookValue,
+    factory: &Candidate,
+    ctx: &LowerCtx,
+    imports: &hook_extractor::ImportCtx,
+    file: &Path,
+) -> Option<HookIR> {
+    use crate::ir::{Expr, Stmt, expr::SummaryValue, free_vars::compute_free_vars};
+    let args = cfg_builder::module_args(value.args, ctx)?;
+    let (params, cfg) = factory.build_cfg(ctx);
+    let (closure_params, mut body_cfg) = returned_closure(&cfg)?;
+    // Assigned by `factory` or by any body nested in it, the closure's own
+    // calls included: what a render reads there is no longer the argument.
+    let reassigned: HashSet<&str> = std::iter::once(&cfg)
+        .chain(
+            crate::ir::bindings::nested_bodies(&cfg)
+                .into_iter()
+                .map(|(_, c)| c),
+        )
+        .flat_map(|c| c.blocks.values())
+        .flat_map(|b| &b.stmts)
+        .filter_map(|s| match s {
+            Stmt::Assign { var, .. } => Some(var.as_str()),
+            _ => None,
+        })
+        .collect();
+    // A name the closure binds itself is not `factory`'s.
+    let own = crate::ir::bound_vars(&body_cfg, &closure_params);
+    let mut prelude = Vec::new();
+    let mut bound = HashMap::new();
+    for (i, param) in params.iter().enumerate().filter(|(_, p)| !own.contains(*p)) {
+        let arg = args.get(i);
+        let rhs = match arg {
+            _ if reassigned.contains(param.as_str()) => Expr::SummaryVal(SummaryValue::Top),
+            Some(arg) => arg.clone(),
+            None => Expr::Lit(Prim::Unit),
+        };
+        match arg.map(Expr::peel_ts) {
+            _ if reassigned.contains(param.as_str()) => {}
+            Some(e @ (Expr::Var(_) | Expr::FieldAccess { .. })) => {
+                bound.insert(param.clone(), imports.classify_callee(e));
+            }
+            Some(Expr::Lit(_)) | None => {
+                bound.insert(param.clone(), None);
+            }
+            Some(_) => {}
+        }
+        prelude.push(Stmt::Let {
+            var: param.clone(),
+            rhs,
+            span: None,
+        });
+    }
+    let locals = crate::ir::bound_vars(&cfg, &[]);
+    let mut captured: Vec<String> = compute_free_vars(&body_cfg)
+        .into_iter()
+        .filter(|v| locals.contains(v) && !params.contains(v) && !closure_params.contains(v))
+        .collect();
+    captured.sort();
+    prelude.extend(captured.into_iter().map(|var| Stmt::Let {
+        var,
+        rhs: Expr::SummaryVal(SummaryValue::Top),
+        span: None,
+    }));
+    let entry = body_cfg.entry;
+    let entry = body_cfg.blocks.get_mut(&entry)?;
+    prelude.append(&mut entry.stmts);
+    entry.stmts = prelude;
+
+    let imports = hook_extractor::ImportCtx {
+        bound: &bound,
+        ..*imports
+    };
+    let (mut hooks, hook_provenance, mut next_label) =
+        extract_hooks(&mut body_cfg, &imports, &ctx.ids);
+    extract_handlers(&body_cfg, &mut hooks, &mut next_label);
+    extract_subscriptions(&mut hooks, &mut next_label);
+    Some(HookIR {
+        file: file.to_path_buf(),
+        name: value.name.clone(),
+        param_defaults: vec![None; closure_params.len()],
+        params: closure_params,
+        body_cfg,
+        hooks,
+        hook_provenance,
+        alias_of: None,
+    })
+}
+
+/// The parameters and body of the one function literal every reachable
+/// `return` of `cfg` hands back, written there or through a name bound once
+/// to it.
+fn returned_closure(cfg: &crate::ir::cfg::CFG) -> Option<(Vec<Var>, crate::ir::cfg::CFG)> {
+    use crate::ir::{Expr, Terminator, types::ExprId};
+    let mut found: Option<(ExprId, &Vec<Var>, &std::sync::Arc<crate::ir::cfg::CFG>)> = None;
+    let reachable = cfg.reachable_blocks();
+    for block in cfg.blocks.values().filter(|b| reachable.contains(&b.id)) {
+        let Terminator::Return(value, _) = &block.term else {
+            continue;
+        };
+        let value = match value.peel_ts() {
+            Expr::Var(v) => crate::ir::bindings::binding_of(v, cfg)?.peel_ts(),
+            other => other,
+        };
+        let Expr::FnLit {
+            id,
+            params,
+            body_cfg,
+        } = value
+        else {
+            return None;
+        };
+        match found {
+            None => found = Some((*id, params, body_cfg)),
+            Some((seen, ..)) if seen == *id => {}
+            Some(_) => return None,
+        }
+    }
+    found.map(|(_, params, body)| (params.clone(), (**body).clone()))
 }
 
 /// The hook names `program` defines: its `use*` functions, and the
 /// [`HookAlias`](hook_detector::HookAlias)es whose every arm is one of React's
 /// effect hooks, which the IR lowers alike, returned with their first arm.
 /// Any other alias is not a definition the analysis reads: a call through it
-/// stays a hook it does not see.
+/// stays a hook it does not see. A hook bound to the value of a call of one of
+/// the file's functions is the file's own too (#342), whether or not that
+/// value is a closure the analysis reads.
 fn local_hooks(
     program: &Program,
     origins: &HashMap<String, import_resolution::HookOrigin>,
@@ -483,12 +637,14 @@ fn local_hooks(
     let mut names: HashSet<String> = detect_custom_hooks(program)
         .iter()
         .map(|c| c.name.clone())
+        .chain(hook_values(program).into_iter().map(|(v, _)| v.name))
         .collect();
     let imports = hook_extractor::ImportCtx {
         origins,
         react_ns,
         local_hooks: &names,
         current_file: Some(file),
+        bound: hook_extractor::ImportCtx::unbound(),
     };
     let aliases: Vec<(hook_detector::HookAlias, String)> =
         hook_detector::detect_hook_aliases(program)
@@ -551,6 +707,7 @@ pub fn lower_program_with_resolver(
         react_ns: &react_ns,
         local_hooks: &local_hooks,
         current_file: Some(file),
+        bound: hook_extractor::ImportCtx::unbound(),
     };
     let components = detect_components(program)
         .into_iter()
@@ -641,6 +798,99 @@ mod tests {
         assert!(
             !m.contains_key("C"),
             "createContext on a non-react receiver"
+        );
+    }
+
+    fn lowered_hooks(src: &str) -> Vec<HookIR> {
+        let alloc = Allocator::default();
+        let ret = Parser::new(&alloc, src, SourceType::tsx())
+            .with_options(ParseOptions::default())
+            .parse();
+        assert!(ret.diagnostics.is_empty(), "{:?}", ret.diagnostics);
+        lower_custom_hooks(
+            &ret.program,
+            src,
+            Path::new("/t.tsx"),
+            &mut FileTable::default(),
+        )
+    }
+
+    fn entry_lets(h: &HookIR) -> Vec<(String, crate::ir::Expr)> {
+        h.body_cfg.blocks[&h.body_cfg.entry]
+            .stmts
+            .iter()
+            .filter_map(|s| match s {
+                crate::ir::Stmt::Let { var, rhs, .. } => Some((var.clone(), rhs.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// #342: the closure the factory returns is the hook's body, its hooks
+    /// extracted; the factory's parameter holds the module call's argument
+    /// and a local of the factory the closure reads is ⊤.
+    #[test]
+    fn a_hook_value_is_the_closure_its_factory_returns() {
+        let hooks = lowered_hooks(
+            "import { useState, useEffect } from \"react\";\n\
+             function make(step) {\n  let calls = 0;\n  return (k) => {\n\
+             const [n, setN] = useState(0);\n    useEffect(() => { calls++; setN(n + step + k); }, [n]);\n\
+             return n;\n  };\n}\nconst useX = make(2);",
+        );
+        let h = hooks
+            .iter()
+            .find(|h| h.name == "useX")
+            .expect("useX lowered");
+        assert_eq!(h.params, vec!["k".to_string()]);
+        assert!(matches!(h.hooks[0], crate::ir::HookEntry::State { .. }));
+        assert!(matches!(h.hooks[1], crate::ir::HookEntry::Effect { .. }));
+        let lets = entry_lets(h);
+        assert!(
+            lets.iter()
+                .any(|(v, e)| v == "step" && matches!(e, crate::ir::Expr::Lit(Prim::Int(2))))
+        );
+        assert!(lets.iter().any(|(v, e)| v == "calls"
+            && matches!(
+                e,
+                crate::ir::Expr::SummaryVal(crate::ir::expr::SummaryValue::Top)
+            )));
+    }
+
+    /// A call of the factory's parameter in the closure is a call of the hook
+    /// the module call hands it, here a hook of the file.
+    #[test]
+    fn a_wrapper_s_parameter_call_is_the_hook_its_argument_names() {
+        let hooks = lowered_hooks(
+            "function useY() { return 1; }\n\
+             function wrap(hook) { return (...args) => hook(...args); }\n\
+             const useX = wrap(useY);",
+        );
+        let h = hooks
+            .iter()
+            .find(|h| h.name == "useX")
+            .expect("useX lowered");
+        assert!(
+            h.hooks
+                .iter()
+                .any(|e| matches!(e, crate::ir::HookEntry::Custom { name, .. } if name == "useY")),
+            "{:?}",
+            h.hooks
+        );
+    }
+
+    /// Two closures returned, a factory that returns its parameter, or one
+    /// imported from another file: no body, the hook stays opaque.
+    #[test]
+    fn a_factory_with_no_one_returned_closure_builds_no_hook() {
+        let hooks = lowered_hooks(
+            "function two(d) { if (d) return () => 0; return () => 1; }\n\
+             function same(h) { return h; }\nimport { make } from \"./m\";\n\
+             const useA = two(true);\nconst useB = same(useA);\nconst useC = make();",
+        );
+        assert!(
+            hooks.is_empty(),
+            "{:?}",
+            hooks.iter().map(|h| &h.name).collect::<Vec<_>>()
         );
     }
 
