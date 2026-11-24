@@ -660,9 +660,11 @@ pub fn lower_hook_values(
 /// it, a default included — and a call of it in the closure is a call of the
 /// hook the argument names; every other local of `factory` the closure reads
 /// is ⊤, since it lives as long as the module and any call may move it. The
-/// closure's own hooks are those its file (`names`) names.
+/// closure's own hooks are those its file (`names`) names. When `factory`
+/// may return one of several closures, the body runs one of them, chosen
+/// once per program run ([`choice_of`], #344).
 /// `None`, the hook staying one the analysis does not see, unless every
-/// return of `factory` is the one closure.
+/// return of `factory` is one of the closures it writes.
 fn lower_hook_value(
     value: &HookValueSite,
     factory: &crate::ir::FunctionIR,
@@ -670,42 +672,41 @@ fn lower_hook_value(
 ) -> Option<HookIR> {
     use crate::ir::{Expr, Stmt, expr::SummaryValue, free_vars::compute_free_vars};
     let (params, cfg) = (&factory.params, &factory.body_cfg);
-    let (closure_params, mut body_cfg) = returned_closure(cfg)?;
+    let closures = returned_closures(cfg)?;
     // Assigned by `factory` or by any body nested in it, the closure's own
     // calls included: what a render reads there is no longer the argument.
-    let reassigned: HashSet<&str> = std::iter::once(cfg)
-        .chain(
-            crate::ir::bindings::nested_bodies(cfg)
-                .into_iter()
-                .map(|(_, c)| c),
-        )
-        .flat_map(|c| c.blocks.values())
-        .flat_map(|b| &b.stmts)
-        .filter_map(|s| match s {
-            Stmt::Assign { var, .. } => Some(var.as_str()),
-            _ => None,
-        })
+    let reassigned = assigned_below(cfg, true);
+    // A name a closure binds itself is not `factory`'s there.
+    let owns: Vec<HashSet<Var>> = closures
+        .iter()
+        .map(|(own_params, body)| crate::ir::bound_vars(body, own_params))
         .collect();
-    // A name the closure binds itself is not `factory`'s.
-    let own = crate::ir::bound_vars(&body_cfg, &closure_params);
     let mut prelude = Vec::new();
     let mut bound = HashMap::new();
-    for (i, param) in params.iter().enumerate().filter(|(_, p)| !own.contains(*p)) {
+    for (i, param) in params.iter().enumerate() {
+        let owners = owns.iter().filter(|own| own.contains(param)).count();
+        if owners == closures.len() {
+            continue;
+        }
         let reassigned = reassigned.contains(param.as_str());
         let rhs = match value.args.get(i) {
             _ if reassigned => Expr::SummaryVal(SummaryValue::Top),
             Some(arg) => arg.clone(),
             None => Expr::Lit(Prim::Unit),
         };
-        match value.hooks.get(i) {
-            _ if reassigned => {}
-            Some(Some(hook)) => {
-                bound.insert(param.clone(), hook.clone());
+        let hook = match value.hooks.get(i) {
+            _ if reassigned => None,
+            Some(Some(hook)) => Some(hook.clone()),
+            Some(None) => None,
+            None => Some(None),
+        };
+        if let Some(hook) = hook {
+            // One closure calls its own binding of the name, another the
+            // argument: the hook map is one for the whole body.
+            if owners > 0 {
+                return None;
             }
-            Some(None) => {}
-            None => {
-                bound.insert(param.clone(), None);
-            }
+            bound.insert(param.clone(), hook);
         }
         prelude.push(Stmt::Let {
             var: param.clone(),
@@ -714,20 +715,20 @@ fn lower_hook_value(
         });
     }
     let locals = crate::ir::bound_vars(cfg, &[]);
-    let mut captured: Vec<String> = compute_free_vars(&body_cfg)
-        .into_iter()
-        .filter(|v| locals.contains(v) && !params.contains(v) && !closure_params.contains(v))
+    let captured: std::collections::BTreeSet<String> = closures
+        .iter()
+        .flat_map(|(own_params, body)| {
+            compute_free_vars(body)
+                .into_iter()
+                .filter(|v| locals.contains(v) && !params.contains(v) && !own_params.contains(v))
+        })
         .collect();
-    captured.sort();
     prelude.extend(captured.into_iter().map(|var| Stmt::Let {
         var,
         rhs: Expr::SummaryVal(SummaryValue::Top),
         span: None,
     }));
-    let entry = body_cfg.entry;
-    let entry = body_cfg.blocks.get_mut(&entry)?;
-    prelude.append(&mut entry.stmts);
-    entry.stmts = prelude;
+    let (closure_params, mut body_cfg) = choice_of(closures, prelude)?;
 
     let imports = hook_extractor::ImportCtx {
         bound: &bound,
@@ -750,36 +751,192 @@ fn lower_hook_value(
     })
 }
 
-/// The parameters and body of the one function literal every reachable
-/// `return` of `cfg` hands back, written there or through a name bound once
-/// to it.
-fn returned_closure(cfg: &crate::ir::cfg::CFG) -> Option<(Vec<Var>, crate::ir::cfg::CFG)> {
-    use crate::ir::{Expr, Terminator, types::ExprId};
-    let mut found: Option<(ExprId, &Vec<Var>, &std::sync::Arc<crate::ir::cfg::CFG>)> = None;
+/// Every name a body nested in `cfg` assigns, and `cfg` itself when `own`.
+fn assigned_below(cfg: &crate::ir::cfg::CFG, own: bool) -> HashSet<&str> {
+    own.then_some(cfg)
+        .into_iter()
+        .chain(
+            crate::ir::bindings::nested_bodies(cfg)
+                .into_iter()
+                .map(|(_, c)| c),
+        )
+        .flat_map(|c| c.blocks.values())
+        .flat_map(|b| &b.stmts)
+        .filter_map(|s| match s {
+            crate::ir::Stmt::Assign { var, .. } => Some(var.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The parameters and body of every function literal a reachable `return`
+/// of `cfg` may hand back, in source order: written there, or through a
+/// name each right-hand side of which is one (`const f = …`, the arms of a
+/// `cond ? a : b`). `None` when a return may be anything else, or a name it
+/// returns is assigned in a nested body (a call may move it before the
+/// return).
+fn returned_closures(cfg: &crate::ir::cfg::CFG) -> Option<Vec<(Vec<Var>, crate::ir::cfg::CFG)>> {
+    use crate::ir::{Expr, Terminator};
+    const MAX_HOPS: usize = 8;
+    let bindings = crate::ir::bindings::local_bindings(cfg);
+    let nested = assigned_below(cfg, false);
+    let mut found: std::collections::BTreeMap<
+        crate::ir::types::ExprId,
+        (Vec<Var>, crate::ir::cfg::CFG),
+    > = std::collections::BTreeMap::new();
     let reachable = cfg.reachable_blocks();
-    for block in cfg.blocks.values().filter(|b| reachable.contains(&b.id)) {
-        let Terminator::Return(value, _) = &block.term else {
-            continue;
-        };
-        let value = match value.peel_ts() {
-            Expr::Var(v) => crate::ir::bindings::binding_of(v, cfg)?.peel_ts(),
-            other => other,
-        };
-        let Expr::FnLit {
-            id,
-            params,
-            body_cfg,
-        } = value
-        else {
-            return None;
-        };
-        match found {
-            None => found = Some((*id, params, body_cfg)),
-            Some((seen, ..)) if seen == *id => {}
-            Some(_) => return None,
+    let mut todo: Vec<(&Expr, usize)> = cfg
+        .blocks
+        .values()
+        .filter(|b| reachable.contains(&b.id))
+        .filter_map(|b| match &b.term {
+            Terminator::Return(value, _) => Some((value, 0)),
+            _ => None,
+        })
+        .collect();
+    let mut seen: HashSet<&str> = HashSet::new();
+    while let Some((value, hops)) = todo.pop() {
+        match value.peel_ts() {
+            Expr::FnLit {
+                id,
+                params,
+                body_cfg,
+            } => {
+                found
+                    .entry(*id)
+                    .or_insert_with(|| (params.clone(), (**body_cfg).clone()));
+            }
+            Expr::Var(v) if hops < MAX_HOPS && !nested.contains(v.as_str()) => {
+                if seen.insert(v.as_str()) {
+                    let rhs = bindings.get(v.as_str())?;
+                    todo.extend(rhs.iter().map(|e| (*e, hops + 1)));
+                }
+            }
+            _ => return None,
         }
     }
-    found.map(|(_, params, body)| (params.clone(), (**body).clone()))
+    (!found.is_empty()).then(|| found.into_values().collect())
+}
+
+/// The body that runs one of `closures` (each its parameters and body),
+/// `prelude` first. One closure is that body. Several are a branch on ⊤ to
+/// each, its sides [`RunChoice`](crate::ir::cfg::EdgeKind::RunChoice)
+/// edges — the factory returned one of them at module time, and every render
+/// of the run calls that one (#344) — the body's parameters positional, each
+/// closure binding its own from them. A name a closure binds that another
+/// one or the prelude binds too is renamed in it, as a splice renames a
+/// callee's (`n#c1`): closures capture variables, and the body's exit, where
+/// the sides meet, would hand one closure's effects the other's `n`.
+fn choice_of(
+    closures: Vec<(Vec<Var>, crate::ir::cfg::CFG)>,
+    mut prelude: Vec<crate::ir::Stmt>,
+) -> Option<(Vec<Var>, crate::ir::cfg::CFG)> {
+    use crate::ir::{
+        Expr, Stmt,
+        cfg::{BasicBlock, CFG, Edge, EdgeKind, Terminator},
+        expr::SummaryValue,
+    };
+    let with_first = |body: &mut CFG, mut first: Vec<Stmt>| -> Option<()> {
+        let entry = body.blocks.get_mut(&body.entry)?;
+        first.append(&mut entry.stmts);
+        entry.stmts = first;
+        Some(())
+    };
+    if let [_] = closures.as_slice() {
+        let (params, mut body) = closures.into_iter().next()?;
+        with_first(&mut body, prelude)?;
+        return Some((params, body));
+    }
+    let arity = closures.iter().map(|(p, _)| p.len()).max().unwrap_or(0);
+    let params: Vec<Var> = (0..arity).map(|i| format!("__closure_arg{i}")).collect();
+    let mut merged = CFG {
+        entry: 0,
+        blocks: std::collections::BTreeMap::new(),
+        edges: Vec::new(),
+    };
+    let binds: Vec<HashSet<Var>> = closures
+        .iter()
+        .map(|(own, body)| crate::ir::bound_vars(body, own))
+        .collect();
+    let mut binders: HashMap<&Var, usize> = HashMap::new();
+    for var in prelude.iter().filter_map(|s| match s {
+        Stmt::Let { var, .. } => Some(var),
+        _ => None,
+    }) {
+        *binders.entry(var).or_default() += 1;
+    }
+    for var in binds.iter().flatten() {
+        *binders.entry(var).or_default() += 1;
+    }
+    let renames: Vec<HashMap<Var, Var>> = binds
+        .iter()
+        .enumerate()
+        .map(|(i, own)| {
+            own.iter()
+                .filter(|v| binders.get(v).is_some_and(|n| *n > 1))
+                .map(|v| {
+                    (
+                        v.clone(),
+                        format!("{v}{}c{i}", crate::ir::splice::SPLICE_MARK),
+                    )
+                })
+                .collect()
+        })
+        .collect();
+    let mut arms = Vec::new();
+    for ((own, body), rename) in closures.into_iter().zip(&renames) {
+        let next = merged.blocks.keys().next_back().map_or(0, |b| b + 1);
+        let mut body = crate::ir::rename_vars_cfg(body, rename).shifted(next);
+        let lets = own
+            .iter()
+            .zip(&params)
+            .map(|(p, arg)| Stmt::Let {
+                var: rename.get(p).unwrap_or(p).clone(),
+                rhs: Expr::Var(arg.clone()),
+                span: None,
+            })
+            .collect();
+        with_first(&mut body, lets)?;
+        arms.push(body.entry);
+        merged.blocks.extend(body.blocks);
+        merged.edges.extend(body.edges);
+    }
+    // Choice `j` takes closure `j` or the next choice; the last one takes
+    // the last two closures.
+    let first = merged.blocks.keys().next_back().map_or(0, |b| b + 1);
+    let choices = arms.len() - 1;
+    for (j, &arm) in arms[..choices].iter().enumerate() {
+        let id = first + j;
+        let rest = if j + 1 == choices {
+            arms[j + 1]
+        } else {
+            id + 1
+        };
+        merged.blocks.insert(
+            id,
+            BasicBlock {
+                id,
+                stmts: std::mem::take(&mut prelude),
+                term: Terminator::Branch {
+                    cond: Expr::SummaryVal(SummaryValue::Top),
+                    then_: arm,
+                    else_: rest,
+                    span: None,
+                    chain_link: false,
+                },
+            },
+        );
+        for to in [arm, rest] {
+            merged.edges.push(Edge {
+                from: id,
+                to,
+                kind: EdgeKind::RunChoice,
+            });
+        }
+    }
+    merged.entry = first;
+    debug_assert!(merged.validate().is_ok(), "{:?}", merged.validate());
+    Some((params, merged))
 }
 
 /// The hook names `program` defines: its `use*` functions, and the
@@ -1045,15 +1202,73 @@ mod tests {
         );
     }
 
-    /// Two closures returned, a factory that returns its parameter, or one
-    /// imported from a file the resolver does not find: no body, the hook
-    /// stays opaque.
+    /// #344: a factory returning one of several closures, through `return`s
+    /// or a `cond ? a : b`, builds a body branching once per run to each,
+    /// its parameters positional and each closure binding its own from them.
     #[test]
-    fn a_factory_with_no_one_returned_closure_builds_no_hook() {
+    fn a_factory_returning_one_of_several_closures_runs_the_one_chosen() {
+        use crate::ir::{Expr, Stmt, cfg::EdgeKind};
         let hooks = lowered_hooks(
-            "function two(d) { if (d) return () => 0; return () => 1; }\n\
-             function same(h) { return h; }\nimport { make } from \"./m\";\n\
-             const useA = two(true);\nconst useB = same(useA);\nconst useC = make();",
+            "function two(d) { if (d) return (a) => a; return (b, c) => b + c; }\n\
+             function pick(d) { const f = d ? () => 1 : () => 2; return f; }\n\
+             const useA = two(true);\nconst useB = pick(false);",
+        );
+        for name in ["useA", "useB"] {
+            let h = hooks
+                .iter()
+                .find(|h| h.name == name)
+                .unwrap_or_else(|| panic!("{name} lowered"));
+            let choices = h
+                .body_cfg
+                .edges
+                .iter()
+                .filter(|e| e.kind == EdgeKind::RunChoice)
+                .count();
+            assert_eq!(choices, 2, "{name}: one choice, two sides");
+            assert!(h.body_cfg.validate().is_ok());
+        }
+        let h = hooks.iter().find(|h| h.name == "useA").unwrap();
+        assert_eq!(h.params, ["__closure_arg0", "__closure_arg1"]);
+        let binds = |var: &str, arg: &str| {
+            h.body_cfg.blocks.values().any(|b| {
+                b.stmts.iter().any(|s| {
+                    matches!(s, Stmt::Let { var: v, rhs: Expr::Var(a), .. } if v == var && a == arg)
+                })
+            })
+        };
+        assert!(binds("a", "__closure_arg0"));
+        assert!(binds("b", "__closure_arg0"));
+        assert!(binds("c", "__closure_arg1"));
+    }
+
+    /// #344: a name two closures bind is two names, one per closure.
+    #[test]
+    fn the_closures_of_one_choice_keep_their_names_apart() {
+        let hooks = lowered_hooks(
+            "function two(d) { if (d) return (k) => { const n = k; return n; };\n\
+             return (k) => { const n = 2; const m = n; return m; }; }\n\
+             const useA = two(true);",
+        );
+        let h = hooks.iter().find(|h| h.name == "useA").expect("useA");
+        let bound = crate::ir::bound_vars(&h.body_cfg, &h.params);
+        for name in ["k#c0", "k#c1", "n#c0", "n#c1", "m"] {
+            assert!(bound.contains(name), "{name}: {bound:?}");
+        }
+        assert!(!bound.contains("n") && !bound.contains("k"), "{bound:?}");
+    }
+
+    /// A factory that returns its parameter, a closure or a value, a name
+    /// a nested body reassigns, or one imported from a file the resolver does
+    /// not find: no body, the hook stays opaque.
+    #[test]
+    fn a_factory_with_no_returned_closure_builds_no_hook() {
+        let hooks = lowered_hooks(
+            "function same(h) { return h; }\n\
+             function some(d) { if (d) return () => 0; return null; }\n\
+             function moved() { let f = () => 0; const g = () => { f = null; }; g(); return f; }\n\
+             import { make } from \"./m\";\n\
+             const useA = some(true);\nconst useB = same(useA);\nconst useC = make();\n\
+             const useD = moved();",
         );
         assert!(
             hooks.is_empty(),

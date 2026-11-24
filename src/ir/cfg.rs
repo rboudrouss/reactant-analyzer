@@ -73,6 +73,14 @@ pub enum EdgeKind {
     /// across it. Consumers ask [`CFG::post_await_blocks`] rather than reading
     /// this variant directly.
     Await,
+    /// A side of a branch on ⊤ that is taken once per program run, not per
+    /// render (#344): the closure a module-time call returned, when it is one
+    /// of several (`if (debug) return a; return b;`). Every analysis reads it
+    /// as the branch it is — a join over the sides, a meet for must facts —
+    /// except the question whether a hook may be skipped on some render
+    /// (`ExitDominance`), which takes the side the hook is on. Losing the
+    /// marker only costs that precision.
+    RunChoice,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +104,41 @@ pub struct CFG {
 }
 
 impl CFG {
+    /// The same CFG with every block id moved up by `by`: its blocks, the
+    /// targets of their terminators, its edges and its entry.
+    pub fn shifted(self, by: BlockId) -> CFG {
+        let blocks = self
+            .blocks
+            .into_values()
+            .map(|mut b| {
+                b.id += by;
+                match &mut b.term {
+                    Terminator::Jump(t) => *t += by,
+                    Terminator::Branch { then_, else_, .. } => {
+                        *then_ += by;
+                        *else_ += by;
+                    }
+                    Terminator::Return(..) | Terminator::Unreachable => {}
+                }
+                (b.id, b)
+            })
+            .collect();
+        let edges = self
+            .edges
+            .into_iter()
+            .map(|e| Edge {
+                from: e.from + by,
+                to: e.to + by,
+                kind: e.kind,
+            })
+            .collect();
+        CFG {
+            entry: self.entry + by,
+            blocks,
+            edges,
+        }
+    }
+
     /// Apply `f` to every TOP-LEVEL expression of the CFG: statement
     /// right-hand sides / expression statements, plus `Return` and `Branch`
     /// terminator expressions. Companion of [`crate::ir::expr::Expr::for_each_child`]
