@@ -242,7 +242,10 @@ fn dispatch_message(
             };
             match parents {
                 false => format!("{} setters ({list})", setters.len()),
-                true => format!("{} state setters of parent components ({list})", setters.len()),
+                true => format!(
+                    "{} state setters of parent components ({list})",
+                    setters.len()
+                ),
             }
         }
     };

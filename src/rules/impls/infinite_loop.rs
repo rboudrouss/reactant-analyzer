@@ -10,11 +10,11 @@ use crate::{
     },
 };
 
+use crate::engine::Handover;
 use crate::engine::{
     Always, Carrier, Change, ChurnEdge, ChurnGraph, EdgeStrength, EveryRender, Rerun, STORE_SLOT,
     WriterPhase, WriterRegion,
 };
-use crate::engine::Handover;
 use crate::ir::ComponentId;
 use crate::rules::api::query::must_effect_cycle;
 
@@ -219,7 +219,11 @@ impl Rule for InfiniteLoop {
                 let more = setters.len().saturating_sub(list.len());
                 let what = match (setters.len(), more) {
                     (1, _) => list.join(""),
-                    (_, 0) => format!("{} parents' state setters ({})", setters.len(), list.join(", ")),
+                    (_, 0) => format!(
+                        "{} parents' state setters ({})",
+                        setters.len(),
+                        list.join(", ")
+                    ),
                     (_, more) => format!(
                         "{} parents' state setters ({} and {more} more)",
                         setters.len(),
