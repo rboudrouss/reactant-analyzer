@@ -63,6 +63,22 @@ pub(crate) fn is_hook_name(name: &str) -> bool {
             .is_some_and(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
 }
 
+/// The JSX transform's rule for a plain element name: `<name/>` renders the
+/// binding `name` (a reference) unless its first character is a lowercase
+/// ASCII letter or it holds a `-`, which make it a host tag string. So
+/// `<Foo/>`, `<_foo/>`, `<$foo/>` and a non-ASCII first letter are
+/// references (#410). Babel: `isCompatTag` (`/^[a-z]/`) on a name
+/// `convertJSXIdentifier` keeps as an identifier (a `-` makes it a string);
+/// TypeScript: `isIntrinsicJsxName`; esbuild: `parseJSXElement` ("Certain
+/// identifiers are strings").
+///
+/// Single source of truth for which names may name a component: the JSX
+/// lowering, the scope scan of element names and the component detector
+/// all call this.
+pub(crate) fn is_reference_name(name: &str) -> bool {
+    !name.contains('-') && !name.starts_with(|c: char| c.is_ascii_lowercase())
+}
+
 /// Every name `program` binds at the top level, whatever the declaration form,
 /// including the ones an `export` wraps.
 ///

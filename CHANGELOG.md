@@ -804,6 +804,14 @@ on a program React settles; 323 oracle cases, none a known false negative.
   elements fires its focus events at that element: an `onFocus` on a leaf
   element elsewhere (an input of another component) is no longer reached; the
   blur of a `focus()` still reaches every `onBlur` (#407).
+- A JSX name is a host tag only when the JSX transform reads it as one: a
+  lowercase ASCII first letter, a `-` or a namespace. `<_Loud/>` and
+  `<$Quiet/>` render their binding, and a function so named is a component
+  when its body is one's; they were host elements, whose props were DOM data
+  and listeners, and the component never ran. Oracle: 4 new cases, 2 `fn` of
+  the base now `tp`. Shown rows: mantine 1,845 → 1,846 (`_Box` is analysed:
+  its `useSxTransform?.()` is a conditional hook call), the 11 other small
+  repos unchanged (#410).
 - A function handed as a prop to a child component the analysis does not see
   (a package's component, an element value it does not resolve, a name several
   files define, a component rendering itself, a context provider's `value`)

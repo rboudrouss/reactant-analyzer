@@ -1059,9 +1059,11 @@ tree, whose body would run in its place
 bound nowhere in the file, a global, falls back to the name, and only when
 exactly one analysed file defines it. A member name of a program import
 (`<UI.Button>`, a namespace import) is never resolved. The scopes are read off
-the source as the language defines them; a JSX name written with a lowercase
-first letter is a host tag whatever binds it, as the JSX transform reads it,
-but so is one starting with `_` or `$`, which the transform reads as a name
+the source as the language defines them; a JSX name is a host tag whatever
+binds it exactly when the JSX transform reads it as a string: a plain name
+whose first character is a lowercase ASCII letter, a name with a `-`, a
+namespaced name `a:b`. Every other name — `<_Item/>`, `<$item/>`, a non-ASCII
+first letter, any member name `<ns.item/>` — is a reference to its binding
 [#410](https://github.com/rboudrouss/reactant-analyzer/issues/410).
 
 Every other child is unanalysable, like any callee outside the run: a package's
@@ -1166,8 +1168,10 @@ top-level functions only, and a class is never a candidate, so it is not
 analysed and the `✓` line says nothing about it. The engine models hooks, which
 a class cannot call; `this.setState` and the lifecycle methods would be a second
 model, which is not planned (#178, same footing as #63 and #65). A function is a
-component when its name is capitalised and its body creates JSX anywhere,
-calls a hook outside a nested function, or carries a component return type.
+component when its name is one a JSX element may render by name (not a
+lowercase ASCII first letter: `Item`, `_Item`, `$item`, #410) and its body
+creates JSX anywhere, calls a hook outside a nested function, or carries a
+component return type.
 
 React's wrappers are followed [#64](https://github.com/rboudrouss/reactant-analyzer/issues/64):
 a function written inside `memo(…)` or `forwardRef(…)` (nested ones too, `memo(forwardRef(…))`,

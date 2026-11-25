@@ -1325,7 +1325,7 @@ fn lower_jsx_element(jsx: &JSXElement, builder: &mut BlockBuilder) -> Expr {
         .collect();
     let (props, prop_spans) = lower_jsx_props(&jsx.opening_element.attributes, builder);
 
-    if name.chars().next().is_some_and(|c| c.is_uppercase()) || name.contains('.') {
+    if jsx_name_is_reference(&jsx.opening_element.name) {
         // React semantics: nested JSX children ARE `props.children`.
         // Dropping them here would erase the whole subtree from the CFG
         // (`<Dialog><Select onValueChange={setX}/></Dialog>` — the Select
@@ -1457,6 +1457,20 @@ fn is_event_prop_key(name: &str) -> bool {
     chars.next() == Some('o')
         && chars.next() == Some('n')
         && chars.next().is_some_and(|c| c.is_ascii_uppercase())
+}
+
+/// Whether the JSX transform reads the element name `name` as a reference
+/// to a binding (a component, or whatever the binding holds) rather than a
+/// host tag string (#410): a plain name by [`super::is_reference_name`], a
+/// namespaced name `a:b` never (a string in every transform), and a member
+/// name (`<ns.item/>`, whatever its root's case) or `<this/>` always.
+pub(super) fn jsx_name_is_reference(name: &JSXElementName) -> bool {
+    match name {
+        JSXElementName::Identifier(id) => super::is_reference_name(&id.name),
+        JSXElementName::IdentifierReference(id) => super::is_reference_name(&id.name),
+        JSXElementName::NamespacedName(_) => false,
+        JSXElementName::MemberExpression(_) | JSXElementName::ThisExpression(_) => true,
+    }
 }
 
 /// A JSX element's name read as the expression the JSX runtime evaluates:

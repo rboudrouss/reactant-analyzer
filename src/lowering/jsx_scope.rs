@@ -386,9 +386,8 @@ fn head(v: &VariableDeclaration) -> Vec<String> {
 
 impl<'a> Visit<'a> for Scan<'_> {
     fn visit_jsx_opening_element(&mut self, it: &JSXOpeningElement<'a>) {
-        let name = super::expr_lower::jsx_element_name(&it.name);
-        let component = name.chars().next().is_some_and(char::is_uppercase) || name.contains('.');
-        if component {
+        if super::expr_lower::jsx_name_is_reference(&it.name) {
+            let name = super::expr_lower::jsx_element_name(&it.name);
             let (root, path) = match name.split_once('.') {
                 Some((root, path)) => (root, Some(path)),
                 None => (name.as_str(), None),
@@ -686,5 +685,19 @@ mod tests {
     fn a_host_tag_is_no_binding() {
         let src = "function App(div) { return <div />; }";
         assert_eq!(scoped(src, "div", 0), None);
+        // A `-` or a namespace makes a string whatever the case (#410).
+        let src = "function App(My) { return <><My-el /><My:rect /></>; }";
+        assert_eq!(scoped(src, "My-el", 0), None);
+        assert_eq!(scoped(src, "My:rect", 0), None);
+    }
+
+    #[test]
+    fn a_name_not_starting_lowercase_or_a_member_is_a_reference() {
+        // #410: only a lowercase ASCII first letter makes a host tag.
+        let src =
+            "function App({ _q, $q, ns, été }) { return <><_q /><$q /><ns.item /><été /></>; }";
+        for tag in ["_q", "$q", "ns.item", "été"] {
+            assert_eq!(scoped(src, tag, 0), Some(vec![ElementLeaf::Value]), "{tag}");
+        }
     }
 }
