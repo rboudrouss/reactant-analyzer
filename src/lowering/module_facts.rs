@@ -242,9 +242,9 @@ fn member_install(program: &Program, roots: &[String]) -> Option<MemberInstall> 
 /// member counts — a member write (`p.x = v`, `p[k] = v`, any compound
 /// operator, an update, a destructuring or `for … of` target), through
 /// parentheses, TS assertions, non-null `!` and any depth of member chain —
-/// except a plain `=` of a primitive literal ([`InstallScan::primitive`]) to
-/// a static or literal key, which holds no function and so installs no code
-/// (#403). So does a call of
+/// except a plain `=` of a primitive literal ([`InstallScan::primitive`]),
+/// under any key, which holds no function and so installs no code (#403).
+/// So does a call of
 /// one of the reflective writers ([`INSTALLERS`]), recognised by the callee's
 /// last name on any receiver or as a bare name (`Object.assign`, `O.assign`
 /// on an alias of `Object`, `assign` destructured off it), whose target — its
@@ -253,14 +253,15 @@ fn member_install(program: &Program, roots: &[String]) -> Option<MemberInstall> 
 /// when it is passed the argument holding what it writes (the source of an
 /// `assign`, the value of a `set`, the descriptor, the prototype, the
 /// accessor: without it the writer writes `undefined` or throws, so
-/// `location.assign(url)` and `map.set(k, v)` install nothing); a call
-/// through a computed member whose key is no literal may be one of them; and
-/// a destructuring of `Object` or `Reflect` that binds one of them
-/// under another name. A name a parameter or a local binding of an enclosing
+/// `location.assign(url)` and `map.set(k, v)` install nothing); and a
+/// destructuring of `Object` or `Reflect` that binds one of them under
+/// another name. A name a parameter or a local binding of an enclosing
 /// function, block, `catch` or loop head shadows is not the import
 /// ([`InstallScan::free`]). Not seen, the documented premise: a writer
 /// called under another name (`const a = Object.assign`, `Object.assign.call`,
-/// `Reflect.apply`), or on an alias of the import other than a module `const`
+/// `Reflect.apply`) or through a computed member (`O[k](ext, src)`, which
+/// names no writer the scan can read), or on an alias of the import other
+/// than a module `const`
 /// (a `let`, a parameter, an object's member). Over the whole file, module
 /// scope included, which no pass interprets.
 fn installs(program: &Program, roots: &[String]) -> Vec<(Option<String>, MemberInstall)> {
@@ -528,12 +529,10 @@ fn callee_name<'e>(
 impl<'a> Visit<'a> for InstallScan<'_> {
     fn visit_assignment_expression(&mut self, it: &AssignmentExpression<'a>) {
         match it.left.as_member_expression() {
-            // A primitive literal written with `=` under a key the program
-            // spells holds no function (#403).
-            Some(m)
-                if it.operator == AssignmentOperator::Assign
-                    && m.static_property_name().is_some()
-                    && self.primitive(&it.right) => {}
+            // A primitive literal written with `=` holds no function, under
+            // any key (#403): a computed key's conversion may run code, but
+            // that code is not installed there.
+            Some(_) if it.operator == AssignmentOperator::Assign && self.primitive(&it.right) => {}
             Some(m) => self.write(m.object(), it.span),
             None => {
                 self.pattern(&it.left, it.span);
@@ -585,10 +584,14 @@ impl<'a> Visit<'a> for InstallScan<'_> {
                         self.write(receiver, it.span);
                     }
                 }
+                // Another name, or a computed member, which names no writer
+                // the scan can read: a writer called so is the premise's, as
+                // one called under a name the program gave it.
                 Some(n) if !INSTALLERS.contains(&n) => {}
-                // An installer, or a computed member that may be one: its
-                // target is the first argument, a spread there any.
-                _ => match it.arguments.first() {
+                None => {}
+                // A writer: its target is the first argument, a spread there
+                // any.
+                Some(_) => match it.arguments.first() {
                     Some(Argument::SpreadElement(_)) => self.note(it.span),
                     Some(a) => {
                         if let Some(target) = a.as_expression() {
@@ -1404,7 +1407,7 @@ mod tests {
             "ext.n += 1;",
             "ext.n ||= 1;",
             "ext.n++;",
-            "ext[k] = 1;",
+            "ext[k] = f;",
             "({ a: ext.hook } = o);",
             "for (ext.hook of fs);",
             "Object.assign(ext, { hook: f });",
@@ -1415,7 +1418,6 @@ mod tests {
             "let merge; ({ assign: merge } = Object);",
             "const { ...all } = Reflect;",
             "const O = Object; O.assign(ext.inner, { hook: f });",
-            "const O = Object; O[k](ext, { hook: f });",
             "Reflect.set(ext, 'hook', f);",
             "Object.defineProperty(ext, 'hook', { value: f });",
             "Object.setPrototypeOf(ext, proto);",
@@ -1436,7 +1438,9 @@ mod tests {
             "ext.z = null;",
             "ext.u = undefined;",
             "ext['flag'] = (false as any);",
+            "ext[FLAG] = true;",
             "ext.inner.depth = 10;",
+            "this.console[method](...args); a[e](...t);",
             "const xs = [String, Object]; f(() => Object); g(x instanceof Object);",
             "const { assign } = Object; const { set } = Reflect;",
             "window.location.assign(ext.url);",

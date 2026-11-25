@@ -238,7 +238,7 @@ on a program React settles; 323 oracle cases, none a known false negative.
   --show-clean" (#394).
 - The write into a package import that makes every hand-over a Warning (#394)
   now counts only a write that may install code there. A primitive literal
-  written with `=` under a key the program spells does not count
+  written with `=`, under any key, does not count
   (`MotionGlobalConfig.skipAnimations = true`,
   `EventEmitter.defaultMaxListeners = 0`), nor does a write through a name a
   parameter or a local binding shadows, nor a reflective writer called without
