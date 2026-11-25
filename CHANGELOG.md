@@ -747,8 +747,11 @@ on a program React settles; 323 oracle cases, none a known false negative.
   evaluated at the element: a string is a host element; anything else is a
   child the analysis does not see, handed the props and its own type, which
   React calls in the render (a component a hook returns, capturing a setter),
-  with an `analysis-limit` Info saying so. Oracle: 17 new cases, 6 `fn` of the
-  base now `tp`, 4 `fp` now `tn`. Shown rows: ai-chatbot 54 → 50,
+  with an `analysis-limit` Info saying so. An element a custom hook builds is
+  a child of every component that calls the hook, never also an entry point
+  analysed with unknown props, whose pass replaced its parent's result: the
+  loops through dub's `const { XModal } = useXModal(); <XModal />` are kept.
+  Oracle: 19 new cases, 6 `fn` of the base now `tp`, 4 `fp` now `tn`. Shown rows: ai-chatbot 54 → 50,
   bulletproof-react 31 → 28, novel 13 → 9, shadcn-admin 35 → 34 (hand-overs
   to radix's `Slot` now Info), mantine 1,712 → 1,711 (a story's `ContextModal`
   no longer runs for `modals[ctx]`), the other 7 small repos unchanged;

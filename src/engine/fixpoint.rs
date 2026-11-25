@@ -1286,7 +1286,7 @@ pub fn analyze_program_defining(
     let handed: RefCell<crate::domains::context::HandedBack> = RefCell::new(HashMap::new());
     let props_owners: RefCell<crate::domains::context::PropsOwners> = RefCell::new(HashMap::new());
 
-    let roots = strategy.detect(&registry);
+    let roots = strategy.detect(&registry, &hook_registry);
     let mut analysed: std::collections::HashSet<ComponentId> = std::collections::HashSet::new();
     let program = ProgramFacts::of(
         &registry,

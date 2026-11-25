@@ -1004,7 +1004,15 @@ does not see (below), never rendered as a component, and said so as an
 and the value itself are handed to code the analysis does not see, since React
 calls the type in the render — a closure it holds (a component a custom hook
 returns, capturing the hook's setter) runs at an unknown time, a render
-included, as an unknown callee's argument does. Not bound by any scope, a
+included, as an unknown callee's argument does; the elements it builds are
+the children of the component that renders it, with the props written there
+(dub's `const { XModal } = useXModal(); <XModal />`). An element a custom
+hook's body builds is the body of every component that calls the hook, so
+the component it names is not also analysed as an entry point, whose pass
+with unknown props would replace that result. A closure type that is a new
+function at a render remounts its subtree, which the analysis does not read:
+a mount-only effect below it is read as firing once
+[#411](https://github.com/rboudrouss/reactant-analyzer/issues/411). Not bound by any scope, a
 name keeps the file's stamp: the file's own top-level declarations, then its
 imports, alias included, followed through a barrel's re-exports to the
 definition. A name imported from a specifier the resolver cannot map (a

@@ -105,7 +105,7 @@ fn heuristic_detects_parent_not_child_as_root() {
     };
     let child = leaf_component("Child");
     let reg = ComponentRegistry::from_components(vec![parent, child]);
-    let roots = RootStrategy::Heuristic.detect(&reg);
+    let roots = RootStrategy::Heuristic.detect(&reg, &HookRegistry::new());
     let names: Vec<String> = roots
         .into_iter()
         .filter_map(|id| reg.table().name(id))
