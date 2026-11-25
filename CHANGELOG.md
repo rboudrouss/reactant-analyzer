@@ -772,13 +772,11 @@ on a program React settles; 323 oracle cases, none a known false negative.
   A listener hears what React DOM registers its prop for (`onChange` hears
   `click`); a `click()` or `requestSubmit()` fires any event, `focus()` and
   `blur()` the focus events and `change`. Oracle: 9 new cases, 4 `fn` of the
-  base now `tp`, 1 `tn` now a tolerated `fp`. Shown rows: twenty 2,094 →
-  17,606, dub 1,394 → 2,345, mantine 1,711 → 17,762 (a `focus()` in code
-  handed to a callee with no timing summary, in each of ~120 demos, reaches
-  every `onChange` and `onFocus` setter of the program), excalidraw 111 →
-  343, memos 185 → 220, ai-chatbot 50 → 79,
-  chakra-ui 373 → 385, next-shadcn-dashboard-starter 41 → 42, the other 6
-  small repos unchanged; mantine's run takes 321 s instead of 175 s (#407).
+  base now `tp`, 1 `tn` now a tolerated `fp`. Shown rows, with the
+  narrowings below: twenty 2,094 → 2,146, dub 1,394 → 1,406, mantine 1,711 →
+  1,845, excalidraw 111 → 135, ai-chatbot 50 → 54, chakra-ui 373 → 379, memos
+  185 → 183, the other 6 small repos unchanged; mantine's run takes 312 s
+  instead of 175 s (#407).
 - The writes a dispatching call's listeners make are one row of that call, at
   the call: "this `ref.current.click()` fires events during render, and the
   listeners they may reach call …", with the call in the JSON's `dispatch`
