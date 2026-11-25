@@ -71,8 +71,23 @@ pub struct Diagnostic {
     /// Secondary evidence items explaining the causal chain.
     pub notes: Vec<Note>,
     /// The setters a hand-over row stands for (#377), in the order its
-    /// message names them; empty on every other row.
+    /// message names them, or the writes a dispatch row's listeners make;
+    /// empty on every other row.
     pub setters: Vec<SetterRef>,
+    /// A dispatch row's call (#407): the row is that call's, at `range`, and
+    /// `setters` are what the listeners it runs write.
+    pub dispatch: Option<DispatchRef>,
+}
+
+/// The call of a dispatch row (#407).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DispatchRef {
+    /// The call as the source spells it (`inputRef.current.focus()`).
+    pub call: String,
+    /// The writes may run at any time, a render included: the call sits in
+    /// code handed to a callee with no timing summary. Else they run in the
+    /// render the call is made in.
+    pub unknown: bool,
 }
 
 /// One setter a hand-over row stands for (#377): a statement that hands
@@ -131,6 +146,7 @@ impl Diagnostic {
             range: None,
             notes: vec![],
             setters: vec![],
+            dispatch: None,
         }
     }
 
@@ -228,6 +244,7 @@ impl Diagnostic {
             range: prov.range,
             notes: prov.notes.clone(),
             setters: vec![],
+            dispatch: None,
         }
     }
 

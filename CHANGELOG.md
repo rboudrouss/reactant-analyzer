@@ -779,6 +779,12 @@ on a program React settles; 323 oracle cases, none a known false negative.
   343, memos 185 → 220, ai-chatbot 50 → 79,
   chakra-ui 373 → 385, next-shadcn-dashboard-starter 41 → 42, the other 6
   small repos unchanged; mantine's run takes 321 s instead of 175 s (#407).
+- The writes a dispatching call's listeners make are one row of that call, at
+  the call: "this `ref.current.click()` fires events during render, and the
+  listeners they may reach call …", with the call in the JSON's `dispatch`
+  and every setter in `setters`; an effect's call is one
+  `cross-component-infinite-loop` row. Each write is still judged on its own
+  first (#407).
 - A function handed as a prop to a child component the analysis does not see
   (a package's component, an element value it does not resolve, a name several
   files define, a component rendering itself, a context provider's `value`)

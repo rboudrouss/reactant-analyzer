@@ -681,7 +681,10 @@ carries an Error.
   names other than `click`, and any event otherwise (a click's activation behaviour submits,
   toggles and opens, firing events of its own). So a `focus()` in an effect reaches every
   `onChange` of the program: React never runs one for it in a browser with the `input` event,
-  which the analysis does not assume. The program's test
+  which the analysis does not assume. The writes one dispatching call's listeners make are judged
+  one by one and reported as one row of that call, at the call, listing the setters (`dispatch`
+  and `setters` in the JSON); an effect's call is one `cross-component-infinite-loop` row. The
+  program's test
   files are not read (`*.test.*`, `*.spec.*` are no source files to the walk), so a dispatch there
   makes nothing ⊤.
 - **`frozen-initial-state`** still fires on a child remounted by machinery it cannot see: a dialog

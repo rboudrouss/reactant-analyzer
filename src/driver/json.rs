@@ -101,6 +101,10 @@ struct JsonDiagnostic<'a> {
     /// message names the first few. Absent on every other row.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     setters: Vec<JsonSetter<'a>>,
+    /// A dispatch row's call (#407), at `line`/`col`, whose listeners write
+    /// the `setters`. Absent on every other row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dispatch: Option<&'a str>,
 }
 
 /// One setter of a hand-over row (#377).
@@ -300,6 +304,7 @@ fn to_json_diag<'a>(
                 var: s.var.as_deref(),
             })
             .collect(),
+        dispatch: d.dispatch.as_ref().map(|r| r.call.as_str()),
     }
 }
 

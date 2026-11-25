@@ -114,6 +114,8 @@ pub(crate) struct WriteSite {
     pub own: Option<(Option<crate::ir::types::ExprId>, BlockId)>,
     /// [`SlotWriter::listener`].
     pub listener: bool,
+    /// [`SlotWriter::dispatch`].
+    pub dispatch: Option<Rc<DispatchSite>>,
     /// [`SlotWriter::accessor`].
     pub accessor: Option<AccessorOf>,
 }
@@ -351,6 +353,7 @@ impl<'a> WriterTables<'a> {
                 sure: s.sure,
                 own: s.own,
                 listener: s.listener,
+                dispatch: s.dispatch,
                 accessor: s.accessor,
             })
             .collect();
@@ -1379,6 +1382,10 @@ pub struct SlotWriter {
     /// registered listener in a program that dispatches events itself
     /// (#219): an event handler in a program that does not.
     pub listener: bool,
+    /// The write runs in a listener a dispatching call of this region runs
+    /// (#407): that call. A rule reports the writes of one dispatch as one
+    /// row of its site, after judging each.
+    pub dispatch: Option<Rc<DispatchSite>>,
     /// The write sits in the body of an accessor of a literal (#321): its
     /// half and the member it defines (`None`: a computed name). It runs at
     /// a read (a getter) or a write (a setter) of that member, wherever one
@@ -1390,6 +1397,15 @@ pub struct SlotWriter {
 
 /// An accessor's half and the member it defines (`None`: a computed name).
 pub type AccessorOf = (crate::ir::expr::Accessor, Option<Var>);
+
+/// A call that fires events (#407), as a row it runs a listener's write for
+/// names it: where it is, and the call as the source spells it.
+#[derive(Debug, Clone)]
+pub struct DispatchSite {
+    pub span: Option<SourceRange>,
+    /// The callee (`inputRef.current.focus`).
+    pub callee: Expr,
+}
 
 impl SlotWriter {
     /// A write of the store (ADR-046), not of any component's slot.
@@ -2049,6 +2065,7 @@ pub(crate) fn collect_slot_writers(
                     .map(|(b, _)| b),
                 own: site.own,
                 listener: site.listener,
+                dispatch: site.dispatch,
                 accessor: site.accessor,
                 written,
             });
@@ -2076,6 +2093,7 @@ pub(crate) fn collect_slot_writers(
                 placed: None,
                 own: None,
                 listener: false,
+                dispatch: None,
                 accessor: None,
                 written: written::carried(),
             });
@@ -2620,6 +2638,8 @@ struct FoundSite {
     /// Found below a JSX prop read as ⊤ only because the program dispatches
     /// events ([`SetterWalk::listening`]).
     listener: bool,
+    /// [`SlotWriter::dispatch`].
+    dispatch: Option<Rc<DispatchSite>>,
     class: WalkClass,
     span: Option<SourceRange>,
     /// The statement the site runs in — block and statement index — `Some`
@@ -3460,7 +3480,11 @@ impl<'a> SetterWalk<'a> {
                     );
                     if self.absorbed.insert(at) {
                         let ran = self.dispatched(fired, mode);
-                        self.absorb_dispatched(&ran, found, prov, stmt_span);
+                        let site = Rc::new(DispatchSite {
+                            span: stmt_span,
+                            callee: (**fn_).clone(),
+                        });
+                        self.absorb_dispatched(&ran, found, prov, site);
                     }
                 }
             }
@@ -3609,6 +3633,7 @@ impl<'a> SetterWalk<'a> {
                 slot,
                 sure: false,
                 listener: self.listening,
+                dispatch: None,
                 accessor: self.accessor.clone(),
                 class,
                 span: stmt_span,
@@ -3664,6 +3689,7 @@ impl<'a> SetterWalk<'a> {
                 slot,
                 sure,
                 listener: self.listening,
+                dispatch: None,
                 accessor: self.accessor.clone(),
                 class: mode,
                 span: stmt_span,
@@ -3987,8 +4013,9 @@ impl<'a> SetterWalk<'a> {
         ran: &Dispatched,
         found: &mut Found,
         prov: Option<BlockId>,
-        stmt_span: Option<SourceRange>,
+        at: Rc<DispatchSite>,
     ) {
+        let stmt_span = at.span;
         let owners = &ran.owners;
         let ran = &ran.found;
         crate::profile::count("dispatch:sites", 1);
@@ -4012,6 +4039,7 @@ impl<'a> SetterWalk<'a> {
                 through: through(&site.through),
                 repeats: site.repeats || self.repeating,
                 listener: site.listener || self.listening,
+                dispatch: Some(Rc::clone(&at)),
                 accessor: site.accessor.clone().or_else(|| self.accessor.clone()),
                 ..site.clone()
             });
@@ -4131,6 +4159,7 @@ impl<'a> SetterWalk<'a> {
                 slot,
                 sure: row.sure(),
                 listener: self.listening,
+                dispatch: None,
                 accessor: self.accessor.clone(),
                 class: held_class,
                 span: stmt_span,
@@ -4281,6 +4310,7 @@ impl<'a> SetterWalk<'a> {
                 slot,
                 sure: false,
                 listener: self.listening,
+                dispatch: None,
                 accessor: self.accessor.clone(),
                 class: unknown,
                 span: stmt_span,

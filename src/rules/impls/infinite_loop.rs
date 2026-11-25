@@ -14,8 +14,13 @@ use crate::engine::{
     Always, Carrier, Change, ChurnEdge, ChurnGraph, EdgeStrength, EveryRender, Rerun, STORE_SLOT,
     WriterPhase, WriterRegion,
 };
+use crate::engine::Handover;
 use crate::ir::ComponentId;
 use crate::rules::api::query::must_effect_cycle;
+
+/// A dispatching call of an effect (#407): its spelling, whether its
+/// listeners run at an unknown time and from package code, and where it is.
+type DispatchKey = (String, bool, bool, Option<SourceRange>);
 use crate::rules::helpers::cycles::{NodeNames, cycle_path, node_display};
 use crate::rules::{
     Certified, Diagnostic, MustResult, OnAllPaths, Rule, Severity, all_deps_provably_stable,
@@ -98,6 +103,9 @@ impl Rule for InfiniteLoop {
             // The effect's writes of a parent's slot, as the writer relation
             // reads them off the call relation (ADR-047).
             let mut named: HashSet<(Option<(u32, u32)>, ComponentId)> = HashSet::new();
+            // The parents' setters the listeners of each dispatching call of
+            // the effect write (#407), one row per call and level.
+            let mut dispatched: Vec<(DispatchKey, Vec<crate::rules::SetterRef>)> = Vec::new();
             for w in &comp_result.slot_writers {
                 if w.region != WriterRegion::Effect(*eff_label) {
                     continue;
@@ -123,7 +131,9 @@ impl Rule for InfiniteLoop {
                 // diverges.
                 {
                     let parent_label = w.slot;
-                    if !named.insert((w.span.map(|r| r.pos_key()), parent_comp)) {
+                    if w.dispatch.is_none()
+                        && !named.insert((w.span.map(|r| r.pos_key()), parent_comp))
+                    {
                         continue;
                     }
                     let shared_write = result.shared_state.get(parent_comp, parent_label);
@@ -132,6 +142,31 @@ impl Rule for InfiniteLoop {
                     }
                     if !shared_write.is_unbounded() {
                         continue; // write is bounded → no divergence
+                    }
+                    if let Some(at) = &w.dispatch {
+                        let names = ctx.source_names();
+                        let (n, through) = w.named(&comp_result.calls, comp_result.component);
+                        let setter = crate::rules::SetterRef {
+                            name: n.map(|n| names.name(&n).into_owned()),
+                            parent: Some(result.display_name(parent_comp)),
+                            through: through.map(|t| names.name(t).into_owned()),
+                            var: Some(w.setter.clone()),
+                        };
+                        let unknown = w.phase == WriterPhase::Unknown;
+                        let key = (
+                            format!("{}()", names.describe(&at.callee)),
+                            unknown,
+                            unknown && w.handover == Handover::Package,
+                            at.span,
+                        );
+                        match dispatched.iter_mut().find(|(k, _)| *k == key) {
+                            Some((_, setters)) if !setters.contains(&setter) => {
+                                setters.push(setter)
+                            }
+                            Some(_) => {}
+                            None => dispatched.push((key, vec![setter])),
+                        }
+                        continue;
                     }
 
                     let deps_note = if deps.is_declared() {
@@ -166,6 +201,55 @@ impl Rule for InfiniteLoop {
                     reported_effects.insert(*eff_label);
                     diags.push(diag);
                 }
+            }
+            // One row per dispatching call of the effect, at the call, listing
+            // the parents' setters its listeners write (#407).
+            for ((call, unknown, package, span), mut setters) in dispatched {
+                setters.sort();
+                let deps_note = if deps.is_declared() {
+                    " (its deps do not provably gate it, so the effect can re-run every render)"
+                } else {
+                    ""
+                };
+                let list: Vec<String> = setters
+                    .iter()
+                    .take(crate::rules::SetterRef::NAMED)
+                    .map(|s| s.entry(true))
+                    .collect();
+                let more = setters.len().saturating_sub(list.len());
+                let what = match (setters.len(), more) {
+                    (1, _) => list.join(""),
+                    (_, 0) => format!("{} parents' state setters ({})", setters.len(), list.join(", ")),
+                    (_, more) => format!(
+                        "{} parents' state setters ({} and {more} more)",
+                        setters.len(),
+                        list.join(", ")
+                    ),
+                };
+                let place = match (unknown, package) {
+                    (false, _) => "",
+                    (true, false) => ", from code handed to a callee with no timing summary",
+                    (true, true) => ", from package code the analysis does not see",
+                };
+                let msg = format!(
+                    "this effect's `{call}` fires events{place}, and the listeners they may \
+                     reach call {what}{deps_note}. Parent re-renders → child re-renders → \
+                     effect fires again: infinite loop"
+                );
+                let mut diag = match package {
+                    true => Diagnostic::info("cross-component-infinite-loop", msg),
+                    false => Diagnostic::warn("cross-component-infinite-loop", msg),
+                }
+                .with_label(*eff_label);
+                diag.setters = setters;
+                diag.dispatch = Some(crate::rules::DispatchRef { call, unknown });
+                if let Some(r) =
+                    span.or_else(|| comp_result.effect_info.get(eff_label).and_then(|i| i.span))
+                {
+                    diag = diag.with_range(r);
+                }
+                reported_effects.insert(*eff_label);
+                diags.push(diag);
             }
         }
 
