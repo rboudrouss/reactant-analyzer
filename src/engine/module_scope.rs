@@ -43,6 +43,9 @@ pub struct ModuleScope {
     /// rooted at a package import ([`crate::ir::ModuleFacts::member_install`]):
     /// a write that replaces part of a package's export.
     install: Option<(PathBuf, crate::ir::module::MemberInstall)>,
+    /// The globals of the builtin table some file of the program binds or
+    /// writes into ([`crate::ir::ModuleFacts::globals_shadowed`]).
+    globals_shadowed: std::collections::HashSet<Var>,
 }
 
 impl ModuleScope {
@@ -69,11 +72,13 @@ impl ModuleScope {
         let mut files = HashMap::new();
         let mut packages = HashMap::new();
         let mut install = None;
+        let mut globals_shadowed = std::collections::HashSet::new();
         for path in paths {
             let Some(facts) = table.facts(path) else {
                 continue;
             };
             packages.insert(path.clone(), facts.packages.iter().cloned().collect());
+            globals_shadowed.extend(facts.globals_shadowed.iter().cloned());
             if install.is_none()
                 && let Some(i) = &facts.member_install
             {
@@ -95,7 +100,14 @@ impl ModuleScope {
             consts: HashMap::new(),
             packages,
             install,
+            globals_shadowed,
         }
+    }
+
+    /// The global `name` of the builtin table, read free, is the language's:
+    /// no file of the program binds the name or writes into it (#391).
+    pub fn builtin_global(&self, name: &str) -> bool {
+        !self.globals_shadowed.contains(name)
     }
 
     /// The program's first write into a package import, when it has one

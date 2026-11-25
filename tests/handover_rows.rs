@@ -384,6 +384,8 @@ fn a_package_import_is_the_packages_unless_the_program_writes_into_one() {
         ("primitive_write", vec!["info"]),
         ("param_shadow_write", vec!["info"]),
         ("assign_destructured", vec!["warning"]),
+        ("array_isarray", vec![]),
+        ("array_shadowed", vec!["warning"]),
     ] {
         assert_eq!(member_levels(dir), levels, "{dir}");
     }

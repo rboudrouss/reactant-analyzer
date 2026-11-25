@@ -64,6 +64,10 @@ pub struct ModuleFacts {
     /// write that may make program code part of a package's export
     /// ([`crate::engine::Handover`], #403).
     pub member_install: Option<MemberInstall>,
+    /// The globals of the builtin table's inert calls (`Array`, #391) the
+    /// module binds anywhere or writes into: there the name may not be the
+    /// language's.
+    pub globals_shadowed: Vec<String>,
 }
 
 /// A write into a package import, as [`ModuleFacts::member_install`] names

@@ -103,6 +103,13 @@ pub trait QueryContext {
         false
     }
 
+    /// The global `name` of the builtin table, read free, is the language's
+    /// ([`crate::engine::ModuleScope::builtin_global`], #391). `false`
+    /// unless the context knows.
+    fn builtin_global(&self, _name: &str) -> bool {
+        false
+    }
+
     /// The function the value of the hook `label` the fixpoint did not
     /// inline calls, when it hands back one that runs its argument: React's
     /// `useEffectEvent` (#320). A call through the value runs that function.
@@ -579,6 +586,8 @@ pub struct FixpointCtx<'a> {
     pub packages: &'a std::collections::HashSet<crate::ir::types::Var>,
     /// See `QueryContext::packages_intact`.
     pub packages_intact: bool,
+    /// The program's module scope, for `QueryContext::builtin_global`.
+    pub modules: &'a crate::engine::ModuleScope,
     /// See `QueryContext::resolves_children`.
     pub resolves_children: bool,
 }
@@ -627,6 +636,10 @@ impl QueryContext for FixpointCtx<'_> {
 
     fn packages_intact(&self) -> bool {
         self.packages_intact
+    }
+
+    fn builtin_global(&self, name: &str) -> bool {
+        self.modules.builtin_global(name)
     }
 
     fn resolves_children(&self) -> bool {

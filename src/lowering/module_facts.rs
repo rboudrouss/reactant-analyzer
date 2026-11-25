@@ -157,7 +157,50 @@ pub fn collect_module_facts(
         imported,
         packages: package_imports(program, file, resolver),
         member_install: member_install(program, &package_imports(program, file, resolver)),
+        globals_shadowed: globals_shadowed(program),
     }
+}
+
+/// The globals of the builtin table that model a call as handing its
+/// arguments to no code ([`crate::engine::purity::inert_globals`], #391)
+/// that `program` binds anywhere — a declaration, a parameter, an import of
+/// any scope — or writes into, as [`member_install`] reads a write into a
+/// package import (`Array.isArray = f`, `Object.assign(Array, src)`), or
+/// assigns (`Array = X`): there the name may not be the language's.
+fn globals_shadowed(program: &Program) -> Vec<String> {
+    struct Bound<'n> {
+        names: &'n [&'static str],
+        found: HashSet<String>,
+    }
+    impl<'a> Visit<'a> for Bound<'_> {
+        fn visit_binding_identifier(&mut self, it: &BindingIdentifier<'a>) {
+            if self.names.contains(&it.name.as_str()) {
+                self.found.insert(it.name.to_string());
+            }
+        }
+        fn visit_simple_assignment_target(&mut self, it: &SimpleAssignmentTarget<'a>) {
+            if let SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = it
+                && self.names.contains(&id.name.as_str())
+            {
+                self.found.insert(id.name.to_string());
+            }
+            walk::walk_simple_assignment_target(self, it);
+        }
+    }
+    let names = crate::engine::purity::inert_globals();
+    let mut bound = Bound {
+        names: &names,
+        found: HashSet::new(),
+    };
+    bound.visit_program(program);
+    for name in &names {
+        if member_install(program, &[name.to_string()]).is_some() {
+            bound.found.insert(name.to_string());
+        }
+    }
+    let mut out: Vec<String> = bound.found.into_iter().collect();
+    out.sort();
+    out
 }
 
 /// The first write of `program` whose receiver is rooted at a name it imports
@@ -1306,6 +1349,30 @@ mod tests {
             "switch (x) { case 1: let ext = {}; ext.hook = f; }",
         ] {
             assert!(!counts(src), "{src}");
+        }
+    }
+
+    /// The globals an inert builtin is called off (`Array`, #391) that a
+    /// file binds anywhere or writes into.
+    #[test]
+    fn a_bound_or_written_global_is_shadowed() {
+        for src in [
+            "const Array = { isArray: (f) => f() };",
+            "function g(Array) { return Array.isArray(x); }",
+            "import { Array } from 'effect';",
+            "try {} catch (Array) {}",
+            "(Array as any).isArray = (f) => f();",
+            "Object.assign(Array, { isArray: f });",
+            "Array = Other;",
+        ] {
+            assert_eq!(facts_of(src).globals_shadowed, ["Array"], "{src}");
+        }
+        for src in [
+            "Array.isArray(x);",
+            "const a = Array.from(xs);",
+            "(Array as any).flag = true;",
+        ] {
+            assert!(facts_of(src).globals_shadowed.is_empty(), "{src}");
         }
     }
 

@@ -568,6 +568,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         module: &module_names,
         packages: &package_names,
         packages_intact: program.modules.packages_intact(),
+        modules: &program.modules,
         resolves_children: inter.is_some(),
     };
     // A `useCallback` value is placed where its recompute hands it back (a

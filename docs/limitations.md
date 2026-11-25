@@ -729,6 +729,16 @@ carries an Error.
   writer called under a name the program gave it (`const a = Object.assign; a(ext, src)`,
   `Object.assign.call(…)`, `Reflect.apply(Object.assign, …)`)
   [#403](https://github.com/rboudrouss/reactant-analyzer/issues/403).
+- **A global the builtin tables name is the language's builtin.** The timers, `addEventListener`,
+  the in-cycle array methods, `Array.from`, the purity table and `Array.isArray`, which calls no
+  code and keeps nothing of its argument (ECMA-262 §7.2.2: an argument it is handed is handed to
+  no one, [#391](https://github.com/rboudrouss/reactant-analyzer/issues/391)), are recognised by
+  name. A program that replaces one breaks that: after `window.setTimeout = (f) => f()`,
+  `setTimeout(() => setS(s + 1))` loops in React and the analyzer reads the timer
+  ([#408](https://github.com/rboudrouss/reactant-analyzer/issues/408)). `Array.isArray`'s model
+  fails closed on what the program shows of `Array`: a binding of the name in any file and any
+  scope, a write into it as a write into a package import counts (below), an assignment
+  `Array = …`. A replacement through the global object (`globalThis.Array = …`) is not seen.
 - **`setter-in-render`** reports a setter that reaches a callee with no timing summary
   (`composeEventHandlers(a, cb)`, `@mantine/form`'s `form.watch(path, cb)`, a package's component,
   a builtin the analysis does not model, a getter it cannot place, and what a generator yields to

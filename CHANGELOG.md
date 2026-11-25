@@ -248,6 +248,12 @@ on a program React settles; 323 oracle cases, none a known false negative.
   `Object` / `Reflect` counts; `Object` read as a value no longer does.
   chakra-ui: 6 hand-over Warnings become Info (379 → 373 shown); the other 10
   small repos and mantine do not move (#403).
+- `Array.isArray(x)` is modelled as the builtin it is (ECMA-262 §7.2.2: it
+  reads no property and calls no code): a closure or a setter it is handed is
+  handed to no code, so it is no longer a hand-over Warning of
+  `setter-in-render`. Only the language's global counts: a file that binds
+  the name `Array` anywhere, writes into it or assigns it keeps the hand-over.
+  The 11 small repos and mantine do not move (#391).
 
 ### Removed
 
