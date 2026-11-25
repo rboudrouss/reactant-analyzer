@@ -146,6 +146,27 @@ pub fn collect_module_facts(
         .map(|(local, origin)| (local, origin.file, origin.imported))
         .collect();
     imported.sort();
+    // A write into a package import or a module `const` aliasing a member of
+    // one (#404) counts here; one rooted at a name the file imports from
+    // another file counts where that name is such an alias, which the module
+    // scope knows ([`crate::engine::ModuleScope`]).
+    let packages = package_imports(program, file, resolver);
+    let package_aliases = package_aliases(program, &packages);
+    let own: Vec<String> = packages.iter().chain(&package_aliases).cloned().collect();
+    let roots: Vec<String> = own
+        .iter()
+        .cloned()
+        .chain(imported.iter().map(|(local, _, _)| local.clone()))
+        .collect();
+    let found = installs(program, &roots);
+    let member_install = found
+        .iter()
+        .find(|(r, _)| r.as_ref().is_none_or(|r| own.contains(r)))
+        .map(|(_, m)| m.clone());
+    let import_installs = found
+        .into_iter()
+        .filter_map(|(r, m)| r.filter(|r| !own.contains(r)).map(|r| (r, m)))
+        .collect();
     ModuleFacts {
         directives,
         imports,
@@ -154,9 +175,11 @@ pub fn collect_module_facts(
         value_refs: value_refs(program, file, resolver),
         accessors: accessor_names(program),
         bindings: super::top_level_binding_names(program),
+        member_install,
+        import_installs,
         imported,
-        packages: package_imports(program, file, resolver),
-        member_install: member_install(program, &package_imports(program, file, resolver)),
+        packages,
+        package_aliases,
         globals_shadowed: globals_shadowed(program),
     }
 }
@@ -203,10 +226,19 @@ fn globals_shadowed(program: &Program) -> Vec<String> {
     out
 }
 
-/// The first write of `program` whose receiver is rooted at a name it imports
-/// from a specifier the resolver maps to no file (`packages`): the one way the
-/// program shows, in plain sight, that it may make program code part of a
-/// package's export ([`crate::engine::Handover`]). Every form that writes a
+/// The first write of `program` whose receiver is rooted at a name of `roots`
+/// — a name it imports from a specifier the resolver maps to no file, or a
+/// module `const` aliasing a member of one ([`package_aliases`], #404) — the
+/// one way the program shows, in plain sight, that it may make program code
+/// part of a package's export ([`crate::engine::Handover`]): see
+/// [`installs`].
+fn member_install(program: &Program, roots: &[String]) -> Option<MemberInstall> {
+    installs(program, roots).into_iter().next().map(|(_, m)| m)
+}
+
+/// The writes [`member_install`] counts, the first rooted at each name of
+/// `roots` (`Some(root)`) and the first that may be into any receiver
+/// (`None`), in source order. Every form that writes a
 /// member counts — a member write (`p.x = v`, `p[k] = v`, any compound
 /// operator, an update, a destructuring or `for … of` target), through
 /// parentheses, TS assertions, non-null `!` and any depth of member chain —
@@ -228,12 +260,13 @@ fn globals_shadowed(program: &Program) -> Vec<String> {
 /// function, block, `catch` or loop head shadows is not the import
 /// ([`InstallScan::free`]). Not seen, the documented premise: a writer
 /// called under another name (`const a = Object.assign`, `Object.assign.call`,
-/// `Reflect.apply`), or on an alias of the import. Over the whole file, module
+/// `Reflect.apply`), or on an alias of the import other than a module `const`
+/// (a `let`, a parameter, an object's member). Over the whole file, module
 /// scope included, which no pass interprets.
-fn member_install(program: &Program, packages: &[String]) -> Option<MemberInstall> {
+fn installs(program: &Program, roots: &[String]) -> Vec<(Option<String>, MemberInstall)> {
     let mut scan = InstallScan {
-        packages: packages.iter().map(String::as_str).collect(),
-        found: None,
+        roots: roots.iter().map(String::as_str).collect(),
+        found: Vec::new(),
         source: program.source_text,
         shadows: Vec::new(),
         module_undefined: super::top_level_binding_names(program)
@@ -284,8 +317,11 @@ fn binds_undefined(program: &Program) -> bool {
 }
 
 struct InstallScan<'s> {
-    packages: HashSet<&'s str>,
-    found: Option<MemberInstall>,
+    /// The names a write is counted into, through a member chain off one.
+    roots: HashSet<&'s str>,
+    /// The first write rooted at each name of `roots`, and the first that
+    /// may be into any receiver (`None`), in source order.
+    found: Vec<(Option<String>, MemberInstall)>,
     source: &'s str,
     /// The names each enclosing function, block, `catch` or loop head
     /// binds, outermost first: a reference to one of them is not the
@@ -336,33 +372,40 @@ impl InstallScan<'_> {
         }
     }
 
-    /// `receiver` is rooted at a package import: a name, the module's, or a
-    /// member chain off one, through parentheses, TS assertions and non-null
-    /// `!`.
-    fn rooted(&self, receiver: &Expression) -> bool {
+    /// The name of `roots` `receiver` is rooted at: the name, the module's,
+    /// or a member chain off one, through parentheses, TS assertions and
+    /// non-null `!`.
+    fn rooted<'e>(&self, receiver: &'e Expression<'e>) -> Option<&'e str> {
         match receiver.get_inner_expression() {
-            Expression::Identifier(id) => {
-                self.packages.contains(id.name.as_str()) && self.free(id.name.as_str())
-            }
+            Expression::Identifier(id) => (self.roots.contains(id.name.as_str())
+                && self.free(id.name.as_str()))
+            .then_some(id.name.as_str()),
             Expression::StaticMemberExpression(m) => self.rooted(&m.object),
             Expression::ComputedMemberExpression(m) => self.rooted(&m.object),
             Expression::ChainExpression(c) => c
                 .expression
                 .as_member_expression()
-                .is_some_and(|m| self.rooted(m.object())),
-            _ => false,
+                .and_then(|m| self.rooted(m.object())),
+            _ => None,
         }
     }
 
     /// A write into `receiver` at `span`.
     fn write(&mut self, receiver: &Expression, span: oxc_span::Span) {
-        if self.found.is_none() && self.rooted(receiver) {
-            self.note(span);
+        if let Some(root) = self.rooted(receiver) {
+            self.record(Some(root.to_string()), span);
         }
     }
 
+    /// A write that may be into any receiver, at `span`.
     fn note(&mut self, span: oxc_span::Span) {
-        if self.found.is_some() {
+        self.record(None, span);
+    }
+
+    /// The write at `span`, rooted at `root` (`None`: any), unless one so
+    /// rooted came first.
+    fn record(&mut self, root: Option<String>, span: oxc_span::Span) {
+        if self.found.iter().any(|(r, _)| *r == root) {
             return;
         }
         let start = span.start as usize;
@@ -380,7 +423,7 @@ impl InstallScan<'_> {
             .chars()
             .take(100)
             .collect();
-        self.found = Some(MemberInstall { line, text });
+        self.found.push((root, MemberInstall { line, text }));
     }
 
     /// Every member target of a destructuring `target`, written with an
@@ -670,10 +713,71 @@ impl<'a> Visit<'a> for InstallScan<'_> {
     fn visit_ts_type_alias_declaration(&mut self, _it: &TSTypeAliasDeclaration<'a>) {}
 }
 
+/// The module-scope `const`s of `program` that alias a package's member
+/// (#404): a `const X = <chain>` (exported or not) whose initializer is
+/// nothing but a chain of static members rooted at a name of `packages`, or
+/// at another such alias, through parentheses and TS assertions
+/// (`const Dialog = DialogPrimitive.Root`, `const Item = Dialog.Item`). `X`
+/// denotes what the chain does, read once at the module's start: the
+/// package's element or callee exactly as the chain written in place, under
+/// the same premise and the same voiding fact ([`crate::engine::Handover`]),
+/// a write into `X` counting as a write into the package import. Not
+/// covered, so the program's: a `let` or `var`, a destructuring, a call
+/// (`styled(X)`, `forwardRef(…)`), a conditional, a computed or optional
+/// member, an alias of a name another file exports.
+pub(crate) fn package_aliases(program: &Program, packages: &[String]) -> Vec<String> {
+    fn rooted<'e>(e: &'e Expression<'e>) -> Option<&'e str> {
+        match e.get_inner_expression() {
+            Expression::Identifier(id) => Some(id.name.as_str()),
+            Expression::StaticMemberExpression(m) => rooted(&m.object),
+            _ => None,
+        }
+    }
+    let mut consts: Vec<(&str, &str)> = Vec::new();
+    for stmt in &program.body {
+        let decl = match stmt {
+            Statement::VariableDeclaration(v) => v,
+            Statement::ExportNamedDeclaration(e) => match &e.declaration {
+                Some(Declaration::VariableDeclaration(v)) => v,
+                _ => continue,
+            },
+            _ => continue,
+        };
+        if decl.kind != VariableDeclarationKind::Const || decl.declare {
+            continue;
+        }
+        for d in &decl.declarations {
+            if let (BindingPattern::BindingIdentifier(id), Some(init)) = (&d.id, &d.init)
+                && let Some(root) = rooted(init)
+            {
+                consts.push((id.name.as_str(), root));
+            }
+        }
+    }
+    let mut out: Vec<String> = packages.to_vec();
+    let mut grown = true;
+    while grown {
+        grown = false;
+        for (name, root) in &consts {
+            if !out.iter().any(|n| n == name) && out.iter().any(|n| n == root) {
+                out.push(name.to_string());
+                grown = true;
+            }
+        }
+    }
+    let mut out: Vec<String> = out.into_iter().filter(|n| !packages.contains(n)).collect();
+    out.sort();
+    out
+}
+
 /// The local names `program` imports as values from a specifier `resolver`
 /// maps to no file: a package's, a missing file's or an unmapped alias's,
 /// code the analysis does not see (#389's reading of an import).
-fn package_imports(program: &Program, file: &Path, resolver: &dyn ImportResolver) -> Vec<String> {
+pub(crate) fn package_imports(
+    program: &Program,
+    file: &Path,
+    resolver: &dyn ImportResolver,
+) -> Vec<String> {
     let mut out = Vec::new();
     for stmt in &program.body {
         let Statement::ImportDeclaration(decl) = stmt else {
@@ -1350,6 +1454,54 @@ mod tests {
         ] {
             assert!(!counts(src), "{src}");
         }
+    }
+
+    /// A module `const` whose initializer is nothing but a static member
+    /// chain rooted at a package import, or at such an alias, aliases a
+    /// package's member (#404); nothing else does.
+    #[test]
+    fn a_module_const_of_a_package_chain_aliases_it() {
+        let f = facts_of(
+            r#"
+            import * as P from "pkg";
+            import { Root } from "pkg2";
+            import { Local } from "./local";
+            export const A = P.Dialog.Root;
+            const B = (A as any).Item;
+            const C = Root;
+            const D = (P.X!);
+            let E = P.Y;
+            var F = P.Z;
+            const G = styled(P.Box);
+            const H = c ? P.A : P.B;
+            const I = P["Computed"];
+            const J = Local.Part;
+            const { K } = P;
+            const L = P?.Opt;
+            function f() { const M = P.Inner; }
+        "#,
+        );
+        assert_eq!(f.package_aliases, ["A", "B", "C", "D"]);
+    }
+
+    /// A write into a module `const` alias of a package's member is a write
+    /// into the package import (#404); one into a name imported from another
+    /// file is recorded for the module scope to judge.
+    #[test]
+    fn a_write_into_an_alias_counts() {
+        let f = facts_of("import * as P from 'pkg';\nconst A = P.Root;\n(A as any).hook = f;");
+        assert!(f.member_install.is_some());
+        let f = facts_of("import * as P from 'pkg';\nlet A = P.Root;\n(A as any).hook = f;");
+        assert!(f.member_install.is_none());
+        let f = facts_of("import { A } from './a';\n(A as any).Close = Local;");
+        assert!(f.member_install.is_none());
+        assert_eq!(
+            f.import_installs
+                .iter()
+                .map(|(r, _)| r.as_str())
+                .collect::<Vec<_>>(),
+            ["A"]
+        );
     }
 
     /// The globals an inert builtin is called off (`Array`, #391) that a

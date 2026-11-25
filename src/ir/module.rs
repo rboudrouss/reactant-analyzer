@@ -64,6 +64,16 @@ pub struct ModuleFacts {
     /// write that may make program code part of a package's export
     /// ([`crate::engine::Handover`], #403).
     pub member_install: Option<MemberInstall>,
+    /// The first write rooted at each name the module imports from another
+    /// analysed file (`(local name, write)`): a write into a package import
+    /// where that name denotes a module `const` aliasing a package's member
+    /// (#404, [`crate::engine::ModuleScope`]).
+    pub import_installs: Vec<(String, MemberInstall)>,
+    /// The module `const`s that alias a member of a package import (#404): a
+    /// `const` whose initializer is nothing but a chain of static members
+    /// rooted at one, or at another such alias. The package's element or
+    /// callee, as the chain written in place is.
+    pub package_aliases: Vec<String>,
     /// The globals of the builtin table's inert calls (`Array`, #391) the
     /// module binds anywhere or writes into: there the name may not be the
     /// language's.
@@ -546,6 +556,22 @@ impl ModuleTable {
 
     pub fn facts(&self, path: &Path) -> Option<&ModuleFacts> {
         self.files.get(path)
+    }
+
+    /// Every module `const` of the program that aliases a package's member
+    /// ([`ModuleFacts::package_aliases`], #404), by its file and name.
+    pub fn package_aliases(&self) -> HashSet<crate::ir::expr::CompOrigin> {
+        self.files
+            .iter()
+            .flat_map(|(file, f)| {
+                f.package_aliases
+                    .iter()
+                    .map(move |name| crate::ir::expr::CompOrigin {
+                        file: file.clone(),
+                        name: name.clone(),
+                    })
+            })
+            .collect()
     }
 
     /// The re-export relation of every file that has one.

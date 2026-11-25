@@ -722,8 +722,9 @@ carries an Error.
   loops in React and the analyzer still reads React's `useCallback`, reporting only `missing-deps`
   [#400](https://github.com/rboudrouss/reactant-analyzer/issues/400). The hand-over level fails
   closed on the one violation the program shows in plain sight, a write whose receiver is rooted at
-  a package import that may install code there (below); the registry does not yet (#400). Neither
-  sees an export replaced through an alias of the import (`const e = ext; e.hook = f`, then
+  a package import, or at a module `const` aliasing a member of one (#404), that may install code
+  there (below); the registry does not yet (#400). Neither sees an export replaced through any
+  other alias of the import (`let e = ext; e.hook = f`, a parameter, an object's member, then
   `ext.hook(cb)`: React loops and the hand-over is an Info), through an object package code hands
   the program (a callback's parameter, a call's result), by another package, or by a reflective
   writer called under a name the program gave it (`const a = Object.assign; a(ext, src)`,
@@ -751,7 +752,13 @@ carries an Error.
     imports from a specifier the resolver maps to no file (#389), or a member element of an import
     so (`<AlertDialogPrimitive.Root>`); a call or a `new` whose callee is a name imported so, or a
     chain of static members rooted at one (`runNow(cb)`, `kit.run(cb)`; a computed member such as
-    `kit.list[0]` is not), read free and resolving to no program body; the arguments of a hook the
+    `kit.list[0]` is not), read free and resolving to no program body; either through a module
+    `const` whose initializer is nothing but such a chain (`const Dialog = DialogPrimitive.Root`,
+    `const run = kit.run`), in its own file or imported from it directly or through barrels
+    ([#404](https://github.com/rboudrouss/reactant-analyzer/issues/404); a `let` or `var`, a
+    destructuring, a call such as `styled(X)` or `forwardRef(…)`, a conditional, a computed or
+    optional member stay the program's, and a write into such an alias counts as a write into the
+    package import); the arguments of a hook the
     expansion left that is imported so (#254) — **unless the program writes into a package
     import.** That reading stands on the premise the registry stands on (the bullet above: a name
     imported from a package denotes that package's export), and fails closed on the one

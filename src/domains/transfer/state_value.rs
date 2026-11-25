@@ -667,10 +667,15 @@ fn eval_comp_app(
     ctx: &mut AnalysisCtx<StateValue>,
 ) {
     // The child is a package's by its import (#389): a name the file imports
-    // from no file, whatever the rest of the run resolves — unless a write of
-    // the program has a receiver rooted at a package import
-    // ([`crate::engine::Handover`]).
-    let package = matches!(origin, Some(ElementOrigin::Unseen)) && ctx.query.packages_intact();
+    // from no file, whatever the rest of the run resolves, or a program
+    // `const` aliasing a member of one, imported through any barrel (#404) —
+    // unless a write of the program has a receiver rooted at a package
+    // import ([`crate::engine::Handover`]).
+    let unseen = match ctx.inter {
+        Some(inter) => inter.registry.package_element(name, origin),
+        None => matches!(origin, Some(ElementOrigin::Unseen)),
+    };
+    let package = unseen && ctx.query.packages_intact();
     let Some(inter) = ctx.inter else {
         // Intra-component analysis: every child is unanalyzable, so any
         // setter escaping into props may be invoked with any argument —

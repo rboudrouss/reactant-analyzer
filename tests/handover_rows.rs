@@ -366,8 +366,9 @@ fn member_levels(dir: &str) -> Vec<String> {
 /// anything else (`window.onfoo = …`, a literal, a parameter that shadows
 /// the import) does not count, nor does a primitive literal written into
 /// one, which installs no code (#403); `Object.assign` counts under any
-/// spelling of its receiver. A write through an alias of the import is the
-/// documented premise: not seen.
+/// spelling of its receiver. A write through a module `const` aliasing the
+/// import counts, in its file or another (#404); one through any other alias
+/// (a `let`) is the documented premise: not seen.
 #[test]
 fn a_package_import_is_the_packages_unless_the_program_writes_into_one() {
     for (dir, levels) in [
@@ -378,7 +379,9 @@ fn a_package_import_is_the_packages_unless_the_program_writes_into_one() {
         ("bare_replaced", vec!["warning"]),
         ("chain_unrelated_write", vec!["info"]),
         ("other_package_write", vec!["warning"]),
-        ("alias_write", vec!["info"]),
+        ("alias_write", vec!["warning"]),
+        ("let_alias_write", vec!["info"]),
+        ("alias_cross_file_write", vec!["warning"]),
         ("shadowed", vec!["warning"]),
         ("call_result", vec!["warning"]),
         ("primitive_write", vec!["info"]),
@@ -386,6 +389,11 @@ fn a_package_import_is_the_packages_unless_the_program_writes_into_one() {
         ("assign_destructured", vec!["warning"]),
         ("array_isarray", vec![]),
         ("array_shadowed", vec!["warning"]),
+        ("alias_element", vec!["info", "info"]),
+        ("alias_barrel", vec!["info"]),
+        ("alias_callee", vec!["info"]),
+        ("alias_program_member", vec!["warning"]),
+        ("let_alias", vec!["warning"]),
     ] {
         assert_eq!(member_levels(dir), levels, "{dir}");
     }

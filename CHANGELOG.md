@@ -254,6 +254,17 @@ on a program React settles; 323 oracle cases, none a known false negative.
   `setter-in-render`. Only the language's global counts: a file that binds
   the name `Array` anywhere, writes into it or assigns it keeps the hand-over.
   The 11 small repos and mantine do not move (#391).
+- A module `const` whose initializer is nothing but a static member chain
+  rooted at a package import (`export const Dialog = DialogPrimitive.Root`,
+  `const run = kit.run`) is that package's element or callee, in its file and
+  wherever it is imported, through barrels too: a setter handed to it is an
+  Info, as with the chain written in place. A `let` or `var`, a destructuring,
+  a call (`styled(X)`, `forwardRef(…)`) or a conditional stays the program's.
+  A write through such an alias now counts as a write into the package import,
+  in any file (`const e = ext; e.hook = f` was an Info, it is a Warning); the
+  premise covers only the other aliases (a `let`, a parameter). memos 214 →
+  185 shown (29 hand-overs Info), bulletproof-react 46 → 31 (15), novel 14 →
+  13 (1); the other 8 small repos and mantine do not move (#404).
 
 ### Removed
 

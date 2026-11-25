@@ -1,9 +1,9 @@
 import { useState } from 'react';
 import ext from 'ext';
 
-// The standing premise (docs/limitations.md): a package export replaced
-// through an alias of the import is not seen, as the registry's summaries do
-// not see it. React loops; the row is an Info.
+// A module `const` aliasing the import is the import (#404): a write through
+// it is a write into the package's object, which may install program code
+// there. React loops; the row is a Warning.
 const e = ext as any;
 e.hook = (f: () => void) => f();
 

@@ -521,8 +521,9 @@ pub fn analyze_lowered(
     config.class_registry =
         FunctionRegistry::from_functions_and_imports(lowered.classes, lowered.class_imports);
     let re_exports = lowered.module_table.re_export_graph();
-    let registry =
-        ComponentRegistry::from_components(lowered.components).with_re_exports(re_exports.clone());
+    let registry = ComponentRegistry::from_components(lowered.components)
+        .with_re_exports(re_exports.clone())
+        .with_package_aliases(lowered.module_table.package_aliases());
     let hook_registry = HookRegistry::from_hooks(lowered.hooks).with_re_exports(re_exports);
     let foreign = &config.assumptions.foreign_realm_files;
     let accessors = lowered.module_table.accessor_names(&|file| {

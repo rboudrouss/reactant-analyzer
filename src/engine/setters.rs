@@ -2278,9 +2278,11 @@ impl WalkClass {
 /// package's. That holds for a bare name and a namespace member too,
 /// though ES makes both read-only: module interop (CommonJS output, the
 /// oracle's esbuild) reads every import as a member of the package's mutable
-/// exports object. What the fact does not see — a write through an alias of
-/// the import, through an object package code hands the program, or by
-/// another package — is the standing premise (`docs/limitations.md`).
+/// exports object. A module `const` aliasing a member of a package import is
+/// that import, as a callee, an element and a write's root (#404). What the
+/// fact does not see — a write through any other alias of the import,
+/// through an object package code hands the program, or by another package —
+/// is the standing premise (`docs/limitations.md`).
 /// Every other ⊤ — a builtin the analysis does not model, a receiver handed at
 /// a member read, write or conversion, an unplaced heap object, a past-budget
 /// body, a generator, a child it does not resolve, a callee that is a

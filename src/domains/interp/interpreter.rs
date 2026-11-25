@@ -2032,15 +2032,18 @@ fn exec_callbacks_depth<T: Transfer>(
             // Arguments first, then the call itself.
             let written = exec_slot_write(transfer, fn_, args, env, ctx, depth);
             if ctx.calls.is_some() {
-                // Module code the analysis does not run may call what the
-                // module scope holds (#335).
-                let module = (ran.bodies.is_empty() || ran.open) && reads_module(fn_, ctx);
+                // The callee is read off a package import, or a module
+                // `const` aliasing a package's member, which holds that
+                // member and nothing else (#404): a package's code
+                // ([`crate::engine::Handover`]), which the row joins over
+                // every evaluation. Any other module code the analysis does
+                // not run may call what the module scope holds (#335).
+                let package = package_callee(fn_, ctx);
+                let module =
+                    !package && (ran.bodies.is_empty() || ran.open) && reads_module(fn_, ctx);
                 let mut eval = call_evaluation(transfer, fn_, env, ctx, ran, written);
                 eval.module = module;
-                // The callee is read off a package import: a package's code
-                // ([`crate::engine::Handover`]), which the row joins over
-                // every evaluation.
-                eval.package = package_callee(fn_, ctx);
+                eval.package = package;
                 ctx.record(|r| r.record_call(*id, eval));
             }
             returned
@@ -2352,8 +2355,9 @@ fn module_root(expr: &Expr) -> Option<&str> {
 }
 
 /// The callee `fn_` is a package's code ([`crate::engine::Handover`]): a
-/// name the component's bodies read free as a package import, or a chain of
-/// static members rooted at one (`ext.run`, `P.a.b`). A computed member is
+/// name the component's bodies read free as a package import, or as a module
+/// `const` aliasing a package's member (#404), or a chain of static members
+/// rooted at one (`ext.run`, `P.a.b`). A computed member is
 /// not: an array builtin the program calls on the package's object may have
 /// put a program function at an index. The context's package imports are
 /// empty when a write of the program has a receiver rooted at a package

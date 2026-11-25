@@ -1,11 +1,12 @@
 // oracle: react=loop
-// The standing premise, stated in docs/limitations.md ("A name imported from a
-// package denotes that package's export"): the program replaces a package
-// export through an ALIAS of the import, which the fact does not see, as the
-// registry's own summaries do not see a replaced `React.useCallback`. React
-// loops through program code, and the analyzer reports the hand-over as an
-// Info: `disclosed`. This is the one known shape where an Info row covers a
-// loop whose callee is the program's.
+// The program replaces a package export through a module `const` that
+// aliases the import: the alias is the import (#404), so the write is a write
+// into the package's object, which may install program code there, and no
+// callee is a package's any more. React loops through program code; the
+// hand-over is a Warning (`tp`). Before #404 the fact did not see a write
+// through an alias, and the row was an Info (`disclosed`); the premise now
+// covers only the aliases that are no module `const`
+// (`handover-let-alias-member-replaced-loops`).
 import { useState } from "react";
 import ext from "ext";
 
