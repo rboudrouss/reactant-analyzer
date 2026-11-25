@@ -675,8 +675,10 @@ carries an Error.
   argument timed as a listener. The target is not resolved, so a dispatch reaches the listeners
   of its event on every element. The event is: a listener hears what it is registered for (an
   `on*` prop the native events React DOM 19.3.1 runs it for — `onChange` hears `change`, `input`
-  and a checkbox's `click` —, an `addEventListener` the literal it names, any event for a name
-  that is not a literal, a package hook's listener any event), and a dispatch fires the focus
+  and a checkbox's `click` —, an `addEventListener` the literal it names or the string of a
+  module-level `const` of the same file no local binding shadows, any event for any other name:
+  an imported constant, a member of a constant object or `enum` — a package hook's listener any
+  event), and a dispatch fires the focus
   events and the blurred control's `change` for `focus()` and `blur()`, the one event a
   `dispatchEvent(new XEvent("x"))` names other than `click`, and any event otherwise (a click's
   activation behaviour submits, toggles and opens, firing events of its own). React DOM's

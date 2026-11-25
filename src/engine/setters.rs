@@ -141,6 +141,9 @@ pub(crate) struct WriterTables<'a> {
     facts: BodyFacts,
     /// The program's listener positions, which a dispatch runs (#407).
     listeners: &'a Listeners,
+    /// The component's module constants: an event name written through one
+    /// is its string (#407).
+    module_consts: &'a HashMap<Var, crate::ir::ModuleConstInit>,
 }
 
 /// What one listener runs when a dispatch reaches it (#407), walked once
@@ -260,6 +263,7 @@ impl<'a> WriterTables<'a> {
         provenance: &[HookProvenance],
         component: ComponentId,
         listeners: &'a Listeners,
+        module_consts: &'a HashMap<Var, crate::ir::ModuleConstInit>,
     ) -> Self {
         let mut shadowed: HashSet<Var> = HashSet::new();
         for cfg in std::iter::once(render).chain(hooks.iter().filter_map(|h| h.body_cfg())) {
@@ -290,6 +294,7 @@ impl<'a> WriterTables<'a> {
             handlers: crate::lowering::hook_extractor::handler_names(render, hooks),
             facts: BodyFacts::default(),
             listeners,
+            module_consts,
         }
     }
 
@@ -301,6 +306,7 @@ impl<'a> WriterTables<'a> {
             &comp.hook_provenance,
             comp.component,
             &comp.listeners,
+            &comp.module_consts,
         )
     }
 
@@ -428,6 +434,7 @@ impl<'a> WriterTables<'a> {
             heard: Heard::default(),
             nested: run.map(|_| Vec::new()),
             absorbed: HashSet::new(),
+            module_consts: self.module_consts,
         };
         match run {
             None => walk.cfg(cfg, depth, &mut found, WalkClass::Sync, None, None),
@@ -1810,6 +1817,7 @@ pub(crate) fn collect_slot_writers(
     reducers: &crate::engine::Reducers<'_>,
     dispatches: bool,
     listeners: &Listeners,
+    module_consts: &HashMap<Var, crate::ir::ModuleConstInit>,
 ) -> (Vec<SlotWriter>, Heard) {
     // What every call writes and runs is the call relation's (ADR-047): a
     // site is keyed by the slot it writes, with its owner, whatever name it
@@ -1849,6 +1857,7 @@ pub(crate) fn collect_slot_writers(
         hook_provenance,
         envs.component,
         listeners,
+        module_consts,
     );
     drop(profile);
     let heard = RefCell::new(Heard::default());
@@ -2238,6 +2247,8 @@ struct SetterWalk<'a> {
     nested: Option<Vec<(Events, WalkClass)>>,
     /// The dispatches whose rows this walk holds ([`DispatchAt`]).
     absorbed: HashSet<DispatchAt>,
+    /// [`WriterTables::module_consts`].
+    module_consts: &'a HashMap<Var, crate::ir::ModuleConstInit>,
 }
 
 /// A dispatch's events and class, the block of the region it runs from,
@@ -3395,7 +3406,8 @@ impl<'a> SetterWalk<'a> {
                 // What an event registrar is handed is a listener a dispatch
                 // runs (#407), reified or not.
                 if registers {
-                    self.hear((*id, i), arg, None, Events::named(args.first()));
+                    let hears = Events::named(args.first(), &|v| self.const_string(v));
+                    self.hear((*id, i), arg, None, hears);
                 }
                 if reified && i == 1 {
                     continue;
@@ -3464,7 +3476,8 @@ impl<'a> SetterWalk<'a> {
         // runs those bodies, which the walk follows, and fires an event only
         // through a dispatch in them, which it sees there (#407).
         if let Expr::Call { id, fn_, args } | Expr::New { id, fn_, args, .. } = expr
-            && let Some(fired) = crate::engine::listeners::fired_events(fn_, args)
+            && let Some(fired) =
+                crate::engine::listeners::fired_events(fn_, args, &|v| self.const_string(v))
             && depth > 0
             && mode != WalkClass::Handler
             && !self.calls.targets(*id).is_some_and(|t| {
@@ -3916,6 +3929,31 @@ impl<'a> SetterWalk<'a> {
         self.handed_row(
             row, module, true, arg, class, placed, depth, found, prov, stmt_span,
         );
+    }
+
+    /// The string `name` holds here when it is a module-level `const` of a
+    /// string literal (#407): only where no body of the component, nor any
+    /// body on the walk's stack, binds the name, and every body on the stack
+    /// says which names it binds.
+    fn const_string(&self, name: &str) -> Option<String> {
+        if self.shadowed.contains(name)
+            || self
+                .scopes
+                .iter()
+                .any(|s| s.other_component || s.names.as_ref().is_none_or(|n| n.contains(name)))
+            || self
+                .scopes
+                .iter()
+                .any(|s| crate::ir::bindings::binds(name, s.body))
+        {
+            return None;
+        }
+        match self.module_consts.get(name) {
+            Some(crate::ir::ModuleConstInit::Prim(crate::ir::expr::Prim::String(s))) => {
+                Some(s.to_string())
+            }
+            _ => None,
+        }
     }
 
     /// Record the listener position `anchor` holding `value` (`member`: the

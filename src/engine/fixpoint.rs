@@ -1168,6 +1168,7 @@ fn compute_relations(
         &reducers,
         dispatches,
         &listeners,
+        &result.module_consts,
     );
     // The seed relation rides the same slice: it folds `slot_writers` rows and
     // the effects' declared deps, so it must come after both (#106, ADR-031).

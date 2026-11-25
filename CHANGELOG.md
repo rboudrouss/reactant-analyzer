@@ -799,6 +799,9 @@ on a program React settles; 323 oracle cases, none a known false negative.
   (`useOnClickOutside`), are read as the event handlers they are, as the
   render's own props are, since every dispatch claims what they write: no
   hand-over Warning says they go to a callee with no timing summary (#402).
+- An event name written through a module-level `const` string of the same
+  file (`addEventListener(PING, h)`, `dispatchEvent(new Event(PONG))`) is
+  that string, so the listener hears that event only (#407).
 - A function handed as a prop to a child component the analysis does not see
   (a package's component, an element value it does not resolve, a name several
   files define, a component rendering itself, a context provider's `value`)

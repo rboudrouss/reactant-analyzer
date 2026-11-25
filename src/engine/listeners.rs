@@ -43,6 +43,16 @@ use std::rc::Rc;
 use crate::engine::setters::{Dispatched, ListenerRun, WalkClass};
 use crate::ir::{expr::Expr, types::ExprId};
 
+/// The string a name holds where it is read, when the analysis knows it (a
+/// module-level `const` of a string literal no local binding shadows,
+/// #407): an event name written through a constant.
+pub(crate) type Consts<'c> = &'c dyn Fn(&str) -> Option<String>;
+
+/// No name holds a known string.
+pub(crate) fn no_consts(_: &str) -> Option<String> {
+    None
+}
+
 /// A set of event names, lowercased, or every event.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum Events {
@@ -69,12 +79,13 @@ impl Events {
     }
 
     /// The events a listener registered for the event `name` hears: that
-    /// event, any when `name` is not a string literal. A `change` listener
-    /// hears the `change` a control fires when it loses the focus after an
-    /// edit ([`BLUR_CHANGE`]).
-    pub(crate) fn named(name: Option<&Expr>) -> Events {
+    /// event, any when `name` is not a string literal or a name `consts`
+    /// knows the string of. A `change` listener hears the `change` a control
+    /// fires when it loses the focus after an edit ([`BLUR_CHANGE`]).
+    pub(crate) fn named(name: Option<&Expr>, consts: Consts<'_>) -> Events {
         match name.map(Expr::peel_ts) {
             Some(Expr::Lit(crate::ir::expr::Prim::String(n))) => Events::listening_to(n),
+            Some(Expr::Var(v)) => consts(v).map_or(Events::Any, |n| Events::listening_to(&n)),
             _ => Events::Any,
         }
     }
@@ -299,7 +310,7 @@ const DISPATCHING_METHODS: &[&str] = &[
 ///   `requestSubmit()` (validation, `submit`, the navigation); a
 ///   `dispatchEvent` of a value, or an `emit`, names no event the analysis
 ///   knows.
-pub(crate) fn fired_events(fn_: &Expr, args: &[Expr]) -> Option<Events> {
+pub(crate) fn fired_events(fn_: &Expr, args: &[Expr], consts: Consts<'_>) -> Option<Events> {
     let name = match fn_.peel_ts() {
         Expr::Var(name) if name == "dispatchEvent" => name.as_str(),
         Expr::FieldAccess { field, .. } if DISPATCHING_METHODS.contains(&field.as_str()) => {
@@ -312,7 +323,7 @@ pub(crate) fn fired_events(fn_: &Expr, args: &[Expr]) -> Option<Events> {
         "dispatchEvent" => match args.first().map(Expr::peel_ts) {
             Some(Expr::New { fn_, args, .. }) => match (fn_.peel_ts(), args.first()) {
                 (Expr::Var(c), Some(name)) if c.ends_with("Event") => {
-                    match Events::named(Some(name)) {
+                    match Events::named(Some(name), consts) {
                         Events::Of(names) if !names.iter().any(|n| n == "click") => {
                             Events::Of(names)
                         }
@@ -425,9 +436,9 @@ mod tests {
             obj: Box::new(Expr::Var("el".into())),
             field: field.into(),
         };
-        assert_eq!(fired_events(&call("click"), &[]), Some(Events::Any));
-        assert_eq!(fired_events(&call("requestSubmit"), &[]), Some(Events::Any));
-        let focus = fired_events(&call("focus"), &[]).unwrap();
+        assert_eq!(fired_events(&call("click"), &[], &no_consts), Some(Events::Any));
+        assert_eq!(fired_events(&call("requestSubmit"), &[], &no_consts), Some(Events::Any));
+        let focus = fired_events(&call("focus"), &[], &no_consts).unwrap();
         assert!(focus.meets(&Events::of_prop("onFocus")));
         assert!(focus.meets(&Events::of_prop("onBlur")));
         // The blurred control's `change` reaches a native listener, never
@@ -435,6 +446,14 @@ mod tests {
         assert!(!focus.meets(&Events::of_prop("onChange")));
         assert!(focus.meets(&Events::listening_to("change")));
         assert!(!focus.meets(&Events::of_prop("onClick")));
-        assert_eq!(fired_events(&call("push"), &[]), None);
+        assert_eq!(fired_events(&call("push"), &[], &no_consts), None);
+    }
+
+    #[test]
+    fn a_module_const_names_its_event() {
+        let consts = |v: &str| (v == "KEYDOWN").then(|| "keydown".to_string());
+        let name = Expr::Var("KEYDOWN".into());
+        assert_eq!(Events::named(Some(&name), &consts), Events::of(&["keydown"]));
+        assert_eq!(Events::named(Some(&name), &no_consts), Events::Any);
     }
 }

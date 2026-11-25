@@ -367,7 +367,12 @@ pub(crate) fn dispatches_events(cfg: &CFG) -> bool {
 fn expr_dispatches_events(e: &Expr) -> bool {
     match e {
         Expr::Call { fn_, args, .. } | Expr::New { fn_, args, .. }
-            if crate::engine::listeners::fired_events(fn_, args).is_some() =>
+            if crate::engine::listeners::fired_events(
+                fn_,
+                args,
+                &crate::engine::listeners::no_consts,
+            )
+            .is_some() =>
         {
             true
         }
