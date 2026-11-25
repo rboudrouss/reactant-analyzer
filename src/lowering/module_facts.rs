@@ -253,15 +253,18 @@ fn member_install(program: &Program, roots: &[String]) -> Option<MemberInstall> 
 /// when it is passed the argument holding what it writes (the source of an
 /// `assign`, the value of a `set`, the descriptor, the prototype, the
 /// accessor: without it the writer writes `undefined` or throws, so
-/// `location.assign(url)` and `map.set(k, v)` install nothing); and a
-/// destructuring of `Object` or `Reflect` that binds one of them under
-/// another name. A name a parameter or a local binding of an enclosing
-/// function, block, `catch` or loop head shadows is not the import
-/// ([`InstallScan::free`]). Not seen, the documented premise: a writer
-/// called under another name (`const a = Object.assign`, `Object.assign.call`,
-/// `Reflect.apply`) or through a computed member (`O[k](ext, src)`, which
-/// names no writer the scan can read), or on an alias of the import other
-/// than a module `const`
+/// `location.assign(url)` and `map.set(k, v)` install nothing); a call
+/// through a computed member whose key is no literal, which may be any
+/// writer, whose first argument is an expression rooted at a package import
+/// and which has a second (`O[k](ext, src)`); and a destructuring of
+/// `Object` or `Reflect` that binds one of them under another name. A name a
+/// parameter or a local binding of an enclosing function, block, `catch` or
+/// loop head shadows is not the import ([`InstallScan::free`]). Not seen,
+/// the documented premise: a writer called under another name
+/// (`const a = Object.assign`, `Object.assign.call`, `Reflect.apply`), a
+/// computed member call whose first argument is a spread (`a[e](...t)`,
+/// which names no target), or a write on an alias of the import other than
+/// a module `const`
 /// (a `let`, a parameter, an object's member). Over the whole file, module
 /// scope included, which no pass interprets.
 fn installs(program: &Program, roots: &[String]) -> Vec<(Option<String>, MemberInstall)> {
@@ -584,11 +587,18 @@ impl<'a> Visit<'a> for InstallScan<'_> {
                         self.write(receiver, it.span);
                     }
                 }
-                // Another name, or a computed member, which names no writer
-                // the scan can read: a writer called so is the premise's, as
-                // one called under a name the program gave it.
+                // Another name names no writer the scan can read: a writer
+                // called so is the premise's.
                 Some(n) if !INSTALLERS.contains(&n) => {}
-                None => {}
+                // A computed member whose key is no literal may be any
+                // writer: with an expression as its first argument and the
+                // value argument, that argument is its target. A spread
+                // there (`a[e](...t)`) names no target: the premise's.
+                None => {
+                    if let Some(target) = it.arguments.first().and_then(Argument::as_expression) {
+                        self.write(target, it.span);
+                    }
+                }
                 // A writer: its target is the first argument, a spread there
                 // any.
                 Some(_) => match it.arguments.first() {
@@ -1419,6 +1429,9 @@ mod tests {
             "const { ...all } = Reflect;",
             "const O = Object; O.assign(ext.inner, { hook: f });",
             "Reflect.set(ext, 'hook', f);",
+            "const O = Object; O[k](ext, { hook: f });",
+            "handlers[k](ext.inner, f, g);",
+            "O[k](ext, ...rest);",
             "Object.defineProperty(ext, 'hook', { value: f });",
             "Object.setPrototypeOf(ext, proto);",
             "ext.__defineGetter__('hook', () => f);",
@@ -1441,6 +1454,9 @@ mod tests {
             "ext[FLAG] = true;",
             "ext.inner.depth = 10;",
             "this.console[method](...args); a[e](...t);",
+            "handlers[k](local, f);",
+            "O[k](ext);",
+            "O['assign'](other, src);",
             "const xs = [String, Object]; f(() => Object); g(x instanceof Object);",
             "const { assign } = Object; const { set } = Reflect;",
             "window.location.assign(ext.url);",

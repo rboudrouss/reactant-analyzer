@@ -245,7 +245,12 @@ on a program React settles; 323 oracle cases, none a known false negative.
   what it writes (`location.assign(Pkg.url)`, `map.set(Pkg.key, v)`).
   `Object.assign` and its kin are known by their name on any receiver or
   destructured (`const { assign } = Object`), and a renamed destructuring of
-  `Object` / `Reflect` counts; `Object` read as a value no longer does.
+  `Object` / `Reflect` counts, so does a call through a computed member whose
+  first argument is rooted at a package import and which has a second
+  (`O[k](ext, src)`); `Object` read as a value no longer does. Not seen: a
+  writer called under another name (`const a = Object.assign`, `.call`,
+  `Reflect.apply`), a computed member call whose first argument is a spread,
+  a write through an alias of the import other than a module `const`.
   chakra-ui: 6 hand-over Warnings become Info (379 → 373 shown); the other 10
   small repos and mantine do not move (#403).
 - `Array.isArray(x)` is modelled as the builtin it is (ECMA-262 §7.2.2: it

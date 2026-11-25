@@ -728,8 +728,8 @@ carries an Error.
   `ext.hook(cb)`: React loops and the hand-over is an Info), through an object package code hands
   the program (a callback's parameter, a call's result), by another package, or by a reflective
   writer called under a name the program gave it (`const a = Object.assign; a(ext, src)`,
-  `Object.assign.call(…)`, `Reflect.apply(Object.assign, …)`) or through a computed member
-  (`O[k](ext, src)`)
+  `Object.assign.call(…)`, `Reflect.apply(Object.assign, …)`), or through a computed member
+  whose first argument is a spread (`a[e](...t)`, which names no target)
   [#403](https://github.com/rboudrouss/reactant-analyzer/issues/403).
 - **A global the builtin tables name is the language's builtin.** The timers, `addEventListener`,
   the in-cycle array methods, `Array.from`, the purity table and `Array.isArray`, which calls no
@@ -777,7 +777,9 @@ carries an Error.
     `O.assign` on an alias of `Object`, `assign` destructured off it) — whose target (the first
     argument, the receiver of the last two) is rooted at a package import and which is passed what
     it writes (without its source, value, descriptor, prototype or accessor it writes `undefined` or
-    throws: `location.assign(Pkg.url)`, `map.set(Pkg.key, v)` install nothing), and a destructuring of
+    throws: `location.assign(Pkg.url)`, `map.set(Pkg.key, v)` install nothing), a call through a
+    computed member whose key is no literal, which may name any writer, whose first argument is an
+    expression rooted at a package import and which has a second (`O[k](ext, src)`), and a destructuring of
     `Object` or `Reflect` that binds a writer under another name (`const { assign: merge } =
     Object`). A name a parameter or a local binding of an enclosing function, block, `catch` or loop
     head shadows is not the import (`.forEach((path) => { path.node.x = y })` next to `import path
