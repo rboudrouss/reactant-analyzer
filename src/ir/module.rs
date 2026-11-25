@@ -60,8 +60,9 @@ pub struct ModuleFacts {
     /// name imported so ([`crate::engine::Handover`]).
     pub packages: Vec<String>,
     /// The first write of the module whose receiver is rooted at one of its
-    /// package imports (`None`: none): a write that replaces part of a
-    /// package's export ([`crate::engine::Handover`]).
+    /// package imports and that may install code there (`None`: none): a
+    /// write that may make program code part of a package's export
+    /// ([`crate::engine::Handover`], #403).
     pub member_install: Option<MemberInstall>,
 }
 

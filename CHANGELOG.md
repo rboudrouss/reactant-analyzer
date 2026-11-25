@@ -236,6 +236,18 @@ on a program React settles; 323 oracle cases, none a known false negative.
   component whose only rows are hidden Infos: "N component(s) with no error or
   warning hidden, M of which met a limit of the analysis; rerun with
   --show-clean" (#394).
+- The write into a package import that makes every hand-over a Warning (#394)
+  now counts only a write that may install code there. A primitive literal
+  written with `=` under a key the program spells does not count
+  (`MotionGlobalConfig.skipAnimations = true`,
+  `EventEmitter.defaultMaxListeners = 0`), nor does a write through a name a
+  parameter or a local binding shadows, nor a reflective writer called without
+  what it writes (`location.assign(Pkg.url)`, `map.set(Pkg.key, v)`).
+  `Object.assign` and its kin are known by their name on any receiver or
+  destructured (`const { assign } = Object`), and a renamed destructuring of
+  `Object` / `Reflect` counts; `Object` read as a value no longer does.
+  chakra-ui: 6 hand-over Warnings become Info (379 → 373 shown); the other 10
+  small repos and mantine do not move (#403).
 
 ### Removed
 

@@ -162,39 +162,145 @@ pub fn collect_module_facts(
 
 /// The first write of `program` whose receiver is rooted at a name it imports
 /// from a specifier the resolver maps to no file (`packages`): the one way the
-/// program shows, in plain sight, that it replaces part of a package's export
-/// ([`crate::engine::Handover`]). Every form that writes a member counts,
-/// whatever it writes: a member write (`p.x = v`, `p[k] = v`, any compound
-/// operator, an update, a destructuring or `for … of` target),
-/// `Object.assign`, `Object.defineProperty` / `defineProperties` /
-/// `setPrototypeOf`, `Reflect.set` / `defineProperty` / `setPrototypeOf`,
-/// `__defineGetter__` / `__defineSetter__`, through parentheses, TS
-/// assertions, non-null `!` and any depth of member chain. A read of `Object`
-/// or `Reflect` the scan does not follow (an alias, a value passed) may be any
-/// of those calls on any receiver: it counts too. Over the whole file, module
+/// program shows, in plain sight, that it may make program code part of a
+/// package's export ([`crate::engine::Handover`]). Every form that writes a
+/// member counts — a member write (`p.x = v`, `p[k] = v`, any compound
+/// operator, an update, a destructuring or `for … of` target), through
+/// parentheses, TS assertions, non-null `!` and any depth of member chain —
+/// except a plain `=` of a primitive literal ([`InstallScan::primitive`]) to
+/// a static or literal key, which holds no function and so installs no code
+/// (#403). So does a call of
+/// one of the reflective writers ([`INSTALLERS`]), recognised by the callee's
+/// last name on any receiver or as a bare name (`Object.assign`, `O.assign`
+/// on an alias of `Object`, `assign` destructured off it), whose target — its
+/// first argument, a spread there included, or the receiver of a
+/// `__defineGetter__` / `__defineSetter__` — is rooted at a package import,
+/// when it is passed the argument holding what it writes (the source of an
+/// `assign`, the value of a `set`, the descriptor, the prototype, the
+/// accessor: without it the writer writes `undefined` or throws, so
+/// `location.assign(url)` and `map.set(k, v)` install nothing); a call
+/// through a computed member whose key is no literal may be one of them; and
+/// a destructuring of `Object` or `Reflect` that binds one of them
+/// under another name. A name a parameter or a local binding of an enclosing
+/// function, block, `catch` or loop head shadows is not the import
+/// ([`InstallScan::free`]). Not seen, the documented premise: a writer
+/// called under another name (`const a = Object.assign`, `Object.assign.call`,
+/// `Reflect.apply`), or on an alias of the import. Over the whole file, module
 /// scope included, which no pass interprets.
 fn member_install(program: &Program, packages: &[String]) -> Option<MemberInstall> {
     let mut scan = InstallScan {
         packages: packages.iter().map(String::as_str).collect(),
         found: None,
         source: program.source_text,
+        shadows: Vec::new(),
+        module_undefined: super::top_level_binding_names(program)
+            .iter()
+            .any(|n| n == "undefined")
+            || binds_undefined(program),
     };
     scan.visit_program(program);
     scan.found
+}
+
+/// The reflective writers a call of which writes into its target:
+/// `Object.assign`, `Object.defineProperty` / `defineProperties`,
+/// `Object.setPrototypeOf`, `Reflect.set` / `defineProperty` /
+/// `setPrototypeOf`, and the receiver's `__defineGetter__` /
+/// `__defineSetter__`.
+const INSTALLERS: &[&str] = &[
+    "assign",
+    "defineProperty",
+    "defineProperties",
+    "setPrototypeOf",
+    "set",
+    "__defineGetter__",
+    "__defineSetter__",
+];
+
+/// A destructured property of key `key` (`None`: computed) bound to the
+/// local name `local` (`None`: anything but a plain name) binds a writer of
+/// [`INSTALLERS`] under another name than its own, or may.
+fn aliases_installer(key: Option<&str>, local: Option<&str>) -> bool {
+    match key {
+        None => true,
+        Some(k) => INSTALLERS.contains(&k) && local != Some(k),
+    }
+}
+
+/// An import of `program` binds the name `undefined`.
+fn binds_undefined(program: &Program) -> bool {
+    program.body.iter().any(|stmt| {
+        let Statement::ImportDeclaration(decl) = stmt else {
+            return false;
+        };
+        decl.specifiers
+            .iter()
+            .flatten()
+            .any(|s| s.local().name == "undefined")
+    })
 }
 
 struct InstallScan<'s> {
     packages: HashSet<&'s str>,
     found: Option<MemberInstall>,
     source: &'s str,
+    /// The names each enclosing function, block, `catch` or loop head
+    /// binds, outermost first: a reference to one of them is not the
+    /// module's.
+    shadows: Vec<HashSet<String>>,
+    /// The module binds `undefined` itself.
+    module_undefined: bool,
 }
 
 impl InstallScan<'_> {
-    /// `receiver` is rooted at a package import: a name, or a member chain
-    /// off one, through parentheses, TS assertions and non-null `!`.
+    /// `name`, read here, is the module scope's: no enclosing scope binds
+    /// it. Each scope lists the names its own statements, parameters or
+    /// head declare, so a `var` is seen in its block only — what it misses
+    /// reads as the module's, which counts the write (fail closed).
+    fn free(&self, name: &str) -> bool {
+        !self.shadows.iter().any(|s| s.contains(name))
+    }
+
+    /// Run `f` in a scope binding `names`.
+    fn scoped(&mut self, names: HashSet<String>, f: impl FnOnce(&mut Self)) {
+        self.shadows.push(names);
+        f(self);
+        self.shadows.pop();
+    }
+
+    /// `e` is a primitive literal, itself: a number, a string, a boolean,
+    /// `null`, `undefined` (the global one), a template without
+    /// substitutions or a negated number, through parentheses and TS
+    /// assertions. Not a name or an expression that merely evaluates to one.
+    fn primitive(&self, e: &Expression) -> bool {
+        match e.get_inner_expression() {
+            Expression::NumericLiteral(_)
+            | Expression::StringLiteral(_)
+            | Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_) => true,
+            Expression::TemplateLiteral(t) => t.expressions.is_empty(),
+            Expression::UnaryExpression(u) => {
+                u.operator == UnaryOperator::UnaryNegation
+                    && matches!(
+                        u.argument.get_inner_expression(),
+                        Expression::NumericLiteral(_)
+                    )
+            }
+            Expression::Identifier(id) => {
+                id.name == "undefined" && self.free("undefined") && !self.module_undefined
+            }
+            _ => false,
+        }
+    }
+
+    /// `receiver` is rooted at a package import: a name, the module's, or a
+    /// member chain off one, through parentheses, TS assertions and non-null
+    /// `!`.
     fn rooted(&self, receiver: &Expression) -> bool {
         match receiver.get_inner_expression() {
-            Expression::Identifier(id) => self.packages.contains(id.name.as_str()),
+            Expression::Identifier(id) => {
+                self.packages.contains(id.name.as_str()) && self.free(id.name.as_str())
+            }
             Expression::StaticMemberExpression(m) => self.rooted(&m.object),
             Expression::ComputedMemberExpression(m) => self.rooted(&m.object),
             Expression::ChainExpression(c) => c
@@ -278,11 +384,92 @@ impl InstallScan<'_> {
     }
 }
 
+/// The names `stmts` declare themselves — `var`, `let`, `const`, a function,
+/// a class, a TS enum — without entering a nested block or function.
+fn declared(stmts: &[Statement]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for stmt in stmts {
+        match stmt {
+            Statement::VariableDeclaration(v) => out.extend(declarators(v)),
+            Statement::FunctionDeclaration(f) => {
+                out.extend(f.id.iter().map(|i| i.name.to_string()))
+            }
+            Statement::ClassDeclaration(c) => out.extend(c.id.iter().map(|i| i.name.to_string())),
+            Statement::TSEnumDeclaration(e) => {
+                out.insert(e.id.name.to_string());
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Every name the declarators of `v` bind.
+fn declarators<'v>(v: &'v VariableDeclaration<'_>) -> impl Iterator<Item = String> + 'v {
+    v.declarations
+        .iter()
+        .flat_map(|d| d.id.get_binding_identifiers())
+        .map(|i| i.name.to_string())
+}
+
+/// Every name the parameters `params` bind.
+fn parameters(params: &FormalParameters) -> HashSet<String> {
+    params
+        .iter_bindings()
+        .flat_map(BindingPattern::get_binding_identifiers)
+        .map(|i| i.name.to_string())
+        .collect()
+}
+
+/// What a call's callee names, for [`INSTALLERS`], through parentheses, TS
+/// assertions and a sequence's last expression (`(0, Object.assign)`): its
+/// last name — a static member's or a literal key's, or a bare name; `None`
+/// for a computed member whose key is no literal, which may be any name —
+/// and a member's object. `None` for any other callee.
+fn callee_name<'e>(
+    callee: &'e Expression<'e>,
+) -> Option<(Option<&'e str>, Option<&'e Expression<'e>>)> {
+    match callee.get_inner_expression() {
+        Expression::Identifier(id) => Some((Some(id.name.as_str()), None)),
+        Expression::SequenceExpression(s) => s.expressions.last().and_then(callee_name),
+        e => {
+            let m = e.as_member_expression()?;
+            Some((m.static_property_name(), Some(m.object())))
+        }
+    }
+}
+
 impl<'a> Visit<'a> for InstallScan<'_> {
     fn visit_assignment_expression(&mut self, it: &AssignmentExpression<'a>) {
         match it.left.as_member_expression() {
+            // A primitive literal written with `=` under a key the program
+            // spells holds no function (#403).
+            Some(m)
+                if it.operator == AssignmentOperator::Assign
+                    && m.static_property_name().is_some()
+                    && self.primitive(&it.right) => {}
             Some(m) => self.write(m.object(), it.span),
-            None => self.pattern(&it.left, it.span),
+            None => {
+                self.pattern(&it.left, it.span);
+                if let AssignmentTarget::ObjectAssignmentTarget(o) = &it.left
+                    && namespace(&it.right).is_some()
+                    && (o.rest.is_some()
+                        || o.properties.iter().any(|p| match p {
+                            AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(_) => {
+                                false
+                            }
+                            AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
+                                let local = p
+                                    .binding
+                                    .as_assignment_target()
+                                    .and_then(AssignmentTarget::get_identifier_name);
+                                aliases_installer(p.name.static_name().as_deref(), local)
+                            }
+                        }))
+                {
+                    self.note(it.span);
+                }
+            }
         }
         walk::walk_assignment_expression(self, it);
     }
@@ -294,60 +481,143 @@ impl<'a> Visit<'a> for InstallScan<'_> {
         walk::walk_update_expression(self, it);
     }
 
-    fn visit_for_of_statement(&mut self, it: &ForOfStatement<'a>) {
-        if let Some(t) = it.left.as_assignment_target() {
-            self.pattern(t, it.span);
-        }
-        walk::walk_for_of_statement(self, it);
-    }
-
     fn visit_call_expression(&mut self, it: &CallExpression<'a>) {
-        let target = it.arguments.first().and_then(Argument::as_expression);
-        if let Expression::StaticMemberExpression(m) = it.callee.get_inner_expression() {
-            let on = namespace(&m.object);
-            match (on, m.property.name.as_str()) {
-                (Some("Object"), "assign" | "defineProperties")
-                | (Some("Object" | "Reflect"), "defineProperty" | "setPrototypeOf")
-                | (Some("Reflect"), "set") => {
-                    if let Some(target) = target {
-                        self.write(target, it.span);
+        // A writer called without the argument that holds what it writes
+        // writes `undefined` or throws (`location.assign(url)`,
+        // `map.set(k, v)` read as `Reflect.set(t, k)`): it installs nothing.
+        let valued =
+            |n: usize| it.arguments.len() >= n || it.arguments.iter().any(Argument::is_spread);
+        if let Some((name, receiver)) = callee_name(&it.callee)
+            && valued(match name {
+                Some("set" | "defineProperty") => 3,
+                _ => 2,
+            })
+        {
+            match name {
+                Some("__defineGetter__" | "__defineSetter__") => {
+                    if let Some(receiver) = receiver {
+                        self.write(receiver, it.span);
                     }
                 }
-                (_, "__defineGetter__" | "__defineSetter__") => self.write(&m.object, it.span),
-                _ => {}
+                Some(n) if !INSTALLERS.contains(&n) => {}
+                // An installer, or a computed member that may be one: its
+                // target is the first argument, a spread there any.
+                _ => match it.arguments.first() {
+                    Some(Argument::SpreadElement(_)) => self.note(it.span),
+                    Some(a) => {
+                        if let Some(target) = a.as_expression() {
+                            self.write(target, it.span);
+                        }
+                    }
+                    None => {}
+                },
             }
         }
         walk::walk_call_expression(self, it);
     }
 
-    // `Object` or `Reflect` read anywhere but as the object of a static
-    // member: an alias or a value passed, which may be any of the calls
-    // above.
-    fn visit_identifier_reference(&mut self, it: &IdentifierReference<'a>) {
-        if matches!(it.name.as_str(), "Object" | "Reflect") {
-            self.note(it.span);
+    // A destructuring of `Object` or `Reflect` that binds a writer under
+    // another name, through a computed key or a rest: the scan, which knows
+    // the writers by name, would not see its calls.
+    fn visit_variable_declarator(&mut self, it: &VariableDeclarator<'a>) {
+        if let (BindingPattern::ObjectPattern(o), Some(init)) = (&it.id, &it.init)
+            && namespace(init).is_some()
+        {
+            let renamed = o.rest.is_some()
+                || o.properties.iter().any(|p| {
+                    let value = match &p.value {
+                        BindingPattern::AssignmentPattern(a) => &a.left,
+                        v => v,
+                    };
+                    let local = match value {
+                        BindingPattern::BindingIdentifier(id) => Some(id.name.as_str()),
+                        _ => None,
+                    };
+                    aliases_installer(p.key.static_name().as_deref(), local)
+                });
+            if renamed {
+                self.note(it.span);
+            }
         }
+        walk::walk_variable_declarator(self, it);
     }
 
-    fn visit_static_member_expression(&mut self, it: &StaticMemberExpression<'a>) {
-        if let Expression::Identifier(id) = it.object.get_inner_expression()
-            && matches!(id.name.as_str(), "Object" | "Reflect")
-        {
-            return;
+    // The scopes a name may be shadowed in.
+    fn visit_function(&mut self, it: &Function<'a>, flags: oxc_syntax::scope::ScopeFlags) {
+        let mut names = parameters(&it.params);
+        names.extend(it.id.iter().map(|i| i.name.to_string()));
+        if let Some(body) = &it.body {
+            names.extend(declared(&body.statements));
         }
-        walk::walk_static_member_expression(self, it);
+        self.scoped(names, |s| walk::walk_function(s, it, flags));
     }
 
-    fn visit_binary_expression(&mut self, it: &BinaryExpression<'a>) {
-        // `x instanceof Object` reads the constructor, installs nothing.
-        if it.operator == BinaryOperator::Instanceof
-            && let Expression::Identifier(id) = it.right.get_inner_expression()
-            && matches!(id.name.as_str(), "Object" | "Reflect")
-        {
-            self.visit_expression(&it.left);
-            return;
+    fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
+        let mut names = parameters(&it.params);
+        names.extend(declared(&it.body.statements));
+        self.scoped(names, |s| walk::walk_arrow_function_expression(s, it));
+    }
+
+    fn visit_block_statement(&mut self, it: &BlockStatement<'a>) {
+        self.scoped(declared(&it.body), |s| walk::walk_block_statement(s, it));
+    }
+
+    fn visit_static_block(&mut self, it: &StaticBlock<'a>) {
+        self.scoped(declared(&it.body), |s| walk::walk_static_block(s, it));
+    }
+
+    fn visit_catch_clause(&mut self, it: &CatchClause<'a>) {
+        let names = it
+            .param
+            .iter()
+            .flat_map(|p| p.pattern.get_binding_identifiers())
+            .map(|i| i.name.to_string())
+            .collect();
+        self.scoped(names, |s| walk::walk_catch_clause(s, it));
+    }
+
+    fn visit_switch_statement(&mut self, it: &SwitchStatement<'a>) {
+        // The discriminant is read outside the cases' scope.
+        self.visit_expression(&it.discriminant);
+        let stmts: Vec<&Statement> = it.cases.iter().flat_map(|c| &c.consequent).collect();
+        let mut names = HashSet::new();
+        for stmt in stmts {
+            names.extend(declared(std::slice::from_ref(stmt)));
         }
-        walk::walk_binary_expression(self, it);
+        self.scoped(names, |s| {
+            for case in &it.cases {
+                s.visit_switch_case(case);
+            }
+        });
+    }
+
+    fn visit_for_statement(&mut self, it: &ForStatement<'a>) {
+        let names = match &it.init {
+            Some(ForStatementInit::VariableDeclaration(v)) => declarators(v).collect(),
+            _ => HashSet::new(),
+        };
+        self.scoped(names, |s| walk::walk_for_statement(s, it));
+    }
+
+    fn visit_for_in_statement(&mut self, it: &ForInStatement<'a>) {
+        let names = match &it.left {
+            ForStatementLeft::VariableDeclaration(v) => declarators(v).collect(),
+            _ => HashSet::new(),
+        };
+        self.scoped(names, |s| walk::walk_for_in_statement(s, it));
+    }
+
+    fn visit_for_of_statement(&mut self, it: &ForOfStatement<'a>) {
+        if let Some(t) = it.left.as_assignment_target() {
+            self.pattern(t, it.span);
+        }
+        // The head's own bindings scope the iterated expression too (its
+        // TDZ) and the body.
+        let names = match &it.left {
+            ForStatementLeft::VariableDeclaration(v) => declarators(v).collect(),
+            _ => HashSet::new(),
+        };
+        self.scoped(names, |s| walk::walk_for_of_statement(s, it));
     }
 
     // Types are erased before anything runs.
@@ -964,6 +1234,79 @@ mod tests {
             ret.diagnostics
         );
         collect_module_facts(&ret.program, Path::new("/root/a.tsx"), &FakeResolver)
+    }
+
+    /// The write into a package import that makes no import read as the
+    /// package's (#394), narrowed to what may install program code (#403):
+    /// a primitive literal does not, a writer is known by its name, and a
+    /// name a scope rebinds is not the import.
+    #[test]
+    fn a_write_into_a_package_import_counts_unless_it_cannot_install_code() {
+        let counts = |src: &str| {
+            facts_of(&format!("import ext from 'ext';\n{src}"))
+                .member_install
+                .is_some()
+        };
+        for src in [
+            "ext.hook = (f) => f();",
+            "ext.hook = f;",
+            "const v = true; ext.flag = v;",
+            "ext.flag = c ? 1 : 2;",
+            "ext.flag = +1;",
+            "ext.t = `${x}`;",
+            "ext.n += 1;",
+            "ext.n ||= 1;",
+            "ext.n++;",
+            "ext[k] = 1;",
+            "({ a: ext.hook } = o);",
+            "for (ext.hook of fs);",
+            "Object.assign(ext, { hook: f });",
+            "Object.assign(...args);",
+            "(0, Object.assign)(ext, src);",
+            "const { assign } = Object; assign(ext, { hook: f });",
+            "const { assign: merge } = Object; merge(other, src);",
+            "let merge; ({ assign: merge } = Object);",
+            "const { ...all } = Reflect;",
+            "const O = Object; O.assign(ext.inner, { hook: f });",
+            "const O = Object; O[k](ext, { hook: f });",
+            "Reflect.set(ext, 'hook', f);",
+            "Object.defineProperty(ext, 'hook', { value: f });",
+            "Object.setPrototypeOf(ext, proto);",
+            "ext.__defineGetter__('hook', () => f);",
+            "function g() { { const ext = {}; } ext.hook = f; }",
+            "function g(e) { ext.hook = e; }",
+            "switch (ext) { case 1: let ext = {}; } ext.hook = f;",
+            "function g() { const undefined = f; ext.u = undefined; }",
+        ] {
+            assert!(counts(src), "{src}");
+        }
+        for src in [
+            "ext.flag = true;",
+            "ext.n = 0;",
+            "ext.m = -1;",
+            "ext.s = 'x';",
+            "ext.t = `x`;",
+            "ext.z = null;",
+            "ext.u = undefined;",
+            "ext['flag'] = (false as any);",
+            "ext.inner.depth = 10;",
+            "const xs = [String, Object]; f(() => Object); g(x instanceof Object);",
+            "const { assign } = Object; const { set } = Reflect;",
+            "window.location.assign(ext.url);",
+            "map.set(ext.key, 1);",
+            "function g(ext) { ext.hook = f; }",
+            "[1].forEach((ext) => { ext.hook = f; });",
+            "try {} catch (ext) { ext.hook = f; }",
+            "for (const ext of xs) ext.hook = f;",
+            "for (let ext = {}; ; ) ext.hook = f;",
+            "{ const ext = {}; ext.hook = f; }",
+            "function g() { ext.hook = f; var ext = {}; }",
+            "class K { m(ext) { ext.hook = f; } }",
+            "const h = function ext() { ext.hook = f; };",
+            "switch (x) { case 1: let ext = {}; ext.hook = f; }",
+        ] {
+            assert!(!counts(src), "{src}");
+        }
     }
 
     /// The names spelled, and whether any name may be an accessor's.

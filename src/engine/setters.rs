@@ -2273,8 +2273,9 @@ impl WalkClass {
 /// registry summary stands on, that a name imported from a package denotes
 /// that package's export, and fails closed on the one violation the program
 /// shows in plain sight: when some write anywhere has a receiver rooted at a
-/// package import ([`crate::engine::ModuleScope::packages_intact`]), no callee
-/// is a package's. That holds for a bare name and a namespace member too,
+/// package import and may install code there — a primitive literal does not
+/// (#403) — ([`crate::engine::ModuleScope::packages_intact`]), no callee is a
+/// package's. That holds for a bare name and a namespace member too,
 /// though ES makes both read-only: module interop (CommonJS output, the
 /// oracle's esbuild) reads every import as a member of the package's mutable
 /// exports object. What the fact does not see — a write through an alias of

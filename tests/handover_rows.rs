@@ -363,8 +363,11 @@ fn member_levels(dir: &str) -> Vec<String> {
 /// member, another package's `other.flag = 1`) makes every package import
 /// read as the program's. Module interop reads a bare name and a namespace
 /// member off the package's mutable exports object too. A write into
-/// anything else (`window.onfoo = …`, a literal) does not count, and a write
-/// through an alias of the import is the documented premise: not seen.
+/// anything else (`window.onfoo = …`, a literal, a parameter that shadows
+/// the import) does not count, nor does a primitive literal written into
+/// one, which installs no code (#403); `Object.assign` counts under any
+/// spelling of its receiver. A write through an alias of the import is the
+/// documented premise: not seen.
 #[test]
 fn a_package_import_is_the_packages_unless_the_program_writes_into_one() {
     for (dir, levels) in [
@@ -378,6 +381,9 @@ fn a_package_import_is_the_packages_unless_the_program_writes_into_one() {
         ("alias_write", vec!["info"]),
         ("shadowed", vec!["warning"]),
         ("call_result", vec!["warning"]),
+        ("primitive_write", vec!["info"]),
+        ("param_shadow_write", vec!["info"]),
+        ("assign_destructured", vec!["warning"]),
     ] {
         assert_eq!(member_levels(dir), levels, "{dir}");
     }

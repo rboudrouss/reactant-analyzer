@@ -722,10 +722,13 @@ carries an Error.
   loops in React and the analyzer still reads React's `useCallback`, reporting only `missing-deps`
   [#400](https://github.com/rboudrouss/reactant-analyzer/issues/400). The hand-over level fails
   closed on the one violation the program shows in plain sight, a write whose receiver is rooted at
-  a package import (below); the registry does not yet (#400). Neither sees an export replaced
-  through an alias of the import (`const e = ext; e.hook = f`, then `ext.hook(cb)`: React loops and
-  the hand-over is an Info), through an object package code hands the program (a callback's
-  parameter, a call's result), or by another package.
+  a package import that may install code there (below); the registry does not yet (#400). Neither
+  sees an export replaced through an alias of the import (`const e = ext; e.hook = f`, then
+  `ext.hook(cb)`: React loops and the hand-over is an Info), through an object package code hands
+  the program (a callback's parameter, a call's result), by another package, or by a reflective
+  writer called under a name the program gave it (`const a = Object.assign; a(ext, src)`,
+  `Object.assign.call(…)`, `Reflect.apply(Object.assign, …)`)
+  [#403](https://github.com/rboudrouss/reactant-analyzer/issues/403).
 - **`setter-in-render`** reports a setter that reaches a callee with no timing summary
   (`composeEventHandlers(a, cb)`, `@mantine/form`'s `form.watch(path, cb)`, a package's component,
   a builtin the analysis does not model, a getter it cannot place, and what a generator yields to
@@ -743,14 +746,25 @@ carries an Error.
     import.** That reading stands on the premise the registry stands on (the bullet above: a name
     imported from a package denotes that package's export), and fails closed on the one
     violation the program shows in plain sight: when some write anywhere in the program has a
-    receiver rooted at a name its file imports from a package — `ext.hook = f`,
-    `(Ns as any).Comp = Local`, `React.flag = 1`, at any depth of member chain, through
-    parentheses, TS assertions and `!`, as a member write of any operator, an update, a
-    destructuring or `for … of` target, `Object.assign`, `Object.defineProperty` / `defineProperties`
-    / `setPrototypeOf`, the `Reflect` twins, `__defineGetter__` / `__defineSetter__`, whatever value
-    it writes — no callee is a package's and every hand-over is a Warning. So is it when `Object` or
-    `Reflect` is read anywhere but as the object of a member or the right of `instanceof`, since an
-    alias of either may be any of those calls. Module interop (CommonJS output, the oracle's
+    receiver rooted at a name its file imports from a package, and may install code there —
+    `ext.hook = f`, `(Ns as any).Comp = Local`, `React.flag = c ? 1 : 2`, at any depth of member
+    chain, through parentheses, TS assertions and `!`, as a member write of any operator but a
+    plain `=` of a primitive literal under a key the program spells (a number, a string, a
+    boolean, `null`, `undefined`, a template without substitutions, a negated number:
+    `MotionGlobalConfig.skipAnimations = true` installs nothing), an update, a destructuring or
+    `for … of` target, a computed-key write whatever it writes — no callee is a package's and every
+    hand-over is a Warning. So is a call of a reflective writer, known by the callee's last name on
+    any receiver or as a bare name — `assign`, `defineProperty`, `defineProperties`,
+    `setPrototypeOf`, `set`, a receiver's `__defineGetter__` / `__defineSetter__` (`Object.assign`,
+    `O.assign` on an alias of `Object`, `assign` destructured off it) — whose target (the first
+    argument, the receiver of the last two) is rooted at a package import and which is passed what
+    it writes (without its source, value, descriptor, prototype or accessor it writes `undefined` or
+    throws: `location.assign(Pkg.url)`, `map.set(Pkg.key, v)` install nothing), a call through a
+    computed member whose key is no literal with such a first argument, and a destructuring of
+    `Object` or `Reflect` that binds a writer under another name (`const { assign: merge } =
+    Object`). A name a parameter or a local binding of an enclosing function, block, `catch` or loop
+    head shadows is not the import (`.forEach((path) => { path.node.x = y })` next to `import path
+    from "path"`) [#403](https://github.com/rboudrouss/reactant-analyzer/issues/403). Module interop (CommonJS output, the oracle's
     esbuild) reads every import, a bare name and a namespace member included, as a member of the
     package's mutable exports object, which is why a bare name is no exception. The fact is
     program-wide and syntactic, over every file and its module scope; `--verbose` names the first
