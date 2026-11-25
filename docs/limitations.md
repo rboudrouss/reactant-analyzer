@@ -258,7 +258,11 @@ that writes it (see *Cross-file limits*).
   outside closures, on every path or behind guards that hold still, without a `key` that moves,
   and its parent stays mounted in turn ([#213](https://github.com/rboudrouss/reactant-analyzer/issues/213)).
   A child rendered from a `.map` callback (any closure) is read as remounting, the fail-closed
-  side [#162](https://github.com/rboudrouss/reactant-analyzer/issues/162). So is one an element
+  side [#162](https://github.com/rboudrouss/reactant-analyzer/issues/162), and so is one a hook's
+  body builds — a `useCallback`, a `useMemo`, a custom hook's own, which an element may take as
+  its type (`const { XModal } = useXModal(); <XModal />`): a remount loop through a hook-returned
+  component is claimed, and so is one whose type holds still (a false positive)
+  [#411](https://github.com/rboudrouss/reactant-analyzer/issues/411). So is one an element
   the tree cannot place may mount: a component some module reads as a value (`c ? A : B`,
   `{ A }`, `[A]`, a lazy `import()`), one whose name several components share, every component
   of a file an element names under a definition the table does not resolve, one that renders
@@ -1009,9 +1013,10 @@ the children of the component that renders it, with the props written there
 (dub's `const { XModal } = useXModal(); <XModal />`). An element a custom
 hook's body builds is the body of every component that calls the hook, so
 the component it names is not also analysed as an entry point, whose pass
-with unknown props would replace that result. A closure type that is a new
-function at a render remounts its subtree, which the analysis does not read:
-a mount-only effect below it is read as firing once
+with unknown props would replace that result. What such a closure builds is
+read as remounting at any of its runs, as a closure's elements are (below):
+a type that is a new function at a render remounts its subtree, which the
+analysis does not tell apart from one that holds still
 [#411](https://github.com/rboudrouss/reactant-analyzer/issues/411). Not bound by any scope, a
 name keeps the file's stamp: the file's own top-level declarations, then its
 imports, alias included, followed through a barrel's re-exports to the

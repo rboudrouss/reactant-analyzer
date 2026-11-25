@@ -1,9 +1,10 @@
 // oracle: react=loop
-// oracle: known=fn #411
-// #392's modal-hook pattern, a remount loop: the `useCallback` is a new
+// #392's modal-hook pattern, a remount loop (#411): the `useCallback` is a new
 // function whenever `show` changes, so the element `App` renders has a new
 // type, React remounts `Inner`, and its mount-only effect bumps `show` again.
-// The analysis reads the effect as firing once (#411).
+// `Inner` is built in a hook's body, a closure the render does not place: it
+// may mount at any of its runs, as a `.map` callback's element may, so its
+// mount-only effect is no proof of one run.
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 function Inner({ show, setShow }: { show: number; setShow: (f: (n: number) => number) => void }) {

@@ -750,8 +750,11 @@ on a program React settles; 323 oracle cases, none a known false negative.
   with an `analysis-limit` Info saying so. An element a custom hook builds is
   a child of every component that calls the hook, never also an entry point
   analysed with unknown props, whose pass replaced its parent's result: the
-  loops through dub's `const { XModal } = useXModal(); <XModal />` are kept.
-  Oracle: 19 new cases, 6 `fn` of the base now `tp`, 4 `fp` now `tn`. Shown rows: ai-chatbot 54 → 50,
+  loops through dub's `const { XModal } = useXModal(); <XModal />` are kept,
+  and what a hook's body builds (a `useCallback`, a `useMemo`) is read as
+  remounting at any of its runs, as a closure's elements are: a remount loop
+  through a hook-returned component is claimed (#411).
+  Oracle: 20 new cases, 7 `fn` of the base now `tp`, 4 `fp` now `tn`. Shown rows: ai-chatbot 54 → 50,
   bulletproof-react 31 → 28, novel 13 → 9, shadcn-admin 35 → 34 (hand-overs
   to radix's `Slot` now Info), mantine 1,712 → 1,711 (a story's `ContextModal`
   no longer runs for `modals[ctx]`), the other 7 small repos unchanged;

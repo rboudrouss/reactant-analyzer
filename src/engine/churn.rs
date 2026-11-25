@@ -485,6 +485,56 @@ fn component_tree(result: &ProgramAnalysisResult) -> ComponentTree<'_> {
         }
         e.for_each_child(&mut |c| walk(c, closure, f));
     }
+    /// The element `e` of `parent` mounts its child under `guards`, when `e`
+    /// is a component element.
+    fn place<'a>(
+        tree: &mut ComponentTree<'a>,
+        table: &crate::ir::ComponentTable,
+        parent: ComponentId,
+        e: &'a Expr,
+        closure: bool,
+        guards: &[&'a Expr],
+    ) {
+        let Expr::CompApp {
+            name,
+            origin,
+            props,
+            ..
+        } = e
+        else {
+            return;
+        };
+        // As the engine resolves the child it analyses — none for an element
+        // of unseen code (#389), each name the binding of a name a scope
+        // binds aliases (#392) — and, for one whose import leads to no
+        // component, the one component of that name.
+        for (name, origin) in ElementOrigin::named(name, origin.as_ref()) {
+            let child = match table.element(name, origin.map(Arc::as_ref)) {
+                ElementTarget::Component(child) => child,
+                ElementTarget::Unseen | ElementTarget::Ambiguous | ElementTarget::Value => {
+                    continue;
+                }
+                ElementTarget::Unresolved => match table.ids_named(name).collect::<Vec<_>>()[..] {
+                    [child] => child,
+                    _ => continue,
+                },
+            };
+            if child == parent {
+                continue;
+            }
+            let mut held = guards.to_vec();
+            if let Expr::ObjectLit { fields, .. } = props.peel_ts()
+                && let Some(key) = object_member(fields, "key")
+            {
+                held.push(key);
+            }
+            tree.entry(child).or_default().push(Element {
+                parent,
+                closure,
+                held,
+            });
+        }
+    }
     let table = &result.component_table;
     let mut tree: ComponentTree = HashMap::new();
     for (&parent, r) in &result.components {
@@ -496,50 +546,25 @@ fn component_tree(result: &ProgramAnalysisResult) -> ComponentTree<'_> {
                 .collect();
             block.for_each_expr(&mut |e| {
                 walk(e, false, &mut |e, closure| {
-                    let Expr::CompApp {
-                        name,
-                        origin,
-                        props,
-                        ..
-                    } = e
-                    else {
-                        return;
-                    };
-                    // As the engine resolves the child it analyses — none for
-                    // an element of unseen code (#389), each name the binding
-                    // of a name a scope binds aliases (#392) — and, for one
-                    // whose import leads to no component, the one component
-                    // of that name.
-                    for (name, origin) in ElementOrigin::named(name, origin.as_ref()) {
-                        let child = match table.element(name, origin.map(Arc::as_ref)) {
-                            ElementTarget::Component(child) => child,
-                            ElementTarget::Unseen
-                            | ElementTarget::Ambiguous
-                            | ElementTarget::Value => continue,
-                            ElementTarget::Unresolved => {
-                                match table.ids_named(name).collect::<Vec<_>>()[..] {
-                                    [child] => child,
-                                    _ => continue,
-                                }
-                            }
-                        };
-                        if child == parent {
-                            continue;
-                        }
-                        let mut held = guards.clone();
-                        if let Expr::ObjectLit { fields, .. } = props.peel_ts()
-                            && let Some(key) = object_member(fields, "key")
-                        {
-                            held.push(key);
-                        }
-                        tree.entry(child).or_default().push(Element {
-                            parent,
-                            closure,
-                            held,
-                        });
-                    }
+                    place(&mut tree, table, parent, e, closure, &guards)
                 });
             });
+        }
+        // A hook's body — a `useCallback`'s or a `useMemo`'s, which the
+        // render reads only as the hook's value, an effect's, a handler's —
+        // is a closure the render does not place: what it builds mounts at
+        // any of its runs, as a `.map` callback's does. A component a custom
+        // hook's `useCallback` renders, which an element takes as its type
+        // (`const { XModal } = useXModal(); <XModal />`), is mounted there
+        // (#392).
+        for hook in &r.hooks {
+            if let Some(body) = hook.body_cfg() {
+                body.for_each_expr(&mut |e| {
+                    walk(e, true, &mut |e, closure| {
+                        place(&mut tree, table, parent, e, closure, &[])
+                    });
+                });
+            }
         }
     }
     tree
