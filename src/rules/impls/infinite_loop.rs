@@ -536,7 +536,16 @@ fn always_clause(
             })
             .unwrap_or_else(|| "a dep".to_string())
     };
+    // React's call of a host `ref` (#412) has no deps list of the source's.
+    let host_ref = comp
+        .hooks
+        .iter()
+        .any(|h| h.label() == label && !h.written());
     let clause = match why {
+        Always::NoDeps if host_ref => "is a host element's `ref`, which React calls after \
+                                       every commit that hands it a new function or may mount \
+                                       its element,"
+            .to_string(),
         Always::NoDeps => "has no dependency array".to_string(),
         Always::FreshDep(i) if surely => {
             format!("depends on `{}`, a new reference every render,", dep(i))
@@ -1030,6 +1039,7 @@ mod tests {
                 body_cfg: eff_cfg,
                 deps: DepsArg::Absent,
                 span: None,
+                host_ref: false,
             },
         ];
         let render_stmts = vec![
@@ -1099,6 +1109,7 @@ mod tests {
                 body_cfg: eff_cfg,
                 deps: DepsArg::List(DepsList::exact(vec![Expr::StateVal(0)])),
                 span: None,
+                host_ref: false,
             },
         ];
         let render_stmts = vec![
@@ -1226,6 +1237,7 @@ mod tests {
                 body_cfg: eff_cfg,
                 deps,
                 span: None,
+                host_ref: false,
             },
         ];
         let render_stmts = vec![
@@ -1591,6 +1603,7 @@ mod tests {
                 body_cfg: eff_cfg,
                 deps,
                 span: None,
+                host_ref: false,
             },
         ];
         let render_stmts = vec![

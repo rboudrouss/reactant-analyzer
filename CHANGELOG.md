@@ -812,6 +812,18 @@ on a program React settles; 323 oracle cases, none a known false negative.
   the base now `tp`. Shown rows: mantine 1,845 → 1,846 (`_Box` is analysed:
   its `useSxTransform?.()` is a conditional hook call), the 11 other small
   repos unchanged (#410).
+- A host element's `ref` runs at commit, as React DOM calls it, not on an
+  event: it is a layout effect of the component, with the `ref` and what holds
+  the element mounted (the conditions above it, its `key`s) as deps, so a
+  `ref` that is a new function at every render, or a setter on an element its
+  own write unmounts, is a loop claim where it was an event handler's write
+  and silent. A `ref` a spread brings (React 19's `ref` prop) is called too,
+  and a `focus()` in a `ref` fires its events at commit. Oracle: 15 new cases,
+  8 `fn` of the base now `tp`, 2 `tn` now tolerated `fp` (a fresh
+  `(node) => setEl(node)`, a parent's setter forwarded as a child's `ref`).
+  Shown rows: excalidraw 135 → 145, mantine 1,846 → 1,897 (most a `ref` on
+  an element a component element receives, read as mounting at any render),
+  the 10 other small repos unchanged (#412).
 - A function handed as a prop to a child component the analysis does not see
   (a package's component, an element value it does not resolve, a name several
   files define, a component rendering itself, a context provider's `value`)

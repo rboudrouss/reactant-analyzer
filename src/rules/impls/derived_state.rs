@@ -61,7 +61,7 @@ impl Rule for DerivedState {
                 body_cfg,
                 deps: DepsArg::List(deps),
                 span,
-                ..
+                host_ref: false,
             } = hook
             else {
                 continue;

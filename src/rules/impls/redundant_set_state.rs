@@ -580,6 +580,7 @@ mod tests {
                 body_cfg: eff_cfg,
                 deps: DepsArg::List(DepsList::exact(vec![])),
                 span: None,
+                host_ref: false,
             }],
             ..crate::test_support::analysis_result(render_cfg)
         }

@@ -18,7 +18,9 @@ pub use cfg_builder::{LowerCtx, build_cfg, build_fn_body_cfg};
 pub use class_lowerer::lower_classes_with_resolver;
 pub use component_detector::{ComponentCandidate, detect_components};
 pub use hook_detector::{HookCandidate, detect_custom_hooks};
-pub use hook_extractor::{extract_handlers, extract_hooks, extract_subscriptions};
+pub use hook_extractor::{
+    extract_handlers, extract_hooks, extract_ref_commits, extract_subscriptions,
+};
 pub use import_resolution::{
     HookOrigin, JsxOrigins, ResolvedImport, build_hook_origins, build_jsx_origins,
     build_resolved_import_map, build_resolved_imports,
@@ -538,6 +540,7 @@ pub(crate) fn lower_file_hooks(
             let (mut hooks, hook_provenance, mut next_label) =
                 extract_hooks(&mut body_cfg, &imports, &ctx.ids);
             extract_handlers(&body_cfg, &mut hooks, &mut next_label);
+            extract_ref_commits(&body_cfg, &mut hooks, &mut next_label);
             extract_subscriptions(&mut hooks, &mut next_label);
             HookIR {
                 file: file.to_path_buf(),
@@ -761,6 +764,7 @@ fn lower_hook_value(
     };
     let (mut hooks, hook_provenance, mut next_label) = extract_hooks(&mut body_cfg, &imports, &ids);
     extract_handlers(&body_cfg, &mut hooks, &mut next_label);
+    extract_ref_commits(&body_cfg, &mut hooks, &mut next_label);
     extract_subscriptions(&mut hooks, &mut next_label);
     Some(HookIR {
         file: value.file.clone(),
@@ -1281,6 +1285,7 @@ pub fn lower_program_with_resolver(
             let (mut hooks, hook_provenance, mut next_label) =
                 extract_hooks(&mut render_cfg, &imports, &ctx.ids);
             extract_handlers(&render_cfg, &mut hooks, &mut next_label);
+            extract_ref_commits(&render_cfg, &mut hooks, &mut next_label);
             extract_subscriptions(&mut hooks, &mut next_label);
             let param = param_names
                 .into_iter()

@@ -279,13 +279,18 @@ fn a_prop_dep_is_versioned_by_the_parent_slot_that_feeds_it() {
 
 // ── The re-run class (#189, #201, #203, #212) ────────────────────────────────
 
-/// The re-run class of the component's only effect.
+/// The re-run class of the component's only effect the source writes (a
+/// host `ref`'s commit is one too, #412).
 fn only_effect_class(c: &AnalysisResult<StateValue>) -> Rerun {
     let effects: Vec<HookLabel> = c
         .hooks
         .iter()
         .filter_map(|h| match h {
-            HookEntry::Effect { label, .. } => Some(*label),
+            HookEntry::Effect {
+                label,
+                host_ref: false,
+                ..
+            } => Some(*label),
             _ => None,
         })
         .collect();

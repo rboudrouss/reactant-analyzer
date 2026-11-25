@@ -424,11 +424,13 @@ fn remap_hook_entry(entry: HookEntry, off: Offsets) -> HookEntry {
             body_cfg,
             deps,
             span,
+            host_ref,
         } => HookEntry::Effect {
             label: label + off.labels,
             body_cfg: remap_cfg(body_cfg, off),
             deps: deps.map_exprs(|e| remap_expr(e, off)),
             span,
+            host_ref,
         },
         HookEntry::Memo {
             label,
@@ -588,6 +590,7 @@ mod tests {
                 ),
                 deps: DepsArg::Absent,
                 span: None,
+                host_ref: false,
             },
         ];
         let remapped = remap_hooks(hooks, Offsets::labels(5));

@@ -48,6 +48,15 @@ impl Rule for MissingDeps {
         let mut diags = Vec::new();
 
         for (label, info) in &result.effect_info {
+            // A host `ref`'s commit call has no deps list of the source's
+            // (#412).
+            if result
+                .hooks
+                .iter()
+                .any(|h| h.label() == *label && !h.written())
+            {
+                continue;
+            }
             if !info.has_deps_array() {
                 // no deps argument → runs every render → no stale capture. A
                 // deps argument the engine cannot read is NOT this case: the

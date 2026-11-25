@@ -918,11 +918,13 @@ pub fn rename_hook_entry(entry: HookEntry, ren: &HashMap<Var, Var>) -> HookEntry
             body_cfg,
             deps,
             span,
+            host_ref,
         } => HookEntry::Effect {
             label,
             body_cfg: rename_vars_cfg(body_cfg, ren),
             deps: deps.map_exprs(|e| rename_vars_expr(e, ren)),
             span,
+            host_ref,
         },
         HookEntry::Memo {
             label,

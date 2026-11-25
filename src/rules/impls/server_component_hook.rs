@@ -77,7 +77,11 @@ fn client_only_hook(entry: &HookEntry, prov: Option<&HookProvenance>) -> Option<
         // surface name produced it (`useReducer` files as `State`,
         // `useLayoutEffect` as `Effect`).
         HookEntry::State { .. } => Some(named("useState")),
-        HookEntry::Effect { .. } => Some(named("useEffect")),
+        HookEntry::Effect {
+            host_ref: false, ..
+        } => Some(named("useEffect")),
+        // A host `ref` is React DOM's call, no hook (#412).
+        HookEntry::Effect { host_ref: true, .. } => None,
         HookEntry::Ref { .. } => Some(named("useRef")),
         // `useMemo` and `useCallback` are in React's server build.
         HookEntry::Memo { .. } | HookEntry::Callback { .. } => None,
