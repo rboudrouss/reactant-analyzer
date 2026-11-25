@@ -1,18 +1,18 @@
 {
-  "total": 6102,
-  "digest": "7f37ac46da75047ed6ce847d13891b53612db40983ef12969aef14e57913516b",
+  "total": 6337,
+  "digest": "8b2c34195d558b1d745788a66c4e4e82e8bfb79e3d904ad87270ec90c3024cc4",
   "by_rule": {
     "always-unstable-deps": 613,
     "conditional-hook": 10,
-    "cross-component-infinite-loop": 310,
-    "cross-setter-in-render": 1198,
+    "cross-component-infinite-loop": 399,
+    "cross-setter-in-render": 1356,
     "frozen-initial-state": 73,
-    "infinite-loop": 544,
+    "infinite-loop": 537,
     "lazy-init": 223,
     "missing-cleanup": 4,
     "missing-deps": 498,
     "redundant-set-state": 5,
-    "setter-in-render": 1750,
+    "setter-in-render": 1745,
     "stale-closure": 1,
     "state-lifted-too-high": 179,
     "state-mutation": 18,
@@ -21,26 +21,26 @@
     "wasted-subtree-render": 479
   },
   "by_repo": {
-    "ai-chatbot": 50,
+    "ai-chatbot": 54,
     "bulletproof-react": 28,
-    "chakra-ui": 373,
+    "chakra-ui": 379,
     "commerce": 5,
-    "dub": 1456,
-    "excalidraw": 111,
-    "mantine": 1711,
-    "memos": 185,
+    "dub": 1473,
+    "excalidraw": 135,
+    "mantine": 1845,
+    "memos": 183,
     "next-shadcn-dashboard-starter": 41,
     "novel": 9,
     "precedent": 1,
     "shadcn-admin": 34,
-    "twenty": 2095,
+    "twenty": 2147,
     "zustand": 3
   },
   "hidden": {
     "ai-chatbot": {
-      "infos": 265,
-      "hand_overs": 21,
-      "setters": 22
+      "infos": 266,
+      "hand_overs": 22,
+      "setters": 40
     },
     "bulletproof-react": {
       "infos": 359,
@@ -58,9 +58,9 @@
       "setters": 2
     },
     "dub": {
-      "infos": 4419,
-      "hand_overs": 331,
-      "setters": 799
+      "infos": 4426,
+      "hand_overs": 337,
+      "setters": 7710
     },
     "excalidraw": {
       "infos": 367,
@@ -68,19 +68,19 @@
       "setters": 8
     },
     "mantine": {
-      "infos": 8988,
+      "infos": 8984,
       "hand_overs": 1,
       "setters": 1
     },
     "memos": {
-      "infos": 672,
-      "hand_overs": 134,
-      "setters": 162
+      "infos": 661,
+      "hand_overs": 123,
+      "setters": 236
     },
     "next-shadcn-dashboard-starter": {
       "infos": 665,
       "hand_overs": 18,
-      "setters": 35
+      "setters": 46
     },
     "novel": {
       "infos": 107,
@@ -98,9 +98,9 @@
       "setters": 32
     },
     "twenty": {
-      "infos": 10833,
-      "hand_overs": 84,
-      "setters": 115
+      "infos": 10836,
+      "hand_overs": 87,
+      "setters": 2745
     },
     "zustand": {
       "infos": 14,
