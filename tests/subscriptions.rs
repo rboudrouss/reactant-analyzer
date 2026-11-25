@@ -350,9 +350,11 @@ fn a_listener_the_program_fires_runs_in_the_slot_fixpoint() {
             .map(|w| w.written.change)
             .collect()
     };
+    // Two rows: the listener's own, and the dispatch's, which runs it where
+    // it is made (#407).
     assert_eq!(
         changes(src),
-        vec![Change::May],
+        vec![Change::May, Change::May],
         "the listener's write moves `v`"
     );
     assert!(infinite_loop_hits(src) > 0, "React loops on this program");

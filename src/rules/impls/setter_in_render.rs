@@ -775,20 +775,17 @@ impl Wording {
 /// `Handler`, `Deferred` or `Cleanup` row is a *proof* of no — a user event
 /// or a known deferring registrar stands between the render pass and the
 /// write. `Unknown` is ⊤ and stays: ⊤ includes the render pass (#130),
-/// except a JSX prop's, ⊤ only because the program dispatches events
-/// (#219): this rule reads it as the event handler it is, as it always did
-/// (`docs/limitations.md`).
+/// except a listener's, ⊤ only because the program dispatches events
+/// (#219), whose writes every dispatch claims where it is made
+/// ([`dispatch_claims`](crate::engine::setters::dispatch_claims), #407).
 pub(crate) fn render_rows(
     comp: &crate::engine::AnalysisResult<crate::domains::StateValue>,
 ) -> impl Iterator<Item = &SlotWriter> {
     comp.slot_writers.iter().filter(|w| {
         w.region == WriterRegion::Render
             && !w.writes_store()
-            && match w.phase {
-                WriterPhase::Render => true,
-                WriterPhase::Unknown => !w.listener,
-                _ => false,
-            }
+            && matches!(w.phase, WriterPhase::Render | WriterPhase::Unknown)
+            && !crate::engine::setters::dispatch_claims(w)
     })
 }
 

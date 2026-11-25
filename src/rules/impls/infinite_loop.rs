@@ -106,10 +106,9 @@ impl Rule for InfiniteLoop {
                 // close the loop: it needs a user event per iteration, which
                 // is the churn graph's own reason for excluding handlers
                 // (#93). A listener ⊤ only because the program dispatches
-                // events (#219) is read as one, as this arm always did.
-                if w.phase == WriterPhase::Handler
-                    || (w.phase == WriterPhase::Unknown && w.listener)
-                {
+                // events (#219) is read as one: every dispatch claims its
+                // writes where it is made (#407).
+                if w.phase == WriterPhase::Handler || crate::engine::setters::dispatch_claims(w) {
                     continue;
                 }
                 // A write of this component's own slot is the churn graph's,

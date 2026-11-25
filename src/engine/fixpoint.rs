@@ -1034,6 +1034,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         iterations: iteration,
         heap,
         calls: std::sync::Arc::new(calls),
+        listeners: Default::default(),
         relations_pending: None,
     };
     // An inter-component analysis may be thrown away (a child re-analysed
@@ -1042,10 +1043,62 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     // do a program's unreached components', whose module rows are the
     // program's (#335).
     match (inter, program.relations_after_all) {
-        (None, false) => compute_relations(&mut result, pending, None, program),
+        (None, false) => {
+            let mut results = [(comp_id, &mut result, pending, None)];
+            compute_program_relations(&mut results, program);
+        }
         _ => result.relations_pending = Some(Box::new(pending)),
     }
     result
+}
+
+/// [`compute_relations`] for every result of `results` (each with its
+/// inputs and the reducer table it registered in), with the listener
+/// positions of all of them (#407).
+///
+/// A dispatch runs every listener of the program it may reach, which is
+/// the positions every walk of the program reads: so every result's
+/// relations are computed once, which records them, and a result whose
+/// walks reached a dispatching call once more, with all of them.
+/// Computing relations writes nothing another result reads, so the second
+/// computation replaces the first.
+fn compute_program_relations(
+    results: &mut [(
+        ComponentId,
+        &mut AnalysisResult<StateValue>,
+        RelationInputs,
+        Option<&crate::engine::ProgramReducers>,
+    )],
+    program: &ProgramFacts,
+) {
+    results.sort_by_key(|(id, ..)| *id);
+    let mut listeners = crate::engine::listeners::Listeners::default();
+    let mut again: Vec<usize> = Vec::new();
+    for (i, (_, result, inputs, reducers)) in results.iter_mut().enumerate() {
+        let heard = compute_relations(result, inputs, *reducers, program);
+        listeners.extend(heard.positions);
+        if heard.dispatch {
+            again.push(i);
+        }
+    }
+    crate::profile::count("listeners:table", listeners.len() as u64);
+    crate::profile::count("listeners:dispatching-results", again.len() as u64);
+    if !again.is_empty() {
+        let _profile = crate::profile::pass("relations:listeners");
+        let owners: HashMap<ComponentId, (&AnalysisResult<StateValue>, bool)> = results
+            .iter()
+            .map(|(id, result, inputs, _)| (*id, (&**result, inputs.dispatches)))
+            .collect();
+        listeners.runs = crate::engine::setters::run_listeners(&listeners, &owners);
+    }
+    let listeners = std::rc::Rc::new(listeners);
+    for (_, result, ..) in results.iter_mut() {
+        result.listeners = std::rc::Rc::clone(&listeners);
+    }
+    for i in again {
+        let (_, result, inputs, reducers) = &mut results[i];
+        compute_relations(result, inputs, *reducers, program);
+    }
 }
 
 /// What [`compute_relations`] needs beyond the converged result: the splice
@@ -1067,20 +1120,26 @@ pub(crate) struct RelationInputs {
 /// component's own hooks fix, so a slot the converged result can name was
 /// registered before the analysis ended (by the analysis that minted its
 /// setter) and reads the same entry at any later point.
+///
+/// A dispatch runs the listener positions of `result.listeners`; what the
+/// walks read of the program's listeners is returned
+/// ([`compute_program_relations`]).
 fn compute_relations(
     result: &mut AnalysisResult<StateValue>,
-    inputs: RelationInputs,
+    inputs: &RelationInputs,
     program_reducers: Option<&crate::engine::ProgramReducers>,
     program: &ProgramFacts,
-) {
+) -> crate::engine::setters::Heard {
     let RelationInputs {
         inline_regions,
         reducers,
         dispatches,
     } = inputs;
+    let dispatches = *dispatches;
     let comp_id = result.component;
     let profile = crate::profile::pass("relations:writers");
-    let reducers = crate::engine::Reducers::registered(comp_id, reducers, program_reducers);
+    let reducers = crate::engine::Reducers::registered(comp_id, reducers.clone(), program_reducers);
+    let listeners = std::rc::Rc::clone(&result.listeners);
     let env_exit = result.exit_env();
     // What every call writes and runs is the call relation's (ADR-047): a
     // write through a parent's setter prop is a row too, owner-qualified
@@ -1099,15 +1158,16 @@ fn compute_relations(
         effect_exits: &result.effect_block_states,
         handler_exits: &result.handler_block_states,
     };
-    let slot_writers = crate::engine::setters::collect_slot_writers(
+    let (slot_writers, heard) = crate::engine::setters::collect_slot_writers(
         &result.render_cfg,
         &result.hooks,
-        &inline_regions,
+        inline_regions,
         &result.hook_provenance,
         &calls,
         &site_envs,
         &reducers,
         dispatches,
+        &listeners,
     );
     // The seed relation rides the same slice: it folds `slot_writers` rows and
     // the effects' declared deps, so it must come after both (#106, ADR-031).
@@ -1164,6 +1224,7 @@ fn compute_relations(
     result.effect_triggers = relation.rows;
     result.effect_reruns = relation.reruns;
     result.effect_props = relation.props;
+    heard
 }
 
 // ── Program-level analysis ────────────────────────────────────────────────────
@@ -1492,12 +1553,18 @@ pub fn analyze_program_defining(
             result.calls = std::sync::Arc::clone(&program_calls);
         }
     }
-    for (id, result) in results.borrow_mut().iter_mut() {
-        if let Some(inputs) = result.relations_pending.take() {
-            // An unreached component registers its reducers nowhere.
-            let reached = phase1_reached.contains(id).then_some(&reducers);
-            compute_relations(result, *inputs, reached, &program);
-        }
+    {
+        let mut results = results.borrow_mut();
+        let mut pending: Vec<_> = results
+            .iter_mut()
+            .filter_map(|(id, result)| {
+                let inputs = result.relations_pending.take()?;
+                // An unreached component registers its reducers nowhere.
+                let reached = phase1_reached.contains(id).then_some(&reducers);
+                Some((*id, result, *inputs, reached))
+            })
+            .collect();
+        compute_program_relations(&mut pending, &program);
     }
 
     let final_stats = stats.into_inner();

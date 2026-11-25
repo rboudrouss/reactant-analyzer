@@ -289,6 +289,9 @@ pub struct AnalysisResult<D: AbstractDomain> {
     /// another's analysis); this analysis's own for a component analysed
     /// alone.
     pub calls: std::sync::Arc<crate::engine::CallRelation>,
+    /// Every listener position of the program (#407), as `calls` is the
+    /// program's: what a dispatch in a body of this component may run.
+    pub(crate) listeners: std::rc::Rc<crate::engine::listeners::Listeners>,
     /// What the relations above (`slot_writers` … `effect_props`) are
     /// computed from, while they are not: an inter-component analysis leaves
     /// them to the program analysis, which computes them for the result it

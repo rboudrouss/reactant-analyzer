@@ -19,6 +19,7 @@ use crate::{
         AnalysisResult,
         calls::{CallRelation, Slot, StmtAt},
         dominance::on_all_paths,
+        listeners::{Events, Listener, Listeners},
         store::STORE_SLOT,
         timing::ArgTiming,
         written::{self, SiteEnvs, Written},
@@ -136,6 +137,62 @@ pub(crate) struct WriterTables<'a> {
     handlers: HashSet<Var>,
     /// What the walks of this component ask of a body alone, once per body.
     facts: BodyFacts,
+    /// The program's listener positions, which a dispatch runs (#407).
+    listeners: &'a Listeners,
+}
+
+/// What one listener runs when a dispatch reaches it (#407), walked once
+/// for the program, in its own component: its rows, in classes relative to
+/// the dispatch's (`Sync` is the dispatch's own), and the events each
+/// dispatch in it fires, with that dispatch's relative class.
+pub(crate) struct ListenerRun {
+    found: Found,
+    nested: Vec<(Events, WalkClass)>,
+}
+
+/// What a dispatch firing some events runs, in some class: every listener
+/// its events may reach, and every listener the events a dispatch in one
+/// of those fires may reach, in that dispatch's class
+/// ([`SetterWalk::dispatched`]).
+pub(crate) struct Dispatched {
+    found: Found,
+    /// The component of the listeners each setter site of `found` was found
+    /// below, in order (`None`: listeners of several).
+    owners: Vec<Option<ComponentId>>,
+}
+
+/// Walk every listener of `listeners` once, in its own component
+/// (`owners`: each component's result and whether the program its walks
+/// read dispatches events) — what [`SetterWalk::dispatched`] combines.
+pub(crate) fn run_listeners(
+    listeners: &Listeners,
+    owners: &HashMap<ComponentId, (&AnalysisResult<StateValue>, bool)>,
+) -> Vec<ListenerRun> {
+    let mut tables: HashMap<ComponentId, WriterTables<'_>> = HashMap::new();
+    listeners
+        .iter()
+        .map(|l| {
+            let Some(&(comp, dispatches)) = owners.get(&l.owner) else {
+                return ListenerRun {
+                    found: Found::default(),
+                    nested: Vec::new(),
+                };
+            };
+            tables
+                .entry(l.owner)
+                .or_insert_with(|| WriterTables::of_result(comp))
+                .run_listener(l, &comp.render_cfg, &comp.calls, dispatches)
+        })
+        .collect()
+}
+
+/// What a walk saw of the program's listeners (#407): every listener
+/// position it read ([`Listeners`]), and whether it reached a call that
+/// dispatches events.
+#[derive(Default)]
+pub(crate) struct Heard {
+    pub positions: Vec<Listener>,
+    pub dispatch: bool,
 }
 
 /// The answers a walk asks of a body that depend on the body alone — its
@@ -200,6 +257,7 @@ impl<'a> WriterTables<'a> {
         hooks: &'a [HookEntry],
         provenance: &[HookProvenance],
         component: ComponentId,
+        listeners: &'a Listeners,
     ) -> Self {
         let mut shadowed: HashSet<Var> = HashSet::new();
         for cfg in std::iter::once(render).chain(hooks.iter().filter_map(|h| h.body_cfg())) {
@@ -229,6 +287,7 @@ impl<'a> WriterTables<'a> {
             callback_bodies: callback_bodies(hooks),
             handlers: crate::lowering::hook_extractor::handler_names(render, hooks),
             facts: BodyFacts::default(),
+            listeners,
         }
     }
 
@@ -239,6 +298,7 @@ impl<'a> WriterTables<'a> {
             &comp.hooks,
             &comp.hook_provenance,
             comp.component,
+            &comp.listeners,
         )
     }
 
@@ -256,20 +316,21 @@ impl<'a> WriterTables<'a> {
     /// ([`SetterWalk::dispatches`]).
     ///
     /// The same walk places the writes of the store (ADR-046), the second
-    /// list.
+    /// list, and records what it saw of the program's listeners, the third.
     pub(crate) fn write_sites(
         &self,
         cfg: &CFG,
         calls: &CallRelation,
         cleanup: Option<crate::ir::types::ExprId>,
         dispatches: bool,
-    ) -> (Vec<WriteSite>, Vec<StoreSite>) {
+    ) -> (Vec<WriteSite>, Vec<StoreSite>, Heard) {
         let channels = Channels {
             stores: true,
             calls: false,
             reads: &NO_VARS,
         };
-        let found = self.walk(cfg, calls, cleanup, dispatches, channels, WALK_DEPTH);
+        let (found, heard, _) =
+            self.walk(cfg, calls, cleanup, dispatches, channels, WALK_DEPTH, None);
         let setters = found
             .setters
             .into_iter()
@@ -293,11 +354,13 @@ impl<'a> WriterTables<'a> {
                 accessor: s.accessor,
             })
             .collect();
-        (setters, found.stores)
+        (setters, found.stores, heard)
     }
 
     /// One walk of `cfg`, recording what `channels` asks besides the setter
-    /// sites, `depth` bodies deep.
+    /// sites, `depth` bodies deep — or, with `run`, of that listener from
+    /// `cfg` ([`Self::run_listener`]), with the dispatches below it.
+    #[allow(clippy::too_many_arguments)]
     fn walk(
         &self,
         cfg: &CFG,
@@ -306,7 +369,8 @@ impl<'a> WriterTables<'a> {
         dispatches: bool,
         channels: Channels<'_>,
         depth: usize,
-    ) -> Found {
+        run: Option<&Listener>,
+    ) -> (Found, Heard, Vec<(Events, WalkClass)>) {
         let mut found = Found::default();
         let wrappers = wrapper_callees(cfg);
         let mut fn_bindings = collect_fn_bindings(cfg);
@@ -357,9 +421,45 @@ impl<'a> WriterTables<'a> {
             listening: false,
             accessor: None,
             facts: &self.facts,
+            listeners: self.listeners,
+            heard: Heard::default(),
+            nested: run.map(|_| Vec::new()),
+            absorbed: HashSet::new(),
         };
-        walk.cfg(cfg, depth, &mut found, WalkClass::Sync, None, None);
-        found
+        match run {
+            None => walk.cfg(cfg, depth, &mut found, WalkClass::Sync, None, None),
+            Some(l) => walk.dispatch_to(l, depth, &mut found, WalkClass::Sync, None, None),
+        }
+        let nested = walk.nested.take().unwrap_or_default();
+        (found, walk.heard, nested)
+    }
+
+    /// What the listener `l` of this component runs when a dispatch
+    /// reaches it ([`ListenerRun`]): its position walked as a dispatch
+    /// walks it, from the render, the dispatches below it recorded instead
+    /// of run.
+    fn run_listener(
+        &self,
+        l: &Listener,
+        render: &CFG,
+        calls: &CallRelation,
+        dispatches: bool,
+    ) -> ListenerRun {
+        let channels = Channels {
+            stores: true,
+            calls: false,
+            reads: &NO_VARS,
+        };
+        let (found, _, nested) = self.walk(
+            render,
+            calls,
+            None,
+            dispatches,
+            channels,
+            WALK_DEPTH,
+            Some(l),
+        );
+        ListenerRun { found, nested }
     }
 }
 
@@ -388,6 +488,27 @@ pub(crate) fn body_writes(comp: &AnalysisResult<StateValue>, body: &CFG) -> Vec<
     WriterTables::of_result(comp)
         .write_sites(body, &comp.calls, None, false)
         .0
+}
+
+/// Is `w` a listener's write that the rules judging the phase it runs in
+/// read as the event handler it is: a row ⊤ only because the program
+/// dispatches events itself (#219, [`SlotWriter::listener`])?
+/// `setter-in-render` and `infinite-loop` skip it.
+///
+/// Sound because every dispatch site claims those writes (#407): wherever a
+/// call may fire an event, the writer walk runs there, in that body's phase,
+/// every listener of the program the event may reach
+/// ([`crate::engine::listeners`]), so a render, an effect or a handler that
+/// dispatches holds those writes as its own rows. Beyond a dispatch, what
+/// runs a marked row runs it as in a program that does not dispatch, where
+/// its timing is an event's: a host element's `on*` prop and an
+/// `addEventListener` argument, both table entries; a host `ref` callback
+/// runs at commit; a seen child's prop runs where the child's own bodies run
+/// it, a listener of the child's (an entry) included. A row the table does
+/// not cover — a value handed to code the analysis does not see — is never
+/// marked: its ⊤ stays.
+pub(crate) fn dispatch_claims(w: &SlotWriter) -> bool {
+    w.phase == WriterPhase::Unknown && w.listener
 }
 
 /// One setter a variable may denote. A may fact only: whether a call through
@@ -1671,7 +1792,8 @@ pub(crate) fn collect_slot_writers(
     envs: &SiteEnvs<'_>,
     reducers: &crate::engine::Reducers<'_>,
     dispatches: bool,
-) -> Vec<SlotWriter> {
+    listeners: &Listeners,
+) -> (Vec<SlotWriter>, Heard) {
     // What every call writes and runs is the call relation's (ADR-047): a
     // site is keyed by the slot it writes, with its owner, whatever name it
     // is spelled with, and a call through a value two contexts bind to two
@@ -1704,8 +1826,15 @@ pub(crate) fn collect_slot_writers(
 
     // The syntax tables every walk of the component reads.
     let profile = crate::profile::phase("writers:tables");
-    let tables = WriterTables::of(render_cfg, hooks, hook_provenance, envs.component);
+    let tables = WriterTables::of(
+        render_cfg,
+        hooks,
+        hook_provenance,
+        envs.component,
+        listeners,
+    );
     drop(profile);
+    let heard = RefCell::new(Heard::default());
 
     // A write reached through a function name is authored where that function
     // is defined, and a name can carry a closure out of the region it was
@@ -1756,7 +1885,12 @@ pub(crate) fn collect_slot_writers(
             _ => None,
         };
         let profile = crate::profile::phase("writers:sites");
-        let (mut sites, store_sites) = tables.write_sites(cfg, calls, cleanup, dispatches);
+        let (mut sites, store_sites, seen) = tables.write_sites(cfg, calls, cleanup, dispatches);
+        {
+            let mut heard = heard.borrow_mut();
+            heard.positions.extend(seen.positions);
+            heard.dispatch |= seen.dispatch;
+        }
         drop(profile);
         let _rows = crate::profile::phase("writers:rows");
         // One source site is one row. A local helper called twice pulls its
@@ -1970,7 +2104,7 @@ pub(crate) fn collect_slot_writers(
     stores.sort_by_key(key);
     stores.dedup_by(|a, b| key(a) == key(b) && a.via == b.via && a.block == b.block);
     out.extend(stores);
-    out
+    (out, heard.into_inner())
 }
 
 /// Threads the walk's fixed context (`setter_vars`, `fn_bindings`) and its
@@ -2073,7 +2207,32 @@ struct SetterWalk<'a> {
     accessor: Option<AccessorOf>,
     /// The component's [`BodyFacts`], shared by its walks.
     facts: &'a BodyFacts,
+    /// The program's listener positions: what a dispatching call runs
+    /// (#407).
+    listeners: &'a Listeners,
+    /// The listener positions this walk read, and whether it reached a
+    /// dispatching call.
+    heard: Heard,
+    /// The walk runs a listener for a dispatch ([`ListenerRun`]): the
+    /// events a dispatch below fires, and its class, which the dispatch
+    /// that reached the listener runs too.
+    nested: Option<Vec<(Events, WalkClass)>>,
+    /// The dispatches whose rows this walk holds ([`DispatchAt`]).
+    absorbed: HashSet<DispatchAt>,
 }
+
+/// A dispatch's events and class, the block of the region it runs from,
+/// and the walk's context there (repeating, listening, in an accessor, the
+/// names gone through): what the rows it adds depend on.
+type DispatchAt = (
+    Events,
+    WalkClass,
+    Option<BlockId>,
+    bool,
+    bool,
+    bool,
+    Vec<Var>,
+);
 
 /// A body on the walk's stack.
 struct Scope<'a> {
@@ -2429,6 +2588,7 @@ pub(crate) struct StoreSite {
 }
 
 /// One raw read site of a tracked binding the walk saw (#127).
+#[derive(Clone)]
 struct FoundRead {
     var: Var,
     class: WalkClass,
@@ -2436,6 +2596,7 @@ struct FoundRead {
 }
 
 /// One raw non-setter call site the walk saw (#126).
+#[derive(Clone)]
 struct FoundCall {
     name: String,
     receiver: Option<String>,
@@ -2444,6 +2605,7 @@ struct FoundCall {
 }
 
 /// One raw call site the walk saw.
+#[derive(Clone)]
 struct FoundSite {
     var: Var,
     /// `var` spells a value that reaches the setter — an object holding
@@ -3207,7 +3369,13 @@ impl<'a> SetterWalk<'a> {
             // A member of a package hook's result the timing table knows
             // (`register(name, { onChange })`) runs that argument at its time.
             let member = self.tables.result_member_timing(fn_);
+            let registers = listener || self.registers_listener(fn_);
             for (i, arg) in args.iter().enumerate() {
+                // What an event registrar is handed is a listener a dispatch
+                // runs (#407), reified or not.
+                if registers {
+                    self.hear((*id, i), arg, None, Events::named(args.first()));
+                }
                 if reified && i == 1 {
                     continue;
                 }
@@ -3241,8 +3409,7 @@ impl<'a> SetterWalk<'a> {
                 // A listener is ⊤ only because the program dispatches
                 // events (#219): its rows say so.
                 let outer_listening = self.listening;
-                self.listening |=
-                    self.dispatches && (listener && i == 1 || self.registers_listener(fn_));
+                self.listening |= self.dispatches && registers;
                 self.relation_handed(
                     Some((*id, i)),
                     arg,
@@ -3258,33 +3425,43 @@ impl<'a> SetterWalk<'a> {
             }
         }
         // A call that fires events (`ref.current.click()`, `dispatchEvent`)
-        // runs the component's JSX handlers of that event before it returns,
-        // or all of them when the name is not known: their writes are
-        // possible writes of this call, in its class (#277), as a registered
+        // runs, before it returns, every listener of the program its events
+        // may reach, in any component (#277, #407): their writes are
+        // possible writes of this call, in its class, as a registered
         // listener's are in a dispatching program (#250). Never placed: the
-        // dispatch may reach none of them.
+        // dispatch may reach none of them. This is what makes a listener's
+        // ⊤ readable as an event's ([`dispatch_claims`]). A dispatch at
+        // event time runs them at event time, which is what each listener's
+        // own row says: it adds nothing of another time. Nor does one in a
+        // listener read as ⊤ only because the program dispatches: its rows
+        // would be that listener's, which the rules read as an event's, and
+        // every dispatch that reaches the listener runs this one too
+        // ([`ListenerRun`]).
         if let Expr::Call { fn_, args, .. } | Expr::New { fn_, args, .. } = expr
-            && let Some(event) = crate::engine::registrations::dispatched_event(fn_, args)
+            && let Some(fired) = crate::engine::listeners::fired_events(fn_, args)
             && depth > 0
+            && mode != WalkClass::Handler
         {
-            for hook in self.tables.hooks {
-                if let HookEntry::Handler {
-                    event: e, body_cfg, ..
-                } = hook
-                    && event.as_deref().is_none_or(|n| n == e)
-                {
-                    let mut inner = Found::default();
-                    self.enter(
-                        body_cfg,
-                        None,
-                        Reached::Named,
-                        depth - 1,
-                        &mut inner,
+            match &mut self.nested {
+                Some(nested) => nested.push((fired, mode)),
+                None if self.listening && matches!(mode, WalkClass::Unknown(_)) => {}
+                None => {
+                    self.heard.dispatch = true;
+                    // The same dispatch from the same block of the region,
+                    // in the same context, holds the same rows.
+                    let at: DispatchAt = (
+                        fired.clone(),
                         mode,
                         prov,
-                        stmt_span,
+                        self.repeating,
+                        self.listening,
+                        self.accessor.is_some(),
+                        self.path.clone(),
                     );
-                    found.absorb(inner, body_cfg, mode, None, prov, self.facts);
+                    if self.absorbed.insert(at) {
+                        let ran = self.dispatched(fired, mode);
+                        self.absorb_dispatched(&ran, found, prov, stmt_span);
+                    }
                 }
             }
         }
@@ -3326,6 +3503,12 @@ impl<'a> SetterWalk<'a> {
             for (i, (name, val)) in fields.iter().enumerate() {
                 if !crate::lowering::hook_extractor::invoked_prop(native, name) {
                     continue;
+                }
+                // A host element's `on*` prop is a listener a dispatch runs
+                // (#407), whatever it holds: a literal reified as a handler
+                // region, a setter, a prop.
+                if native && crate::lowering::hook_extractor::is_event_prop(name) {
+                    self.hear((*id, i), val, None, Events::of_prop(name));
                 }
                 // A literal there, or a name the render binds to one or to a
                 // `useCallback`, is a handler region of its own
@@ -3574,6 +3757,7 @@ impl<'a> SetterWalk<'a> {
             self.handed_row(
                 handed,
                 false,
+                true,
                 via,
                 WalkClass::UNKNOWN,
                 None,
@@ -3695,17 +3879,226 @@ impl<'a> SetterWalk<'a> {
         // what `arg` spells reaches, never is.
         let module = anchor.is_some_and(|(a, _)| crate::engine::ModuleScope::is_anchor(a));
         self.handed_row(
-            row, module, arg, class, placed, depth, found, prov, stmt_span,
+            row, module, true, arg, class, placed, depth, found, prov, stmt_span,
         );
     }
 
+    /// Record the listener position `anchor` holding `value` (`member`: the
+    /// one literal of an options object there that is the listener), which
+    /// hears `hears` (#407).
+    fn hear(
+        &mut self,
+        anchor: (crate::ir::types::ExprId, usize),
+        value: &Expr,
+        member: Option<crate::ir::types::ExprId>,
+        hears: Events,
+    ) {
+        self.heard.positions.push(Listener {
+            owner: self.tables.component,
+            anchor,
+            value: value.clone(),
+            member,
+            hears,
+        });
+    }
+
+    /// What a dispatch firing `fired` in class `mode` runs (#407): every
+    /// listener its events may reach, and every listener the events a
+    /// dispatch in one of those fires may reach, in the class of that
+    /// dispatch, until no dispatch adds one — each listener once per class.
+    /// A dispatch at event time adds nothing (the dispatch block). The
+    /// program's listeners were each walked once ([`ListenerRun`]); this
+    /// combines them, once per events and class for the program.
+    fn dispatched(&self, fired: Events, mode: WalkClass) -> Rc<Dispatched> {
+        let listeners: &'a Listeners = self.listeners;
+        let key = (fired, mode);
+        if let Some(ran) = listeners.dispatched.borrow().get(&key) {
+            return Rc::clone(ran);
+        }
+        let _profile = crate::profile::phase("writers:dispatch");
+        crate::profile::count("dispatch:closures", 1);
+        let mut found = Found::default();
+        let mut owners: Vec<Option<ComponentId>> = Vec::new();
+        // One source site is one row, as `dedup_source_sites` makes it: a
+        // write two listeners reach is reached twice, co-execution.
+        let mut sites: HashMap<(Slot, SourceRange, WalkClass), usize> = HashMap::new();
+        let mut ran: HashSet<(usize, WalkClass)> = HashSet::new();
+        let mut queue = vec![key.clone()];
+        while let Some((events, class)) = queue.pop() {
+            for (i, l) in listeners.reached_by(&events) {
+                let Some(run) = listeners.runs.get(i) else {
+                    continue;
+                };
+                if !ran.insert((i, class)) {
+                    continue;
+                }
+                crate::profile::count("dispatch:listeners-run", 1);
+                for site in &run.found.setters {
+                    let class = site.class.under(class);
+                    if let Some(span) = site.span {
+                        let key = (site.slot, span, class.kind());
+                        if let Some(&i) = sites.get(&key) {
+                            let kept: &mut FoundSite = &mut found.setters[i];
+                            kept.repeats = true;
+                            kept.listener &= site.listener;
+                            kept.class = kept.class.join(class);
+                            if owners[i] != Some(l.owner) {
+                                owners[i] = None;
+                            }
+                            continue;
+                        }
+                        sites.insert(key, found.setters.len());
+                    }
+                    found.setters.push(FoundSite {
+                        class,
+                        ..site.clone()
+                    });
+                    owners.push(Some(l.owner));
+                }
+                for store in &run.found.stores {
+                    found.stores.push(StoreSite {
+                        class: store.class.under(class),
+                        ..store.clone()
+                    });
+                }
+                for (events, at) in &run.nested {
+                    let at = at.under(class);
+                    if at != WalkClass::Handler {
+                        queue.push((events.clone(), at));
+                    }
+                }
+            }
+        }
+        let ran = Rc::new(Dispatched { found, owners });
+        listeners
+            .dispatched
+            .borrow_mut()
+            .insert(key, Rc::clone(&ran));
+        ran
+    }
+
+    /// Splice in, at a dispatching call, what [`Self::dispatched`] ran:
+    /// never placed, at the call's position where a site has none of its
+    /// own, below the names the walk went through, and reading no name of
+    /// the region — the listener a dispatch runs is the one of the last
+    /// commit, whose captures may be another render's ([`Foreign::All`]).
+    fn absorb_dispatched(
+        &self,
+        ran: &Dispatched,
+        found: &mut Found,
+        prov: Option<BlockId>,
+        stmt_span: Option<SourceRange>,
+    ) {
+        let owners = &ran.owners;
+        let ran = &ran.found;
+        crate::profile::count("dispatch:sites", 1);
+        crate::profile::count("dispatch:rows", ran.setters.len() as u64);
+        let through = |own: &[Var]| -> Vec<Var> { self.path.iter().chain(own).cloned().collect() };
+        for (site, owner) in ran.setters.iter().zip(owners) {
+            // A name of another component's listener is no name here: the
+            // row is named by its slot (#310).
+            let (var, carried) = match *owner == Some(self.tables.component) {
+                true => (site.var.clone(), site.carried),
+                false => (Var::new(), false),
+            };
+            found.setters.push(FoundSite {
+                var,
+                carried,
+                span: site.span.or(stmt_span),
+                prov_block: prov,
+                at: None,
+                own: None,
+                foreign: Foreign::All,
+                through: through(&site.through),
+                repeats: site.repeats || self.repeating,
+                listener: site.listener || self.listening,
+                accessor: site.accessor.clone().or_else(|| self.accessor.clone()),
+                ..site.clone()
+            });
+        }
+        for call in &ran.calls {
+            found.calls.push(FoundCall {
+                span: call.span.or(stmt_span),
+                ..call.clone()
+            });
+        }
+        for read in &ran.reads {
+            found.reads.push(FoundRead {
+                span: read.span.or(stmt_span),
+                ..read.clone()
+            });
+        }
+        for store in &ran.stores {
+            found.stores.push(StoreSite {
+                span: store.span.or(stmt_span),
+                prov_block: prov,
+                at: None,
+                through: through(&store.through),
+                repeats: store.repeats || self.repeating,
+                ..store.clone()
+            });
+        }
+    }
+
+    /// Run the listener `l` at a dispatching call, in its `mode` (#407):
+    /// what the relation says its position holds is handed to the call, as
+    /// a value is to a callee that calls it, and a body there runs there.
+    /// The value is written elsewhere — in another body of this component
+    /// or in another component — so a literal there is reached as a body of
+    /// its own.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_to(
+        &mut self,
+        l: &'a Listener,
+        depth: usize,
+        found: &mut Found,
+        mode: WalkClass,
+        prov: Option<BlockId>,
+        stmt_span: Option<SourceRange>,
+    ) {
+        let calls = self.calls;
+        let (anchor, pos) = l.anchor;
+        let Some(site) = l.member else {
+            let Some(row) = calls.escapes(anchor, pos) else {
+                return;
+            };
+            let module = crate::engine::ModuleScope::is_anchor(anchor);
+            self.handed_row(
+                row, module, false, &l.value, mode, None, depth, found, prov, stmt_span,
+            );
+            return;
+        };
+        let Some(body) = calls.body(site) else {
+            return;
+        };
+        let reached = match self.of_other_component(site) {
+            true => Reached::Other,
+            false => Reached::Named,
+        };
+        let mut inner = Found::default();
+        self.enter(
+            body,
+            Some(site),
+            reached,
+            depth - 1,
+            &mut inner,
+            mode,
+            prov,
+            stmt_span,
+        );
+        found.absorb(inner, body, mode, None, prov, self.facts);
+    }
+
     /// [`Self::relation_handed`] for the row `row` of what `arg` handed;
-    /// `module`: the row is a module binding's own.
+    /// `module`: the row is a module binding's own; `inline`: `arg` is
+    /// written in the body the walk is in, so a literal there is that body's
+    /// (not so for a listener a dispatch runs, #407).
     #[allow(clippy::too_many_arguments)]
     fn handed_row(
         &mut self,
         row: &'a crate::engine::calls::Escapes,
         module: bool,
+        inline: bool,
         arg: &'a Expr,
         class: WalkClass,
         placed: Option<(BlockId, usize)>,
@@ -3763,7 +4156,9 @@ impl<'a> SetterWalk<'a> {
             // off the relation ([`Self::past_budget`]).
             let cost = 1;
             let (reached, here) = match arg.peel_ts() {
-                Expr::FnLit { id, params, .. } if *id == site => (Reached::Inline(params), true),
+                Expr::FnLit { id, params, .. } if *id == site && inline => {
+                    (Reached::Inline(params), true)
+                }
                 _ if self.of_other_component(site) => (Reached::Other, false),
                 _ => (Reached::Named, false),
             };
@@ -3828,6 +4223,10 @@ impl<'a> SetterWalk<'a> {
             (timing, arg.peel_ts())
         else {
             let class = self.timing_class(timing, handover);
+            // What a package's DOM listener runs, a dispatch runs (#407).
+            if timing == Some(ArgTiming::Listener) {
+                self.hear(anchor, arg, None, Events::Any);
+            }
             self.relation_handed(
                 Some(anchor),
                 arg,
@@ -3855,7 +4254,11 @@ impl<'a> SetterWalk<'a> {
                 && depth > 0
             {
                 timed.insert(*id);
-                let class = self.timing_class(t.member(name), handover);
+                let timing = t.member(name);
+                let class = self.timing_class(timing, handover);
+                if timing == Some(ArgTiming::Listener) {
+                    self.hear(anchor, arg, Some(*id), Events::Any);
+                }
                 let mut inner = Found::default();
                 self.enter(
                     body_cfg,
@@ -4043,7 +4446,7 @@ pub fn collect_slot_reads(comp: &AnalysisResult<StateValue>) -> Vec<SlotRead> {
             WriterRegion::Effect(l) => Some(comp.component.hook_site(l)),
             _ => None,
         };
-        let found = tables.walk(cfg, &comp.calls, cleanup, false, channels, 2);
+        let (found, ..) = tables.walk(cfg, &comp.calls, cleanup, false, channels, 2, None);
         for r in found.reads {
             let Some(&slot) = labels.get(&r.var) else {
                 continue;
@@ -4104,8 +4507,15 @@ pub fn collect_body_calls(
         WriterRegion::Effect(l) => Some(comp.component.hook_site(l)),
         _ => None,
     };
-    let found =
-        WriterTables::of_result(comp).walk(cfg, &comp.calls, cleanup, false, channels, WALK_DEPTH);
+    let (found, ..) = WriterTables::of_result(comp).walk(
+        cfg,
+        &comp.calls,
+        cleanup,
+        false,
+        channels,
+        WALK_DEPTH,
+        None,
+    );
     let mut rows: Vec<BodyCall> = found
         .calls
         .into_iter()

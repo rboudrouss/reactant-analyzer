@@ -151,7 +151,9 @@ that writes it (see *Cross-file limits*).
   name. `setter-in-render` and the cross-component arm read a JSX prop's or a registered
   listener's write as the event handler it is even in a program that dispatches events itself,
   where the loop rules read it as ⊤ ([#219](https://github.com/rboudrouss/reactant-analyzer/issues/219)):
-  a render that dispatches an event to such a listener is not their finding. Only React DOM's
+  a render or an effect that dispatches an event to such a listener holds the listener's writes
+  as its own, at the dispatching call, which is where they report it
+  ([#407](https://github.com/rboudrouss/reactant-analyzer/issues/407)). Only React DOM's
   handlers are listeners by default: a host element's `on*` prop, and a component's prop where
   the analysis runs the component, whose own bodies say when it calls it. A child component the
   analysis does not see — a package's, an element value it does not resolve, a name several files
@@ -664,11 +666,22 @@ carries an Error.
   program the fixpoint runs every listener where it is registered, as it runs a timer callback, so
   the slot a listener writes moves with its writes, a listener passed by name included
   [#250](https://github.com/rboudrouss/reactant-analyzer/issues/250). A dispatch
-  hidden in an opaque callee is not seen. A dispatching call runs the component's own JSX
-  handlers of the event it fires (`click()` its `onClick`s, a `dispatchEvent` of an event whose
-  name is not a literal all of them) where it is made, as possible writes of that body [#277](https://github.com/rboudrouss/reactant-analyzer/issues/277);
-  another component's handlers, reached by bubbling or through a ref handed down, stay
-  event-only. The program's test
+  hidden in an opaque callee is not seen. A dispatching call runs, where it is made and as
+  possible writes of that body, every listener of the program its event may reach
+  [#277](https://github.com/rboudrouss/reactant-analyzer/issues/277),
+  [#407](https://github.com/rboudrouss/reactant-analyzer/issues/407): every host element's `on*`
+  prop whatever it holds, in any component (bubbling and capture reach ancestors, a ref handed
+  down reaches a child's element), every `addEventListener` argument and every package hook
+  argument timed as a listener. The target is not resolved, so a dispatch reaches the listeners
+  of its event on every element. The event is: a listener hears what it is registered for (an
+  `on*` prop the native events React DOM registers it for — `onChange` hears `click`, `focusin`
+  and `focusout` among others —, an `addEventListener` the literal it names, any event for a name
+  that is not a literal, a package hook's listener any event), and a dispatch fires the focus
+  events and `change` for `focus()` and `blur()`, the one event a `dispatchEvent(new XEvent("x"))`
+  names other than `click`, and any event otherwise (a click's activation behaviour submits,
+  toggles and opens, firing events of its own). So a `focus()` in an effect reaches every
+  `onChange` of the program: React never runs one for it in a browser with the `input` event,
+  which the analysis does not assume. The program's test
   files are not read (`*.test.*`, `*.spec.*` are no source files to the walk), so a dispatch there
   makes nothing ⊤.
 - **`frozen-initial-state`** still fires on a child remounted by machinery it cannot see: a dialog

@@ -10,6 +10,7 @@ pub mod fixpoint;
 pub mod function_registry;
 pub mod guards;
 pub mod hook_registry;
+pub(crate) mod listeners;
 pub mod module_scope;
 pub mod program_relations;
 pub mod program_result;

@@ -379,7 +379,7 @@ impl<'a> EntityCtx<'a> {
         };
         let cleanup = matches!(region_of(row), WriterRegion::Effect(_))
             .then(|| self.comp.component.hook_site(row.info.label));
-        let (mut sites, _) = crate::engine::setters::WriterTables::of_result(self.comp)
+        let (mut sites, _, _) = crate::engine::setters::WriterTables::of_result(self.comp)
             .write_sites(body, &self.comp.calls, cleanup, false);
         sites.retain(|s| s.slot.0 == self.comp.component);
         sites.sort_by_key(|s| s.class);

@@ -760,6 +760,24 @@ on a program React settles; 323 oracle cases, none a known false negative.
   no longer runs for `modals[ctx]`), the other 7 small repos unchanged;
   dub 1,437 → 1,419 measured before what a hook's body builds was read as
   remounting, twenty to be measured (#392).
+- A call that dispatches events (`ref.current.click()`, `focus()`,
+  `dispatchEvent`) runs, where it is made and in that body's phase, every
+  listener of the program its event may reach: a host element's `on*` prop
+  whatever it holds (a setter, a prop, a call result), in any component (an
+  ancestor's the event bubbles to), an `addEventListener` argument, a package
+  hook's argument timed as a listener (`useOnClickOutside`). Before, it ran
+  only the dispatching component's own handler literals, so a render or an
+  effect that clicked a button whose `onClick` is a setter, a parent's
+  setter handed down or a parent's handler was silent although React loops.
+  A listener hears what React DOM registers its prop for (`onChange` hears
+  `click`); a `click()` or `requestSubmit()` fires any event, `focus()` and
+  `blur()` the focus events and `change`. Oracle: 9 new cases, 5 `fn` of the
+  base now `tp`, 1 `tn` now a tolerated `fp`. Shown rows: mantine 1,711 →
+  17,762 (a `focus()` in code handed to a callee with no timing summary, in
+  each of ~120 demos, reaches every `onChange` and `onFocus` setter of the
+  program), excalidraw 111 → 343, memos 185 → 220, ai-chatbot 50 → 79,
+  chakra-ui 373 → 385, next-shadcn-dashboard-starter 41 → 42, the other 6
+  small repos unchanged; mantine's run takes 321 s instead of 175 s (#407).
 - A function handed as a prop to a child component the analysis does not see
   (a package's component, an element value it does not resolve, a name several
   files define, a component rendering itself, a context provider's `value`)
