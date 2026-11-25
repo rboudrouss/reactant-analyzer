@@ -785,6 +785,9 @@ on a program React settles; 323 oracle cases, none a known false negative.
   and every setter in `setters`; an effect's call is one
   `cross-component-infinite-loop` row. Each write is still judged on its own
   first (#407).
+- A call the analysis resolves to program bodies alone is no dispatch,
+  whatever its name: a program object's `emit` or `focus` runs those bodies,
+  and fires events only through a dispatch in them (#407).
 - A function handed as a prop to a child component the analysis does not see
   (a package's component, an element value it does not resolve, a name several
   files define, a component rendering itself, a context provider's `value`)

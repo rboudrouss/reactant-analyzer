@@ -3457,10 +3457,18 @@ impl<'a> SetterWalk<'a> {
         // would be that listener's, which the rules read as an event's, and
         // every dispatch that reaches the listener runs this one too
         // ([`ListenerRun`]).
-        if let Expr::Call { fn_, args, .. } | Expr::New { fn_, args, .. } = expr
+        //
+        // A call the relation resolves to program bodies (or setters) alone
+        // is no dispatch, whatever its name (a program object's `emit`): it
+        // runs those bodies, which the walk follows, and fires an event only
+        // through a dispatch in them, which it sees there (#407).
+        if let Expr::Call { id, fn_, args } | Expr::New { id, fn_, args, .. } = expr
             && let Some(fired) = crate::engine::listeners::fired_events(fn_, args)
             && depth > 0
             && mode != WalkClass::Handler
+            && !self.calls.targets(*id).is_some_and(|t| {
+                !t.open && !t.module && !(t.bodies.is_empty() && t.setters.is_empty())
+            })
         {
             match &mut self.nested {
                 Some(nested) => nested.push((fired, mode)),
