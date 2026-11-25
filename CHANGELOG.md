@@ -771,11 +771,12 @@ on a program React settles; 323 oracle cases, none a known false negative.
   setter handed down or a parent's handler was silent although React loops.
   A listener hears what React DOM registers its prop for (`onChange` hears
   `click`); a `click()` or `requestSubmit()` fires any event, `focus()` and
-  `blur()` the focus events and `change`. Oracle: 9 new cases, 5 `fn` of the
-  base now `tp`, 1 `tn` now a tolerated `fp`. Shown rows: mantine 1,711 →
-  17,762 (a `focus()` in code handed to a callee with no timing summary, in
-  each of ~120 demos, reaches every `onChange` and `onFocus` setter of the
-  program), excalidraw 111 → 343, memos 185 → 220, ai-chatbot 50 → 79,
+  `blur()` the focus events and `change`. Oracle: 9 new cases, 4 `fn` of the
+  base now `tp`, 1 `tn` now a tolerated `fp`. Shown rows: twenty 2,094 →
+  17,606, dub 1,394 → 2,345, mantine 1,711 → 17,762 (a `focus()` in code
+  handed to a callee with no timing summary, in each of ~120 demos, reaches
+  every `onChange` and `onFocus` setter of the program), excalidraw 111 →
+  343, memos 185 → 220, ai-chatbot 50 → 79,
   chakra-ui 373 → 385, next-shadcn-dashboard-starter 41 → 42, the other 6
   small repos unchanged; mantine's run takes 321 s instead of 175 s (#407).
 - A function handed as a prop to a child component the analysis does not see
