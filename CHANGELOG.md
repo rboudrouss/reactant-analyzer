@@ -802,6 +802,10 @@ on a program React settles; 323 oracle cases, none a known false negative.
 - An event name written through a module-level `const` string of the same
   file (`addEventListener(PING, h)`, `dispatchEvent(new Event(PONG))`) is
   that string, so the listener hears that event only (#407).
+- A `focus()` or `blur()` on a ref the component binds only to its own host
+  elements fires its focus events at that element: an `onFocus` on a leaf
+  element elsewhere (an input of another component) is no longer reached; the
+  blur of a `focus()` still reaches every `onBlur` (#407).
 - A function handed as a prop to a child component the analysis does not see
   (a package's component, an element value it does not resolve, a name several
   files define, a component rendering itself, a context provider's `value`)

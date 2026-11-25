@@ -338,6 +338,35 @@ pub(crate) fn fired_events(fn_: &Expr, args: &[Expr], consts: Consts<'_>) -> Opt
     })
 }
 
+/// What the call `node.method()` fires, `fired` its events
+/// ([`fired_events`]), when the analysis knows `node` is one of the host
+/// elements `targets` (props sites, sorted):
+///
+/// - `focus()` runs the focus update steps (HTML Standard, "focus update
+///   steps"): `blur` and `focusout` at the element that held the focus — any
+///   element of the page, so they reach anywhere, with the `change` of an
+///   edited control — then `focus` and `focusin` at the target, which reach
+///   its propagation path only.
+/// - `blur()` runs the unfocusing steps: `blur` and `focusout` at the
+///   target, and the focus moves to the viewport (the body), which is no
+///   element of the program: nothing fires anywhere else.
+/// - Any other call keeps every listener: a click's activation behaviour
+///   fires events at the form, a label's control, a popover's or command's
+///   target, none of which is on the target's path.
+pub(crate) fn on_node(method: &str, fired: Events, mut targets: Vec<ExprId>) -> Fired {
+    targets.sort();
+    targets.dedup();
+    let elsewhere = match method {
+        "focus" => Events::of(&["blur", "focusout", BLUR_CHANGE]),
+        "blur" => Events::Of(Vec::new()),
+        _ => return Fired::anywhere(fired),
+    };
+    Fired {
+        events: fired,
+        narrowed: Some((elsewhere, targets)),
+    }
+}
+
 /// One listener position ([module docs](self)).
 #[derive(Debug, Clone)]
 pub(crate) struct Listener {
@@ -355,6 +384,46 @@ pub(crate) struct Listener {
     pub member: Option<ExprId>,
     /// The events it hears.
     pub hears: Events,
+    /// A host element's `on*` prop: the element's props allocation site, and
+    /// whether it is a leaf — no child but literal text, no spread, no
+    /// `children` prop — which contains no other node ([`Fired::narrowed`]).
+    pub element: Option<(ExprId, bool)>,
+}
+
+/// What a dispatching call fires, and where (#407).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct Fired {
+    /// The events it fires.
+    pub events: Events,
+    /// A dispatch on a node the analysis knows — one of these host
+    /// elements, by props site, sorted — fires `events` on that node's
+    /// propagation path, and only the first set anywhere else. An event on a
+    /// node reaches only that node, its ancestors, the document and the
+    /// window (DOM Standard, "dispatch", the event path); a leaf element
+    /// contains no node, so a leaf that is not the target is on no path but
+    /// its own: its listeners hear only what fires anywhere.
+    pub narrowed: Option<(Events, Vec<ExprId>)>,
+}
+
+impl Fired {
+    /// `events` fired where the analysis does not know the target.
+    pub(crate) fn anywhere(events: Events) -> Fired {
+        Fired {
+            events,
+            narrowed: None,
+        }
+    }
+
+    /// Does `l` hear any of it?
+    fn reaches(&self, l: &Listener) -> bool {
+        l.hears.meets(&self.events)
+            && match (&self.narrowed, l.element) {
+                (Some((elsewhere, targets)), Some((site, true))) if !targets.contains(&site) => {
+                    l.hears.meets(elsewhere)
+                }
+                _ => true,
+            }
+    }
 }
 
 /// Every listener position of the program the writer walks read, once each,
@@ -366,7 +435,7 @@ pub struct Listeners {
     /// What each position runs, by index ([`crate::engine::setters::run_listeners`]).
     pub(crate) runs: Vec<ListenerRun>,
     /// What a dispatch of these events in this class runs, once per program.
-    pub(crate) dispatched: RefCell<HashMap<(Events, WalkClass), Rc<Dispatched>>>,
+    pub(crate) dispatched: RefCell<HashMap<(Fired, WalkClass), Rc<Dispatched>>>,
 }
 
 impl std::fmt::Debug for Listeners {
@@ -394,11 +463,11 @@ impl Listeners {
     }
 
     /// The listeners a dispatch firing `fired` may reach, with their index.
-    pub(crate) fn reached_by(&self, fired: &Events) -> Vec<(usize, &Listener)> {
+    pub(crate) fn reached_by(&self, fired: &Fired) -> Vec<(usize, &Listener)> {
         self.list
             .iter()
             .enumerate()
-            .filter(|(_, l)| l.hears.meets(fired))
+            .filter(|(_, l)| fired.reaches(l))
             .collect()
     }
 
@@ -436,8 +505,14 @@ mod tests {
             obj: Box::new(Expr::Var("el".into())),
             field: field.into(),
         };
-        assert_eq!(fired_events(&call("click"), &[], &no_consts), Some(Events::Any));
-        assert_eq!(fired_events(&call("requestSubmit"), &[], &no_consts), Some(Events::Any));
+        assert_eq!(
+            fired_events(&call("click"), &[], &no_consts),
+            Some(Events::Any)
+        );
+        assert_eq!(
+            fired_events(&call("requestSubmit"), &[], &no_consts),
+            Some(Events::Any)
+        );
         let focus = fired_events(&call("focus"), &[], &no_consts).unwrap();
         assert!(focus.meets(&Events::of_prop("onFocus")));
         assert!(focus.meets(&Events::of_prop("onBlur")));
@@ -453,7 +528,10 @@ mod tests {
     fn a_module_const_names_its_event() {
         let consts = |v: &str| (v == "KEYDOWN").then(|| "keydown".to_string());
         let name = Expr::Var("KEYDOWN".into());
-        assert_eq!(Events::named(Some(&name), &consts), Events::of(&["keydown"]));
+        assert_eq!(
+            Events::named(Some(&name), &consts),
+            Events::of(&["keydown"])
+        );
         assert_eq!(Events::named(Some(&name), &no_consts), Events::Any);
     }
 }

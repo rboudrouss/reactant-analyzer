@@ -672,8 +672,15 @@ carries an Error.
   [#407](https://github.com/rboudrouss/reactant-analyzer/issues/407): every host element's `on*`
   prop whatever it holds, in any component (bubbling and capture reach ancestors, a ref handed
   down reaches a child's element), every `addEventListener` argument and every package hook
-  argument timed as a listener. The target is not resolved, so a dispatch reaches the listeners
-  of its event on every element. The event is: a listener hears what it is registered for (an
+  argument timed as a listener. The target is resolved in one case: a `focus()` or `blur()` on
+  `r.current`, where `r` is a `useRef` the component binds only to its own host elements
+  (`ref={r}`, and otherwise only `r.current` reads). Its focus-side events then reach no leaf
+  element (no child but text, no spread, no `children`) that is not one of those elements, as
+  an event reaches only its target's propagation path; the blur side of a `focus()` still
+  reaches every listener, since the element that held the focus may be any. Every other
+  dispatch reaches the listeners of its event on every element: a component's ancestors are
+  not computed, since code the analysis does not see (a package rendering `children`, a route
+  table, MDX) may place any component above another. The event is: a listener hears what it is registered for (an
   `on*` prop the native events React DOM 19.3.1 runs it for — `onChange` hears `change`, `input`
   and a checkbox's `click` —, an `addEventListener` the literal it names or the string of a
   module-level `const` of the same file no local binding shadows, any event for any other name:

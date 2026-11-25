@@ -166,8 +166,49 @@ export function App() {
     let row = &rows[0];
     assert!(row.dispatch.is_some());
     assert_eq!(row.setters.len(), 2, "{:?}", row.setters);
-    assert!(row.message.contains("fires events during render"), "{}", row.message);
+    assert!(
+        row.message.contains("fires events during render"),
+        "{}",
+        row.message
+    );
     assert!(!row.message.contains("called directly"));
+}
+
+#[test]
+fn a_focus_on_a_host_ref_reaches_its_path_and_every_blur_listener() {
+    // #407, N2: the effect focuses its own input. An ancestor's `onFocus`
+    // is on the path; a leaf input elsewhere hears no focus, but its
+    // `onBlur` may (it may hold the focus).
+    let src = |listener: &str, wrapper: &str| {
+        format!(
+            r#"
+import {{ useEffect, useRef, useState }} from "react";
+export function App() {{
+  const [x, setX] = useState<unknown>(0);
+  const ref = useRef<HTMLInputElement>(null);
+  useEffect(() => {{ ref.current?.focus(); }});
+  return <div {wrapper}>{{String(!!x)}}<input ref={{ref}} /><input {listener} /></div>;
+}}
+"#
+        )
+    };
+    let claimed = |s: &str| {
+        claims_on(s, "App")
+            .iter()
+            .any(|(rule, _)| rule == "infinite-loop")
+    };
+    assert!(
+        claimed(&src("", "onFocus={() => setX({})}")),
+        "the ancestor's onFocus"
+    );
+    assert!(
+        !claimed(&src("onFocus={() => setX({})}", "")),
+        "a leaf's onFocus"
+    );
+    assert!(
+        claimed(&src("onBlur={() => setX({})}", "")),
+        "a leaf's onBlur"
+    );
 }
 
 /// The Warning or Error loop claims of every loop rule on `component`, the

@@ -19,7 +19,7 @@ use crate::{
         AnalysisResult,
         calls::{CallRelation, Slot, StmtAt},
         dominance::on_all_paths,
-        listeners::{Events, Listener, Listeners},
+        listeners::{Events, Fired, Listener, Listeners},
         store::STORE_SLOT,
         timing::ArgTiming,
         written::{self, SiteEnvs, Written},
@@ -144,6 +144,136 @@ pub(crate) struct WriterTables<'a> {
     /// The component's module constants: an event name written through one
     /// is its string (#407).
     module_consts: &'a HashMap<Var, crate::ir::ModuleConstInit>,
+    /// The component's refs bound only to its own host elements, with those
+    /// elements' props sites ([`host_refs`]).
+    host_refs: HashMap<Var, Vec<crate::ir::types::ExprId>>,
+}
+
+/// The names the render binds, once and in no other body, to a `useRef`
+/// whose every use in the component — the render, every hook body and
+/// argument, every function nested in them — is a read of `.current` or the
+/// `ref` prop of a host element, with the props sites of those elements
+/// (#407): what `name.current` holds is one of them or nothing. React sets
+/// a host element's ref to its DOM node; nothing else writes the container,
+/// and nothing that may is handed it.
+fn host_refs(render: &CFG, hooks: &[HookEntry]) -> HashMap<Var, Vec<crate::ir::types::ExprId>> {
+    let refs: HashSet<HookLabel> = hooks
+        .iter()
+        .filter_map(|h| match h {
+            HookEntry::Ref { label, .. } => Some(*label),
+            _ => None,
+        })
+        .collect();
+    // The candidates and how many times any body binds each name.
+    let mut binds: HashMap<Var, usize> = HashMap::new();
+    let mut candidates: HashSet<Var> = HashSet::new();
+    fn count_binders(cfg: &CFG, binds: &mut HashMap<Var, usize>) {
+        for stmt in cfg.blocks.values().flat_map(|b| &b.stmts) {
+            if let Stmt::Let { var, .. } | Stmt::Assign { var, .. } = stmt {
+                *binds.entry(var.clone()).or_default() += 1;
+            }
+        }
+        cfg.for_each_expr(&mut |e| count_in(e, binds));
+    }
+    fn count_in(e: &Expr, binds: &mut HashMap<Var, usize>) {
+        if let Expr::FnLit {
+            params, body_cfg, ..
+        } = e
+        {
+            for p in params {
+                *binds.entry(p.clone()).or_default() += 1;
+            }
+            count_binders(body_cfg, binds);
+            return;
+        }
+        e.for_each_child(&mut |c| count_in(c, binds));
+    }
+    for stmt in render.blocks.values().flat_map(|b| &b.stmts) {
+        if let Stmt::Let { var, rhs, .. } = stmt
+            && matches!(rhs.peel_ts(), Expr::HookMarker(l, _) if refs.contains(l))
+        {
+            candidates.insert(var.clone());
+        }
+    }
+    if candidates.is_empty() {
+        return HashMap::new();
+    }
+    count_binders(render, &mut binds);
+    let bodies: Vec<&CFG> = hooks.iter().filter_map(HookEntry::body_cfg).collect();
+    for body in &bodies {
+        count_binders(body, &mut binds);
+    }
+    for h in hooks {
+        if let HookEntry::Callback { params, .. } | HookEntry::Handler { params, .. } = h {
+            for p in params {
+                *binds.entry(p.clone()).or_default() += 1;
+            }
+        }
+    }
+    // Every use of a candidate: `.current` reads and host `ref` props are
+    // kept, anything else disqualifies it.
+    let mut targets: HashMap<Var, Vec<crate::ir::types::ExprId>> = HashMap::new();
+    let mut other: HashSet<Var> = HashSet::new();
+    fn uses(
+        e: &Expr,
+        candidates: &HashSet<Var>,
+        targets: &mut HashMap<Var, Vec<crate::ir::types::ExprId>>,
+        other: &mut HashSet<Var>,
+    ) {
+        match e {
+            Expr::FieldAccess { obj, field }
+                if field == "current"
+                    && matches!(obj.peel_ts(), Expr::Var(v) if candidates.contains(v)) => {}
+            Expr::NativeElem {
+                props, children, ..
+            } => {
+                if let Expr::ObjectLit { id, fields } = props.peel_ts() {
+                    for (k, v) in fields {
+                        match v.peel_ts() {
+                            Expr::Var(r) if k == "ref" && candidates.contains(r) => {
+                                targets.entry(r.clone()).or_default().push(*id);
+                            }
+                            _ => uses(v, candidates, targets, other),
+                        }
+                    }
+                } else {
+                    uses(props, candidates, targets, other);
+                }
+                for c in children {
+                    uses(c, candidates, targets, other);
+                }
+            }
+            Expr::Var(v) if candidates.contains(v) => {
+                other.insert(v.clone());
+            }
+            Expr::FnLit { body_cfg, .. } => {
+                body_cfg.for_each_expr(&mut |c| uses(c, candidates, targets, other));
+            }
+            _ => e.for_each_child(&mut |c| uses(c, candidates, targets, other)),
+        }
+    }
+    let mut exprs: Vec<&Expr> = Vec::new();
+    for h in hooks {
+        match h {
+            HookEntry::State { init, reducer, .. } => {
+                exprs.push(init);
+                exprs.extend(reducer);
+            }
+            HookEntry::Ref { init, .. } => exprs.push(init),
+            HookEntry::Custom { args, .. } => exprs.extend(args),
+            _ => {}
+        }
+    }
+    for cfg in std::iter::once(render).chain(bodies.iter().copied()) {
+        cfg.for_each_expr(&mut |e| uses(e, &candidates, &mut targets, &mut other));
+    }
+    for e in exprs {
+        uses(e, &candidates, &mut targets, &mut other);
+    }
+    targets
+        .into_iter()
+        .filter(|(v, _)| !other.contains(v) && binds.get(v) == Some(&1))
+        .collect()
 }
 
 /// What one listener runs when a dispatch reaches it (#407), walked once
@@ -295,6 +425,7 @@ impl<'a> WriterTables<'a> {
             facts: BodyFacts::default(),
             listeners,
             module_consts,
+            host_refs: host_refs(render, hooks),
         }
     }
 
@@ -435,6 +566,7 @@ impl<'a> WriterTables<'a> {
             nested: run.map(|_| Vec::new()),
             absorbed: HashSet::new(),
             module_consts: self.module_consts,
+            host_refs: &self.host_refs,
         };
         match run {
             None => walk.cfg(cfg, depth, &mut found, WalkClass::Sync, None, None),
@@ -2249,13 +2381,15 @@ struct SetterWalk<'a> {
     absorbed: HashSet<DispatchAt>,
     /// [`WriterTables::module_consts`].
     module_consts: &'a HashMap<Var, crate::ir::ModuleConstInit>,
+    /// [`WriterTables::host_refs`].
+    host_refs: &'a HashMap<Var, Vec<crate::ir::types::ExprId>>,
 }
 
 /// A dispatch's events and class, the block of the region it runs from,
 /// and the walk's context there (repeating, listening, in an accessor, the
 /// names gone through): what the rows it adds depend on.
 type DispatchAt = (
-    Events,
+    Fired,
     WalkClass,
     Option<BlockId>,
     bool,
@@ -3489,6 +3623,7 @@ impl<'a> SetterWalk<'a> {
                 None if self.listening && matches!(mode, WalkClass::Unknown(_)) => {}
                 None => {
                     self.heard.dispatch = true;
+                    let fired = self.fired_on(fn_, fired);
                     // The same dispatch from the same block of the region,
                     // in the same context, holds the same rows.
                     let at: DispatchAt = (
@@ -3539,6 +3674,17 @@ impl<'a> SetterWalk<'a> {
             && let Expr::ObjectLit { id, fields, .. } = props.peel_ts()
         {
             let native = matches!(expr, Expr::NativeElem { .. });
+            // A leaf contains no other node: no child but literal text, no
+            // spread and no `children` prop (#407, `Fired::narrowed`).
+            let leaf = match expr {
+                Expr::NativeElem { children, .. } => {
+                    children.iter().all(|c| matches!(c.peel_ts(), Expr::Lit(_)))
+                        && !fields.iter().any(|(k, _)| {
+                            k == "children" || k.starts_with(crate::ir::expr::SPREAD_KEY_PREFIX)
+                        })
+                }
+                _ => false,
+            };
             let unseen = !native && self.calls.unseen_element(*id);
             let class = match unseen {
                 true => {
@@ -3555,6 +3701,9 @@ impl<'a> SetterWalk<'a> {
                 // region, a setter, a prop.
                 if native && crate::lowering::hook_extractor::is_event_prop(name) {
                     self.hear((*id, i), val, None, Events::of_prop(name));
+                    if let Some(l) = self.heard.positions.last_mut() {
+                        l.element = Some((*id, leaf));
+                    }
                 }
                 // A literal there, or a name the render binds to one or to a
                 // `useCallback`, is a handler region of its own
@@ -3931,6 +4080,30 @@ impl<'a> SetterWalk<'a> {
         );
     }
 
+    /// What the dispatching call `fn_` fires (`fired`) and where (#407): on
+    /// `r.current`, `r` a ref this component binds only to its own host
+    /// elements ([`WriterTables::host_refs`]), the call's node is one of
+    /// them ([`crate::engine::listeners::on_node`]); anywhere otherwise.
+    fn fired_on(&self, fn_: &Expr, fired: Events) -> Fired {
+        if let Expr::FieldAccess { obj, field } = fn_.peel_ts()
+            && let Expr::FieldAccess {
+                obj: r,
+                field: current,
+            } = obj.peel_ts()
+            && current == "current"
+            && let Expr::Var(r) = r.peel_ts()
+            && self.scopes.iter().all(|s| {
+                !s.other_component
+                    && (std::ptr::eq(s.body, self.tables.render)
+                        || !crate::ir::bindings::binds(r, s.body))
+            })
+            && let Some(targets) = self.host_refs.get(r)
+        {
+            return crate::engine::listeners::on_node(field, fired, targets.clone());
+        }
+        Fired::anywhere(fired)
+    }
+
     /// The string `name` holds here when it is a module-level `const` of a
     /// string literal (#407): only where no body of the component, nor any
     /// body on the walk's stack, binds the name, and every body on the stack
@@ -3972,6 +4145,7 @@ impl<'a> SetterWalk<'a> {
             value: value.clone(),
             member,
             hears,
+            element: None,
         });
     }
 
@@ -3982,7 +4156,7 @@ impl<'a> SetterWalk<'a> {
     /// A dispatch at event time adds nothing (the dispatch block). The
     /// program's listeners were each walked once ([`ListenerRun`]); this
     /// combines them, once per events and class for the program.
-    fn dispatched(&self, fired: Events, mode: WalkClass) -> Rc<Dispatched> {
+    fn dispatched(&self, fired: Fired, mode: WalkClass) -> Rc<Dispatched> {
         let listeners: &'a Listeners = self.listeners;
         let key = (fired, mode);
         if let Some(ran) = listeners.dispatched.borrow().get(&key) {
@@ -3997,8 +4171,8 @@ impl<'a> SetterWalk<'a> {
         let mut sites: HashMap<(Slot, SourceRange, WalkClass), usize> = HashMap::new();
         let mut ran: HashSet<(usize, WalkClass)> = HashSet::new();
         let mut queue = vec![key.clone()];
-        while let Some((events, class)) = queue.pop() {
-            for (i, l) in listeners.reached_by(&events) {
+        while let Some((fired, class)) = queue.pop() {
+            for (i, l) in listeners.reached_by(&fired) {
                 let Some(run) = listeners.runs.get(i) else {
                     continue;
                 };
@@ -4037,7 +4211,7 @@ impl<'a> SetterWalk<'a> {
                 for (events, at) in &run.nested {
                     let at = at.under(class);
                     if at != WalkClass::Handler {
-                        queue.push((events.clone(), at));
+                        queue.push((Fired::anywhere(events.clone()), at));
                     }
                 }
             }

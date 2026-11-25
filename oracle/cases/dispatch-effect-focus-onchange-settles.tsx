@@ -2,7 +2,9 @@
 // #407, N3: an effect with no deps focuses an input whose `onChange` writes a
 // new object. A focus fires `focusin` and `focusout`, for which React DOM
 // never runs `onChange` where the `input` event exists (ChangeEventPlugin):
-// the effect runs once per commit and nothing else does.
+// the effect runs once per commit and nothing else does. (The oracle's
+// container is in no document, where `focus()` fires nothing at all: React's
+// verdict holds, the case pins that the analysis no longer claims it.)
 import { useEffect, useRef, useState } from "react";
 
 export function App() {
