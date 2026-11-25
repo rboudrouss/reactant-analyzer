@@ -758,8 +758,8 @@ on a program React settles; 323 oracle cases, none a known false negative.
   bulletproof-react 31 → 28, novel 13 → 9, shadcn-admin 35 → 34 (hand-overs
   to radix's `Slot` now Info), mantine 1,712 → 1,711 (a story's `ContextModal`
   no longer runs for `modals[ctx]`), the other 7 small repos unchanged;
-  twenty 2,171 → 2,085 and dub 1,437 → 1,382 measured before the type of an
-  unresolved element was handed over (#392).
+  dub 1,437 → 1,419 measured before what a hook's body builds was read as
+  remounting, twenty to be measured (#392).
 - A function handed as a prop to a child component the analysis does not see
   (a package's component, an element value it does not resolve, a name several
   files define, a component rendering itself, a context provider's `value`)
