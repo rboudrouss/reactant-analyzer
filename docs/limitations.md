@@ -759,7 +759,10 @@ carries an Error.
     ([#404](https://github.com/rboudrouss/reactant-analyzer/issues/404); a `let` or `var`, a
     destructuring, a call such as `styled(X)` or `forwardRef(…)`, a conditional, a computed or
     optional member stay the program's, and a write into such an alias counts as a write into the
-    package import); the arguments of a hook the
+    package import); a JSX element whose name a scope binds to a `const` that chooses only among
+    such names and strings (`const Comp = asChild ? Slot : "button"`, `const D = Pkg.Root` in a
+    component, [#392](https://github.com/rboudrouss/reactant-analyzer/issues/392)), a write through
+    such a `const` counting as one into the package import as well; the arguments of a hook the
     expansion left that is imported so (#254) — **unless the program writes into a package
     import.** That reading stands on the premise the registry stands on (the bullet above: a name
     imported from a package denotes that package's export), and fails closed on the one
@@ -976,19 +979,46 @@ share a name changes how a component is *shown* (`Name@file` tells the two
 apart) but never which findings it has
 ([ADR-040](adr/ADR-040-component-identity-is-an-interned-id.md)).
 
-A JSX callee is resolved through the file that writes it, and only there: the
-file's own top-level declarations, then its imports, alias included, followed
-through a barrel's re-exports to the definition. A name imported from a
-specifier the resolver cannot map (a package, an unknown alias, a missing file)
-is that package's component, which the analysis does not see — never a
-same-named component of the analysed tree, whose body would run in its place
+A JSX callee is resolved through the scope at the element first, then through
+the file that writes it, and only there. A name a scope binds — a parameter, a
+destructured prop, a `const`, `let` or `var` (a `var` of a nested block
+included), a function or class the body declares (before or after the element:
+hoisting), a `catch` or loop binding, a module destructuring
+(`const { Button } = ui`) — is that binding's value, never the file's import
+or declaration of the same name, nor a same-named component of the program
+[#392](https://github.com/rboudrouss/reactant-analyzer/issues/392); a member
+name (`<ns.Item>`) follows its root. The element is every type the binding may
+hold, joined. When the binding is a `const` whose initializer chooses (`?:`,
+`||`, `??`, `&&`, through parentheses and TS assertions) among strings, names
+and static member chains, those are the types, each name resolved where the
+`const` is, in turn: a string is a host element (`asChild ? Slot : "button"`:
+the package's `Slot` or a host button); a name is the element written in place
+(`const Q = Quiet` renders `Quiet`; `const D = Pkg.Root` is the package's).
+Anything else the binding holds — a parameter or a prop (`{ as: Comp }`), a
+`let`, a call's result, a computed member (`item.icon`, `modals[k]`), a
+function declared in the body — is evaluated where the element is: a value
+that is only a string (a parent passing `as="button"`) is a host element, and
+every other value, a closure the heap places included, is a child the analysis
+does not see (below), never rendered as a component, and said so as an
+`analysis-limit` on the component ("takes its type from a value"): its props
+and the value itself are handed to code the analysis does not see, since React
+calls the type in the render — a closure it holds (a component a custom hook
+returns, capturing the hook's setter) runs at an unknown time, a render
+included, as an unknown callee's argument does. Not bound by any scope, a
+name keeps the file's stamp: the file's own top-level declarations, then its
+imports, alias included, followed through a barrel's re-exports to the
+definition. A name imported from a specifier the resolver cannot map (a
+package, an unknown alias, a missing file) is that package's component, which
+the analysis does not see — never a same-named component of the analysed
+tree, whose body would run in its place
 [#389](https://github.com/rboudrouss/reactant-analyzer/issues/389). Only a name
-the file neither declares nor imports falls back to the name, and only when
-exactly one analysed file defines it. A member name (`<UI.Button>`, a namespace
-import) is never resolved. A name bound inside a body (`const Icon = item.icon;
-<Icon />`) is not a declaration of the file and still takes the name fallback,
-which may run a same-named component in place of the value
-[#392](https://github.com/rboudrouss/reactant-analyzer/issues/392).
+bound nowhere in the file, a global, falls back to the name, and only when
+exactly one analysed file defines it. A member name of a program import
+(`<UI.Button>`, a namespace import) is never resolved. The scopes are read off
+the source as the language defines them; a JSX name written with a lowercase
+first letter is a host tag whatever binds it, as the JSX transform reads it,
+but so is one starting with `_` or `$`, which the transform reads as a name
+[#410](https://github.com/rboudrouss/reactant-analyzer/issues/410).
 
 Every other child is unanalysable, like any callee outside the run: a package's
 component, an import that leads to no component the analysis holds (a value it

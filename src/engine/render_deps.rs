@@ -1236,6 +1236,7 @@ impl<'a> Analyzer<'a> {
                 props,
                 span,
                 origin,
+                ..
             } => {
                 // The element type can be a value of this render (`const {
                 // Modal } = useModal()`, `<Modal />`): what it depends on

@@ -280,11 +280,13 @@ pub fn remap_expr(expr: Expr, off: Offsets) -> Expr {
             props,
             span,
             origin,
+            value,
         } => Expr::CompApp {
             name,
             props: Box::new(remap_expr(*props, off)),
             span,
             origin,
+            value: value.map(|v| Box::new(remap_expr(*v, off))),
         },
         Expr::NativeElem {
             tag,

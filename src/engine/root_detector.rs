@@ -31,7 +31,7 @@ impl CompAppRef {
         match table.element(&self.name, self.origin.as_deref()) {
             ElementTarget::Component(id) => vec![id],
             ElementTarget::Ambiguous => table.ids_named(&self.name).collect(),
-            ElementTarget::Unseen | ElementTarget::Unresolved => Vec::new(),
+            ElementTarget::Unseen | ElementTarget::Unresolved | ElementTarget::Value => Vec::new(),
         }
     }
 }
@@ -154,11 +154,15 @@ fn collect_compapp_in_cfg(cfg: &CFG, out: &mut HashSet<CompAppRef>) {
 
 fn collect_compapp_in_expr(expr: &Expr, out: &mut HashSet<CompAppRef>) {
     match expr {
+        // An element whose name a scope binds instantiates each name its
+        // binding aliases, and no component by its own name (#392).
         Expr::CompApp { name, origin, .. } => {
-            out.insert(CompAppRef {
-                name: name.clone(),
-                origin: origin.clone(),
-            });
+            for (name, origin) in ElementOrigin::named(name, origin.as_ref()) {
+                out.insert(CompAppRef {
+                    name: name.clone(),
+                    origin: origin.cloned(),
+                });
+            }
         }
         // `for_each_child` does not cross `FnLit`; render helpers can still
         // instantiate components, so descend into the body CFG explicitly.
@@ -212,6 +216,7 @@ mod tests {
                         props: Box::new(Expr::Lit(Prim::Null)),
                         span: None,
                         origin: None,
+                        value: None,
                     },
                     None,
                 ),

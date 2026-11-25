@@ -351,6 +351,10 @@ pub struct AnalysisStats {
     /// child is treated as unanalysable, exactly like an unknown one — the
     /// two are kept apart only because the user's remedy differs.
     pub ambiguous_component_refs: HashSet<UnresolvedRef>,
+    /// (caller, name) pairs where an element's type is a value a scope binds
+    /// and the analysis does not resolve (a prop, a parameter, a call's
+    /// result, #392): the child is treated as unknown, like an unknown one.
+    pub value_component_refs: HashSet<UnresolvedRef>,
     /// Components whose callback traversal hit the inline depth cap.
     pub callback_depth_capped: HashSet<ComponentId>,
     /// Components where the utility-inlining splice budget

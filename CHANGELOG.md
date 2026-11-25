@@ -734,6 +734,26 @@ on a program React settles; 323 oracle cases, none a known false negative.
   none when several files define it. A child imported through a barrel is
   no longer analysed a second time as a root, which overwrote its parent's
   result and silenced its loop (#389).
+- A JSX element whose name a scope binds — a parameter, a destructured prop,
+  a local, a function declared in the body (hoisted), a `catch` or loop
+  binding, a module destructuring — is that binding's value, never the file's
+  import of the same name nor a same-named component of the program:
+  `const Quiet = Loud; <Quiet/>` ran the imported `./Quiet` and was silent
+  where React loops, and a parameter shadowing a package import was an Info
+  "handed to package code". A `const` that chooses among names and strings is
+  each of them (`asChild ? Slot : "button"`: the package's `Slot` or a host
+  button, an Info; `const Q = Quiet` renders `Quiet`), and a write through
+  such a `const` counts as one into the package import. Any other value is
+  evaluated at the element: a string is a host element; anything else is a
+  child the analysis does not see, handed the props and its own type, which
+  React calls in the render (a component a hook returns, capturing a setter),
+  with an `analysis-limit` Info saying so. Oracle: 17 new cases, 6 `fn` of the
+  base now `tp`, 4 `fp` now `tn`. Shown rows: ai-chatbot 54 → 50,
+  bulletproof-react 31 → 28, novel 13 → 9, shadcn-admin 35 → 34 (hand-overs
+  to radix's `Slot` now Info), mantine 1,712 → 1,711 (a story's `ContextModal`
+  no longer runs for `modals[ctx]`), the other 7 small repos unchanged;
+  twenty 2,171 → 2,085 and dub 1,437 → 1,382 measured before the type of an
+  unresolved element was handed over (#392).
 - A function handed as a prop to a child component the analysis does not see
   (a package's component, an element value it does not resolve, a name several
   files define, a component rendering itself, a context provider's `value`)

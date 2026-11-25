@@ -3355,6 +3355,28 @@ impl<'a> SetterWalk<'a> {
                 }
             }
         }
+        // The type of an element whose name a scope binds to a value the
+        // analysis does not resolve is handed to React, which calls it to
+        // render the element: what it holds runs where the element is, at a
+        // time the walk does not place, a render included (#392).
+        if let Expr::CompApp {
+            props,
+            value: Some(value),
+            ..
+        } = expr
+            && let Expr::ObjectLit { id, .. } = props.peel_ts()
+        {
+            self.relation_handed(
+                Some((*id, crate::engine::calls::CALLEE)),
+                value,
+                WalkClass::UNKNOWN,
+                None,
+                depth,
+                found,
+                prov,
+                stmt_span,
+            );
+        }
         // An accessor of a literal runs at any read or write of its member,
         // which the walk does not place: what it reaches runs where the
         // literal is written, at an unknown time (#321).

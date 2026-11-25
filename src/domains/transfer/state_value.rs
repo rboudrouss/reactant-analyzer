@@ -21,7 +21,7 @@ use crate::{
         ComponentId,
         bindings::binding_of,
         cfg::CFG,
-        expr::{BinOp, ElementOrigin, Expr, MarkerVal, Prim, SummaryValue, UnaryOp},
+        expr::{BinOp, ElementLeaf, ElementOrigin, Expr, MarkerVal, Prim, SummaryValue, UnaryOp},
         hooks::{Arity, DepsArg, HookEntry},
         stmt::Stmt,
         types::{ExprId, Symbol},
@@ -280,8 +280,17 @@ fn eval_state_value(
             props,
             origin,
             span,
+            value,
         } => {
-            eval_comp_app(name, props, origin.as_deref(), *span, env, ctx);
+            eval_element(
+                name,
+                props,
+                origin.as_deref(),
+                value.as_deref(),
+                *span,
+                env,
+                ctx,
+            );
             StateValue::reference(Stability::PerRender)
         }
 
@@ -652,6 +661,64 @@ fn setter_calls_in_expr(
         other => {
             other
                 .for_each_child(&mut |c| setter_calls_in_expr(c, scope, closure, ctx, out, walked));
+        }
+    }
+}
+
+/// Evaluate an element for its effects. One whose name a scope binds is
+/// every type its binding may hold, joined (#392): a name it aliases is the
+/// element written in place ([`eval_comp_app`]); a string is a host element,
+/// whose props React DOM holds as listeners; the value the binding holds
+/// anywhere else is evaluated where the element is — a string there is a
+/// host element too, anything else a child the analysis does not see, handed
+/// the props as any unseen child is (#325), never a component by the name.
+fn eval_element(
+    name: &Symbol,
+    props_expr: &Expr,
+    origin: Option<&ElementOrigin>,
+    value: Option<&Expr>,
+    span: Option<crate::ir::SourceRange>,
+    env: &AbstractEnv<StateValue>,
+    ctx: &mut AnalysisCtx<StateValue>,
+) {
+    let Some(ElementOrigin::Local(leaves)) = origin else {
+        return eval_comp_app(name, props_expr, origin, span, env, ctx);
+    };
+    for leaf in leaves.iter() {
+        match leaf {
+            ElementLeaf::Host(_) => {}
+            ElementLeaf::Named { name, origin } => {
+                eval_comp_app(name, props_expr, origin.as_deref(), span, env, ctx)
+            }
+            ElementLeaf::Value => {
+                let host =
+                    value.is_some_and(|v| as_str_only(&eval_state_value(v, env, ctx)).is_some());
+                if host {
+                    continue;
+                }
+                if let Some(inter) = ctx.inter {
+                    if inter.probe {
+                        continue;
+                    }
+                    inter
+                        .stats
+                        .borrow_mut()
+                        .value_component_refs
+                        .insert((inter.component, name.clone()));
+                }
+                havoc_setter_props(props_expr, true, false, env, ctx);
+                // The type itself is handed to React, which calls it with the
+                // props: a closure it holds (one a hook returns, capturing a
+                // setter) runs there, a render included, as an unseen
+                // callee's argument does.
+                let anchor = match props_expr {
+                    Expr::ObjectLit { id, .. } => Some((*id, crate::engine::calls::CALLEE)),
+                    _ => None,
+                };
+                if let Some(v) = value {
+                    escape_at(&StateValueTransfer, v, env, ctx, anchor);
+                }
+            }
         }
     }
 }

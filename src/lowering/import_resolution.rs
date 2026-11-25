@@ -221,13 +221,25 @@ pub fn build_resolved_import_map(
 ///
 /// [`Expr::CompApp::origin`]: crate::ir::expr::Expr::CompApp
 #[derive(Debug, Clone, Default)]
-pub struct JsxOrigins(Arc<HashMap<Symbol, Arc<ElementOrigin>>>);
+pub struct JsxOrigins {
+    names: Arc<HashMap<Symbol, Arc<ElementOrigin>>>,
+    /// The elements whose name a scope of the file binds, by the start of
+    /// the opening tag ([`super::jsx_scope::scoped_elements`], #392).
+    scoped: Arc<HashMap<u32, Arc<ElementOrigin>>>,
+}
 
 impl JsxOrigins {
-    /// What `local` was proven to name here, or `None` when this file
-    /// neither declares nor imports it.
+    /// What `local` was proven to name where no scope binds it, or `None`
+    /// when this file neither declares nor imports it.
     pub fn get(&self, local: &str) -> Option<&Arc<ElementOrigin>> {
-        self.0.get(local)
+        self.names.get(local)
+    }
+
+    /// What the element whose opening tag starts at `start` names when a
+    /// scope binds its name ([`ElementOrigin::Local`]): the scope decides,
+    /// never [`Self::get`].
+    pub fn scoped(&self, start: u32) -> Option<&Arc<ElementOrigin>> {
+        self.scoped.get(&start)
     }
 }
 
@@ -243,9 +255,11 @@ impl JsxOrigins {
 /// and import one name (that is a redeclaration error), but so the rule is
 /// stated once rather than depending on which pass ran first.
 ///
-/// A name absent from the map is one the file neither declares nor imports
-/// (a namespace member, a global, a binding of a body): the engine falls back
-/// to resolution by name.
+/// An element whose name a scope binds (a parameter, a local, a module
+/// destructuring) is that binding's value, whatever the map says of the
+/// name ([`JsxOrigins::scoped`], #392). A name absent from both is bound
+/// nowhere in the file, a global: the engine falls back to resolution by
+/// name.
 pub fn build_jsx_origins(
     program: &Program,
     current_file: &Path,
@@ -298,5 +312,9 @@ pub fn build_jsx_origins(
             }
         }
     }
-    JsxOrigins(Arc::new(map))
+    let scoped = super::jsx_scope::scoped_elements(program, &map);
+    JsxOrigins {
+        names: Arc::new(map),
+        scoped: Arc::new(scoped),
+    }
 }

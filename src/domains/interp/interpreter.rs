@@ -2048,10 +2048,16 @@ fn exec_callbacks_depth<T: Transfer>(
             }
             returned
         }
-        Expr::CompApp { props, .. } => {
+        Expr::CompApp { props, value, .. } => {
+            // The type a scope binds is read first, a getter of its member
+            // chain run there (#392).
+            if let Some(value) = value {
+                exec_callbacks_depth(transfer, value, env, ctx, depth);
+            }
             exec_callbacks_depth(transfer, props, env, ctx, depth);
             // The JSX runtime converts the element's key where it creates
-            // it, before the child renders (#371).
+            // it, before the child renders (#371); a host element's props
+            // too, which one whose type a scope binds may be.
             run_conversions(transfer, expr, env, ctx, depth);
             // Fire inter-component inlining for CompApp inside children/fields.
             if !capped {
