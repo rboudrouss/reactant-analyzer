@@ -1,54 +1,54 @@
 {
-  "total": 6167,
-  "digest": "75731b733efcdcd8793edb7beffcc82c6187fc9361c430b30dc7eb5449dcac7e",
+  "total": 6102,
+  "digest": "7f37ac46da75047ed6ce847d13891b53612db40983ef12969aef14e57913516b",
   "by_rule": {
-    "always-unstable-deps": 610,
+    "always-unstable-deps": 613,
     "conditional-hook": 10,
-    "cross-component-infinite-loop": 296,
-    "cross-setter-in-render": 1287,
-    "frozen-initial-state": 74,
-    "infinite-loop": 543,
+    "cross-component-infinite-loop": 310,
+    "cross-setter-in-render": 1198,
+    "frozen-initial-state": 73,
+    "infinite-loop": 544,
     "lazy-init": 223,
     "missing-cleanup": 4,
     "missing-deps": 498,
     "redundant-set-state": 5,
-    "setter-in-render": 1741,
+    "setter-in-render": 1750,
     "stale-closure": 1,
-    "state-lifted-too-high": 180,
+    "state-lifted-too-high": 179,
     "state-mutation": 18,
     "unnecessary-rerender": 14,
     "unstable-context-value": 183,
-    "wasted-subtree-render": 480
+    "wasted-subtree-render": 479
   },
   "by_repo": {
-    "ai-chatbot": 54,
-    "bulletproof-react": 31,
+    "ai-chatbot": 50,
+    "bulletproof-react": 28,
     "chakra-ui": 373,
     "commerce": 5,
-    "dub": 1432,
+    "dub": 1456,
     "excalidraw": 111,
-    "mantine": 1712,
+    "mantine": 1711,
     "memos": 185,
     "next-shadcn-dashboard-starter": 41,
-    "novel": 13,
+    "novel": 9,
     "precedent": 1,
-    "shadcn-admin": 35,
-    "twenty": 2171,
+    "shadcn-admin": 34,
+    "twenty": 2095,
     "zustand": 3
   },
   "hidden": {
     "ai-chatbot": {
-      "infos": 260,
-      "hand_overs": 17,
-      "setters": 18
+      "infos": 265,
+      "hand_overs": 21,
+      "setters": 22
     },
     "bulletproof-react": {
-      "infos": 353,
-      "hand_overs": 18,
-      "setters": 21
+      "infos": 359,
+      "hand_overs": 21,
+      "setters": 27
     },
     "chakra-ui": {
-      "infos": 10456,
+      "infos": 10467,
       "hand_overs": 6,
       "setters": 6
     },
@@ -58,17 +58,17 @@
       "setters": 2
     },
     "dub": {
-      "infos": 4242,
-      "hand_overs": 314,
-      "setters": 771
+      "infos": 4419,
+      "hand_overs": 331,
+      "setters": 799
     },
     "excalidraw": {
-      "infos": 364,
+      "infos": 367,
       "hand_overs": 7,
       "setters": 8
     },
     "mantine": {
-      "infos": 8984,
+      "infos": 8988,
       "hand_overs": 1,
       "setters": 1
     },
@@ -78,29 +78,29 @@
       "setters": 162
     },
     "next-shadcn-dashboard-starter": {
-      "infos": 664,
+      "infos": 665,
       "hand_overs": 18,
       "setters": 35
     },
     "novel": {
-      "infos": 103,
-      "hand_overs": 7,
-      "setters": 7
+      "infos": 107,
+      "hand_overs": 11,
+      "setters": 11
     },
     "precedent": {
-      "infos": 46,
+      "infos": 47,
       "hand_overs": 2,
       "setters": 2
     },
     "shadcn-admin": {
-      "infos": 378,
-      "hand_overs": 16,
-      "setters": 26
+      "infos": 379,
+      "hand_overs": 17,
+      "setters": 32
     },
     "twenty": {
-      "infos": 10706,
-      "hand_overs": 83,
-      "setters": 114
+      "infos": 10833,
+      "hand_overs": 84,
+      "setters": 115
     },
     "zustand": {
       "infos": 14,
