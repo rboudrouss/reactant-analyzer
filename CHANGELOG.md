@@ -758,8 +758,8 @@ on a program React settles; 323 oracle cases, none a known false negative.
   bulletproof-react 31 → 28, novel 13 → 9, shadcn-admin 35 → 34 (hand-overs
   to radix's `Slot` now Info), mantine 1,712 → 1,711 (a story's `ContextModal`
   no longer runs for `modals[ctx]`), the other 7 small repos unchanged;
-  dub 1,437 → 1,419 measured before what a hook's body builds was read as
-  remounting, twenty to be measured (#392).
+  on CI dub 1,437 → 1,461 (no loop finding lost, 30 gained) and twenty
+  2,171 → 2,095 (#392).
 - A call that dispatches events (`ref.current.click()`, `focus()`,
   `dispatchEvent`) runs, where it is made and in that body's phase, every
   listener of the program its event may reach: a host element's `on*` prop
