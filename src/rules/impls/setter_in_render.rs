@@ -550,9 +550,13 @@ impl SetterInRender {
                     return None;
                 }
                 // A deferred or handler row runs on another turn; ⊤ may run
-                // in the memo's own run.
+                // in the memo's own run, but a listener's, which every
+                // dispatch claims where it is made (#402, #407).
                 let sync = match w.phase {
                     WriterPhase::Memo => true,
+                    WriterPhase::Unknown if crate::engine::setters::dispatch_claims(w) => {
+                        return None;
+                    }
                     WriterPhase::Unknown => false,
                     _ => return None,
                 };

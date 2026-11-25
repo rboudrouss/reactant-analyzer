@@ -794,6 +794,11 @@ on a program React settles; 323 oracle cases, none a known false negative.
   `change` a control fires on losing the focus, which React DOM filters out by
   its value tracker. So a `focus()` no longer reaches every `onChange` of the
   program (#407).
+- In a program that dispatches events, a JSX prop of an element a `useMemo`
+  builds, and a package hook's argument its DOM listener runs
+  (`useOnClickOutside`), are read as the event handlers they are, as the
+  render's own props are, since every dispatch claims what they write: no
+  hand-over Warning says they go to a callee with no timing summary (#402).
 - A function handed as a prop to a child component the analysis does not see
   (a package's component, an element value it does not resolve, a name several
   files define, a component rendering itself, a context provider's `value`)

@@ -504,8 +504,9 @@ pub(crate) fn body_writes(comp: &AnalysisResult<StateValue>, body: &CFG) -> Vec<
 /// ([`crate::engine::listeners`]), so a render, an effect or a handler that
 /// dispatches holds those writes as its own rows. Beyond a dispatch, what
 /// runs a marked row runs it as in a program that does not dispatch, where
-/// its timing is an event's: a host element's `on*` prop and an
-/// `addEventListener` argument, both table entries; a host `ref` callback
+/// its timing is an event's: a host element's `on*` prop, an
+/// `addEventListener` argument and a package hook's argument timed
+/// `Listener`, all table entries; a host `ref` callback
 /// runs at commit; a seen child's prop runs where the child's own bodies run
 /// it, a listener of the child's (an entry) included. A row the table does
 /// not cover — a value handed to code the analysis does not see — is never
@@ -4260,10 +4261,14 @@ impl<'a> SetterWalk<'a> {
             (timing, arg.peel_ts())
         else {
             let class = self.timing_class(timing, handover);
-            // What a package's DOM listener runs, a dispatch runs (#407).
-            if timing == Some(ArgTiming::Listener) {
+            // What a package's DOM listener runs, a dispatch runs (#407): ⊤
+            // only because the program dispatches, its rows say so (#402).
+            let listener = timing == Some(ArgTiming::Listener);
+            if listener {
                 self.hear(anchor, arg, None, Events::Any);
             }
+            let outer = self.listening;
+            self.listening |= self.dispatches && listener;
             self.relation_handed(
                 Some(anchor),
                 arg,
@@ -4274,6 +4279,7 @@ impl<'a> SetterWalk<'a> {
                 prov,
                 stmt_span,
             );
+            self.listening = outer;
             return;
         };
         let calls = self.calls;
@@ -4293,9 +4299,12 @@ impl<'a> SetterWalk<'a> {
                 timed.insert(*id);
                 let timing = t.member(name);
                 let class = self.timing_class(timing, handover);
-                if timing == Some(ArgTiming::Listener) {
+                let listener = timing == Some(ArgTiming::Listener);
+                if listener {
                     self.hear(anchor, arg, Some(*id), Events::Any);
                 }
+                let outer = self.listening;
+                self.listening |= self.dispatches && listener;
                 let mut inner = Found::default();
                 self.enter(
                     body_cfg,
@@ -4307,6 +4316,7 @@ impl<'a> SetterWalk<'a> {
                     prov,
                     stmt_span,
                 );
+                self.listening = outer;
                 found.absorb(inner, body_cfg, class, None, prov, self.facts);
             }
         }

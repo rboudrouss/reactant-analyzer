@@ -2,12 +2,10 @@
 // The render dispatches `click` on a button a `useMemo` builds with the
 // setter itself as `onClick`: React runs the handler inside the render,
 // which updates the state of the component rendering, every pass (a
-// render-phase loop). The dispatch walk runs only the handler regions the
-// lowering reified (#277), and a setter passed as the prop is none, so the
-// one row that covers the loop is the memo's hand-over Warning
-// (`setter-in-render`, `tp`). Reading that prop's ⊤ as an event handler in a
-// dispatching program, as the render's own JSX props are (#219, proposed
-// for the memo in #402), would leave this loop uncovered (`fn`).
+// render-phase loop). The dispatch runs every listener its event may reach,
+// a setter handed as a prop in a memo's element included (#407): the claim
+// is the render's own row, at the click, so the memo's prop is read as the
+// event handler it is (#402) and the loop stays covered (`tp`).
 import { useEffect, useMemo, useRef, useState } from "react";
 
 export function App() {
