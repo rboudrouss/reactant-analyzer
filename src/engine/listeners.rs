@@ -69,11 +69,21 @@ impl Events {
     }
 
     /// The events a listener registered for the event `name` hears: that
-    /// event, any when `name` is not a string literal.
+    /// event, any when `name` is not a string literal. A `change` listener
+    /// hears the `change` a control fires when it loses the focus after an
+    /// edit ([`BLUR_CHANGE`]).
     pub(crate) fn named(name: Option<&Expr>) -> Events {
         match name.map(Expr::peel_ts) {
-            Some(Expr::Lit(crate::ir::expr::Prim::String(n))) => Events::of(&[n.as_str()]),
+            Some(Expr::Lit(crate::ir::expr::Prim::String(n))) => Events::listening_to(n),
             _ => Events::Any,
+        }
+    }
+
+    /// What a native listener of the event `name` hears.
+    fn listening_to(name: &str) -> Events {
+        match name.eq_ignore_ascii_case("change") {
+            true => Events::of(&["change", BLUR_CHANGE]),
+            false => Events::of(&[name]),
         }
     }
 
@@ -93,16 +103,22 @@ impl Events {
         let deps: &[&str] = match name {
             "MouseEnter" | "MouseLeave" => &["mouseout", "mouseover"],
             "PointerEnter" | "PointerLeave" => &["pointerout", "pointerover"],
-            "Change" => &[
-                "change",
-                "click",
-                "focusin",
-                "focusout",
-                "input",
-                "keydown",
-                "keyup",
-                "selectionchange",
-            ],
+            // Registered for `change click focusin focusout input keydown
+            // keyup selectionchange` (line 30105), but `ChangeEventPlugin`
+            // (`extractEvents$1`, lines 21262-21298) queues `onChange` only
+            // for a `change` on a `select` or file input
+            // (`getTargetInstForChangeEvent`, line 3723) or a custom
+            // element, an `input` or `change` on a text input or `textarea`
+            // (`getTargetInstForInputOrChangeEvent`, line 3769) when
+            // `isInputEventSupported`, and a `click` on a checkbox or radio
+            // (`getTargetInstForClickEvent`, line 3766). `focusin`,
+            // `focusout`, `keydown`, `keyup` and `selectionchange` serve the
+            // polyfill branch alone, taken when `isInputEventSupported` is
+            // false (lines 3746-3765; set at 28069-28073: the `input` event
+            // exists and the engine is not IE 9 or older), which no engine
+            // React 19 supports takes (`docs/limitations.md`). React 19.3.1
+            // runs nothing on a controlled input's `focusout` here.
+            "Change" => &["change", "click", "input"],
             "Select" => &[
                 "focusout",
                 "contextmenu",
@@ -168,6 +184,16 @@ impl Events {
         Events::of(deps)
     }
 }
+
+/// The `change` a text control fires when it loses the focus after the user
+/// edited it, which a focus move fires: a native `change` listener hears it,
+/// React DOM's `onChange` never does — `ChangeEventPlugin` takes a `change`
+/// only through `getInstIfValueChanged` (react-dom 19.3.1, line 3719), true
+/// only when the value differs from the tracker's (`updateValueIfChanged`,
+/// line 1790), which the `input` events of that edit already moved (line
+/// 3769) and a programmatic write moves too (`trackValueOnNode`, line 1738).
+/// No name an event can be registered under.
+const BLUR_CHANGE: &str = "\u{0}change on blur";
 
 /// React DOM's `simpleEventPluginEvents` (react-dom 19.3.1,
 /// `cjs/react-dom-client.development.js` lines 28109-28113, with the
@@ -263,7 +289,7 @@ const DISPATCHING_METHODS: &[&str] = &[
 ///
 /// - `focus()` and `blur()` move the focus: `focus` and `focusin` where it
 ///   lands, `blur` and `focusout` where it leaves, and `change` there when an
-///   edited control loses it.
+///   edited control loses it ([`BLUR_CHANGE`]).
 /// - `dispatchEvent(new XEvent("name"))` fires `name`, and only it: a
 ///   dispatched event runs no default action, but a `click`'s activation
 ///   behaviour, below.
@@ -282,7 +308,7 @@ pub(crate) fn fired_events(fn_: &Expr, args: &[Expr]) -> Option<Events> {
         _ => return None,
     };
     Some(match name {
-        "focus" | "blur" => Events::of(&["focus", "focusin", "blur", "focusout", "change"]),
+        "focus" | "blur" => Events::of(&["focus", "focusin", "blur", "focusout", BLUR_CHANGE]),
         "dispatchEvent" => match args.first().map(Expr::peel_ts) {
             Some(Expr::New { fn_, args, .. }) => match (fn_.peel_ts(), args.first()) {
                 (Expr::Var(c), Some(name)) if c.ends_with("Event") => {
@@ -380,8 +406,10 @@ mod tests {
         let click = Events::of(&["click"]);
         assert!(Events::of_prop("onClick").meets(&click));
         assert!(Events::of_prop("onClickCapture").meets(&click));
-        // A checkbox's `onChange` runs on its click.
+        // A checkbox's `onChange` runs on its click; no `onChange` runs on a
+        // focus move.
         assert!(Events::of_prop("onChange").meets(&click));
+        assert!(!Events::of_prop("onChange").meets(&Events::of(&["focusin", "focusout"])));
         assert!(!Events::of_prop("onMouseDown").meets(&click));
         assert!(Events::of_prop("onMouseDown").meets(&Events::of(&["mousedown"])));
         assert!(Events::of_prop("onDoubleClick").meets(&Events::of(&["dblclick"])));
@@ -402,7 +430,10 @@ mod tests {
         let focus = fired_events(&call("focus"), &[]).unwrap();
         assert!(focus.meets(&Events::of_prop("onFocus")));
         assert!(focus.meets(&Events::of_prop("onBlur")));
-        assert!(focus.meets(&Events::of_prop("onChange")));
+        // The blurred control's `change` reaches a native listener, never
+        // React's `onChange`.
+        assert!(!focus.meets(&Events::of_prop("onChange")));
+        assert!(focus.meets(&Events::listening_to("change")));
         assert!(!focus.meets(&Events::of_prop("onClick")));
         assert_eq!(fired_events(&call("push"), &[]), None);
     }

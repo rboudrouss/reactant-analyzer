@@ -788,6 +788,12 @@ on a program React settles; 323 oracle cases, none a known false negative.
 - A call the analysis resolves to program bodies alone is no dispatch,
   whatever its name: a program object's `emit` or `focus` runs those bodies,
   and fires events only through a dispatch in them (#407).
+- `onChange` hears what React DOM 19.3.1 runs it for, `change`, `input` and a
+  checkbox's `click`, not the `focusin` / `focusout` / key events of its
+  polyfill path, which no engine React 19 supports takes; nor does it hear the
+  `change` a control fires on losing the focus, which React DOM filters out by
+  its value tracker. So a `focus()` no longer reaches every `onChange` of the
+  program (#407).
 - A function handed as a prop to a child component the analysis does not see
   (a package's component, an element value it does not resolve, a name several
   files define, a component rendering itself, a context provider's `value`)

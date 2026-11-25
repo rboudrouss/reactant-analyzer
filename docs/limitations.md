@@ -674,14 +674,20 @@ carries an Error.
   down reaches a child's element), every `addEventListener` argument and every package hook
   argument timed as a listener. The target is not resolved, so a dispatch reaches the listeners
   of its event on every element. The event is: a listener hears what it is registered for (an
-  `on*` prop the native events React DOM registers it for — `onChange` hears `click`, `focusin`
-  and `focusout` among others —, an `addEventListener` the literal it names, any event for a name
+  `on*` prop the native events React DOM 19.3.1 runs it for — `onChange` hears `change`, `input`
+  and a checkbox's `click` —, an `addEventListener` the literal it names, any event for a name
   that is not a literal, a package hook's listener any event), and a dispatch fires the focus
-  events and `change` for `focus()` and `blur()`, the one event a `dispatchEvent(new XEvent("x"))`
-  names other than `click`, and any event otherwise (a click's activation behaviour submits,
-  toggles and opens, firing events of its own). So a `focus()` in an effect reaches every
-  `onChange` of the program: React never runs one for it in a browser with the `input` event,
-  which the analysis does not assume. The writes one dispatching call's listeners make are judged
+  events and the blurred control's `change` for `focus()` and `blur()`, the one event a
+  `dispatchEvent(new XEvent("x"))` names other than `click`, and any event otherwise (a click's
+  activation behaviour submits, toggles and opens, firing events of its own). React DOM's
+  `onChange` table rests on one premise: the engine has the `input` event, which every engine
+  React 19 supports has (React DOM takes a polyfill path that runs `onChange` on focus moves and
+  keys only where it lacks it). A blurred control's `change` never runs `onChange`: React DOM
+  takes a `change` only when the value differs from the one the edit's `input` events already
+  recorded. A call the analysis resolves to program bodies alone (a method of an object the
+  program builds, named `emit` or `focus`) is no dispatch: it fires events only through a
+  dispatch in those bodies, which the walk follows; a method of a module object, which the
+  analysis does not run, stays one. The writes one dispatching call's listeners make are judged
   one by one and reported as one row of that call, at the call, listing the setters (`dispatch`
   and `setters` in the JSON); an effect's call is one `cross-component-infinite-loop` row. The
   program's test

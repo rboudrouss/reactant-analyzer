@@ -108,6 +108,68 @@ fn without_a_dispatch_the_listener_is_event_only() {
     assert_eq!(loop_claims(&with_trigger("")), 0);
 }
 
+/// Every row of the loop rules on `component`, Info included.
+fn rows_on(src: &str, component: &str) -> Vec<reactant::rules::Diagnostic> {
+    use oxc_allocator::Allocator;
+    use oxc_parser::{ParseOptions, Parser};
+    use oxc_span::SourceType;
+
+    let alloc = Allocator::default();
+    let ret = Parser::new(&alloc, src, SourceType::tsx())
+        .with_options(ParseOptions::default())
+        .parse();
+    let path = std::path::Path::new("test.tsx");
+    let components = lower_program(&ret.program, src, path, &mut Default::default());
+    let r = analyze_program(
+        ComponentRegistry::from_components(components),
+        HookRegistry::new(),
+        RootStrategy::Heuristic,
+        &Config::default(),
+    );
+    let ctx = RuleCtx::new(&r, r.component_named(component).unwrap());
+    all_rules()
+        .iter()
+        .filter(|rule| {
+            [
+                "infinite-loop",
+                "cross-component-infinite-loop",
+                "setter-in-render",
+                "cross-setter-in-render",
+            ]
+            .contains(&rule.name())
+        })
+        .flat_map(|rule| rule.check(&ctx))
+        .collect()
+}
+
+#[test]
+fn the_writes_of_one_dispatch_are_one_row_of_its_call() {
+    // #407: the render's click reaches two listeners, each writing its own
+    // state with the event: one row, at the click, listing both setters.
+    let src = r#"
+import { useEffect, useRef, useState } from "react";
+export function App() {
+  const [a, setA] = useState<unknown>(0);
+  const [b, setB] = useState<unknown>(0);
+  const [m, setM] = useState(0);
+  const ref = useRef<HTMLButtonElement>(null);
+  useEffect(() => { setM(1); }, []);
+  ref.current?.click();
+  return <div onClick={setB}><button ref={ref} onClick={setA}>{m}</button></div>;
+}
+"#;
+    let rows: Vec<_> = rows_on(src, "App")
+        .into_iter()
+        .filter(|d| d.rule == "setter-in-render")
+        .collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let row = &rows[0];
+    assert!(row.dispatch.is_some());
+    assert_eq!(row.setters.len(), 2, "{:?}", row.setters);
+    assert!(row.message.contains("fires events during render"), "{}", row.message);
+    assert!(!row.message.contains("called directly"));
+}
+
 /// The Warning or Error loop claims of every loop rule on `component`, the
 /// components no element renders the roots (a child gets its parent's
 /// props).
