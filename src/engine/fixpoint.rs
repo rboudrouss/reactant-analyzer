@@ -2653,10 +2653,8 @@ fn seed_made_objects(
                         for v in &m.captures {
                             captured.extend(v.clone(), StateValue::top());
                         }
-                        let body = std::sync::Arc::new(crate::ir::remap_cfg(
-                            (*m.body_cfg).clone(),
-                            off,
-                        ));
+                        let body =
+                            std::sync::Arc::new(crate::ir::remap_cfg((*m.body_cfg).clone(), off));
                         heap.alloc_fn(
                             shift(m.id),
                             &m.params,
