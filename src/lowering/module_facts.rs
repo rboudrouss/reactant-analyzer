@@ -167,7 +167,12 @@ pub fn collect_module_facts(
         .into_iter()
         .filter_map(|(r, m)| r.filter(|r| !own.contains(r)).map(|r| (r, m)))
         .collect();
+    let consts = super::const_scan::scan(program, file, resolver);
     ModuleFacts {
+        const_uses: consts.uses,
+        namespace_imports: consts.namespaces,
+        opened_modules: consts.opened,
+        made_consts: made_consts(program),
         directives,
         imports,
         compiled_entries,
@@ -182,6 +187,46 @@ pub fn collect_module_facts(
         package_aliases,
         globals_shadowed: globals_shadowed(program),
     }
+}
+
+/// The module `const`s `program` initialises with a call of one of its own
+/// top-level names, `const X = f(…)` (#422): `(X, f)`. Whether `f` is a
+/// function every return of which is an object literal is the resolver's to
+/// say ([`crate::ir::MadeObject`]).
+fn made_consts(program: &Program) -> Vec<(String, String)> {
+    let own: HashSet<String> = super::top_level_binding_names(program)
+        .into_iter()
+        .collect();
+    let mut out = Vec::new();
+    for stmt in &program.body {
+        let decl = match stmt {
+            Statement::VariableDeclaration(d) => d,
+            Statement::ExportNamedDeclaration(exp) => match &exp.declaration {
+                Some(Declaration::VariableDeclaration(d)) => d,
+                _ => continue,
+            },
+            _ => continue,
+        };
+        if decl.kind != VariableDeclarationKind::Const {
+            continue;
+        }
+        for vd in &decl.declarations {
+            let BindingPattern::BindingIdentifier(id) = &vd.id else {
+                continue;
+            };
+            let Some(Expression::CallExpression(call)) =
+                vd.init.as_ref().map(|e| e.get_inner_expression())
+            else {
+                continue;
+            };
+            if let Expression::Identifier(f) = call.callee.get_inner_expression()
+                && own.contains(f.name.as_str())
+            {
+                out.push((id.name.to_string(), f.name.to_string()));
+            }
+        }
+    }
+    out
 }
 
 /// The globals of the builtin table that model a call as handing its

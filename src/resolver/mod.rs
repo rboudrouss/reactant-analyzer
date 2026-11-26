@@ -400,6 +400,7 @@ pub fn lower_files_with(
         lowered.file_count += 1;
     }
 
+    resolve_made_objects(&lowered, &mut consts, &file_imports);
     resolve_imported_contexts(&mut lowered, consts, &file_imports);
     resolve_imported_utilities(&mut lowered, &file_imports);
     lowered.hooks.extend(crate::lowering::lower_hook_values(
@@ -410,6 +411,272 @@ pub fn lower_files_with(
         &lowered.module_table.re_export_graph(),
     ));
     lowered
+}
+
+/// The module `const`s a program function made ([`ModuleConstInit::Made`],
+/// #422), in their file's table and, one level, in the tables of the files
+/// that import them as contexts are (#49): `const X = f(…)` where `f` is the
+/// file's own utility, nothing writes `f`, every return of `f` is an object
+/// literal ([`made_object`]) and no use of `X` in any file can change the
+/// object ([`made_exposed`]). Every other such `const` stays out of the
+/// table: ⊤, as before.
+fn resolve_made_objects(
+    lowered: &LoweredProgram,
+    consts: &mut HashMap<PathBuf, HashMap<String, ModuleConstInit>>,
+    file_imports: &[(PathBuf, HashMap<String, ResolvedImport>)],
+) {
+    let table = &lowered.module_table;
+    let (uses, opened) = table.const_uses();
+    let graph = table.re_export_graph();
+    let declares = |file: &Path, name: &str| {
+        table
+            .facts(file)
+            .is_some_and(|f| f.bindings.iter().any(|b| b == name))
+    };
+    // The files whose every binding a namespace object handed on may change.
+    let opened_key = |key: &(PathBuf, String)| {
+        opened.iter().any(|f| {
+            *f == key.0
+                || graph
+                    .origin(f, &key.1, &declares)
+                    .is_some_and(|origin| origin == *key)
+        })
+    };
+    let written = |key: &(PathBuf, String)| {
+        uses.iter()
+            .any(|u| u.key == *key && u.of.kind == crate::ir::module::ConstUseKind::Write)
+    };
+    let mut paths: Vec<&PathBuf> = table.paths().collect();
+    paths.sort();
+    let mut made: HashMap<(PathBuf, String), Arc<crate::ir::MadeObject>> = HashMap::new();
+    for file in paths {
+        let Some(facts) = table.facts(file) else {
+            continue;
+        };
+        for (name, factory) in &facts.made_consts {
+            let key = (file.clone(), name.clone());
+            let factory_key = (file.clone(), factory.clone());
+            let Some(f) = lowered
+                .utilities
+                .iter()
+                .find(|u| u.file == *file && u.name == *factory)
+            else {
+                continue;
+            };
+            if written(&factory_key) || opened_key(&factory_key) || opened_key(&key) {
+                continue;
+            }
+            let Some(obj) = made_object(f, facts) else {
+                continue;
+            };
+            if !made_exposed(&key, &obj, &uses) {
+                made.insert(key, Arc::new(obj));
+            }
+        }
+    }
+    for ((file, name), obj) in &made {
+        consts
+            .entry(file.clone())
+            .or_default()
+            .insert(name.clone(), ModuleConstInit::Made(Arc::clone(obj)));
+    }
+    for (file, imports) in file_imports {
+        for (local, origin) in imports {
+            if let Some(obj) = made.get(&(origin.file.clone(), origin.imported.clone())) {
+                consts
+                    .entry(file.clone())
+                    .or_default()
+                    .insert(local.clone(), ModuleConstInit::Made(Arc::clone(obj)));
+            }
+        }
+    }
+}
+
+/// The object the utility `f` returns, when every return of it is an
+/// object literal whose keys are names (no spread, no accessor, no computed
+/// key, no `__proto__`), at least one return is, and no function member
+/// reads `this` or a top-level name of `facts`' file but through the
+/// function's own names (which may hold anything: the analysis does not run
+/// the module's load). Numbered as `f`'s body is: each analysis grafts it.
+fn made_object(f: &FunctionIR, facts: &crate::ir::ModuleFacts) -> Option<crate::ir::MadeObject> {
+    use crate::ir::{Expr, cfg::Terminator};
+    let mut returns = Vec::new();
+    let mut order: Vec<_> = f.body_cfg.blocks.keys().copied().collect();
+    order.sort();
+    for b in order {
+        if let Terminator::Return(e, _) = &f.body_cfg.blocks[&b].term {
+            match e.peel_ts() {
+                lit @ Expr::ObjectLit { .. } => returns.push(lit.clone()),
+                _ => return None,
+            }
+        }
+    }
+    if returns.is_empty() {
+        return None;
+    }
+    // The function's own code builds what its methods capture from
+    // builtins alone: no function literal but the methods, no call, a
+    // `new` only of a global's name. So a captured name holds no program
+    // function but what a method's argument put in it, through a call or a
+    // write on a value the analysis does not place, which hands it over
+    // there.
+    let top_level = |v: &str| {
+        facts.bindings.iter().any(|b| b == v) || facts.imported.iter().any(|(l, _, _)| l == v)
+    };
+    fn builds_from_builtins(e: &Expr, top_level: &dyn Fn(&str) -> bool) -> bool {
+        match e {
+            Expr::FnLit { .. } | Expr::Call { .. } => false,
+            Expr::New { fn_, args, .. } => {
+                matches!(fn_.peel_ts(), Expr::Var(c) if !top_level(c))
+                    && args.iter().all(|a| builds_from_builtins(a, top_level))
+            }
+            other => {
+                let mut ok = true;
+                other.for_each_child(&mut |c| ok = ok && builds_from_builtins(c, top_level));
+                ok
+            }
+        }
+    }
+    for block in f.body_cfg.blocks.values() {
+        let mut ok = true;
+        for stmt in &block.stmts {
+            stmt.for_each_expr(&mut |e| ok = ok && builds_from_builtins(e, &top_level));
+        }
+        match &block.term {
+            Terminator::Return(e, _) => {
+                if let Expr::ObjectLit { fields, .. } = e.peel_ts() {
+                    ok = ok
+                        && fields.iter().all(|(_, v)| {
+                            matches!(v.peel_ts(), Expr::FnLit { .. })
+                                || builds_from_builtins(v, &top_level)
+                        });
+                }
+            }
+            Terminator::Branch { cond, .. } => {
+                ok = ok && builds_from_builtins(cond, &top_level);
+            }
+            _ => {}
+        }
+        if !ok {
+            return None;
+        }
+    }
+    // The function's own names: its parameters, and what its body declares
+    // at its own level (an assignment there may be a top-level name's).
+    let own = |v: &str| {
+        f.params.iter().any(|p| p == v)
+            || f.body_cfg.blocks.values().any(|b| {
+                b.stmts
+                    .iter()
+                    .any(|s| matches!(s, crate::ir::Stmt::Let { var, .. } if var == v))
+            })
+    };
+    let mut literals = Vec::new();
+    for lit in returns {
+        let Expr::ObjectLit { id, fields } = lit else {
+            return None;
+        };
+        let mut members = Vec::new();
+        for (key, val) in fields {
+            if crate::ir::expr::is_synthetic_key(&key) || key == "__proto__" {
+                return None;
+            }
+            let method = match val.peel_ts() {
+                Expr::FnLit {
+                    id,
+                    params,
+                    body_cfg,
+                } => {
+                    // `this`, which a method's preamble binds to the
+                    // call's receiver, an arrow nested in it reads too.
+                    let mut read = std::collections::HashSet::new();
+                    body_cfg.for_each_expr(&mut |e| {
+                        crate::ir::free_vars::collect_used_vars(e, &mut read)
+                    });
+                    if read.contains(crate::ir::expr::THIS) {
+                        return None;
+                    }
+                    let free = crate::ir::free_vars::compute_free_vars(body_cfg);
+                    let mut captures = Vec::new();
+                    for v in free {
+                        if own(&v) {
+                            captures.push(v);
+                        } else if top_level(&v) {
+                            return None;
+                        }
+                    }
+                    captures.sort();
+                    // A captured name holds what the function built: no
+                    // method writes one.
+                    if assigns_any(body_cfg, &captures) {
+                        return None;
+                    }
+                    Some(crate::ir::MadeMethod {
+                        id: *id,
+                        params: params.clone(),
+                        body_cfg: Arc::clone(body_cfg),
+                        captures,
+                    })
+                }
+                _ => None,
+            };
+            members.push((key, method));
+        }
+        literals.push(crate::ir::MadeLiteral { id, members });
+    }
+    Some(crate::ir::MadeObject {
+        literals,
+        span: crate::ir::graft_spans(&f.body_cfg, &[]),
+    })
+}
+
+/// Does `cfg`, nested functions included, assign one of `names`?
+fn assigns_any(cfg: &crate::ir::CFG, names: &[crate::ir::Var]) -> bool {
+    fn expr(e: &crate::ir::Expr, names: &[crate::ir::Var]) -> bool {
+        match e {
+            crate::ir::Expr::FnLit { body_cfg, .. } => assigns_any(body_cfg, names),
+            other => {
+                let mut hit = false;
+                other.for_each_child(&mut |c| hit = hit || expr(c, names));
+                hit
+            }
+        }
+    }
+    cfg.blocks.values().any(|b| {
+        b.stmts.iter().any(|s| {
+            let mut hit = matches!(s, crate::ir::Stmt::Assign { var, .. } if names.contains(var));
+            s.for_each_expr(&mut |e| hit = hit || expr(e, names));
+            hit
+        })
+    }) || {
+        let mut hit = false;
+        cfg.for_each_expr(&mut |e| hit = hit || expr(e, names));
+        hit
+    }
+}
+
+/// Can a use of the module `const` `key`, holding `obj`, change the object?
+/// A write rooted at it; the `const` read as a value; a call through it of
+/// anything but one of its methods (a method of `Object.prototype` may
+/// define or replace a member). A member read, a method read as a value, a
+/// call through a member's value, is no change of the object: a method
+/// reads no `this` ([`made_object`]) and a member that is no method is
+/// read ⊤.
+fn made_exposed(
+    key: &(PathBuf, String),
+    obj: &crate::ir::MadeObject,
+    uses: &[crate::ir::module::ResolvedUse<'_>],
+) -> bool {
+    use crate::ir::module::ConstUseKind;
+    uses.iter()
+        .filter(|u| u.key == *key)
+        .any(|u| match u.of.kind {
+            ConstUseKind::Write => true,
+            ConstUseKind::Value => u.path.is_empty(),
+            ConstUseKind::Receiver => {
+                u.path.is_empty() && !u.of.member.as_deref().is_some_and(|m| obj.method(m))
+            }
+        })
 }
 
 /// Record the import edges that point at lowered utilities (ADR-027 §3), so

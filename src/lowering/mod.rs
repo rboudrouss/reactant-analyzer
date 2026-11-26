@@ -2,6 +2,7 @@ mod body_scan;
 pub mod cfg_builder;
 pub mod class_lowerer;
 pub mod component_detector;
+mod const_scan;
 mod detector;
 pub mod expr_lower;
 pub mod hook_detector;

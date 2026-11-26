@@ -38,6 +38,10 @@ fn loop_severities(src: &str) -> Vec<Severity> {
 }
 
 fn with_trigger(trigger: &str) -> String {
+    listening_to("click", trigger)
+}
+
+fn listening_to(event: &str, trigger: &str) -> String {
     format!(
         r#"
 import {{ useEffect, useState }} from "react";
@@ -45,9 +49,9 @@ export function App() {{
   const [s, setS] = useState({{}});
   useEffect(() => {{
     const h = () => setS({{}});
-    document.addEventListener("click", h);
+    document.addEventListener("{event}", h);
     {trigger}
-    return () => document.removeEventListener("click", h);
+    return () => document.removeEventListener("{event}", h);
   }});
   return <div>{{Object.keys(s).length}}</div>;
 }}
@@ -57,14 +61,40 @@ export function App() {{
 
 #[test]
 fn an_element_method_that_fires_events_makes_a_listener_run_in_place() {
-    for trigger in [
-        "document.body.click();",
-        "document.body.focus();",
-        "document.body.blur();",
-        "form.requestSubmit();",
-    ] {
+    // A click's activation behaviour and a submission fire any event.
+    for trigger in ["document.body.click();", "form.requestSubmit();"] {
         assert!(loop_claims(&with_trigger(trigger)) > 0, "{trigger}");
     }
+    // A focus move fires the focus events, which a focus listener hears.
+    for trigger in ["document.body.focus();", "document.body.blur();"] {
+        for event in ["focus", "focusin", "blur", "focusout"] {
+            assert!(
+                loop_claims(&listening_to(event, trigger)) > 0,
+                "{event} {trigger}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_listener_no_dispatch_of_the_program_fires_runs_only_on_events() {
+    // #422: a focus move fires no `click` and no `keydown`: the listener
+    // runs on a user's event only, whatever the effect re-runs.
+    for trigger in ["document.body.focus();", "document.body.blur();"] {
+        assert_eq!(loop_claims(&with_trigger(trigger)), 0, "{trigger}");
+        assert_eq!(
+            loop_claims(&listening_to("keydown", trigger)),
+            0,
+            "{trigger}"
+        );
+    }
+    // A dispatched `keydown` reaches a `keydown` listener only.
+    let keydown = r#"document.dispatchEvent(new KeyboardEvent("keydown"));"#;
+    assert!(loop_claims(&listening_to("keydown", keydown)) > 0);
+    assert_eq!(loop_claims(&listening_to("resize", keydown)), 0);
+    // A dispatched event the analysis cannot name may be any.
+    let unnamed = "document.dispatchEvent(ev);";
+    assert!(loop_claims(&listening_to("resize", unnamed)) > 0);
 }
 
 fn jsx_case(trigger: &str, deps: &str, handler: &str) -> String {

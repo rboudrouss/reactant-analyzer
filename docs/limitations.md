@@ -440,7 +440,8 @@ that writes it (see *Cross-file limits*).
   render of every component [#335](https://github.com/rboudrouss/reactant-analyzer/issues/335):
   what a body stores there — the binding itself, or a member of the object it holds — joins
   into it, and escapes, since code the analysis does not see may read it. A call of module code
-  the analysis does not run (a module object's method, a module class's static member, a utility
+  the analysis does not run (a module object's method — but one of an object a program function
+  made, which runs, #422 below —, a module class's static member, a utility
   called where it is not inlined, a function a binding holds), and a value called or handed on
   by a binding's name, may call anything any module binding holds, in its own phase; so may a
   read off a module binding that may run an accessor the analysis does not see (#337). The
@@ -683,13 +684,21 @@ carries an Error.
   `subscribe`) as a long-lived registration [#42](https://github.com/rboudrouss/reactant-analyzer/issues/42). Such a match never reaches Error, and
   neither does a write back that is not on every path of the callback
   [#142](https://github.com/rboudrouss/reactant-analyzer/issues/142).
-- **One `dispatchEvent` anywhere makes every `addEventListener` listener ⊤.** A listener is
+- **A dispatch of an event anywhere makes every listener of that event ⊤.** A listener (an
+  `addEventListener` callback, a host element's `on*` prop, a package hook's listener) is
   event-only (no churn edge) only while no body of the program calls `dispatchEvent`, `emit` on a
   receiver, or an element method that fires events before it returns (`click()`, `focus()`,
-  `blur()`, `requestSubmit()`): a dispatch runs the listeners before it returns, and which listener it reaches
-  is a question of event names and targets the analysis does not resolve (#219). In such a
-  program the fixpoint runs every listener where it is registered, as it runs a timer callback, so
-  the slot a listener writes moves with its writes, a listener passed by name included
+  `blur()`, `requestSubmit()`) that may fire an event it hears: a dispatch runs the listeners
+  before it returns, and which listener it reaches is a question of targets the analysis does not
+  resolve (#219). The events are those the dispatch block below lists (a `focus()` fires the
+  focus events and the blurred control's `change`, never `keydown`, `resize`, `scroll` or
+  `storage`; a `click()`, a `requestSubmit()` and a dispatched value any event), and a listener
+  hears its literal or module-`const` name, any event otherwise
+  [#422](https://github.com/rboudrouss/reactant-analyzer/issues/422). No target is read, so a
+  `window` listener, or one on an element a package renders, is reached by every dispatch of its
+  event. In such a program the fixpoint runs every listener a dispatch may reach where it is
+  registered, as it runs a timer callback, so the slot a listener writes moves with its writes, a
+  listener passed by name included
   [#250](https://github.com/rboudrouss/reactant-analyzer/issues/250). A dispatch
   hidden in an opaque callee is not seen. A dispatching call runs, where it is made and as
   possible writes of that body, every listener of the program its event may reach
@@ -721,7 +730,19 @@ carries an Error.
   recorded. A call the analysis resolves to program bodies alone (a method of an object the
   program builds, named `emit` or `focus`) is no dispatch: it fires events only through a
   dispatch in those bodies, which the walk follows; a method of a module object, which the
-  analysis does not run, stays one. The writes one dispatching call's listeners make are judged
+  analysis does not run, stays one. A module object a program function made is run: `const X =
+  f(…)`, `f` a function of the same file every return of which is an object literal (no spread,
+  accessor or computed key), is that literal, its methods the literal's functions closing over
+  `f`'s own names, which hold any value, so `X.m(…)` runs `m`'s body and a dispatch there is seen
+  where `X.m` is called [#422](https://github.com/rboudrouss/reactant-analyzer/issues/422). This
+  holds only where the program cannot have changed the object, read by the names it is used
+  under: no write rooted at `X` or at an import of it, `X` never read as a value nor the receiver
+  of a call of anything but one of its methods, no method reading `this` or writing what it
+  captures, `f`'s own code building what the methods capture from builtins alone (no function
+  but the methods, no call), nothing writing `f`, and no namespace of `X`'s file handed on.
+  Anywhere else — an object a function of another file makes, a return through a local name
+  (`const o = {…}; return o`), a member written as a name (`return { emit }`) — `X.m` stays a
+  method of a module object. The writes one dispatching call's listeners make are judged
   one by one and reported as one row of that call, at the call, listing the setters (`dispatch`
   and `setters` in the JSON); an effect's call is one `cross-component-infinite-loop` row. The
   program's test

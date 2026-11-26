@@ -79,9 +79,10 @@ impl Default for Config {
 /// is analysed: facts a component's own bodies cannot settle, and the
 /// results they would be joined over do not exist yet.
 pub struct ProgramFacts {
-    /// Some body fires event listeners itself (`dispatchEvent`), so no
-    /// listener is event-only (#219).
-    pub dispatches: bool,
+    /// The events the program's bodies fire themselves (`dispatchEvent`,
+    /// `focus()`, #219): a listener one of them may reach is no event-only
+    /// listener (#422).
+    pub(crate) dispatches: crate::engine::listeners::Dispatches,
     /// The names some body writes outside itself
     /// ([`written_names`](crate::engine::render_deps::written_names)): a
     /// module binding among them is a cell that moves with no slot (#224).
@@ -114,8 +115,12 @@ impl ProgramFacts {
         facts.accessors = accessors;
         facts.modules = std::sync::Arc::new(modules);
         facts.relations_after_all = true;
-        facts.dispatches =
-            crate::engine::registrations::program_dispatches_events(components, hooks, utilities);
+        facts.dispatches = crate::engine::registrations::program_dispatches_events(
+            components,
+            hooks,
+            utilities,
+            &facts.modules,
+        );
         for c in components.all_components() {
             facts.written.extend(written_in(
                 std::slice::from_ref(&c.param),
@@ -136,9 +141,14 @@ impl ProgramFacts {
     /// files, so no accessor an object it does not place may hold.
     fn of_utilities(utilities: &FunctionRegistry) -> Self {
         ProgramFacts {
-            dispatches: utilities
-                .all_functions()
-                .any(|f| crate::engine::registrations::dispatches_events(&f.body_cfg)),
+            dispatches: {
+                let mut out = crate::engine::listeners::Dispatches::default();
+                let none = crate::engine::registrations::Methods::none();
+                for f in utilities.all_functions() {
+                    crate::engine::registrations::dispatches_events(&f.body_cfg, &none, &mut out);
+                }
+                out
+            },
             written: utilities
                 .all_functions()
                 .flat_map(|f| crate::engine::render_deps::written_roots(&f.params, &f.body_cfg))
@@ -364,6 +374,14 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         }
     };
     let mut initial_env = initial_env;
+    // A module object a program function made (#422) is one of the literals
+    // its returns build, allocated once at module load, in the heap every
+    // analysis starts from: each holds its members as written — a method the
+    // function literal it is, any other member ⊤ — and lacks every other
+    // one, as a literal does (#340). A method is a closure of no component,
+    // its captures the making function's names, which hold any value.
+    let mut initial_heap = initial_heap;
+    let made_sites = seed_made_objects(&module_consts, &mut initial_heap, &mut splice_salt);
     // Module consts alone, in their own env: reused below as the entry env of
     // custom-hook argument bodies — a module const has the same value at every
     // program point, so it is the only binding that may be seeded there.
@@ -381,16 +399,23 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 }
                 // A context object is a module-scoped reference like any
                 // literal — the role it also records is read by the rules layer.
-                ModuleConstInit::Ref | ModuleConstInit::Context(_) => {
+                ModuleConstInit::Ref | ModuleConstInit::Context(_) | ModuleConstInit::Made(_) => {
                     StateValue::reference(Stability::Stable)
                 }
             };
+            let sites = made_sites.get(name);
             // Bindings already present in `initial_env` (props from a parent
             // analysis) win there; `module_env` keeps every const.
             if !initial_env.contains(name) {
                 initial_env.extend(name.clone(), val.clone());
+                if let Some(s) = sites {
+                    initial_env.bind_locs(name.clone(), Some(s.clone()));
+                }
             }
             env.extend(name.clone(), val);
+            if let Some(s) = sites {
+                env.bind_locs(name.clone(), Some(s.clone()));
+            }
         }
         env
     };
@@ -482,12 +507,24 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     // body is an effect's, whose returned cleanup React calls too (#171);
     // what the fixpoint knows beyond the body's syntax (callback bodies,
     // reducers) and how loops widen are the same for all of them.
-    // A listener may run synchronously wherever the program dispatches
-    // events (#219): this component's own bodies, inlined hooks and utilities
-    // included, or any other body of the program. Every pass then runs a
-    // registered listener where it is registered (#250).
-    let dispatches = program.dispatches
-        || crate::engine::registrations::body_dispatches_events(&render_cfg, &hooks);
+    // A listener may run synchronously wherever the program dispatches an
+    // event it hears (#219, #422): from this component's own bodies, inlined
+    // hooks and utilities included, or any other body of the program. Every
+    // pass then runs such a registered listener where it is registered
+    // (#250).
+    let mut dispatches = program.dispatches.clone();
+    let methods = crate::engine::registrations::body_methods(
+        Some(&*module_consts),
+        &render_cfg,
+        &hooks,
+        std::slice::from_ref(&comp_param),
+    );
+    crate::engine::registrations::body_dispatches_events(
+        &render_cfg,
+        &hooks,
+        &methods,
+        &mut dispatches,
+    );
     // The hooks expansion left: their arguments escape at their call (#254).
     let hook_args: HashMap<HookLabel, Vec<Expr>> = hooks
         .iter()
@@ -561,7 +598,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         callbacks: &callback_bodies,
         hooks: &hooks,
         reducers: &reducers,
-        dispatches,
+        dispatches: &dispatches,
         hook_args: &hook_args,
         hands_back: &hands_back,
         hook_reads: &hook_reads,
@@ -1089,9 +1126,15 @@ fn compute_program_relations(
     crate::profile::count("listeners:dispatching-results", again.len() as u64);
     if !again.is_empty() {
         let _profile = crate::profile::pass("relations:listeners");
-        let owners: HashMap<ComponentId, (&AnalysisResult<StateValue>, bool)> = results
+        let owners: HashMap<
+            ComponentId,
+            (
+                &AnalysisResult<StateValue>,
+                &crate::engine::listeners::Dispatches,
+            ),
+        > = results
             .iter()
-            .map(|(id, result, inputs, _)| (*id, (&**result, inputs.dispatches)))
+            .map(|(id, result, inputs, _)| (*id, (&**result, &inputs.dispatches)))
             .collect();
         listeners.runs = crate::engine::setters::run_listeners(&listeners, &owners);
     }
@@ -1106,13 +1149,13 @@ fn compute_program_relations(
 }
 
 /// What [`compute_relations`] needs beyond the converged result: the splice
-/// regions, the component's own reducers and whether the program dispatches
-/// events. Kept on a result whose relations are not computed yet.
+/// regions, the component's own reducers and the events the program
+/// dispatches. Kept on a result whose relations are not computed yet.
 #[derive(Debug, Clone)]
 pub(crate) struct RelationInputs {
     inline_regions: crate::engine::setters::InlineRegions,
     reducers: HashMap<HookLabel, crate::engine::reducers::Reducer>,
-    dispatches: bool,
+    dispatches: crate::engine::listeners::Dispatches,
 }
 
 /// The relations the rules read off a converged result: the writer rows, the
@@ -1139,7 +1182,6 @@ fn compute_relations(
         reducers,
         dispatches,
     } = inputs;
-    let dispatches = *dispatches;
     let comp_id = result.component;
     let profile = crate::profile::pass("relations:writers");
     let reducers = crate::engine::Reducers::registered(comp_id, reducers.clone(), program_reducers);
@@ -1647,6 +1689,20 @@ impl SpliceIds {
         let n = self.next_call;
         self.next_call += 1;
         crate::ir::types::ExprId(crate::ir::expr::CALL_SITES + n)
+    }
+
+    /// The offsets of one graft of a body `span` wide
+    /// ([`crate::ir::graft_spans`]) that renames nothing and carries no hook
+    /// table: a module object a program function made (#422).
+    fn graft(&mut self, span: (u64, u64)) -> crate::ir::Offsets {
+        let off = crate::ir::Offsets {
+            ids: self.next_alloc,
+            calls: self.next_call,
+            ..Default::default()
+        };
+        self.next_alloc += span.0;
+        self.next_call += span.1;
+        off
     }
 
     /// The salt and the offsets for one graft of `cfg` and its `hooks` —
@@ -2563,9 +2619,73 @@ fn declared_names(cfg: &CFG, out: &mut HashSet<Var>) {
     }
 }
 
+/// Put every module object of `consts` ([`ModuleConstInit::Made`], #422) in
+/// `heap`, grafted into the analysis's range by `salt` as a utility's body
+/// is spliced: each literal at its site, its methods as closures of
+/// [`ComponentId::MODULE_OBJECTS`] whose captures hold ⊤. Returns the sites
+/// each `const` may point to. The graft is the analysis's own: what it
+/// records at a method's calls joins no other analysis's rows, as a spliced
+/// body's do not; what crosses analyses through the object — a closure one
+/// component's call hands to the state the methods capture, called by
+/// another's — is handed to code the analysis does not see there, which
+/// may run it at any time in the analysis that handed it.
+fn seed_made_objects(
+    consts: &HashMap<Var, ModuleConstInit>,
+    heap: &mut Heap,
+    salt: &mut SpliceIds,
+) -> HashMap<Var, crate::domains::stores::Sites> {
+    use crate::domains::stores::{EnvVal, Members, Sites};
+    let mut out = HashMap::new();
+    let mut names: Vec<&Var> = consts.keys().collect();
+    names.sort();
+    for name in names {
+        let Some(ModuleConstInit::Made(obj)) = consts.get(name) else {
+            continue;
+        };
+        let off = salt.graft(obj.span);
+        let shift = |id: crate::ir::types::ExprId| crate::ir::types::ExprId(id.0 + off.ids);
+        for lit in &obj.literals {
+            let mut named = HashMap::new();
+            for (key, method) in &lit.members {
+                let entry = match method {
+                    Some(m) => {
+                        let mut captured: AbstractEnv<StateValue> = AbstractEnv::new();
+                        for v in &m.captures {
+                            captured.extend(v.clone(), StateValue::top());
+                        }
+                        let body =
+                            std::sync::Arc::new(crate::ir::remap_cfg((*m.body_cfg).clone(), off));
+                        heap.alloc_fn(
+                            shift(m.id),
+                            &m.params,
+                            &body,
+                            &captured,
+                            ComponentId::MODULE_OBJECTS,
+                        );
+                        EnvVal::located(
+                            Some(Sites::closed([shift(m.id)])),
+                            StateValue::reference(Stability::Stable),
+                        )
+                    }
+                    None => EnvVal::Val(StateValue::top()),
+                };
+                named.insert(key.clone(), entry);
+            }
+            let mut members = Members::exactly(named);
+            members.literal = true;
+            heap.insert(shift(lit.id), crate::domains::HeapValue::Obj(members));
+        }
+        out.insert(
+            name.clone(),
+            Sites::closed(obj.literals.iter().map(|l| shift(l.id))),
+        );
+    }
+    out
+}
+
 /// Every name a body binds — a `let`, an assignment, a parameter — nested
 /// bodies included.
-fn bound_names(cfg: &CFG, out: &mut HashSet<crate::ir::types::Var>) {
+pub(crate) fn bound_names(cfg: &CFG, out: &mut HashSet<crate::ir::types::Var>) {
     fn expr(e: &Expr, out: &mut HashSet<crate::ir::types::Var>) {
         if let Expr::FnLit {
             params, body_cfg, ..

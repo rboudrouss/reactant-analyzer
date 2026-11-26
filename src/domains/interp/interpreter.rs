@@ -1866,7 +1866,14 @@ fn exec_callbacks_depth<T: Transfer>(
     }
     match expr {
         Expr::Call { id, fn_, args } => {
-            let class = classify_callee(fn_, env, ctx.query.dispatches());
+            // A listener runs where it is registered when some dispatch of
+            // the program may fire its event (#219, #422): the name the
+            // call's first argument holds, any event when it is not known.
+            let reached = || {
+                let event = args.first().and_then(|a| member_key(a, env));
+                ctx.query.dispatches(event.as_deref())
+            };
+            let class = classify_callee(fn_, env, reached);
             // Descend the receiver: handles chains like `a.then(x).then(y)`.
             exec_callbacks_depth(transfer, fn_, env, ctx, depth);
             // A callee that can only be `null` or `undefined` throws once

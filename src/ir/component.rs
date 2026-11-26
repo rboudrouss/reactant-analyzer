@@ -38,6 +38,70 @@ pub enum ModuleConstInit {
     /// mean the same cell. The resolver already had the origin in hand when it
     /// marked an imported name; it used to drop it.
     Context(ContextId),
+    /// `const X = f(…)` where `f` is a function of the same file every
+    /// return of which is an object literal, and the program cannot have
+    /// changed the object (#422): a reference like
+    /// [`Ref`](ModuleConstInit::Ref) to one of those literals, whose function
+    /// members are the literal's functions ([`MadeObject`]).
+    Made(Arc<MadeObject>),
+}
+
+/// The object a module `const` holds when a program function made it
+/// (`const channel = createChannel()`, [`ModuleConstInit::Made`], #422):
+/// one of the literals its returns build. The resolver keeps it only when
+/// every return of the function is an object literal with no spread, no
+/// accessor and no computed key, no method reads `this`, nothing writes the
+/// function's name, and no use of the `const` can change the object: no
+/// write rooted at it, no read of it as a value, no call through it but of
+/// one of its methods, its file's namespace never handed on
+/// ([`crate::ir::ModuleTable::const_uses`]).
+///
+/// Its ids are the function's own, as lowered: every analysis that reads the
+/// `const` grafts the object into its own range, as a splice grafts a
+/// utility's body (`span` wide, [`crate::ir::graft_spans`]), so what one
+/// analysis records at a method's calls is that analysis's alone.
+#[derive(Debug, Clone)]
+pub struct MadeObject {
+    /// One object per return literal, in the function's block order.
+    pub literals: Vec<MadeLiteral>,
+    /// The allocation-id and call-id widths of the function's body.
+    pub span: (u64, u64),
+}
+
+/// One literal a [`MadeObject`] may be.
+#[derive(Debug, Clone)]
+pub struct MadeLiteral {
+    /// Where the object is allocated, once, at module load.
+    pub id: crate::ir::types::ExprId,
+    /// Its members by name, in source order: a function literal's
+    /// [`MadeMethod`], `None` for any other value (read ⊤).
+    pub members: Vec<(Symbol, Option<MadeMethod>)>,
+}
+
+/// A function member of a [`MadeLiteral`]: the function the literal holds,
+/// allocated once, closing over the function's own names (`captures`),
+/// which hold any value (the analysis does not run the module's load).
+#[derive(Debug, Clone)]
+pub struct MadeMethod {
+    pub id: crate::ir::types::ExprId,
+    pub params: Vec<Var>,
+    pub body_cfg: Arc<CFG>,
+    /// The free names of the body the function that made the literal
+    /// declares (its parameters and its locals).
+    pub captures: Vec<Var>,
+}
+
+impl MadeObject {
+    /// Is `member` a method of every literal the object may be?
+    pub fn method(&self, member: &str) -> bool {
+        self.literals.iter().all(|l| {
+            l.members
+                .iter()
+                .rev()
+                .find(|(k, _)| k == member)
+                .is_some_and(|(_, m)| m.is_some())
+        })
+    }
 }
 
 /// Canonical identity of a React context cell: the file that called

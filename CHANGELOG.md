@@ -885,6 +885,27 @@ on a program React settles; 323 oracle cases, none a known false negative.
   Oracle: 3 new cases (two loops the graph now claims alone, their settling
   neighbour `tn`); the 11 small repos and mantine unchanged, and no new claim
   on dub or twenty (#421).
+- A registered listener (an `addEventListener` callback, a host element's
+  `on*` prop, a package hook's listener) runs where it is registered only
+  when some dispatch of the program may fire an event it hears: a program
+  whose dispatches are `focus()` calls no longer runs its `keydown`,
+  `resize` or `storage` listeners at registration, which run on a user's or
+  the browser's event only. A `click()`, a `requestSubmit()`, a dispatched
+  value and a listener whose event name is not known still mean any event.
+  Shown rows: chakra-ui 379 → 377, shadcn-admin 34 → 32, the 9 other small
+  repos, mantine, dub and twenty unchanged (each of these fires some `click()`
+  or `requestSubmit()`, #427) (#422).
+- A module `const` a program function of the same file made, every return of
+  which is an object literal (`const channel = createChannel()`), is that
+  literal: `channel.emit(x)` runs the literal's `emit`, so it is no dispatch
+  of any event, and a `dispatchEvent` in its body is seen where `emit` is
+  called. Where the program may have changed the object (a member written, the
+  object handed on, a call of anything but one of its methods, a return that
+  is no literal, a method reading `this`), the method stays one of a module
+  object the analysis does not run, as before. Shown rows: dub 1,307 → 1,306
+  (`storageEventChannel.emit()` is no dispatch: 203 setter claims leave, one
+  Warning appears at the effect that calls it), twenty and the 12 other repos
+  unchanged (#422).
 - A function handed as a prop to a child component the analysis does not see
   (a package's component, an element value it does not resolve, a name several
   files define, a component rendering itself, a context provider's `value`)

@@ -27,13 +27,14 @@ pub enum TriggerClass {
 /// consequence of the current render/effect (and so must be descended into for
 /// their side effects).
 ///
-/// `dispatches`: some body of the program fires event listeners itself
-/// (#219). A listener `addEventListener` registers may then run in the pass
-/// that registers it, as a timer callback may, so it is in-cycle (#250).
+/// `reached`: some dispatch of the program may fire the event the listener
+/// an `addEventListener` call registers hears (#219, #422). That listener
+/// may then run in the pass that registers it, as a timer callback may, so
+/// it is in-cycle (#250).
 pub fn classify_callee<D: AbstractDomain>(
     fn_: &Expr,
     env: &AbstractEnv<D>,
-    dispatches: bool,
+    reached: impl FnOnce() -> bool,
 ) -> TriggerClass {
     match fn_ {
         // A setter is a name bound to one, or one whose value can only be a
@@ -64,7 +65,7 @@ pub fn classify_callee<D: AbstractDomain>(
             // synchronously. Receiver-restricted — a bare `.from` on an
             // unknown object could be anything.
             "from" if matches!(obj.as_ref(), Expr::Var(v) if v == "Array") => TriggerClass::InCycle,
-            "addEventListener" if dispatches => TriggerClass::InCycle,
+            "addEventListener" if reached() => TriggerClass::InCycle,
             "addEventListener" | "removeEventListener" => TriggerClass::Subscription,
             _ => TriggerClass::Unknown,
         },
@@ -101,7 +102,7 @@ mod tests {
             "reduceRight",
         ] {
             assert_eq!(
-                classify_callee(&method("arr", f), &env(), false),
+                classify_callee(&method("arr", f), &env(), || false),
                 TriggerClass::InCycle,
                 "{f} must be in-cycle"
             );
@@ -111,11 +112,11 @@ mod tests {
     #[test]
     fn string_replacer_callbacks_are_in_cycle() {
         assert_eq!(
-            classify_callee(&method("s", "replace"), &env(), false),
+            classify_callee(&method("s", "replace"), &env(), || false),
             TriggerClass::InCycle
         );
         assert_eq!(
-            classify_callee(&method("s", "replaceAll"), &env(), false),
+            classify_callee(&method("s", "replaceAll"), &env(), || false),
             TriggerClass::InCycle
         );
     }
@@ -123,13 +124,13 @@ mod tests {
     #[test]
     fn array_from_is_receiver_restricted() {
         assert_eq!(
-            classify_callee(&method("Array", "from"), &env(), false),
+            classify_callee(&method("Array", "from"), &env(), || false),
             TriggerClass::InCycle
         );
         // `.from` on an unknown receiver could be anything (e.g. a query
         // builder) — stays Unknown, FP-averse.
         assert_eq!(
-            classify_callee(&method("router", "from"), &env(), false),
+            classify_callee(&method("router", "from"), &env(), || false),
             TriggerClass::Unknown
         );
     }
@@ -137,11 +138,11 @@ mod tests {
     #[test]
     fn subscriptions_and_unknowns_unchanged() {
         assert_eq!(
-            classify_callee(&method("el", "addEventListener"), &env(), false),
+            classify_callee(&method("el", "addEventListener"), &env(), || false),
             TriggerClass::Subscription
         );
         assert_eq!(
-            classify_callee(&method("api", "subscribe"), &env(), false),
+            classify_callee(&method("api", "subscribe"), &env(), || false),
             TriggerClass::Unknown
         );
     }
@@ -151,11 +152,11 @@ mod tests {
         // #250: a dispatch may run the listener in the registering pass. A
         // teardown takes it back and runs nothing.
         assert_eq!(
-            classify_callee(&method("el", "addEventListener"), &env(), true),
+            classify_callee(&method("el", "addEventListener"), &env(), || true),
             TriggerClass::InCycle
         );
         assert_eq!(
-            classify_callee(&method("el", "removeEventListener"), &env(), true),
+            classify_callee(&method("el", "removeEventListener"), &env(), || true),
             TriggerClass::Subscription
         );
     }

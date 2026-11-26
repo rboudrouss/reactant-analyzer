@@ -78,6 +78,52 @@ pub struct ModuleFacts {
     /// module binds anywhere or writes into: there the name may not be the
     /// language's.
     pub globals_shadowed: Vec<String>,
+    /// The uses of the file's own top-level names and of its program
+    /// imports that may let the program change a module object
+    /// ([`ModuleTable::const_uses`], #422).
+    pub const_uses: Vec<ConstUse>,
+    /// `import * as ns from "./x"`: the local, and the file.
+    pub namespace_imports: Vec<(String, PathBuf)>,
+    /// Files whose namespace object the file hands on as a value: an
+    /// `import("./x")`, an `export * as ns from "./x"`.
+    pub opened_modules: Vec<PathBuf>,
+    /// The module `const`s the file initialises with a call of one of its
+    /// own top-level names (`const channel = createChannel()`): the
+    /// `const`, and the name called (#422).
+    pub made_consts: Vec<(String, String)>,
+}
+
+/// A [`ConstUse`] resolved to the binding it names ([`ModuleTable::const_uses`]).
+#[derive(Debug, Clone)]
+pub struct ResolvedUse<'u> {
+    /// The file and the name that declare the binding.
+    pub key: (PathBuf, String),
+    /// The member path off the binding.
+    pub path: &'u [String],
+    /// The use.
+    pub of: &'u ConstUse,
+}
+
+/// How a use of a name may change a module object (#419, #422).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstUseKind {
+    /// The name (a member chain off it) is written to.
+    Write,
+    /// The chain is read as a value: what it holds escapes there.
+    Value,
+    /// The chain is the receiver of a call through one of its members.
+    Receiver,
+}
+
+/// One use of a name that may stand for a module object (#419, #422): the
+/// static member path off it that is used, and for a call's receiver the
+/// member called (`None`: a key no literal names, or a tag or a `new`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstUse {
+    pub root: String,
+    pub path: Vec<String>,
+    pub kind: ConstUseKind,
+    pub member: Option<String>,
 }
 
 /// A write into a package import, as [`ModuleFacts::member_install`] names
@@ -572,6 +618,63 @@ impl ModuleTable {
                     })
             })
             .collect()
+    }
+
+    /// Every use the files record ([`ModuleFacts::const_uses`]) of a name
+    /// that may stand for a top-level binding of an analysed file, resolved
+    /// to the file and name that declare it — through an import and any
+    /// barrel, or a namespace import's member —, with the member path off
+    /// it; and the files whose namespace object is handed on as a value (a
+    /// namespace import read whole, an `import()`, an `export * as`), every
+    /// binding of which may be changed there. A use no analysed file
+    /// declares is left out.
+    pub fn const_uses(&self) -> (Vec<ResolvedUse<'_>>, Vec<PathBuf>) {
+        let graph = self.re_export_graph();
+        let declares = |file: &Path, name: &str| {
+            self.facts(file)
+                .is_some_and(|f| f.bindings.iter().any(|b| b == name))
+        };
+        let mut out = Vec::new();
+        let mut opened: Vec<PathBuf> = Vec::new();
+        for (file, facts) in &self.files {
+            opened.extend(facts.opened_modules.iter().cloned());
+            for u in &facts.const_uses {
+                let imported = facts
+                    .imported
+                    .iter()
+                    .find(|(local, _, _)| *local == u.root)
+                    .map(|(_, origin, exported)| (origin, exported));
+                let namespace = facts
+                    .namespace_imports
+                    .iter()
+                    .find(|(local, _)| *local == u.root)
+                    .map(|(_, f)| f);
+                let target = if let Some((origin, exported)) = imported {
+                    graph
+                        .origin(origin, exported, &declares)
+                        .map(|key| (key, u.path.as_slice()))
+                } else if let Some(ns) = namespace {
+                    match u.path.split_first() {
+                        None if u.kind != ConstUseKind::Receiver => {
+                            opened.push(ns.clone());
+                            None
+                        }
+                        Some((first, rest)) => {
+                            graph.origin(ns, first, &declares).map(|key| (key, rest))
+                        }
+                        None => None,
+                    }
+                } else if facts.bindings.contains(&u.root) {
+                    Some(((file.clone(), u.root.clone()), u.path.as_slice()))
+                } else {
+                    None
+                };
+                if let Some((key, path)) = target {
+                    out.push(ResolvedUse { key, path, of: u });
+                }
+            }
+        }
+        (out, opened)
     }
 
     /// The re-export relation of every file that has one.

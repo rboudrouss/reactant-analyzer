@@ -91,6 +91,25 @@ impl Events {
         }
     }
 
+    /// What a listener registered for the event `name` hears, any event
+    /// when the name is not known ([`Self::named`]).
+    pub(crate) fn of_name(name: Option<&str>) -> Events {
+        name.map_or(Events::Any, Events::listening_to)
+    }
+
+    /// Every event either set holds.
+    pub(crate) fn join(&self, other: &Events) -> Events {
+        match (self, other) {
+            (Events::Of(a), Events::Of(b)) => {
+                let mut names: Vec<String> = a.iter().chain(b).cloned().collect();
+                names.sort();
+                names.dedup();
+                Events::Of(names)
+            }
+            _ => Events::Any,
+        }
+    }
+
     /// What a native listener of the event `name` hears.
     fn listening_to(name: &str) -> Events {
         match name.eq_ignore_ascii_case("change") {
@@ -194,6 +213,48 @@ impl Events {
             }
         };
         Events::of(deps)
+    }
+}
+
+/// The events the program's dispatches may fire, joined over every
+/// dispatching call of every body of the program (#219, #422): `None` when no
+/// body dispatches.
+///
+/// A registered listener (an `addEventListener` argument, a host element's
+/// `on*` prop, a package hook's argument timed `Listener`: every position of
+/// [`Listeners`]) runs where it is registered, ⊤, only when
+/// [`Self::reach`] says some dispatch may fire an event it hears; any other
+/// listener is the event handler it is. The program's dispatches are the only
+/// synchronous sources of an event the analysis does not otherwise model: a
+/// user's or the browser's event runs a listener from no React phase, and
+/// what code the analysis does not see dispatches is a limit written down
+/// (`docs/limitations.md`). A dispatch fires what [`fired_events`] lists for
+/// it, any event when it cannot say (`click()`, `requestSubmit()`, a
+/// dispatched value), and a listener hears what it is registered for, any
+/// event when its name is not a literal or a known constant. No target is
+/// read, so a listener on a target the program does not own (`window`, an
+/// element a package renders) is reached by every dispatch of its event: a
+/// listener no dispatch can reach runs only on a user's or the browser's
+/// event.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Dispatches(Option<Events>);
+
+/// No body of the program dispatches.
+pub(crate) static NO_DISPATCH: Dispatches = Dispatches(None);
+
+impl Dispatches {
+    /// What a dispatching call firing `fired` adds.
+    pub(crate) fn add(&mut self, fired: &Events) {
+        self.0 = Some(match &self.0 {
+            Some(e) => e.join(fired),
+            None => fired.clone(),
+        });
+    }
+
+    /// May some dispatch of the program fire an event a listener hearing
+    /// `hears` hears? With `hears` [`Events::Any`]: does any body dispatch.
+    pub(crate) fn reach(&self, hears: &Events) -> bool {
+        self.0.as_ref().is_some_and(|fired| fired.meets(hears))
     }
 }
 
@@ -523,6 +584,27 @@ mod tests {
         assert!(focus.meets(&Events::listening_to("change")));
         assert!(!focus.meets(&Events::of_prop("onClick")));
         assert_eq!(fired_events(&call("push"), &[], &no_consts), None);
+    }
+
+    #[test]
+    fn a_listener_is_reached_by_the_dispatches_of_its_events_only() {
+        let call = |field: &str| Expr::FieldAccess {
+            obj: Box::new(Expr::Var("el".into())),
+            field: field.into(),
+        };
+        let mut program = Dispatches::default();
+        assert!(!program.reach(&Events::Any), "no dispatch");
+        program.add(&fired_events(&call("focus"), &[], &no_consts).unwrap());
+        assert!(!program.reach(&Events::of_name(Some("keydown"))));
+        assert!(!program.reach(&Events::of_prop("onKeyDown")));
+        assert!(program.reach(&Events::of_name(Some("focusin"))));
+        assert!(program.reach(&Events::of_name(Some("change"))));
+        assert!(program.reach(&Events::of_name(None)), "an unknown name");
+        program.add(&Events::of(&["keydown"]));
+        assert!(program.reach(&Events::of_prop("onKeyDown")));
+        assert!(!program.reach(&Events::of_name(Some("resize"))));
+        program.add(&fired_events(&call("click"), &[], &no_consts).unwrap());
+        assert!(program.reach(&Events::of_name(Some("resize"))));
     }
 
     #[test]
