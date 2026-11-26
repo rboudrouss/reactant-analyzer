@@ -1,18 +1,18 @@
 {
-  "total": 6149,
-  "digest": "a8f50add7aca3f3914770d16547c511a6ad3baeeeaf73a988acb58e822df9c3d",
+  "total": 6132,
+  "digest": "956128a32fefa290e3e9eb99a2576aee3164d5f9b49ea32ba307ae0e892a1482",
   "by_rule": {
     "always-unstable-deps": 613,
     "conditional-hook": 11,
-    "cross-component-infinite-loop": 273,
+    "cross-component-infinite-loop": 269,
     "cross-setter-in-render": 1356,
     "frozen-initial-state": 73,
-    "infinite-loop": 474,
+    "infinite-loop": 462,
     "lazy-init": 223,
     "missing-cleanup": 4,
     "missing-deps": 498,
     "redundant-set-state": 5,
-    "setter-in-render": 1745,
+    "setter-in-render": 1744,
     "stale-closure": 1,
     "state-lifted-too-high": 179,
     "state-mutation": 18,
@@ -21,15 +21,15 @@
     "wasted-subtree-render": 479
   },
   "by_repo": {
-    "ai-chatbot": 54,
+    "ai-chatbot": 49,
     "bulletproof-react": 28,
     "chakra-ui": 377,
     "commerce": 5,
-    "dub": 1306,
+    "dub": 1297,
     "excalidraw": 141,
     "mantine": 1881,
-    "memos": 179,
-    "next-shadcn-dashboard-starter": 41,
+    "memos": 178,
+    "next-shadcn-dashboard-starter": 39,
     "novel": 9,
     "precedent": 1,
     "shadcn-admin": 32,
@@ -38,9 +38,9 @@
   },
   "hidden": {
     "ai-chatbot": {
-      "infos": 266,
+      "infos": 264,
       "hand_overs": 22,
-      "setters": 40
+      "setters": 33
     },
     "bulletproof-react": {
       "infos": 359,
@@ -59,8 +59,8 @@
     },
     "dub": {
       "infos": 4434,
-      "hand_overs": 337,
-      "setters": 7710
+      "hand_overs": 339,
+      "setters": 2035
     },
     "excalidraw": {
       "infos": 367,
@@ -73,14 +73,14 @@
       "setters": 1
     },
     "memos": {
-      "infos": 661,
-      "hand_overs": 123,
-      "setters": 236
+      "infos": 663,
+      "hand_overs": 125,
+      "setters": 221
     },
     "next-shadcn-dashboard-starter": {
-      "infos": 665,
+      "infos": 663,
       "hand_overs": 18,
-      "setters": 46
+      "setters": 41
     },
     "novel": {
       "infos": 107,
