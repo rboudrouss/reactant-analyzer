@@ -521,3 +521,397 @@ fn the_config_schema_holds_the_list_of_globs() {
     assert_eq!(list["type"], "array", "{schema:#}");
     assert_eq!(list["items"]["type"], "string");
 }
+
+// ── packagePropsRunOnEvents ──────────────────────────────────────────────────
+
+const ON_EVENTS: &str = "packagePropsRunOnEvents";
+
+/// The hand-over rows (`rule:severity`) of a JSON report run with `--info`.
+fn hand_overs(doc: &serde_json::Value) -> Vec<String> {
+    let mut found: Vec<String> = doc["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|d| d["rule"].as_str().unwrap().ends_with("setter-in-render"))
+        .map(|d| {
+            format!(
+                "{}:{}",
+                d["rule"].as_str().unwrap(),
+                d["severity"].as_str().unwrap()
+            )
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+fn hidden_hand_overs(doc: &serde_json::Value) -> u64 {
+    doc["summary"]["hidden_hand_overs"].as_u64().unwrap()
+}
+
+/// A package component calling its prop on a click: by default an Info row
+/// (hidden, counted in the summary); declared, the prop is an event's, no row
+/// at all and nothing counted as hidden, and the output says what it assumed.
+#[test]
+fn package_props_on_events_drop_the_hand_over_and_say_so() {
+    let p = Project::case("handover-info-package-child-handler-settles");
+    let off = p.json(&["--info"]);
+    assert_eq!(hand_overs(&off), ["setter-in-render:info"], "off");
+    assert!(assumptions(&off).is_empty(), "off");
+    assert_eq!(hidden_hand_overs(&p.json(&[])), 1, "off");
+
+    let on = p.json(&["--info", "--assume", ON_EVENTS]);
+    assert!(hand_overs(&on).is_empty(), "on: {:?}", hand_overs(&on));
+    assert_eq!(assumptions(&on), [ON_EVENTS], "on");
+    assert_eq!(
+        hidden_hand_overs(&p.json(&["--assume", ON_EVENTS])),
+        0,
+        "on"
+    );
+}
+
+/// A program component wraps a package element and hands it a closure that
+/// calls the parent's setter prop (shadcn's `<Dialog onOpenChange={(o) =>
+/// onOpenChange(o)}>`): what the closure reaches by its captures runs only
+/// when the package calls it, so it is covered with it. In a program that
+/// fires events itself the covered part keeps the package's provenance: the
+/// row never turns into a Warning.
+#[test]
+fn package_props_on_events_cover_what_the_closure_calls() {
+    for dispatches in [false, true] {
+        let effect = if dispatches {
+            "useEffect(() => { r.current?.focus(); }, []);"
+        } else {
+            ""
+        };
+        let src = format!(
+            r#"import {{ useEffect, useRef, useState }} from "react";
+import {{ ClickCalls }} from "ext";
+function Confirm({{ onOpenChange }}: {{ onOpenChange: (o: boolean) => void }}) {{
+  return <ClickCalls fn={{(o: boolean) => onOpenChange(o)}} />;
+}}
+export function App() {{
+  const [t, setT] = useState<number | undefined>(0);
+  const r = useRef<HTMLInputElement>(null);
+  {effect}
+  return <div>{{t}}<input ref={{r}} /><Confirm onOpenChange={{(open) => !open && setT(undefined)}} /></div>;
+}}
+"#
+        );
+        let p = Project::new(&[("a.tsx", &src)]);
+        assert_eq!(
+            hand_overs(&p.json(&["--info"])),
+            ["cross-setter-in-render:info"],
+            "dispatches={dispatches}: off"
+        );
+        let on = p.json(&["--info", "--assume", ON_EVENTS]);
+        assert!(
+            hand_overs(&on).is_empty(),
+            "dispatches={dispatches}: on, {:?}",
+            hand_overs(&on)
+        );
+    }
+}
+
+/// The price: a package that calls the prop from an effect loops in React;
+/// by default the Info row discloses it, declared the analysis says nothing.
+#[test]
+fn package_props_on_events_lose_the_package_effect_loop() {
+    for case in [
+        "handover-info-package-child-effect-loops",
+        "package-props-named-closure-effect-loops",
+    ] {
+        let p = Project::case(case);
+        assert_eq!(
+            hand_overs(&p.json(&["--info"])),
+            ["setter-in-render:info"],
+            "{case}: off"
+        );
+        let on = p.json(&["--info", "--assume", ON_EVENTS]);
+        assert!(hand_overs(&on).is_empty(), "{case}: on");
+        assert!(loops(&on).is_empty(), "{case}: on");
+    }
+}
+
+/// What the statement does not cover keeps its default reading: a `ref`, the
+/// `children`, a spread, a function held by a member of an object prop
+/// (written in place or named) and an element of an array prop.
+#[test]
+fn package_props_on_events_leave_ref_children_spreads_and_members() {
+    let shapes = [
+        ("ref", r#"<RefTarget ref={() => setN(n + 1)} />"#),
+        (
+            "children",
+            r#"<RenderProp>{() => { setN(n + 1); return null; }}</RenderProp>"#,
+        ),
+        (
+            "children prop",
+            r#"<RenderProp children={() => setN(n + 1)} />"#,
+        ),
+        (
+            "spread",
+            r#"<EffectCalls {...{ fn: () => setN(n + 1) }} />"#,
+        ),
+        (
+            "object member",
+            r#"<EffectCalls opts={{ cb: () => setN(n + 1) }} />"#,
+        ),
+        (
+            "array entry",
+            r#"<EffectCalls fns={[() => setN(n + 1)]} />"#,
+        ),
+        ("named object", r#"<EffectCalls opts={held} />"#),
+    ];
+    for (name, element) in shapes {
+        let src = format!(
+            r#"import {{ useState }} from "react";
+import {{ EffectCalls, RefTarget, RenderProp }} from "ext";
+export function App() {{
+  const [n, setN] = useState(0);
+  const held = {{ cb: () => setN(n + 1) }};
+  return <div>{{n}}{element}</div>;
+}}
+"#
+        );
+        let p = Project::new(&[("a.tsx", &src)]);
+        let off = hand_overs(&p.json(&["--info"]));
+        assert_eq!(off, ["setter-in-render:info"], "{name}: off");
+        let on = p.json(&["--info", "--assume", ON_EVENTS]);
+        assert_eq!(hand_overs(&on), off, "{name}: on");
+        assert_eq!(assumptions(&on), [ON_EVENTS], "{name}: on");
+    }
+}
+
+/// Code that is not provably a package's keeps its Warning either way: a
+/// program child the analysis does not resolve, and a package element once
+/// the program writes code into a package import (#401's voiding fact).
+#[test]
+fn package_props_on_events_leave_program_code_and_a_replaced_package() {
+    let p = Project::case("package-props-unresolved-program-child-loops");
+    assert_eq!(
+        hand_overs(&p.json(&["--info"])),
+        ["setter-in-render:warning"]
+    );
+    assert_eq!(
+        hand_overs(&p.json(&["--info", "--assume", ON_EVENTS])),
+        ["setter-in-render:warning"]
+    );
+
+    let voided = r#"import { useState } from "react";
+import * as Ext from "ext";
+(Ext as any).hook = (f: () => void) => f();
+export function App() {
+  const [n, setN] = useState(0);
+  return <div>{n}<Ext.ClickCalls fn={() => setN(n + 1)} /></div>;
+}
+"#;
+    let p = Project::new(&[("a.tsx", voided)]);
+    assert_eq!(
+        hand_overs(&p.json(&["--info"])),
+        ["setter-in-render:warning"]
+    );
+    assert_eq!(
+        hand_overs(&p.json(&["--info", "--assume", ON_EVENTS])),
+        ["setter-in-render:warning"]
+    );
+}
+
+/// Declared, a package's prop is a listener a dispatch of any event may
+/// reach (#407): the program's own click of the package's button, in an
+/// effect after every commit, is a loop the analysis now claims.
+#[test]
+fn package_props_on_events_are_listeners_a_dispatch_runs() {
+    let p = Project::case("package-props-dispatched-click-loops");
+    assert!(loops(&p.json(&[])).is_empty(), "off");
+    assert_eq!(
+        loops(&p.json(&["--assume", ON_EVENTS])),
+        ["infinite-loop:warning"],
+        "on"
+    );
+}
+
+/// The loop rules read the same timing: W6's store cycle through a
+/// navigating closure handed to a package leaves under the assumption — on
+/// the program that settles, and on its neighbour that loops (the price).
+#[test]
+fn package_props_on_events_remove_the_store_step_from_the_loop_rules() {
+    for case in [
+        "package-props-store-shared-button-settles",
+        "package-props-store-shared-button-loops",
+    ] {
+        let p = Project::case(case);
+        assert_eq!(
+            loops(&p.json(&[])),
+            ["cross-component-infinite-loop:warning"],
+            "{case}: off"
+        );
+        assert!(
+            loops(&p.json(&["--assume", ON_EVENTS])).is_empty(),
+            "{case}: on"
+        );
+    }
+}
+
+#[test]
+fn package_props_on_events_are_declared_in_the_config_and_stated_in_the_human_output() {
+    let declared = format!(r#"{{ "assumptions": {{ "{ON_EVENTS}": true }} }}"#);
+    let p = Project::case_with_config(
+        "handover-info-package-child-handler-settles",
+        Some(&declared),
+    );
+    let doc = p.json(&["--info"]);
+    assert_eq!(assumptions(&doc), [ON_EVENTS]);
+    assert!(hand_overs(&doc).is_empty());
+    let line = "1 assumption in force: a package component calls its function props only from an event handler";
+    let human = String::from_utf8(p.run(&[]).stdout).unwrap();
+    assert_eq!(human.matches(line).count(), 1, "{human}");
+
+    // Explicitly off in the config: the default reading, turned on by the flag.
+    let off = format!(r#"{{ "assumptions": {{ "{ON_EVENTS}": false }} }}"#);
+    let p = Project::case_with_config("handover-info-package-child-handler-settles", Some(&off));
+    let doc = p.json(&["--info"]);
+    assert!(assumptions(&doc).is_empty());
+    assert_eq!(hand_overs(&doc), ["setter-in-render:info"]);
+    let human = String::from_utf8(p.run(&[]).stdout).unwrap();
+    assert!(!human.contains("assumption"), "{human}");
+    assert_eq!(assumptions(&p.json(&["--assume", ON_EVENTS])), [ON_EVENTS]);
+
+    let schema = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("docs/schemas/reactant-config.schema.json"),
+    )
+    .unwrap();
+    let schema: serde_json::Value = serde_json::from_str(&schema).unwrap();
+    let flag = &schema["$defs"]["Assumptions"]["properties"][ON_EVENTS];
+    assert_eq!(flag["type"], "boolean", "{schema:#}");
+    assert_eq!(flag["default"], false);
+}
+
+// ── programEventsMissPackageHandlers ─────────────────────────────────────────
+
+const USER_ONLY: &str = "programEventsMissPackageHandlers";
+
+/// Every row of a JSON report, as `rule:severity@line`, the diagnostics only.
+fn rows(doc: &serde_json::Value) -> Vec<String> {
+    let mut found: Vec<String> = doc["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            format!(
+                "{}:{}@{}",
+                d["rule"].as_str().unwrap(),
+                d["severity"].as_str().unwrap(),
+                d["line"]
+            )
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// Alone, the second assumption changes no finding, and the output says it
+/// has no effect: it speaks of package props the first makes listeners.
+#[test]
+fn program_events_miss_package_handlers_alone_changes_nothing_and_says_so() {
+    for case in [
+        "package-props-dispatched-click-loops",
+        "package-props-ancestor-click-loops",
+        "handover-info-package-child-handler-settles",
+    ] {
+        let p = Project::case(case);
+        let off = p.json(&["--info"]);
+        let alone = p.json(&["--info", "--assume", USER_ONLY]);
+        assert_eq!(rows(&alone), rows(&off), "{case}");
+        assert_eq!(assumptions(&alone), [USER_ONLY], "{case}");
+    }
+    let p = Project::case("package-props-dispatched-click-loops");
+    let human = String::from_utf8(p.run(&["--assume", USER_ONLY]).stdout).unwrap();
+    assert!(
+        human.contains("(no effect without packagePropsRunOnEvents)"),
+        "{human}"
+    );
+}
+
+/// Together, a package prop is a handler of user events only: the program's
+/// own click no longer reaches it. The settling program loses its false
+/// alarm; the program whose click reaches the package's handler (a bubbling
+/// click, the price) loses its loop.
+#[test]
+fn both_package_assumptions_keep_the_program_events_off_package_props() {
+    let both = ["--assume", ON_EVENTS, "--assume", USER_ONLY];
+    for case in [
+        "package-props-dispatched-click-loops",
+        "package-props-ancestor-click-loops",
+    ] {
+        let p = Project::case(case);
+        assert_eq!(
+            loops(&p.json(&["--assume", ON_EVENTS])),
+            ["infinite-loop:warning"],
+            "{case}: first alone"
+        );
+        let doc = p.json(&both);
+        assert!(loops(&doc).is_empty(), "{case}: both, {:?}", loops(&doc));
+        assert_eq!(assumptions(&doc), [ON_EVENTS, USER_ONLY], "{case}");
+    }
+    // The radix shape the oracle cannot run (its container is in no
+    // document, so a `focus()` fires nothing there): the program moves the
+    // focus after every commit while a package layer is handed a closure that
+    // writes state. Under the first assumption alone the focus events may
+    // reach the package's handler: the loop is claimed. Under both they do
+    // not (in a browser, radix's `DismissableLayer` would hear the `focusin`
+    // on `document` and call `onDismiss`: the second assumption's price).
+    let src = r#"import { useEffect, useRef, useState } from "react";
+import { Layer } from "@radix-ui/react-dismissable-layer";
+export function App() {
+  const [n, setN] = useState(0);
+  const input = useRef<HTMLInputElement>(null);
+  useEffect(() => { input.current?.focus(); });
+  return <div><input ref={input} /><Layer onDismiss={() => setN(n + 1)}>{n}</Layer></div>;
+}
+"#;
+    let p = Project::new(&[("a.tsx", src)]);
+    assert_eq!(
+        hand_overs(&p.json(&["--info"])),
+        ["setter-in-render:info"],
+        "off"
+    );
+    assert!(
+        !loops(&p.json(&["--assume", ON_EVENTS])).is_empty(),
+        "first alone"
+    );
+    let doc = p.json(&["--info", "--assume", ON_EVENTS, "--assume", USER_ONLY]);
+    assert!(loops(&doc).is_empty(), "both: {:?}", loops(&doc));
+    assert!(hand_overs(&doc).is_empty(), "both: {:?}", hand_overs(&doc));
+}
+
+/// Declared in the config with the first, turned off there, and in the
+/// schema.
+#[test]
+fn program_events_miss_package_handlers_is_declared_in_the_config() {
+    let declared =
+        format!(r#"{{ "assumptions": {{ "{ON_EVENTS}": true, "{USER_ONLY}": true }} }}"#);
+    let p = Project::case_with_config("package-props-dispatched-click-loops", Some(&declared));
+    let doc = p.json(&[]);
+    assert_eq!(assumptions(&doc), [ON_EVENTS, USER_ONLY]);
+    assert!(loops(&doc).is_empty());
+    let human = String::from_utf8(p.run(&[]).stdout).unwrap();
+    assert!(human.contains("2 assumptions in force"), "{human}");
+    assert!(!human.contains("no effect"), "{human}");
+
+    let off = format!(r#"{{ "assumptions": {{ "{ON_EVENTS}": true, "{USER_ONLY}": false }} }}"#);
+    let p = Project::case_with_config("package-props-dispatched-click-loops", Some(&off));
+    let doc = p.json(&[]);
+    assert_eq!(assumptions(&doc), [ON_EVENTS]);
+    assert_eq!(loops(&doc), ["infinite-loop:warning"]);
+
+    let schema = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("docs/schemas/reactant-config.schema.json"),
+    )
+    .unwrap();
+    let schema: serde_json::Value = serde_json::from_str(&schema).unwrap();
+    let flag = &schema["$defs"]["Assumptions"]["properties"][USER_ONLY];
+    assert_eq!(flag["type"], "boolean", "{schema:#}");
+    assert_eq!(flag["default"], false);
+}

@@ -1,5 +1,10 @@
 // @file App.tsx
 // oracle: react=loop
+// oracle: assume=packagePropsRunOnEvents fn
+// oracle: assume=packagePropsRunOnEvents,programEventsMissPackageHandlers fn
+// (Under `packagePropsRunOnEvents` the premise is false for React's own
+// `Profiler`, which calls `onRender` at every commit: the loop is the
+// assumption's price, ADR-048.)
 // #389. `Trans` is imported from a package (React's `Profiler` under another
 // name): code the analysis does not see, which calls `onRender` after every
 // commit. The program defines a `Trans` of its own, which never calls it;

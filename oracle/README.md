@@ -113,5 +113,5 @@ the next program in the worker must not read them.
 | `src/shrink.mjs` | generic AST shrinking |
 | `src/pool.mjs`, `src/worker.mjs` | worker threads with a time limit |
 | `src/realm.mjs` | the snapshot of a worker's realm and the check that a program left it unchanged |
-| `cases/` | one program per behaviour (one or several files), `// oracle: react=…` and `known=…` headers |
+| `cases/` | one program per behaviour (one or several files), `// oracle: react=…`, `known=…` and `assume=<name> <verdict>` headers (the verdict under an assumption, ADR-048; `docs/semantics.md` §6) |
 | `fuzz-baseline.json` | the violations of the CI sample; regenerate with `--write-baseline` |

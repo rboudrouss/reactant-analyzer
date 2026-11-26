@@ -401,6 +401,10 @@ pub struct Heap {
 /// What [`Heap::reach_of`] finds: the setters and the closures reached.
 type Reach = (Vec<(ComponentId, HookLabel)>, Vec<ReachedFn>);
 
+/// Setters and closure sites a value reaches one way
+/// ([`Heap::reach_members`], [`crate::engine::CallRelation::record_reached`]).
+pub type Reached = (Vec<(ComponentId, HookLabel)>, Vec<ExprId>);
+
 /// One [`Heap::hand_over`] and the cells after it.
 #[derive(Debug)]
 struct HandMemo {
@@ -768,6 +772,39 @@ impl Heap {
                     fns.push((id, Arc::clone(body_cfg)));
                     stack.extend(captured_locs.values().flat_map(|s| s.ids.iter().copied()));
                 }
+                None => {}
+            }
+        }
+        (setters, fns)
+    }
+
+    /// What a value at `sites` holds through the members of the objects it
+    /// is (an array's entries included), and of the objects those hold, at
+    /// any depth: the setters stored there and the closures found there.
+    /// Code given the value reaches these without calling it; a closure's
+    /// captures are not followed, since only a call of the closure reads
+    /// them.
+    pub fn reach_members(&self, sites: &Sites) -> Reached {
+        let mut stack: Vec<ExprId> = sites
+            .ids
+            .iter()
+            .filter(|id| matches!(self.get(**id), Some(HeapValue::Obj(_))))
+            .copied()
+            .collect();
+        let mut seen = BTreeSet::new();
+        let (mut setters, mut fns) = (Vec::new(), Vec::new());
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            match self.get(id) {
+                Some(HeapValue::Obj(obj)) => {
+                    stack.extend(obj.values().filter_map(EnvVal::locs).flatten().copied());
+                    setters.extend(obj.values().flat_map(|ev| ev.as_val().setters()));
+                }
+                // Reached from an object: held through a member, even if
+                // the value may also be this closure itself.
+                Some(HeapValue::Fn { .. }) => fns.push(id),
                 None => {}
             }
         }

@@ -568,6 +568,10 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         module: &module_names,
         packages: &package_names,
         packages_intact: program.modules.packages_intact(),
+        package_props_run_on_events: config
+            .assumptions
+            .holds(crate::assumptions::Assumption::PackagePropsRunOnEvents),
+        package_props_run_on_user_events: config.assumptions.package_props_run_on_user_events(),
         modules: &program.modules,
         resolves_children: inter.is_some(),
     };

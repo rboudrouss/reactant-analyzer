@@ -217,6 +217,21 @@ pub struct Escapes {
     /// value's spelling a setter for.
     pub direct: BTreeSet<Slot>,
     pub bodies: BTreeSet<ExprId>,
+    /// How the value reached its row, as the evaluations that say it found
+    /// it: `reached` and `reached_setters`, everything they found;
+    /// `members` and `member_setters`, what they found the value holding
+    /// through a member of an object (an array's entries included) it is or
+    /// holds, at any depth — what code given the value reaches without
+    /// calling it. The rest of what they found is the value itself and what
+    /// a closure it is reaches by its captures, which only a call of that
+    /// closure runs. Recorded at a JSX element's props only, and only when
+    /// the run declares
+    /// [`crate::assumptions::Assumption::PackagePropsRunOnEvents`], their
+    /// one reader ([`Self::split_called`]).
+    pub reached: BTreeSet<ExprId>,
+    pub reached_setters: BTreeSet<Slot>,
+    pub members: BTreeSet<ExprId>,
+    pub member_setters: BTreeSet<Slot>,
     /// `Some(true)`: every evaluation handed a value surely the one setter
     /// or function it lists to a callee that runs it (an array method).
     /// `Some(false)` once code the analysis does not see took it.
@@ -235,6 +250,86 @@ impl Escapes {
     /// knows when: the must column, as [`Targets::sure`] is for a call.
     pub fn sure(&self) -> bool {
         self.sure == Some(true) && self.placed && self.setters.len() + self.bodies.len() == 1
+    }
+
+    /// This row in two: what runs only when the handed value is called — the
+    /// setters and closures it may be, and what their captures reach — and
+    /// everything else, which keeps the module flag: what it holds through a
+    /// member of an object, and what an evaluation recorded without saying
+    /// how ([`Self::reached`]; fail closed). Each part is sure only if the
+    /// row is.
+    pub fn split_called(&self) -> (Escapes, Escapes) {
+        let sure = if self.sure() { self.sure } else { Some(false) };
+        let is_setter =
+            |s: &Slot| self.reached_setters.contains(s) && !self.member_setters.contains(s);
+        let is_body = |b: &ExprId| self.reached.contains(b) && !self.members.contains(b);
+        let own = Escapes {
+            setters: self.setters.iter().copied().filter(is_setter).collect(),
+            direct: self.direct.iter().copied().filter(is_setter).collect(),
+            bodies: self.bodies.iter().copied().filter(is_body).collect(),
+            sure,
+            placed: self.placed,
+            ..Escapes::default()
+        };
+        let rest = Escapes {
+            setters: self
+                .setters
+                .iter()
+                .copied()
+                .filter(|s| !is_setter(s))
+                .collect(),
+            direct: self
+                .direct
+                .iter()
+                .copied()
+                .filter(|s| !is_setter(s))
+                .collect(),
+            bodies: self
+                .bodies
+                .iter()
+                .copied()
+                .filter(|b| !is_body(b))
+                .collect(),
+            sure,
+            placed: self.placed,
+            module: self.module,
+            ..Escapes::default()
+        };
+        (own, rest)
+    }
+}
+
+/// Whose code an element's child the analysis does not see is (#325),
+/// joined over the evaluations of the element as the weakest (`min`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UnseenChild {
+    /// Code that is not provably a package's: an element value the analysis
+    /// does not resolve, an ambiguous name, a package import when a write
+    /// of the program may have replaced it.
+    Other,
+    /// A package's, by its import (#389, [`crate::engine::Handover`]).
+    Package,
+    /// A package's, and the run declares that a package component calls its
+    /// function props only from an event handler
+    /// ([`crate::assumptions::Assumption::PackagePropsRunOnEvents`]).
+    PackageOnEvents,
+    /// As `PackageOnEvents`, and the run also declares that no event the
+    /// program fires runs such a prop
+    /// ([`crate::assumptions::Assumption::ProgramEventsMissPackageHandlers`]):
+    /// the package calls it on user events only.
+    PackageOnUserEvents,
+}
+
+impl UnseenChild {
+    /// The child of an element whose name is a package's (`package`), under
+    /// what the run declares (`on_events`, and `user_only` with it).
+    pub fn of(package: bool, on_events: bool, user_only: bool) -> UnseenChild {
+        match (package, on_events, user_only) {
+            (false, _, _) => UnseenChild::Other,
+            (true, false, _) => UnseenChild::Package,
+            (true, true, false) => UnseenChild::PackageOnEvents,
+            (true, true, true) => UnseenChild::PackageOnUserEvents,
+        }
     }
 }
 
@@ -279,9 +374,9 @@ pub struct CallRelation {
     /// instantiates a child the analysis does not see (#325): a package's
     /// component, an element value it does not resolve, an ambiguous name.
     /// Each function prop is handed there to unseen code, at an unknown time.
-    /// `true` while every such evaluation's child was a package's: its name
-    /// imported from a specifier the resolver maps to no file (#389).
-    unseen: BTreeMap<ExprId, bool>,
+    /// Whose code that is, the weakest over every such evaluation
+    /// ([`UnseenChild`]).
+    unseen: BTreeMap<ExprId, UnseenChild>,
     /// The hooks the expansion left, by their site: `true` while every pass
     /// that reached the marker had the package imports intact
     /// ([`crate::engine::ModuleScope::packages_intact`]).
@@ -303,11 +398,11 @@ impl CallRelation {
     }
 
     /// Some evaluation of the element whose props object is `props`
-    /// instantiated a child the analysis does not see; `package`: a
-    /// package's, by its import.
-    pub fn mark_unseen_element(&mut self, props: ExprId, package: bool) {
-        let all = self.unseen.entry(props).or_insert(true);
-        *all &= package;
+    /// instantiated a child the analysis does not see, whose code `child`
+    /// is.
+    pub fn mark_unseen_element(&mut self, props: ExprId, child: UnseenChild) {
+        let all = self.unseen.entry(props).or_insert(child);
+        *all = (*all).min(child);
     }
 
     /// The element whose props object is `props` may instantiate a child the
@@ -320,7 +415,29 @@ impl CallRelation {
     /// Every child the element at `props` instantiates unseen is a
     /// package's ([`crate::engine::Handover::Package`]).
     pub fn unseen_package_element(&self, props: ExprId) -> bool {
-        self.unseen.get(&props).copied().unwrap_or(false)
+        self.unseen
+            .get(&props)
+            .is_some_and(|c| *c >= UnseenChild::Package)
+    }
+
+    /// Every child the element at `props` instantiates unseen is a
+    /// package's, and the run assumes it calls a function it receives as a
+    /// named prop only from an event handler
+    /// ([`crate::assumptions::Assumption::PackagePropsRunOnEvents`]): what
+    /// such a prop is runs at an event's time ([`Escapes::split_called`],
+    /// [`crate::ir::expr::package_event_prop`]).
+    pub fn package_props_on_events(&self, props: ExprId) -> bool {
+        self.unseen
+            .get(&props)
+            .is_some_and(|c| *c >= UnseenChild::PackageOnEvents)
+    }
+
+    /// [`Self::package_props_on_events`], and the run assumes no event the
+    /// program fires reaches such a prop
+    /// ([`crate::assumptions::Assumption::ProgramEventsMissPackageHandlers`]):
+    /// it is no listener of the dispatch table (#407).
+    pub fn package_props_on_user_events(&self, props: ExprId) -> bool {
+        self.unseen.get(&props) == Some(&UnseenChild::PackageOnUserEvents)
     }
 
     /// The module bindings some write of the program stored a setter or a
@@ -583,6 +700,23 @@ impl CallRelation {
             self.module.insert(anchor);
         }
     }
+    /// Say how one evaluation of the value at `pos` of `anchor` reached its
+    /// row: everything it found (`reached`), and what of it the value holds
+    /// through a member of an object (`members`) ([`Escapes::reached`]).
+    pub fn record_reached(
+        &mut self,
+        anchor: ExprId,
+        pos: usize,
+        reached: crate::domains::stores::heap::Reached,
+        members: crate::domains::stores::heap::Reached,
+    ) {
+        let row = self.escapes.entry((anchor, pos)).or_default();
+        row.reached_setters.extend(reached.0);
+        row.reached.extend(reached.1);
+        row.member_setters.extend(members.0);
+        row.members.extend(members.1);
+    }
+
     /// Remember the body run at `site`.
     pub fn record_body(&mut self, site: ExprId, body: &Arc<CFG>) {
         self.cfgs.entry(site).or_insert_with(|| Arc::clone(body));
@@ -636,6 +770,11 @@ impl CallRelation {
             row.setters.extend(e.setters.iter().copied());
             row.direct.extend(e.direct.iter().copied());
             row.bodies.extend(e.bodies.iter().copied());
+            row.reached.extend(e.reached.iter().copied());
+            row.reached_setters
+                .extend(e.reached_setters.iter().copied());
+            row.members.extend(e.members.iter().copied());
+            row.member_setters.extend(e.member_setters.iter().copied());
             row.placed |= e.placed;
             row.module |= e.module;
             row.sure = match (row.sure, e.sure) {
@@ -650,8 +789,8 @@ impl CallRelation {
             self.slot_names.entry(*slot).or_insert_with(|| name.clone());
         }
         self.module.extend(other.module.iter().copied());
-        for (props, package) in &other.unseen {
-            self.mark_unseen_element(*props, *package);
+        for (props, child) in &other.unseen {
+            self.mark_unseen_element(*props, *child);
         }
         for (site, intact) in &other.left_hooks {
             self.mark_left_hook(*site, *intact);

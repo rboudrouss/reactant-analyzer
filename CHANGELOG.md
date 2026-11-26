@@ -69,6 +69,32 @@ on a program React settles; 323 oracle cases, none a known false negative.
   files a possible call; the declared files are still analysed and reported, and their own reads still
   see every accessor of the program. The output states the globs (`N assumptions in force: …`, and
   `assumption_values` in the JSON, present only when a valued assumption is).
+- Third assumption, `packagePropsRunOnEvents`
+  ([#394](https://github.com/rboudrouss/reactant-analyzer/issues/394), ADR-048), off by default:
+  `"assumptions": { "packagePropsRunOnEvents": true }` (`false` turns it off) or
+  `--assume packagePropsRunOnEvents`. A package's component calls a function it receives as a named
+  prop only from an event handler: such a prop's setter or closure is read as a host `onClick`'s
+  (no hand-over row, no loop step through it; a dispatch the program fires still runs it). `ref`,
+  `key`, `children`, a spread, a function held in an object or array prop, package functions' and
+  hooks' arguments are not covered. Its price is every loop through a package that calls such a
+  prop from an effect or while it renders (vaul's uncontrolled `Drawer.Root`, React's `Profiler`);
+  the oracle cases that state `assume=packagePropsRunOnEvents fn` are those (6 of 886). Measured on:
+  rows shown dub 1,307 → 1,305, twenty 2,092 → 2,047, the 11 small repos and mantine 2,755 → 2,744;
+  hidden hand-over rows dub 337 → 115, twenty 87 → 41, small repos 230 → 160. In a program that
+  fires events itself, such a prop stays a listener its dispatches may reach.
+- Fourth assumption, `programEventsMissPackageHandlers`
+  ([#394](https://github.com/rboudrouss/reactant-analyzer/issues/394), ADR-048), off by default,
+  switchable on its own (`"programEventsMissPackageHandlers": true` / `false`, or `--assume`): an
+  event the program fires itself (`click()`, `focus()`, `requestSubmit()`, `dispatchEvent`) never
+  runs a package component's function prop. With `packagePropsRunOnEvents`, such a prop is a handler
+  of user events only and no dispatch of the program reaches it; alone it changes nothing, and the
+  output says so. Its price: a layer that closes on a focus outside or an outside pointer event
+  (radix's `DismissableLayer`) while the program moves the focus or clicks, and a package listening
+  on an ancestor of an element the program clicks (2 of 888 oracle cases `tp` → `fn`). Measured with
+  both declared: rows shown dub 1,307 → 1,288 (loop rows 244 → 228), twenty 2,092 → 2,092, the 11
+  small repos and mantine 2,755 → 2,754. A write a covered closure hands to code the analysis does
+  not follow is no longer claimed by a dispatch row and is shown on its own, so a program can show
+  more rows with both than with the first alone (twenty 2,047 → 2,092).
 - The default output says what `--info` would add: the human summary ends with "N setter(s) handed
   to package code the analysis does not see (M site(s)) and K other info finding(s) are not shown,
   rerun with --info to list them", and the JSON `summary` gains `hidden_infos`, the number of Info

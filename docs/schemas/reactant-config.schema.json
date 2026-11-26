@@ -126,8 +126,18 @@
             "type": "string"
           }
         },
+        "packagePropsRunOnEvents": {
+          "description": "A component of a package calls a function it receives as a named\nprop (not `key`, `ref`, `children` or a spread) only from an event\nhandler, never during its render, an effect or a commit. Removes the\nhand-over rows and the loop steps through such props; misses a loop\nthrough a package that calls one from an effect (an uncontrolled\n`onChange`) or during its render (a render prop by another name).",
+          "type": "boolean",
+          "default": false
+        },
         "plainObjectsRunNoAccessor": {
           "description": "No accessor of the program is ever installed on `Object.prototype`,\nand no prototype is ever set on a props or ref object. Recovers the\nfindings a polyfill's variable-named getter hides; misses a loop that\nreally runs through such a getter.",
+          "type": "boolean",
+          "default": false
+        },
+        "programEventsMissPackageHandlers": {
+          "description": "An event the program fires itself (`el.click()`, `focus()`,\n`requestSubmit()`, `dispatchEvent`) never runs a function a package\ncomponent received as a prop. With `packagePropsRunOnEvents`, such a\nprop is a handler of user events only; alone, it changes nothing.\nMisses a loop through a package that closes a layer when the program\nmoves the focus or clicks outside it, or that listens on an ancestor\nof a program element the program clicks.",
           "type": "boolean",
           "default": false
         }

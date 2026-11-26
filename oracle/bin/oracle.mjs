@@ -4,10 +4,11 @@
 //   oracle.mjs run FILE...                 judge hand-written programs, print everything
 //   oracle.mjs cases [DIR]                 the regression suite: oracle/cases/*.tsx
 //   oracle.mjs fuzz [--seed S] [--count N] [--shrink] [--out DIR]
-//                   [--baseline FILE] [--write-baseline]
+//                   [--baseline FILE] [--write-baseline] [--verdicts FILE]
 //
 // Every command takes --jobs N (default: cores - 1), the number of React
-// workers and of analyzer processes running at once.
+// workers and of analyzer processes running at once, and --assume NAME[,NAME], the
+// assumptions the analyzer runs under (ADR-048; `cases`: every case, and only so).
 // REACTANT_BIN overrides the analyzer binary (default: target/release/reactant).
 
 import { readFileSync, readdirSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
@@ -37,8 +38,17 @@ function parseArgs(argv) {
   return opts;
 }
 
-async function check(pool, source) {
-  const [react, report] = await Promise.all([pool.run(source), analyze(source)]);
+/**
+ * The assumptions one `--assume` value or `assume=` header names: one name, or several joined
+ * by commas (`packagePropsRunOnEvents,programEventsMissPackageHandlers`), declared together.
+ */
+function assumed(spec) {
+  return typeof spec === "string" && spec ? spec.split(",") : [];
+}
+
+/** `assume`: the assumptions the analyzer runs under (ADR-048); React does not change. */
+async function check(pool, source, assume = []) {
+  const [react, report] = await Promise.all([pool.run(source), analyze(source, { assume })]);
   const c = claims(report);
   return { react, claims: c, ...judge(react, c) };
 }
@@ -83,26 +93,52 @@ async function cmdRun(opts) {
   requireBinary();
   const pool = startPool(opts);
   const ran = [];
+  const assume = assumed(opts.assume);
   for (const f of opts._) {
-    const r = await check(pool, readFileSync(f, "utf8"));
-    console.log(`── ${f}\n${describe(r)}\n`);
+    const r = await check(pool, readFileSync(f, "utf8"), assume);
+    console.log(`── ${f}${assume.length ? ` (assume ${assume.join(", ")})` : ""}\n${describe(r)}\n`);
     ran.push([f, r.react.realmChanged]);
   }
   await pool.close();
   reportRespawns(pool, ran);
 }
 
-/** `// oracle: react=loop` and `// oracle: known=fn #168` headers. */
+/**
+ * `// oracle: react=loop`, `// oracle: known=fn #168` and
+ * `// oracle: assume=<name> fn` headers. The last says what the case's verdict
+ * is when the analyzer runs under that assumption (ADR-048): `cases` runs it a second time so,
+ * and only there is a violation the expected verdict — the assumption's stated price.
+ */
 function caseHeader(source) {
-  const h = { react: null, known: null, issue: null };
-  for (const m of source.matchAll(/^\/\/ oracle: (\w+)=(\S+)(?: (#\d+))?/gm)) {
+  const h = { react: null, known: null, issue: null, assumed: new Map() };
+  for (const m of source.matchAll(/^\/\/ oracle: (\w+)=(\S+)(?: (#\d+|[\w-]+))?/gm)) {
     if (m[1] === "react") h.react = m[2];
     if (m[1] === "known") {
       h.known = m[2];
       h.issue = m[3] ?? null;
     }
+    if (m[1] === "assume" && m[3]) h.assumed.set(m[2], m[3]);
   }
   return h;
+}
+
+/**
+ * The problems of one run of a case: `assume` is the assumption it ran under, `null` for the
+ * default run. Under an assumption the case states a verdict for, that verdict is the only one
+ * accepted; otherwise the default rules hold (a violation fails unless `known`).
+ */
+function caseProblems(r, h, assume) {
+  const problems = [];
+  if (!h.react) problems.push("missing `// oracle: react=loop|converges|perpetual` header");
+  else if (h.react !== r.react.verdict) problems.push(`React did \`${r.react.verdict}\`, the case expects \`${h.react}\`: the reading of React in docs/semantics.md is wrong here`);
+  const stated = assume ? h.assumed.get(assume) : undefined;
+  if (stated) {
+    if (stated !== r.verdict) problems.push(`under ${assume} the case expects \`${stated}\`, the verdict is ${r.verdict}${r.why ? `: ${r.why}` : ""}`);
+    return problems;
+  }
+  if (VIOLATIONS.has(r.verdict) && h.known !== r.verdict) problems.push(`new ${r.verdict}${assume ? ` under ${assume}` : ""}: ${r.why}`);
+  if (h.known && h.known !== r.verdict) problems.push(`marked known=${h.known} ${h.issue ?? ""} but the verdict is now ${r.verdict}: if the issue is fixed, drop the \`known\` line`);
+  return problems;
 }
 
 async function cmdCases(opts) {
@@ -110,23 +146,35 @@ async function cmdCases(opts) {
   const dir = resolve(opts._[0] ?? join(here, "../cases"));
   const files = readdirSync(dir).filter((f) => /\.(tsx|jsx)$/.test(f)).sort();
   const pool = startPool(opts);
+  // `--assume NAME`: every case runs under it, and only so. By default every case runs as it is,
+  // and a case that states its verdict under an assumption runs a second time under it.
+  const only = typeof opts.assume === "string" ? opts.assume : null;
   let failures = 0;
-  const results = await Promise.all(files.map(async (f) => [f, await check(pool, readFileSync(join(dir, f), "utf8")), caseHeader(readFileSync(join(dir, f), "utf8"))]));
-  for (const [f, r, h] of results) {
-    const problems = [];
-    if (!h.react) problems.push("missing `// oracle: react=loop|converges|perpetual` header");
-    else if (h.react !== r.react.verdict) problems.push(`React did \`${r.react.verdict}\`, the case expects \`${h.react}\`: the reading of React in docs/semantics.md is wrong here`);
-    if (VIOLATIONS.has(r.verdict) && h.known !== r.verdict) problems.push(`new ${r.verdict}: ${r.why}`);
-    if (h.known && h.known !== r.verdict) problems.push(`marked known=${h.known} ${h.issue ?? ""} but the verdict is now ${r.verdict}: if the issue is fixed, drop the \`known\` line`);
-    const tag = problems.length ? "FAIL" : VIOLATIONS.has(r.verdict) ? `known ${h.issue ?? ""}`.trim() : "ok";
-    console.log(`${tag.padEnd(10)} ${f.padEnd(40)} react=${r.react.verdict.padEnd(10)} ${r.verdict}`);
-    for (const p of problems) console.log(`           ${p}`);
-    if (problems.length) console.log(describe(r).replace(/^/gm, "           "));
-    failures += problems.length ? 1 : 0;
+  let runs = 0;
+  const results = await Promise.all(
+    files.map(async (f) => {
+      const source = readFileSync(join(dir, f), "utf8");
+      const h = caseHeader(source);
+      const ways = only ? [only] : [null, ...h.assumed.keys()];
+      const rs = await Promise.all(ways.map(async (a) => [a, await check(pool, source, assumed(a))]));
+      return [f, rs, h];
+    }),
+  );
+  for (const [f, rs, h] of results) {
+    for (const [assume, r] of rs) {
+      runs += 1;
+      const problems = caseProblems(r, h, assume);
+      const stated = assume && h.assumed.get(assume);
+      const tag = problems.length ? "FAIL" : stated && VIOLATIONS.has(r.verdict) ? "price" : VIOLATIONS.has(r.verdict) ? `known ${h.issue ?? ""}`.trim() : "ok";
+      console.log(`${tag.padEnd(10)} ${f.padEnd(40)} react=${r.react.verdict.padEnd(10)} ${r.verdict}${assume ? `  (assume ${assume})` : ""}`);
+      for (const p of problems) console.log(`           ${p}`);
+      if (problems.length) console.log(describe(r).replace(/^/gm, "           "));
+      failures += problems.length ? 1 : 0;
+    }
   }
   await pool.close();
-  console.log(`\n${files.length} cases, ${failures} failing`);
-  reportRespawns(pool, results.map(([f, r]) => [f, r.react.realmChanged]));
+  console.log(`\n${files.length} cases, ${failures} failing (${runs} runs${only ? `, all under ${only}` : ""})`);
+  reportRespawns(pool, results.flatMap(([f, rs]) => rs.map(([, r]) => [f, r.react.realmChanged])));
   process.exit(failures ? 1 : 0);
 }
 
@@ -143,6 +191,8 @@ async function cmdFuzz(opts) {
   const tally = Object.fromEntries(VERDICTS.map((v) => [v, 0]));
   const violations = {};
   const started = Date.now();
+  // `--assume NAME[,NAME]`: the analyzer runs under those assumptions (ADR-048).
+  const assume = assumed(opts.assume);
 
   const ids = Array.from({ length: count }, (_, i) => i);
   const results = new Array(count);
@@ -154,7 +204,7 @@ async function cmdFuzz(opts) {
         const i = ids.shift();
         const program = generate(seed, i);
         const source = printProgram(program);
-        results[i] = { program, source, ...(await check(pool, source)) };
+        results[i] = { program, source, ...(await check(pool, source, assume)) };
         if (++done % 50 === 0) process.stderr.write(`  ${done}/${count}\r`);
       }
     }),
@@ -165,7 +215,9 @@ async function cmdFuzz(opts) {
     if (VIOLATIONS.has(r.verdict)) violations[i] = r.verdict;
   }
   const secs = ((Date.now() - started) / 1000).toFixed(1);
-  console.log(`seed ${seed}, ${count} programs in ${secs}s`);
+  console.log(`seed ${seed}, ${count} programs in ${secs}s${assume.length ? `, under ${assume.join(", ")}` : ""}`);
+  // `--verdicts FILE`: every program's verdict, by index, to compare two runs program by program.
+  if (typeof opts.verdicts === "string") writeFileSync(resolve(opts.verdicts), JSON.stringify(results.map((r) => r.verdict)) + "\n");
   console.log(VERDICTS.map((v) => `${v}=${tally[v]}`).join("  "));
   reportRespawns(pool, results.map((r, i) => [`program #${i}`, r.react.realmChanged]));
   const fns = results.filter((r) => r.verdict === "fn");
@@ -183,9 +235,9 @@ async function cmdFuzz(opts) {
     results.map(async (r) => {
       if (!VIOLATIONS.has(r.verdict) || !opts.shrink || r.verdict === "parse-error") return r;
       const target = r.verdict;
-      const { program } = await shrink(r.program, async (cand) => (await check(pool, printProgram(cand))).verdict === target);
+      const { program } = await shrink(r.program, async (cand) => (await check(pool, printProgram(cand), assume)).verdict === target);
       const source = printProgram(program);
-      return { program, source, ...(await check(pool, source)) };
+      return { program, source, ...(await check(pool, source, assume)) };
     }),
   );
   const seen = new Map();

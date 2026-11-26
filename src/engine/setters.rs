@@ -3772,6 +3772,9 @@ impl<'a> SetterWalk<'a> {
                 _ => false,
             };
             let unseen = !native && self.calls.unseen_element(*id);
+            // The run assumes the package's child calls what a named prop
+            // is only from an event handler (ADR-048).
+            let on_events = unseen && self.calls.package_props_on_events(*id);
             let class = match unseen {
                 true => {
                     WalkClass::Unknown(Handover::package_if(self.calls.unseen_package_element(*id)))
@@ -3794,6 +3797,10 @@ impl<'a> SetterWalk<'a> {
                     if let Some(l) = self.heard.positions.last_mut() {
                         l.element = Some((*id, leaf));
                     }
+                }
+                if on_events && crate::ir::expr::package_event_prop(name) {
+                    self.package_prop((*id, i), val, class, depth, found, prov, stmt_span);
+                    continue;
                 }
                 // A literal there, or a name the render binds to one or to a
                 // `useCallback`, is a handler region of its own
@@ -4440,6 +4447,62 @@ impl<'a> SetterWalk<'a> {
         found.absorb(inner, body, mode, None, prov, self.facts);
     }
 
+    /// The named prop at `anchor` of a package's element, holding `val`,
+    /// under [`crate::assumptions::Assumption::PackagePropsRunOnEvents`]
+    /// (ADR-048): what runs only when the value is called — the setter or
+    /// the closure it is, and what that closure's captures reach — runs as a
+    /// host element's `on*` prop does, at an event's time, and is a listener
+    /// a dispatch of any event may reach (#407); what it holds through a
+    /// member of an object is handed to the package at any time, in `class`,
+    /// as without the assumption ([`crate::engine::Escapes::split_called`]).
+    /// In a program that dispatches, the first part is ⊤ only because of
+    /// that, and still handed to the package: a site found both ways joins
+    /// to the package's ⊤, never to other code's.
+    ///
+    /// Under [`crate::assumptions::Assumption::ProgramEventsMissPackageHandlers`]
+    /// too, no event the program fires runs the first part: it is not put in
+    /// the program's dispatch table, so no dispatch runs it, and it runs in
+    /// the class a user's event gives, `Handler`, in every program.
+    #[allow(clippy::too_many_arguments)]
+    fn package_prop(
+        &mut self,
+        anchor: (crate::ir::types::ExprId, usize),
+        val: &'a Expr,
+        class: WalkClass,
+        depth: usize,
+        found: &mut Found,
+        prov: Option<BlockId>,
+        stmt_span: Option<SourceRange>,
+    ) {
+        let calls = self.calls;
+        let Some(row) = calls.escapes(anchor.0, anchor.1) else {
+            return;
+        };
+        let (own, rest) = row.split_called();
+        // A listener of the program's dispatches unless the run assumes none
+        // reaches it.
+        let user_only = calls.package_props_on_user_events(anchor.0);
+        if !user_only {
+            self.hear(anchor, val, None, Events::Any);
+        }
+        let reached = self.dispatches && !user_only;
+        // ⊤ only because the program dispatches events (#219), as a host
+        // element's listener: the rows say so.
+        let outer = std::mem::replace(&mut self.listening, reached);
+        let listener = match reached {
+            true => WalkClass::Unknown(Handover::Package),
+            false => WalkClass::Handler,
+        };
+        self.handed_row(
+            &own, false, true, val, listener, None, depth, found, prov, stmt_span,
+        );
+        self.listening = false;
+        self.handed_row(
+            &rest, false, true, val, class, None, depth, found, prov, stmt_span,
+        );
+        self.listening = outer;
+    }
+
     /// [`Self::relation_handed`] for the row `row` of what `arg` handed;
     /// `module`: the row is a module binding's own; `inline`: `arg` is
     /// written in the body the walk is in, so a literal there is that body's
@@ -4447,7 +4510,7 @@ impl<'a> SetterWalk<'a> {
     #[allow(clippy::too_many_arguments)]
     fn handed_row(
         &mut self,
-        row: &'a crate::engine::calls::Escapes,
+        row: &crate::engine::calls::Escapes,
         module: bool,
         inline: bool,
         arg: &'a Expr,

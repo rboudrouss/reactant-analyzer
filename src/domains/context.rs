@@ -103,6 +103,23 @@ pub trait QueryContext {
         false
     }
 
+    /// The run declares that a package component calls its function props
+    /// only from an event handler
+    /// ([`crate::assumptions::Assumption::PackagePropsRunOnEvents`],
+    /// ADR-048). `false` unless the context knows.
+    fn package_props_run_on_events(&self) -> bool {
+        false
+    }
+
+    /// The run declares both package assumptions: a package component calls
+    /// its function props only from a user's event, which no event the
+    /// program fires reaches
+    /// ([`crate::assumptions::Assumptions::package_props_run_on_user_events`]).
+    /// `false` unless the context knows.
+    fn package_props_run_on_user_events(&self) -> bool {
+        false
+    }
+
     /// The global `name` of the builtin table, read free, is the language's
     /// ([`crate::engine::ModuleScope::builtin_global`], #391). `false`
     /// unless the context knows.
@@ -586,6 +603,10 @@ pub struct FixpointCtx<'a> {
     pub packages: &'a std::collections::HashSet<crate::ir::types::Var>,
     /// See `QueryContext::packages_intact`.
     pub packages_intact: bool,
+    /// See `QueryContext::package_props_run_on_events`.
+    pub package_props_run_on_events: bool,
+    /// See `QueryContext::package_props_run_on_user_events`.
+    pub package_props_run_on_user_events: bool,
     /// The program's module scope, for `QueryContext::builtin_global`.
     pub modules: &'a crate::engine::ModuleScope,
     /// See `QueryContext::resolves_children`.
@@ -636,6 +657,14 @@ impl QueryContext for FixpointCtx<'_> {
 
     fn packages_intact(&self) -> bool {
         self.packages_intact
+    }
+
+    fn package_props_run_on_events(&self) -> bool {
+        self.package_props_run_on_events
+    }
+
+    fn package_props_run_on_user_events(&self) -> bool {
+        self.package_props_run_on_user_events
     }
 
     fn builtin_global(&self, name: &str) -> bool {

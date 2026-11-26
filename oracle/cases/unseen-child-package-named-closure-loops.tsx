@@ -1,4 +1,9 @@
 // oracle: react=loop
+// oracle: assume=packagePropsRunOnEvents fn
+// oracle: assume=packagePropsRunOnEvents,programEventsMissPackageHandlers fn
+// (Under `packagePropsRunOnEvents` the premise is false for React's own
+// `Profiler`, which calls `onRender` at every commit: the loop is the
+// assumption's price, ADR-048.)
 // #325. A closure bound to a name and handed to a package's component, which
 // the analysis does not see: React's `Profiler` calls `onRender` after every
 // commit, so the write re-renders the component, which commits again.

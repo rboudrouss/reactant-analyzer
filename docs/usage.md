@@ -58,7 +58,7 @@ reactant check src/ --ignore-rule derived-state  # all but this one
 | `--all-roots` | Analyze every component as an entry point (`props = ⊤`). |
 | `--exclude-dir <names>` | Directory names never walked, matched at any depth. Repeatable or comma-separated. **Replaces** the default policy (see [Discovery](#plain-everything-else)) rather than adding to it; `node_modules/` and `.git/` are skipped regardless. |
 | `--follow-imports` | Also analyze the files the named paths import, transitively, so their hooks are read instead of treated as opaque. The report still covers only the paths you named. **Not a speed optimization**, see [Following imports](#following-imports---follow-imports). |
-| `--assume <name[=value]>` | Take a statement about your program as true (repeatable; adds to the config's `assumptions`). `foreignRealmFiles` takes a glob: `--assume foreignRealmFiles=packages/server/**`. Off by default, stated in the output; an unknown name, or a value that does not fit, exits with code 2. See [Assumptions](#assumptions). |
+| `--assume <name[=value]>` | Take a statement about your program as true (repeatable; adds to the config's `assumptions`): `plainObjectsRunNoAccessor`, `packagePropsRunOnEvents`, `programEventsMissPackageHandlers`, or `foreignRealmFiles`, which takes a glob: `--assume foreignRealmFiles=packages/server/**`. Off by default, stated in the output; an unknown name, or a value that does not fit, exits with code 2. See [Assumptions](#assumptions). |
 | `--verbose` | Debug output on stderr: symbol graph topo order, fixpoint stats, per-component iterations/widened labels. |
 | `--no-color` | Disable ANSI colors. Also honored: a non-empty `NO_COLOR` env var, or stdout not being a terminal. |
 | `--config <path>` | Config file to use (default: `<project root>/reactant.config.json` when present). Also accepted by `rules` and `explain` (their default root is the cwd). |
@@ -848,6 +848,85 @@ runner), not because it is inconvenient. Globs are read against the path from th
 project root (the first directory argument): `*` matches inside a path segment,
 `**` any number of segments, a directory is `dir/**`; a file outside the root
 matches none. Prefer the narrowest glob that covers the contributing files.
+
+### `packagePropsRunOnEvents`
+
+A component of a package calls a function it receives as a named prop only
+from an event handler: never while it renders, never from an effect or at
+commit.
+
+```jsonc
+// reactant.config.json
+{ "assumptions": { "packagePropsRunOnEvents": true } }   // false, or no entry: off
+```
+
+or `reactant check --assume packagePropsRunOnEvents` for one run (the flag only
+turns it on; to turn it off again, set it to `false` or remove it from the
+config). The human output prints `1 assumption in force: a package component
+calls its function props only from an event handler`; the JSON lists
+`packagePropsRunOnEvents` in `assumptions`.
+
+**What it means.** By default a setter or a closure handed to a package's
+component (`<Drawer.Root onOpenChange={close}>`, `<Command.Item onSelect={…}>`)
+may be called at any time, a render included: the hand-over is an Info row
+behind `--info` ("handed to package code the analysis does not see"), and a loop
+through it stays a Warning. Declared, what such a prop *is* — the setter or the
+closure — runs at an event's time, as a host element's `onClick` does: no
+hand-over row, no loop step through it. A program that fires events itself
+(`el.click()`, `dispatchEvent`) still runs it where it fires them. A component
+is a package's exactly when the hand-over would be an Info: its name, member
+element or `const` alias is imported from a package, and no write of the
+program may install code into a package import.
+
+**What it does not cover** (the default reading stays): `ref` (React calls it
+at commit), `key`, `children` (a render prop is called while the package
+renders), a spread `{...props}` (it names no prop, and carries `ref` and
+`children`), a function held by a member of an object prop or an entry of an
+array prop, a package function's argument (`pkg.run(cb)`), a package hook's
+argument (`useThing(cb)`), and any program code the analysis does not resolve.
+What the covered closure calls, and a function the package gets back by
+calling it, run at the event's time too.
+
+**What it misses.** A loop through a package that calls such a prop from an
+effect or while it renders. vaul's uncontrolled `Drawer.Root` (no `open` prop)
+calls `onOpenChange` from an effect when its value changes; a library with
+`useEffect(() => props.onChange(value))` does the same, and so does React's own
+`<Profiler onRender>` (after every commit); a render prop named
+other than `children` (`render`, `renderItem`, a formatter) is called while the
+package renders. Declare it when the packages you hand functions to call them
+from user events only.
+
+**In a program that fires events itself** (`el.click()`, `focus()`,
+`requestSubmit()`, `dispatchEvent`), it buys little on its own: the analysis
+cannot tell which event a package's handler hears nor on which node, so a
+covered prop stays a listener every such dispatch may reach. That is what the
+next assumption switches off.
+
+### `programEventsMissPackageHandlers`
+
+An event the program fires itself never runs a function a package component
+received as a prop. It refines `packagePropsRunOnEvents` and means nothing
+without it: declared alone it changes no finding, and the human line says
+`(no effect without packagePropsRunOnEvents)`.
+
+```jsonc
+// reactant.config.json: both, each switchable on its own
+{ "assumptions": { "packagePropsRunOnEvents": true, "programEventsMissPackageHandlers": true } }
+```
+
+or `--assume packagePropsRunOnEvents --assume programEventsMissPackageHandlers`.
+Together, a package component's function prop is a handler of **user** events
+only: none of the program's dispatches reaches it, so it writes neither during
+a render nor from an effect.
+
+**What it misses.** A loop through a package the program's own events do reach:
+a layer that closes when the focus moves outside it or on an outside pointer
+event (radix's `DismissableLayer` listens for `focusin` and `pointerdown` on
+`document`, then calls `onDismiss`, which a dialog or a popover wires to
+`onOpenChange(false)`) while an effect of the program calls `focus()` or
+`click()`; a package that listens on an ancestor of one of your elements that
+your code clicks. A write the prop's closure hands to code the analysis does not
+follow is no longer claimed by any dispatch, so it shows as a Warning of its own.
 
 ## Fixtures
 

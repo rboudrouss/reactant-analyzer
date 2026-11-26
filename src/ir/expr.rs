@@ -199,6 +199,17 @@ pub fn invoked_prop(native: bool, name: &str) -> bool {
     !native || is_event_prop(name) || name == "ref"
 }
 
+/// A prop of a package's element that
+/// [`crate::assumptions::Assumption::PackagePropsRunOnEvents`] speaks of: a
+/// named prop other than `key` (React keeps it), `ref` (React calls it at
+/// commit, #412) and `children` (what the element renders, a render prop by
+/// design). A spread, a computed key or an accessor names no prop.
+pub fn package_event_prop(name: &str) -> bool {
+    !is_synthetic_key(name)
+        && !name.starts_with(COMMIT_KEY_PREFIX)
+        && !matches!(name, "key" | "ref" | "children")
+}
+
 /// An event handler's prop name: `on` and a capital (`onClick`).
 pub fn is_event_prop(name: &str) -> bool {
     let mut chars = name.chars();

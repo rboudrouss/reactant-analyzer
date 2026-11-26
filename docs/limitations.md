@@ -889,6 +889,37 @@ carries an Error.
   deliberately: a library with no table, a handler this body invokes itself, and a name bound more
   than once, since two forms inlined into one render body leave no way to say whose `handleSubmit` a
   call means [precision-log](precision-log.md#2026-09-03-a-wrapper-does-not-run-its-argument).
+- **Declaring [`packagePropsRunOnEvents`](usage.md#packagepropsrunonevents)** (an assumption, off
+  by default and stated in the output, [ADR-048](adr/ADR-048-assumptions-are-configuration.md))
+  takes the hand-over to a package's *component* off where the value handed is a named prop's own
+  function (a setter, a closure): it runs at an event's time, as a host `on*` prop does, and is a
+  listener a dispatch of any event the program fires may reach. Its price is every loop through a
+  package that calls such a prop from an effect or while it renders: vaul 1.1.2's uncontrolled
+  `Drawer.Root` calls `onOpenChange` from an effect (`dist/index.mjs:463-506`), and so does any
+  `useEffect(() => props.onChange(v))` and React's own `<Profiler onRender>` (after every commit); the oracle cases stating
+  `assume=packagePropsRunOnEvents fn` are those loops, missed under the declaration. Not covered,
+  whatever is declared: a `ref` (commit time, #412), `key`, `children` (a render prop is called
+  while the package renders; a render prop under another name is the declaring user's to vouch
+  for), a spread, a function held by a member of an object prop or an entry of an array prop, a
+  package function's or a package hook's argument, any element of a program that may write code into
+  a package import (#401's voiding fact), and program code the analysis does not resolve. What the
+  covered closure's captures reach is covered with it (only a call of the closure runs it), so a
+  function the package obtains by calling the prop — a render prop's result — is read as an
+  event's too. A closure *returned* by a closure handed to package code, and allocated by that
+  call, is not followed by the writer walk in either reading
+  [#425](https://github.com/rboudrouss/reactant-analyzer/issues/425).
+- **Declaring [`programEventsMissPackageHandlers`](usage.md#programeventsmisspackagehandlers)
+  with it** (a second assumption, off by default; alone it changes nothing) takes such a prop out of
+  the program's dispatch table: no event the program fires (`click()`, `focus()`,
+  `requestSubmit()`, `dispatchEvent`, #407) runs it, so it is a handler of user events only. Its
+  price is every loop through a package that the program's own events reach: a layer that closes on
+  a focus outside it or an outside pointer event (radix's `DismissableLayer`, which listens for
+  `focusin` and `pointerdown` on `document`, `@radix-ui/react-dismissable-layer` 1.1.11
+  `dist/index.mjs:135-192`) while the program moves the focus or clicks, and a package that listens
+  on an ancestor of a program element the program clicks (the oracle cases stating
+  `assume=packagePropsRunOnEvents,programEventsMissPackageHandlers fn`). A write such a prop's
+  closure hands to code the analysis does not follow is then claimed by no dispatch and is shown on
+  its own, as a Warning.
 - **A write in a `useMemo` body is a render write** [#249](https://github.com/rboudrouss/reactant-analyzer/issues/249),
   with the memo's re-run class. It is an Error only when the memo is called on every render, its
   body writes on every path, and it recomputes at every render: no deps array, or the written slot

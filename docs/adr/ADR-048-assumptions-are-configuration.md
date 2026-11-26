@@ -68,6 +68,98 @@ to it (two declared files may share a realm). The output states the globs once: 
 `assumption_values` (`{ "foreignRealmFiles": [...] }`) in the JSON beside the names-only
 `assumptions` array, present only when a valued assumption is in force.
 
+## A third: `packagePropsRunOnEvents` (the user's decision of 2026-11-26)
+
+**Statement.** A component of a package calls a function it receives *as a named prop* only from an
+event handler: never during its render, never from an effect or at commit. "A component of a
+package" is exactly what #401 proves a package's (`Handover::Package` for a JSX element: a name, a
+member element or a module `const` alias imported from a specifier the resolver maps to no file), on
+the same premise and with the same voiding fact (a write that may install code into a package import
+makes no element a package's, so none is covered). "The function it receives as the prop" is what
+the prop's value *is*: a setter, or a closure (written in place, or a name, a member or a parameter
+that holds one), with what only a call of it runs: the closures and setters its captures reach. A
+package cannot read a closure's captures; it reaches them by calling the closure, whose body the
+walk follows at the closure's time, or by keeping what the call returns — so the statement covers a
+function the package obtains by calling such a prop too (a render prop's result, when it is a
+function: the user who declares the assumption asserts it). Under it that value is read as a host element's `on*` prop is: at an event's time
+(no `setter-in-render` / `cross-setter-in-render` row, no loop step through it, a dispatch inside it
+at event time), and a listener a dispatch of any event may reach (#407): a program that fires events
+itself still runs it where it fires them.
+
+**One read.** The fixpoint marks the element where its child is classed unseen
+(`havoc_setter_props`, #325: `UnseenChild::PackageOnEvents`); the writer walk reads the mark where it
+classes each prop of that element (`CallRelation::package_props_on_events`), so every rule sees one
+timing. The state still takes every write such a prop may make. The relation records, for a JSX
+prop and only under the assumption, everything the value reached and what of it the value holds
+through a member of an object (`Escapes::split_called`): only the rest is covered, and what an
+evaluation recorded without saying how is not. In a program that dispatches events, the covered
+part is ⊤ only because of that (marked a listener's, which the dispatch sites claim) and keeps the
+package's provenance, so a site found both covered and not joins to an Info, as without the
+assumption.
+
+**Not covered**, each keeping its default reading (an Info hand-over, or a Warning):
+- `ref`: React's commit-time protocol (#412), not a prop the package calls on an event; `key`, which
+  React keeps;
+- `children`: what the element renders, a render prop by design (`<AutoSizer>{(size) => …}`); a
+  render prop under another name (`render`, `renderItem`, a formatter) cannot be told from the
+  outside, so the user who declares the assumption asserts it for those;
+- a spread (`{...props}`): it names no prop at the element and forwards `ref` and `children`;
+- what the value holds without a call: a function held by a member of an object prop (written in
+  place or named), an entry of an array prop, at any depth;
+- a package function call `pkg.run(cb)` and a package hook's argument `useThing(cb)` (not
+  components, not props): the obvious sibling assumptions, not this one;
+- a program child the analysis does not resolve (`Handover::Other`): program code, never covered.
+
+**When it is false.** vaul 1.1.2's uncontrolled `Drawer.Root` calls `onOpenChange` from an effect when
+its value changes (`dist/index.mjs:463-506`: `useUncontrolledState`'s `useEffect` calls `onChange`,
+read in the published package); any library with `useEffect(() => props.onChange(v))`; React's own
+`<Profiler onRender>`, which React calls after every commit (an import from `react` is a package's
+element like any other: the element does not keep its specifier); the oracle's `ext.EffectCalls`. A loop through such a package is then missed: the oracle cases that state
+`assume=packagePropsRunOnEvents fn` are that price, and a harness run under the assumption accepts
+`fn` there and nowhere else.
+
+**What it buys in a program that fires events itself: little.** "Only from an event handler" includes
+the events the program fires (`el.click()`, `focus()`, `requestSubmit()`, `dispatchEvent`), and the
+analysis cannot say which event a package's handler hears nor on which node: a covered prop is a
+listener every dispatch of the program reaches (#407). On dub the hand-over rows become listener
+rows, but the loop rules still read them as running wherever the program fires events: rows shown
+1,307 → 1,305. The next section is the separate switch for that.
+
+## A fourth: `programEventsMissPackageHandlers` (the user's decision of 2026-11-26)
+
+**Statement.** An event the program fires itself — a dispatching call the analysis sees, every entry
+of #407's table (`click()`, `requestSubmit()`, `focus()`, `blur()`, `dispatchEvent`, an emitter's
+`emit`) — never runs a function a package component received as a prop. It speaks of the props
+`packagePropsRunOnEvents` covers, and of nothing else: **alone it changes nothing**, and the output
+says so (`… (no effect without packagePropsRunOnEvents)` in the human line; the JSON lists the name,
+as declared). Declared with the first, a covered prop is a handler of **user** events only: no
+dispatch of the program reaches it, so no render-time or effect-time write comes from it.
+
+**One read, in #407's table.** The element's mark becomes `UnseenChild::PackageOnUserEvents` where the
+first's is decided (`havoc_setter_props`), and the walk does not enter such a prop in the program's
+dispatch table (`package_prop` skips `hear`): no dispatch reaches it, and its class is a user event's
+(`Handler`) in every program, as a host `onClick` is in a program that fires no event. No rule reads
+either assumption.
+
+**When it is false.**
+- A library that closes a layer when the focus moves outside it or on an outside pointer event, while
+  the program moves the focus or clicks programmatically: radix's `DismissableLayer`
+  (`@radix-ui/react-dismissable-layer` 1.1.11, `dist/index.mjs:51-58`: a focus outside the layer calls
+  `onFocusOutside`, `onInteractOutside`, then `onDismiss`; `:179-192`: the listener is a `focusin`
+  listener on `document`; `:135-170`: `pointerdown` on `document`), which radix's dialogs and popovers
+  wire to `onOpenChange(false)`. A `focus()` in an effect while such a layer is open runs the prop.
+- A program element rendered inside a package component whose handler listens on an ancestor: a click
+  the program fires on it bubbles to the package's node (the oracle cases
+  `package-props-ancestor-click-loops` and `package-props-dispatched-click-loops`, which become `fn`).
+- The oracle cannot run the focus shape: it renders into a container no document holds, so `focus()`
+  fires nothing and `document` hears nothing; `tests/assumptions.rs` pins the analysis's two readings
+  of it instead.
+
+**What it costs and buys** (measured): the two cases above `tp` → `fn`; on dub and twenty the rows the
+dispatches claimed through package props leave (see `CHANGELOG.md`). A write such a prop's closure hands
+to code the analysis does not follow (`(x) => run(cb)`) is no longer claimed by any dispatch, so it is
+shown on its own, a Warning, as in a handler of a program that fires no event.
+
 ## Why #297's declarations are members of the same section
 
 A declared library summary (#297) is also a statement about code the analysis does not read that

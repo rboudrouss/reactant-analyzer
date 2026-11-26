@@ -61,8 +61,11 @@ pub struct CheckArgs {
 
     /// Take a statement about the program as true (repeatable; adds to the
     /// config's `assumptions`; stated in the output). Off by default. Names:
-    /// plainObjectsRunNoAccessor, foreignRealmFiles=<glob> (files that share
-    /// no realm with the app, matched against the path from the project root)
+    /// plainObjectsRunNoAccessor, packagePropsRunOnEvents (a package
+    /// component calls its function props only from an event handler),
+    /// programEventsMissPackageHandlers (with the previous one: no event the
+    /// program fires runs such a prop), foreignRealmFiles=<glob> (files that share no realm with the app,
+    /// matched against the path from the project root)
     #[arg(long, value_name = "NAME[=VALUE]")]
     pub assume: Vec<String>,
 
