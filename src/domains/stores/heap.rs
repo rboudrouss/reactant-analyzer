@@ -774,6 +774,29 @@ impl Heap {
         (setters, fns)
     }
 
+    /// The closures a value at `sites` reaches through at least one member
+    /// of an object or one capture of a closure: [`Heap::reach_of`] of what
+    /// the sites point to, not of the sites themselves.
+    pub fn reached_through(&self, sites: &Sites) -> Vec<ExprId> {
+        let mut next: Vec<ExprId> = Vec::new();
+        for id in &sites.ids {
+            match self.get(*id) {
+                Some(HeapValue::Obj(obj)) => {
+                    next.extend(obj.values().filter_map(EnvVal::locs).flatten().copied());
+                }
+                Some(HeapValue::Fn { captured_locs, .. }) => {
+                    next.extend(captured_locs.values().flat_map(|s| s.ids.iter().copied()));
+                }
+                None => {}
+            }
+        }
+        self.reach_of(&Sites::closed(next))
+            .1
+            .into_iter()
+            .map(|(site, _)| site)
+            .collect()
+    }
+
     /// The closures an escaped site reaches, through the members of the
     /// objects on the way, in site order. Read when they are run, not when
     /// they escape: a member written after the object escaped is reachable

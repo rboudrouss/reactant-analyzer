@@ -216,7 +216,18 @@ pub struct Escapes {
     /// through a closure it is that calls it: what a row may call the
     /// value's spelling a setter for.
     pub direct: BTreeSet<Slot>,
+    /// Those of `setters` some evaluation found the value holding, through a
+    /// member of an object it reaches.
+    pub held: BTreeSet<Slot>,
     pub bodies: BTreeSet<ExprId>,
+    /// Those of `bodies` the handed value may itself be (one of its own
+    /// sites is that closure), and those some evaluation found it reaching
+    /// through a member of an object or a capture of a closure. Recorded at
+    /// a JSX element's props only, and only when the run declares
+    /// [`crate::assumptions::Assumption::PackagePropsRunOnEvents`], their
+    /// one reader ([`Self::split_own`]).
+    pub own: BTreeSet<ExprId>,
+    pub through: BTreeSet<ExprId>,
     /// `Some(true)`: every evaluation handed a value surely the one setter
     /// or function it lists to a callee that runs it (an array method).
     /// `Some(false)` once code the analysis does not see took it.
@@ -235,6 +246,79 @@ impl Escapes {
     /// knows when: the must column, as [`Targets::sure`] is for a call.
     pub fn sure(&self) -> bool {
         self.sure == Some(true) && self.placed && self.setters.len() + self.bodies.len() == 1
+    }
+
+    /// This row in two: what the handed value is — the setters it may be
+    /// that no evaluation found it holding, the closures it may be that none
+    /// found it reaching through a member or a capture — and everything else
+    /// it reaches, which keeps the module flag. A setter or a body recorded
+    /// without saying how (another producer than a JSX prop's) is the
+    /// second's: fail closed. Each part is sure only if the row is.
+    pub fn split_own(&self) -> (Escapes, Escapes) {
+        let sure = if self.sure() { self.sure } else { Some(false) };
+        let is_setter = |s: &Slot| self.direct.contains(s) && !self.held.contains(s);
+        let is_body = |b: &ExprId| self.own.contains(b) && !self.through.contains(b);
+        let own = Escapes {
+            setters: self.setters.iter().copied().filter(is_setter).collect(),
+            direct: self.setters.iter().copied().filter(is_setter).collect(),
+            bodies: self.bodies.iter().copied().filter(is_body).collect(),
+            sure,
+            placed: self.placed,
+            ..Escapes::default()
+        };
+        let rest = Escapes {
+            setters: self
+                .setters
+                .iter()
+                .copied()
+                .filter(|s| !is_setter(s))
+                .collect(),
+            direct: self
+                .direct
+                .iter()
+                .copied()
+                .filter(|s| !is_setter(s))
+                .collect(),
+            bodies: self
+                .bodies
+                .iter()
+                .copied()
+                .filter(|b| !is_body(b))
+                .collect(),
+            sure,
+            placed: self.placed,
+            module: self.module,
+            ..Escapes::default()
+        };
+        (own, rest)
+    }
+}
+
+/// Whose code an element's child the analysis does not see is (#325),
+/// joined over the evaluations of the element as the weakest (`min`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UnseenChild {
+    /// Code that is not provably a package's: an element value the analysis
+    /// does not resolve, an ambiguous name, a package import when a write
+    /// of the program may have replaced it.
+    Other,
+    /// A package's, by its import (#389, [`crate::engine::Handover`]).
+    Package,
+    /// A package's, and the run declares that a package component calls its
+    /// function props only from an event handler
+    /// ([`crate::assumptions::Assumption::PackagePropsRunOnEvents`]).
+    PackageOnEvents,
+}
+
+impl UnseenChild {
+    /// The child of an element whose name is a package's (`package`), under
+    /// what the run declares (`on_events`).
+    pub fn of(package: bool, on_events: bool) -> UnseenChild {
+        match (package, on_events) {
+            (false, _) => UnseenChild::Other,
+            (true, false) => UnseenChild::Package,
+            (true, true) => UnseenChild::PackageOnEvents,
+        }
     }
 }
 
@@ -279,9 +363,9 @@ pub struct CallRelation {
     /// instantiates a child the analysis does not see (#325): a package's
     /// component, an element value it does not resolve, an ambiguous name.
     /// Each function prop is handed there to unseen code, at an unknown time.
-    /// `true` while every such evaluation's child was a package's: its name
-    /// imported from a specifier the resolver maps to no file (#389).
-    unseen: BTreeMap<ExprId, bool>,
+    /// Whose code that is, the weakest over every such evaluation
+    /// ([`UnseenChild`]).
+    unseen: BTreeMap<ExprId, UnseenChild>,
     /// The hooks the expansion left, by their site: `true` while every pass
     /// that reached the marker had the package imports intact
     /// ([`crate::engine::ModuleScope::packages_intact`]).
@@ -303,11 +387,11 @@ impl CallRelation {
     }
 
     /// Some evaluation of the element whose props object is `props`
-    /// instantiated a child the analysis does not see; `package`: a
-    /// package's, by its import.
-    pub fn mark_unseen_element(&mut self, props: ExprId, package: bool) {
-        let all = self.unseen.entry(props).or_insert(true);
-        *all &= package;
+    /// instantiated a child the analysis does not see, whose code `child`
+    /// is.
+    pub fn mark_unseen_element(&mut self, props: ExprId, child: UnseenChild) {
+        let all = self.unseen.entry(props).or_insert(child);
+        *all = (*all).min(child);
     }
 
     /// The element whose props object is `props` may instantiate a child the
@@ -320,7 +404,19 @@ impl CallRelation {
     /// Every child the element at `props` instantiates unseen is a
     /// package's ([`crate::engine::Handover::Package`]).
     pub fn unseen_package_element(&self, props: ExprId) -> bool {
-        self.unseen.get(&props).copied().unwrap_or(false)
+        self.unseen
+            .get(&props)
+            .is_some_and(|c| *c >= UnseenChild::Package)
+    }
+
+    /// Every child the element at `props` instantiates unseen is a
+    /// package's, and the run assumes it calls a function it receives as a
+    /// named prop only from an event handler
+    /// ([`crate::assumptions::Assumption::PackagePropsRunOnEvents`]): what
+    /// such a prop is runs at an event's time ([`Escapes::split_own`],
+    /// [`crate::ir::expr::package_event_prop`]).
+    pub fn package_props_on_events(&self, props: ExprId) -> bool {
+        self.unseen.get(&props) == Some(&UnseenChild::PackageOnEvents)
     }
 
     /// The module bindings some write of the program stored a setter or a
@@ -574,7 +670,10 @@ impl CallRelation {
             row.direct.insert(slot);
             row.setters.insert(slot);
         }
-        row.setters.extend(held);
+        for slot in held {
+            row.held.insert(slot);
+            row.setters.insert(slot);
+        }
         row.bodies.extend(bodies);
         row.sure = Some(row.sure.unwrap_or(true) && sure);
         // A module binding counts once it may hold something a call runs.
@@ -583,6 +682,21 @@ impl CallRelation {
             self.module.insert(anchor);
         }
     }
+    /// Say how the value at `pos` of `anchor` reached the bodies of its row:
+    /// `own`, those it may itself be, and `through`, those it reached
+    /// through a member or a capture ([`Escapes::own`]).
+    pub fn record_reached(
+        &mut self,
+        anchor: ExprId,
+        pos: usize,
+        own: impl IntoIterator<Item = ExprId>,
+        through: impl IntoIterator<Item = ExprId>,
+    ) {
+        let row = self.escapes.entry((anchor, pos)).or_default();
+        row.own.extend(own);
+        row.through.extend(through);
+    }
+
     /// Remember the body run at `site`.
     pub fn record_body(&mut self, site: ExprId, body: &Arc<CFG>) {
         self.cfgs.entry(site).or_insert_with(|| Arc::clone(body));
@@ -635,7 +749,10 @@ impl CallRelation {
             let row = self.escapes.entry(*k).or_default();
             row.setters.extend(e.setters.iter().copied());
             row.direct.extend(e.direct.iter().copied());
+            row.held.extend(e.held.iter().copied());
             row.bodies.extend(e.bodies.iter().copied());
+            row.own.extend(e.own.iter().copied());
+            row.through.extend(e.through.iter().copied());
             row.placed |= e.placed;
             row.module |= e.module;
             row.sure = match (row.sure, e.sure) {
@@ -650,8 +767,8 @@ impl CallRelation {
             self.slot_names.entry(*slot).or_insert_with(|| name.clone());
         }
         self.module.extend(other.module.iter().copied());
-        for (props, package) in &other.unseen {
-            self.mark_unseen_element(*props, *package);
+        for (props, child) in &other.unseen {
+            self.mark_unseen_element(*props, *child);
         }
         for (site, intact) in &other.left_hooks {
             self.mark_left_hook(*site, *intact);

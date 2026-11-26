@@ -69,6 +69,11 @@ const makeExt = () => ({
     return null;
   },
   ClickCalls: ({ fn }) => React.createElement("button", { onClick: fn }),
+  // A package component that attaches the `ref` it receives to a node (React 19's
+  // `ref` prop), and one that calls its `children` during its render (a render
+  // prop): what `packagePropsRunOnEvents` does not cover (ADR-048).
+  RefTarget: ({ ref }) => React.createElement("div", { ref }),
+  RenderProp: ({ children }) => children(),
 });
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>");

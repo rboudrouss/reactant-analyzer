@@ -889,6 +889,22 @@ carries an Error.
   deliberately: a library with no table, a handler this body invokes itself, and a name bound more
   than once, since two forms inlined into one render body leave no way to say whose `handleSubmit` a
   call means [precision-log](precision-log.md#2026-09-03-a-wrapper-does-not-run-its-argument).
+- **Declaring [`packagePropsRunOnEvents`](usage.md#packagepropsrunonevents)** (an assumption, off
+  by default and stated in the output, [ADR-048](adr/ADR-048-assumptions-are-configuration.md))
+  takes the hand-over to a package's *component* off where the value handed is a named prop's own
+  function (a setter, a closure): it runs at an event's time, as a host `on*` prop does, and is a
+  listener a dispatch of any event the program fires may reach. Its price is every loop through a
+  package that calls such a prop from an effect or while it renders: vaul 1.1.2's uncontrolled
+  `Drawer.Root` calls `onOpenChange` from an effect (`dist/index.mjs:463-506`), and so does any
+  `useEffect(() => props.onChange(v))`; the oracle cases stating
+  `assume=packagePropsRunOnEvents fn` are those loops, missed under the declaration. Not covered,
+  whatever is declared: a `ref` (commit time, #412), `key`, `children` (a render prop is called
+  while the package renders; a render prop under another name is the declaring user's to vouch
+  for), a spread, a function held by a member of an object prop or an entry of an array prop, a
+  package function's or a package hook's argument, any element of a program that may write code into
+  a package import (#401's voiding fact), and program code the analysis does not resolve. A closure
+  *returned* by a closure handed to package code is not followed by the writer walk in either
+  reading.
 - **A write in a `useMemo` body is a render write** [#249](https://github.com/rboudrouss/reactant-analyzer/issues/249),
   with the memo's re-run class. It is an Error only when the memo is called on every render, its
   body writes on every path, and it recomputes at every render: no deps array, or the written slot

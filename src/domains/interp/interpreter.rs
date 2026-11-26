@@ -2490,6 +2490,18 @@ fn record_reach<D: AbstractDomain>(
         return;
     }
     let (held, fns) = sites.map(|s| ctx.heap.reach_of(s)).unwrap_or_default();
+    // How the value reaches each closure, which only the assumption that a
+    // package calls its function props on events reads (`Escapes::own`).
+    let (own, through) = match sites {
+        Some(s) if ctx.query.package_props_run_on_events() => (
+            fns.iter()
+                .map(|(site, _)| *site)
+                .filter(|site| s.ids.contains(site))
+                .collect(),
+            ctx.heap.reached_through(s),
+        ),
+        _ => (Vec::new(), Vec::new()),
+    };
     ctx.record(|r| {
         for (site, body) in &fns {
             r.record_body(*site, body);
@@ -2503,6 +2515,7 @@ fn record_reach<D: AbstractDomain>(
             false,
             ctx.escaped,
         );
+        r.record_reached(at.0, at.1, own, through);
     });
 }
 

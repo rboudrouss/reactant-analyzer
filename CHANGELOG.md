@@ -69,6 +69,16 @@ on a program React settles; 323 oracle cases, none a known false negative.
   files a possible call; the declared files are still analysed and reported, and their own reads still
   see every accessor of the program. The output states the globs (`N assumptions in force: …`, and
   `assumption_values` in the JSON, present only when a valued assumption is).
+- Third assumption, `packagePropsRunOnEvents`
+  ([#394](https://github.com/rboudrouss/reactant-analyzer/issues/394), ADR-048), off by default:
+  `"assumptions": { "packagePropsRunOnEvents": true }` (`false` turns it off) or
+  `--assume packagePropsRunOnEvents`. A package's component calls a function it receives as a named
+  prop only from an event handler: such a prop's setter or closure is read as a host `onClick`'s
+  (no hand-over row, no loop step through it; a dispatch the program fires still runs it). `ref`,
+  `key`, `children`, a spread, a function held in an object or array prop, package functions' and
+  hooks' arguments are not covered. Its price is every loop through a package that calls such a
+  prop from an effect or while it renders (vaul's uncontrolled `Drawer.Root`); the oracle cases
+  that state `assume=packagePropsRunOnEvents fn` are those.
 - The default output says what `--info` would add: the human summary ends with "N setter(s) handed
   to package code the analysis does not see (M site(s)) and K other info finding(s) are not shown,
   rerun with --info to list them", and the JSON `summary` gains `hidden_infos`, the number of Info

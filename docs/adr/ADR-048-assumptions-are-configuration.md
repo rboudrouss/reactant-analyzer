@@ -68,6 +68,47 @@ to it (two declared files may share a realm). The output states the globs once: 
 `assumption_values` (`{ "foreignRealmFiles": [...] }`) in the JSON beside the names-only
 `assumptions` array, present only when a valued assumption is in force.
 
+## A third: `packagePropsRunOnEvents` (the user's decision of 2026-11-26)
+
+**Statement.** A component of a package calls a function it receives *as a named prop* only from an
+event handler: never during its render, never from an effect or at commit. "A component of a
+package" is exactly what #401 proves a package's (`Handover::Package` for a JSX element: a name, a
+member element or a module `const` alias imported from a specifier the resolver maps to no file), on
+the same premise and with the same voiding fact (a write that may install code into a package import
+makes no element a package's, so none is covered). "The function it receives as the prop" is what
+the prop's value *is*: a setter, or a closure (written in place, or a name, a member or a parameter
+that holds one). Under it that value is read as a host element's `on*` prop is: at an event's time
+(no `setter-in-render` / `cross-setter-in-render` row, no loop step through it, a dispatch inside it
+at event time), and a listener a dispatch of any event may reach (#407): a program that fires events
+itself still runs it where it fires them.
+
+**One read.** The fixpoint marks the element where its child is classed unseen
+(`havoc_setter_props`, #325: `UnseenChild::PackageOnEvents`); the writer walk reads the mark where it
+classes each prop of that element (`CallRelation::package_props_on_events`), so every rule sees one
+timing. The state still takes every write such a prop may make. The relation records, for a JSX
+prop and only under the assumption, which closures the value may be and which it reaches through a
+member or a capture (`Escapes::split_own`): only the first are covered.
+
+**Not covered**, each keeping its default reading (an Info hand-over, or a Warning):
+- `ref`: React's commit-time protocol (#412), not a prop the package calls on an event; `key`, which
+  React keeps;
+- `children`: what the element renders, a render prop by design (`<AutoSizer>{(size) => …}`); a
+  render prop under another name (`render`, `renderItem`, a formatter) cannot be told from the
+  outside, so the user who declares the assumption asserts it for those;
+- a spread (`{...props}`): it names no prop at the element and forwards `ref` and `children`;
+- what the value reaches without being it: a function held by a member of an object prop, an entry of
+  an array prop, one a closure captures;
+- a package function call `pkg.run(cb)` and a package hook's argument `useThing(cb)` (not
+  components, not props): the obvious sibling assumptions, not this one;
+- a program child the analysis does not resolve (`Handover::Other`): program code, never covered.
+
+**When it is false.** vaul 1.1.2's uncontrolled `Drawer.Root` calls `onOpenChange` from an effect when
+its value changes (`dist/index.mjs:463-506`: `useUncontrolledState`'s `useEffect` calls `onChange`,
+read in the published package); any library with `useEffect(() => props.onChange(v))`; the oracle's
+`ext.EffectCalls`. A loop through such a package is then missed: the oracle cases that state
+`assume=packagePropsRunOnEvents fn` are that price, and a harness run under the assumption accepts
+`fn` there and nowhere else.
+
 ## Why #297's declarations are members of the same section
 
 A declared library summary (#297) is also a statement about code the analysis does not read that

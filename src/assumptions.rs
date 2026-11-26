@@ -26,6 +26,13 @@ pub enum Assumption {
     /// ([`crate::ir::ModuleTable::accessor_names`], #379). A valued
     /// assumption: it is declared with its globs.
     ForeignRealmFiles,
+    /// A component of a package calls a function it receives as a named
+    /// prop (every prop but `key`, `ref` and `children`; a spread names
+    /// none) only from an event handler: never during its render, an effect
+    /// or a commit. Read where the props of an element whose child is a
+    /// package's are classed
+    /// ([`crate::engine::calls::CallRelation::package_props_on_events`]).
+    PackagePropsRunOnEvents,
 }
 
 impl Assumption {
@@ -33,6 +40,7 @@ impl Assumption {
     pub const ALL: &'static [Assumption] = &[
         Assumption::PlainObjectsRunNoAccessor,
         Assumption::ForeignRealmFiles,
+        Assumption::PackagePropsRunOnEvents,
     ];
 
     /// The name the config and `--assume` spell it with.
@@ -40,6 +48,7 @@ impl Assumption {
         match self {
             Assumption::PlainObjectsRunNoAccessor => "plainObjectsRunNoAccessor",
             Assumption::ForeignRealmFiles => "foreignRealmFiles",
+            Assumption::PackagePropsRunOnEvents => "packagePropsRunOnEvents",
         }
     }
 
@@ -79,6 +88,14 @@ pub struct Assumptions {
     /// loop through one that the app really reads. Empty by default.
     #[serde(default)]
     pub foreign_realm_files: Vec<String>,
+    /// A component of a package calls a function it receives as a named
+    /// prop (not `key`, `ref`, `children` or a spread) only from an event
+    /// handler, never during its render, an effect or a commit. Removes the
+    /// hand-over rows and the loop steps through such props; misses a loop
+    /// through a package that calls one from an effect (an uncontrolled
+    /// `onChange`) or during its render (a render prop by another name).
+    #[serde(default)]
+    pub package_props_run_on_events: bool,
 }
 
 impl Assumptions {
@@ -87,6 +104,7 @@ impl Assumptions {
         match a {
             Assumption::PlainObjectsRunNoAccessor => self.plain_objects_run_no_accessor,
             Assumption::ForeignRealmFiles => !self.foreign_realm_files.is_empty(),
+            Assumption::PackagePropsRunOnEvents => self.package_props_run_on_events,
         }
     }
 
@@ -95,6 +113,7 @@ impl Assumptions {
     pub fn declare(&mut self, a: Assumption) {
         match a {
             Assumption::PlainObjectsRunNoAccessor => self.plain_objects_run_no_accessor = true,
+            Assumption::PackagePropsRunOnEvents => self.package_props_run_on_events = true,
             Assumption::ForeignRealmFiles => {
                 unreachable!("`foreignRealmFiles` is declared with its globs")
             }
@@ -120,8 +139,13 @@ impl Assumptions {
         };
         let a = Assumption::parse(name)?;
         match (a, value) {
-            (Assumption::PlainObjectsRunNoAccessor, None) => self.declare(a),
-            (Assumption::PlainObjectsRunNoAccessor, Some(_)) => {
+            (Assumption::PlainObjectsRunNoAccessor | Assumption::PackagePropsRunOnEvents, None) => {
+                self.declare(a)
+            }
+            (
+                Assumption::PlainObjectsRunNoAccessor | Assumption::PackagePropsRunOnEvents,
+                Some(_),
+            ) => {
                 return Err(format!("`{name}` takes no value"));
             }
             (Assumption::ForeignRealmFiles, Some(glob)) if !glob.is_empty() => {
@@ -156,6 +180,10 @@ impl Assumptions {
                     "files matching {} do not share a realm with the app",
                     self.foreign_realm_files.join(", ")
                 ),
+                Assumption::PackagePropsRunOnEvents => {
+                    "a package component calls its function props only from an event handler"
+                        .to_string()
+                }
             })
             .collect()
     }
@@ -165,6 +193,7 @@ impl Assumptions {
     /// like the boolean flags, and a list adds to the list).
     pub fn merge(&mut self, other: &Assumptions) {
         self.plain_objects_run_no_accessor |= other.plain_objects_run_no_accessor;
+        self.package_props_run_on_events |= other.package_props_run_on_events;
         for glob in &other.foreign_realm_files {
             self.declare_files(glob);
         }
@@ -230,8 +259,18 @@ mod tests {
         let mut a = Assumptions::default();
         a.declare_arg("plainObjectsRunNoAccessor").unwrap();
         assert!(a.plain_objects_run_no_accessor);
+        a.declare_arg("packagePropsRunOnEvents").unwrap();
+        assert!(a.package_props_run_on_events);
+        assert_eq!(
+            a.statements(),
+            [
+                "plain objects run no accessor of the program",
+                "a package component calls its function props only from an event handler"
+            ]
+        );
         for bad in [
             "plainObjectsRunNoAccessor=true",
+            "packagePropsRunOnEvents=true",
             "foreignRealmFiles",
             "foreignRealmFiles=",
             "foreignRealmFile=a/**",

@@ -520,7 +520,12 @@ pub(crate) fn returns_no_input(
 /// walk reads the position as an unseen callee's argument, never as an event
 /// handler (#325). `package`: the element's name is imported from a
 /// specifier the resolver maps to no file (#389), so the child is a
-/// package's code, not the program's ([`crate::engine::Handover`]).
+/// package's code, not the program's ([`crate::engine::Handover`]). That is
+/// where the run's assumption that a package component calls its function
+/// props only from an event handler is read, once
+/// ([`crate::assumptions::Assumption::PackagePropsRunOnEvents`]): the state
+/// still takes every write such a prop may make, and the writer walk times
+/// it as an event's.
 fn havoc_setter_props(
     props_expr: &Expr,
     unseen: bool,
@@ -532,7 +537,9 @@ fn havoc_setter_props(
         return;
     };
     if unseen {
-        ctx.record(|r| r.mark_unseen_element(*id, package));
+        let child =
+            crate::engine::calls::UnseenChild::of(package, ctx.query.package_props_run_on_events());
+        ctx.record(|r| r.mark_unseen_element(*id, child));
     }
     let mut setters: Vec<(ComponentId, crate::ir::types::HookLabel)> = Vec::new();
     for (i, (_, v)) in fields.iter().enumerate() {
