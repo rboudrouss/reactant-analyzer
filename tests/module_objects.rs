@@ -206,6 +206,52 @@ fn an_object_the_program_may_change_stays_a_module_object() {
 }
 
 #[test]
+fn each_component_keeps_the_writes_of_the_closures_it_hands_to_the_object() {
+    // Two components subscribe a closure writing their own state, from an
+    // effect with no deps: each closure is handed to the `Set` the methods
+    // capture, which may call it at any time, so each component keeps its
+    // own loop claim, whatever the other one handed there.
+    let hook = r#"
+import { useEffect, useState } from "react";
+const createChannel = () => {
+  const listeners = new Set<(v: string) => void>();
+  return {
+    subscribe: (l: (v: string) => void) => {
+      listeners.add(l);
+      return () => listeners.delete(l);
+    },
+  };
+};
+const channel = createChannel();
+export function useSynced(key: string) {
+  const [value, setValue] = useState<unknown>(0);
+  useEffect(() => channel.subscribe((v) => setValue({ key, v })));
+  return value;
+}
+"#;
+    let comp = |name: &str| {
+        format!(
+            "import {{ useSynced }} from \"./hook\";\nexport function {name}() {{\n  const s = useSynced(\"{name}\");\n  return <p>{{String(s)}}</p>;\n}}\n"
+        )
+    };
+    let (a, b) = (comp("A"), comp("B"));
+    let p = [
+        ("/p/hook.ts", hook),
+        ("/p/A.tsx", a.as_str()),
+        ("/p/B.tsx", b.as_str()),
+    ];
+    assert!(made(&p, "/p/hook.ts", "channel"));
+    for name in ["A", "B"] {
+        let claims = loop_claims(&p, name);
+        // Its own state's cycle, not only the other component's.
+        assert!(
+            claims.iter().any(|c| c.starts_with("infinite-loop ")),
+            "{name}: {claims:?}"
+        );
+    }
+}
+
+#[test]
 fn an_importer_s_write_voids_the_object() {
     let app = format!("{APP}\nchannel.emit = () => undefined;\n");
     let p = vec![("/p/channel.ts", CHANNEL.to_string()), ("/p/App.tsx", app)];

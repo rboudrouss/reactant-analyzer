@@ -17,8 +17,7 @@ pub mod types;
 
 pub use cfg::{BasicBlock, CFG, Edge, EdgeKind, Terminator};
 pub use component::{
-    ComponentIR, ContextId, MadeIds, MadeLiteral, MadeMethod, MadeObject, ModuleConstInit,
-    RefPassing,
+    ComponentIR, ContextId, MadeLiteral, MadeMethod, MadeObject, ModuleConstInit, RefPassing,
 };
 pub use component_id::{ComponentId, ComponentTable, ElementTarget};
 pub use expr::{BinOp, CompOrigin, ElementOrigin, Expr, Prim, UnaryOp};

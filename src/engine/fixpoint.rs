@@ -381,7 +381,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     // one, as a literal does (#340). A method is a closure of no component,
     // its captures the making function's names, which hold any value.
     let mut initial_heap = initial_heap;
-    let made_sites = seed_made_objects(&module_consts, &mut initial_heap);
+    let made_sites = seed_made_objects(&module_consts, &mut initial_heap, &mut splice_salt);
     // Module consts alone, in their own env: reused below as the entry env of
     // custom-hook argument bodies — a module const has the same value at every
     // program point, so it is the only binding that may be seeded there.
@@ -1691,6 +1691,20 @@ impl SpliceIds {
         crate::ir::types::ExprId(crate::ir::expr::CALL_SITES + n)
     }
 
+    /// The offsets of one graft of a body `span` wide
+    /// ([`crate::ir::graft_spans`]) that renames nothing and carries no hook
+    /// table: a module object a program function made (#422).
+    fn graft(&mut self, span: (u64, u64)) -> crate::ir::Offsets {
+        let off = crate::ir::Offsets {
+            ids: self.next_alloc,
+            calls: self.next_call,
+            ..Default::default()
+        };
+        self.next_alloc += span.0;
+        self.next_call += span.1;
+        off
+    }
+
     /// The salt and the offsets for one graft of `cfg` and its `hooks` —
     /// its allocation sites and its call sites, its labels shifted by
     /// `labels` — advancing every supply past it.
@@ -2606,23 +2620,31 @@ fn declared_names(cfg: &CFG, out: &mut HashSet<Var>) {
 }
 
 /// Put every module object of `consts` ([`ModuleConstInit::Made`], #422) in
-/// `heap`: each literal at its site, its methods as closures of
+/// `heap`, grafted into the analysis's range by `salt` as a utility's body
+/// is spliced: each literal at its site, its methods as closures of
 /// [`ComponentId::MODULE_OBJECTS`] whose captures hold ⊤. Returns the sites
-/// each `const` may point to.
+/// each `const` may point to. The graft is the analysis's own: what it
+/// records at a method's calls joins no other analysis's rows, as a spliced
+/// body's do not; what crosses analyses through the object — a closure one
+/// component's call hands to the state the methods capture, called by
+/// another's — is handed to code the analysis does not see there, which
+/// may run it at any time in the analysis that handed it.
 fn seed_made_objects(
     consts: &HashMap<Var, ModuleConstInit>,
     heap: &mut Heap,
+    salt: &mut SpliceIds,
 ) -> HashMap<Var, crate::domains::stores::Sites> {
     use crate::domains::stores::{EnvVal, Members, Sites};
     let mut out = HashMap::new();
-    for (name, init) in consts {
-        let ModuleConstInit::Made(obj) = init else {
+    let mut names: Vec<&Var> = consts.keys().collect();
+    names.sort();
+    for name in names {
+        let Some(ModuleConstInit::Made(obj)) = consts.get(name) else {
             continue;
         };
+        let off = salt.graft(obj.span);
+        let shift = |id: crate::ir::types::ExprId| crate::ir::types::ExprId(id.0 + off.ids);
         for lit in &obj.literals {
-            if heap.get(lit.id).is_some() {
-                continue;
-            }
             let mut named = HashMap::new();
             for (key, method) in &lit.members {
                 let entry = match method {
@@ -2631,15 +2653,19 @@ fn seed_made_objects(
                         for v in &m.captures {
                             captured.extend(v.clone(), StateValue::top());
                         }
+                        let body = std::sync::Arc::new(crate::ir::remap_cfg(
+                            (*m.body_cfg).clone(),
+                            off,
+                        ));
                         heap.alloc_fn(
-                            m.id,
+                            shift(m.id),
                             &m.params,
-                            &m.body_cfg,
+                            &body,
                             &captured,
                             ComponentId::MODULE_OBJECTS,
                         );
                         EnvVal::located(
-                            Some(Sites::closed([m.id])),
+                            Some(Sites::closed([shift(m.id)])),
                             StateValue::reference(Stability::Stable),
                         )
                     }
@@ -2649,11 +2675,11 @@ fn seed_made_objects(
             }
             let mut members = Members::exactly(named);
             members.literal = true;
-            heap.insert(lit.id, crate::domains::HeapValue::Obj(members));
+            heap.insert(shift(lit.id), crate::domains::HeapValue::Obj(members));
         }
         out.insert(
             name.clone(),
-            Sites::closed(obj.literals.iter().map(|l| l.id)),
+            Sites::closed(obj.literals.iter().map(|l| shift(l.id))),
         );
     }
     out

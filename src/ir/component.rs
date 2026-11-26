@@ -55,10 +55,17 @@ pub enum ModuleConstInit {
 /// write rooted at it, no read of it as a value, no call through it but of
 /// one of its methods, its file's namespace never handed on
 /// ([`crate::ir::ModuleTable::const_uses`]).
+///
+/// Its ids are the function's own, as lowered: every analysis that reads the
+/// `const` grafts the object into its own range, as a splice grafts a
+/// utility's body (`span` wide, [`crate::ir::graft_spans`]), so what one
+/// analysis records at a method's calls is that analysis's alone.
 #[derive(Debug, Clone)]
 pub struct MadeObject {
     /// One object per return literal, in the function's block order.
     pub literals: Vec<MadeLiteral>,
+    /// The allocation-id and call-id widths of the function's body.
+    pub span: (u64, u64),
 }
 
 /// One literal a [`MadeObject`] may be.
@@ -82,31 +89,6 @@ pub struct MadeMethod {
     /// The free names of the body the function that made the literal
     /// declares (its parameters and its locals).
     pub captures: Vec<Var>,
-}
-
-/// The ids of the module objects ([`MadeObject`]): one graft of the making
-/// function's ids per object, in
-/// [`ComponentId::MODULE_OBJECTS`](crate::ir::ComponentId::MODULE_OBJECTS)'s
-/// range, calls as allocation sites.
-#[derive(Debug, Default)]
-pub struct MadeIds {
-    allocs: u64,
-    calls: u64,
-}
-
-impl MadeIds {
-    /// The offsets of one graft of `cfg`, the supplies advanced past it.
-    pub fn graft(&mut self, cfg: &CFG) -> crate::ir::Offsets {
-        let base = crate::ir::ComponentId::MODULE_OBJECTS.site_base();
-        let off = crate::ir::Offsets {
-            ids: base + self.allocs,
-            calls: base + self.calls,
-            ..Default::default()
-        };
-        self.allocs += crate::ir::alloc_id_span(cfg);
-        self.calls += crate::ir::call_id_span(cfg);
-        off
-    }
 }
 
 impl MadeObject {

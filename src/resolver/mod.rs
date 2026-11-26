@@ -448,7 +448,6 @@ fn resolve_made_objects(
     };
     let mut paths: Vec<&PathBuf> = table.paths().collect();
     paths.sort();
-    let mut ids = crate::ir::MadeIds::default();
     let mut made: HashMap<(PathBuf, String), Arc<crate::ir::MadeObject>> = HashMap::new();
     for file in paths {
         let Some(facts) = table.facts(file) else {
@@ -467,7 +466,7 @@ fn resolve_made_objects(
             if written(&factory_key) || opened_key(&factory_key) || opened_key(&key) {
                 continue;
             }
-            let Some(obj) = made_object(f, facts, &mut ids) else {
+            let Some(obj) = made_object(f, facts) else {
                 continue;
             };
             if !made_exposed(&key, &obj, &uses) {
@@ -498,13 +497,8 @@ fn resolve_made_objects(
 /// key, no `__proto__`), at least one return is, and no function member
 /// reads `this` or a top-level name of `facts`' file but through the
 /// function's own names (which may hold anything: the analysis does not run
-/// the module's load). Numbered in [`crate::ir::ComponentId::MODULE_OBJECTS`]'s
-/// range, one graft of `f`'s ids per object.
-fn made_object(
-    f: &FunctionIR,
-    facts: &crate::ir::ModuleFacts,
-    ids: &mut crate::ir::MadeIds,
-) -> Option<crate::ir::MadeObject> {
+/// the module's load). Numbered as `f`'s body is: each analysis grafts it.
+fn made_object(f: &FunctionIR, facts: &crate::ir::ModuleFacts) -> Option<crate::ir::MadeObject> {
     use crate::ir::{Expr, cfg::Terminator};
     let mut returns = Vec::new();
     let mut order: Vec<_> = f.body_cfg.blocks.keys().copied().collect();
@@ -577,10 +571,9 @@ fn made_object(
                     .any(|s| matches!(s, crate::ir::Stmt::Let { var, .. } if var == v))
             })
     };
-    let off = ids.graft(&f.body_cfg);
     let mut literals = Vec::new();
     for lit in returns {
-        let Expr::ObjectLit { id, fields } = crate::ir::remap_expr(lit, off) else {
+        let Expr::ObjectLit { id, fields } = lit else {
             return None;
         };
         let mut members = Vec::new();
@@ -631,7 +624,10 @@ fn made_object(
         }
         literals.push(crate::ir::MadeLiteral { id, members });
     }
-    Some(crate::ir::MadeObject { literals })
+    Some(crate::ir::MadeObject {
+        literals,
+        span: crate::ir::graft_spans(&f.body_cfg, &[]),
+    })
 }
 
 /// Does `cfg`, nested functions included, assign one of `names`?
