@@ -5,10 +5,11 @@
     "fn": 0,
     "error-unsound": 0,
     "parse-error": 0,
-    "fp": 340,
-    "tp": 341,
-    "tn": 296,
-    "perpetual": 23,
+    "fp": 351,
+    "tp": 321,
+    "disclosed": 1,
+    "tn": 300,
+    "perpetual": 27,
     "invalid": 0
   },
   "violations": {}

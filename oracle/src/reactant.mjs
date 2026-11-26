@@ -72,13 +72,23 @@ function analyzeNow(source, { bin = reactantBinary() } = {}) {
   });
 }
 
+/**
+ * The rules whose Info hand-over row (a setter handed to package code the
+ * analysis does not see, the row's `setters`) is a limit the analyzer reports for its
+ * component: no loop claim, but no silence either (docs/semantics.md §5).
+ */
+export const HAND_OVER_RULES = new Set(["setter-in-render", "cross-setter-in-render"]);
+
 /** The checkable part of a report. */
 export function claims(report) {
   const loops = [];
   const limits = [];
+  const handOvers = [];
   for (const d of report.diagnostics) {
     if (LOOP_RULES.has(d.rule) && (d.severity === "error" || d.severity === "warning")) {
       loops.push({ rule: d.rule, severity: d.severity, component: d.component, line: d.line, message: d.message });
+    } else if (HAND_OVER_RULES.has(d.rule) && d.severity === "info" && d.setters?.length) {
+      handOvers.push({ rule: d.rule, severity: d.severity, component: d.component, line: d.line, message: d.message });
     } else if (d.rule === "analysis-limit") {
       limits.push({ component: d.component, message: d.message });
     }
@@ -86,6 +96,7 @@ export function claims(report) {
   return {
     loops,
     limits,
+    handOvers,
     blindSpots: report.blind_spots?.length ?? 0,
     parseErrors: report.parse_errors?.length ?? 0,
     components: report.summary?.components_analyzed ?? 0,

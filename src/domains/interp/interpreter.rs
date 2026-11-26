@@ -1740,6 +1740,7 @@ fn call_evaluation<T: Transfer>(
             .map(|(slot, v)| (slot, v.as_state_value().unwrap_or_else(StateValue::top)))
             .collect(),
         module: false,
+        package: false,
     }
 }
 
@@ -2035,6 +2036,10 @@ fn exec_callbacks_depth<T: Transfer>(
                 let module = (ran.bodies.is_empty() || ran.open) && reads_module(fn_, ctx);
                 let mut eval = call_evaluation(transfer, fn_, env, ctx, ran, written);
                 eval.module = module;
+                // The callee is read off a package import: a package's code
+                // ([`crate::engine::Handover`]), which the row joins over
+                // every evaluation.
+                eval.package = package_callee(fn_, ctx);
                 ctx.record(|r| r.record_call(*id, eval));
             }
             returned
@@ -2119,6 +2124,11 @@ fn exec_callbacks_depth<T: Transfer>(
             for (i, arg) in query.hook_args(*label).iter().enumerate() {
                 escape_at(transfer, arg, env, ctx, Some((site, i)));
             }
+            // Whether a package's hook is that package's code here: no write
+            // of the program is rooted at a package import
+            // ([`crate::engine::Handover`]).
+            let intact = query.packages_intact();
+            ctx.record(|r| r.mark_left_hook(site, intact));
             None
         }
         // A native element hands React the props it invokes (`on*`, `ref`).
@@ -2208,6 +2218,20 @@ fn exec_unseen_new<T: Transfer>(
     });
     for (i, arg) in args.iter().enumerate() {
         escape_at(transfer, arg, env, ctx, Some((id, i)));
+    }
+    // An open row, which runs nothing: it says whose code the arguments
+    // went to, a package's when the class is read off a package import
+    // ([`crate::engine::Handover`]).
+    if ctx.calls.is_some()
+        && let Expr::New { fn_, .. } = expr
+    {
+        let eval = crate::engine::calls::Evaluation {
+            open: true,
+            escaped: ctx.escaped,
+            package: package_callee(fn_, ctx),
+            ..Default::default()
+        };
+        ctx.record(|r| r.record_call(id, eval));
     }
     if !on_this {
         return None;
@@ -2324,6 +2348,24 @@ fn module_root(expr: &Expr) -> Option<&str> {
         Expr::IndexAccess { arr, .. } => module_root(arr),
         _ => None,
     }
+}
+
+/// The callee `fn_` is a package's code ([`crate::engine::Handover`]): a
+/// name the component's bodies read free as a package import, or a chain of
+/// static members rooted at one (`ext.run`, `P.a.b`). A computed member is
+/// not: an array builtin the program calls on the package's object may have
+/// put a program function at an index. The context's package imports are
+/// empty when a write of the program has a receiver rooted at a package
+/// import.
+fn package_callee<D: AbstractDomain>(fn_: &Expr, ctx: &AnalysisCtx<D>) -> bool {
+    fn root(e: &Expr) -> Option<&str> {
+        match e.peel_ts() {
+            Expr::Var(v) => Some(v),
+            Expr::FieldAccess { obj, .. } => root(obj),
+            _ => None,
+        }
+    }
+    root(fn_).is_some_and(|n| ctx.query.package_import(n))
 }
 
 /// `expr` is read off a module binding (#335): it may be anything the

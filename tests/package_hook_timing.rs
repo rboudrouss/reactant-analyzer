@@ -41,6 +41,8 @@ fn comp<'a>(r: &'a ProgramAnalysisResult, name: &str) -> &'a AnalysisResult<Stat
     &r.components[&r.component_named(name).unwrap()]
 }
 
+/// The levels of `setter-in-render`'s rows on `name`: a callback a package's
+/// hook receives with no timing is handed to that package's code, an Info.
 fn setter_in_render(r: &ProgramAnalysisResult, name: &str) -> Vec<Severity> {
     let id = r.component_named(name).unwrap();
     SetterInRender
@@ -197,11 +199,7 @@ fn an_options_member_the_table_does_not_name_keeps_unknown_timing() {
         "TableChangedInRender",
         "Mutation",
     ] {
-        assert_eq!(
-            setter_in_render(&r, name),
-            vec![Severity::Warning],
-            "{name}"
-        );
+        assert_eq!(setter_in_render(&r, name), vec![Severity::Info], "{name}");
     }
 }
 
@@ -225,11 +223,7 @@ fn a_debounced_callback_that_may_run_synchronously_keeps_unknown_timing() {
     // hook of the same name is not in the table.
     let r = parse_and_analyze(SRC);
     for name in ["Flushed", "Leading", "HandedOut", "Foreign"] {
-        assert_eq!(
-            setter_in_render(&r, name),
-            vec![Severity::Warning],
-            "{name}"
-        );
+        assert_eq!(setter_in_render(&r, name), vec![Severity::Info], "{name}");
     }
 }
 
@@ -297,6 +291,8 @@ fn a_member_the_table_does_not_name_or_cannot_certify_keeps_unknown_timing() {
     // `validate` runs when the library validates, which a `trigger()` may ask
     // for at any time; another package's `register` proves nothing; a name
     // bound twice is not certainly the member.
+    // The callee is a member of a hook's result, called off a local name,
+    // not off the package's import: a Warning.
     let r = parse_and_analyze(MEMBERS);
     for name in ["RegisteredValidate", "OtherRegister", "RegisterRebound"] {
         assert_eq!(

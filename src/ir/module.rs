@@ -55,6 +55,22 @@ pub struct ModuleFacts {
     /// The names the module imports from another analysed file: `(local
     /// name, origin file, the name the origin exports it under)` (#335).
     pub imported: Vec<(String, PathBuf, String)>,
+    /// The local names of the values the module imports from a specifier
+    /// the resolver maps to no file — a package's code, as #389 reads a JSX
+    /// name imported so ([`crate::engine::Handover`]).
+    pub packages: Vec<String>,
+    /// The first write of the module whose receiver is rooted at one of its
+    /// package imports (`None`: none): a write that replaces part of a
+    /// package's export ([`crate::engine::Handover`]).
+    pub member_install: Option<MemberInstall>,
+}
+
+/// A write into a package import, as [`ModuleFacts::member_install`] names
+/// it: its line and its text.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemberInstall {
+    pub line: usize,
+    pub text: String,
 }
 
 /// The member names some accessor of the program defines (#334): an object

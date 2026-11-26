@@ -18,6 +18,7 @@ fn reactant(dir: &std::path::Path) -> Output {
             "json",
             "--fail-on",
             "never",
+            "--info",
         ])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
@@ -82,8 +83,9 @@ fn an_unconditional_render_write_is_an_error() {
 #[test]
 fn a_write_not_proven_to_run_or_to_write_is_a_warning() {
     assert_eq!(levels("if (props.c) setN(42);"), ["warning"]);
-    // Handed to a callee the analysis does not see.
-    assert_eq!(levels("someCall((u: number) => setN(u));"), ["warning"]);
+    // Handed to a callee the analysis does not see: the hand-over row, an
+    // Info.
+    assert_eq!(levels("someCall((u: number) => setN(u));"), ["info"]);
     // A callee that may be the setter or something else.
     assert_eq!(
         levels("const f = props.c ? setN : noop; f(1);"),

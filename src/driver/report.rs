@@ -26,6 +26,9 @@ pub struct ComponentReport {
     /// place, and on the same `--info` switch, as `safe_checks`: it is the
     /// negative half of the very same channel.
     pub suspended_safe_checks: usize,
+    /// The Info rows of this component left out because `--info` was not
+    /// given; 0 under `--info`.
+    pub hidden_infos: usize,
 }
 
 /// Everything the renderers need.
@@ -36,6 +39,8 @@ pub struct CheckReport {
     pub errors: usize,
     pub warnings: usize,
     pub infos: usize,
+    /// The Info rows the run computed and does not show (no `--info`).
+    pub hidden: Hidden,
     pub exit_code: i32,
     /// Resolves the `FileId` carried by every diagnostic/note span (ADR-019),
     /// so renderers can name the file a cross-file trace step points into.
@@ -50,6 +55,21 @@ pub struct CheckReport {
     /// Set by `--follow-imports`: what the run pulled in beyond the paths the
     /// user named, and what it found there but is not showing (#138).
     pub followed: Option<Followed>,
+}
+
+/// The Info rows a run without `--info` leaves out, counted as the summary
+/// counts the rows it shows (one per location group, `--per-component` one
+/// per row), so that the default output says what it hides. All zero under
+/// `--info`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Hidden {
+    /// Every hidden Info row.
+    pub infos: usize,
+    /// Of those, the hand-over rows (#377): one per site that hands setters
+    /// to code the analysis does not see.
+    pub hand_overs: usize,
+    /// The setters those rows list, each counted once per row.
+    pub setters: usize,
 }
 
 /// The `--follow-imports` accounting (#138).

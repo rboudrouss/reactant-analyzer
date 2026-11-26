@@ -106,7 +106,8 @@ fn a_parent_setter_called_through_an_optional_prop_stays_reported() {
 
 /// A setter reported at several sites of equal strength is anchored at the
 /// first one in the source (`Anchor.tsx`, line 11), not at the first one the
-/// walk meets once a `?.` has split the handlers' blocks.
+/// walk meets once a `?.` has split the handlers' blocks. Both sites hand it
+/// to a package's code (`useHotkeys`, `<TextInput>`): an Info, under `--info`.
 #[test]
 fn a_setter_row_anchors_at_its_first_site_in_the_source() {
     let out = reactant(&[
@@ -117,6 +118,7 @@ fn a_setter_row_anchors_at_its_first_site_in_the_source() {
         "json",
         "--fail-on",
         "never",
+        "--info",
     ]);
     let doc: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout))
         .expect("stdout must be valid JSON");

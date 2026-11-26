@@ -131,7 +131,9 @@ pub const RULE_DOCS: &[RuleDoc] = &[
                       \"Cannot update a component while rendering a different component\", or \
                       loops. Error needs two proofs: the call dominates every exit, and \
                       calling the prop provably writes. A prop that only *carries* a \
-                      captured setter into a handler warns instead.",
+                      captured setter into a handler warns instead. A parent's setter handed \
+                      to a package's code is a limit of the analysis, an Info shown with \
+                      `--info`, as for `setter-in-render`.",
         "function Child({ setTotal }) { setTotal(42); return <div/>; }",
         "Move the call into a `useEffect` or an event handler.",
     ),
@@ -263,12 +265,16 @@ pub const RULE_DOCS: &[RuleDoc] = &[
         "Calling a setter while rendering schedules another render before this \
                       one commits. Unconditional call → guaranteed infinite loop (Error); \
                       conditional call → loops whenever the condition holds (Warning). \
-                      A third shape warns without claiming a call at all: the setter is \
-                      handed to a callee with no timing summary (`handleSubmit(onSubmit)`), \
-                      so the analyzer cannot rule out that it runs during render (one row \
-                      per hand-over, listing every setter it hands); or it is \
+                      A third shape claims no call at all. The setter is handed to a \
+                      callee with no timing summary (`handleSubmit(onSubmit)`, a builtin \
+                      the analysis does not model, a package's component), so the analyzer \
+                      cannot rule out that it runs during render (one row per hand-over, \
+                      listing every setter it hands): a Warning, or an Info shown with \
+                      `--info` when the callee is provably a package's code, a limit of \
+                      the analysis that the default summary counts; an effect that loops \
+                      through any such callee is still `infinite-loop`'s Warning. Or it is \
                       called in a getter or setter, which runs wherever its member is read \
-                      or written, the render included. A write a \
+                      or written, the render included (Warning). A write a \
                       known registrar defers (`setTimeout(() => setN(1))`) is proven not to \
                       be a render write and is not reported here.",
         "function C() { const [n, setN] = useState(0); setN(1); return <div/>; }",

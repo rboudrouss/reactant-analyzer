@@ -85,6 +85,23 @@ A library's own timers are not on the virtual clock: only the timer functions
 the program itself sees are (the library calls the real `setTimeout`). A case
 must not depend on them.
 
+## The verdicts
+
+`fn`, `error-unsound`, `parse-error` (the violations), `tp`, `disclosed`,
+`tn`, `fp`, `perpetual`, `invalid`; the definitions are in
+[`docs/semantics.md`](../docs/semantics.md) §5. `disclosed` is a program React
+loops on where the only row on a component of the loop is an Info hand-over
+row of `setter-in-render` / `cross-setter-in-render` (one that carries
+`setters`: a setter handed to code the analysis proves is a package's). It is no loop
+claim, so it is not a `tp`, and it names the setter and where it went, so it
+is not an `fn`: the fuzz tally counts it apart, and `fn` stays "React loops
+and nothing covers it". `ext` exports `EffectCalls` and `ClickCalls`, two
+components a program sees as a package's, which call their `fn` prop from an
+effect after every commit and from a button's `onClick`, for the cases of that
+verdict. The `ext` object is made anew for every program: a program may write
+members on it (`ext.hook = …`), which the realm snapshot does not cover, and
+the next program in the worker must not read them.
+
 | File | Role |
 |---|---|
 | `src/react-run.mjs` | the concrete run: compile, render, drain timers, verdict; provides `ext` |

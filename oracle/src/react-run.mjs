@@ -41,7 +41,10 @@ export const IN_LOOP = 10;
  * `absent?.(f())` never runs `f` (#301). `bump` reads its `this`: called as
  * a method, it calls the receiver's `set` with an updater (#340).
  */
-const EXT = {
+// Made anew for every program (`load`): a program may write members on the
+// package's object (`ext.hook = …`), and the next program run in the worker
+// must not read them (the realm check does not cover this object).
+const makeExt = () => ({
   absent: undefined,
   runNow: (cb) => cb(),
   defer: (cb) => void Promise.resolve().then(cb),
@@ -57,7 +60,16 @@ const EXT = {
       const fns = typeof x === "function" ? [x] : Object.values(x ?? {});
       for (const f of fns) if (typeof f === "function") f();
     }),
-};
+  // A package component that calls its `fn` prop after every commit, and one
+  // that hands it to a button's `onClick` only (S40).
+  EffectCalls({ fn }) {
+    React.useEffect(() => {
+      fn();
+    });
+    return null;
+  },
+  ClickCalls: ({ fn }) => React.createElement("button", { onClick: fn }),
+});
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>");
 for (const key of ["window", "document", "navigator", "HTMLElement", "Node", "Element"]) {
@@ -280,6 +292,7 @@ export function compile(source, name = ENTRY) {
 function load(source, clock) {
   const files = new Map(splitFiles(source).map((f) => [f.name, f.text]));
   const cache = new Map();
+  const ext = makeExt();
   const t = clock.api;
   const evaluate = (name) => {
     if (cache.has(name)) return cache.get(name).exports;
@@ -297,7 +310,7 @@ function load(source, clock) {
     if (id === "react/jsx-runtime") return jsxShim;
     if (id === "react-dom") return require("react-dom");
     if (id === "react-dom/client") return ReactDOMClient;
-    if (id === "ext") return EXT;
+    if (id === "ext") return ext;
     if (packageOf(id)) return library(id);
     if (id.startsWith("./")) {
       const base = id.slice(2);

@@ -36,6 +36,13 @@ pub struct ModuleScope {
     files: HashMap<PathBuf, HashMap<Var, ExprId>>,
     /// Per analysed file: its module `const`s of known kind (#354).
     consts: HashMap<PathBuf, Arc<HashMap<Var, ModuleConstInit>>>,
+    /// Per analysed file: the names it imports from a package
+    /// ([`crate::ir::ModuleFacts::packages`]).
+    packages: HashMap<PathBuf, std::collections::HashSet<Var>>,
+    /// The first write of the program, in path order, whose receiver is
+    /// rooted at a package import ([`crate::ir::ModuleFacts::member_install`]):
+    /// a write that replaces part of a package's export.
+    install: Option<(PathBuf, crate::ir::module::MemberInstall)>,
 }
 
 impl ModuleScope {
@@ -60,10 +67,18 @@ impl ModuleScope {
             }
         }
         let mut files = HashMap::new();
+        let mut packages = HashMap::new();
+        let mut install = None;
         for path in paths {
             let Some(facts) = table.facts(path) else {
                 continue;
             };
+            packages.insert(path.clone(), facts.packages.iter().cloned().collect());
+            if install.is_none()
+                && let Some(i) = &facts.member_install
+            {
+                install = Some((path.clone(), i.clone()));
+            }
             let mut names = HashMap::new();
             for name in &facts.bindings {
                 names.insert(name.clone(), anchors[&(path.clone(), name.clone())]);
@@ -78,7 +93,52 @@ impl ModuleScope {
         ModuleScope {
             files,
             consts: HashMap::new(),
+            packages,
+            install,
         }
+    }
+
+    /// The program's first write into a package import, when it has one
+    /// ([`crate::engine::Handover`]): no import of a package is then read as
+    /// that package's code.
+    pub fn member_install(&self) -> Option<&(PathBuf, crate::ir::module::MemberInstall)> {
+        self.install.as_ref()
+    }
+
+    /// No write of the program has a receiver rooted at a package import:
+    /// what a package import reads is that package's code, the premise the
+    /// registry's summaries stand on too.
+    pub fn packages_intact(&self) -> bool {
+        self.install.is_none()
+    }
+
+    /// The names a body written in one of `files` reads, free, as a package
+    /// import: imported so by one of the files, declared by no body of the
+    /// component (`declared`), and a module binding of none of the files: a
+    /// name one of them binds to program code is never read as a package's
+    /// (fail closed, [`crate::engine::Handover`]).
+    pub fn packages<'p>(
+        &self,
+        files: impl IntoIterator<Item = &'p Path> + Clone,
+        declared: &std::collections::HashSet<Var>,
+    ) -> std::collections::HashSet<Var> {
+        if !self.packages_intact() {
+            return std::collections::HashSet::new();
+        }
+        let bound = |name: &Var| {
+            files
+                .clone()
+                .into_iter()
+                .any(|f| self.files.get(f).is_some_and(|m| m.contains_key(name)))
+        };
+        files
+            .clone()
+            .into_iter()
+            .filter_map(|f| self.packages.get(f))
+            .flatten()
+            .filter(|name| !declared.contains(*name) && !bound(name))
+            .cloned()
+            .collect()
     }
 
     /// This scope, with every file's module `const`s

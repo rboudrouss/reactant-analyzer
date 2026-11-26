@@ -12,12 +12,12 @@ use crate::ir::{
 
 use crate::engine::guards::{Invariance, LoopFacts, converges_once_written};
 use crate::engine::triggers::{Always, Rerun};
-use crate::engine::{Change, SlotWriter, WriterPhase, WriterRegion, triggers_of};
+use crate::engine::{Change, Handover, SlotWriter, WriterPhase, WriterRegion, triggers_of};
 use crate::ir::hooks::HookEntry;
 use crate::rules::api::query::must_render_write;
 use crate::rules::helpers::eval_in_exit_env;
 use crate::rules::{
-    Diagnostic, ExitDominance, MustResult, Rule, SetterRef, Severity, must_alias_scopes,
+    Diagnostic, ExitDominance, MustResult, Rule, SetterRef, must_alias_scopes,
     must_dominates_all_exits, must_state_vals,
 };
 
@@ -33,6 +33,9 @@ use crate::rules::{
 /// Severity:
 /// - `Error`   call block dominates all render exits (unconditional).
 /// - `Warning` conditional path or nested FnLit (dominance unknowable).
+/// - `Info`    a setter handed to a package's code (a hand-over the walk
+///   proves goes there, `row`): a limit of the analysis, behind `--info`.
+///   A hand-over to any other callee with no timing summary is a Warning.
 ///
 /// Silence: the sanctioned "adjust state during render" idiom — a
 /// **conditional local** call whose dominating guards read the slot it
@@ -83,20 +86,23 @@ impl Rule for SetterInRender {
 /// values to one unseen callee, and the setters those values carry are what
 /// it hands, not separate findings — every other row, a setter called
 /// during render included, keeps one row per setter. A row with no site is
-/// never grouped. The setters are listed in their sorted order, each once;
-/// `var`, `hook_label` and the witness are the first one's, its peers'
-/// distinct witness steps follow.
+/// never grouped. The level is in the key too: a site that hands one setter
+/// to a package's code (Info) and another to code the walk cannot prove is
+/// one (Warning) is two rows, so a group never shows a Warning's setter at
+/// Info. The setters are listed in their sorted order, each once; `var`,
+/// `hook_label` and the witness are the first one's, its peers' distinct
+/// witness steps follow.
 fn group_hand_overs(rows: Vec<Diagnostic>, component: &str) -> Vec<Diagnostic> {
+    type Key = (std::borrow::Cow<'static, str>, crate::ir::SourceRange, u8);
     let mut out: Vec<Diagnostic> = Vec::with_capacity(rows.len());
     let mut groups: Vec<Vec<Diagnostic>> = Vec::new();
-    let mut at: HashMap<(std::borrow::Cow<'static, str>, crate::ir::SourceRange), usize> =
-        HashMap::new();
+    let mut at: HashMap<Key, usize> = HashMap::new();
     for d in rows {
         let Some(range) = d.range.filter(|_| !d.setters.is_empty()) else {
             out.push(d);
             continue;
         };
-        match at.entry((d.rule.clone(), range)) {
+        match at.entry((d.rule.clone(), range, d.severity().rank())) {
             std::collections::hash_map::Entry::Occupied(g) => groups[*g.get()].push(d),
             std::collections::hash_map::Entry::Vacant(g) => {
                 g.insert(groups.len());
@@ -122,7 +128,9 @@ fn group_hand_overs(rows: Vec<Diagnostic>, component: &str) -> Vec<Diagnostic> {
                 }
             }
         }
-        row.message = hand_over_message(&row.setters, component);
+        // An Info hand-over is one to a package's code (`row`).
+        let package = row.severity() == crate::rules::Severity::Info;
+        row.message = hand_over_message(&row.setters, component, package);
         out.push(row);
     }
     out
@@ -257,12 +265,17 @@ impl SetterInRender {
             let handed = (!sync)
                 .then(|| wording.handed(w, w.owner.map(|p| result.display_name(p))))
                 .flatten();
+            let package = w.handover == Handover::Package;
             let (rule_name, message) = match (w.owner, &wording.through, &handed) {
                 // Handed to code with no timing summary: the row of its site
                 // (`group_hand_overs`).
                 (_, _, Some(h)) => (
                     hand_over_rule(h),
-                    hand_over_message(std::slice::from_ref(h), &result.display_name(component)),
+                    hand_over_message(
+                        std::slice::from_ref(h),
+                        &result.display_name(component),
+                        package,
+                    ),
                 ),
                 // A write in an accessor's body the render's read or write
                 // runs (#337).
@@ -310,19 +323,13 @@ impl SetterInRender {
                     )
                 }
             };
-            let mut d = match proof {
-                Some(proof) => Diagnostic::error(rule_name, proof, message),
-                None => Diagnostic::warn(rule_name, message),
-            };
+            let mut d = row(rule_name, proof, handed, package, message);
             d = match w.owner {
                 None => d.with_label(w.slot),
                 Some(_) => d.with_var(w.setter.clone()),
             };
             if let Some(r) = w.span {
                 d = d.with_range(r);
-            }
-            if let Some(h) = handed {
-                d = d.with_setter(h);
             }
             // Witness (ADR-019): the render-time setter call itself.
             d = d.with_step(
@@ -335,9 +342,10 @@ impl SetterInRender {
         };
         // Every site is judged: a setter whose render-pass site settles may
         // also be handed to a callee that runs it at any time. A slot is one
-        // finding, its strongest site nothing clears (#285): a certified one
-        // if any — `if (c) setN(1); setN(2)` loops on every render whatever
-        // `c` — else the first, the synchronous ones first. First in the
+        // finding, its strongest site nothing clears (#285): the first of the
+        // strongest level — a certified one if any (`if (c) setN(1);
+        // setN(2)` loops on every render whatever `c`), a Warning over a
+        // hand-over's Info — the synchronous ones first. First in the
         // source, not in the walk (#301).
         let mut rows = rows;
         rows.sort_by_key(|w| {
@@ -355,9 +363,7 @@ impl SetterInRender {
             };
             match out.iter_mut().find(|(k, _)| *k == key) {
                 None => out.push((key, d)),
-                Some((_, kept))
-                    if d.severity() == Severity::Error && kept.severity() != Severity::Error =>
-                {
+                Some((_, kept)) if d.severity().rank() > kept.severity().rank() => {
                     *kept = d;
                 }
                 Some(_) => {}
@@ -446,10 +452,15 @@ impl SetterInRender {
                 let handed = (!sync && w.owner.is_none())
                     .then(|| wording.handed(w, None))
                     .flatten();
+                let package = w.handover == Handover::Package;
                 let (rule_name, message) = match (w.owner, &handed) {
                     (_, Some(h)) => (
                         hand_over_rule(h),
-                        hand_over_message(std::slice::from_ref(h), &result.display_name(component)),
+                        hand_over_message(
+                            std::slice::from_ref(h),
+                            &result.display_name(component),
+                            package,
+                        ),
                     ),
                     (None, _) if sync => (
                         "setter-in-render",
@@ -478,19 +489,13 @@ impl SetterInRender {
                         ),
                     ),
                 };
-                let mut d = match proof {
-                    Some(proof) => Diagnostic::error(rule_name, proof, message),
-                    None => Diagnostic::warn(rule_name, message),
-                };
+                let mut d = row(rule_name, proof, handed, package, message);
                 d = match w.owner {
                     None => d.with_label(w.slot),
                     Some(_) => d.with_var(w.setter.clone()),
                 };
                 if let Some(r) = w.span {
                     d = d.with_range(r);
-                }
-                if let Some(h) = handed {
-                    d = d.with_setter(h);
                 }
                 d = d.with_step(
                     wording.step(w),
@@ -516,6 +521,36 @@ fn unknown_accessor_message(wording: &Wording) -> String {
     )
 }
 
+/// A row of these two rules at its level, decided here alone: an Error from
+/// a proof that the write runs on every render; an Info for a hand-over
+/// (`handed`, carried as the row's setter) to code the walk proves is a
+/// package's (`package`, [`Handover::Package`]); a Warning otherwise, a
+/// hand-over to anything else included. Package code is code the analysis
+/// does not see: a limit of the analysis, which is what Info means
+/// (CLAUDE.md), behind `--info` and counted by the default output — the
+/// user's decision of 2026-11-24 (#394). A hand-over to program code the
+/// analysis did not follow (a builtin it does not model, an unplaced heap
+/// object, a cutoff) is a possible defect of the program, so it keeps its
+/// Warning, as does a setter seen called during render; a cycle through any
+/// such callee is still `infinite-loop`'s Warning.
+fn row<E>(
+    rule: &'static str,
+    proof: Option<crate::rules::Certified<E>>,
+    handed: Option<SetterRef>,
+    package: bool,
+    message: String,
+) -> Diagnostic {
+    let d = match (proof, &handed) {
+        (Some(proof), _) => Diagnostic::error(rule, proof, message),
+        (None, Some(_)) if package => Diagnostic::info(rule, message),
+        (None, _) => Diagnostic::warn(rule, message),
+    };
+    match handed {
+        Some(setter) => d.with_setter(setter),
+        None => d,
+    }
+}
+
 /// The rule a hand-over row of `setter` belongs to: a parent's setter is
 /// `cross-setter-in-render`'s.
 fn hand_over_rule(setter: &SetterRef) -> &'static str {
@@ -535,13 +570,12 @@ fn hand_over_rule(setter: &SetterRef) -> &'static str {
 /// [`SetterRef::NAMED`] listed (the row's `setters` holds them all). What
 /// they went through is said once when they share it. `component` is the
 /// component the rule runs on, which a parent's setter re-renders the
-/// parent from.
-fn hand_over_message(setters: &[SetterRef], component: &str) -> String {
+/// parent from. `package`: the callee is provably a package's code
+/// ([`Handover::Package`]), which the message then says it is.
+fn hand_over_message(setters: &[SetterRef], component: &str, package: bool) -> String {
     let through = setters.first().and_then(|s| s.through.as_ref());
     let shared = setters.iter().all(|s| s.through.as_ref() == through);
-    let clause = through
-        .filter(|_| shared)
-        .map_or_else(String::new, |t| format!(" through `{t}`,"));
+    let through = through.filter(|_| shared);
     let parents = setters.first().is_some_and(|s| s.parent.is_some());
     let (head, it, them, renders) = match setters {
         [s] => (
@@ -587,10 +621,25 @@ fn hand_over_message(setters: &[SetterRef], component: &str) -> String {
             format!(" ({list})")
         }
     };
+    let (to, callee) = match (package, through) {
+        (false, t) => (
+            format!(
+                "to a callee{} with no timing summary",
+                t.map_or_else(String::new, |t| format!(" through `{t}`,"))
+            ),
+            "callee",
+        ),
+        (true, t) => (
+            format!(
+                "{}to package code the analysis does not see",
+                t.map_or_else(String::new, |t| format!("through `{t}` "))
+            ),
+            "code",
+        ),
+    };
     format!(
-        "{head} handed to a callee{clause} with no timing summary{list}. If that callee runs \
-         {it} during render, {renders}; if it runs {them} only from event handlers, there is \
-         nothing to fix"
+        "{head} handed {to}{list}. If that {callee} runs {it} during render, {renders}; if it \
+         runs {them} only from event handlers, there is nothing to fix"
     )
 }
 
@@ -961,10 +1010,17 @@ mod tests {
     fn a_hand_over_names_one_setter_as_a_write_does_and_counts_several() {
         // #377: one setter reads as the row of its write.
         assert_eq!(
-            hand_over_message(&[handed(Some("setN"), Some("P"), None)], "C"),
+            hand_over_message(&[handed(Some("setN"), Some("P"), None)], "C", false),
             "prop `setN` (a state setter of parent `P`) is handed to a callee with no timing \
              summary. If that callee runs it during render, `C` re-renders its parent on every \
              render; if it runs it only from event handlers, there is nothing to fix"
+        );
+        // To a package's code, the message says so.
+        assert_eq!(
+            hand_over_message(&[handed(Some("setN"), None, None)], "C", true),
+            "setter `setN` is handed to package code the analysis does not see. If that code \
+             runs it during render, this re-renders on every render; if it runs it only from \
+             event handlers, there is nothing to fix"
         );
         // What they went through, said once when they share it.
         let shared = [
@@ -972,12 +1028,20 @@ mod tests {
             handed(None, None, Some("payload")),
         ];
         assert!(
-            hand_over_message(&shared, "C").starts_with(
+            hand_over_message(&shared, "C", false).starts_with(
                 "2 setters are handed to a callee through `payload`, with no timing summary \
                  (`setA` and a state setter). If that callee runs one of them"
             ),
             "{}",
-            hand_over_message(&shared, "C")
+            hand_over_message(&shared, "C", false)
+        );
+        assert!(
+            hand_over_message(&shared, "C", true).starts_with(
+                "2 setters are handed through `payload` to package code the analysis does not \
+                 see (`setA` and a state setter). If that code runs one of them"
+            ),
+            "{}",
+            hand_over_message(&shared, "C", true)
         );
         // Else on each, and past three, counted.
         let mixed = [
@@ -988,14 +1052,14 @@ mod tests {
             handed(Some("setE"), Some("Q"), None),
         ];
         assert!(
-            hand_over_message(&mixed, "C").starts_with(
+            hand_over_message(&mixed, "C", false).starts_with(
                 "5 state setters of parent components are handed to a callee with no timing \
                  summary (`setA` of `P` through `o`, `setB` of `P`, `setC` of `Q` and 2 more). \
                  If that callee runs one of them during render, `C` re-renders that setter's \
                  parent on every render"
             ),
             "{}",
-            hand_over_message(&mixed, "C")
+            hand_over_message(&mixed, "C", false)
         );
     }
 

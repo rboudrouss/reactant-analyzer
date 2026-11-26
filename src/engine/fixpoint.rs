@@ -524,8 +524,10 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         .collect();
     // The module bindings the component's bodies name (#335): those of its
     // file, and of every file a body was spliced from, but the names it
-    // declares itself.
-    let module_names = {
+    // declares itself; and the names they read as a package import, which a
+    // call's callee is rooted at when that callee is a package's code
+    // ([`crate::engine::Handover`]).
+    let (module_names, package_names) = {
         let mut declared: HashSet<Var> = HashSet::from([comp_param.clone()]);
         declared_names(&render_cfg, &mut declared);
         for hook in &hooks {
@@ -541,12 +543,11 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             .map(|r| r.from.as_path())
             .chain(inline_regions.entry_files.values().map(|f| f.as_path()));
         let classes = class_files.iter().map(std::path::PathBuf::as_path);
-        let mut names = program.modules.names(
-            std::iter::once(comp_file.as_path())
-                .chain(spliced)
-                .chain(classes),
-            &declared,
-        );
+        let files = std::iter::once(comp_file.as_path())
+            .chain(spliced)
+            .chain(classes);
+        let mut names = program.modules.names(files.clone(), &declared);
+        let packages = program.modules.packages(files, &declared);
         // A free name a splice renamed is the binding of its body's file
         // (#354).
         for (name, anchor) in renamed_anchors {
@@ -554,7 +555,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 names.entry(name).or_default().push(anchor);
             }
         }
-        names
+        (names, packages)
     };
     let query = FixpointCtx {
         callbacks: &callback_bodies,
@@ -565,6 +566,8 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         hands_back: &hands_back,
         hook_reads: &hook_reads,
         module: &module_names,
+        packages: &package_names,
+        packages_intact: program.modules.packages_intact(),
         resolves_children: inter.is_some(),
     };
     // A `useCallback` value is placed where its recompute hands it back (a

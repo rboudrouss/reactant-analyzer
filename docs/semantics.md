@@ -140,10 +140,19 @@ shrinks back to one file and no `ext` was not caused by either.
 `cross-component-infinite-loop`, `setter-in-render` or `cross-setter-in-render`.
 
 - **P1 (no false negative).** If React loops, the analyzer makes a loop claim
-  on a component in the loop (§3). A claim on another component does not
-  count: with three components, a Warning on the wrong one would otherwise hide
-  the missing one. A violation is `fn`. When an `analysis-limit` was reported,
-  the `fn` is marked *disclosed*; it is still an `fn`.
+  on a component in the loop (§3), or discloses on it that it cannot tell. A
+  claim on another component does not count: with three components, a Warning
+  on the wrong one would otherwise hide the missing one. The disclosure is a
+  *hand-over row*: an Info of `setter-in-render` or `cross-setter-in-render`
+  that carries `setters` (a setter handed to code the analysis proves is a
+  package's, which may run it during render; the analyzer runs with `--info`,
+  so the row is in the report). A hand-over to anything else is a Warning, a
+  loop claim like any other. A loop with no claim on its components and such a row on
+  one of them is `disclosed`: not a `tp`, since no loop was claimed at
+  Warning, and not an `fn`, since the report names the setter and the code it
+  went to. A loop with neither is `fn`, the violation. When an
+  `analysis-limit` was reported, the `fn` is marked *limited*; it is still an
+  `fn`.
 - **P2 (an Error is certain).** If the analyzer makes an Error loop claim on a
   component that React rendered, React does not settle. For
   `cross-setter-in-render`, React's "Cannot update a component while rendering
@@ -159,8 +168,11 @@ since it does not settle, it refutes none either (P2 holds). It is counted as
 `perpetual` and judged no further.
 
 A program the analyzer cannot parse is `parse-error`, also a violation. The
-other classes are `tp` and `tn` (agreement), `fp` (a Warning on a program that
-settles, tolerated and counted), `perpetual`, and `invalid` (React crashed).
+other classes are `tp` and `tn` (agreement), `disclosed` (above: a loop the
+analyzer reported as a hand-over to package code, counted apart),
+`fp` (a Warning on a program that settles, tolerated and counted; an Info
+hand-over row on a program that settles is no claim, so that program is `tn`),
+`perpetual`, and `invalid` (React crashed).
 
 The check is one execution per program, which is what makes it exact rather
 than statistical: a program has no props and no input, so React's run is the

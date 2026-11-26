@@ -17,6 +17,7 @@ fn reactant(dir: &std::path::Path) -> Output {
             "json",
             "--fail-on",
             "never",
+            "--info",
         ])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
@@ -28,7 +29,8 @@ fn reactant(dir: &std::path::Path) -> Output {
 /// other test's analyzer (an empty stdout, "EOF while parsing a value").
 static RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// The loop findings (`rule:severity`) of the program `src`.
+/// The loop findings (`rule:severity`) of the program `src`, and its Info
+/// hand-over rows (a closure handed to code the analysis does not see).
 fn findings_of(src: &str, tag: &str) -> Vec<String> {
     let run = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
@@ -45,7 +47,8 @@ fn findings_of(src: &str, tag: &str) -> Vec<String> {
         .iter()
         .filter(|d| {
             let rule = d["rule"].as_str().unwrap_or("");
-            rule.ends_with("setter-in-render") || rule == "infinite-loop"
+            (rule.ends_with("setter-in-render") || rule == "infinite-loop")
+                && (d["severity"] != "info" || d["setters"].is_array())
         })
         .map(|d| {
             format!(

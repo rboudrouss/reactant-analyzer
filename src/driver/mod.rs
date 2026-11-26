@@ -30,7 +30,7 @@ use crate::rules::{Diagnostic, ProgramCache, RuleRegistry, SafeCheck, Severity};
 use crate::ir::{CompOrigin, ComponentId};
 pub use blind_spots::BlindSpot;
 pub use palette::Palette;
-pub use report::{CheckReport, ComponentReport, Followed};
+pub use report::{CheckReport, ComponentReport, Followed, Hidden};
 
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_FINDINGS: i32 = 1;
@@ -358,6 +358,7 @@ pub fn run_check(
             errors: 0,
             warnings: 0,
             infos: 0,
+            hidden: Hidden::default(),
             exit_code: EXIT_OK,
             file_table: lowered.file_table,
             blind_spots: blind,
@@ -406,6 +407,28 @@ pub fn run_check(
             "[verbose] cache hits: {}, misses: {}",
             program_result.stats.cache_hits, program_result.stats.cache_misses
         );
+        // Why a hand-over to a package's code is a Warning in this run
+        // ([`crate::engine::Handover`]).
+        let mut paths: Vec<&PathBuf> = program_result.module_table.paths().collect();
+        paths.sort();
+        let install = paths.into_iter().find_map(|p| {
+            let i = program_result
+                .module_table
+                .facts(p)?
+                .member_install
+                .as_ref()?;
+            Some((p, i))
+        });
+        let _ = match install {
+            Some((p, i)) => writeln!(
+                err,
+                "[verbose] package members may be replaced: {}:{} `{}`",
+                display(p),
+                i.line,
+                i.text
+            ),
+            None => writeln!(err, "[verbose] package members intact"),
+        };
     }
 
     // ── Rules + filtering ─────────────────────────────────────────────────────
@@ -425,6 +448,8 @@ pub fn run_check(
     // to a file they did not name is the surprise the flag exists to avoid.
     let mut withheld = 0usize;
     let mut withheld_files: std::collections::BTreeSet<String> = Default::default();
+    // The Info rows of the reported components that `--info` would show.
+    let mut hidden_rows: Vec<Diagnostic> = Vec::new();
 
     // One cache for the whole run: rules needing whole-program structure (the
     // churn graph of `infinite-loop`) build it once here instead of once per
@@ -454,10 +479,13 @@ pub fn run_check(
         // shared with every other frontend. Only the `--info` visibility
         // filter is a display concern kept here.
         let findings = registry.check_component(&rule_cache, id);
-        let mut diags: Vec<Diagnostic> = findings.diagnostics;
         let safe_checks: Vec<SafeCheck> = findings.safe_checks;
         let suspended_safe_checks = findings.suspended_safe_checks;
-        diags.retain(|d| d.severity() != Severity::Info || opts.info);
+        // Without `--info` the Info rows are counted, not shown.
+        let (diags, hidden_here): (Vec<Diagnostic>, Vec<Diagnostic>) = findings
+            .diagnostics
+            .into_iter()
+            .partition(|d| d.severity() != Severity::Info || opts.info);
 
         // A component defined outside the named paths exists in this run only
         // to make the named ones analysable. Its findings are real, and saying
@@ -471,6 +499,8 @@ pub fn run_check(
             }
             continue;
         }
+        let hidden_infos = hidden_here.len();
+        hidden_rows.extend(hidden_here);
 
         errors += diags
             .iter()
@@ -496,6 +526,7 @@ pub fn run_check(
             diagnostics: diags,
             safe_checks,
             suspended_safe_checks,
+            hidden_infos,
         });
     }
 
@@ -514,6 +545,7 @@ pub fn run_check(
         errors,
         warnings,
         infos,
+        hidden: locations::hidden(&hidden_rows, opts.per_component),
         exit_code,
         file_table: program_result.file_table,
         blind_spots: blind,

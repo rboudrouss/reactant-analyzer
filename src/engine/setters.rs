@@ -559,6 +559,21 @@ impl<'a> WalkTables<'a> {
         })
     }
 
+    /// The hook at `label` is imported from a specifier the resolver maps to
+    /// no file: a package's (#254), whose arguments are handed to code the
+    /// analysis does not see. A hook defined in the program, or resolved to a
+    /// file by an alias, is not.
+    fn package_hook(&self, label: HookLabel) -> bool {
+        self.hooks.iter().any(|h| {
+            matches!(h, HookEntry::Custom {
+                label: l,
+                import_source: Some(_),
+                resolved_file: None,
+                ..
+            } if *l == label)
+        })
+    }
+
     /// The timing the package-hook table gives argument `i` of the left hook
     /// at `label`, `None` when it gives none.
     fn arg_timing(&self, label: HookLabel, i: usize) -> Option<ArgTiming> {
@@ -1187,6 +1202,10 @@ pub struct SlotWriter {
     pub span: Option<SourceRange>,
     pub region: WriterRegion,
     pub phase: WriterPhase,
+    /// For a `WriterPhase::Unknown` write, who the value was handed to:
+    /// [`Handover::Package`] only where that is provably a package's code;
+    /// `Other` for every other phase.
+    pub handover: Handover,
     /// Whether the write is caller-authored or reached through inlined
     /// wrappers (ADR-027 §4).
     pub via: WriteProvenance,
@@ -1513,7 +1532,7 @@ fn callback_bound_vars(
 fn dedup_source_sites(sites: &mut Vec<WriteSite>) {
     // A site the relation keys by its slot is that slot's, however spelled.
     type Key = (Slot, SourceRange, WalkClass);
-    let key = |site: &WriteSite, span: SourceRange| -> Key { (site.slot, span, site.class) };
+    let key = |site: &WriteSite, span: SourceRange| -> Key { (site.slot, span, site.class.kind()) };
     let mut seen: HashMap<Key, usize> = HashMap::new();
     let mut out: Vec<WriteSite> = Vec::with_capacity(sites.len());
     for site in std::mem::take(sites) {
@@ -1527,6 +1546,7 @@ fn dedup_source_sites(sites: &mut Vec<WriteSite>) {
             Some(&i) => {
                 out[i].repeats = true;
                 out[i].listener &= site.listener;
+                out[i].class = out[i].class.join(site.class);
             }
             None => {
                 seen.insert(k, out.len());
@@ -1588,7 +1608,7 @@ fn class_phase(class: WalkClass, region: WriterRegion) -> WriterPhase {
         WalkClass::Deferred => WriterPhase::Deferred,
         WalkClass::Handler => WriterPhase::Handler,
         WalkClass::Cleanup => WriterPhase::Cleanup,
-        WalkClass::Unknown => WriterPhase::Unknown,
+        WalkClass::Unknown(_) => WriterPhase::Unknown,
     }
 }
 
@@ -1880,6 +1900,10 @@ pub(crate) fn collect_slot_writers(
                 span: site.span,
                 region,
                 phase: class_phase(site.class, region),
+                handover: match site.class {
+                    WalkClass::Unknown(h) => h,
+                    _ => Handover::Other,
+                },
                 updater,
                 same_tick,
                 owner,
@@ -1909,6 +1933,7 @@ pub(crate) fn collect_slot_writers(
                 span: site.span,
                 region,
                 phase: class_phase(site.class, region),
+                handover: Handover::Other,
                 updater: Updater::Unknown,
                 same_tick: false,
                 owner: Some(ComponentId::STORE),
@@ -2199,8 +2224,96 @@ pub(crate) enum WalkClass {
     Handler,
     /// An effect's returned cleanup function.
     Cleanup,
-    /// Nested under an unknown callee — may run in any phase (⊤).
-    Unknown,
+    /// Nested under an unknown callee — may run in any phase (⊤), with who
+    /// that callee is.
+    Unknown(Handover),
+}
+
+impl WalkClass {
+    /// ⊤ handed to code that is not provably a package's.
+    pub(crate) const UNKNOWN: WalkClass = WalkClass::Unknown(Handover::Other);
+
+    /// What a site of this class found in a body run in `mode` takes: a
+    /// synchronous site takes the body's class; ⊤ under ⊤ stays a package's
+    /// only when both are.
+    fn under(self, mode: WalkClass) -> WalkClass {
+        match (self, mode) {
+            (WalkClass::Sync, m) => m,
+            (WalkClass::Unknown(a), WalkClass::Unknown(b)) => WalkClass::Unknown(a.and(b)),
+            (c, _) => c,
+        }
+    }
+
+    /// The class without its provenance: two sites that differ only in it
+    /// are one site, whose provenance is their join.
+    fn kind(self) -> WalkClass {
+        match self {
+            WalkClass::Unknown(_) => WalkClass::UNKNOWN,
+            c => c,
+        }
+    }
+
+    /// The join of two sites of one kind.
+    fn join(self, other: WalkClass) -> WalkClass {
+        match (self, other) {
+            (WalkClass::Unknown(a), WalkClass::Unknown(b)) => WalkClass::Unknown(a.and(b)),
+            (c, _) => c,
+        }
+    }
+}
+
+/// Who a value of unknown timing (`WalkClass::Unknown`, `WriterPhase::Unknown`)
+/// was handed to. `Package` only where the walk proves the receiving code is a
+/// package's, outside the program: it is reached through an import from a
+/// specifier the resolver maps to no file — a JSX element whose name, or whose
+/// member name's root (`<Primitive.Root/>`), is one (#389), a call or `new`
+/// whose callee is one or a chain of static members rooted at one and nothing
+/// else ([`crate::engine::calls::Targets::package`]), the arguments of a hook
+/// the expansion left that is one (#254). That stands on the premise every
+/// registry summary stands on, that a name imported from a package denotes
+/// that package's export, and fails closed on the one violation the program
+/// shows in plain sight: when some write anywhere has a receiver rooted at a
+/// package import ([`crate::engine::ModuleScope::packages_intact`]), no callee
+/// is a package's. That holds for a bare name and a namespace member too,
+/// though ES makes both read-only: module interop (CommonJS output, the
+/// oracle's esbuild) reads every import as a member of the package's mutable
+/// exports object. What the fact does not see — a write through an alias of
+/// the import, through an object package code hands the program, or by
+/// another package — is the standing premise (`docs/limitations.md`).
+/// Every other ⊤ — a builtin the analysis does not model, a receiver handed at
+/// a member read, write or conversion, an unplaced heap object, a past-budget
+/// body, a generator, a child it does not resolve, a callee that is a
+/// parameter, a value or a computed member — is `Other`, and so is every
+/// producer that does not say: program code the analysis did not follow, a
+/// possible defect (Warning), where package code is a limit of the analysis
+/// (Info). Joined as "a package's only if every way there is"
+/// ([`Handover::and`]): the default fails closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub enum Handover {
+    /// Code of a package, which the analysis does not see.
+    Package,
+    /// Anything else.
+    #[default]
+    Other,
+}
+
+impl Handover {
+    /// A package's only when both are.
+    pub fn and(self, other: Handover) -> Handover {
+        match (self, other) {
+            (Handover::Package, Handover::Package) => Handover::Package,
+            _ => Handover::Other,
+        }
+    }
+
+    /// `Package` when `package` holds.
+    pub fn package_if(package: bool) -> Handover {
+        if package {
+            Handover::Package
+        } else {
+            Handover::Other
+        }
+    }
 }
 
 /// One row per *call site*, in walk order.
@@ -2264,23 +2377,21 @@ impl Found {
             let sync = site.class == WalkClass::Sync;
             let every_call = site.at.is_some_and(|(b, _)| facts.on_all(body, b));
             self.setters.push(FoundSite {
-                class: if sync { mode } else { site.class },
+                class: site.class.under(mode),
                 at: if sync && every_call { at } else { None },
                 prov_block: prov,
                 ..site
             });
         }
         for call in inner.calls {
-            let sync = call.class == WalkClass::Sync;
             self.calls.push(FoundCall {
-                class: if sync { mode } else { call.class },
+                class: call.class.under(mode),
                 ..call
             });
         }
         for read in inner.reads {
-            let sync = read.class == WalkClass::Sync;
             self.reads.push(FoundRead {
-                class: if sync { mode } else { read.class },
+                class: read.class.under(mode),
                 ..read
             });
         }
@@ -2288,7 +2399,7 @@ impl Found {
             let sync = store.class == WalkClass::Sync;
             let every_call = store.at.is_some_and(|(b, _)| facts.on_all(body, b));
             self.stores.push(StoreSite {
-                class: if sync { mode } else { store.class },
+                class: store.class.under(mode),
                 at: if sync && every_call { at } else { None },
                 prov_block: prov,
                 ..store
@@ -2587,7 +2698,7 @@ impl<'a> SetterWalk<'a> {
     ///
     /// A bare-global registrar is fail-closed: any local binding of the name
     /// anywhere disables its summary (`shadowed`).
-    fn arg_class(&self, fn_: &Expr, mode: WalkClass) -> WalkClass {
+    fn arg_class(&self, id: crate::ir::types::ExprId, fn_: &Expr, mode: WalkClass) -> WalkClass {
         use crate::engine::registrations::Timing;
         if let Some((reg, _)) = crate::engine::registrations::match_registrar(fn_) {
             let shadowed = !reg.method_only
@@ -2596,7 +2707,7 @@ impl<'a> SetterWalk<'a> {
                 return match reg.timing.in_program(self.dispatches) {
                     Timing::Deferred => WalkClass::Deferred,
                     Timing::Handler => WalkClass::Handler,
-                    Timing::Unknown => WalkClass::Unknown,
+                    Timing::Unknown => WalkClass::UNKNOWN,
                 };
             }
         }
@@ -2610,8 +2721,21 @@ impl<'a> SetterWalk<'a> {
         }
         match fn_ {
             Expr::FieldAccess { field, .. } if SYNC_HOF_METHODS.contains(&field.as_str()) => mode,
-            _ => WalkClass::Unknown,
+            _ => WalkClass::Unknown(self.callee(id)),
         }
+    }
+
+    /// Who call `id` hands its arguments to: a package's code only when its
+    /// callee is nothing but a package import read free, or a member chain
+    /// rooted at one, at every evaluation
+    /// ([`crate::engine::calls::Targets::package`]); a callee that may also
+    /// be a program body or a setter, or module code, is the program's.
+    fn callee(&self, id: crate::ir::types::ExprId) -> Handover {
+        self.calls.targets(id).map_or(Handover::Other, |row| {
+            Handover::package_if(
+                row.package() && row.bodies.is_empty() && row.setters.is_empty() && !row.module,
+            )
+        })
     }
 
     /// `mode == Sync` → block IDs recorded are from the caller's CFG,
@@ -2955,7 +3079,7 @@ impl<'a> SetterWalk<'a> {
                 self.relation_handed(
                     Some((*id, 0)),
                     expr,
-                    WalkClass::Unknown,
+                    WalkClass::UNKNOWN,
                     None,
                     depth,
                     found,
@@ -2970,7 +3094,7 @@ impl<'a> SetterWalk<'a> {
             self.relation_handed(
                 Some((*id, 0)),
                 expr,
-                WalkClass::Unknown,
+                WalkClass::UNKNOWN,
                 None,
                 depth,
                 found,
@@ -3048,7 +3172,7 @@ impl<'a> SetterWalk<'a> {
                 self.relation_handed(
                     Some((*id, crate::engine::calls::CALLEE)),
                     expr,
-                    WalkClass::Unknown,
+                    WalkClass::Unknown(self.callee(*id)),
                     None,
                     depth,
                     found,
@@ -3085,13 +3209,22 @@ impl<'a> SetterWalk<'a> {
                     continue;
                 }
                 if let Some((_, timing)) = member.filter(|(at, _)| *at == i) {
-                    self.relation_timed((*id, i), arg, Some(timing), depth, found, prov, stmt_span);
+                    self.relation_timed(
+                        (*id, i),
+                        arg,
+                        Some(timing),
+                        Handover::Other,
+                        depth,
+                        found,
+                        prov,
+                        stmt_span,
+                    );
                     continue;
                 }
                 let class = if listener && i == 1 {
                     self.listener_class()
                 } else {
-                    self.arg_class(fn_, mode)
+                    self.arg_class(*id, fn_, mode)
                 };
                 // A callback a sync HOF runs executes once per element: its
                 // writes co-execute with themselves in a single tick, with no
@@ -3159,10 +3292,14 @@ impl<'a> SetterWalk<'a> {
         // A package hook the timing table knows runs it at that time instead.
         if let Expr::HookMarker(label, _) = expr {
             let tables = self.tables;
+            let site = tables.component.hook_site(*label);
+            let handover = Handover::package_if(
+                tables.package_hook(*label) && self.calls.left_hook_intact(site),
+            );
             for (i, arg) in tables.left_args(*label).iter().enumerate() {
                 let timing = tables.arg_timing(*label, i);
                 let anchor = (tables.component.hook_site(*label), i);
-                self.relation_timed(anchor, arg, timing, depth, found, prov, stmt_span);
+                self.relation_timed(anchor, arg, timing, handover, depth, found, prov, stmt_span);
             }
         }
         // A JSX prop React or the child may invoke runs as a listener, the
@@ -3178,7 +3315,9 @@ impl<'a> SetterWalk<'a> {
             let native = matches!(expr, Expr::NativeElem { .. });
             let unseen = !native && self.calls.unseen_element(*id);
             let class = match unseen {
-                true => WalkClass::Unknown,
+                true => {
+                    WalkClass::Unknown(Handover::package_if(self.calls.unseen_package_element(*id)))
+                }
                 false => self.listener_class(),
             };
             for (i, (name, val)) in fields.iter().enumerate() {
@@ -3223,7 +3362,7 @@ impl<'a> SetterWalk<'a> {
                     self.relation_handed(
                         Some((*id, i)),
                         val,
-                        WalkClass::Unknown,
+                        WalkClass::UNKNOWN,
                         None,
                         depth,
                         found,
@@ -3248,6 +3387,12 @@ impl<'a> SetterWalk<'a> {
         prov: Option<BlockId>,
         stmt_span: Option<SourceRange>,
     ) {
+        // A body past the budget is program code the walk did not follow,
+        // whoever runs it: never a package's.
+        let class = match class {
+            WalkClass::Unknown(_) => WalkClass::UNKNOWN,
+            c => c,
+        };
         let slots = self.calls.writes_of(site, &mut self.summaries.borrow_mut());
         for slot in slots {
             found.setters.push(FoundSite {
@@ -3405,7 +3550,7 @@ impl<'a> SetterWalk<'a> {
                 handed,
                 false,
                 via,
-                WalkClass::Unknown,
+                WalkClass::UNKNOWN,
                 None,
                 0,
                 found,
@@ -3476,6 +3621,11 @@ impl<'a> SetterWalk<'a> {
         prov: Option<BlockId>,
         stmt_span: Option<SourceRange>,
     ) {
+        // Module code calls what the module scope holds: the program's.
+        let class = match class {
+            WalkClass::Unknown(_) => WalkClass::UNKNOWN,
+            c => c,
+        };
         let anchors: Vec<crate::ir::types::ExprId> = self.calls.module_anchors().collect();
         for anchor in anchors {
             self.relation_handed(
@@ -3541,7 +3691,12 @@ impl<'a> SetterWalk<'a> {
     ) {
         let calls = self.calls;
         let held_class = match arg.peel_ts() {
-            Expr::ObjectLit { .. } | Expr::ArrayLit { .. } | Expr::Spread(_) => WalkClass::Unknown,
+            // What a literal holds is the code's to call: a package's only
+            // when the literal is handed to one.
+            Expr::ObjectLit { .. } | Expr::ArrayLit { .. } | Expr::Spread(_) => match class {
+                WalkClass::Unknown(h) => WalkClass::Unknown(h),
+                _ => WalkClass::UNKNOWN,
+            },
             _ => class,
         };
         if row.module && !module {
@@ -3629,22 +3784,25 @@ impl<'a> SetterWalk<'a> {
 
     /// [`Self::relation_handed`] for an argument the timing table times
     /// `timing` (⊤ when `None`): an options literal's own function members
-    /// each at the time the table gives it, everything else it reaches ⊤.
+    /// each at the time the table gives it, everything else it reaches ⊤,
+    /// handed to `handover`.
     #[allow(clippy::too_many_arguments)]
     fn relation_timed(
         &mut self,
         anchor: (crate::ir::types::ExprId, usize),
         arg: &'a Expr,
         timing: Option<ArgTiming>,
+        handover: Handover,
         depth: usize,
         found: &mut Found,
         prov: Option<BlockId>,
         stmt_span: Option<SourceRange>,
     ) {
+        let unknown = WalkClass::Unknown(handover);
         let (Some(t @ ArgTiming::Members(_)), Expr::ObjectLit { fields, .. }) =
             (timing, arg.peel_ts())
         else {
-            let class = self.timing_class(timing);
+            let class = self.timing_class(timing, handover);
             self.relation_handed(
                 Some(anchor),
                 arg,
@@ -3672,7 +3830,7 @@ impl<'a> SetterWalk<'a> {
                 && depth > 0
             {
                 timed.insert(*id);
-                let class = self.timing_class(t.member(name));
+                let class = self.timing_class(t.member(name), handover);
                 let mut inner = Found::default();
                 self.enter(
                     body_cfg,
@@ -3696,7 +3854,7 @@ impl<'a> SetterWalk<'a> {
                 sure: false,
                 listener: self.listening,
                 accessor: self.accessor.clone(),
-                class: WalkClass::Unknown,
+                class: unknown,
                 span: stmt_span,
                 at: None,
                 own: None,
@@ -3714,7 +3872,7 @@ impl<'a> SetterWalk<'a> {
                 continue;
             };
             if depth == 0 {
-                self.past_budget(site, WalkClass::Unknown, found, prov, stmt_span);
+                self.past_budget(site, unknown, found, prov, stmt_span);
                 continue;
             }
             let reached = match self.of_other_component(site) {
@@ -3728,22 +3886,22 @@ impl<'a> SetterWalk<'a> {
                 reached,
                 depth - 1,
                 &mut inner,
-                WalkClass::Unknown,
+                unknown,
                 prov,
                 stmt_span,
             );
-            found.absorb(inner, body, WalkClass::Unknown, None, prov, self.facts);
+            found.absorb(inner, body, unknown, None, prov, self.facts);
         }
     }
 
     /// The class a package hook's argument timed `timing` runs in
     /// ([`crate::engine::timing`]); ⊤ for an untimed one, and for an options
-    /// object handed whole.
-    fn timing_class(&self, timing: Option<ArgTiming>) -> WalkClass {
+    /// object handed whole, handed to `handover`.
+    fn timing_class(&self, timing: Option<ArgTiming>, handover: Handover) -> WalkClass {
         match timing {
             Some(ArgTiming::Deferred) => WalkClass::Deferred,
             Some(ArgTiming::Listener) => self.listener_class(),
-            Some(ArgTiming::Members(_)) | None => WalkClass::Unknown,
+            Some(ArgTiming::Members(_)) | None => WalkClass::Unknown(handover),
         }
     }
 
@@ -3764,7 +3922,7 @@ impl<'a> SetterWalk<'a> {
     /// ([`Timing::in_program`](crate::engine::registrations::Timing::in_program), #219).
     fn listener_class(&self) -> WalkClass {
         if self.dispatches {
-            WalkClass::Unknown
+            WalkClass::UNKNOWN
         } else {
             WalkClass::Handler
         }

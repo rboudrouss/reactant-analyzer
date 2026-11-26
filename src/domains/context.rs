@@ -88,6 +88,21 @@ pub trait QueryContext {
         &[]
     }
 
+    /// The name `name`, read free in this component's bodies, is a package
+    /// import ([`crate::engine::ModuleScope::packages`]). `false` unless the
+    /// context knows.
+    fn package_import(&self, _name: &str) -> bool {
+        false
+    }
+
+    /// No write of the program has a receiver rooted at a package import
+    /// ([`crate::engine::ModuleScope::packages_intact`]): what a package
+    /// import reads is that package's code. `false` unless the context
+    /// knows.
+    fn packages_intact(&self) -> bool {
+        false
+    }
+
     /// The function the value of the hook `label` the fixpoint did not
     /// inline calls, when it hands back one that runs its argument: React's
     /// `useEffectEvent` (#320). A call through the value runs that function.
@@ -560,6 +575,10 @@ pub struct FixpointCtx<'a> {
         &'a std::collections::HashMap<crate::ir::types::HookLabel, Vec<crate::ir::expr::Expr>>,
     /// See `QueryContext::module_binding`.
     pub module: &'a std::collections::HashMap<crate::ir::types::Var, Vec<crate::ir::types::ExprId>>,
+    /// See `QueryContext::package_import`.
+    pub packages: &'a std::collections::HashSet<crate::ir::types::Var>,
+    /// See `QueryContext::packages_intact`.
+    pub packages_intact: bool,
     /// See `QueryContext::resolves_children`.
     pub resolves_children: bool,
 }
@@ -600,6 +619,14 @@ impl QueryContext for FixpointCtx<'_> {
 
     fn module_binding(&self, name: &str) -> &[crate::ir::types::ExprId] {
         self.module.get(name).map_or(&[], Vec::as_slice)
+    }
+
+    fn package_import(&self, name: &str) -> bool {
+        self.packages.contains(name)
+    }
+
+    fn packages_intact(&self) -> bool {
+        self.packages_intact
     }
 
     fn resolves_children(&self) -> bool {

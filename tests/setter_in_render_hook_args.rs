@@ -207,6 +207,18 @@ export function LeftHookNoClosure() {
 
 /// Does the writer relation hold a write through `setA` of unknown timing
 /// in the render region?
+/// The level of a hand-over in these sources. A left hook carries its import
+/// on its entry: `useExternal` is a package's, its hand-over an Info. A call
+/// of `runIt` is a package's only where the run knows the file's imports
+/// (the module table of a CLI run); these tests lower one source with none,
+/// so the walk cannot prove it and the row fails closed to a Warning.
+fn handed_level(component: &str) -> Severity {
+    match component.starts_with("LeftHook") {
+        true => Severity::Info,
+        false => Severity::Warning,
+    }
+}
+
 fn unknown_render_write(c: &AnalysisResult<StateValue>) -> bool {
     c.slot_writers.iter().any(|w| {
         w.region == WriterRegion::Render
@@ -233,7 +245,7 @@ fn a_closure_handed_to_a_left_hook_or_an_unknown_callee_may_write_in_render() {
         );
         assert_eq!(
             setter_in_render(&r, name),
-            vec![Severity::Warning],
+            vec![handed_level(name)],
             "{name}: a possible render write, never a certain one"
         );
     }
@@ -297,7 +309,7 @@ fn a_closure_inside_an_argument_object_or_array_may_write_in_render() {
         );
         assert_eq!(
             setter_in_render(&r, name),
-            vec![Severity::Warning],
+            vec![handed_level(name)],
             "{name}: a possible render write, never a certain one"
         );
     }

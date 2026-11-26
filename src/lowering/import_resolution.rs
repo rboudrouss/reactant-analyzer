@@ -269,5 +269,26 @@ pub fn build_jsx_origins(
         };
         map.insert(local, Arc::new(origin));
     }
+    // A namespace imported from unseen code names no component itself, but
+    // the root of member elements that are that code's (`<Primitive.Root/>`,
+    // #394). A namespace of the program's is left out: its members resolve
+    // by name, as before.
+    for stmt in &program.body {
+        let Statement::ImportDeclaration(decl) = stmt else {
+            continue;
+        };
+        let Some(specifiers) = &decl.specifiers else {
+            continue;
+        };
+        for spec in specifiers {
+            if let ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) = spec
+                && resolver
+                    .resolve(current_file, decl.source.value.as_str())
+                    .is_none()
+            {
+                map.insert(s.local.name.to_string(), Arc::new(ElementOrigin::Unseen));
+            }
+        }
+    }
     JsxOrigins(Arc::new(map))
 }

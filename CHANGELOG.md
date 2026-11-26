@@ -69,6 +69,11 @@ on a program React settles; 323 oracle cases, none a known false negative.
   files a possible call; the declared files are still analysed and reported, and their own reads still
   see every accessor of the program. The output states the globs (`N assumptions in force: …`, and
   `assumption_values` in the JSON, present only when a valued assumption is).
+- The default output says what `--info` would add: the human summary ends with "N setter(s) handed
+  to package code the analysis does not see (M site(s)) and K other info finding(s) are not shown,
+  rerun with --info to list them", and the JSON `summary` gains `hidden_infos`, the number of Info
+  rows left out (0 under `--info`), and `hidden_hand_overs` / `hidden_hand_over_setters`, the
+  hand-over rows among them and their setters (#394).
 
 ### Changed
 
@@ -193,6 +198,44 @@ on a program React settles; 323 oracle cases, none a known false negative.
   repos and mantine 3,177 → 2,792 rows (mantine 2,002 → 1,712); on the whole
   corpus, measured on CI, 9,446 → 6,832 (twenty 3,826 → 2,290,
   dub 2,443 → 1,750) (#377).
+- A setter (or a closure that reaches one) handed to a package's code — a
+  component whose name the file imports from a specifier the resolver maps to
+  no file, or a member element of an import so (`<AlertDialogPrimitive.Root>`),
+  a call of such an import or of a chain of static members rooted at one
+  (`runNow(cb)`, `kit.run(cb)`), the arguments of a hook imported so the
+  expansion left, in a program none of whose writes has a receiver rooted at a
+  package import (`ext.hook = f` replaces what an import reads; `--verbose`
+  names the first such write; a write through an alias of the import is not
+  seen, the premise the registry stands on too, #400) — is an **Info** of
+  `setter-in-render` /
+  `cross-setter-in-render`, "handed to package code the analysis does not see",
+  shown with `--info` or `"info": true`, where it was a Warning (**breaking**:
+  these rows no longer appear by default, and `--fail-on warning` no longer
+  fails on them, since no Info sets the exit code). Every other hand-over — a
+  builtin the analysis does not model, a receiver handed at a member access,
+  an unplaced heap object, a cutoff, a generator, a child it does not resolve,
+  a callee that is a parameter, a prop or any other value — stays a Warning:
+  that is program code the analysis did not follow. A loop proven through any
+  such callee stays `infinite-loop`'s Warning. 11 small repos and mantine:
+  rows shown by default 2,792 → 2,615: 177 of the 1,808 hand-over rows become
+  Info (memos 105, next-shadcn 18, ai-chatbot 17, shadcn-admin 16, …); in
+  chakra-ui a codemod script writes into an import of Node's `events`
+  (`EventEmitter.defaultMaxListeners = 0`), so none does there; every other
+  row is unchanged. Oracle: 21 cases and 28 of 14,000 fuzz programs React
+  loops on are now reported only by this Info (`disclosed`), all through a
+  package's callee but one, `handover-alias-member-replaced-loops`, the
+  documented alias shape; 4 cases and 12 fuzz programs that settle lose a
+  false positive (#394).
+- A run that shows no Error nor Warning but met a limit of the analysis — an
+  Info row, hidden without `--info` or listed with it — no longer ends with
+  "✓ no issues found": it says "no errors or warnings, but the analysis is not
+  exhaustive: it met N limit(s), …" and how to list them; a component shown
+  by `--show-clean` with hidden Info rows says so instead of its tick, and so
+  does the GitHub action's job summary (#394).
+- The count of components hidden for showing nothing no longer calls clean a
+  component whose only rows are hidden Infos: "N component(s) with no error or
+  warning hidden, M of which met a limit of the analysis; rerun with
+  --show-clean" (#394).
 
 ### Removed
 

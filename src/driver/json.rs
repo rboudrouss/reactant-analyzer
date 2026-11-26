@@ -166,6 +166,15 @@ struct JsonSummary {
     errors: usize,
     warnings: usize,
     infos: usize,
+    /// The Info rows the run computed and `diagnostics` leaves out because
+    /// `--info` was not given, counted as `infos` would count them; 0 under
+    /// `--info`, where they are in `diagnostics`.
+    hidden_infos: usize,
+    /// Of `hidden_infos`, the hand-over rows of `setter-in-render` /
+    /// `cross-setter-in-render` (one per site that hands setters to package
+    /// code the analysis does not see), and the setters they list.
+    hidden_hand_overs: usize,
+    hidden_hand_over_setters: usize,
     components_analyzed: usize,
     exit_code: i32,
 }
@@ -367,6 +376,9 @@ pub fn render(
             errors: locations.errors,
             warnings: locations.warnings,
             infos: locations.infos,
+            hidden_infos: report.hidden.infos,
+            hidden_hand_overs: report.hidden.hand_overs,
+            hidden_hand_over_setters: report.hidden.setters,
             components_analyzed: report.components.len(),
             exit_code: report.exit_code,
         },

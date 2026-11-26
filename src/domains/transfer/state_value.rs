@@ -509,10 +509,13 @@ pub(crate) fn returns_no_input(
 /// analyse it, rather than this pass alone — marks the element so: that code
 /// may call what a prop reaches at any time, a render included, so the writer
 /// walk reads the position as an unseen callee's argument, never as an event
-/// handler (#325).
+/// handler (#325). `package`: the element's name is imported from a
+/// specifier the resolver maps to no file (#389), so the child is a
+/// package's code, not the program's ([`crate::engine::Handover`]).
 fn havoc_setter_props(
     props_expr: &Expr,
     unseen: bool,
+    package: bool,
     env: &AbstractEnv<StateValue>,
     ctx: &mut AnalysisCtx<StateValue>,
 ) {
@@ -520,7 +523,7 @@ fn havoc_setter_props(
         return;
     };
     if unseen {
-        ctx.record(|r| r.mark_unseen_element(*id));
+        ctx.record(|r| r.mark_unseen_element(*id, package));
     }
     let mut setters: Vec<(ComponentId, crate::ir::types::HookLabel)> = Vec::new();
     for (i, (_, v)) in fields.iter().enumerate() {
@@ -663,6 +666,11 @@ fn eval_comp_app(
     env: &AbstractEnv<StateValue>,
     ctx: &mut AnalysisCtx<StateValue>,
 ) {
+    // The child is a package's by its import (#389): a name the file imports
+    // from no file, whatever the rest of the run resolves — unless a write of
+    // the program has a receiver rooted at a package import
+    // ([`crate::engine::Handover`]).
+    let package = matches!(origin, Some(ElementOrigin::Unseen)) && ctx.query.packages_intact();
     let Some(inter) = ctx.inter else {
         // Intra-component analysis: every child is unanalyzable, so any
         // setter escaping into props may be invoked with any argument —
@@ -670,7 +678,7 @@ fn eval_comp_app(
         // pass that only skips the children the program analyses (the
         // post-render pass) leaves them seen.
         let unseen = !ctx.query.resolves_children();
-        havoc_setter_props(props_expr, unseen, env, ctx);
+        havoc_setter_props(props_expr, unseen, package, env, ctx);
         return;
     };
     // What this element hands its child, and what the child writes back
@@ -709,7 +717,7 @@ fn eval_comp_app(
                 };
                 refs.insert((inter.component, name.clone()));
             }
-            havoc_setter_props(props_expr, true, env, ctx);
+            havoc_setter_props(props_expr, true, package, env, ctx);
             return;
         }
     };
@@ -726,14 +734,14 @@ fn eval_comp_app(
                 .recursive_component_refs
                 .insert((inter.component, child));
         }
-        havoc_setter_props(props_expr, true, env, ctx);
+        havoc_setter_props(props_expr, true, false, env, ctx);
         return;
     }
     // Unreachable — `resolve_child` just resolved it — but an unknown child may
     // invoke any setter it received, so the fallback is the unknown-child one,
     // never a silent skip.
     let Some(child_ir) = inter.registry.ir_of(child).cloned() else {
-        havoc_setter_props(props_expr, true, env, ctx);
+        havoc_setter_props(props_expr, true, false, env, ctx);
         return;
     };
 
