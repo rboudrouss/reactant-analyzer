@@ -105,6 +105,54 @@ struct JsonDiagnostic<'a> {
     /// the `setters`. Absent on every other row.
     #[serde(skip_serializing_if = "Option::is_none")]
     dispatch: Option<&'a str>,
+    /// The cycles a loop row stands for, every one, where the message names
+    /// the first few. Absent on every other row.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    cycles: Vec<JsonCycle<'a>>,
+}
+
+/// One cycle of a loop row.
+#[derive(Serialize)]
+struct JsonCycle<'a> {
+    /// The component it is reported in.
+    component: &'a str,
+    /// The cycle as the message names it, from that component.
+    path: &'a str,
+    steps: Vec<JsonCycleStep<'a>>,
+}
+
+/// One step of a cycle: a write a component's effect (or render) makes,
+/// which a change of `from` re-runs.
+#[derive(Serialize)]
+struct JsonCycleStep<'a> {
+    /// The component whose effect or render makes the write.
+    component: &'a str,
+    from: JsonSlot<'a>,
+    /// The state it writes.
+    state: JsonSlot<'a>,
+    /// Where it writes it.
+    file: Option<String>,
+    line: Option<u32>,
+    col: Option<u32>,
+    /// dep | versioned | props | every-render | read | mount | render
+    reruns: &'static str,
+    /// Why the analysis could not prove the step; null for a proven one.
+    unproven: Option<JsonUnproven<'a>>,
+}
+
+#[derive(Serialize)]
+struct JsonSlot<'a> {
+    /// The component owning the state; null for a library store.
+    component: Option<&'a str>,
+    state: &'a str,
+}
+
+#[derive(Serialize)]
+struct JsonUnproven<'a> {
+    /// store | listener | handed-to-package | handed | later | unmounted |
+    /// moved | fresh | value | versioned | props | every-render | read | mount
+    kind: &'static str,
+    why: &'a str,
 }
 
 /// One setter of a hand-over row (#377).
@@ -305,6 +353,37 @@ fn to_json_diag<'a>(
             })
             .collect(),
         dispatch: d.dispatch.as_ref().map(|r| r.call.as_str()),
+        cycles: d
+            .cycles
+            .iter()
+            .map(|c| JsonCycle {
+                component: &c.component,
+                path: &c.path,
+                steps: c
+                    .steps
+                    .iter()
+                    .map(|s| JsonCycleStep {
+                        component: &s.carrier,
+                        from: JsonSlot {
+                            component: s.from.component.as_deref(),
+                            state: &s.from.state,
+                        },
+                        state: JsonSlot {
+                            component: s.to.component.as_deref(),
+                            state: &s.to.state,
+                        },
+                        file: s.site.and_then(|r| files.path(r.file)).map(display),
+                        line: s.site.map(|r| r.line),
+                        col: s.site.map(|r| r.col),
+                        reruns: s.reruns,
+                        unproven: s
+                            .unproven
+                            .as_ref()
+                            .map(|(kind, why)| JsonUnproven { kind, why }),
+                    })
+                    .collect(),
+            })
+            .collect(),
     }
 }
 

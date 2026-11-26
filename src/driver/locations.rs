@@ -26,21 +26,26 @@ use super::report::{ComponentReport, Hidden};
 /// uses, plus the rule. The message is part of it, so two findings that say
 /// different things on one line stay two rows, and so are the setters a
 /// hand-over row stands for (#377), which its message counts past the first
-/// few. The level is not: the group is shown at its strongest row. `None`
+/// few; a loop row's family stands in for its message ([`key`]). The level
+/// is not: the group is shown at its strongest row. `None`
 /// for the position when the diagnostic carries no range: a row whose
 /// location is unknown is never claimed to be the same as another's.
 type Key<'a> = (
     &'a str,
     Option<(FileId, u32, u32)>,
-    &'a str,
+    Result<&'static str, &'a str>,
     &'a [crate::rules::SetterRef],
 );
 
+/// A loop row of a family is keyed by it instead of its message: the rows of
+/// one family at one site are the cycles through one effect, whichever
+/// component closes each, and their group is printed as one row listing them
+/// all ([`crate::rules::merge_cycles`]); each cycle names its component.
 fn key(d: &Diagnostic) -> Key<'_> {
     (
         d.rule.as_ref(),
         d.range.map(|r| (r.file, r.line, r.col)),
-        d.message.as_str(),
+        d.family.ok_or(d.message.as_str()),
         &d.setters,
     )
 }
@@ -73,6 +78,9 @@ struct Group {
     /// so a group never shows a weaker level than one of its rows — an Error
     /// keeps its own proof and witness, it is not a Warning promoted.
     rep: (usize, usize),
+    /// A family's group of several rows, printed as one standing for every
+    /// cycle of them ([`crate::rules::merge_cycles`]).
+    merged: Option<Diagnostic>,
 }
 
 /// Which components share each finding, and where each row should render.
@@ -121,9 +129,21 @@ impl LocationIndex {
                         groups.push(Group {
                             rows: vec![(ci, di)],
                             rep: (ci, di),
+                            merged: None,
                         });
                     }
                 }
+            }
+        }
+        for group in &mut groups {
+            let (rc, rd) = group.rep;
+            if group.rows.len() > 1 && components[rc].diagnostics[rd].family.is_some() {
+                // The printed member first: the merge keeps the first of the
+                // strongest level, which the representative is.
+                let rows = std::iter::once(group.rep)
+                    .chain(group.rows.iter().copied().filter(|r| *r != group.rep))
+                    .map(|(c, d)| &components[c].diagnostics[d]);
+                group.merged = crate::rules::merge_cycles(rows);
             }
         }
 
@@ -157,6 +177,12 @@ impl LocationIndex {
         })
     }
 
+    /// What the row at `(component, diagnostic)` prints, when it is not its
+    /// own diagnostic: the merge of a family's group it is printed as.
+    pub fn merged(&self, component: usize, diagnostic: usize) -> Option<&Diagnostic> {
+        self.roles[component][diagnostic].and_then(|g| self.groups[g].merged.as_ref())
+    }
+
     /// True when every visible diagnostic of this component is printed as
     /// another component's row.
     pub fn all_repeats(&self, component: usize) -> bool {
@@ -174,7 +200,10 @@ impl LocationIndex {
             comp.diagnostics
                 .iter()
                 .enumerate()
-                .filter_map(move |(di, d)| Some((d, ci, self.consumers(ci, di)?)))
+                .filter_map(move |(di, d)| {
+                    let d = self.merged(ci, di).unwrap_or(d);
+                    Some((d, ci, self.consumers(ci, di)?))
+                })
         })
     }
 }

@@ -324,6 +324,7 @@ impl RuleRegistry {
                 &a.var,
                 a.hook_label,
                 &a.setters,
+                &a.cycles,
             )
                 .cmp(&(
                     &b.rule,
@@ -333,6 +334,7 @@ impl RuleRegistry {
                     &b.var,
                     b.hook_label,
                     &b.setters,
+                    &b.cycles,
                 ))
         });
         safe_checks.sort_by(|a, b| a.rule.cmp(b.rule));

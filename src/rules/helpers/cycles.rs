@@ -61,6 +61,32 @@ pub(in crate::rules) fn node_display(
     }
 }
 
+/// A slot node as a loop row's `cycles` names it: its owner's display name
+/// (`None` for the store) and its name as [`node_display`] prints it,
+/// unquoted.
+pub(in crate::rules) fn slot_ref(
+    node: &QualifiedSlot,
+    result: &ProgramAnalysisResult,
+    names: &mut NodeNames,
+) -> crate::rules::SlotRef {
+    if *node == crate::engine::STORE_SLOT {
+        return crate::rules::SlotRef {
+            component: None,
+            state: "a library store".to_string(),
+        };
+    }
+    let name = node_display(node, node.0, result, names);
+    let state = name
+        .strip_prefix('`')
+        .and_then(|n| n.strip_suffix('`'))
+        .unwrap_or(&name)
+        .to_string();
+    crate::rules::SlotRef {
+        component: Some(result.display_name(node.0)),
+        state,
+    }
+}
+
 /// The cycle as `a → b → a`: every edge's source, then back to the first.
 pub(in crate::rules) fn cycle_path(
     edges: &[ChurnEdge],
@@ -177,6 +203,10 @@ mod row_tests {
             always: None,
             self_slot: false,
             stepping: false,
+            why: crate::engine::EdgeWhy {
+                reruns: crate::engine::Trigger::Dep,
+                write: Some(crate::engine::Obstacle::Value),
+            },
         }
     }
 

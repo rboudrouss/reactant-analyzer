@@ -23,7 +23,10 @@ pub mod impls;
 pub mod registry;
 
 pub use api::cache::ProgramCache;
-pub use api::diagnostic::{Diagnostic, DispatchRef, SetterRef, Severity};
+pub use api::diagnostic::{
+    CycleRef, CycleStep, Diagnostic, DispatchRef, SetterRef, Severity, SlotRef, cycles_message,
+    merge_cycles,
+};
 pub use api::query::{
     Certified, CleanupVerdict, ConditionalHookCall, DominatesAllExits, EffectCycleProof,
     ExitDominance, InitSetterCall, May, Motion, MovingFeeder, MustResult, OnAllPaths, OptionKind,

@@ -62,9 +62,12 @@ for (const d of report.diagnostics ?? []) {
     `${s.name == null ? "a state setter" : `\`${s.name}\``}` +
     `${s.parent == null ? "" : ` of \`${s.parent}\``}${s.through == null ? "" : ` through \`${s.through}\``}`;
   const setters = d.setters ?? [];
+  // A loop row names its first cycles and counts the rest; the annotation lists them all.
+  const cycles = d.cycles ?? [];
   const msg = [
     `[${who}] ${d.message}`,
     ...(setters.length > 3 ? [`setters: ${setters.map(setter).join(", ")}`] : []),
+    ...(cycles.length > 1 ? cycles.map((c) => `cycle in ${c.component}: ${c.path}`) : []),
     ...(d.notes ?? []).map((n) => `→ ${n.message}`),
   ].join("\n");
   console.log(`::${level[d.severity] ?? "notice"} ${props.join(",")}::${escData(msg)}`);

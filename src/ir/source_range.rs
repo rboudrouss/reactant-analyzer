@@ -50,7 +50,7 @@ impl FileTable {
 }
 
 /// A `(file, line, col)` source position. `line` is 1-indexed, `col` 0-indexed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SourceRange {
     pub file: FileId,
     pub line: u32,

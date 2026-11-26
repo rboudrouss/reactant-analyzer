@@ -278,6 +278,22 @@ on a program React settles; 323 oracle cases, none a known false negative.
   said "Parent re-renders → child re-renders → effect fires again: infinite
   loop", a re-fire it did not prove and that is false where the deps are the
   child's own state (dub's `Combobox`). Same rows, same level (#421).
+- **Breaking** for a reader that took one cycle per row: the churn graph's
+  Warning rows of `infinite-loop` and `cross-component-infinite-loop` are one
+  row per rule, message family and effect site, within a component and across
+  the components it is reported through, standing for every cycle in a new
+  JSON `cycles` field: each cycle's component, path and steps (who writes
+  which state where, how a change re-runs it, and the step the analysis could
+  not prove and why, read off the engine's own reason for the edge). The
+  message words the first cycle, says its unproven step ("Not proven: the
+  write of `x` at `f.tsx:12` is handed to package code …"), names the next two
+  and counts the rest; `--trace` and the GitHub action list them all. An
+  effect that calls several parents' setters is one row listing them in
+  `setters`. An Error keeps one row per proof, and `--per-component` each
+  component's own cycles. The same claims (the set of rule, level, site,
+  component and cycle is equal before and after on the 11 small repos and
+  mantine): shown rows 2,779 → 2,755 (mantine 1,897 → 1,881, excalidraw
+  145 → 141, memos 183 → 179) (#421).
 
 ### Removed
 

@@ -957,7 +957,8 @@ finding 87 times. Across the corpus, 6,322 produced findings resolve to 1,170
 distinct source locations, and the effect is worst on the codebases that factor
 their hooks best.
 
-Both reports group by `(rule, file, line, col, message)`. Each location is one
+Both reports group by `(rule, file, line, col, message)`, a loop row by its family in place of
+its message (below). Each location is one
 row naming the components it is reported through (`` [reported through `<A>`
 and `<B>`] ``, `[reported through 87 components]` past three, listed under
 `--trace`), at the strongest level any of them reports it. The human report
@@ -967,6 +968,18 @@ them in `components` (schema v3). `--per-component` restores one row per
 component, and `--fail-on` reads the per-component findings, so nothing about
 which findings exist is affected [#129](https://github.com/rboudrouss/reactant-analyzer/issues/129),
 [#271](https://github.com/rboudrouss/reactant-analyzer/issues/271).
+
+**A loop row stands for every cycle through its effect.** The churn graph's Warning rows of one
+rule and message family at one effect are one row: several cycles through an effect a hook
+places in many components (dub's `use-media-query.ts:28`, one cycle through each of 34
+callers), several states one effect writes. The message words the first cycle as a row of it
+alone would, says the step of it the analysis could not prove ("Not proven: the write of `x`
+at `f.tsx:12` is handed to package code the analysis does not see, …"), and names the next two
+and counts the rest; the JSON's `cycles` lists every one with its steps, each with its own
+unproven step and why, read off the engine's reason for the edge, and `--trace` prints them.
+An Error keeps one row per proof; `--per-component` shows each component's own cycles; an
+effect calling several parents' setters is one `cross-component-infinite-loop` row listing
+them in `setters` [#421](https://github.com/rboudrouss/reactant-analyzer/issues/421).
 
 **Every finding carries a position.** Lowering and the CFG splice mint statements
 the source did not write: an `await` hoist, a ternary arm's temp, a spliced
