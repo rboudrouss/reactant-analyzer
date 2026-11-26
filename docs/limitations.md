@@ -692,7 +692,9 @@ carries an Error.
   before it returns, and which listener it reaches is a question of targets the analysis does not
   resolve (#219). The events are those the dispatch block below lists (a `focus()` fires the
   focus events and the blurred control's `change`, never `keydown`, `resize`, `scroll` or
-  `storage`; a `click()`, a `requestSubmit()` and a dispatched value any event), and a listener
+  `storage`; a `click()` and a `requestSubmit()` what the HTML Standard fires before they return,
+  below [#427](https://github.com/rboudrouss/reactant-analyzer/issues/427); a dispatched value
+  any event), and a listener
   hears its literal or module-`const` name, any event otherwise
   [#422](https://github.com/rboudrouss/reactant-analyzer/issues/422). No target is read, so a
   `window` listener, or one on an element a package renders, is reached by every dispatch of its
@@ -720,9 +722,23 @@ carries an Error.
   module-level `const` of the same file no local binding shadows, any event for any other name:
   an imported constant, a member of a constant object or `enum` — a package hook's listener any
   event), and a dispatch fires the focus
-  events and the blurred control's `change` for `focus()` and `blur()`, the one event a
-  `dispatchEvent(new XEvent("x"))` names other than `click`, and any event otherwise (a click's
-  activation behaviour submits, toggles and opens, firing events of its own). React DOM's
+  events and the blurred control's `change` for `focus()` and `blur()` (a focus move scrolls
+  nothing synchronously: CSSOM View's scroll events are pending until the event loop updates the
+  rendering), the one event a `dispatchEvent(new XEvent("x"))` names, and for `click()` or a
+  dispatched `click` the `click` and what the activation behaviour of any element kind fires
+  before it returns, the target's kind not being read (HTML Standard: `click()` fires one
+  synthetic `click`, DOM's dispatch runs the activation target's behaviour after the listeners):
+  a checkbox's or radio's `input` and `change`, a form submission's `invalid`, `submit` and
+  `formdata`, a reset's `reset`, a command's `command`, a popover's or dialog's `beforetoggle`
+  and `cancel`, a navigation's `navigate`, `navigateerror`, `abort`, `popstate`,
+  `currententrychange` and `dispose`, and the focus events of a focus move; a `requestSubmit()`
+  the submission's. A `toggle`, a dialog's `close`, a `hashchange`, a file input's `change` and a
+  form's navigation are queued by the Standard, so they run at an event's time. One premise: the
+  Standard leaves a `label`'s activation to the platform, whose engines click its control and may
+  focus it. Any other event name (a key, a pointer, `resize`, `scroll`, `storage`) is fired by no
+  click and no submission; the analysis does not model other methods that dispatch before they
+  return (`reset()`, `submit()`'s `formdata`, `reportValidity()`, `showPopover()`,
+  `showModal()`, `close()`), which stay unseen dispatches [#428](https://github.com/rboudrouss/reactant-analyzer/issues/428). React DOM's
   `onChange` table rests on one premise: the engine has the `input` event, which every engine
   React 19 supports has (React DOM takes a polyfill path that runs `onChange` on focus moves and
   keys only where it lacks it). A blurred control's `change` never runs `onChange`: React DOM

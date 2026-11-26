@@ -61,10 +61,9 @@ export function App() {{
 
 #[test]
 fn an_element_method_that_fires_events_makes_a_listener_run_in_place() {
-    // A click's activation behaviour and a submission fire any event.
-    for trigger in ["document.body.click();", "form.requestSubmit();"] {
-        assert!(loop_claims(&with_trigger(trigger)) > 0, "{trigger}");
-    }
+    // A click fires `click`; a submission fires `submit`.
+    assert!(loop_claims(&with_trigger("document.body.click();")) > 0);
+    assert!(loop_claims(&listening_to("submit", "form.requestSubmit();")) > 0);
     // A focus move fires the focus events, which a focus listener hears.
     for trigger in ["document.body.focus();", "document.body.blur();"] {
         for event in ["focus", "focusin", "blur", "focusout"] {
@@ -95,6 +94,85 @@ fn a_listener_no_dispatch_of_the_program_fires_runs_only_on_events() {
     // A dispatched event the analysis cannot name may be any.
     let unnamed = "document.dispatchEvent(ev);";
     assert!(loop_claims(&listening_to("resize", unnamed)) > 0);
+}
+
+#[test]
+fn a_click_or_a_submission_fires_what_activation_behaviour_fires_alone() {
+    // #427: a click fires the `click` and what the activation behaviour of
+    // any element fires before it returns — a checkbox's `input` and
+    // `change`, a submit button's submission, a reset, a command, a popover
+    // or dialog toggle, a navigation, a focus move —, a submission its
+    // `invalid`, `submit` and `formdata`. A keydown, resize, scroll or
+    // storage listener runs on a user's or the browser's event only. (The
+    // oracle renders into a container no document holds, where a checkbox's
+    // activation and a submit button's submission fire nothing: these
+    // readings are pinned here.)
+    for trigger in [
+        "document.body.click();",
+        "form.requestSubmit();",
+        r#"document.dispatchEvent(new MouseEvent("click"));"#,
+    ] {
+        for event in [
+            "keydown",
+            "keyup",
+            "resize",
+            "scroll",
+            "storage",
+            "pointerdown",
+        ] {
+            assert_eq!(
+                loop_claims(&listening_to(event, trigger)),
+                0,
+                "{event} {trigger}"
+            );
+        }
+    }
+    for event in [
+        "click",
+        "change",
+        "input",
+        "submit",
+        "formdata",
+        "reset",
+        "beforetoggle",
+        "popstate",
+        "focusin",
+    ] {
+        assert!(
+            loop_claims(&listening_to(event, "button.click();")) > 0,
+            "{event}"
+        );
+    }
+    for event in ["submit", "formdata", "invalid", "focusin"] {
+        assert!(
+            loop_claims(&listening_to(event, "form.requestSubmit();")) > 0,
+            "{event}"
+        );
+    }
+    assert_eq!(
+        loop_claims(&listening_to("click", "form.requestSubmit();")),
+        0,
+        "a submission fires no click"
+    );
+    // React's `onSubmit` on the form a program button clicks: the
+    // submission runs it in the effect.
+    let src = r#"
+import { useEffect, useRef, useState } from "react";
+export function App() {
+  const [n, setN] = useState<unknown>(0);
+  const ref = useRef<HTMLButtonElement>(null);
+  useEffect(() => { ref.current?.click(); });
+  return (
+    <form onSubmit={(e) => { e.preventDefault(); setN({}); }}>
+      {String(!!n)}
+      <button ref={ref} type="submit">go</button>
+    </form>
+  );
+}
+"#;
+    assert!(loop_claims(src) > 0, "the submit button's form submits");
+    let keydown = src.replace("onSubmit=", "onKeyDown=");
+    assert_eq!(loop_claims(&keydown), 0, "no click fires a keydown");
 }
 
 fn jsx_case(trigger: &str, deps: &str, handler: &str) -> String {

@@ -1,10 +1,10 @@
 // oracle: react=converges
-// #422: the neighbour of `listener-keydown-program-focuses-settles` whose one
-// dispatch is a `click()`. A click runs the element's activation behaviour,
-// which may fire other events (a form's `submit`, a label's control, a
-// popover), so the analysis reads it as firing any event and the keydown
-// listener as running where it is registered: a tolerated false positive.
-// React converges: a button's click fires no keydown.
+// #422, #427: the neighbour of `listener-keydown-program-focuses-settles`
+// whose one dispatch is a `click()`. A click fires the `click` and what the
+// activation behaviour of an element fires before it returns (a form's
+// submission, a checkbox's `input` and `change`, a popover's `beforetoggle`,
+// a navigation, a focus move), never a `keydown`: the keydown listener runs
+// on a user's key press only. React converges.
 import { useCallback, useEffect, useRef, useState } from "react";
 
 function useShortcut(callback: () => void) {
