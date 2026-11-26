@@ -2286,6 +2286,7 @@ fn collect_effect_info(hooks: &[HookEntry]) -> HashMap<HookLabel, EffectInfo> {
                 body_cfg,
                 deps,
                 span,
+                ..
             } => {
                 let (free_paths, deps_pinned) = free_paths_and_pinned(body_cfg, &deps.covering());
                 Some((
@@ -3024,6 +3025,7 @@ mod tests {
                 body_cfg: eff_cfg,
                 deps: DepsArg::List(DepsList::exact(vec![])),
                 span: None,
+                host_ref: false,
             },
         ];
         let render_stmts = vec![
@@ -3089,6 +3091,7 @@ mod tests {
                 body_cfg: eff_cfg,
                 deps: DepsArg::List(DepsList::exact(vec![])),
                 span: None,
+                host_ref: false,
             },
         ];
         let comp = component(hooks, vec![]);
@@ -3136,6 +3139,7 @@ mod tests {
                 body_cfg: eff_cfg,
                 deps: DepsArg::List(DepsList::exact(vec![])),
                 span: None,
+                host_ref: false,
             },
         ];
         let comp = component(hooks, vec![]);
@@ -3206,6 +3210,7 @@ mod tests {
             body_cfg: eff_cfg,
             deps: DepsArg::List(DepsList::exact(vec![])),
             span: None,
+            host_ref: false,
         }];
         let comp = component(hooks, vec![]);
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
@@ -3309,6 +3314,7 @@ mod tests {
                 body_cfg: eff_cfg,
                 deps: DepsArg::List(DepsList::exact(vec![Expr::StateVal(0)])),
                 span: None,
+                host_ref: false,
             },
         ];
 
@@ -3856,6 +3862,7 @@ mod tests {
                 body_cfg: eff_cfg,
                 deps: DepsArg::List(DepsList::exact(vec![Expr::StateVal(0)])),
                 span: None,
+                host_ref: false,
             },
             HookEntry::Handler {
                 label: 2,
@@ -4004,6 +4011,7 @@ mod tests {
             body_cfg: eff_cfg,
             deps: DepsArg::List(DepsList::exact(vec![])),
             span: None,
+            host_ref: false,
         }];
         let comp = component(hooks, vec![]);
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());

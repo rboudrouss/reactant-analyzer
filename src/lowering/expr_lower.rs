@@ -1323,9 +1323,10 @@ fn lower_jsx_element(jsx: &JSXElement, builder: &mut BlockBuilder) -> Expr {
         .iter()
         .filter_map(|c| lower_jsx_child(c, builder))
         .collect();
-    let (props, prop_spans) = lower_jsx_props(&jsx.opening_element.attributes, builder);
+    let reference = jsx_name_is_reference(&jsx.opening_element.name);
+    let (props, prop_spans) = lower_jsx_props(&jsx.opening_element.attributes, !reference, builder);
 
-    if name.chars().next().is_some_and(|c| c.is_uppercase()) || name.contains('.') {
+    if reference {
         // React semantics: nested JSX children ARE `props.children`.
         // Dropping them here would erase the whole subtree from the CFG
         // (`<Dialog><Select onValueChange={setX}/></Dialog>` — the Select
@@ -1398,15 +1399,21 @@ fn lower_jsx_element(jsx: &JSXElement, builder: &mut BlockBuilder) -> Expr {
     }
 }
 
-/// Lower JSX attributes to an `ObjectLit`, collecting spans for `onX` props.
-/// Returns `(props_expr, prop_spans)` by prop name.
+/// Lower JSX attributes to an `ObjectLit`, collecting spans for `onX` props
+/// (and a `host` element's `ref`). Returns `(props_expr, prop_spans)` by
+/// prop name. A `host` element's props also get its commit calls
+/// ([`commit_calls`]).
 fn lower_jsx_props(
     attrs: &[JSXAttributeItem],
+    host: bool,
     builder: &mut BlockBuilder,
 ) -> (Expr, Vec<(String, Option<SourceRange>)>) {
     let id = builder.next_expr_id();
     let mut prop_spans: Vec<(String, Option<SourceRange>)> = Vec::new();
-    let fields: Vec<(String, Expr)> = attrs
+    // The `ref`s a host element's commit calls, each with the text it is
+    // written as.
+    let mut refs: Vec<(Expr, oxc_span::Span)> = Vec::new();
+    let mut fields: Vec<(String, Expr)> = attrs
         .iter()
         .map(|attr| match attr {
             JSXAttributeItem::Attribute(a) => {
@@ -1418,7 +1425,8 @@ fn lower_jsx_props(
                 };
                 // Capture span for event-handler props so hook_extractor can set
                 // HookEntry::Handler.span without needing the original Oxc AST.
-                if is_event_prop_key(&key) {
+                let commit = host && key == "ref";
+                if is_event_prop_key(&key) || commit {
                     prop_spans.push((key.clone(), builder.span_at(a.span.start)));
                 }
                 let val = match &a.value {
@@ -1434,6 +1442,24 @@ fn lower_jsx_props(
                     Some(JSXAttributeValue::Fragment(f)) => lower_jsx_fragment(f, builder),
                     None => Expr::Lit(Prim::Bool(true)), // boolean attribute: <Comp disabled />
                 };
+                // A host `ref` the commit call names: a literal is read off
+                // the prop itself (`extract_ref_commits`), anything else must
+                // be a name the call can repeat.
+                let called = commit && !matches!(val.peel_ts(), Expr::FnLit { .. } | Expr::Lit(_));
+                let val = match called {
+                    true => {
+                        let val = named(val, a.span, builder);
+                        let at = match &a.value {
+                            Some(JSXAttributeValue::ExpressionContainer(ec)) => {
+                                ec.expression.span()
+                            }
+                            _ => a.span,
+                        };
+                        refs.push((val.clone(), at));
+                        val
+                    }
+                    false => val,
+                };
                 (key, val)
             }
             // Keep spreads under a synthetic `...N` key: `<X {...props}/>`
@@ -1442,14 +1468,100 @@ fn lower_jsx_props(
             // The key can't collide with a real JSX attribute name.
             JSXAttributeItem::SpreadAttribute(s) => {
                 let spread_id = builder.next_expr_id();
-                (
-                    format!("...{}", spread_id.0),
-                    lower_expr(&s.argument, builder),
-                )
+                let val = lower_expr(&s.argument, builder);
+                let val = match host {
+                    true => {
+                        let val = named(val, s.span, builder);
+                        let member = Expr::FieldAccess {
+                            obj: Box::new(val.clone()),
+                            field: "ref".to_string(),
+                        };
+                        refs.push((member, s.span));
+                        val
+                    }
+                    false => val,
+                };
+                (format!("...{}", spread_id.0), val)
             }
         })
         .collect();
+    let calls = commit_calls(refs, builder);
+    fields.extend(calls);
     (Expr::ObjectLit { id, fields }, prop_spans)
+}
+
+/// `value` as a name or a member chain off one: itself, or a temp the
+/// statement bound at `at` holds it in.
+fn named(value: Expr, at: oxc_span::Span, builder: &mut BlockBuilder) -> Expr {
+    if value.peel_ts().name_path() {
+        return value;
+    }
+    let tmp = builder.fresh_temp(at);
+    let span = builder.span_at(at.start);
+    builder.push_stmt(Stmt::Let {
+        var: tmp.clone(),
+        rhs: value,
+        span,
+    });
+    Expr::Var(tmp)
+}
+
+/// The calls React makes of a host element's `ref` at a commit that attaches
+/// it (#412, react-dom 19.3.1 `commitAttachRef`: `ref(instance)`, its result
+/// kept as the cleanup), one member of no parameter per `ref` the props may
+/// hold that is not a literal: the `ref` prop, and the `ref` member of each
+/// spread (React 19 hands a component its `ref` as a prop, which a spread
+/// forwards). The node is ⊤: a new one at each mount, and `null` at a
+/// detach (`safelyDetachRef`). `refs` are the callees, each with the text
+/// a temp holding it is named by.
+fn commit_calls(
+    refs: Vec<(Expr, oxc_span::Span)>,
+    builder: &mut BlockBuilder,
+) -> Vec<(String, Expr)> {
+    refs.into_iter()
+        .enumerate()
+        .map(|(i, (callee, at))| {
+            // React reads the `ref` off the props and calls it plainly, with
+            // no receiver (`ref(instance)`): a member is read into a temp
+            // first, so the call hands no object it was read off.
+            let (stmts, fn_) = match callee.peel_ts() {
+                Expr::Var(_) => (Vec::new(), callee),
+                _ => {
+                    let tmp = builder.temp_at("__ref", at);
+                    let read = Stmt::Let {
+                        var: tmp.clone(),
+                        rhs: callee,
+                        span: None,
+                    };
+                    (vec![read], Expr::Var(tmp))
+                }
+            };
+            let call = Expr::Call {
+                id: builder.next_call_id(),
+                fn_: Box::new(fn_),
+                args: vec![opaque()],
+            };
+            let body_cfg = CFG {
+                entry: 0,
+                blocks: std::iter::once((
+                    0,
+                    BasicBlock {
+                        id: 0,
+                        stmts,
+                        term: Terminator::Return(call, None),
+                    },
+                ))
+                .collect(),
+                edges: Vec::new(),
+            };
+            let commit = Expr::FnLit {
+                id: builder.next_expr_id(),
+                params: Vec::new(),
+                body_cfg: Arc::new(body_cfg),
+            };
+            (format!("{}{i}", crate::ir::expr::COMMIT_KEY_PREFIX), commit)
+        })
+        .collect()
 }
 
 fn is_event_prop_key(name: &str) -> bool {
@@ -1457,6 +1569,20 @@ fn is_event_prop_key(name: &str) -> bool {
     chars.next() == Some('o')
         && chars.next() == Some('n')
         && chars.next().is_some_and(|c| c.is_ascii_uppercase())
+}
+
+/// Whether the JSX transform reads the element name `name` as a reference
+/// to a binding (a component, or whatever the binding holds) rather than a
+/// host tag string (#410): a plain name by [`super::is_reference_name`], a
+/// namespaced name `a:b` never (a string in every transform), and a member
+/// name (`<ns.item/>`, whatever its root's case) or `<this/>` always.
+pub(super) fn jsx_name_is_reference(name: &JSXElementName) -> bool {
+    match name {
+        JSXElementName::Identifier(id) => super::is_reference_name(&id.name),
+        JSXElementName::IdentifierReference(id) => super::is_reference_name(&id.name),
+        JSXElementName::NamespacedName(_) => false,
+        JSXElementName::MemberExpression(_) | JSXElementName::ThisExpression(_) => true,
+    }
 }
 
 /// A JSX element's name read as the expression the JSX runtime evaluates:

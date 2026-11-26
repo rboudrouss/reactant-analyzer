@@ -18,7 +18,9 @@ pub use cfg_builder::{LowerCtx, build_cfg, build_fn_body_cfg};
 pub use class_lowerer::lower_classes_with_resolver;
 pub use component_detector::{ComponentCandidate, detect_components};
 pub use hook_detector::{HookCandidate, detect_custom_hooks};
-pub use hook_extractor::{extract_handlers, extract_hooks, extract_subscriptions};
+pub use hook_extractor::{
+    extract_handlers, extract_hooks, extract_ref_commits, extract_subscriptions,
+};
 pub use import_resolution::{
     HookOrigin, JsxOrigins, ResolvedImport, build_hook_origins, build_jsx_origins,
     build_resolved_import_map, build_resolved_imports,
@@ -61,6 +63,22 @@ pub(crate) fn is_hook_name(name: &str) -> bool {
             .chars()
             .nth(3)
             .is_some_and(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+}
+
+/// The JSX transform's rule for a plain element name: `<name/>` renders the
+/// binding `name` (a reference) unless its first character is a lowercase
+/// ASCII letter or it holds a `-`, which make it a host tag string. So
+/// `<Foo/>`, `<_foo/>`, `<$foo/>` and a non-ASCII first letter are
+/// references (#410). Babel: `isCompatTag` (`/^[a-z]/`) on a name
+/// `convertJSXIdentifier` keeps as an identifier (a `-` makes it a string);
+/// TypeScript: `isIntrinsicJsxName`; esbuild: `parseJSXElement` ("Certain
+/// identifiers are strings").
+///
+/// Single source of truth for which names may name a component: the JSX
+/// lowering, the scope scan of element names and the component detector
+/// all call this.
+pub(crate) fn is_reference_name(name: &str) -> bool {
+    !name.contains('-') && !name.starts_with(|c: char| c.is_ascii_lowercase())
 }
 
 /// Every name `program` binds at the top level, whatever the declaration form,
@@ -522,6 +540,7 @@ pub(crate) fn lower_file_hooks(
             let (mut hooks, hook_provenance, mut next_label) =
                 extract_hooks(&mut body_cfg, &imports, &ctx.ids);
             extract_handlers(&body_cfg, &mut hooks, &mut next_label);
+            extract_ref_commits(&body_cfg, &mut hooks, &mut next_label);
             extract_subscriptions(&mut hooks, &mut next_label);
             HookIR {
                 file: file.to_path_buf(),
@@ -745,6 +764,7 @@ fn lower_hook_value(
     };
     let (mut hooks, hook_provenance, mut next_label) = extract_hooks(&mut body_cfg, &imports, &ids);
     extract_handlers(&body_cfg, &mut hooks, &mut next_label);
+    extract_ref_commits(&body_cfg, &mut hooks, &mut next_label);
     extract_subscriptions(&mut hooks, &mut next_label);
     Some(HookIR {
         file: value.file.clone(),
@@ -1265,6 +1285,7 @@ pub fn lower_program_with_resolver(
             let (mut hooks, hook_provenance, mut next_label) =
                 extract_hooks(&mut render_cfg, &imports, &ctx.ids);
             extract_handlers(&render_cfg, &mut hooks, &mut next_label);
+            extract_ref_commits(&render_cfg, &mut hooks, &mut next_label);
             extract_subscriptions(&mut hooks, &mut next_label);
             let param = param_names
                 .into_iter()

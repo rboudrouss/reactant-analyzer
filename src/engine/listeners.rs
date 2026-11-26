@@ -31,8 +31,9 @@
 //! ([`crate::engine::setters::dispatch_claims`]). A component element's prop
 //! is no entry: the child's own bodies run
 //! it, a listener position of the child's own included, which is an entry.
-//! Neither is a host `ref` callback, which React runs at commit and no
-//! dispatch runs. A value handed to code the analysis does not see is no
+//! Neither is a host `ref` callback, which React runs at commit, as its
+//! element's commit effect (#412), and no dispatch runs. A value handed to
+//! code the analysis does not see is no
 //! entry either: that code may attach it to anything, and its row stays the
 //! hand-over it is.
 

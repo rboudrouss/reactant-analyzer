@@ -70,8 +70,14 @@ impl Rule for AlwaysUnstableDeps {
 
         for hook in &result.hooks {
             let (label, deps, kind, span) = match hook {
+                // React's call of a host `ref` has no deps list of the
+                // source's (#412).
                 HookEntry::Effect {
-                    label, deps, span, ..
+                    label,
+                    deps,
+                    span,
+                    host_ref: false,
+                    ..
                 } => (*label, deps, HookKind::Effect, *span),
                 HookEntry::Memo {
                     label, deps, span, ..
@@ -280,6 +286,7 @@ mod tests {
                 fields: vec![],
             }])),
             span: None,
+            host_ref: false,
         }];
         let comp = component(hooks, vec![]);
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
@@ -301,6 +308,7 @@ mod tests {
                 body_cfg: Arc::new(empty_cfg()),
             }])),
             span: None,
+            host_ref: false,
         }];
         let comp = component(hooks, vec![]);
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
@@ -316,6 +324,7 @@ mod tests {
             body_cfg: empty_cfg(),
             deps: DepsArg::List(DepsList::exact(vec![Expr::Lit(Prim::Int(42))])),
             span: None,
+            host_ref: false,
         }];
         let comp = component(hooks, vec![]);
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
@@ -334,6 +343,7 @@ mod tests {
             body_cfg: empty_cfg(),
             deps: DepsArg::List(DepsList::exact(vec![])),
             span: None,
+            host_ref: false,
         }];
         let comp = component(hooks, vec![]);
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
@@ -352,6 +362,7 @@ mod tests {
             body_cfg: empty_cfg(),
             deps: DepsArg::Absent,
             span: None,
+            host_ref: false,
         }];
         let comp = component(hooks, vec![]);
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
@@ -377,6 +388,7 @@ mod tests {
                 Expr::Lit(Prim::Int(42)),
             ])),
             span: None,
+            host_ref: false,
         }];
         let comp = component(hooks, vec![]);
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
@@ -408,6 +420,7 @@ mod tests {
                 Expr::Lit(Prim::Bool(true)),
             ])),
             span: None,
+            host_ref: false,
         }];
         let comp = component(hooks, vec![]);
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());

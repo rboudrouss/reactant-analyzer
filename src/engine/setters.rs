@@ -199,7 +199,11 @@ fn host_refs(render: &CFG, hooks: &[HookEntry]) -> HashMap<Var, Vec<crate::ir::t
         return HashMap::new();
     }
     count_binders(render, &mut binds);
-    let bodies: Vec<&CFG> = hooks.iter().filter_map(HookEntry::body_cfg).collect();
+    let bodies: Vec<&CFG> = hooks
+        .iter()
+        .filter(|h| h.written())
+        .filter_map(HookEntry::body_cfg)
+        .collect();
     for body in &bodies {
         count_binders(body, &mut binds);
     }
@@ -233,6 +237,9 @@ fn host_refs(render: &CFG, hooks: &[HookEntry]) -> HashMap<Var, Vec<crate::ir::t
                             Expr::Var(r) if k == "ref" && candidates.contains(r) => {
                                 targets.entry(r.clone()).or_default().push(*id);
                             }
+                            // React's call of the `ref` (#412): of a `useRef`
+                            // object, a write of its `current`.
+                            _ if k.starts_with(crate::ir::expr::COMMIT_KEY_PREFIX) => {}
                             _ => uses(v, candidates, targets, other),
                         }
                     }
@@ -645,11 +652,12 @@ pub(crate) fn body_writes(comp: &AnalysisResult<StateValue>, body: &CFG) -> Vec<
 /// runs a marked row runs it as in a program that does not dispatch, where
 /// its timing is an event's: a host element's `on*` prop, an
 /// `addEventListener` argument and a package hook's argument timed
-/// `Listener`, all table entries; a host `ref` callback
-/// runs at commit; a seen child's prop runs where the child's own bodies run
-/// it, a listener of the child's (an entry) included. A row the table does
-/// not cover — a value handed to code the analysis does not see — is never
-/// marked: its ⊤ stays.
+/// `Listener`, all table entries; a seen child's prop runs where the child's
+/// own bodies run it, a listener of the child's (an entry) included. A host
+/// element's `ref` is no listener: React calls it at commit, its element's
+/// commit effect (#412), whose rows are an effect's and never marked. A row
+/// the table does not cover — a value handed to code the analysis does not
+/// see — is never marked: its ⊤ stays.
 pub(crate) fn dispatch_claims(w: &SlotWriter) -> bool {
     w.phase == WriterPhase::Unknown && w.listener
 }
@@ -3693,7 +3701,11 @@ impl<'a> SetterWalk<'a> {
                 false => self.listener_class(),
             };
             for (i, (name, val)) in fields.iter().enumerate() {
-                if !crate::lowering::hook_extractor::invoked_prop(native, name) {
+                // A host element's `ref` runs at commit: its element's commit
+                // effect calls it (`extract_ref_commits`, #412).
+                if !crate::lowering::hook_extractor::invoked_prop(native, name)
+                    || (native && name == "ref")
+                {
                     continue;
                 }
                 // A host element's `on*` prop is a listener a dispatch runs

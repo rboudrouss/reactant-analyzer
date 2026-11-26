@@ -63,13 +63,18 @@ fn default<'a>(
 
 // ── Detection rules ────────────────────────────────────────────────────────────
 
-fn is_component(name: &str, stmts: &[Statement], return_type: Option<&TSTypeAnnotation>) -> bool {
+pub(super) fn is_component(
+    name: &str,
+    stmts: &[Statement],
+    return_type: Option<&TSTypeAnnotation>,
+) -> bool {
     // Rule 1: `use` prefix → hook, never a component
     if name.starts_with("use") {
         return false;
     }
-    // React convention: component names must start with uppercase
-    if !name.chars().next().is_some_and(|c| c.is_uppercase()) {
+    // A component is rendered by its name only when the JSX transform reads
+    // the name as a reference (#410): `_Item` and `$Item` may be components.
+    if !super::is_reference_name(name) {
         return false;
     }
     let facts = scan_body(stmts);
@@ -311,6 +316,19 @@ mod tests {
     #[test]
     fn lowercase_excluded() {
         assert!(names("function helper() { return <div/>; }").is_empty());
+    }
+
+    /// #410: `<_Item/>` and `<$item/>` render the binding, so a name the JSX
+    /// transform reads as a reference may be a component.
+    #[test]
+    fn a_name_starting_with_underscore_or_dollar_may_be_a_component() {
+        assert_eq!(
+            names(
+                "function _Item() { return <div/>; }\n\
+                 const $item = () => { useState(0); return null; };"
+            ),
+            vec!["_Item", "$item"]
+        );
     }
 
     #[test]

@@ -54,8 +54,12 @@ impl Rule for MissingCleanup {
         let mut diags = Vec::new();
 
         for hook in &result.hooks {
+            // A host `ref`'s commit call is no effect the source writes (#412).
             let HookEntry::Effect {
-                label, body_cfg, ..
+                label,
+                body_cfg,
+                host_ref: false,
+                ..
             } = hook
             else {
                 continue;

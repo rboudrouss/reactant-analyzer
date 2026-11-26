@@ -55,7 +55,8 @@ that writes it (see *Cross-file limits*).
 
 - Hooks and callees it cannot reach. A function handed to code the analysis does not see — an
   npm-package callee (`pkgFn(() => setN(1))`, `new IntersectionObserver(cb)`), a hook it does not
-  inline (`useTable({ onClick })`), React through an element's `on*` or `ref`, an object the heap
+  inline (`useTable({ onClick })`), React through an element's `on*` or `ref` (whose writes are
+  also read at commit, below), an object the heap
   does not place (`props.box.current = cb`), what such a function returns, a callback past the inlining
   depth, and every `useCallback` body — runs with the
   handlers, at an unknown time [#254](https://github.com/rboudrouss/reactant-analyzer/issues/254):
@@ -271,6 +272,21 @@ that writes it (see *Cross-file limits*).
   itself [#313](https://github.com/rboudrouss/reactant-analyzer/issues/313). A component
   referenced only by code the analysis does not read (a file it skipped, a `require`) is still
   read as a root.
+- A host element's `ref` is a layout effect of the component that builds the element
+  [#412](https://github.com/rboudrouss/reactant-analyzer/issues/412): React DOM calls it with the
+  node after a commit that mounts the element or hands it a `ref` that is not the last commit's
+  (and the previous one with `null`, or its returned cleanup), so its deps are the `ref` — a
+  literal or a closure the render builds is new at every render, a setter or a `useCallback` with
+  held deps is not — and what holds the element mounted: the conditions above its block and the
+  `key`s of the element and of the host elements around it. An element built in a closure, a
+  hook's body or a component element's props (its children), or under a condition that reads more
+  than names, has no deps (it may mount at any render). A `ref` a spread brings (`<input {...props}/>`,
+  React 19's `ref` prop) is called too. Two limits, which a component element's mount shares
+  above: an element built where it is unconditional but placed under a condition later
+  (`const d = <div ref={setEl}/>; return c ? d : null`) or moved among siblings by an array
+  built in steps is read as staying mounted; and a `ref` that is a name local to a closure (a
+  `.map` callback's own binding) is not seen by the effect, which runs from the render's
+  bindings — a literal there is read in place, as a handler's body is.
 - `x.slice()` and `x.concat()` are proven fresh only when `x` can only be an object: on a string they
   return a primitive, so a receiver of unknown kind (a prop, a nullable value) leaves the result
   unknown [#22](https://github.com/rboudrouss/reactant-analyzer/issues/22).
@@ -607,6 +623,12 @@ carries an Error.
   [#209](https://github.com/rboudrouss/reactant-analyzer/issues/209); and a write that reads a slot
   its effect does not depend on keeps an edge from that slot, even when the read sits on an arm
   that never runs (`false ? s1 : 2`) [#204](https://github.com/rboudrouss/reactant-analyzer/issues/204).
+- **A host `ref` is called with an unknown value** [#412](https://github.com/rboudrouss/reactant-analyzer/issues/412),
+  the node React attaches or the `null` of a detach: one run per commit stands for both calls. So
+  a fresh `ref={(node) => setEl(node)}` is a possible loop although React settles (the batch
+  stores `null`, then the same node, and bails out), and so is a setter `ref` on an element a
+  closure, a hook's body or a component element's children builds, which reads as remounting at
+  every render (`items.map((i) => <li ref={setActive}/>)`).
 - **A write in a closure reads what the closure binds as unknown.** In an IIFE, a helper, a
   callback, a timer or a cleanup, the closure's own locals and parameters, and the temps a `?:`,
   `??` or `&&` there lowers to, are ⊤ in the value the write stores; through a helper called by
@@ -1059,9 +1081,11 @@ tree, whose body would run in its place
 bound nowhere in the file, a global, falls back to the name, and only when
 exactly one analysed file defines it. A member name of a program import
 (`<UI.Button>`, a namespace import) is never resolved. The scopes are read off
-the source as the language defines them; a JSX name written with a lowercase
-first letter is a host tag whatever binds it, as the JSX transform reads it,
-but so is one starting with `_` or `$`, which the transform reads as a name
+the source as the language defines them; a JSX name is a host tag whatever
+binds it exactly when the JSX transform reads it as a string: a plain name
+whose first character is a lowercase ASCII letter, a name with a `-`, a
+namespaced name `a:b`. Every other name — `<_Item/>`, `<$item/>`, a non-ASCII
+first letter, any member name `<ns.item/>` — is a reference to its binding
 [#410](https://github.com/rboudrouss/reactant-analyzer/issues/410).
 
 Every other child is unanalysable, like any callee outside the run: a package's
@@ -1166,8 +1190,10 @@ top-level functions only, and a class is never a candidate, so it is not
 analysed and the `✓` line says nothing about it. The engine models hooks, which
 a class cannot call; `this.setState` and the lifecycle methods would be a second
 model, which is not planned (#178, same footing as #63 and #65). A function is a
-component when its name is capitalised and its body creates JSX anywhere,
-calls a hook outside a nested function, or carries a component return type.
+component when its name is one a JSX element may render by name (not a
+lowercase ASCII first letter: `Item`, `_Item`, `$item`, #410) and its body
+creates JSX anywhere, calls a hook outside a nested function, or carries a
+component return type.
 
 React's wrappers are followed [#64](https://github.com/rboudrouss/reactant-analyzer/issues/64):
 a function written inside `memo(…)` or `forwardRef(…)` (nested ones too, `memo(forwardRef(…))`,

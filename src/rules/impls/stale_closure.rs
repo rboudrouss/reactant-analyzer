@@ -277,6 +277,7 @@ impl Rule for StaleClosure {
                 body_cfg,
                 deps,
                 span: eff_span,
+                host_ref: false,
             } = hook
             else {
                 continue;

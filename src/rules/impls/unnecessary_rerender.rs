@@ -96,6 +96,7 @@ impl Rule for UnnecessaryRerender {
                 label: eff_label,
                 body_cfg,
                 deps,
+                host_ref: false,
                 ..
             } = hook
             else {
@@ -256,6 +257,7 @@ mod tests {
                 body_cfg: effect_cfg(effect_stmts),
                 deps,
                 span: None,
+                host_ref: false,
             },
         ];
         let render_stmts = vec![

@@ -133,6 +133,15 @@ pub const FORWARDED_REF_KEY: &str = "[forwarded-ref]";
 /// statements — and returns it, or what the constructor returns.
 pub const CONSTRUCT_KEY: &str = "[construct]";
 
+/// Key prefix of the member lowering adds to a host element's props for each
+/// `ref` it may hand React as a name or a member chain (#412): a function of
+/// no parameter whose body calls that `ref` with the node (⊤: a new node at
+/// each mount, `null` at a detach) and returns what it returns, the call
+/// React makes at a commit that attaches it. Its body is the element's
+/// commit effect (`hook_extractor::extract_ref_commits`); React never sees
+/// the member. Not a valid property name of a destructuring or a dot access.
+pub const COMMIT_KEY_PREFIX: &str = "[commit]";
+
 /// The name a class's member bodies read the instance by: `this`, which no
 /// source binding can spell, so it never meets a program name. The
 /// construction body declares it; a method, an accessor or a field
@@ -217,6 +226,8 @@ fn prop_conversion<'e>(host: Option<&str>, name: &str, value: &'e Expr) -> Optio
     match host {
         _ if name == "key" => Some(Converted::Value(value)),
         Some(tag) if name == "children" => (tag == "textarea").then_some(Converted::Prop(value)),
+        // React's own call of the `ref` (#412), no prop it sees.
+        _ if name.starts_with(COMMIT_KEY_PREFIX) => None,
         Some(_) if !invoked_prop(true, name) => Some(Converted::Prop(value)),
         _ => None,
     }
@@ -962,6 +973,18 @@ impl Expr {
             Expr::Var(v) => Some(v),
             Expr::FieldAccess { obj, .. } | Expr::IndexAccess { arr: obj, .. } => obj.root_var(),
             _ => None,
+        }
+    }
+
+    /// A name, or a chain of static members off one (`f`, `props.ref`,
+    /// `this.x`): an expression another body may repeat to read what the
+    /// name holds there, allocating nothing and calling no code but a
+    /// getter's.
+    pub fn name_path(&self) -> bool {
+        match self.peel_ts() {
+            Expr::Var(_) => true,
+            Expr::FieldAccess { obj, .. } => obj.name_path(),
+            _ => false,
         }
     }
 

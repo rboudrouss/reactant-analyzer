@@ -23,10 +23,18 @@ pub fn detect_utilities<'a>(program: &'a Program<'a>) -> Vec<UtilityCandidate<'a
     detector::detect_fns(program, classify, None, None)
 }
 
-/// A function is a utility iff its name is neither a hook nor a component and
-/// its body creates no JSX (a function creating elements renders them).
+/// A function is a utility iff its name is neither a hook nor a component,
+/// its body creates no JSX (a function creating elements renders them) and
+/// the component detector does not take it (`function _Item()` calling a
+/// hook, #410).
 fn classify(item: &FnItem) -> bool {
-    is_utility(item.name) && !scan_body(&item.body.statements).jsx
+    is_utility(item.name)
+        && !scan_body(&item.body.statements).jsx
+        && !super::component_detector::is_component(
+            item.name,
+            &item.body.statements,
+            item.return_type,
+        )
 }
 
 /// Returns `true` iff `name` is a utility (not a hook, not a component).
@@ -97,6 +105,9 @@ mod tests {
     #[test]
     fn component_excluded() {
         assert!(names("function Counter() { return <div/>; }").is_empty());
+        // #410: a `_` name calling a hook is the component detector's.
+        assert!(names("function _Beacon() { useState(0); return null; }").is_empty());
+        assert_eq!(names("function _fmt(x) { return x; }"), vec!["_fmt"]);
     }
 
     #[test]

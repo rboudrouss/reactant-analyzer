@@ -137,6 +137,215 @@ pub fn extract_handlers(cfg: &CFG, hooks: &mut Vec<HookEntry>, next_label: &mut 
     hooks.extend(found);
 }
 
+/// React's calls of the `ref`s of the host elements `cfg` and the bodies of
+/// `hooks` build, each a layout effect of the component (#412).
+///
+/// react-dom 19.3.1 (`cjs/react-dom-client.development.js`): a host fiber's
+/// `ref` is its element's `ref` prop (`coerceRef`, l. 6451); `markRef`
+/// (l. 10518) flags it when the element mounts or the prop is not the last
+/// commit's (`current.ref !== ref`); that commit then detaches the old one
+/// in the mutation phase (`safelyDetachRef`, l. 14022: the cleanup it
+/// returned, else `ref(null)`) and attaches the new one in the layout phase
+/// (`commitAttachRef`, l. 13962: `refCleanup = ref(instance)`, the DOM node).
+/// So the effect's deps are the `ref` and what holds the element mounted —
+/// the conditions of the branches that control its block, and the `key`s of
+/// the element and of the host elements around it, as the component tree
+/// reads a component element (`churn::component_tree`). An element a closure
+/// or a hook's body builds, or one handed to a component element (its
+/// children included), may mount at any render of whoever runs it, and so
+/// may one whose mount conditions read more than names: no deps. A literal
+/// `ref` is new at every render: no deps, and its body is the effect's, its
+/// parameters the node (⊤). Any other `ref` is called by the commit member
+/// lowering added (`ir::expr::COMMIT_KEY_PREFIX`), whose body is the effect's.
+pub fn extract_ref_commits(cfg: &CFG, hooks: &mut Vec<HookEntry>, next_label: &mut HookLabel) {
+    let controls = crate::engine::dominance::controlling_branches(cfg);
+    let mut found: Vec<HookEntry> = Vec::new();
+    for block in cfg.blocks.values() {
+        let held: Option<Vec<Expr>> = controls
+            .get(&block.id)
+            .into_iter()
+            .flatten()
+            .map(|b| match cfg.blocks.get(b).map(|b| &b.term) {
+                Some(Terminator::Branch { cond, .. }) => mount_fact(cfg, *b, cond),
+                _ => None,
+            })
+            .collect();
+        block.for_each_expr(&mut |e| commits_in(e, held.as_deref(), &mut found, next_label));
+    }
+    for body in hooks.iter().filter_map(HookEntry::body_cfg) {
+        body.for_each_expr(&mut |e| commits_in(e, None, &mut found, next_label));
+    }
+    hooks.extend(found);
+}
+
+/// What the branch ending block `branch` on `cond` reads, when it reads only
+/// names: the operand a short-circuit temp holds at the branch
+/// (`lower_logical`'s `let t = a; if (t) …` reads `a`). `None` otherwise.
+fn mount_fact(cfg: &CFG, branch: BlockId, cond: &Expr) -> Option<Expr> {
+    let mut fact = cond.peel_ts();
+    if let Expr::Var(t) = fact
+        && let Some(rhs) = cfg.blocks.get(&branch).and_then(|b| {
+            b.stmts.iter().rev().find_map(|s| match s {
+                Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. } if var == t => Some(rhs),
+                _ => None,
+            })
+        })
+    {
+        fact = rhs;
+    }
+    reads_only(fact).then(|| fact.clone())
+}
+
+/// `e` reads names and computes on them, and nothing else: no call, no
+/// allocation, no function — an expression a deps list may repeat.
+fn reads_only(e: &Expr) -> bool {
+    match e.peel_ts() {
+        Expr::Lit(_)
+        | Expr::Var(_)
+        | Expr::StateVal(_)
+        | Expr::StateSetter(_)
+        | Expr::MemoVal(_)
+        | Expr::CallbackVal(_) => true,
+        Expr::FieldAccess { obj, .. } => reads_only(obj),
+        Expr::IndexAccess { arr, idx } => reads_only(arr) && reads_only(idx),
+        Expr::BinOp { lhs, rhs, .. } => reads_only(lhs) && reads_only(rhs),
+        Expr::UnaryOp { arg, .. } => reads_only(arg),
+        _ => false,
+    }
+}
+
+/// The commit effects of the host elements under `e`, held mounted by `held`
+/// (`None`: they may mount at any render) — see [`extract_ref_commits`].
+fn commits_in(
+    e: &Expr,
+    held: Option<&[Expr]>,
+    out: &mut Vec<HookEntry>,
+    next_label: &mut HookLabel,
+) {
+    match e {
+        Expr::NativeElem {
+            props,
+            children,
+            span,
+            prop_spans,
+            ..
+        } => {
+            let fields: &[(String, Expr)] = match props.peel_ts() {
+                Expr::ObjectLit { fields, .. } => fields,
+                _ => &[],
+            };
+            // The element's own key, or one a spread brings, holds it and
+            // its subtree.
+            let held: Option<Vec<Expr>> = held.map(|h| {
+                let keys = fields.iter().filter_map(|(k, v)| match k.as_str() {
+                    "key" => Some(v.clone()),
+                    _ if k.starts_with(crate::ir::expr::SPREAD_KEY_PREFIX) => {
+                        Some(Expr::FieldAccess {
+                            obj: Box::new(v.clone()),
+                            field: "key".to_string(),
+                        })
+                    }
+                    _ => None,
+                });
+                h.iter().cloned().chain(keys).collect()
+            });
+            let held = held.filter(|h| h.iter().all(reads_only));
+            let at = prop_spans
+                .iter()
+                .find(|(k, _)| k == "ref")
+                .and_then(|(_, s)| *s)
+                .or(*span);
+            for (k, v) in fields {
+                match v.peel_ts() {
+                    Expr::FnLit {
+                        params, body_cfg, ..
+                    } if k == "ref" => {
+                        out.push(commit_effect(
+                            next_label,
+                            bound(params, body_cfg),
+                            DepsArg::Absent,
+                            at,
+                        ));
+                    }
+                    Expr::FnLit { body_cfg, .. }
+                        if k.starts_with(crate::ir::expr::COMMIT_KEY_PREFIX) =>
+                    {
+                        // The `ref` the member calls (`commit_calls`): the
+                        // member it reads first, or the name it calls.
+                        let entry = body_cfg.blocks.get(&body_cfg.entry);
+                        let callee = match entry.map(|b| (b.stmts.first(), &b.term)) {
+                            Some((Some(Stmt::Let { rhs, .. }), _)) => Some(rhs),
+                            Some((None, Terminator::Return(Expr::Call { fn_, .. }, _))) => {
+                                Some(&**fn_)
+                            }
+                            _ => None,
+                        };
+                        let deps = match (&held, callee) {
+                            (Some(h), Some(callee)) => {
+                                DepsArg::List(crate::ir::hooks::DepsList::exact(
+                                    std::iter::once(callee.clone())
+                                        .chain(h.iter().cloned())
+                                        .collect(),
+                                ))
+                            }
+                            _ => DepsArg::Absent,
+                        };
+                        out.push(commit_effect(next_label, (**body_cfg).clone(), deps, at));
+                    }
+                    _ => commits_in(v, None, out, next_label),
+                }
+            }
+            for child in children {
+                commits_in(child, held.as_deref(), out, next_label);
+            }
+        }
+        // What a component element receives it mounts when it renders it.
+        Expr::CompApp { props, .. } => commits_in(props, None, out, next_label),
+        Expr::FnLit { body_cfg, .. } => {
+            body_cfg.for_each_expr(&mut |x| commits_in(x, None, out, next_label));
+        }
+        // The children an element holds in place.
+        Expr::ArrayLit { elems, .. } => {
+            for x in elems {
+                commits_in(x, held, out, next_label);
+            }
+        }
+        Expr::TSAnnotated(x) => commits_in(x, held, out, next_label),
+        other => other.for_each_child(&mut |c| commits_in(c, None, out, next_label)),
+    }
+}
+
+/// A literal `ref`'s body with its parameters bound to the node (⊤).
+fn bound(params: &[Var], body_cfg: &CFG) -> CFG {
+    let mut cfg = body_cfg.clone();
+    if let Some(entry) = cfg.blocks.get_mut(&cfg.entry) {
+        let lets = params.iter().map(|p| Stmt::Let {
+            var: p.clone(),
+            rhs: Expr::SummaryVal(crate::ir::expr::SummaryValue::Top),
+            span: None,
+        });
+        entry.stmts.splice(0..0, lets);
+    }
+    cfg
+}
+
+fn commit_effect(
+    next_label: &mut HookLabel,
+    body_cfg: CFG,
+    deps: DepsArg,
+    span: Option<SourceRange>,
+) -> HookEntry {
+    let label = *next_label;
+    *next_label += 1;
+    HookEntry::Effect {
+        label,
+        body_cfg,
+        deps,
+        span,
+        host_ref: true,
+    }
+}
+
 /// The names [`extract_handlers`] resolves a handler prop through: every
 /// `let`/assignment of `cfg` whose right-hand side `pick` takes.
 fn bound_handlers<T>(cfg: &CFG, pick: impl Fn(&Expr) -> Option<T>) -> HashMap<&str, T> {
@@ -205,11 +414,11 @@ fn collect_handlers_in_expr(
         } => {
             if let Expr::ObjectLit { fields, .. } = props.as_ref() {
                 for (name, val) in fields {
-                    // `on*` events and `ref` callbacks share invoke semantics
-                    // on native elements: React calls them at arbitrary times
-                    // (events / mount-unmount). Other native props are DOM
-                    // data, never invoked.
-                    if invoked_prop(true, name) {
+                    // `on*` events: React calls them when the event fires
+                    // there. The `ref` runs at commit, an effect of its own
+                    // ([`extract_ref_commits`], #412). Other native props are
+                    // DOM data, never invoked.
+                    if is_event_prop(name) {
                         if let Some((params, body_cfg)) = handler_body(val, var_bodies) {
                             let label = *next_label;
                             *next_label += 1;
@@ -1039,6 +1248,7 @@ fn make_hook_entry(
                 body_cfg,
                 deps,
                 span,
+                host_ref: false,
             })
         }
         "useMemo" => {
@@ -2078,5 +2288,60 @@ mod tests {
         );
         // The receiver is a lowering temp (`__arr_N`), never a source name.
         assert_eq!(*binding, None, "a temp is not a binding");
+    }
+
+    /// #412: each host `ref` is a commit effect, no handler. The deps of a
+    /// named `ref` are the `ref` and what holds the element mounted; a
+    /// literal, an element a closure builds or a component element receives
+    /// has none.
+    #[test]
+    fn a_host_ref_is_a_commit_effect_with_its_mount_deps() {
+        let commits = |src: &str| -> Vec<Option<Vec<String>>> {
+            let (cfg, mut hooks) = parse_and_extract(src);
+            let mut next = hooks.len() as HookLabel;
+            extract_handlers(&cfg, &mut hooks, &mut next);
+            assert!(
+                !hooks.iter().any(|h| matches!(h, HookEntry::Handler { .. })),
+                "a host `ref` is no handler: {src}"
+            );
+            extract_ref_commits(&cfg, &mut hooks, &mut next);
+            hooks
+                .iter()
+                .filter_map(|h| match h {
+                    HookEntry::Effect {
+                        deps,
+                        host_ref: true,
+                        ..
+                    } => Some(
+                        deps.list()
+                            .map(|l| l.as_slice().iter().map(|e| format!("{e:?}")).collect()),
+                    ),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            commits("function A() { return <div ref={(el) => f(el)} />; }"),
+            vec![None]
+        );
+        let named = commits("function A() { return <div ref={setEl} />; }");
+        assert_eq!(named.len(), 1);
+        assert_eq!(named[0].as_ref().map(Vec::len), Some(1), "{named:?}");
+        let guarded =
+            commits("function A() { return <p>{open && <div key={k} ref={setEl} />}</p>; }");
+        let deps = guarded[0].as_ref().expect("a deps list");
+        assert!(deps.iter().any(|d| d.contains("\"open\"")), "{deps:?}");
+        assert!(deps.iter().any(|d| d.contains("\"k\"")), "{deps:?}");
+        for src in [
+            "function A() { return <ul>{xs.map((x) => <li ref={setEl} />)}</ul>; }",
+            "function A() { return <Box><div ref={setEl} /></Box>; }",
+        ] {
+            assert_eq!(commits(src), vec![None], "{src}");
+        }
+        // A spread may bring a `ref` (React 19's prop).
+        assert_eq!(
+            commits("function A(p) { return <input {...p} />; }").len(),
+            1
+        );
     }
 }

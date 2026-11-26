@@ -273,6 +273,12 @@ pub enum HookEntry {
         body_cfg: CFG,
         deps: DepsArg,
         span: Option<SourceRange>,
+        /// Not a hook the source calls: React's call of a host element's
+        /// `ref` at a commit that attaches it (#412), which the lowering
+        /// reads as a layout effect (`hook_extractor::extract_ref_commits`).
+        /// The engine and the loop rules read it as any effect; a rule about
+        /// the effects the source writes skips it ([`HookEntry::written`]).
+        host_ref: bool,
     },
     Memo {
         label: HookLabel,
@@ -335,8 +341,9 @@ pub enum HookEntry {
         params: Vec<Var>,
         span: Option<SourceRange>,
         /// An `on*` prop of a native element: React runs it only when that
-        /// DOM event fires there. Not a native `ref` callback (run at
-        /// commit), nor a function a component element receives (its
+        /// DOM event fires there. A native `ref` is no handler: React runs
+        /// it at commit, an effect of its own (#412). Not a function a
+        /// component element receives either (its
         /// component may call it whenever it runs), nor an
         /// `addEventListener` callback, whose timing `registrations` decides.
         dom_event: bool,
@@ -351,6 +358,12 @@ pub enum HookEntry {
 }
 
 impl HookEntry {
+    /// Is this a hook the source calls, rather than React's commit-time call
+    /// of a host element's `ref` the lowering reads as an effect (#412)?
+    pub fn written(&self) -> bool {
+        !matches!(self, HookEntry::Effect { host_ref: true, .. })
+    }
+
     pub fn label(&self) -> HookLabel {
         match self {
             HookEntry::State { label, .. }
