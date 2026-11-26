@@ -683,13 +683,21 @@ carries an Error.
   `subscribe`) as a long-lived registration [#42](https://github.com/rboudrouss/reactant-analyzer/issues/42). Such a match never reaches Error, and
   neither does a write back that is not on every path of the callback
   [#142](https://github.com/rboudrouss/reactant-analyzer/issues/142).
-- **One `dispatchEvent` anywhere makes every `addEventListener` listener ⊤.** A listener is
+- **A dispatch of an event anywhere makes every listener of that event ⊤.** A listener (an
+  `addEventListener` callback, a host element's `on*` prop, a package hook's listener) is
   event-only (no churn edge) only while no body of the program calls `dispatchEvent`, `emit` on a
   receiver, or an element method that fires events before it returns (`click()`, `focus()`,
-  `blur()`, `requestSubmit()`): a dispatch runs the listeners before it returns, and which listener it reaches
-  is a question of event names and targets the analysis does not resolve (#219). In such a
-  program the fixpoint runs every listener where it is registered, as it runs a timer callback, so
-  the slot a listener writes moves with its writes, a listener passed by name included
+  `blur()`, `requestSubmit()`) that may fire an event it hears: a dispatch runs the listeners
+  before it returns, and which listener it reaches is a question of targets the analysis does not
+  resolve (#219). The events are those the dispatch block below lists (a `focus()` fires the
+  focus events and the blurred control's `change`, never `keydown`, `resize`, `scroll` or
+  `storage`; a `click()`, a `requestSubmit()` and a dispatched value any event), and a listener
+  hears its literal or module-`const` name, any event otherwise
+  [#422](https://github.com/rboudrouss/reactant-analyzer/issues/422). No target is read, so a
+  `window` listener, or one on an element a package renders, is reached by every dispatch of its
+  event. In such a program the fixpoint runs every listener a dispatch may reach where it is
+  registered, as it runs a timer callback, so the slot a listener writes moves with its writes, a
+  listener passed by name included
   [#250](https://github.com/rboudrouss/reactant-analyzer/issues/250). A dispatch
   hidden in an opaque callee is not seen. A dispatching call runs, where it is made and as
   possible writes of that body, every listener of the program its event may reach

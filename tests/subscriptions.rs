@@ -368,7 +368,7 @@ fn a_listener_the_program_fires_runs_in_the_slot_fixpoint() {
 }
 
 #[test]
-fn a_dispatch_anywhere_in_the_program_makes_every_listener_top() {
+fn a_dispatch_of_its_event_anywhere_in_the_program_makes_a_listener_top() {
     use reactant::engine::WriterPhase;
     let listener = r#"
         import { useState, useEffect } from "react";
@@ -399,6 +399,14 @@ fn a_dispatch_anywhere_in_the_program_makes_every_listener_top() {
         effect_phases(&r, "Listener", "setN"),
         vec![WriterPhase::Unknown],
         "another component dispatches: the listener may run in its effect"
+    );
+    // #422: a dispatch of another event never reaches it.
+    let other = dispatcher.replace("\"ping\"", "\"pong\"");
+    let r = analyze(&format!("{listener}{other}"));
+    assert_eq!(
+        effect_phases(&r, "Listener", "setN"),
+        vec![WriterPhase::Handler],
+        "another component dispatches `pong`: the `ping` listener is event-only"
     );
 }
 

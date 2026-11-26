@@ -60,9 +60,11 @@ pub trait QueryContext {
         None
     }
 
-    /// Some body of the program fires event listeners itself (`dispatchEvent`,
-    /// `emit`, #219): a listener may then run in the pass that registers it.
-    fn dispatches(&self) -> bool {
+    /// May some dispatch of the program (`dispatchEvent`, `focus()`, #219)
+    /// fire the event `event` (any event when `None`) at a listener
+    /// registered for it (#422)? Such a listener may then run in the pass
+    /// that registers it.
+    fn dispatches(&self, _event: Option<&str>) -> bool {
         false
     }
 
@@ -572,7 +574,7 @@ impl<'a, D: AbstractDomain> AnalysisCtx<'a, D> {
 
 /// What a component's fixpoint knows that a body cannot read off its own
 /// syntax: the `useCallback` bodies and the `useReducer` reducers in reach,
-/// whether the program dispatches its own events, and the arguments of the
+/// the events the program dispatches itself, and the arguments of the
 /// hooks it did not inline.
 /// Fixed for the whole fixpoint — built once, borrowed by every pass.
 pub struct FixpointCtx<'a> {
@@ -587,7 +589,7 @@ pub struct FixpointCtx<'a> {
     /// `QueryContext::reducer`).
     pub reducers: &'a Reducers<'a>,
     /// See `QueryContext::dispatches`.
-    pub dispatches: bool,
+    pub(crate) dispatches: &'a crate::engine::listeners::Dispatches,
     /// See `QueryContext::hook_args`.
     pub hook_args:
         &'a std::collections::HashMap<crate::ir::types::HookLabel, Vec<crate::ir::expr::Expr>>,
@@ -631,8 +633,9 @@ impl QueryContext for FixpointCtx<'_> {
         self.reducers.get(owner, label)
     }
 
-    fn dispatches(&self) -> bool {
+    fn dispatches(&self, event: Option<&str>) -> bool {
         self.dispatches
+            .reach(&crate::engine::listeners::Events::of_name(event))
     }
 
     fn hook_args(&self, label: crate::ir::types::HookLabel) -> &[crate::ir::expr::Expr] {

@@ -19,6 +19,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::engine::listeners::{Dispatches, Events};
+
 use crate::ir::{
     SourceRange,
     cfg::{CFG, Terminator},
@@ -48,8 +50,8 @@ pub enum Timing {
     Deferred,
     /// An external event. The DOM has no synchronous dispatch from
     /// `addEventListener`, so the callback provably does not run during the
-    /// registering call — and, while no body of the program calls
-    /// `dispatchEvent`, during no React phase ([`Timing::in_program`]).
+    /// registering call — and, while no dispatch of the program may fire
+    /// its event, during no React phase ([`Timing::in_program`]).
     Handler,
     /// The registrar may invoke the callback synchronously — an RxJS
     /// `BehaviorSubject` emits to a new subscriber on the spot — so nothing
@@ -336,89 +338,85 @@ impl Registration {
 // ── Synchronous dispatch (#219) ───────────────────────────────────────────────
 
 impl Timing {
-    /// A registrar's timing, given whether the program dispatches events
-    /// itself.
+    /// A registrar's timing, given whether some dispatch of the program may
+    /// fire an event the callback hears (`reached`).
     ///
     /// `Handler` rests on "the DOM has no synchronous dispatch from
     /// `addEventListener`", and `dispatchEvent` is one: it runs the target's
-    /// listeners before it returns, in the dispatching body's phase. Which
-    /// listener a dispatch reaches is a question of event names and targets
-    /// the IR does not resolve, so a program with any visible dispatch keeps
-    /// every listener at ⊤ (fail-closed, as #161's `navigates` does for
-    /// navigation-held values).
-    pub fn in_program(self, dispatches: bool) -> Timing {
+    /// listeners before it returns, in the dispatching body's phase. Targets
+    /// are not resolved, so a listener some dispatch of the program may fire
+    /// its event at is ⊤ (fail-closed, as #161's `navigates` does for
+    /// navigation-held values); one no dispatch can reach stays a handler
+    /// (#422).
+    pub fn in_program(self, reached: bool) -> Timing {
         match self {
-            Timing::Handler if dispatches => Timing::Unknown,
+            Timing::Handler if reached => Timing::Unknown,
             t => t,
         }
     }
 }
 
-/// Does `cfg`, nested functions included, fire event listeners itself: call
-/// `dispatchEvent`, `emit` on a receiver, or an element method that fires
-/// events before it returns
-/// ([`fired_events`](crate::engine::listeners::fired_events))?
-pub(crate) fn dispatches_events(cfg: &CFG) -> bool {
-    let mut found = false;
-    cfg.for_each_expr(&mut |e| found = found || expr_dispatches_events(e));
-    found
+/// The events `cfg`'s dispatching calls fire, nested functions included,
+/// joined into `out`: a call of `dispatchEvent`, of `emit` on a receiver,
+/// or of an element method that fires events before it returns
+/// ([`fired_events`](crate::engine::listeners::fired_events)).
+pub(crate) fn dispatches_events(cfg: &CFG, out: &mut Dispatches) {
+    cfg.for_each_expr(&mut |e| expr_dispatches_events(e, out));
 }
 
-fn expr_dispatches_events(e: &Expr) -> bool {
+fn expr_dispatches_events(e: &Expr, out: &mut Dispatches) {
+    if let Expr::Call { fn_, args, .. } | Expr::New { fn_, args, .. } = e
+        && let Some(fired) =
+            crate::engine::listeners::fired_events(fn_, args, &crate::engine::listeners::no_consts)
+    {
+        out.add(&fired);
+    }
     match e {
-        Expr::Call { fn_, args, .. } | Expr::New { fn_, args, .. }
-            if crate::engine::listeners::fired_events(
-                fn_,
-                args,
-                &crate::engine::listeners::no_consts,
-            )
-            .is_some() =>
-        {
-            true
-        }
-        Expr::FnLit { body_cfg, .. } => dispatches_events(body_cfg),
-        other => {
-            let mut found = false;
-            other.for_each_child(&mut |c| found = found || expr_dispatches_events(c));
-            found
-        }
+        Expr::FnLit { body_cfg, .. } => dispatches_events(body_cfg, out),
+        other => other.for_each_child(&mut |c| expr_dispatches_events(c, out)),
     }
 }
 
 /// [`dispatches_events`] over one component or hook body and every hook it
 /// calls, the expressions its entries keep included.
-pub(crate) fn body_dispatches_events(cfg: &CFG, hooks: &[HookEntry]) -> bool {
-    dispatches_events(cfg)
-        || hooks.iter().any(|hook| {
-            hook.body_cfg().is_some_and(dispatches_events)
-                || match hook {
-                    HookEntry::State { init, .. } | HookEntry::Ref { init, .. } => {
-                        expr_dispatches_events(init)
-                    }
-                    HookEntry::Custom { args, .. } => args.iter().any(expr_dispatches_events),
-                    _ => false,
+pub(crate) fn body_dispatches_events(cfg: &CFG, hooks: &[HookEntry], out: &mut Dispatches) {
+    dispatches_events(cfg, out);
+    for hook in hooks {
+        if let Some(body) = hook.body_cfg() {
+            dispatches_events(body, out);
+        }
+        match hook {
+            HookEntry::State { init, .. } | HookEntry::Ref { init, .. } => {
+                expr_dispatches_events(init, out)
+            }
+            HookEntry::Custom { args, .. } => {
+                for arg in args {
+                    expr_dispatches_events(arg, out);
                 }
-        })
+            }
+            _ => {}
+        }
+    }
 }
 
-/// Does any body of the program — component, custom hook or utility — fire
-/// event listeners itself?
+/// The events every body of the program — component, custom hook or
+/// utility — may fire itself.
 pub(crate) fn program_dispatches_events(
     components: &crate::engine::ComponentRegistry,
     hooks: &crate::engine::HookRegistry,
     utilities: &crate::engine::FunctionRegistry,
-) -> bool {
-    components
-        .all_components()
-        .any(|c| body_dispatches_events(&c.render_cfg, &c.hooks))
-        || hooks
-            .all_keys()
-            .iter()
-            .filter_map(|k| hooks.get(k))
-            .any(|h| body_dispatches_events(&h.body_cfg, &h.hooks))
-        || utilities
-            .all_functions()
-            .any(|f| dispatches_events(&f.body_cfg))
+) -> Dispatches {
+    let mut out = Dispatches::default();
+    for c in components.all_components() {
+        body_dispatches_events(&c.render_cfg, &c.hooks, &mut out);
+    }
+    for h in hooks.all_keys().iter().filter_map(|k| hooks.get(k)) {
+        body_dispatches_events(&h.body_cfg, &h.hooks, &mut out);
+    }
+    for f in utilities.all_functions() {
+        dispatches_events(&f.body_cfg, &mut out);
+    }
+    out
 }
 
 // ── The relation ──────────────────────────────────────────────────────────────
@@ -429,12 +427,13 @@ pub(crate) fn program_dispatches_events(
 /// Depth 2 is what both former native scans used: a registration one helper
 /// call or one callback deep still counts, nothing deeper does.
 ///
-/// `dispatches`: some body of the program fires listeners itself
-/// ([`Timing::in_program`]).
-pub fn collect_registrations(
+/// `dispatches`: the events the program's dispatches may fire
+/// ([`Timing::in_program`]): an `addEventListener` row is ⊤ when one of them
+/// is its event.
+pub(crate) fn collect_registrations(
     render_cfg: &CFG,
     hooks: &[HookEntry],
-    dispatches: bool,
+    dispatches: &Dispatches,
 ) -> Vec<Registration> {
     let render_fns = crate::engine::setters::collect_fn_bindings(render_cfg);
     let mut out = Vec::new();
@@ -455,7 +454,8 @@ pub fn collect_registrations(
         let cleanups = cleanup_bodies(body_cfg);
         for row in &mut rows {
             row.pairing = pair(row, &cleanups, &fns);
-            row.timing = row.timing.in_program(dispatches);
+            let hears = Events::of_name(row.event.as_deref());
+            row.timing = row.timing.in_program(dispatches.reach(&hears));
         }
         out.append(&mut rows);
     }

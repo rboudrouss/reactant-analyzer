@@ -79,9 +79,10 @@ impl Default for Config {
 /// is analysed: facts a component's own bodies cannot settle, and the
 /// results they would be joined over do not exist yet.
 pub struct ProgramFacts {
-    /// Some body fires event listeners itself (`dispatchEvent`), so no
-    /// listener is event-only (#219).
-    pub dispatches: bool,
+    /// The events the program's bodies fire themselves (`dispatchEvent`,
+    /// `focus()`, #219): a listener one of them may reach is no event-only
+    /// listener (#422).
+    pub(crate) dispatches: crate::engine::listeners::Dispatches,
     /// The names some body writes outside itself
     /// ([`written_names`](crate::engine::render_deps::written_names)): a
     /// module binding among them is a cell that moves with no slot (#224).
@@ -136,9 +137,13 @@ impl ProgramFacts {
     /// files, so no accessor an object it does not place may hold.
     fn of_utilities(utilities: &FunctionRegistry) -> Self {
         ProgramFacts {
-            dispatches: utilities
-                .all_functions()
-                .any(|f| crate::engine::registrations::dispatches_events(&f.body_cfg)),
+            dispatches: {
+                let mut out = crate::engine::listeners::Dispatches::default();
+                for f in utilities.all_functions() {
+                    crate::engine::registrations::dispatches_events(&f.body_cfg, &mut out);
+                }
+                out
+            },
             written: utilities
                 .all_functions()
                 .flat_map(|f| crate::engine::render_deps::written_roots(&f.params, &f.body_cfg))
@@ -482,12 +487,13 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     // body is an effect's, whose returned cleanup React calls too (#171);
     // what the fixpoint knows beyond the body's syntax (callback bodies,
     // reducers) and how loops widen are the same for all of them.
-    // A listener may run synchronously wherever the program dispatches
-    // events (#219): this component's own bodies, inlined hooks and utilities
-    // included, or any other body of the program. Every pass then runs a
-    // registered listener where it is registered (#250).
-    let dispatches = program.dispatches
-        || crate::engine::registrations::body_dispatches_events(&render_cfg, &hooks);
+    // A listener may run synchronously wherever the program dispatches an
+    // event it hears (#219, #422): from this component's own bodies, inlined
+    // hooks and utilities included, or any other body of the program. Every
+    // pass then runs such a registered listener where it is registered
+    // (#250).
+    let mut dispatches = program.dispatches.clone();
+    crate::engine::registrations::body_dispatches_events(&render_cfg, &hooks, &mut dispatches);
     // The hooks expansion left: their arguments escape at their call (#254).
     let hook_args: HashMap<HookLabel, Vec<Expr>> = hooks
         .iter()
@@ -561,7 +567,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         callbacks: &callback_bodies,
         hooks: &hooks,
         reducers: &reducers,
-        dispatches,
+        dispatches: &dispatches,
         hook_args: &hook_args,
         hands_back: &hands_back,
         hook_reads: &hook_reads,
@@ -1089,9 +1095,15 @@ fn compute_program_relations(
     crate::profile::count("listeners:dispatching-results", again.len() as u64);
     if !again.is_empty() {
         let _profile = crate::profile::pass("relations:listeners");
-        let owners: HashMap<ComponentId, (&AnalysisResult<StateValue>, bool)> = results
+        let owners: HashMap<
+            ComponentId,
+            (
+                &AnalysisResult<StateValue>,
+                &crate::engine::listeners::Dispatches,
+            ),
+        > = results
             .iter()
-            .map(|(id, result, inputs, _)| (*id, (&**result, inputs.dispatches)))
+            .map(|(id, result, inputs, _)| (*id, (&**result, &inputs.dispatches)))
             .collect();
         listeners.runs = crate::engine::setters::run_listeners(&listeners, &owners);
     }
@@ -1106,13 +1118,13 @@ fn compute_program_relations(
 }
 
 /// What [`compute_relations`] needs beyond the converged result: the splice
-/// regions, the component's own reducers and whether the program dispatches
-/// events. Kept on a result whose relations are not computed yet.
+/// regions, the component's own reducers and the events the program
+/// dispatches. Kept on a result whose relations are not computed yet.
 #[derive(Debug, Clone)]
 pub(crate) struct RelationInputs {
     inline_regions: crate::engine::setters::InlineRegions,
     reducers: HashMap<HookLabel, crate::engine::reducers::Reducer>,
-    dispatches: bool,
+    dispatches: crate::engine::listeners::Dispatches,
 }
 
 /// The relations the rules read off a converged result: the writer rows, the
@@ -1139,7 +1151,6 @@ fn compute_relations(
         reducers,
         dispatches,
     } = inputs;
-    let dispatches = *dispatches;
     let comp_id = result.component;
     let profile = crate::profile::pass("relations:writers");
     let reducers = crate::engine::Reducers::registered(comp_id, reducers.clone(), program_reducers);

@@ -885,6 +885,14 @@ on a program React settles; 323 oracle cases, none a known false negative.
   Oracle: 3 new cases (two loops the graph now claims alone, their settling
   neighbour `tn`); the 11 small repos and mantine unchanged, and no new claim
   on dub or twenty (#421).
+- A registered listener (an `addEventListener` callback, a host element's
+  `on*` prop, a package hook's listener) runs where it is registered only
+  when some dispatch of the program may fire an event it hears: a program
+  whose dispatches are `focus()` calls no longer runs its `keydown`,
+  `resize` or `storage` listeners at registration, which run on a user's or
+  the browser's event only. A `click()`, a `requestSubmit()`, a dispatched
+  value and a listener whose event name is not known still mean any event
+  (#422).
 - A function handed as a prop to a child component the analysis does not see
   (a package's component, an element value it does not resolve, a name several
   files define, a component rendering itself, a context provider's `value`)

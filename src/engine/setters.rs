@@ -19,7 +19,7 @@ use crate::{
         AnalysisResult,
         calls::{CallRelation, Slot, StmtAt},
         dominance::on_all_paths,
-        listeners::{Events, Fired, Listener, Listeners},
+        listeners::{Dispatches, Events, Fired, Listener, Listeners, NO_DISPATCH},
         store::STORE_SLOT,
         timing::ArgTiming,
         written::{self, SiteEnvs, Written},
@@ -344,11 +344,11 @@ pub(crate) struct Dispatched {
 }
 
 /// Walk every listener of `listeners` once, in its own component
-/// (`owners`: each component's result and whether the program its walks
-/// read dispatches events) — what [`SetterWalk::dispatched`] combines.
+/// (`owners`: each component's result and the events the program its walks
+/// read dispatches) — what [`SetterWalk::dispatched`] combines.
 pub(crate) fn run_listeners(
     listeners: &Listeners,
-    owners: &HashMap<ComponentId, (&AnalysisResult<StateValue>, bool)>,
+    owners: &HashMap<ComponentId, (&AnalysisResult<StateValue>, &Dispatches)>,
 ) -> Vec<ListenerRun> {
     let mut tables: HashMap<ComponentId, WriterTables<'_>> = HashMap::new();
     listeners
@@ -498,7 +498,7 @@ impl<'a> WriterTables<'a> {
     /// call id and position: the walk binds nothing. It keeps what is about
     /// the syntax: the traversal, the phase of each position, placement, the
     /// spelling. `cleanup` is the walked effect's hook site. `dispatches`:
-    /// some body of the program fires event listeners itself
+    /// the events the program's bodies fire themselves
     /// ([`SetterWalk::dispatches`]).
     ///
     /// The same walk places the writes of the store (ADR-046), the second
@@ -508,7 +508,7 @@ impl<'a> WriterTables<'a> {
         cfg: &CFG,
         calls: &CallRelation,
         cleanup: Option<crate::ir::types::ExprId>,
-        dispatches: bool,
+        dispatches: &Dispatches,
     ) -> (Vec<WriteSite>, Vec<StoreSite>, Heard) {
         let channels = Channels {
             stores: true,
@@ -555,7 +555,7 @@ impl<'a> WriterTables<'a> {
         cfg: &CFG,
         calls: &CallRelation,
         cleanup: Option<crate::ir::types::ExprId>,
-        dispatches: bool,
+        dispatches: &Dispatches,
         channels: Channels<'_>,
         depth: usize,
         run: Option<&Listener>,
@@ -634,7 +634,7 @@ impl<'a> WriterTables<'a> {
         l: &Listener,
         render: &CFG,
         calls: &CallRelation,
-        dispatches: bool,
+        dispatches: &Dispatches,
     ) -> ListenerRun {
         let channels = Channels {
             stores: true,
@@ -677,13 +677,13 @@ pub(crate) fn row_name(calls: &CallRelation, slot: Slot, var: Var) -> Var {
 /// keyed by slot, never a name table.
 pub(crate) fn body_writes(comp: &AnalysisResult<StateValue>, body: &CFG) -> Vec<WriteSite> {
     WriterTables::of_result(comp)
-        .write_sites(body, &comp.calls, None, false)
+        .write_sites(body, &comp.calls, None, &NO_DISPATCH)
         .0
 }
 
 /// Is `w` a listener's write that the rules judging the phase it runs in
-/// read as the event handler it is: a row ⊤ only because the program
-/// dispatches events itself (#219, [`SlotWriter::listener`])?
+/// read as the event handler it is: a row ⊤ only because some dispatch of
+/// the program may fire its event (#219, #422, [`SlotWriter::listener`])?
 /// `setter-in-render` and `infinite-loop` skip it.
 ///
 /// Sound because every dispatch site claims those writes (#407): wherever a
@@ -2007,7 +2007,7 @@ pub(crate) fn collect_slot_writers(
     calls: &CallRelation,
     envs: &SiteEnvs<'_>,
     reducers: &crate::engine::Reducers<'_>,
-    dispatches: bool,
+    dispatches: &Dispatches,
     listeners: &Listeners,
     module_consts: &HashMap<Var, crate::ir::ModuleConstInit>,
 ) -> (Vec<SlotWriter>, Heard) {
@@ -2381,10 +2381,12 @@ struct SetterWalk<'a> {
     /// listeners were reified as Handler entries (`extract_subscriptions`),
     /// and its returned function is its cleanup.
     effect_body: bool,
-    /// Some body of the program dispatches events itself, so a listener may
-    /// run synchronously in the dispatching body: it is ⊤, not `Handler`
-    /// ([`Timing::in_program`](crate::engine::registrations::Timing::in_program), #219).
-    dispatches: bool,
+    /// The events the program's bodies dispatch themselves: a listener one
+    /// of them may reach may run synchronously in the dispatching body, so
+    /// it is ⊤, not `Handler`
+    /// ([`Timing::in_program`](crate::engine::registrations::Timing::in_program),
+    /// #219, #422).
+    dispatches: &'a Dispatches,
     /// Locally-bound names that disable a deferring-global summary
     /// (fail-closed: `let setTimeout = …` anywhere in the component makes
     /// the bare name mean nothing).
@@ -3114,14 +3116,21 @@ impl<'a> SetterWalk<'a> {
     /// where the timing is a contract rather than a name-table guess.
     ///
     /// A bare-global registrar is fail-closed: any local binding of the name
-    /// anywhere disables its summary (`shadowed`).
-    fn arg_class(&self, id: crate::ir::types::ExprId, fn_: &Expr, mode: WalkClass) -> WalkClass {
+    /// anywhere disables its summary (`shadowed`). `hears`: the events a
+    /// listener the call registers hears.
+    fn arg_class(
+        &self,
+        id: crate::ir::types::ExprId,
+        fn_: &Expr,
+        mode: WalkClass,
+        hears: &Events,
+    ) -> WalkClass {
         use crate::engine::registrations::Timing;
         if let Some((reg, _)) = crate::engine::registrations::match_registrar(fn_) {
             let shadowed = !reg.method_only
                 && matches!(fn_.peel_ts(), Expr::Var(n) if self.shadowed.contains(n.as_str()));
             if !shadowed {
-                return match reg.timing.in_program(self.dispatches) {
+                return match reg.timing.in_program(self.dispatches.reach(hears)) {
                     Timing::Deferred => WalkClass::Deferred,
                     Timing::Handler => WalkClass::Handler,
                     Timing::Unknown => WalkClass::UNKNOWN,
@@ -3602,15 +3611,24 @@ impl<'a> SetterWalk<'a> {
             // entry — its body is walked as its own Handler region, so
             // descending it here would double-count. Anywhere else the same
             // shape was NOT reified: classify the listener as Handler. In a
-            // program that dispatches events, the listener may also run
-            // synchronously in this body's phase: the reified row keeps the
-            // event, and the descent here adds the ⊤ row (#219).
+            // program some dispatch of which may fire its event, the listener
+            // may also run synchronously in this body's phase: the reified
+            // row keeps the event, and the descent here adds the ⊤ row (#219,
+            // #422).
             let listener = expr.subscription_listener().is_some();
-            let reified = listener
-                && self.effect_body
-                && at_root
-                && mode == WalkClass::Sync
-                && !self.dispatches;
+            // A member of a package hook's result the timing table knows
+            // (`register(name, { onChange })`) runs that argument at its time.
+            let member = self.tables.result_member_timing(fn_);
+            let registers = listener || self.registers_listener(fn_);
+            // What the listener an event registrar is handed hears, and
+            // whether a dispatch of the program may fire it.
+            let hears = match registers {
+                true => Events::named(args.first(), &|v| self.const_string(v)),
+                false => Events::Any,
+            };
+            let reached = registers && self.dispatches.reach(&hears);
+            let reified =
+                listener && self.effect_body && at_root && mode == WalkClass::Sync && !reached;
             // A teardown takes the callback back, it does not call it
             // (ADR-034 §5). Descending it here gave every registered listener
             // a second ⊤ row — from the very cleanup that unregisters it —
@@ -3618,16 +3636,11 @@ impl<'a> SetterWalk<'a> {
             if crate::engine::registrations::is_teardown(fn_) {
                 return;
             }
-            // A member of a package hook's result the timing table knows
-            // (`register(name, { onChange })`) runs that argument at its time.
-            let member = self.tables.result_member_timing(fn_);
-            let registers = listener || self.registers_listener(fn_);
             for (i, arg) in args.iter().enumerate() {
                 // What an event registrar is handed is a listener a dispatch
                 // runs (#407), reified or not.
                 if registers {
-                    let hears = Events::named(args.first(), &|v| self.const_string(v));
-                    self.hear((*id, i), arg, None, hears);
+                    self.hear((*id, i), arg, None, hears.clone());
                 }
                 if reified && i == 1 {
                     continue;
@@ -3646,9 +3659,9 @@ impl<'a> SetterWalk<'a> {
                     continue;
                 }
                 let class = if listener && i == 1 {
-                    self.listener_class()
+                    self.listener_class(&hears)
                 } else {
-                    self.arg_class(*id, fn_, mode)
+                    self.arg_class(*id, fn_, mode, &hears)
                 };
                 // A callback a sync HOF runs executes once per element: its
                 // writes co-execute with themselves in a single tick, with no
@@ -3659,10 +3672,10 @@ impl<'a> SetterWalk<'a> {
                 // rows run at this call, and are placed here only when the
                 // receiver surely runs it, as an IIFE is (#248).
                 let placed = at.filter(|_| i == 0 && runs_at_least_once(fn_, args));
-                // A listener is ⊤ only because the program dispatches
-                // events (#219): its rows say so.
+                // A listener is ⊤ only because a dispatch of the program may
+                // fire its event (#219, #422): its rows say so.
                 let outer_listening = self.listening;
-                self.listening |= self.dispatches && registers;
+                self.listening |= reached;
                 self.relation_handed(
                     Some((*id, i)),
                     arg,
@@ -3775,12 +3788,6 @@ impl<'a> SetterWalk<'a> {
             // The run assumes the package's child calls what a named prop
             // is only from an event handler (ADR-048).
             let on_events = unseen && self.calls.package_props_on_events(*id);
-            let class = match unseen {
-                true => {
-                    WalkClass::Unknown(Handover::package_if(self.calls.unseen_package_element(*id)))
-                }
-                false => self.listener_class(),
-            };
             for (i, (name, val)) in fields.iter().enumerate() {
                 // A host element's `ref` runs at commit: its element's commit
                 // effect calls it (`extract_ref_commits`, #412).
@@ -3791,13 +3798,26 @@ impl<'a> SetterWalk<'a> {
                 }
                 // A host element's `on*` prop is a listener a dispatch runs
                 // (#407), whatever it holds: a literal reified as a handler
-                // region, a setter, a prop.
-                if native && crate::lowering::hook_extractor::is_event_prop(name) {
-                    self.hear((*id, i), val, None, Events::of_prop(name));
+                // region, a setter, a prop. It hears the events React DOM
+                // runs it for; a seen child's prop, which the child may hand
+                // to any listener of its own, any event.
+                let event_prop = native && crate::lowering::hook_extractor::is_event_prop(name);
+                let hears = match event_prop {
+                    true => Events::of_prop(name),
+                    false => Events::Any,
+                };
+                if event_prop {
+                    self.hear((*id, i), val, None, hears.clone());
                     if let Some(l) = self.heard.positions.last_mut() {
                         l.element = Some((*id, leaf));
                     }
                 }
+                let class = match unseen {
+                    true => WalkClass::Unknown(Handover::package_if(
+                        self.calls.unseen_package_element(*id),
+                    )),
+                    false => self.listener_class(&hears),
+                };
                 if on_events && crate::ir::expr::package_event_prop(name) {
                     self.package_prop((*id, i), val, class, depth, found, prov, stmt_span);
                     continue;
@@ -3812,9 +3832,9 @@ impl<'a> SetterWalk<'a> {
                         _ => false,
                     };
                 if !reified {
-                    // ⊤ here only because the program dispatches events
-                    // (#219): the rows say so.
-                    let listening = self.dispatches && !unseen;
+                    // ⊤ here only because a dispatch of the program may fire
+                    // an event it hears (#219, #422): the rows say so.
+                    let listening = !unseen && self.dispatches.reach(&hears);
                     let outer = std::mem::replace(&mut self.listening, listening);
                     self.relation_handed(
                         Some((*id, i)),
@@ -4485,9 +4505,9 @@ impl<'a> SetterWalk<'a> {
         if !user_only {
             self.hear(anchor, val, None, Events::Any);
         }
-        let reached = self.dispatches && !user_only;
+        let reached = !user_only && self.dispatches.reach(&Events::Any);
         // ⊤ only because the program dispatches events (#219), as a host
-        // element's listener: the rows say so.
+        // element's listener: the rows say so. It hears any event.
         let outer = std::mem::replace(&mut self.listening, reached);
         let listener = match reached {
             true => WalkClass::Unknown(Handover::Package),
@@ -4647,7 +4667,7 @@ impl<'a> SetterWalk<'a> {
                 self.hear(anchor, arg, None, Events::Any);
             }
             let outer = self.listening;
-            self.listening |= self.dispatches && listener;
+            self.listening |= listener && self.dispatches.reach(&Events::Any);
             self.relation_handed(
                 Some(anchor),
                 arg,
@@ -4683,7 +4703,7 @@ impl<'a> SetterWalk<'a> {
                     self.hear(anchor, arg, Some(*id), Events::Any);
                 }
                 let outer = self.listening;
-                self.listening |= self.dispatches && listener;
+                self.listening |= listener && self.dispatches.reach(&Events::Any);
                 let mut inner = Found::default();
                 self.enter(
                     body_cfg,
@@ -4757,7 +4777,8 @@ impl<'a> SetterWalk<'a> {
     fn timing_class(&self, timing: Option<ArgTiming>, handover: Handover) -> WalkClass {
         match timing {
             Some(ArgTiming::Deferred) => WalkClass::Deferred,
-            Some(ArgTiming::Listener) => self.listener_class(),
+            // A package's DOM listener hears any event.
+            Some(ArgTiming::Listener) => self.listener_class(&Events::Any),
             Some(ArgTiming::Members(_)) | None => WalkClass::Unknown(handover),
         }
     }
@@ -4774,11 +4795,13 @@ impl<'a> SetterWalk<'a> {
         })
     }
 
-    /// A listener's class: `Handler`, or ⊤ in a program that dispatches
-    /// events itself, where it may run synchronously in the dispatching body
-    /// ([`Timing::in_program`](crate::engine::registrations::Timing::in_program), #219).
-    fn listener_class(&self) -> WalkClass {
-        if self.dispatches {
+    /// The class of a listener hearing `hears`: `Handler`, or ⊤ in a program
+    /// some dispatch of which may fire one of those events, where it may run
+    /// synchronously in the dispatching body
+    /// ([`Timing::in_program`](crate::engine::registrations::Timing::in_program),
+    /// #219, #422).
+    fn listener_class(&self, hears: &Events) -> WalkClass {
+        if self.dispatches.reach(hears) {
             WalkClass::UNKNOWN
         } else {
             WalkClass::Handler
@@ -4875,7 +4898,7 @@ pub fn collect_slot_reads(comp: &AnalysisResult<StateValue>) -> Vec<SlotRead> {
             WriterRegion::Effect(l) => Some(comp.component.hook_site(l)),
             _ => None,
         };
-        let (found, ..) = tables.walk(cfg, &comp.calls, cleanup, false, channels, 2, None);
+        let (found, ..) = tables.walk(cfg, &comp.calls, cleanup, &NO_DISPATCH, channels, 2, None);
         for r in found.reads {
             let Some(&slot) = labels.get(&r.var) else {
                 continue;
@@ -4940,7 +4963,7 @@ pub fn collect_body_calls(
         cfg,
         &comp.calls,
         cleanup,
-        false,
+        &NO_DISPATCH,
         channels,
         WALK_DEPTH,
         None,
