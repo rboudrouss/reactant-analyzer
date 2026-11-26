@@ -3070,3 +3070,121 @@ export function App() {
 "#;
     assert!(infinite_loop_diags(handler, "App").is_empty());
 }
+
+/// The child of #421's programs: its effect calls the prop `on0`, which the
+/// parent's elements fill with `{a}` and `{b}`.
+fn joined_prop(a: &str, b: &str, call: &str) -> String {
+    format!(
+        r#"
+import {{ useState, useEffect }} from 'react';
+function C0({{ on0, p1 }}: {{ on0: (x: number) => void; p1: number }}) {{
+  useEffect(() => {{ {call}; }}, [p1]);
+  return null;
+}}
+export function App() {{
+  const [s, setS] = useState(0);
+  return <div><C0 on0={{{a}}} p1={{1}} /><C0 on0={{{b}}} p1={{s + 2}} /></div>;
+}}
+"#
+    )
+}
+
+/// The change leg of the row `C0`'s effect writes `App`'s slot with.
+fn carried_change(src: &str) -> Vec<reactant::engine::Change> {
+    let result = parse_and_analyze(src);
+    let (app, c0) = (
+        result.component_named("App").unwrap(),
+        result.component_named("C0").unwrap(),
+    );
+    result.components[&c0]
+        .slot_writers
+        .iter()
+        .filter(|w| w.owner == Some(app))
+        .map(|w| w.written.change)
+        .collect()
+}
+
+#[test]
+fn a_call_through_a_prop_holding_two_closures_stores_what_either_stores() {
+    // #421: the writer row of `on0(p1)` stood for the first closure alone
+    // (`0`, one value known in advance), and the churn graph had no edge:
+    // only the cross-component arm claimed the loop React runs. It stores
+    // the join of both closures' writes, and the graph closes the cycle.
+    use reactant::engine::Change;
+    let loops = joined_prop("() => setS(0)", "(x) => setS(x + 2)", "on0(p1)");
+    assert_eq!(carried_change(&loops), vec![Change::May]);
+    assert_eq!(cycles_carried_by(&loops, "C0"), 1);
+    // A setter at one element and a closure at the other: the setter's `1`
+    // alone is no longer the row's value.
+    let mixed = joined_prop("setS", "(x) => setS(s + x)", "on0(1)");
+    assert_eq!(carried_change(&mixed), vec![Change::May]);
+    assert_eq!(cycles_carried_by(&mixed, "C0"), 1);
+    // Both closures store the same constant: still one value known in
+    // advance, which nothing moves the slot away from (React settles).
+    let settles = joined_prop("() => setS(0)", "() => setS(0)", "on0(p1)");
+    assert_eq!(carried_change(&settles), vec![Change::Once]);
+    assert_eq!(cycles_carried_by(&settles, "C0"), 0);
+}
+
+#[test]
+fn the_cross_arm_states_the_condition_it_did_not_prove() {
+    // dub's `Combobox` (`combobox/index.tsx:204`): the effect's one dep is
+    // the child's own state, which a re-render of the parent does not move.
+    // The arm still claims (a Warning on an unbounded parent slot), and its
+    // sentence says which dep is not proven stable and why, and that a loop
+    // needs a re-render of the parent to change it — no re-fire it did not
+    // prove.
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Combo({ onSearchChange }: { onSearchChange: (s: string) => void }) {
+  const [search, setSearch] = useState("");
+  useEffect(() => { onSearchChange(search); }, [search]);
+  return <input value={search} onChange={(e) => setSearch(e.target.value)} />;
+}
+export function App() {
+  const [q, setQ] = useState("");
+  return <div>{q}<Combo onSearchChange={setQ} /></div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "Combo");
+    let cross: Vec<_> = diags
+        .iter()
+        .filter(|(r, _, _)| r == "cross-component-infinite-loop")
+        .collect();
+    assert_eq!(cross.len(), 1, "{diags:?}");
+    let (_, sev, msg) = cross[0];
+    assert_eq!(*sev, Severity::Warning);
+    assert!(
+        msg.contains("`onSearchChange`, a state setter of parent `App`")
+            && msg.contains("(`search` changes with state `search`)")
+            && msg.contains("if a re-render of `App` changes one of them")
+            && !msg.contains("fires again"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn a_local_helper_called_twice_is_still_one_write() {
+    // The collapse of one setter call reached twice is unchanged by #421:
+    // the row keeps its own value, a single constant.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function App() {
+  const [s, setS] = useState(0);
+  const reset = () => setS(0);
+  useEffect(() => { reset(); reset(); }, [s]);
+  return <div>{s}</div>;
+}
+"#;
+    let result = parse_and_analyze(src);
+    let app = result.component_named("App").unwrap();
+    let changes: Vec<_> = result.components[&app]
+        .slot_writers
+        .iter()
+        .map(|w| w.written.change)
+        .collect();
+    assert!(
+        !changes.is_empty() && changes.iter().all(|c| *c == reactant::engine::Change::Once),
+        "{changes:?}"
+    );
+}

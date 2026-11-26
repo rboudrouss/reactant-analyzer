@@ -23,7 +23,10 @@ pub mod impls;
 pub mod registry;
 
 pub use api::cache::ProgramCache;
-pub use api::diagnostic::{Diagnostic, DispatchRef, SetterRef, Severity};
+pub use api::diagnostic::{
+    CycleRef, CycleStep, Diagnostic, DispatchRef, SetterRef, Severity, SlotRef, cycles_message,
+    merge_cycles,
+};
 pub use api::query::{
     Certified, CleanupVerdict, ConditionalHookCall, DominatesAllExits, EffectCycleProof,
     ExitDominance, InitSetterCall, May, Motion, MovingFeeder, MustResult, OnAllPaths, OptionKind,
@@ -54,7 +57,7 @@ pub(crate) use helpers::{
     ConvergedEval, arg_is_call_free, collect_callees, describe_value, eval_in_stores,
     has_hook_kind, hook_kind_word, local_bindings, parent_elements, state_slot_name,
 };
-pub(in crate::rules) use helpers::{all_deps_provably_stable, fn_lit_binding};
+pub(in crate::rules) use helpers::{all_deps_provably_stable, fn_lit_binding, unstable_deps};
 
 /// A check that was *applicable* to a component and found nothing wrong —
 /// surfaced under `--info` as positive assurance ("verified: …").

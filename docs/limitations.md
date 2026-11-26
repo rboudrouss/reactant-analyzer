@@ -143,7 +143,10 @@ that writes it (see *Cross-file limits*).
   analysis does not run writes, at that point, every setter it reaches and runs every closure it
   reaches, of unknown timing. A row is keyed by (call site, slot, region): one slot spelled two
   ways at one site is one row, printed with what the source wrote there, else the slot's own
-  setter. **A helper called with one setter in one place and another elsewhere writes either at
+  setter. A call through a value that may be several closures or setters (a prop two elements
+  fill differently) is one row too, which stores what any of them may store: a single value
+  known in advance only when each stores that same one
+  ([#421](https://github.com/rboudrouss/reactant-analyzer/issues/421)). **A helper called with one setter in one place and another elsewhere writes either at
   every call of it**, so a write through it is a Warning, never an Error; an Error through a
   helper's parameter needs every call of the helper to pass the one setter. Past the walk's depth
   the writes of a body still count, unplaced. `setter-in-render`, the cross-component arm of
@@ -724,6 +727,13 @@ carries an Error.
   program's test
   files are not read (`*.test.*`, `*.spec.*` are no source files to the walk), so a dispatch there
   makes nothing ⊤.
+- **`cross-component-infinite-loop`'s arm over a parent's state** claims when an effect calls a
+  setter of a parent whose state the analysis bounds no value of, and the effect's deps are not
+  proven stable. It does not prove that a re-render of the parent re-runs the effect: its row
+  names the deps not proven stable and why, and says that a loop needs that re-render to change
+  one of them. A dep that changes only with the child's own state (dub's `Combobox`,
+  `useEffect(() => onSearchChange?.(search), [search])`) does not, and such a row is a false
+  positive [#421](https://github.com/rboudrouss/reactant-analyzer/issues/421).
 - **`frozen-initial-state`** still fires on a child remounted by machinery it cannot see: a dialog
   body unmounted by its library wrapper, a route that swaps the subtree [#136](https://github.com/rboudrouss/reactant-analyzer/issues/136).
 - **`missing-deps`** asks whether a capture can go *stale*, so a read through a handle that never
@@ -947,7 +957,8 @@ finding 87 times. Across the corpus, 6,322 produced findings resolve to 1,170
 distinct source locations, and the effect is worst on the codebases that factor
 their hooks best.
 
-Both reports group by `(rule, file, line, col, message)`. Each location is one
+Both reports group by `(rule, file, line, col, message)`, a loop row by its family in place of
+its message (below). Each location is one
 row naming the components it is reported through (`` [reported through `<A>`
 and `<B>`] ``, `[reported through 87 components]` past three, listed under
 `--trace`), at the strongest level any of them reports it. The human report
@@ -957,6 +968,18 @@ them in `components` (schema v3). `--per-component` restores one row per
 component, and `--fail-on` reads the per-component findings, so nothing about
 which findings exist is affected [#129](https://github.com/rboudrouss/reactant-analyzer/issues/129),
 [#271](https://github.com/rboudrouss/reactant-analyzer/issues/271).
+
+**A loop row stands for every cycle through its effect.** The churn graph's Warning rows of one
+rule and message family at one effect are one row: several cycles through an effect a hook
+places in many components (dub's `use-media-query.ts:28`, one cycle through each of 34
+callers), several states one effect writes. The message words the first cycle as a row of it
+alone would, says the step of it the analysis could not prove ("Not proven: the write of `x`
+at `f.tsx:12` is handed to package code the analysis does not see, …"), and names the next two
+and counts the rest; the JSON's `cycles` lists every one with its steps, each with its own
+unproven step and why, read off the engine's reason for the edge, and `--trace` prints them.
+An Error keeps one row per proof; `--per-component` shows each component's own cycles; an
+effect calling several parents' setters is one `cross-component-infinite-loop` row listing
+them in `setters` [#421](https://github.com/rboudrouss/reactant-analyzer/issues/421).
 
 **Every finding carries a position.** Lowering and the CFG splice mint statements
 the source did not write: an `await` hoist, a ternary arm's temp, a spliced

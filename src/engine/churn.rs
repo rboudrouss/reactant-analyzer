@@ -154,6 +154,71 @@ pub struct ChurnEdge {
     /// start, not by a new reference (`stepping_slots`, #144): what its
     /// message says the loop rests on.
     pub stepping: bool,
+    /// What the edge rests on, as the build met it: a loop row's account of
+    /// each step. No decision reads it.
+    pub why: EdgeWhy,
+}
+
+/// How a change of an edge's `from` re-runs its carrier, and what stopped
+/// the proof that its write settles: the facts the build decided the edge
+/// on, kept for the row that reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EdgeWhy {
+    pub reruns: Trigger,
+    /// `None` when the write changes its slot at every run of it (a must
+    /// write, `EdgeStrength::Must`'s write leg), or for a remount, whose
+    /// fresh instance no certificate of the old one bounds.
+    pub write: Option<Obstacle>,
+}
+
+/// How a change of an edge's `from` re-runs its carrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trigger {
+    /// A dep of the effect is the slot itself.
+    Dep,
+    /// A dep is versioned by the slot: an alias, a member, a value computed
+    /// from it.
+    Versioned,
+    /// A dep moves with the component's props, which a change of the slot,
+    /// an ancestor's, may move (#207).
+    Props,
+    /// The effect re-runs after every render (`ChurnEdge::always` says why).
+    EveryRender,
+    /// The write reads the slot, which is no trigger: the next run a trigger
+    /// causes stores what the read then holds (#204).
+    Read,
+    /// The component may remount when the slot moves, which runs its effects
+    /// again (#207, #213).
+    Mount,
+    /// A render that writes the store runs again at each re-render (ADR-046).
+    Render,
+}
+
+/// Why an edge's write is not proven to settle: the first of these that
+/// holds of the writer row, in this order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Obstacle {
+    /// It writes a library store: a may-write, never killed (ADR-046).
+    Store,
+    /// It sits in a listener, read as running wherever the program fires
+    /// events (#219).
+    Listener,
+    /// It runs in code with no timing summary, at any time, a render
+    /// included: a package's (`Handover::Package`) or other code's.
+    Handed(crate::engine::Handover),
+    /// It runs on a later turn: a timer, a continuation, a cleanup.
+    Later,
+    /// It changes its slot at every run, but an ancestor's guard or key may
+    /// unmount the component in the batch that would re-run it (#213).
+    Unmounted,
+    /// Another write the loop runs may move the slot away from what it
+    /// leaves there, so no guard of it is proven to stop it.
+    Moved,
+    /// It stores a new reference, but not on every path, or the slot has a
+    /// write that may restore it (#188).
+    Fresh,
+    /// It may store a new value, and no guard of it is proven to stop it.
+    Value,
 }
 
 /// What re-runs to carry an edge: an effect, or the render of the edge's
@@ -1381,11 +1446,32 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 EdgeStrength::May
             };
             let steps = must_write && stepping.contains(&node);
+            // What stopped the proof that the write settles, for the row.
+            let write = (!must_write).then(|| {
+                if w.writes_store() {
+                    Obstacle::Store
+                } else if w.listener {
+                    Obstacle::Listener
+                } else if w.phase == WriterPhase::Unknown {
+                    Obstacle::Handed(w.handover)
+                } else if matches!(w.phase, WriterPhase::Deferred | WriterPhase::Cleanup) {
+                    Obstacle::Later
+                } else if changes {
+                    Obstacle::Unmounted
+                } else if moved {
+                    Obstacle::Moved
+                } else if w.written.change == Change::Must {
+                    Obstacle::Fresh
+                } else {
+                    Obstacle::Value
+                }
+            });
 
             let mut push = |from: QualifiedSlot,
                             strength: EdgeStrength,
                             self_slot: bool,
-                            always: Option<&EveryRender>| {
+                            always: Option<&EveryRender>,
+                            reruns: Trigger| {
                 insert_edge(
                     &mut best,
                     ChurnEdge {
@@ -1398,6 +1484,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                         always: always.cloned(),
                         self_slot,
                         stepping: steps && strength == EdgeStrength::Must,
+                        why: EdgeWhy { reruns, write },
                     },
                 );
             };
@@ -1430,10 +1517,10 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             let always = f.always.as_ref();
             if always.is_some_and(|a| a.surely) {
                 for &x in &every_render {
-                    push(x, strength, false, always);
+                    push(x, strength, false, always, Trigger::EveryRender);
                 }
                 for &x in from_props {
-                    push(x, EdgeStrength::May, false, always);
+                    push(x, EdgeStrength::May, false, always, Trigger::EveryRender);
                 }
                 continue;
             }
@@ -1443,7 +1530,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 let self_slot = x == node;
                 let dropped = !reads_slot(x) || (self_slot && !retrigger());
                 if !dropped {
-                    push(x, strength, self_slot, None);
+                    push(x, strength, self_slot, None, Trigger::Dep);
                 }
             }
             for &x in &f.versioned {
@@ -1453,20 +1540,20 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 let self_slot = x == node && x.0 == f.comp;
                 let dropped = !reads_slot(x) || (self_slot && !retrigger());
                 if !dropped {
-                    push(x, EdgeStrength::May, self_slot, None);
+                    push(x, EdgeStrength::May, self_slot, None, Trigger::Versioned);
                 }
             }
             // A dep the props move: `P_c` is a trigger.
             if f.props {
                 for &x in from_props {
-                    push(x, EdgeStrength::May, false, None);
+                    push(x, EdgeStrength::May, false, None, Trigger::Props);
                 }
             }
             // A re-run that is only possible adds May edges beside the rows'
             // own, which keep their partition on a tie (pushed first).
             if always.is_some_and(|a| !a.surely) {
                 for &x in every_render.iter().chain(from_props) {
-                    push(x, EdgeStrength::May, false, always);
+                    push(x, EdgeStrength::May, false, always, Trigger::EveryRender);
                 }
             }
             // The reads-kill says a re-run stores what the last run stored,
@@ -1479,10 +1566,10 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 && (!f.triggers.is_empty() || f.props)
             {
                 for &l in &r.slots {
-                    push((f.comp, l), EdgeStrength::May, false, None);
+                    push((f.comp, l), EdgeStrength::May, false, None, Trigger::Read);
                 }
                 for &x in from_props {
-                    push(x, EdgeStrength::May, false, None);
+                    push(x, EdgeStrength::May, false, None, Trigger::Read);
                 }
             }
         }
@@ -1517,6 +1604,10 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                         always: None,
                         self_slot: false,
                         stepping: false,
+                        why: EdgeWhy {
+                            reruns: Trigger::Mount,
+                            write: None,
+                        },
                     },
                 );
             }
@@ -1558,6 +1649,10 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     always: None,
                     self_slot: false,
                     stepping: false,
+                    why: EdgeWhy {
+                        reruns: Trigger::Render,
+                        write: Some(Obstacle::Store),
+                    },
                 },
             );
         }

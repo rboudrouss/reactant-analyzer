@@ -266,12 +266,23 @@ pub(in crate::rules) fn all_deps_provably_stable(
     deps: &[Expr],
     result: &AnalysisResult<StateValue>,
 ) -> bool {
+    unstable_deps(deps, result).is_empty()
+}
+
+/// The deps of `deps` that are not provably `Stable`, by position, with the
+/// verdict that keeps each one live: what [`all_deps_provably_stable`]
+/// quantifies over, for a message that names them.
+pub(in crate::rules) fn unstable_deps(
+    deps: &[Expr],
+    result: &AnalysisResult<StateValue>,
+) -> Vec<(usize, query::StabilityVerdict)> {
     let exit_env = result.exit_env();
     let mut eval = result.evaluator();
-    deps.iter().all(|dep| {
-        let val = eval.at(&exit_env, dep);
-        query::stability_verdict_of(&val).is_stable()
-    })
+    deps.iter()
+        .enumerate()
+        .map(|(i, dep)| (i, query::stability_verdict_of(&eval.at(&exit_env, dep))))
+        .filter(|(_, v)| !v.is_stable())
+        .collect()
 }
 
 #[cfg(test)]

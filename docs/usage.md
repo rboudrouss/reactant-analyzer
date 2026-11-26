@@ -449,6 +449,29 @@ Semantics:
   holds a parent's setter by (what a one-setter row's `var` says). The row's
   `var` and `hook_label` are its first entry's. A setter *called* during
   render keeps one row per setter, without `setters`.
+- `cycles`: present only on an `infinite-loop` or `cross-component-infinite-loop`
+  row of the churn graph's arms: every cycle the row stands for, where the
+  message names the first three and counts the rest. The Warning rows of one
+  rule and message family at one effect are one row, within a component and
+  across the components it is reported through, not one per cycle and per
+  component *(added by #421)*; an Error keeps one row per proof. Each entry is
+  `{ "component", "path", "steps" }`: the component the cycle is reported in,
+  the cycle as the message names it from there, and its steps in that order,
+  each `{ "component", "from", "state", "file", "line", "col", "reruns",
+  "unproven" }`: the component whose effect (or render) makes the write, the
+  state whose change re-runs it and the state it writes (`{ "component",
+  "state" }`, `component` `null` for a library store), where it writes it,
+  how the change re-runs it (`dep | versioned | props | every-render | read |
+  mount | render`), and why the analysis could not prove the step (`{ "kind",
+  "why" }`, `null` for a proven step): its write is a store's, a listener's
+  read as running wherever the program fires events, handed to code with no
+  timing summary (`handed-to-package`, `handed`), run on a later turn, in a
+  component that may be unmounted, moved by another write, a new reference not
+  on every path, a value no guard is proven to stop; or a change that only
+  may re-run it. The message says the first cycle's unproven step ("Not
+  proven: …"). **Breaking** for a reader that took one cycle per row: the row's
+  `message`, `component` and `notes` are its first cycle's; `components` lists
+  every component of its cycles.
 - `line` is 1-indexed, `col` is 0-indexed; both `null` when the diagnostic has
   no source range.
 - `severity` ∈ `"error" | "warning" | "info"`. Info entries appear only with

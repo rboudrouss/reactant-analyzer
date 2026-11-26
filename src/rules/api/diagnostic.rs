@@ -77,6 +77,145 @@ pub struct Diagnostic {
     /// A dispatch row's call (#407): the row is that call's, at `range`, and
     /// `setters` are what the listeners it runs write.
     pub dispatch: Option<DispatchRef>,
+    /// The cycles a loop row stands for, every one, in the order its message
+    /// names them ([`cycles_message`]); empty on every other row.
+    pub cycles: Vec<CycleRef>,
+    /// The family a loop row is one of at its site: rows of one rule and
+    /// family at one site are one row, listing their cycles, within a
+    /// component and across the components it is reported through
+    /// ([`merge_cycles`]). `None`: grouped only with a row saying the same.
+    pub family: Option<&'static str>,
+}
+
+/// One cycle a loop row stands for: the component it is reported in, the
+/// path its message names, and its steps in that order.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CycleRef {
+    /// The component the cycle is reported in, as the report names it.
+    pub component: String,
+    /// The cycle as the message names it, from that component
+    /// (`` `a` → `b` of `P` → `a` ``).
+    pub path: String,
+    pub steps: Vec<CycleStep>,
+    /// What a row of this cycle alone says.
+    pub sentence: String,
+    /// What it says of the step the analysis could not prove; `None` for a
+    /// proven cycle.
+    pub unproven: Option<String>,
+}
+
+/// One step of a cycle: a write the carrier's effect (or render) makes, which
+/// a change of `from` re-runs.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CycleStep {
+    /// The component whose effect or render makes the write.
+    pub carrier: String,
+    pub from: SlotRef,
+    /// The state the step writes.
+    pub to: SlotRef,
+    /// Where it writes it.
+    pub site: Option<SourceRange>,
+    /// How a change of `from` re-runs the carrier (`dep`, `versioned`,
+    /// `props`, `every-render`, `read`, `mount`, `render`).
+    pub reruns: &'static str,
+    /// Why the step is not proven to happen at every round, a kind and its
+    /// sentence, from the engine's own reason (`ChurnEdge::why`); `None` for
+    /// a step proven to.
+    pub unproven: Option<(&'static str, String)>,
+}
+
+/// A state of a cycle step.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SlotRef {
+    /// The component that owns it, as the report names it; `None` for a
+    /// library store (ADR-046).
+    pub component: Option<String>,
+    /// Its name as a message prints it, unquoted (`count`, `state #7`).
+    pub state: String,
+}
+
+impl CycleRef {
+    /// A loop row's message names this many cycles and counts the rest.
+    pub const NAMED: usize = 3;
+}
+
+/// The message of a loop row standing for `cycles`, in their order: the
+/// first one's sentence and what it could not prove, then the others,
+/// named up to [`CycleRef::NAMED`] in all and counted past, each with the
+/// component it is reported in where that is not the first one's.
+pub fn cycles_message(cycles: &[CycleRef]) -> String {
+    let Some(first) = cycles.first() else {
+        return String::new();
+    };
+    let mut msg = first.sentence.clone();
+    if let Some(u) = &first.unproven {
+        msg.push_str(". Not proven: ");
+        msg.push_str(u);
+    }
+    let rest = &cycles[1..];
+    if rest.is_empty() {
+        return msg;
+    }
+    let named: Vec<String> = rest
+        .iter()
+        .take(CycleRef::NAMED - 1)
+        .map(|c| match c.component == first.component {
+            true => format!("({})", c.path),
+            false => format!("({}) in `{}`", c.path, c.component),
+        })
+        .collect();
+    let list = match rest.len() - named.len() {
+        0 => match named.as_slice() {
+            [one] => one.clone(),
+            [init @ .., last] => format!("{} and {last}", init.join(", ")),
+            [] => String::new(),
+        },
+        more => format!("{} and {more} more", named.join(", ")),
+    };
+    let more = match rest.len() {
+        1 => "1 more cycle goes".to_string(),
+        n => format!("{n} more cycles go"),
+    };
+    msg.push_str(&format!(". {more} through this effect: {list}"));
+    msg
+}
+
+/// One row of `rows`, loop rows of one rule and family at one site: the
+/// first of the strongest level, standing for every cycle of them, each
+/// (component, path, sites) once, in that order, its message rebuilt from
+/// them. What the rule does with a component's rows and the report with a
+/// site's rows across components: the same facts, one row.
+pub fn merge_cycles<'d>(rows: impl IntoIterator<Item = &'d Diagnostic>) -> Option<Diagnostic> {
+    let mut rows = rows.into_iter();
+    let mut row = rows.next()?.clone();
+    for d in rows {
+        if d.severity.rank() > row.severity.rank() {
+            let cycles = std::mem::take(&mut row.cycles);
+            row = d.clone();
+            row.cycles.extend(cycles);
+        } else {
+            row.cycles.extend(d.cycles.iter().cloned());
+        }
+    }
+    // Two cycles alike in all three are one finding to a reader: the copies
+    // of a hook a component inlines twice, whose slots differ only by an id
+    // no output shows (one row of identical messages before, #129).
+    row.cycles.sort_by(|a, b| a.order().cmp(&b.order()));
+    row.cycles.dedup_by(|a, b| a.order() == b.order());
+    row.message = cycles_message(&row.cycles);
+    Some(row)
+}
+
+impl CycleRef {
+    /// The order a loop row lists its cycles in, and what tells two apart:
+    /// (component, path, the sites of its steps).
+    pub fn order(&self) -> (&str, &str, Vec<Option<SourceRange>>) {
+        (
+            &self.component,
+            &self.path,
+            self.steps.iter().map(|s| s.site).collect(),
+        )
+    }
 }
 
 /// The call of a dispatch row (#407).
@@ -147,6 +286,8 @@ impl Diagnostic {
             notes: vec![],
             setters: vec![],
             dispatch: None,
+            cycles: vec![],
+            family: None,
         }
     }
 
@@ -245,6 +386,8 @@ impl Diagnostic {
             notes: prov.notes.clone(),
             setters: vec![],
             dispatch: None,
+            cycles: vec![],
+            family: None,
         }
     }
 
@@ -279,6 +422,52 @@ mod tests {
         assert_eq!(d.severity(), Severity::Warning);
         let d = Diagnostic::info("r", "m").clamp(Severity::Warning);
         assert_eq!(d.severity(), Severity::Info);
+    }
+
+    #[test]
+    fn a_loop_row_names_its_first_cycles_and_counts_the_rest() {
+        let cycle = |component: &str, path: &str| CycleRef {
+            component: component.to_string(),
+            path: path.to_string(),
+            steps: vec![],
+            sentence: format!("these effects may form a state-update cycle ({path})"),
+            unproven: Some("the write of `a` is handed to package code".to_string()),
+        };
+        let one = [cycle("A", "`a` → `a`")];
+        assert_eq!(
+            cycles_message(&one),
+            "these effects may form a state-update cycle (`a` → `a`). Not proven: the write \
+             of `a` is handed to package code"
+        );
+        let five: Vec<CycleRef> = [
+            "`a` → `a`",
+            "`b` → `b`",
+            "`c` → `c`",
+            "`d` → `d`",
+            "`e` → `e`",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, p)| cycle(if i == 2 { "B" } else { "A" }, p))
+        .collect();
+        assert!(
+            cycles_message(&five).ends_with(
+                ". 4 more cycles go through this effect: (`b` → `b`), (`c` → `c`) in `B` and 2 \
+                 more"
+            ),
+            "{}",
+            cycles_message(&five)
+        );
+        // A merge keeps each cycle once, in (component, path) order, and
+        // rebuilds the message from them.
+        let mut a = Diagnostic::warn("infinite-loop", "x");
+        a.cycles = vec![five[1].clone(), five[0].clone()];
+        let mut b = Diagnostic::warn("infinite-loop", "y");
+        b.cycles = vec![five[0].clone(), five[2].clone()];
+        let m = merge_cycles([&a, &b]).unwrap();
+        let paths: Vec<&str> = m.cycles.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(paths, ["`a` → `a`", "`b` → `b`", "`c` → `c`"]);
+        assert_eq!(m.message, cycles_message(&m.cycles));
     }
 
     #[test]

@@ -12,8 +12,8 @@ use crate::{
 
 use crate::engine::Handover;
 use crate::engine::{
-    Always, Carrier, Change, ChurnEdge, ChurnGraph, EdgeStrength, EveryRender, Rerun, STORE_SLOT,
-    WriterPhase, WriterRegion,
+    Always, Carrier, Change, ChurnEdge, ChurnGraph, EdgeStrength, EveryRender, Obstacle, Rerun,
+    STORE_SLOT, Trigger, WriterPhase, WriterRegion,
 };
 use crate::ir::ComponentId;
 use crate::rules::api::query::must_effect_cycle;
@@ -21,7 +21,7 @@ use crate::rules::api::query::must_effect_cycle;
 /// A dispatching call of an effect (#407): its spelling, whether its
 /// listeners run at an unknown time and from package code, and where it is.
 type DispatchKey = (String, bool, bool, Option<SourceRange>);
-use crate::rules::helpers::cycles::{NodeNames, cycle_path, node_display};
+use crate::rules::helpers::cycles::{NodeNames, cycle_path, node_display, slot_ref};
 use crate::rules::{
     Certified, Diagnostic, MustResult, OnAllPaths, Rule, Severity, all_deps_provably_stable,
     must_on_all_paths, resolve_setter_aliases, state_slot_name, state_val_labels,
@@ -106,6 +106,8 @@ impl Rule for InfiniteLoop {
             // The parents' setters the listeners of each dispatching call of
             // the effect write (#407), one row per call and level.
             let mut dispatched: Vec<(DispatchKey, Vec<crate::rules::SetterRef>)> = Vec::new();
+            // The parents' setters the effect calls itself, one row of them.
+            let mut called: Vec<crate::rules::SetterRef> = Vec::new();
             for w in &comp_result.slot_writers {
                 if w.region != WriterRegion::Effect(*eff_label) {
                     continue;
@@ -169,48 +171,63 @@ impl Rule for InfiniteLoop {
                         continue;
                     }
 
-                    let deps_note = if deps.is_declared() {
-                        " (its deps do not provably gate it, so the effect can re-run every render)"
-                    } else {
-                        ""
-                    };
                     // The value it calls, when that is the setter; else the
                     // setter and what reaches it (D2).
                     let names = ctx.source_names();
-                    let parent = result.display_name(parent_comp);
-                    let called = match w.named(&comp_result.calls, comp_result.component) {
-                        (Some(n), None) => {
-                            format!("`{}`, a state setter of parent `{parent}`", names.name(&n))
-                        }
-                        (n, through) => format!(
-                            "the state setter {}of parent `{parent}` through `{}`",
-                            n.map_or_else(String::new, |n| format!("`{}` ", names.name(&n))),
-                            through.map_or_else(String::new, |t| names.name(t).into_owned())
-                        ),
+                    let (n, through) = w.named(&comp_result.calls, comp_result.component);
+                    let setter = crate::rules::SetterRef {
+                        name: n.map(|n| names.name(&n).into_owned()),
+                        parent: Some(result.display_name(parent_comp)),
+                        through: through.map(|t| names.name(t).into_owned()),
+                        var: Some(w.setter.clone()),
                     };
-                    let msg = format!(
-                        "this effect calls {called}{deps_note}. \
-                         Parent re-renders → child re-renders → effect fires again: infinite loop"
-                    );
-                    let mut diag = Diagnostic::warn("cross-component-infinite-loop", msg)
-                        .with_label(*eff_label);
-
-                    if let Some(r) = comp_result.effect_info.get(eff_label).and_then(|i| i.span) {
-                        diag = diag.with_range(r);
+                    if !called.contains(&setter) {
+                        called.push(setter);
                     }
-                    reported_effects.insert(*eff_label);
-                    diags.push(diag);
                 }
+            }
+            // One row per effect, listing the parents' setters it calls: the
+            // claim is about the effect's re-runs, which its condition names
+            // once, and each setter is a state it writes (#421).
+            if !called.is_empty() {
+                called.sort();
+                let mut diag = Diagnostic::warn(
+                    "cross-component-infinite-loop",
+                    cross_message(&called, |parents| {
+                        rerun_condition(
+                            *eff_label,
+                            deps,
+                            comp_result,
+                            result,
+                            ctx.source_names(),
+                            parents,
+                        )
+                    }),
+                )
+                .with_label(*eff_label);
+                diag.setters = called;
+                if let Some(r) = comp_result.effect_info.get(eff_label).and_then(|i| i.span) {
+                    diag = diag.with_range(r);
+                }
+                reported_effects.insert(*eff_label);
+                diags.push(diag);
             }
             // One row per dispatching call of the effect, at the call, listing
             // the parents' setters its listeners write (#407).
             for ((call, unknown, package, span), mut setters) in dispatched {
                 setters.sort();
-                let deps_note = if deps.is_declared() {
-                    " (its deps do not provably gate it, so the effect can re-run every render)"
-                } else {
-                    ""
+                let parents = match setters.len() {
+                    1 => format!("`{}`", setters[0].parent.as_deref().unwrap_or("its parent")),
+                    _ => "one of those parents".to_string(),
                 };
+                let condition = rerun_condition(
+                    *eff_label,
+                    deps,
+                    comp_result,
+                    result,
+                    ctx.source_names(),
+                    &parents,
+                );
                 let list: Vec<String> = setters
                     .iter()
                     .take(crate::rules::SetterRef::NAMED)
@@ -237,8 +254,12 @@ impl Rule for InfiniteLoop {
                 };
                 let msg = format!(
                     "this effect's `{call}` fires events{place}, and the listeners they may \
-                     reach call {what}{deps_note}. Parent re-renders → child re-renders → \
-                     effect fires again: infinite loop"
+                     reach call {what}, and the analysis bounds no value {states}. \
+                     {condition}: possible infinite render loop",
+                    states = match setters.len() {
+                        1 => "that state takes",
+                        _ => "those states take",
+                    }
                 );
                 let mut diag = match package {
                     true => Diagnostic::info("cross-component-infinite-loop", msg),
@@ -271,7 +292,7 @@ impl Rule for InfiniteLoop {
             &reported_effects,
         ));
 
-        diags
+        group_loop_rows(diags)
     }
 }
 
@@ -453,12 +474,45 @@ fn check_multi_effect_cycles(
                      next effect: possible infinite render loop"
                 )
             };
+            // The family of the row, the branch above that worded it: a
+            // Warning's, which its site groups (#421); an Error keeps its own
+            // row and its own proof.
+            let family = (!certain).then_some(
+                match (
+                    store_callee.is_some() && cyc.len() == 1,
+                    cyc.iter().all(|e| allocates(e)),
+                    always.is_some(),
+                    cyc.len(),
+                ) {
+                    (true, ..) => "store-self",
+                    (false, false, true, _) => "may-every-render",
+                    (false, false, false, 1) => "may-self",
+                    (false, false, false, _) => "may-cycle",
+                    (false, true, true, _) => "fresh-every-render",
+                    (false, true, false, 1) => "fresh-self",
+                    (false, true, false, _) => "fresh-cycle",
+                },
+            );
+            let steps = cycle_steps(&cyc, component, result, &mut names);
+            let cycle_ref = crate::rules::CycleRef {
+                component: result.display_name(component),
+                path: path.clone(),
+                unproven: family.map(|_| unproven_step(&steps, cycle.cross_component)),
+                steps,
+                sentence: msg.clone(),
+            };
+            let msg = match family {
+                Some(_) => crate::rules::cycles_message(std::slice::from_ref(&cycle_ref)),
+                None => msg,
+            };
 
             let mut diag = match cycle_proof {
                 Some(proof) => Diagnostic::error(rule, proof, msg),
                 None => Diagnostic::warn(rule, msg),
             }
             .with_label(effect_label);
+            diag.cycles = vec![cycle_ref];
+            diag.family = family;
             if let Some(r) = comp_result
                 .effect_info
                 .get(&effect_label)
@@ -570,6 +624,389 @@ fn always_clause(
     (clause, if surely { "re-runs" } else { "may re-run" })
 }
 
+/// The steps of a cycle the graph reports, in its order, as a loop row's
+/// `cycles` names them from `viewer`: the write each makes, how a change of
+/// its source re-runs it and, for a step not proven to happen at every
+/// round, why, read off the engine's own reason (`ChurnEdge::why`).
+fn cycle_steps(
+    cyc: &[&ChurnEdge],
+    viewer: ComponentId,
+    result: &ProgramAnalysisResult,
+    names: &mut NodeNames,
+) -> Vec<crate::rules::CycleStep> {
+    cyc.iter()
+        .map(|e| crate::rules::CycleStep {
+            carrier: result.display_name(e.component),
+            from: slot_ref(&e.from, result, names),
+            to: slot_ref(&e.to, result, names),
+            site: e.write_span,
+            reruns: trigger_kind(e.why.reruns),
+            unproven: (e.strength != EdgeStrength::Must)
+                .then(|| unproven(e, viewer, result, names)),
+        })
+        .collect()
+}
+
+/// A trigger as `cycles` names it.
+fn trigger_kind(t: Trigger) -> &'static str {
+    match t {
+        Trigger::Dep => "dep",
+        Trigger::Versioned => "versioned",
+        Trigger::Props => "props",
+        Trigger::EveryRender => "every-render",
+        Trigger::Read => "read",
+        Trigger::Mount => "mount",
+        Trigger::Render => "render",
+    }
+}
+
+/// Why the may edge `e` is not proven to happen at every round, as a kind and
+/// a sentence naming its states from `viewer`: its write's obstacle, else
+/// (a write that changes its slot at every run) its re-run, which only may.
+fn unproven(
+    e: &ChurnEdge,
+    viewer: ComponentId,
+    result: &ProgramAnalysisResult,
+    names: &mut NodeNames,
+) -> (&'static str, String) {
+    let to = node_display(&e.to, viewer, result, names);
+    let from = node_display(&e.from, viewer, result, names);
+    let carrier = result.display_name(e.component);
+    let at = e.write_span.map_or_else(String::new, |r| {
+        let file = result
+            .file_table
+            .path(r.file)
+            .and_then(|p| p.file_name())
+            .map_or_else(String::new, |f| f.to_string_lossy().into_owned());
+        format!(" at `{file}:{}`", r.line)
+    });
+    let handed = |whom: &str| {
+        format!(
+            "the write of {to}{at} is handed to {whom}, which may run it at any time, a render \
+             included; if it runs it only after a user action, this step does not happen"
+        )
+    };
+    match e.why.write {
+        Some(Obstacle::Store) if e.carrier == Carrier::Render => (
+            "store",
+            format!(
+                "the render of `{carrier}` may write a library store{at}, which re-renders \
+                 every component that reads it"
+            ),
+        ),
+        Some(Obstacle::Store) => (
+            "store",
+            format!(
+                "the effect may write a library store{at}, which re-renders every component \
+                 that reads it"
+            ),
+        ),
+        Some(Obstacle::Listener) => (
+            "listener",
+            format!(
+                "the write of {to}{at} sits in an event listener, read as running wherever the \
+                 program fires events; if no code fires its event, it runs only on user input"
+            ),
+        ),
+        Some(Obstacle::Handed(Handover::Package)) => (
+            "handed-to-package",
+            handed("package code the analysis does not see"),
+        ),
+        Some(Obstacle::Handed(Handover::Other)) => {
+            ("handed", handed("a callee with no timing summary"))
+        }
+        Some(Obstacle::Later) => (
+            "later",
+            format!(
+                "the write of {to}{at} runs on a later turn (a timer, a promise, a cleanup), \
+                 whose rounds no proof bounds"
+            ),
+        ),
+        Some(Obstacle::Unmounted) => (
+            "unmounted",
+            format!(
+                "the write of {to}{at} changes it at every run, but an ancestor's guard or key \
+                 may unmount `{carrier}` before its effect runs again"
+            ),
+        ),
+        Some(Obstacle::Moved) => (
+            "moved",
+            format!(
+                "another write of {to} may move it away from what the write{at} leaves there, \
+                 so no guard of that write is proven to stop it"
+            ),
+        ),
+        Some(Obstacle::Fresh) => (
+            "fresh",
+            format!(
+                "the write{at} stores a new reference into {to}, but not on every path, or \
+                 another write of {to} may restore it"
+            ),
+        ),
+        Some(Obstacle::Value) => (
+            "value",
+            format!(
+                "no guard of the write of {to}{at} is proven to stop it once {to} holds what it \
+                 stores"
+            ),
+        ),
+        None => match e.why.reruns {
+            Trigger::Mount => (
+                "mount",
+                format!(
+                    "`{carrier}` may remount when {from} changes, which runs its effects again"
+                ),
+            ),
+            Trigger::Props => (
+                "props",
+                format!(
+                    "the effect of `{carrier}` re-runs when its props change, which a change of \
+                     {from} may not cause"
+                ),
+            ),
+            Trigger::Versioned => (
+                "versioned",
+                format!(
+                    "the effect of `{carrier}` re-runs on a value computed from {from}, which may \
+                     stay the same when {from} changes"
+                ),
+            ),
+            Trigger::EveryRender => (
+                "every-render",
+                format!("the effect of `{carrier}` may re-run after every render"),
+            ),
+            Trigger::Read => (
+                "read",
+                format!(
+                    "the write{at} reads {from}, which is no dep: a change of it reaches the \
+                     write only when another dep re-runs the effect"
+                ),
+            ),
+            Trigger::Dep | Trigger::Render => (
+                "dep",
+                format!(
+                    "the effect of `{carrier}` re-runs on {from}, but the cycle crosses \
+                     components, where no re-run is proven"
+                ),
+            ),
+        },
+    }
+}
+
+/// The step of `steps` a loop row says it could not prove: the first of the
+/// most actionable kind — code with no timing summary, a listener, the
+/// store, a later turn, a remount first: what a reader can check in the
+/// source — or, every step changing its state at every run, why the cycle is
+/// still not proven.
+fn unproven_step(steps: &[crate::rules::CycleStep], cross_component: bool) -> String {
+    const RANK: &[&str] = &[
+        "handed-to-package",
+        "handed",
+        "listener",
+        "store",
+        "later",
+        "mount",
+        "moved",
+        "unmounted",
+        "value",
+        "fresh",
+        "props",
+        "versioned",
+        "every-render",
+        "read",
+        "dep",
+    ];
+    let rank = |k: &str| RANK.iter().position(|r| *r == k).unwrap_or(RANK.len());
+    steps
+        .iter()
+        .filter_map(|s| s.unproven.as_ref())
+        .min_by_key(|(k, _)| rank(k))
+        .map(|(_, why)| why.clone())
+        .unwrap_or_else(|| match cross_component {
+            true => "each step changes its state at every run, but the cycle crosses \
+                     components, where no re-run is proven"
+                .to_string(),
+            false => "no step is proven to happen at every round".to_string(),
+        })
+}
+
+/// One row per (rule, site, family) of a component's loop rows (#421): the
+/// rows of one family at one effect site are the cycles through it — several
+/// effects at one site (a hook called twice), several states one effect
+/// writes — and become one row standing for every cycle of them
+/// ([`merge_cycles`](crate::rules::merge_cycles)). The report groups a
+/// site's rows across components the same way. A row with no family (an
+/// Error, which keeps its own proof; an Info) or no site keeps its own.
+/// After every proof: only how the arms' rows are reported changes.
+fn group_loop_rows(rows: Vec<Diagnostic>) -> Vec<Diagnostic> {
+    let mut out: Vec<Diagnostic> = Vec::with_capacity(rows.len());
+    let mut groups: Vec<Vec<Diagnostic>> = Vec::new();
+    type Key = (
+        std::borrow::Cow<'static, str>,
+        SourceRange,
+        u8,
+        &'static str,
+    );
+    let mut at: HashMap<Key, usize> = HashMap::new();
+    for d in rows {
+        let (Some(range), Some(family)) = (d.range, d.family) else {
+            out.push(d);
+            continue;
+        };
+        match at.entry((d.rule.clone(), range, d.severity().rank(), family)) {
+            std::collections::hash_map::Entry::Occupied(g) => groups[*g.get()].push(d),
+            std::collections::hash_map::Entry::Vacant(g) => {
+                g.insert(groups.len());
+                groups.push(vec![d]);
+            }
+        }
+    }
+    for mut group in groups {
+        // The row a group is printed as is its first cycle's, whatever order
+        // the arms found them in.
+        fn first(d: &Diagnostic) -> Option<(&str, &str, Vec<Option<SourceRange>>)> {
+            d.cycles.iter().map(|c| c.order()).min()
+        }
+        group.sort_by(|a, b| (first(a), a.hook_label).cmp(&(first(b), b.hook_label)));
+        match group.len() {
+            1 => out.extend(group),
+            _ => out.extend(crate::rules::merge_cycles(&group)),
+        }
+    }
+    out
+}
+
+/// The cross-component arm's row of an effect that calls parents' setters
+/// (#421): one setter as the source spells it at the call, or the setters
+/// counted and the first [`SetterRef::NAMED`](crate::rules::SetterRef::NAMED)
+/// named; then what the arm established, `condition` told whose re-render a
+/// loop needs.
+fn cross_message(
+    setters: &[crate::rules::SetterRef],
+    condition: impl Fn(&str) -> String,
+) -> String {
+    let parents: HashSet<&str> = setters.iter().filter_map(|s| s.parent.as_deref()).collect();
+    let whose = match (
+        parents.len(),
+        setters.first().and_then(|s| s.parent.as_deref()),
+    ) {
+        (1, Some(p)) => format!("`{p}`"),
+        _ => "one of those parents".to_string(),
+    };
+    if let [s] = setters {
+        let parent = s.parent.as_deref().unwrap_or_default();
+        let called = match (&s.name, &s.through) {
+            (Some(n), None) => format!("`{n}`, a state setter of parent `{parent}`"),
+            (n, through) => format!(
+                "the state setter {}of parent `{parent}` through `{}`",
+                n.as_ref().map_or_else(String::new, |n| format!("`{n}` ")),
+                through.as_deref().unwrap_or_default()
+            ),
+        };
+        return format!(
+            "this effect calls {called}, and the analysis bounds no value that state takes. \
+             {}: possible infinite render loop",
+            condition(&whose)
+        );
+    }
+    let named: Vec<String> = setters
+        .iter()
+        .take(crate::rules::SetterRef::NAMED)
+        .map(|s| s.entry(true))
+        .collect();
+    let list = match setters.len() - named.len() {
+        0 => named.join(", "),
+        more => format!("{} and {more} more", named.join(", ")),
+    };
+    format!(
+        "this effect calls {} state setters of parent components ({list}), and the analysis \
+         bounds no value those states take. {}: possible infinite render loop",
+        setters.len(),
+        condition(&whose)
+    )
+}
+
+/// What the cross-component arm established about an effect's re-runs, as
+/// the sentence of its row: the condition under which it loops. The arm
+/// claims on a write of a parent's state no bound settles, made by an effect
+/// its deps do not gate for good — never on a re-render of the parent
+/// re-running the effect, so that is left as the condition, with the deps
+/// not proven stable and why: the slots the engine's trigger rows say a dep
+/// moves with, else what its value is. `parents` names whose re-render it
+/// would be.
+fn rerun_condition(
+    label: HookLabel,
+    deps: &crate::ir::hooks::DepsArg,
+    comp: &crate::engine::AnalysisResult<crate::domains::StateValue>,
+    program: &ProgramAnalysisResult,
+    names: &crate::ir::SourceNames,
+    parents: &str,
+) -> String {
+    use crate::ir::hooks::DepsArg;
+    use crate::rules::api::query::StabilityVerdict;
+    let list = match deps {
+        DepsArg::Absent => {
+            return format!(
+                "It has no dependency array, so a re-render of {parents} that re-renders this \
+                 component runs it again"
+            );
+        }
+        DepsArg::Opaque(_) => {
+            return format!(
+                "Its deps argument cannot be read: if a re-render of {parents} re-runs it, it \
+                 writes again"
+            );
+        }
+        DepsArg::List(l) if l.arity.exact().is_none() => {
+            return format!(
+                "Its deps hold a spread the analysis cannot read in full: if a re-render of \
+                 {parents} changes one of them, the effect runs and writes again"
+            );
+        }
+        DepsArg::List(l) => l.as_slice(),
+    };
+    let mut slots: NodeNames = HashMap::new();
+    let why: Vec<String> = crate::rules::unstable_deps(list, comp)
+        .into_iter()
+        .map(|(i, verdict)| {
+            let dep = names.describe(&list[i]);
+            let mut moves: Vec<String> = crate::engine::triggers_of(&comp.effect_triggers, label)
+                .filter(|t| t.dep == i)
+                .map(|t| match t.slot == STORE_SLOT {
+                    true => "a library store".to_string(),
+                    false => format!(
+                        "state {}",
+                        node_display(&t.slot, comp.component, program, &mut slots)
+                    ),
+                })
+                .collect();
+            moves.dedup();
+            if !moves.is_empty() {
+                return format!("`{dep}` changes with {}", moves.join(" or "));
+            }
+            match verdict {
+                StabilityVerdict::Versioned(on) if !on.is_empty() => {
+                    let on: Vec<String> = on
+                        .iter()
+                        .map(|s| node_display(s, comp.component, program, &mut slots))
+                        .collect();
+                    format!("`{dep}` changes with state {}", on.join(" or "))
+                }
+                StabilityVerdict::Versioned(_) => format!("`{dep}` changes with some state"),
+                StabilityVerdict::PerRender => format!("`{dep}` may change at every render"),
+                StabilityVerdict::Unknown | StabilityVerdict::Stable => {
+                    format!("`{dep}` is a value the analysis cannot bound")
+                }
+            }
+        })
+        .collect();
+    format!(
+        "Its deps are not proven stable ({}): if a re-render of {parents} changes one of them, \
+         the effect runs and writes again",
+        why.join("; ")
+    )
+}
+
 /// The message of a loop through the store alone (ADR-046): effect `label`
 /// may write the store through `callee` and re-runs when it moves — on a dep
 /// a library store holds, or after every render (`always`).
@@ -667,6 +1104,7 @@ fn check_object_churn(
     let cfg = &comp_result.render_cfg;
     let state_vals = resolve_setter_aliases(cfg, &state_val_labels(cfg));
     let mut diags = Vec::new();
+    let mut names: NodeNames = HashMap::new();
 
     for hook in &comp_result.hooks {
         let HookEntry::Effect {
@@ -701,12 +1139,13 @@ fn check_object_churn(
         // Best churn finding per slot: (severity, call span, Error proof,
         // whether the effect stores a new reference into the slot, whether
         // the proven loop rests on a step instead).
-        type ChurnBest = (
+        type ChurnBest<'g> = (
             Severity,
             Option<SourceRange>,
             Option<Certified<OnAllPaths>>,
             bool,
             bool,
+            &'g ChurnEdge,
         );
         let mut best: HashMap<HookLabel, ChurnBest> = HashMap::new();
         for e in edges {
@@ -769,12 +1208,12 @@ fn check_object_churn(
             if replace {
                 best.insert(
                     state_label,
-                    (sev, e.write_span, churn_proof, allocates, e.stepping),
+                    (sev, e.write_span, churn_proof, allocates, e.stepping, e),
                 );
             }
         }
 
-        for (state_label, (sev, call_span, proof, allocates, stepping)) in best {
+        for (state_label, (sev, call_span, proof, allocates, stepping, edge)) in best {
             // One report per effect, as in the cycle arm: an effect the
             // cross arm flagged keeps that report, unless this arm holds the
             // stronger, proven verdict.
@@ -829,6 +1268,28 @@ fn check_object_churn(
                 ),
             }
             .with_label(state_label);
+            // The self-edge as a cycle of one step, which a Warning's site
+            // groups by its family (#421): every state of the effect.
+            if sev != Severity::Info {
+                let steps = cycle_steps(&[edge], component, result, &mut names);
+                let state = node_display(&edge.to, component, result, &mut names);
+                let warn = sev == Severity::Warning;
+                let cycle_ref = crate::rules::CycleRef {
+                    component: result.display_name(component),
+                    path: format!("{state} → {state}"),
+                    unproven: warn.then(|| unproven_step(&steps, false)),
+                    steps,
+                    sentence: diag.message.clone(),
+                };
+                if warn {
+                    diag.message = crate::rules::cycles_message(std::slice::from_ref(&cycle_ref));
+                    diag.family = Some(match allocates {
+                        true => "churn-fresh",
+                        false => "churn-may",
+                    });
+                }
+                diag.cycles = vec![cycle_ref];
+            }
             if let Some(r) = eff_span {
                 diag = diag.with_range(r);
             }

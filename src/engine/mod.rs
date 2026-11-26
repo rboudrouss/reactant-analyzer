@@ -33,7 +33,10 @@ pub use analysis_result::{
 };
 pub use calls::{CallRelation, Escapes, Targets};
 pub use cfg_analyzer::analyze_cfg;
-pub use churn::{Carrier, ChurnCycle, ChurnEdge, ChurnGraph, EdgeStrength, EveryRender};
+pub use churn::{
+    Carrier, ChurnCycle, ChurnEdge, ChurnGraph, EdgeStrength, EdgeWhy, EveryRender, Obstacle,
+    Trigger,
+};
 pub use component_cache::ComponentCache;
 pub use component_registry::{ComponentKey, ComponentRegistry};
 pub use dominance::{DominatorTree, compute_dominators, dominates, on_all_paths};

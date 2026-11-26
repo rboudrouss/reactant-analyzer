@@ -178,6 +178,7 @@ pub fn render(
             let Some(consumers) = locations.consumers(ci, di) else {
                 continue;
             };
+            let d = locations.merged(ci, di).unwrap_or(d);
             let (sev_color, sev_tag) = match d.severity() {
                 Severity::Error => (p.red, "error"),
                 Severity::Warning => (p.yellow, "warn "),
@@ -240,6 +241,22 @@ pub fn render(
                     setters.join(", "),
                     p.reset
                 );
+            }
+            // A loop row standing for several cycles lists them all under
+            // `--trace`, each with the step the analysis could not prove.
+            if trace && d.cycles.len() > 1 {
+                for c in &d.cycles {
+                    let unproven = c
+                        .unproven
+                        .as_deref()
+                        .map(|u| format!(": not proven: {u}"))
+                        .unwrap_or_default();
+                    let _ = writeln!(
+                        out,
+                        "       {}cycle in {}: {}{}{}",
+                        p.dim, c.component, c.path, unproven, p.reset
+                    );
+                }
             }
             if trace {
                 // Depth gate (ADR-019): pathological chains stay bounded.

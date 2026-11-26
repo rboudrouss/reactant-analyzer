@@ -270,6 +270,32 @@ on a program React settles; 323 oracle cases, none a known false negative.
   premise covers only the other aliases (a `let`, a parameter). memos 214 →
   185 shown (29 hand-overs Info), bulletproof-react 46 → 31 (15), novel 14 →
   13 (1); the other 8 small repos and mantine do not move (#404).
+- `cross-component-infinite-loop`'s row of an effect that calls a parent's
+  setter, and of an effect whose dispatch's listeners do, says what the
+  analysis established: the parent's state is not bounded, the deps not
+  proven stable and why each is not (`search` changes with state `search`),
+  and that a loop needs a re-render of the parent to change one of them. It
+  said "Parent re-renders → child re-renders → effect fires again: infinite
+  loop", a re-fire it did not prove and that is false where the deps are the
+  child's own state (dub's `Combobox`). Same rows, same level (#421).
+- **Breaking** for a reader that took one cycle per row: the churn graph's
+  Warning rows of `infinite-loop` and `cross-component-infinite-loop` are one
+  row per rule, message family and effect site, within a component and across
+  the components it is reported through, standing for every cycle in a new
+  JSON `cycles` field: each cycle's component, path and steps (who writes
+  which state where, how a change re-runs it, and the step the analysis could
+  not prove and why, read off the engine's own reason for the edge). The
+  message words the first cycle, says its unproven step ("Not proven: the
+  write of `x` at `f.tsx:12` is handed to package code …"), names the next two
+  and counts the rest; `--trace` and the GitHub action list them all. An
+  effect that calls several parents' setters is one row listing them in
+  `setters`. An Error keeps one row per proof, and `--per-component` each
+  component's own cycles. The same claims (the set of rule, level, site,
+  component and cycle is equal before and after on the 11 small repos and
+  mantine, dub and twenty): shown rows 2,779 → 2,755 on the small repos and
+  mantine (mantine 1,897 → 1,881, excalidraw 145 → 141, memos 183 → 179),
+  dub 1,482 → 1,307 (loop rows 419 → 244), twenty 2,150 → 2,092 (loop rows
+  298 → 240), one run each against the base's CI artifact (#421).
 
 ### Removed
 
@@ -824,6 +850,15 @@ on a program React settles; 323 oracle cases, none a known false negative.
   Shown rows: excalidraw 135 → 145, mantine 1,846 → 1,897 (most a `ref` on
   an element a component element receives, read as mounting at any render),
   the 10 other small repos unchanged (#412).
+- A call through a value that may be several closures or setters (a prop two
+  elements fill with two closures) stores what any of them stores: its writer
+  row kept the first closure's value alone, a single `0` where the other
+  closure steps the parent's state, so the churn graph had no edge and only
+  the cross-component arm claimed the loop React runs. With that arm switched
+  off, 3 fuzz seeds ×300 go from 1 `fn` to 0, and 14 seeds ×1000 have none.
+  Oracle: 3 new cases (two loops the graph now claims alone, their settling
+  neighbour `tn`); the 11 small repos and mantine unchanged, and no new claim
+  on dub or twenty (#421).
 - A function handed as a prop to a child component the analysis does not see
   (a package's component, an element value it does not resolve, a name several
   files define, a component rendering itself, a context provider's `value`)

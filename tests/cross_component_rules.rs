@@ -199,9 +199,18 @@ fn cross_component_infinite_loop_fires_all_unstable_deps() {
         "cross-component-infinite-loop should fire: [value] is entirely unstable \
          (Number widens) → effect runs every render → infinite loop"
     );
+    // The row states what the arm established: the dep not proven stable,
+    // and the condition a loop needs, not a re-fire it did not prove.
     assert!(
-        diags[0].message.contains("do not provably gate"),
-        "diagnostic should mention that the deps do not gate the effect"
+        diags[0]
+            .message
+            .contains("Its deps are not proven stable (`value`")
+            && diags[0]
+                .message
+                .contains("if a re-render of `Section23_Parent` changes one of them")
+            && !diags[0].message.contains("effect fires again"),
+        "{}",
+        diags[0].message
     );
 }
 
