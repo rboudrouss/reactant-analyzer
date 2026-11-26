@@ -118,10 +118,15 @@ impl Profile {
             .iter()
             .map(|o| format!("{}/{}", self.name(o.component), o.kind))
             .collect();
+        let counts: Vec<String> = top_n(&self.counts, 6)
+            .into_iter()
+            .map(|(c, n)| format!("{c}={n}"))
+            .collect();
         eprintln!(
-            "[profile] live: runs={} top=[{}] analyses=[{}]",
+            "[profile] live: runs={} top=[{}] counts=[{}] analyses=[{}]",
             self.runs,
             top.join(" "),
+            counts.join(" "),
             stack.join(" > ")
         );
     }

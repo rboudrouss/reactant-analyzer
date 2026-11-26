@@ -307,7 +307,7 @@ fn writes_move_together(
     let tables = crate::engine::setters::WriterTables::of_result(comp);
     let mut found = false;
     for scope in scopes {
-        let (sites, _) = tables.write_sites(scope, &comp.calls, None, false);
+        let (sites, _, _) = tables.write_sites(scope, &comp.calls, None, false);
         if !sites.iter().any(|s| s.slot == (owner, slot)) {
             continue;
         }

@@ -107,3 +107,244 @@ fn a_dispatch_runs_the_components_jsx_handlers_of_that_event() {
 fn without_a_dispatch_the_listener_is_event_only() {
     assert_eq!(loop_claims(&with_trigger("")), 0);
 }
+
+/// Every row of the loop rules on `component`, Info included.
+fn rows_on(src: &str, component: &str) -> Vec<reactant::rules::Diagnostic> {
+    use oxc_allocator::Allocator;
+    use oxc_parser::{ParseOptions, Parser};
+    use oxc_span::SourceType;
+
+    let alloc = Allocator::default();
+    let ret = Parser::new(&alloc, src, SourceType::tsx())
+        .with_options(ParseOptions::default())
+        .parse();
+    let path = std::path::Path::new("test.tsx");
+    let components = lower_program(&ret.program, src, path, &mut Default::default());
+    let r = analyze_program(
+        ComponentRegistry::from_components(components),
+        HookRegistry::new(),
+        RootStrategy::Heuristic,
+        &Config::default(),
+    );
+    let ctx = RuleCtx::new(&r, r.component_named(component).unwrap());
+    all_rules()
+        .iter()
+        .filter(|rule| {
+            [
+                "infinite-loop",
+                "cross-component-infinite-loop",
+                "setter-in-render",
+                "cross-setter-in-render",
+            ]
+            .contains(&rule.name())
+        })
+        .flat_map(|rule| rule.check(&ctx))
+        .collect()
+}
+
+#[test]
+fn the_writes_of_one_dispatch_are_one_row_of_its_call() {
+    // #407: the render's click reaches two listeners, each writing its own
+    // state with the event: one row, at the click, listing both setters.
+    let src = r#"
+import { useEffect, useRef, useState } from "react";
+export function App() {
+  const [a, setA] = useState<unknown>(0);
+  const [b, setB] = useState<unknown>(0);
+  const [m, setM] = useState(0);
+  const ref = useRef<HTMLButtonElement>(null);
+  useEffect(() => { setM(1); }, []);
+  ref.current?.click();
+  return <div onClick={setB}><button ref={ref} onClick={setA}>{m}</button></div>;
+}
+"#;
+    let rows: Vec<_> = rows_on(src, "App")
+        .into_iter()
+        .filter(|d| d.rule == "setter-in-render")
+        .collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let row = &rows[0];
+    assert!(row.dispatch.is_some());
+    assert_eq!(row.setters.len(), 2, "{:?}", row.setters);
+    assert!(
+        row.message.contains("fires events during render"),
+        "{}",
+        row.message
+    );
+    assert!(!row.message.contains("called directly"));
+}
+
+#[test]
+fn a_focus_on_a_host_ref_reaches_its_path_and_every_blur_listener() {
+    // #407, N2: the effect focuses its own input. An ancestor's `onFocus`
+    // is on the path; a leaf input elsewhere hears no focus, but its
+    // `onBlur` may (it may hold the focus).
+    let src = |listener: &str, wrapper: &str| {
+        format!(
+            r#"
+import {{ useEffect, useRef, useState }} from "react";
+export function App() {{
+  const [x, setX] = useState<unknown>(0);
+  const ref = useRef<HTMLInputElement>(null);
+  useEffect(() => {{ ref.current?.focus(); }});
+  return <div {wrapper}>{{String(!!x)}}<input ref={{ref}} /><input {listener} /></div>;
+}}
+"#
+        )
+    };
+    let claimed = |s: &str| {
+        claims_on(s, "App")
+            .iter()
+            .any(|(rule, _)| rule == "infinite-loop")
+    };
+    assert!(
+        claimed(&src("", "onFocus={() => setX({})}")),
+        "the ancestor's onFocus"
+    );
+    assert!(
+        !claimed(&src("onFocus={() => setX({})}", "")),
+        "a leaf's onFocus"
+    );
+    assert!(
+        claimed(&src("onBlur={() => setX({})}", "")),
+        "a leaf's onBlur"
+    );
+}
+
+/// The Warning or Error loop claims of every loop rule on `component`, the
+/// components no element renders the roots (a child gets its parent's
+/// props).
+fn claims_on(src: &str, component: &str) -> Vec<(String, Severity)> {
+    use oxc_allocator::Allocator;
+    use oxc_parser::{ParseOptions, Parser};
+    use oxc_span::SourceType;
+
+    let alloc = Allocator::default();
+    let ret = Parser::new(&alloc, src, SourceType::tsx())
+        .with_options(ParseOptions::default())
+        .parse();
+    assert!(ret.diagnostics.is_empty(), "{:?}", ret.diagnostics);
+    let path = std::path::Path::new("test.tsx");
+    let components = lower_program(&ret.program, src, path, &mut Default::default());
+    let r = analyze_program(
+        ComponentRegistry::from_components(components),
+        HookRegistry::new(),
+        RootStrategy::Heuristic,
+        &Config::default(),
+    );
+    let ctx = RuleCtx::new(&r, r.component_named(component).unwrap());
+    all_rules()
+        .iter()
+        .filter(|rule| {
+            [
+                "infinite-loop",
+                "cross-component-infinite-loop",
+                "setter-in-render",
+                "cross-setter-in-render",
+            ]
+            .contains(&rule.name())
+        })
+        .flat_map(|rule| rule.check(&ctx))
+        .filter(|d| d.severity() != Severity::Info)
+        .map(|d| (d.rule.to_string(), d.severity()))
+        .collect()
+}
+
+#[test]
+fn a_dispatch_runs_a_setter_handed_as_the_listener() {
+    // #407: the render clicks its own button, whose `onClick` is the setter.
+    let src = r#"
+import { useEffect, useRef, useState } from "react";
+export function App() {
+  const [n, setN] = useState<unknown>(0);
+  const [m, setM] = useState(0);
+  const ref = useRef<HTMLButtonElement>(null);
+  useEffect(() => { setM(1); }, []);
+  ref.current?.click();
+  return <button ref={ref} onClick={setN}>{m}{String(!!n)}</button>;
+}
+"#;
+    let claims = claims_on(src, "App");
+    assert!(
+        claims.contains(&("setter-in-render".into(), Severity::Warning)),
+        "{claims:?}"
+    );
+    // A focus fires no `click`: React never runs `onClick` for it.
+    assert!(claims_on(&src.replace(".click()", ".focus()"), "App").is_empty());
+    // A click from a handler runs the setter at event time.
+    let handled = src.replace(
+        "ref.current?.click();\n  return <button",
+        "return <><button onClick={() => ref.current?.click()}>go</button><button",
+    );
+    let handled = handled.replace("</button>;", "</button></>;");
+    assert!(claims_on(&handled, "App").is_empty(), "{handled}");
+}
+
+#[test]
+fn a_dispatch_runs_the_listeners_of_another_component() {
+    // #407: the child's render clicks its button, whose `onClick` is the
+    // parent's setter; and a click bubbles to the parent's `onClick`.
+    let child_button = r#"
+import { useEffect, useRef, useState } from "react";
+function Child({ onOpen }: { onOpen: (e: unknown) => void }) {
+  const ref = useRef<HTMLButtonElement>(null);
+  ref.current?.click();
+  return <button ref={ref} onClick={onOpen}>open</button>;
+}
+export function App() {
+  const [n, setN] = useState<unknown>(0);
+  const [m, setM] = useState(0);
+  useEffect(() => { setM(1); }, []);
+  return <div>{m}{String(!!n)}<Child onOpen={setN} /></div>;
+}
+"#;
+    assert!(
+        claims_on(child_button, "Child")
+            .contains(&("cross-setter-in-render".into(), Severity::Warning)),
+    );
+    let bubbles = r#"
+import { useEffect, useRef, useState } from "react";
+function Child() {
+  const ref = useRef<HTMLButtonElement>(null);
+  ref.current?.click();
+  return <button ref={ref}>go</button>;
+}
+export function App() {
+  const [n, setN] = useState(0);
+  const [m, setM] = useState(0);
+  useEffect(() => { setM(1); }, []);
+  return <div onClick={() => setN((x) => x + 1)}>{n}{m}<Child /></div>;
+}
+"#;
+    assert!(
+        claims_on(bubbles, "Child").contains(&("cross-setter-in-render".into(), Severity::Warning)),
+    );
+}
+
+#[test]
+fn a_dispatch_runs_a_package_hooks_listener() {
+    // #407: `useOnClickOutside` runs its handler from a document listener,
+    // which the render's dispatch reaches.
+    let src = r#"
+import { useEffect, useRef, useState } from "react";
+import { useOnClickOutside } from "usehooks-ts";
+export function App() {
+  const [n, setN] = useState(0);
+  const [m, setM] = useState(0);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => { setM(1); }, []);
+  if (m) {
+    const ev = document.createEvent("Event");
+    ev.initEvent("mousedown", true, true);
+    document.body.dispatchEvent(ev);
+  }
+  useOnClickOutside(ref, () => setN(n + 1));
+  return <div ref={ref}>{n}</div>;
+}
+"#;
+    assert!(
+        claims_on(src, "App").contains(&("setter-in-render".into(), Severity::Warning)),
+        "{:?}",
+        claims_on(src, "App")
+    );
+}

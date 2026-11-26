@@ -151,7 +151,9 @@ that writes it (see *Cross-file limits*).
   name. `setter-in-render` and the cross-component arm read a JSX prop's or a registered
   listener's write as the event handler it is even in a program that dispatches events itself,
   where the loop rules read it as ⊤ ([#219](https://github.com/rboudrouss/reactant-analyzer/issues/219)):
-  a render that dispatches an event to such a listener is not their finding. Only React DOM's
+  a render or an effect that dispatches an event to such a listener holds the listener's writes
+  as its own, at the dispatching call, which is where they report it
+  ([#407](https://github.com/rboudrouss/reactant-analyzer/issues/407)). Only React DOM's
   handlers are listeners by default: a host element's `on*` prop, and a component's prop where
   the analysis runs the component, whose own bodies say when it calls it. A child component the
   analysis does not see — a package's, an element value it does not resolve, a name several files
@@ -664,11 +666,40 @@ carries an Error.
   program the fixpoint runs every listener where it is registered, as it runs a timer callback, so
   the slot a listener writes moves with its writes, a listener passed by name included
   [#250](https://github.com/rboudrouss/reactant-analyzer/issues/250). A dispatch
-  hidden in an opaque callee is not seen. A dispatching call runs the component's own JSX
-  handlers of the event it fires (`click()` its `onClick`s, a `dispatchEvent` of an event whose
-  name is not a literal all of them) where it is made, as possible writes of that body [#277](https://github.com/rboudrouss/reactant-analyzer/issues/277);
-  another component's handlers, reached by bubbling or through a ref handed down, stay
-  event-only. The program's test
+  hidden in an opaque callee is not seen. A dispatching call runs, where it is made and as
+  possible writes of that body, every listener of the program its event may reach
+  [#277](https://github.com/rboudrouss/reactant-analyzer/issues/277),
+  [#407](https://github.com/rboudrouss/reactant-analyzer/issues/407): every host element's `on*`
+  prop whatever it holds, in any component (bubbling and capture reach ancestors, a ref handed
+  down reaches a child's element), every `addEventListener` argument and every package hook
+  argument timed as a listener. The target is resolved in one case: a `focus()` or `blur()` on
+  `r.current`, where `r` is a `useRef` the component binds only to its own host elements
+  (`ref={r}`, and otherwise only `r.current` reads). Its focus-side events then reach no leaf
+  element (no child but text, no spread, no `children`) that is not one of those elements, as
+  an event reaches only its target's propagation path; the blur side of a `focus()` still
+  reaches every listener, since the element that held the focus may be any. Every other
+  dispatch reaches the listeners of its event on every element: a component's ancestors are
+  not computed, since code the analysis does not see (a package rendering `children`, a route
+  table, MDX) may place any component above another. The event is: a listener hears what it is registered for (an
+  `on*` prop the native events React DOM 19.3.1 runs it for — `onChange` hears `change`, `input`
+  and a checkbox's `click` —, an `addEventListener` the literal it names or the string of a
+  module-level `const` of the same file no local binding shadows, any event for any other name:
+  an imported constant, a member of a constant object or `enum` — a package hook's listener any
+  event), and a dispatch fires the focus
+  events and the blurred control's `change` for `focus()` and `blur()`, the one event a
+  `dispatchEvent(new XEvent("x"))` names other than `click`, and any event otherwise (a click's
+  activation behaviour submits, toggles and opens, firing events of its own). React DOM's
+  `onChange` table rests on one premise: the engine has the `input` event, which every engine
+  React 19 supports has (React DOM takes a polyfill path that runs `onChange` on focus moves and
+  keys only where it lacks it). A blurred control's `change` never runs `onChange`: React DOM
+  takes a `change` only when the value differs from the one the edit's `input` events already
+  recorded. A call the analysis resolves to program bodies alone (a method of an object the
+  program builds, named `emit` or `focus`) is no dispatch: it fires events only through a
+  dispatch in those bodies, which the walk follows; a method of a module object, which the
+  analysis does not run, stays one. The writes one dispatching call's listeners make are judged
+  one by one and reported as one row of that call, at the call, listing the setters (`dispatch`
+  and `setters` in the JSON); an effect's call is one `cross-component-infinite-loop` row. The
+  program's test
   files are not read (`*.test.*`, `*.spec.*` are no source files to the walk), so a dispatch there
   makes nothing ⊤.
 - **`frozen-initial-state`** still fires on a child remounted by machinery it cannot see: a dialog

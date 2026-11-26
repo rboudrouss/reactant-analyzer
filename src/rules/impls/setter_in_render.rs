@@ -92,8 +92,18 @@ impl Rule for SetterInRender {
 /// Info. The setters are listed in their sorted order, each once; `var`,
 /// `hook_label` and the witness are the first one's, its peers' distinct
 /// witness steps follow.
+///
+/// A dispatch row (#407) is grouped the same way, by its call too: the rows
+/// of one rule whose writes the listeners of one dispatching call make are
+/// one row of that call, listing the setters — after each write was judged
+/// on its own, so no value of one write stands for another's.
 fn group_hand_overs(rows: Vec<Diagnostic>, component: &str) -> Vec<Diagnostic> {
-    type Key = (std::borrow::Cow<'static, str>, crate::ir::SourceRange, u8);
+    type Key = (
+        std::borrow::Cow<'static, str>,
+        crate::ir::SourceRange,
+        u8,
+        Option<crate::rules::DispatchRef>,
+    );
     let mut out: Vec<Diagnostic> = Vec::with_capacity(rows.len());
     let mut groups: Vec<Vec<Diagnostic>> = Vec::new();
     let mut at: HashMap<Key, usize> = HashMap::new();
@@ -102,7 +112,12 @@ fn group_hand_overs(rows: Vec<Diagnostic>, component: &str) -> Vec<Diagnostic> {
             out.push(d);
             continue;
         };
-        match at.entry((d.rule.clone(), range, d.severity().rank())) {
+        match at.entry((
+            d.rule.clone(),
+            range,
+            d.severity().rank(),
+            d.dispatch.clone(),
+        )) {
             std::collections::hash_map::Entry::Occupied(g) => groups[*g.get()].push(d),
             std::collections::hash_map::Entry::Vacant(g) => {
                 g.insert(groups.len());
@@ -130,10 +145,135 @@ fn group_hand_overs(rows: Vec<Diagnostic>, component: &str) -> Vec<Diagnostic> {
         }
         // An Info hand-over is one to a package's code (`row`).
         let package = row.severity() == crate::rules::Severity::Info;
-        row.message = hand_over_message(&row.setters, component, package);
+        row.message = match &row.dispatch {
+            Some(at) => dispatch_message(at, &row.setters, component, package),
+            None => hand_over_message(&row.setters, component, package),
+        };
         out.push(row);
     }
     out
+}
+
+/// The row of a write a listener makes when a dispatching call of the
+/// render runs it (#407): the call's row, at the call, carrying the setter
+/// (`group_hand_overs` makes one row of a call's writes). Never an Error:
+/// the dispatch may reach none of the listeners. Info when the call sits in
+/// code handed to a package's code, which runs it at a time nothing knows
+/// (#401's rule for a hand-over to package code); a Warning otherwise.
+fn dispatch_row(
+    ctx: &RuleCtx,
+    w: &SlotWriter,
+    wording: &Wording,
+    at: &crate::engine::setters::DispatchSite,
+) -> Diagnostic {
+    let (result, component) = (ctx.program(), ctx.component());
+    let parent = w.owner.map(|p| result.display_name(p));
+    let setter = SetterRef {
+        name: wording.name.clone(),
+        var: parent.as_ref().map(|_| w.setter.clone()),
+        parent,
+        through: wording.through.clone(),
+    };
+    let unknown = w.phase == WriterPhase::Unknown;
+    let package = unknown && w.handover == Handover::Package;
+    let rule = hand_over_rule(&setter);
+    let dispatch = crate::rules::DispatchRef {
+        call: format!("{}()", ctx.source_names().describe(&at.callee)),
+        unknown,
+    };
+    let message = dispatch_message(
+        &dispatch,
+        std::slice::from_ref(&setter),
+        &result.display_name(component),
+        package,
+    );
+    let mut d = match package {
+        true => Diagnostic::info(rule, message),
+        false => Diagnostic::warn(rule, message),
+    }
+    .with_setter(setter);
+    d = match w.owner {
+        None => d.with_label(w.slot),
+        Some(_) => d.with_var(w.setter.clone()),
+    };
+    if let Some(r) = at.span.or(w.span) {
+        d = d.with_range(r);
+    }
+    // Witness: the listener's write, where it is.
+    d = d.with_step(
+        wording.step(w),
+        None,
+        w.span,
+        &ctx.names(&crate::rules::api::witness::fallback_name),
+    );
+    d.dispatch = Some(dispatch);
+    d
+}
+
+/// The wording of a dispatch row (#407): the call fires events, which run
+/// the listeners they may reach, whose writes these setters are — in the
+/// render, or, for a call in code handed to a callee with no timing
+/// summary, at whatever time that code runs it (`package`: package code).
+fn dispatch_message(
+    at: &crate::rules::DispatchRef,
+    setters: &[SetterRef],
+    component: &str,
+    package: bool,
+) -> String {
+    let parents = setters.first().is_some_and(|s| s.parent.is_some());
+    let shared = {
+        let through = setters.first().and_then(|s| s.through.as_ref());
+        setters.iter().all(|s| s.through.as_ref() == through)
+    };
+    let what = match setters {
+        [s] => match &s.parent {
+            None => setter_phrase(s.name.as_deref()),
+            Some(p) => format!("{} of `{p}`", setter_phrase(s.name.as_deref())),
+        },
+        _ => {
+            let named: Vec<String> = setters
+                .iter()
+                .take(SetterRef::NAMED)
+                .map(|s| s.entry(!shared))
+                .collect();
+            let list = match (setters.len() - named.len(), named.split_last()) {
+                (0, Some((last, init))) => format!("{} and {last}", init.join(", ")),
+                (more, _) => format!("{} and {more} more", named.join(", ")),
+            };
+            match parents {
+                false => format!("{} setters ({list})", setters.len()),
+                true => format!(
+                    "{} state setters of parent components ({list})",
+                    setters.len()
+                ),
+            }
+        }
+    };
+    let renders = match (parents, setters) {
+        (false, _) => "this re-renders on every render".to_string(),
+        (true, [s]) => format!(
+            "`{component}` re-renders `{}` on every render",
+            s.parent.as_deref().unwrap_or_default()
+        ),
+        (true, _) => format!("`{component}` re-renders their components on every render"),
+    };
+    match (at.unknown, package) {
+        (false, _) => format!(
+            "this `{}` fires events during render, and the listeners they may reach call \
+             {what}: {renders}",
+            at.call
+        ),
+        (true, pkg) => format!(
+            "this `{}` sits in code handed to {}, and the listeners its events may reach \
+             call {what}. If that code runs it during render, {renders}; if it runs it only \
+             from event handlers, there is nothing to fix",
+            at.call,
+            match pkg {
+                true => "package code the analysis does not see",
+                false => "a callee with no timing summary",
+            }
+        ),
+    }
 }
 
 impl SetterInRender {
@@ -260,6 +400,9 @@ impl SetterInRender {
             let mut wording = Wording::of(w, comp_result, names);
             if let Some(name) = shared.then(slot_name).flatten() {
                 wording.name = Some(names.name(&name).into_owned());
+            }
+            if let Some(at) = &w.dispatch {
+                return Some(dispatch_row(ctx, w, &wording, at));
             }
             let setter = wording.setter();
             let handed = (!sync)
@@ -410,9 +553,13 @@ impl SetterInRender {
                     return None;
                 }
                 // A deferred or handler row runs on another turn; ⊤ may run
-                // in the memo's own run.
+                // in the memo's own run, but a listener's, which every
+                // dispatch claims where it is made (#402, #407).
                 let sync = match w.phase {
                     WriterPhase::Memo => true,
+                    WriterPhase::Unknown if crate::engine::setters::dispatch_claims(w) => {
+                        return None;
+                    }
                     WriterPhase::Unknown => false,
                     _ => return None,
                 };
@@ -449,6 +596,9 @@ impl SetterInRender {
                         _ => None,
                     });
                 let wording = Wording::of(w, comp_result, names);
+                if let Some(at) = &w.dispatch {
+                    return Some(dispatch_row(ctx, w, &wording, at));
+                }
                 let handed = (!sync && w.owner.is_none())
                     .then(|| wording.handed(w, None))
                     .flatten();
@@ -775,20 +925,17 @@ impl Wording {
 /// `Handler`, `Deferred` or `Cleanup` row is a *proof* of no — a user event
 /// or a known deferring registrar stands between the render pass and the
 /// write. `Unknown` is ⊤ and stays: ⊤ includes the render pass (#130),
-/// except a JSX prop's, ⊤ only because the program dispatches events
-/// (#219): this rule reads it as the event handler it is, as it always did
-/// (`docs/limitations.md`).
+/// except a listener's, ⊤ only because the program dispatches events
+/// (#219), whose writes every dispatch claims where it is made
+/// ([`dispatch_claims`](crate::engine::setters::dispatch_claims), #407).
 pub(crate) fn render_rows(
     comp: &crate::engine::AnalysisResult<crate::domains::StateValue>,
 ) -> impl Iterator<Item = &SlotWriter> {
     comp.slot_writers.iter().filter(|w| {
         w.region == WriterRegion::Render
             && !w.writes_store()
-            && match w.phase {
-                WriterPhase::Render => true,
-                WriterPhase::Unknown => !w.listener,
-                _ => false,
-            }
+            && matches!(w.phase, WriterPhase::Render | WriterPhase::Unknown)
+            && !crate::engine::setters::dispatch_claims(w)
     })
 }
 

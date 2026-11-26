@@ -758,8 +758,52 @@ on a program React settles; 323 oracle cases, none a known false negative.
   bulletproof-react 31 → 28, novel 13 → 9, shadcn-admin 35 → 34 (hand-overs
   to radix's `Slot` now Info), mantine 1,712 → 1,711 (a story's `ContextModal`
   no longer runs for `modals[ctx]`), the other 7 small repos unchanged;
-  dub 1,437 → 1,419 measured before what a hook's body builds was read as
-  remounting, twenty to be measured (#392).
+  on CI dub 1,437 → 1,461 (no loop finding lost, 30 gained) and twenty
+  2,171 → 2,095 (#392).
+- A call that dispatches events (`ref.current.click()`, `focus()`,
+  `dispatchEvent`) runs, where it is made and in that body's phase, every
+  listener of the program its event may reach: a host element's `on*` prop
+  whatever it holds (a setter, a prop, a call result), in any component (an
+  ancestor's the event bubbles to), an `addEventListener` argument, a package
+  hook's argument timed as a listener (`useOnClickOutside`). Before, it ran
+  only the dispatching component's own handler literals, so a render or an
+  effect that clicked a button whose `onClick` is a setter, a parent's
+  setter handed down or a parent's handler was silent although React loops.
+  A listener hears what React DOM registers its prop for (`onChange` hears
+  `click`); a `click()` or `requestSubmit()` fires any event, `focus()` and
+  `blur()` the focus events and `change`. Oracle: 9 new cases, 4 `fn` of the
+  base now `tp`, 1 `tn` now a tolerated `fp`. Shown rows, with the
+  narrowings below: twenty 2,094 → 2,146, dub 1,394 → 1,406, mantine 1,711 →
+  1,845, excalidraw 111 → 135, ai-chatbot 50 → 54, chakra-ui 373 → 379, memos
+  185 → 183, the other 6 small repos unchanged; mantine's run takes 312 s
+  instead of 175 s (#407).
+- The writes a dispatching call's listeners make are one row of that call, at
+  the call: "this `ref.current.click()` fires events during render, and the
+  listeners they may reach call …", with the call in the JSON's `dispatch`
+  and every setter in `setters`; an effect's call is one
+  `cross-component-infinite-loop` row. Each write is still judged on its own
+  first (#407).
+- A call the analysis resolves to program bodies alone is no dispatch,
+  whatever its name: a program object's `emit` or `focus` runs those bodies,
+  and fires events only through a dispatch in them (#407).
+- `onChange` hears what React DOM 19.3.1 runs it for, `change`, `input` and a
+  checkbox's `click`, not the `focusin` / `focusout` / key events of its
+  polyfill path, which no engine React 19 supports takes; nor does it hear the
+  `change` a control fires on losing the focus, which React DOM filters out by
+  its value tracker. So a `focus()` no longer reaches every `onChange` of the
+  program (#407).
+- In a program that dispatches events, a JSX prop of an element a `useMemo`
+  builds, and a package hook's argument its DOM listener runs
+  (`useOnClickOutside`), are read as the event handlers they are, as the
+  render's own props are, since every dispatch claims what they write: no
+  hand-over Warning says they go to a callee with no timing summary (#402).
+- An event name written through a module-level `const` string of the same
+  file (`addEventListener(PING, h)`, `dispatchEvent(new Event(PONG))`) is
+  that string, so the listener hears that event only (#407).
+- A `focus()` or `blur()` on a ref the component binds only to its own host
+  elements fires its focus events at that element: an `onFocus` on a leaf
+  element elsewhere (an input of another component) is no longer reached; the
+  blur of a `focus()` still reaches every `onBlur` (#407).
 - A function handed as a prop to a child component the analysis does not see
   (a package's component, an element value it does not resolve, a name several
   files define, a component rendering itself, a context provider's `value`)

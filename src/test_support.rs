@@ -142,6 +142,7 @@ pub(crate) fn analysis_result(render_cfg: CFG) -> AnalysisResult<StateValue> {
         iterations: 0,
         heap: Heap::new(),
         calls: Default::default(),
+        listeners: Default::default(),
         relations_pending: None,
     }
 }
