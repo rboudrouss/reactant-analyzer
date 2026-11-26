@@ -107,12 +107,16 @@ pub fn global(name: &str) -> Kind {
 }
 
 /// One pure builtin: called on `on`, named `name`, it returns a value of
-/// kind `gives`, and runs its argument at `runs` when there is one.
+/// kind `gives`, and runs its argument at `runs` when there is one. `inert`:
+/// it calls no code at all — it runs none of its arguments, reads no
+/// property of them, converts none — and its result holds nothing of them
+/// ([`hands_nothing`]).
 struct Builtin {
     on: Kind,
     name: &'static str,
     gives: Kind,
     runs: Option<usize>,
+    inert: bool,
 }
 
 const fn b(on: Kind, name: &'static str, gives: Kind) -> Builtin {
@@ -121,6 +125,7 @@ const fn b(on: Kind, name: &'static str, gives: Kind) -> Builtin {
         name,
         gives,
         runs: None,
+        inert: false,
     }
 }
 
@@ -130,6 +135,53 @@ const fn cb(on: Kind, name: &'static str, gives: Kind, runs: usize) -> Builtin {
         name,
         gives,
         runs: Some(runs),
+        inert: false,
+    }
+}
+
+/// A builtin that calls no code and keeps nothing of its arguments
+/// ([`Builtin::inert`]); its result is a primitive of kind `gives`.
+const fn inert(on: Kind, name: &'static str, gives: Kind) -> Builtin {
+    Builtin {
+        on,
+        name,
+        gives,
+        runs: None,
+        inert: true,
+    }
+}
+
+/// The globals an inert builtin of the table is called off
+/// (one that calls no code): where the program binds one of these names or
+/// writes into it, it may not be the language's (#391).
+pub fn inert_globals() -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = METHODS
+        .iter()
+        .chain(CALLS)
+        .filter(|x| x.inert)
+        .filter_map(|x| match x.on {
+            Kind::Global(g) => Some(g),
+            _ => None,
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// A call through `callee` hands its arguments to no code (#391): the
+/// callee is a builtin of the table that calls none and keeps nothing of
+/// them — it runs none, reads no property of them, converts none. The
+/// caller resolves the callee as for
+/// [`call`]: a global only where nothing in scope binds the name. A spread
+/// among the arguments runs its source's iterator, which is the caller's to
+/// see.
+pub fn hands_nothing(callee: Callee<'_>) -> bool {
+    match callee {
+        Callee::Method(k, name) => METHODS
+            .iter()
+            .any(|x| x.on == k && x.name == name && x.inert),
+        Callee::Value(k) => CALLS.iter().any(|x| x.on == k && x.inert),
     }
 }
 
@@ -165,7 +217,10 @@ const METHODS: &[Builtin] = &[
     b(Kind::Global("Object"), "fromEntries", U),
     b(Kind::Global("Object"), "is", B),
     b(Kind::Global("Object"), "hasOwn", B),
-    b(Kind::Global("Array"), "isArray", B),
+    // ECMA-262 §23.1.2.2 `Array.isArray(arg)` returns `IsArray(arg)`, and
+    // §7.2.2 IsArray reads no property and calls no code: it looks at the
+    // object's internal slots, and on a Proxy at its target, with no trap.
+    inert(Kind::Global("Array"), "isArray", B),
     b(Kind::Global("Array"), "of", A),
     cb(Kind::Global("Array"), "from", A, 1),
     b(Kind::Global("Number"), "isInteger", B),

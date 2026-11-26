@@ -235,7 +235,9 @@ impl JsxOrigins {
 /// its own top-level declarations and the imports the resolver maps to a
 /// real file are program definitions; an import the resolver maps to no file
 /// (a package, an unmapped alias, a missing file) is unseen code, which no
-/// same-named component of the program stands for (#389).
+/// same-named component of the program stands for (#389), and so is a
+/// module `const` aliasing a member of one
+/// ([`crate::ir::ModuleFacts::package_aliases`], #404).
 ///
 /// Imports are laid down last on purpose — not because a file can both declare
 /// and import one name (that is a redeclaration error), but so the rule is
@@ -268,6 +270,12 @@ pub fn build_jsx_origins(
             None => ElementOrigin::Unseen,
         };
         map.insert(local, Arc::new(origin));
+    }
+    // A module `const` that aliases a package's member is that package's
+    // element, as the chain written in place is (#404).
+    let packages = super::module_facts::package_imports(program, current_file, resolver);
+    for alias in super::module_facts::package_aliases(program, &packages) {
+        map.insert(alias, Arc::new(ElementOrigin::Unseen));
     }
     // A namespace imported from unseen code names no component itself, but
     // the root of member elements that are that code's (`<Primitive.Root/>`,

@@ -236,6 +236,40 @@ on a program React settles; 323 oracle cases, none a known false negative.
   component whose only rows are hidden Infos: "N component(s) with no error or
   warning hidden, M of which met a limit of the analysis; rerun with
   --show-clean" (#394).
+- The write into a package import that makes every hand-over a Warning (#394)
+  now counts only a write that may install code there. A primitive literal
+  written with `=`, under any key, does not count
+  (`MotionGlobalConfig.skipAnimations = true`,
+  `EventEmitter.defaultMaxListeners = 0`), nor does a write through a name a
+  parameter or a local binding shadows, nor a reflective writer called without
+  what it writes (`location.assign(Pkg.url)`, `map.set(Pkg.key, v)`).
+  `Object.assign` and its kin are known by their name on any receiver or
+  destructured (`const { assign } = Object`), and a renamed destructuring of
+  `Object` / `Reflect` counts, so does a call through a computed member whose
+  first argument is rooted at a package import and which has a second
+  (`O[k](ext, src)`); `Object` read as a value no longer does. Not seen: a
+  writer called under another name (`const a = Object.assign`, `.call`,
+  `Reflect.apply`), a computed member call whose first argument is a spread,
+  a write through an alias of the import other than a module `const`.
+  chakra-ui: 6 hand-over Warnings become Info (379 → 373 shown); the other 10
+  small repos and mantine do not move (#403).
+- `Array.isArray(x)` is modelled as the builtin it is (ECMA-262 §7.2.2: it
+  reads no property and calls no code): a closure or a setter it is handed is
+  handed to no code, so it is no longer a hand-over Warning of
+  `setter-in-render`. Only the language's global counts: a file that binds
+  the name `Array` anywhere, writes into it or assigns it keeps the hand-over.
+  The 11 small repos and mantine do not move (#391).
+- A module `const` whose initializer is nothing but a static member chain
+  rooted at a package import (`export const Dialog = DialogPrimitive.Root`,
+  `const run = kit.run`) is that package's element or callee, in its file and
+  wherever it is imported, through barrels too: a setter handed to it is an
+  Info, as with the chain written in place. A `let` or `var`, a destructuring,
+  a call (`styled(X)`, `forwardRef(…)`) or a conditional stays the program's.
+  A write through such an alias now counts as a write into the package import,
+  in any file (`const e = ext; e.hook = f` was an Info, it is a Warning); the
+  premise covers only the other aliases (a `let`, a parameter). memos 214 →
+  185 shown (29 hand-overs Info), bulletproof-react 46 → 31 (15), novel 14 →
+  13 (1); the other 8 small repos and mantine do not move (#404).
 
 ### Removed
 

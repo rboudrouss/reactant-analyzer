@@ -1884,6 +1884,7 @@ fn exec_callbacks_depth<T: Transfer>(
             }
             let runs_args = class == TriggerClass::InCycle && !capped;
             let binds_args = class == TriggerClass::Unknown && !capped;
+            let inert = class == TriggerClass::Unknown && inert_builtin(fn_, args, env, ctx);
             // What a local callee's parameters are bound to (#253): the
             // arguments up to the first spread, whose entries may take any
             // position from there on — ⊤ past it, as past the last argument.
@@ -1950,7 +1951,7 @@ fn exec_callbacks_depth<T: Transfer>(
                     if ran.objects {
                         escape_at(transfer, arg, env, ctx, Some((*id, i)));
                     }
-                } else {
+                } else if !inert {
                     let sites = escape_at(transfer, arg, env, ctx, Some((*id, i)));
                     if binds_args && i < positional {
                         passed.push(EnvVal::located(sites, transfer.eval_expr(arg, env, ctx)));
@@ -2031,15 +2032,18 @@ fn exec_callbacks_depth<T: Transfer>(
             // Arguments first, then the call itself.
             let written = exec_slot_write(transfer, fn_, args, env, ctx, depth);
             if ctx.calls.is_some() {
-                // Module code the analysis does not run may call what the
-                // module scope holds (#335).
-                let module = (ran.bodies.is_empty() || ran.open) && reads_module(fn_, ctx);
+                // The callee is read off a package import, or a module
+                // `const` aliasing a package's member, which holds that
+                // member and nothing else (#404): a package's code
+                // ([`crate::engine::Handover`]), which the row joins over
+                // every evaluation. Any other module code the analysis does
+                // not run may call what the module scope holds (#335).
+                let package = package_callee(fn_, ctx);
+                let module =
+                    !package && (ran.bodies.is_empty() || ran.open) && reads_module(fn_, ctx);
                 let mut eval = call_evaluation(transfer, fn_, env, ctx, ran, written);
                 eval.module = module;
-                // The callee is read off a package import: a package's code
-                // ([`crate::engine::Handover`]), which the row joins over
-                // every evaluation.
-                eval.package = package_callee(fn_, ctx);
+                eval.package = package;
                 ctx.record(|r| r.record_call(*id, eval));
             }
             returned
@@ -2351,8 +2355,9 @@ fn module_root(expr: &Expr) -> Option<&str> {
 }
 
 /// The callee `fn_` is a package's code ([`crate::engine::Handover`]): a
-/// name the component's bodies read free as a package import, or a chain of
-/// static members rooted at one (`ext.run`, `P.a.b`). A computed member is
+/// name the component's bodies read free as a package import, or as a module
+/// `const` aliasing a package's member (#404), or a chain of static members
+/// rooted at one (`ext.run`, `P.a.b`). A computed member is
 /// not: an array builtin the program calls on the package's object may have
 /// put a program function at an index. The context's package imports are
 /// empty when a write of the program has a receiver rooted at a package
@@ -2366,6 +2371,30 @@ fn package_callee<D: AbstractDomain>(fn_: &Expr, ctx: &AnalysisCtx<D>) -> bool {
         }
     }
     root(fn_).is_some_and(|n| ctx.query.package_import(n))
+}
+
+/// A call through `fn_` with `args` hands its arguments to no code: its
+/// callee is an inert builtin of the table (`Array.isArray`,
+/// [`crate::engine::purity::hands_nothing`], #391), its global read free —
+/// no binding of the env, none the program makes of the name
+/// ([`crate::domains::QueryContext::builtin_global`]) — and no spread among
+/// the arguments, which would run its source's iterator.
+fn inert_builtin<D: AbstractDomain>(
+    fn_: &Expr,
+    args: &[Expr],
+    env: &AbstractEnv<D>,
+    ctx: &AnalysisCtx<D>,
+) -> bool {
+    if args.iter().any(|a| matches!(a, Expr::Spread(_))) {
+        return false;
+    }
+    let mut kind = |e: &Expr| match e.peel_ts() {
+        Expr::Var(v) if env.lookup_env_val(v).is_none() && ctx.query.builtin_global(v) => {
+            crate::engine::purity::global(v)
+        }
+        _ => Kind::Unknown,
+    };
+    crate::engine::purity::hands_nothing(crate::engine::purity::Callee::of(fn_, &mut kind))
 }
 
 /// `expr` is read off a module binding (#335): it may be anything the

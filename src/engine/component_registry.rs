@@ -74,6 +74,21 @@ impl ComponentRegistry {
         self
     }
 
+    /// Read an element imported from a program `const` that aliases a
+    /// package's member as that package's (#404, [`Self::resolve_child`]).
+    pub fn with_package_aliases(mut self, aliases: std::collections::HashSet<CompOrigin>) -> Self {
+        self.table.set_package_aliases(aliases);
+        self
+    }
+
+    /// The element `<name/>` stamped `origin` instantiates code of a package
+    /// ([`ElementTarget::Unseen`](crate::ir::component_id::ElementTarget)):
+    /// imported from one, or from a program `const` aliasing a member of
+    /// one (#404).
+    pub fn package_element(&self, name: &Symbol, origin: Option<&ElementOrigin>) -> bool {
+        self.table.element(name, origin) == crate::ir::component_id::ElementTarget::Unseen
+    }
+
     /// The identity table this registry minted.
     pub fn table(&self) -> &ComponentTable {
         &self.table

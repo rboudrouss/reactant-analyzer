@@ -39,10 +39,18 @@ pub struct ModuleScope {
     /// Per analysed file: the names it imports from a package
     /// ([`crate::ir::ModuleFacts::packages`]).
     packages: HashMap<PathBuf, std::collections::HashSet<Var>>,
+    /// Per analysed file: the names it binds to a module `const` aliasing a
+    /// package's member, its own ([`crate::ir::ModuleFacts::package_aliases`])
+    /// or one it imports, through any barrel, from the file that declares it
+    /// (#404).
+    aliases: HashMap<PathBuf, std::collections::HashSet<Var>>,
     /// The first write of the program, in path order, whose receiver is
     /// rooted at a package import ([`crate::ir::ModuleFacts::member_install`]):
     /// a write that replaces part of a package's export.
     install: Option<(PathBuf, crate::ir::module::MemberInstall)>,
+    /// The globals of the builtin table some file of the program binds or
+    /// writes into ([`crate::ir::ModuleFacts::globals_shadowed`]).
+    globals_shadowed: std::collections::HashSet<Var>,
 }
 
 impl ModuleScope {
@@ -69,16 +77,43 @@ impl ModuleScope {
         let mut files = HashMap::new();
         let mut packages = HashMap::new();
         let mut install = None;
+        let mut globals_shadowed = std::collections::HashSet::new();
+        let mut aliases = HashMap::new();
+        let graph = table.re_export_graph();
+        let aliased = table.package_aliases();
+        let declares = |file: &Path, name: &str| {
+            table
+                .facts(file)
+                .is_some_and(|f| f.bindings.iter().any(|b| b == name))
+        };
         for path in paths {
             let Some(facts) = table.facts(path) else {
                 continue;
             };
             packages.insert(path.clone(), facts.packages.iter().cloned().collect());
+            globals_shadowed.extend(facts.globals_shadowed.iter().cloned());
+            let mut own: std::collections::HashSet<Var> =
+                facts.package_aliases.iter().cloned().collect();
+            for (local, origin, exported) in &facts.imported {
+                if let Some((file, name)) = graph.origin(origin, exported, &declares)
+                    && aliased.contains(&crate::ir::expr::CompOrigin { file, name })
+                {
+                    own.insert(local.clone());
+                }
+            }
+            // A write into a package import, or into a name the file binds
+            // to an alias of a package's member, its own or imported (#404).
+            let into_alias = facts
+                .import_installs
+                .iter()
+                .find(|(root, _)| own.contains(root.as_str()))
+                .map(|(_, i)| i);
             if install.is_none()
-                && let Some(i) = &facts.member_install
+                && let Some(i) = facts.member_install.as_ref().or(into_alias)
             {
                 install = Some((path.clone(), i.clone()));
             }
+            aliases.insert(path.clone(), own);
             let mut names = HashMap::new();
             for name in &facts.bindings {
                 names.insert(name.clone(), anchors[&(path.clone(), name.clone())]);
@@ -94,8 +129,16 @@ impl ModuleScope {
             files,
             consts: HashMap::new(),
             packages,
+            aliases,
             install,
+            globals_shadowed,
         }
+    }
+
+    /// The global `name` of the builtin table, read free, is the language's:
+    /// no file of the program binds the name or writes into it (#391).
+    pub fn builtin_global(&self, name: &str) -> bool {
+        !self.globals_shadowed.contains(name)
     }
 
     /// The program's first write into a package import, when it has one
@@ -113,10 +156,11 @@ impl ModuleScope {
     }
 
     /// The names a body written in one of `files` reads, free, as a package
-    /// import: imported so by one of the files, declared by no body of the
-    /// component (`declared`), and a module binding of none of the files: a
-    /// name one of them binds to program code is never read as a package's
-    /// (fail closed, [`crate::engine::Handover`]).
+    /// import: imported so by one of the files, or bound by one to a module
+    /// `const` aliasing a package's member (#404), declared by no body of
+    /// the component (`declared`), and a module binding of none of the files
+    /// but as such an alias: a name one of them binds to program code is
+    /// never read as a package's (fail closed, [`crate::engine::Handover`]).
     pub fn packages<'p>(
         &self,
         files: impl IntoIterator<Item = &'p Path> + Clone,
@@ -125,16 +169,23 @@ impl ModuleScope {
         if !self.packages_intact() {
             return std::collections::HashSet::new();
         }
+        let alias = |f: &Path, name: &Var| self.aliases.get(f).is_some_and(|a| a.contains(name));
         let bound = |name: &Var| {
             files
                 .clone()
                 .into_iter()
-                .any(|f| self.files.get(f).is_some_and(|m| m.contains_key(name)))
+                .any(|f| self.files.get(f).is_some_and(|m| m.contains_key(name)) && !alias(f, name))
         };
         files
             .clone()
             .into_iter()
             .filter_map(|f| self.packages.get(f))
+            .chain(
+                files
+                    .clone()
+                    .into_iter()
+                    .filter_map(|f| self.aliases.get(f)),
+            )
             .flatten()
             .filter(|name| !declared.contains(*name) && !bound(name))
             .cloned()

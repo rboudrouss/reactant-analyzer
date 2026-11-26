@@ -127,7 +127,11 @@ pub struct ComponentTable {
     /// once per origin, not at every evaluation of an element (a design
     /// system's `export *` tree is hundreds of files). Reset by anything that
     /// changes the answer.
-    behind_barrels: Arc<Mutex<HashMap<CompOrigin, Option<ComponentId>>>>,
+    behind_barrels: Arc<Mutex<HashMap<CompOrigin, ElementTarget>>>,
+    /// The module `const`s of the program that alias a package's member
+    /// ([`crate::ir::ModuleFacts::package_aliases`], #404): an import of one,
+    /// through any barrel, is that package's element.
+    package_aliases: Arc<std::collections::HashSet<CompOrigin>>,
 }
 
 /// Which component of the program a JSX element instantiates
@@ -260,6 +264,14 @@ impl ComponentTable {
         self.behind_barrels = Arc::default();
     }
 
+    /// The module `const`s that alias a package's member (#404), which an
+    /// element imported from one, through any barrel, instantiates
+    /// ([`Self::element`]).
+    pub fn set_package_aliases(&mut self, aliases: std::collections::HashSet<CompOrigin>) {
+        self.package_aliases = Arc::new(aliases);
+        self.behind_barrels = Arc::default();
+    }
+
     /// Which component the element `<name/>` instantiates, given what its own
     /// file proved about the name (`origin`, stamped at lowering). The one
     /// rule the inliner and every reader of the component tree apply; the
@@ -270,7 +282,9 @@ impl ComponentTable {
     ///   same-named component elsewhere, which would run another body in the
     ///   real one's place;
     /// - imported from unseen code: [`ElementTarget::Unseen`], whatever the
-    ///   program defines under that name;
+    ///   program defines under that name, and so is a program `const` that
+    ///   aliases a package's member, imported directly or through barrels
+    ///   (#404);
     /// - neither declared nor imported in the file: the one component of that
     ///   name, the name-only fallback ADR-013 accepts — never the first of
     ///   several (#7).
@@ -287,18 +301,25 @@ impl ComponentTable {
                     .behind_barrels
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                let found = *behind.entry(o.clone()).or_insert_with(|| {
-                    let defines = |file: &Path, name: &str| {
-                        self.by_origin.contains_key(&CompOrigin {
-                            file: file.to_path_buf(),
-                            name: name.to_string(),
-                        })
+                *behind.entry(o.clone()).or_insert_with(|| {
+                    let at = |file: &Path, name: &str| CompOrigin {
+                        file: file.to_path_buf(),
+                        name: name.to_string(),
                     };
-                    self.re_exports
-                        .origin(&o.file, &o.name, &defines)
-                        .and_then(|(file, name)| self.id_of(&CompOrigin { file, name }))
-                });
-                found.map_or(ElementTarget::Unresolved, ElementTarget::Component)
+                    let defines = |file: &Path, name: &str| {
+                        let o = at(file, name);
+                        self.by_origin.contains_key(&o) || self.package_aliases.contains(&o)
+                    };
+                    match self.re_exports.origin(&o.file, &o.name, &defines) {
+                        Some((file, name)) if self.package_aliases.contains(&at(&file, &name)) => {
+                            ElementTarget::Unseen
+                        }
+                        Some((file, name)) => self
+                            .id_of(&CompOrigin { file, name })
+                            .map_or(ElementTarget::Unresolved, ElementTarget::Component),
+                        None => ElementTarget::Unresolved,
+                    }
+                })
             }
             None => {
                 let mut named = self.ids_named(name);
