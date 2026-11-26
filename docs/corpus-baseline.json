@@ -1,13 +1,13 @@
 {
-  "total": 6154,
-  "digest": "01d874b1cfd8fb4e3f33ea301c71a2e45a405a72982a02d2b3689a4de737b26f",
+  "total": 6149,
+  "digest": "a8f50add7aca3f3914770d16547c511a6ad3baeeeaf73a988acb58e822df9c3d",
   "by_rule": {
     "always-unstable-deps": 613,
     "conditional-hook": 11,
-    "cross-component-infinite-loop": 275,
+    "cross-component-infinite-loop": 273,
     "cross-setter-in-render": 1356,
     "frozen-initial-state": 73,
-    "infinite-loop": 477,
+    "infinite-loop": 474,
     "lazy-init": 223,
     "missing-cleanup": 4,
     "missing-deps": 498,
@@ -23,16 +23,16 @@
   "by_repo": {
     "ai-chatbot": 54,
     "bulletproof-react": 28,
-    "chakra-ui": 379,
+    "chakra-ui": 377,
     "commerce": 5,
-    "dub": 1307,
+    "dub": 1306,
     "excalidraw": 141,
     "mantine": 1881,
     "memos": 179,
     "next-shadcn-dashboard-starter": 41,
     "novel": 9,
     "precedent": 1,
-    "shadcn-admin": 34,
+    "shadcn-admin": 32,
     "twenty": 2092,
     "zustand": 3
   },
@@ -58,7 +58,7 @@
       "setters": 2
     },
     "dub": {
-      "infos": 4426,
+      "infos": 4434,
       "hand_overs": 337,
       "setters": 7710
     },
