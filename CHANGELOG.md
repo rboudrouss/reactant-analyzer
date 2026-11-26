@@ -90,7 +90,11 @@ on a program React settles; 323 oracle cases, none a known false negative.
   of user events only and no dispatch of the program reaches it; alone it changes nothing, and the
   output says so. Its price: a layer that closes on a focus outside or an outside pointer event
   (radix's `DismissableLayer`) while the program moves the focus or clicks, and a package listening
-  on an ancestor of an element the program clicks.
+  on an ancestor of an element the program clicks (2 of 888 oracle cases `tp` → `fn`). Measured with
+  both declared: rows shown dub 1,307 → 1,288 (loop rows 244 → 228), twenty 2,092 → 2,092, the 11
+  small repos and mantine 2,755 → 2,754. A write a covered closure hands to code the analysis does
+  not follow is no longer claimed by a dispatch row and is shown on its own, so a program can show
+  more rows with both than with the first alone (twenty 2,047 → 2,092).
 - The default output says what `--info` would add: the human summary ends with "N setter(s) handed
   to package code the analysis does not see (M site(s)) and K other info finding(s) are not shown,
   rerun with --info to list them", and the JSON `summary` gains `hidden_infos`, the number of Info
