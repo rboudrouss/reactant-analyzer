@@ -914,7 +914,10 @@ on a program React settles; 323 oracle cases, none a known false negative.
   navigation's `navigate`, `popstate` and navigation API events, focus
   moves). A program's `keydown`, `resize`, `scroll` or `storage` listener no
   longer runs where it is registered because the program clicks a button or
-  submits a form (#427).
+  submits a form. Shown rows: dub 1,306 → 1,297 (loop pairs 848 → 798),
+  ai-chatbot 54 → 49, next-shadcn 41 → 39, memos 179 → 178; twenty, mantine
+  and the 8 other small repos unchanged (twenty and mantine still dispatch
+  events whose names the analysis does not know) (#427).
 - A function handed as a prop to a child component the analysis does not see
   (a package's component, an element value it does not resolve, a name several
   files define, a component rendering itself, a context provider's `value`)
