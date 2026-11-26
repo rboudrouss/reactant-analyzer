@@ -229,8 +229,9 @@ impl Events {
 /// user's or the browser's event runs a listener from no React phase, and
 /// what code the analysis does not see dispatches is a limit written down
 /// (`docs/limitations.md`). A dispatch fires what [`fired_events`] lists for
-/// it, any event when it cannot say (`click()`, `requestSubmit()`, a
-/// dispatched value), and a listener hears what it is registered for, any
+/// it — a `click()` or a `requestSubmit()` what the HTML Standard lets them
+/// fire before they return (#427), any event when it cannot say (a
+/// dispatched value) — and a listener hears what it is registered for, any
 /// event when its name is not a literal or a known constant. No target is
 /// read, so a listener on a target the program does not own (`window`, an
 /// element a package renders) is reached by every dispatch of its event: a
@@ -347,6 +348,125 @@ const SIMPLE_EVENTS: &[&str] = &[
     "scrollEnd",
 ];
 
+/// The events a focus move fires before it returns: `focus` and `focusin`
+/// where it lands, `blur` and `focusout` where it leaves, and `change` there
+/// when an edited control loses it ([`BLUR_CHANGE`]) — the HTML Standard's
+/// focusing steps and focus update steps (`interaction.html#focusing-steps`,
+/// `#focus-update-steps`). No `scroll`: a scroll of the viewport or of an
+/// element only appends to the document's *pending scroll events* (CSSOM
+/// View, `#scrolling-events`: "append (element, "scroll") to doc's pending
+/// scroll events"), which the event loop fires when it updates the rendering
+/// (HTML, `webappapis.html#update-the-rendering`: "run the scroll steps"),
+/// never inside the call; `resize` likewise ("run the resize steps").
+const FOCUS_MOVE: &[&str] = &["focus", "focusin", "blur", "focusout", BLUR_CHANGE];
+
+/// The events a form submission fires before it returns (#427), whoever
+/// starts it — `requestSubmit()`, a submit button's activation — read in the
+/// HTML Standard's form submission algorithm
+/// (`form-control-infrastructure.html#concept-form-submit`):
+///
+/// - unless no-validate, it "interactively validate[s] the constraints":
+///   "firing an event named `invalid` at field" for each invalid control
+///   (`#statically-validate-the-constraints`), then "user agents may focus
+///   one of those elements … by running the focusing steps"
+///   (`#interactively-validate-the-constraints`) — [`FOCUS_MOVE`];
+/// - "firing an event named `submit` at form using SubmitEvent";
+/// - "constructing the entry list", which fires "an event named `formdata`
+///   at form" (`#constructing-the-form-data-set`);
+/// - for method `dialog`, "close the dialog" (`interactive-elements.html
+///   #close-the-dialog`): "fire an event named `beforetoggle`" and the
+///   focusing steps on the previously focused element; its `toggle` and
+///   `close` are queued ("queue a dialog toggle event task", "queue an
+///   element task … to fire an event named close");
+/// - any other method "plan[s] to navigate", which queues the navigation
+///   ("queue an element task on the DOM manipulation task source … navigate"):
+///   nothing of it fires inside the call.
+///
+/// A disconnected form "cannot navigate" (`links.html#cannot-navigate`) and
+/// submits nothing; the set is the bound, not a claim that it fires.
+const SUBMISSION: &[&str] = &["invalid", "submit", "formdata", "beforetoggle"];
+
+/// The events a `click` dispatch may fire before it returns (#427): the
+/// `click` itself along the target's path, then the activation behaviour of
+/// the activation target. `click()` "fire[s] a synthetic pointer event named
+/// click at this element" and nothing else (`interaction.html#dom-click`;
+/// `webappapis.html#fire-a-synthetic-pointer-event`: one PointerEvent, so no
+/// `pointerdown`, `mousedown`, `mouseup` nor key event). DOM's dispatch
+/// (`dom.spec.whatwg.org/#concept-event-dispatch`) sets the activation target
+/// to the target or the first ancestor "that has activation behavior" when
+/// "event is a MouseEvent object and event's type attribute is "click"", runs
+/// its legacy-pre-activation behaviour before the listeners and its
+/// activation behaviour after them, before dispatch returns. The elements
+/// the HTML Standard gives an activation behaviour, and what each fires
+/// synchronously:
+///
+/// - checkbox and radio `input`s (`input.html#checkbox-state-(type=checkbox)`,
+///   `#radio-button-state-(type=radio)`): "fire an event named `input`" and
+///   "fire an event named `change`" (only if connected);
+/// - submit and image buttons, a `button` in the Submit state
+///   (`#submit-button-state-(type=submit)`, `#image-button-state-(type=image)`,
+///   `form-elements.html#the-button-element`): "submit the element's form
+///   owner" — [`SUBMISSION`];
+/// - reset buttons (`#reset-button-state-(type=reset)`, the `button`'s Reset
+///   state): "reset the form owner", "firing an event named `reset` at form"
+///   (`form-control-infrastructure.html#concept-form-reset`); its controls'
+///   reset "do not cause `input` events to fire";
+/// - a `button` with `commandfor` (`#the-button-element`): "firing an event
+///   named `command` at target", then the show / hide popover algorithms
+///   (`popover.html#show-popover`, `#hide-popover-algorithm`: "firing an event
+///   named `beforetoggle`", the popover focusing steps or the focus restored,
+///   "queue a popover toggle event task") or the dialog's command steps
+///   (`interactive-elements.html`: show a modal dialog — `beforetoggle`, the
+///   dialog focusing steps; close the dialog — `beforetoggle`, the focus
+///   restored; request to close — the close watcher's cancel action, "firing
+///   an event named `cancel` at dialog", then close);
+/// - a `button` or button `input` with `popovertarget`
+///   (`popover.html#popover-target-attribute-activation-behavior`): the same
+///   show / hide popover algorithms;
+/// - `a` and `area` with an `href` (`links.html#links-created-by-a-and-area-elements`):
+///   download or follow the hyperlink, which navigates
+///   (`browsing-the-web.html#beginning-navigation`): "firing a
+///   push/replace/reload navigate event at navigation" (`navigate`, and
+///   `navigateerror` and `abort` when it aborts the ongoing one,
+///   `nav-history-apis.html#abort-the-ongoing-navigation`); a fragment
+///   navigation runs synchronously (`#navigate-fragid`: "same-event-loop
+///   fragment navigations need to take effect synchronously") and updates the
+///   document, which fires `popstate` (`#update-document-for-history-step-application`)
+///   and the navigation API's `currententrychange` and `dispose`
+///   (`#update-the-navigation-api-entries-for-a-same-document-navigation`);
+///   its `hashchange` and the scroll to the fragment are queued, and a
+///   cross-document navigation's `beforeunload` is checked "in parallel";
+/// - `summary` (`interactive-elements.html#the-summary-element`): toggles its
+///   `details`' `open` attribute, whose `toggle` is queued ("queue a details
+///   toggle event task") — nothing synchronous;
+/// - file, color and date-like `input`s: "show the picker, if applicable";
+///   the selection's `input` and `change` are queued
+///   (`input.html#file-upload-state-(type=file)`: "queue an element task …
+///   fire an event named input") — nothing synchronous;
+/// - `label` (`forms.html#the-label-element`): the Standard leaves its
+///   activation behaviour to "the platform's label behavior". Engines click
+///   the labeled control and may focus it: the control's activation, above,
+///   and [`FOCUS_MOVE`]. This one premise is the Standard's silence, written
+///   in `docs/limitations.md`.
+///
+/// Every focus move above fires [`FOCUS_MOVE`]. Any event not listed is
+/// fired later, by a task, or by the user: an event handler's time.
+const ACTIVATION: &[&str] = &[
+    "click",
+    "input",
+    "change",
+    "reset",
+    "command",
+    "beforetoggle",
+    "cancel",
+    "navigate",
+    "navigateerror",
+    "abort",
+    "popstate",
+    "currententrychange",
+    "dispose",
+];
+
 /// The DOM element methods that fire events before they return.
 const DISPATCHING_METHODS: &[&str] = &[
     "dispatchEvent",
@@ -360,18 +480,19 @@ const DISPATCHING_METHODS: &[&str] = &[
 /// The events a call with callee `fn_` and arguments `args` fires before it
 /// returns, `None` when it fires none.
 ///
-/// - `focus()` and `blur()` move the focus: `focus` and `focusin` where it
-///   lands, `blur` and `focusout` where it leaves, and `change` there when an
-///   edited control loses it ([`BLUR_CHANGE`]).
+/// - `focus()` and `blur()` move the focus ([`FOCUS_MOVE`]).
+/// - `click()` and a dispatched `click` fire the `click` and what the
+///   activation behaviour of any element kind fires before it returns
+///   ([`ACTIVATION`], with [`SUBMISSION`] and [`FOCUS_MOVE`]): the target's
+///   kind is not read (#427).
+/// - `requestSubmit()` submits the form ([`SUBMISSION`], [`FOCUS_MOVE`];
+///   `forms.html#dom-form-requestsubmit`: "submit this form element, from
+///   submitter").
 /// - `dispatchEvent(new XEvent("name"))` fires `name`, and only it: a
-///   dispatched event runs no default action, but a `click`'s activation
-///   behaviour, below.
-/// - Every other dispatch fires any event: `click()` and a dispatched `click`
-///   run the element's activation behaviour (submitting its form, toggling
-///   a control, opening a popover, each firing its own events), and so does
-///   `requestSubmit()` (validation, `submit`, the navigation); a
-///   `dispatchEvent` of a value, or an `emit`, names no event the analysis
-///   knows.
+///   dispatched event runs no default action but a `click`'s activation
+///   behaviour, above.
+/// - Every other dispatch fires any event: a `dispatchEvent` of a value, or
+///   an `emit`, names no event the analysis knows.
 pub(crate) fn fired_events(fn_: &Expr, args: &[Expr], consts: Consts<'_>) -> Option<Events> {
     let name = match fn_.peel_ts() {
         Expr::Var(name) if name == "dispatchEvent" => name.as_str(),
@@ -380,16 +501,19 @@ pub(crate) fn fired_events(fn_: &Expr, args: &[Expr], consts: Consts<'_>) -> Opt
         }
         _ => return None,
     };
+    let click = || Events::of(&[ACTIVATION, SUBMISSION, FOCUS_MOVE].concat());
     Some(match name {
-        "focus" | "blur" => Events::of(&["focus", "focusin", "blur", "focusout", BLUR_CHANGE]),
+        "focus" | "blur" => Events::of(FOCUS_MOVE),
+        "click" => click(),
+        "requestSubmit" => Events::of(&[SUBMISSION, FOCUS_MOVE].concat()),
         "dispatchEvent" => match args.first().map(Expr::peel_ts) {
             Some(Expr::New { fn_, args, .. }) => match (fn_.peel_ts(), args.first()) {
                 (Expr::Var(c), Some(name)) if c.ends_with("Event") => {
                     match Events::named(Some(name), consts) {
-                        Events::Of(names) if !names.iter().any(|n| n == "click") => {
-                            Events::Of(names)
+                        Events::Of(names) if names.iter().any(|n| n == "click") => {
+                            click().join(&Events::Of(names))
                         }
-                        _ => Events::Any,
+                        named => named,
                     }
                 }
                 _ => Events::Any,
@@ -412,9 +536,10 @@ pub(crate) fn fired_events(fn_: &Expr, args: &[Expr], consts: Consts<'_>) -> Opt
 /// - `blur()` runs the unfocusing steps: `blur` and `focusout` at the
 ///   target, and the focus moves to the viewport (the body), which is no
 ///   element of the program: nothing fires anywhere else.
-/// - Any other call keeps every listener: a click's activation behaviour
-///   fires events at the form, a label's control, a popover's or command's
-///   target, none of which is on the target's path.
+/// - Any other call fires its events anywhere: a click's activation
+///   behaviour fires them at the form, a label's control, a popover's or
+///   command's target, the navigation, none of which is on the target's
+///   path.
 pub(crate) fn on_node(method: &str, fired: Events, mut targets: Vec<ExprId>) -> Fired {
     targets.sort();
     targets.dedup();
@@ -562,19 +687,72 @@ mod tests {
     }
 
     #[test]
-    fn a_click_fires_any_event_a_focus_its_focus_events() {
+    fn a_click_fires_its_activation_events_a_focus_its_focus_events() {
         let call = |field: &str| Expr::FieldAccess {
             obj: Box::new(Expr::Var("el".into())),
             field: field.into(),
         };
-        assert_eq!(
-            fired_events(&call("click"), &[], &no_consts),
-            Some(Events::Any)
-        );
-        assert_eq!(
-            fired_events(&call("requestSubmit"), &[], &no_consts),
-            Some(Events::Any)
-        );
+        // #427: what the HTML Standard lets a click or a submission fire
+        // before it returns; never a key, pointer, scroll or storage event.
+        let click = fired_events(&call("click"), &[], &no_consts).unwrap();
+        for heard in [
+            "click",
+            "input",
+            "change",
+            "submit",
+            "formdata",
+            "invalid",
+            "reset",
+            "command",
+            "beforetoggle",
+            "cancel",
+            "navigate",
+            "popstate",
+            "focusin",
+            "focusout",
+        ] {
+            assert!(click.meets(&Events::of_name(Some(heard))), "{heard}");
+        }
+        let submit = fired_events(&call("requestSubmit"), &[], &no_consts).unwrap();
+        for heard in ["submit", "formdata", "invalid", "focusin"] {
+            assert!(submit.meets(&Events::of_name(Some(heard))), "{heard}");
+        }
+        for unheard in [
+            "keydown",
+            "keyup",
+            "resize",
+            "scroll",
+            "storage",
+            "pointerdown",
+            "mousedown",
+            "mouseup",
+            "toggle",
+            "close",
+            "hashchange",
+        ] {
+            let hears = Events::of_name(Some(unheard));
+            assert!(!click.meets(&hears), "{unheard}");
+            assert!(!submit.meets(&hears), "{unheard}");
+        }
+        assert!(!submit.meets(&Events::of_name(Some("click"))));
+        assert!(click.meets(&Events::of_prop("onChange")));
+        assert!(click.meets(&Events::of_prop("onSubmit")));
+        assert!(!click.meets(&Events::of_prop("onKeyDown")));
+        assert!(!click.meets(&Events::of_prop("onScroll")));
+        // A dispatched `click` runs activation behaviour too; another named
+        // event fires that name alone.
+        let dispatched = |ctor: &str, name: &str| {
+            let ev = Expr::New {
+                id: ExprId(1),
+                fn_: Box::new(Expr::Var(ctor.into())),
+                args: vec![Expr::Lit(crate::ir::expr::Prim::String(name.into()))],
+                ctor: None,
+                on_this: false,
+            };
+            fired_events(&Expr::Var("dispatchEvent".into()), &[ev], &no_consts).unwrap()
+        };
+        assert!(dispatched("MouseEvent", "click").meets(&Events::of_name(Some("submit"))));
+        assert_eq!(dispatched("Event", "ping"), Events::of(&["ping"]));
         let focus = fired_events(&call("focus"), &[], &no_consts).unwrap();
         assert!(focus.meets(&Events::of_prop("onFocus")));
         assert!(focus.meets(&Events::of_prop("onBlur")));
@@ -604,6 +782,9 @@ mod tests {
         assert!(program.reach(&Events::of_prop("onKeyDown")));
         assert!(!program.reach(&Events::of_name(Some("resize"))));
         program.add(&fired_events(&call("click"), &[], &no_consts).unwrap());
+        assert!(!program.reach(&Events::of_name(Some("resize"))), "#427");
+        assert!(program.reach(&Events::of_name(Some("submit"))));
+        program.add(&fired_events(&call("emit"), &[], &no_consts).unwrap());
         assert!(program.reach(&Events::of_name(Some("resize"))));
     }
 
