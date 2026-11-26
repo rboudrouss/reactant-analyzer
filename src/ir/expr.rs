@@ -381,15 +381,81 @@ pub enum ElementOrigin {
     /// an unmapped alias, a missing file): code the analysis does not see,
     /// never a same-named component of the program.
     Unseen,
+    /// A name a scope of the file binds and no import or top-level
+    /// declaration stamps — a parameter, a destructured prop, a local, a
+    /// module destructuring (#392): a value, which neither the same-named
+    /// import nor a same-named component stands for. The element is every
+    /// type the binding may hold, joined: never empty.
+    Local(Arc<[ElementLeaf]>),
+}
+
+/// One type a [`ElementOrigin::Local`] binding may hold (#392).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ElementLeaf {
+    /// A string: a host element of that tag.
+    Host(Symbol),
+    /// A name the binding is a `const` alias of, read where the binding is:
+    /// the element written `<name/>` there, stamped as that element would
+    /// be (`origin`, never `Local`).
+    Named {
+        name: Symbol,
+        origin: Option<Arc<ElementOrigin>>,
+    },
+    /// What the binding holds where no `const` alias proves it (a parameter,
+    /// a prop, a `let`, a call's result): the value of the element's name
+    /// where the element is ([`Expr::CompApp`]'s `value`), which the engine
+    /// evaluates.
+    Value,
 }
 
 impl ElementOrigin {
-    /// The program definition, unless the name is imported from unseen code.
+    /// The program definition, unless the name is imported from unseen code
+    /// or bound by a scope.
     pub fn program(&self) -> Option<&CompOrigin> {
         match self {
             ElementOrigin::Program(o) => Some(o),
-            ElementOrigin::Unseen => None,
+            ElementOrigin::Unseen | ElementOrigin::Local(_) => None,
         }
+    }
+
+    /// The elements `<name/>` stamped `origin` instantiates, each as one
+    /// written in place: itself, or for a name a scope binds every name its
+    /// binding aliases ([`ElementLeaf::Named`]). A host tag or a value the
+    /// engine evaluates is none of them.
+    pub fn named<'a>(
+        name: &'a Symbol,
+        origin: Option<&'a Arc<ElementOrigin>>,
+    ) -> Vec<(&'a Symbol, Option<&'a Arc<ElementOrigin>>)> {
+        match origin.map(Arc::as_ref) {
+            Some(ElementOrigin::Local(leaves)) => leaves
+                .iter()
+                .filter_map(|leaf| match leaf {
+                    ElementLeaf::Named { name, origin } => Some((name, origin.as_ref())),
+                    ElementLeaf::Host(_) | ElementLeaf::Value => None,
+                })
+                .collect(),
+            _ => vec![(name, origin)],
+        }
+    }
+
+    /// A host element is among the types the element may be — a string
+    /// leaf, or a value, which may be one — with its tag when exactly one
+    /// is possible (`Some(None)`: any tag).
+    pub fn may_be_host(&self) -> Option<Option<&str>> {
+        let ElementOrigin::Local(leaves) = self else {
+            return None;
+        };
+        let mut host: Option<Option<&str>> = None;
+        for leaf in leaves.iter() {
+            host = match (leaf, host) {
+                (ElementLeaf::Value, _) => return Some(None),
+                (ElementLeaf::Host(tag), None) => Some(Some(tag.as_str())),
+                (ElementLeaf::Host(tag), Some(Some(t))) if t == tag.as_str() => host,
+                (ElementLeaf::Host(_), Some(_)) => Some(None),
+                (ElementLeaf::Named { .. }, h) => h,
+            };
+        }
+        host
     }
 }
 
@@ -524,9 +590,14 @@ pub enum Expr {
         span: Option<SourceRange>,
         /// What the file's imports (or its own declarations) prove `name`
         /// stands for — the same fact `HookEntry::Custom::resolved_file` and
-        /// `import_source` record for a custom hook call. `None`: the file
-        /// neither declares nor imports the name.
+        /// `import_source` record for a custom hook call. `None`: the name
+        /// is bound nowhere in the file, a global.
         origin: Option<Arc<ElementOrigin>>,
+        /// The element's name as the expression it is, when a scope binds
+        /// it ([`ElementOrigin::Local`], #392): the variable, or the member
+        /// chain off it (`<Ns.Item/>`), read before the props are, as the
+        /// JSX runtime reads the type.
+        value: Option<Box<Expr>>,
     },
     NativeElem {
         tag: Symbol,
@@ -790,7 +861,12 @@ impl Expr {
                     f(a);
                 }
             }
-            Expr::CompApp { props, .. } => f(props),
+            Expr::CompApp { props, value, .. } => {
+                if let Some(value) = value {
+                    f(value);
+                }
+                f(props);
+            }
             Expr::NativeElem {
                 props, children, ..
             } => {
@@ -843,7 +919,12 @@ impl Expr {
                     f(a);
                 }
             }
-            Expr::CompApp { props, .. } => f(props),
+            Expr::CompApp { props, value, .. } => {
+                if let Some(value) = value {
+                    f(value);
+                }
+                f(props);
+            }
             Expr::NativeElem {
                 props, children, ..
             } => {
@@ -925,7 +1006,17 @@ impl Expr {
                 children,
                 ..
             } => (Some(tag.as_str()), props.object_fields(), children),
-            Expr::CompApp { props, .. } => (None, props.object_fields(), &[]),
+            // An element whose type a scope binds may be a host element
+            // (#392), whose conversions hold a component's: a tag nothing
+            // pins converts as the one that converts the most, a textarea's
+            // children included.
+            Expr::CompApp { props, origin, .. } => {
+                let host = origin
+                    .as_deref()
+                    .and_then(ElementOrigin::may_be_host)
+                    .map(|tag| tag.unwrap_or("textarea"));
+                (host, props.object_fields(), &[])
+            }
             _ => (None, &[], &[]),
         };
         let children = match host {
@@ -1182,6 +1273,7 @@ mod accessor_tests {
             props: props(&all),
             span: None,
             origin: None,
+            value: None,
         };
         assert_eq!(names(&component), ["v_key", "key of v_...7"]);
     }

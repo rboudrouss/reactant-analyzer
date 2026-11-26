@@ -296,10 +296,16 @@ fn collect_callees_in_expr(expr: &Expr, out: &mut Vec<Callee>) {
                 });
             }
         }
-        Expr::CompApp { name, origin, .. } => out.push(Callee {
-            name: name.clone(),
-            origin: origin.clone(),
-        }),
+        // An element whose name a scope binds calls each name its binding
+        // aliases, and nothing by its own name (#392).
+        Expr::CompApp { name, origin, .. } => {
+            for (name, origin) in ElementOrigin::named(name, origin.as_ref()) {
+                out.push(Callee {
+                    name: name.clone(),
+                    origin: origin.cloned(),
+                });
+            }
+        }
         _ => {}
     }
     // Structural descent. `for_each_child` does not cross `FnLit`, which is

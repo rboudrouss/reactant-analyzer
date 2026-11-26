@@ -2,7 +2,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::{
-    engine::component_registry::ComponentRegistry,
+    engine::{
+        component_registry::ComponentRegistry,
+        hook_registry::{HookKey, HookRegistry},
+    },
     ir::{
         ComponentId, ElementTarget,
         cfg::CFG,
@@ -31,7 +34,7 @@ impl CompAppRef {
         match table.element(&self.name, self.origin.as_deref()) {
             ElementTarget::Component(id) => vec![id],
             ElementTarget::Ambiguous => table.ids_named(&self.name).collect(),
-            ElementTarget::Unseen | ElementTarget::Unresolved => Vec::new(),
+            ElementTarget::Unseen | ElementTarget::Unresolved | ElementTarget::Value => Vec::new(),
         }
     }
 }
@@ -66,7 +69,7 @@ fn explicit_matches(registry: &ComponentRegistry, name: &Symbol) -> Vec<Componen
 impl RootStrategy {
     /// The root components to analyse, by [`ComponentId`] so distinct files
     /// defining the same name are each analysed.
-    pub fn detect(&self, registry: &ComponentRegistry) -> Vec<ComponentId> {
+    pub fn detect(&self, registry: &ComponentRegistry, hooks: &HookRegistry) -> Vec<ComponentId> {
         match self {
             RootStrategy::Heuristic => {
                 // A reference the lowering resolved rules out exactly one
@@ -76,9 +79,17 @@ impl RootStrategy {
                 // `Widget`) leave its target looking unreferenced, so the
                 // target was analysed a second time as a root and that pass
                 // overwrote the precise result its parent had produced (#7).
+                // The bodies of the custom hooks a component calls are its
+                // body too, once expanded: an element a hook builds (`const
+                // { XModal } = useXModal()`, the modal a `useCallback` of the
+                // hook renders) is a reference of every component that calls
+                // it (#392). A component referenced only so and never reached
+                // is still analysed, unreached (phase 2).
                 let mut refs: HashSet<CompAppRef> = HashSet::new();
+                let mut seen: HashSet<HookKey> = HashSet::new();
                 for comp in registry.all_components() {
                     collect_compapp_in_component(comp, &mut refs);
+                    collect_called_hooks(&comp.hooks, hooks, &mut seen, &mut refs);
                 }
                 let table = registry.table();
                 let mut referenced: HashSet<ComponentId> = HashSet::new();
@@ -124,6 +135,38 @@ fn collect_compapp_in_component(comp: &ComponentIR, out: &mut HashSet<CompAppRef
     collect_compapp_refs(&comp.render_cfg, &comp.hooks, out);
 }
 
+/// The references of every custom hook `entries` call, and of the hooks
+/// those call in turn, each resolved as its expansion resolves it
+/// ([`HookRegistry::resolve_call`]) and walked once (`seen`).
+fn collect_called_hooks(
+    entries: &[HookEntry],
+    hooks: &HookRegistry,
+    seen: &mut HashSet<HookKey>,
+    out: &mut HashSet<CompAppRef>,
+) {
+    for entry in entries {
+        let HookEntry::Custom {
+            name,
+            import_source,
+            resolved_file,
+            ..
+        } = entry
+        else {
+            continue;
+        };
+        let Some(hook) =
+            hooks.resolve_call(name, import_source.as_deref(), resolved_file.as_deref())
+        else {
+            continue;
+        };
+        if !seen.insert((hook.file.clone(), hook.name.clone())) {
+            continue;
+        }
+        collect_compapp_refs(&hook.body_cfg, &hook.hooks, out);
+        collect_called_hooks(&hook.hooks, hooks, seen, out);
+    }
+}
+
 /// Every component this body syntactically instantiates — the render CFG plus
 /// every hook body, nested `FnLit`s included.
 ///
@@ -154,11 +197,15 @@ fn collect_compapp_in_cfg(cfg: &CFG, out: &mut HashSet<CompAppRef>) {
 
 fn collect_compapp_in_expr(expr: &Expr, out: &mut HashSet<CompAppRef>) {
     match expr {
+        // An element whose name a scope binds instantiates each name its
+        // binding aliases, and no component by its own name (#392).
         Expr::CompApp { name, origin, .. } => {
-            out.insert(CompAppRef {
-                name: name.clone(),
-                origin: origin.clone(),
-            });
+            for (name, origin) in ElementOrigin::named(name, origin.as_ref()) {
+                out.insert(CompAppRef {
+                    name: name.clone(),
+                    origin: origin.cloned(),
+                });
+            }
         }
         // `for_each_child` does not cross `FnLit`; render helpers can still
         // instantiate components, so descend into the body CFG explicitly.
@@ -212,6 +259,7 @@ mod tests {
                         props: Box::new(Expr::Lit(Prim::Null)),
                         span: None,
                         origin: None,
+                        value: None,
                     },
                     None,
                 ),
@@ -254,7 +302,7 @@ mod tests {
     fn heuristic_leaf_component_is_root() {
         // App has no parent → root
         let reg = registry(vec![component("App")]);
-        let roots = RootStrategy::Heuristic.detect(&reg);
+        let roots = RootStrategy::Heuristic.detect(&reg, &HookRegistry::new());
         assert_eq!(names(&reg, &roots), vec!["App".to_string()]);
     }
 
@@ -265,8 +313,55 @@ mod tests {
             component_rendering_child("Parent", "Child"),
             component("Child"),
         ]);
-        let roots = RootStrategy::Heuristic.detect(&reg);
+        let roots = RootStrategy::Heuristic.detect(&reg, &HookRegistry::new());
         assert_eq!(names(&reg, &roots), vec!["Parent".to_string()]);
+    }
+
+    /// An element a custom hook builds is a reference of the component that
+    /// calls the hook, through hooks that call hooks too (#392): its child
+    /// is no root, whose pass with unknown props would replace the result
+    /// the caller produced.
+    #[test]
+    fn a_child_a_called_hook_renders_is_not_a_root() {
+        let hook = |name: &str, body: CFG, hooks: Vec<HookEntry>| crate::ir::hook_ir::HookIR {
+            file: std::path::PathBuf::new(),
+            name: name.to_string(),
+            params: vec![],
+            param_defaults: vec![],
+            body_cfg: body,
+            hooks,
+            hook_provenance: vec![],
+            alias_of: None,
+            body_file: None,
+        };
+        let call = |name: &str| HookEntry::Custom {
+            label: 0,
+            name: name.to_string(),
+            args: vec![],
+            deps: crate::ir::hooks::DepsArg::Absent,
+            binding: None,
+            import_source: None,
+            resolved_file: None,
+            span: None,
+        };
+        let modal = component_rendering_child("useModalBody", "Modal").render_cfg;
+        let hooks = HookRegistry::from_hooks(vec![
+            hook("useModal", trivial_cfg(), vec![call("useModalInner")]),
+            hook("useModalInner", modal, vec![]),
+        ]);
+        let mut app = component("App");
+        app.hooks = vec![call("useModal")];
+        let reg = registry(vec![app, component("Modal")]);
+        assert_eq!(
+            names(&reg, &RootStrategy::Heuristic.detect(&reg, &hooks)),
+            vec!["App".to_string()]
+        );
+        // A hook no component calls references nothing.
+        let reg = registry(vec![component("App"), component("Modal")]);
+        assert_eq!(
+            names(&reg, &RootStrategy::Heuristic.detect(&reg, &hooks)),
+            vec!["App".to_string(), "Modal".to_string()]
+        );
     }
 
     #[test]
@@ -277,14 +372,14 @@ mod tests {
             component("B"),
             component("C"),
         ]);
-        let roots = RootStrategy::Heuristic.detect(&reg);
+        let roots = RootStrategy::Heuristic.detect(&reg, &HookRegistry::new());
         assert_eq!(names(&reg, &roots), vec!["A".to_string(), "C".to_string()]);
     }
 
     #[test]
     fn all_components_returns_everything() {
         let reg = registry(vec![component("X"), component("Y"), component("Z")]);
-        let roots = RootStrategy::AllComponents.detect(&reg);
+        let roots = RootStrategy::AllComponents.detect(&reg, &HookRegistry::new());
         assert_eq!(
             names(&reg, &roots),
             vec!["X".to_string(), "Y".to_string(), "Z".to_string()]
@@ -294,7 +389,8 @@ mod tests {
     #[test]
     fn explicit_returns_named() {
         let reg = registry(vec![component("A"), component("B"), component("C")]);
-        let roots = RootStrategy::Explicit(vec!["B".to_string()]).detect(&reg);
+        let roots =
+            RootStrategy::Explicit(vec!["B".to_string()]).detect(&reg, &HookRegistry::new());
         assert_eq!(names(&reg, &roots), vec!["B".to_string()]);
         assert!(
             RootStrategy::Explicit(vec!["B".to_string()])
@@ -310,7 +406,10 @@ mod tests {
         let reg = registry(vec![component("A")]);
         let strategy = RootStrategy::Explicit(vec!["A".to_string(), "Nope".to_string()]);
         assert_eq!(strategy.unmatched(&reg), vec!["Nope".to_string()]);
-        assert_eq!(names(&reg, &strategy.detect(&reg)), vec!["A".to_string()]);
+        assert_eq!(
+            names(&reg, &strategy.detect(&reg, &HookRegistry::new())),
+            vec!["A".to_string()]
+        );
     }
 
     /// The qualified form is what the report prints back for a collision, so it
@@ -327,7 +426,10 @@ mod tests {
         let display = reg.table().display_name(reg.id(&key).unwrap()).unwrap();
         let strategy = RootStrategy::Explicit(vec![display]);
         assert!(strategy.unmatched(&reg).is_empty());
-        assert_eq!(strategy.detect(&reg), vec![reg.id(&key).unwrap()]);
+        assert_eq!(
+            strategy.detect(&reg, &HookRegistry::new()),
+            vec![reg.id(&key).unwrap()]
+        );
 
         assert_eq!(
             RootStrategy::Explicit(vec!["Widget@nowhere.tsx".to_string()]).unmatched(&reg),
@@ -339,6 +441,10 @@ mod tests {
     #[test]
     fn heuristic_no_components_returns_empty() {
         let reg = registry(vec![]);
-        assert!(RootStrategy::Heuristic.detect(&reg).is_empty());
+        assert!(
+            RootStrategy::Heuristic
+                .detect(&reg, &HookRegistry::new())
+                .is_empty()
+        );
     }
 }

@@ -147,7 +147,9 @@ impl ComponentRegistry {
                 .filter(|key| self.entries.contains(key))
                 .map_or(ChildLookup::Unknown, ChildLookup::Resolved),
             ElementTarget::Ambiguous => ChildLookup::Ambiguous,
-            ElementTarget::Unseen | ElementTarget::Unresolved => ChildLookup::Unknown,
+            ElementTarget::Unseen | ElementTarget::Unresolved | ElementTarget::Value => {
+                ChildLookup::Unknown
+            }
         }
     }
 

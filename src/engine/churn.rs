@@ -91,6 +91,7 @@
 //! Every other edge is the graph arm's.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::{
     domains::{
@@ -409,7 +410,9 @@ fn mounted_unplaced(result: &ProgramAnalysisResult) -> HashSet<ComponentId> {
                 // An element of unseen code mounts none of the program's
                 // components (#389).
                 let origin = match origin {
-                    Some(ElementOrigin::Unseen) => return,
+                    // `walk_elements` hands no scope's binding, only the
+                    // names it aliases.
+                    Some(ElementOrigin::Unseen | ElementOrigin::Local(_)) => return,
                     Some(ElementOrigin::Program(o)) => Some(o),
                     None => None,
                 };
@@ -458,10 +461,14 @@ fn mounted_unplaced(result: &ProgramAnalysisResult) -> HashSet<ComponentId> {
 }
 
 /// Every element under `e`, closures included: its tag as written and the
-/// component the lowering proved it names.
+/// component the lowering proved it names — for one whose name a scope
+/// binds, each name its binding aliases (#392); what else it may mount, a
+/// value, is read as one ([`ValueRef`]).
 fn walk_elements<'a>(e: &'a Expr, f: &mut dyn FnMut(&'a str, Option<&'a ElementOrigin>)) {
     if let Expr::CompApp { name, origin, .. } = e {
-        f(name, origin.as_deref());
+        for (name, origin) in ElementOrigin::named(name, origin.as_ref()) {
+            f(name, origin.map(Arc::as_ref));
+        }
     }
     if let Expr::FnLit { body_cfg, .. } = e {
         body_cfg.for_each_expr(&mut |x| walk_elements(x, f));
@@ -478,6 +485,56 @@ fn component_tree(result: &ProgramAnalysisResult) -> ComponentTree<'_> {
         }
         e.for_each_child(&mut |c| walk(c, closure, f));
     }
+    /// The element `e` of `parent` mounts its child under `guards`, when `e`
+    /// is a component element.
+    fn place<'a>(
+        tree: &mut ComponentTree<'a>,
+        table: &crate::ir::ComponentTable,
+        parent: ComponentId,
+        e: &'a Expr,
+        closure: bool,
+        guards: &[&'a Expr],
+    ) {
+        let Expr::CompApp {
+            name,
+            origin,
+            props,
+            ..
+        } = e
+        else {
+            return;
+        };
+        // As the engine resolves the child it analyses — none for an element
+        // of unseen code (#389), each name the binding of a name a scope
+        // binds aliases (#392) — and, for one whose import leads to no
+        // component, the one component of that name.
+        for (name, origin) in ElementOrigin::named(name, origin.as_ref()) {
+            let child = match table.element(name, origin.map(Arc::as_ref)) {
+                ElementTarget::Component(child) => child,
+                ElementTarget::Unseen | ElementTarget::Ambiguous | ElementTarget::Value => {
+                    continue;
+                }
+                ElementTarget::Unresolved => match table.ids_named(name).collect::<Vec<_>>()[..] {
+                    [child] => child,
+                    _ => continue,
+                },
+            };
+            if child == parent {
+                continue;
+            }
+            let mut held = guards.to_vec();
+            if let Expr::ObjectLit { fields, .. } = props.peel_ts()
+                && let Some(key) = object_member(fields, "key")
+            {
+                held.push(key);
+            }
+            tree.entry(child).or_default().push(Element {
+                parent,
+                closure,
+                held,
+            });
+        }
+    }
     let table = &result.component_table;
     let mut tree: ComponentTree = HashMap::new();
     for (&parent, r) in &result.components {
@@ -489,45 +546,25 @@ fn component_tree(result: &ProgramAnalysisResult) -> ComponentTree<'_> {
                 .collect();
             block.for_each_expr(&mut |e| {
                 walk(e, false, &mut |e, closure| {
-                    let Expr::CompApp {
-                        name,
-                        origin,
-                        props,
-                        ..
-                    } = e
-                    else {
-                        return;
-                    };
-                    // As the engine resolves the child it analyses — none for
-                    // an element of unseen code (#389) — and, for one whose
-                    // import leads to no component, the one component of
-                    // that name.
-                    let child = match table.element(name, origin.as_deref()) {
-                        ElementTarget::Component(child) => child,
-                        ElementTarget::Unseen | ElementTarget::Ambiguous => return,
-                        ElementTarget::Unresolved => {
-                            match table.ids_named(name).collect::<Vec<_>>()[..] {
-                                [child] => child,
-                                _ => return,
-                            }
-                        }
-                    };
-                    if child == parent {
-                        return;
-                    }
-                    let mut held = guards.clone();
-                    if let Expr::ObjectLit { fields, .. } = props.peel_ts()
-                        && let Some(key) = object_member(fields, "key")
-                    {
-                        held.push(key);
-                    }
-                    tree.entry(child).or_default().push(Element {
-                        parent,
-                        closure,
-                        held,
-                    });
+                    place(&mut tree, table, parent, e, closure, &guards)
                 });
             });
+        }
+        // A hook's body — a `useCallback`'s or a `useMemo`'s, which the
+        // render reads only as the hook's value, an effect's, a handler's —
+        // is a closure the render does not place: what it builds mounts at
+        // any of its runs, as a `.map` callback's does. A component a custom
+        // hook's `useCallback` renders, which an element takes as its type
+        // (`const { XModal } = useXModal(); <XModal />`), is mounted there
+        // (#392).
+        for hook in &r.hooks {
+            if let Some(body) = hook.body_cfg() {
+                body.for_each_expr(&mut |e| {
+                    walk(e, true, &mut |e, closure| {
+                        place(&mut tree, table, parent, e, closure, &[])
+                    });
+                });
+            }
         }
     }
     tree

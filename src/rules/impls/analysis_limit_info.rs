@@ -14,6 +14,8 @@ use crate::rules::{Diagnostic, Rule};
 ///   that child are treated as ⊤.
 /// - `ambiguous-component` — several analysed files define the child's name and
 ///   the call site does not say which; the child is treated as unknown (#7).
+/// - `value-component` — the element's type is a value a scope binds that the
+///   analysis does not resolve; the child is treated as unknown (#392).
 /// - `callback-depth-cap` — callback inlining reached MAX_INLINE_DEPTH; deeper
 ///   HOF chains (`.then(() => .then(…))`) not descended.
 /// - `unknown-hook` — custom hook call whose source is not in the registry and
@@ -71,6 +73,20 @@ impl Rule for AnalysisLimitInfo {
                              this reference does not resolve to one of them, so the child \
                              is treated as unknown. Import it explicitly from its file \
                              (FN possible)"
+                    ),
+                ));
+            }
+        }
+
+        for (caller, callee) in &stats.value_component_refs {
+            if *caller == component {
+                diags.push(Diagnostic::info(
+                    "analysis-limit",
+                    format!(
+                        "the element `<{callee}>` takes its type from a value this \
+                             component binds (a prop, a parameter, a local), which the \
+                             analysis does not resolve, so the child is treated as \
+                             unknown (FN possible)"
                     ),
                 ));
             }

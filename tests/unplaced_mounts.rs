@@ -46,7 +46,9 @@ fn loops(src: &str) -> Vec<String> {
 }
 
 /// `C` stores a new object after every render and ticks its parent, which
-/// renders it as `element` while `n < 3`.
+/// renders it as `element` while `n < 3`. `Comp` is a `let`: a `const`
+/// choice between `C` and `D` would place the element, as `<C/>` or `<D/>`
+/// written in place (#392).
 fn mounted(decls: &str, element: &str) -> Vec<String> {
     loops(&format!(
         "import {{ useEffect, useState }} from 'react';\n\
@@ -60,7 +62,7 @@ fn mounted(decls: &str, element: &str) -> Vec<String> {
          export function App() {{\n\
            const [n, setN] = useState(0);\n\
            const tick = () => setN((x) => x + 1);\n\
-           const Comp = n >= 0 ? C : D;\n\
+           let Comp = n >= 0 ? C : D;\n\
            const items = n < 3 ? [C] : [];\n\
            return <div>{{n < 3 ? {element} : null}}{{typeof Comp}}{{items.length}}</div>;\n\
          }}\n"

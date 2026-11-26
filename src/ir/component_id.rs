@@ -150,6 +150,10 @@ pub enum ElementTarget {
     /// holds (a value the lowering made no component, a barrel's re-export
     /// it cannot follow), or no file defines the name.
     Unresolved,
+    /// A scope of the file binds the name (#392): a value, whose types the
+    /// engine resolves through the binding's leaves
+    /// ([`ElementOrigin::named`]) — never a component by the name.
+    Value,
 }
 
 impl ComponentTable {
@@ -285,12 +289,15 @@ impl ComponentTable {
     ///   program defines under that name, and so is a program `const` that
     ///   aliases a package's member, imported directly or through barrels
     ///   (#404);
-    /// - neither declared nor imported in the file: the one component of that
+    /// - bound by a scope of the file: [`ElementTarget::Value`], whatever
+    ///   the file imports or the program defines under that name (#392);
+    /// - bound nowhere in the file, a global: the one component of that
     ///   name, the name-only fallback ADR-013 accepts — never the first of
     ///   several (#7).
     pub fn element(&self, name: &str, origin: Option<&ElementOrigin>) -> ElementTarget {
         match origin {
             Some(ElementOrigin::Unseen) => ElementTarget::Unseen,
+            Some(ElementOrigin::Local(_)) => ElementTarget::Value,
             Some(ElementOrigin::Program(o)) => {
                 // The file defines it: the common case, without the walk's
                 // bookkeeping.

@@ -1349,10 +1349,23 @@ fn lower_jsx_element(jsx: &JSXElement, builder: &mut BlockBuilder) -> Expr {
             ));
         }
         let span = builder.span_at(jsx.opening_element.span.start);
-        // Who `<Name/>` refers to is settled by this file's imports and its own
-        // declarations, and nowhere else — resolving it later, from the bare
-        // name, is how a same-named component in an unrelated file came to be
-        // inlined in its place (#7).
+        // Who `<Name/>` refers to is settled by the scope at the element
+        // first: a name a scope binds is that binding's value, never the
+        // file's import or declaration of the name (#392), and the element
+        // reads it as the JSX runtime does.
+        if let Some(origin) = builder.ctx.jsx.scoped(jsx.opening_element.span.start) {
+            return Expr::CompApp {
+                name,
+                props: Box::new(props),
+                span,
+                origin: Some(origin.clone()),
+                value: Some(Box::new(jsx_name_expr(&jsx.opening_element.name))),
+            };
+        }
+        // Then by this file's imports and its own declarations, and nowhere
+        // else — resolving it later, from the bare name, is how a same-named
+        // component in an unrelated file came to be inlined in its place
+        // (#7).
         // A member name (`<Primitive.Root/>`) is no binding of the file; its
         // root is, and a root imported from code the analysis does not see
         // makes the member that code's too, as it makes a call of
@@ -1372,6 +1385,7 @@ fn lower_jsx_element(jsx: &JSXElement, builder: &mut BlockBuilder) -> Expr {
             props: Box::new(props),
             span,
             origin,
+            value: None,
         }
     } else {
         Expr::NativeElem {
@@ -1445,7 +1459,31 @@ fn is_event_prop_key(name: &str) -> bool {
         && chars.next().is_some_and(|c| c.is_ascii_uppercase())
 }
 
-fn jsx_element_name(name: &JSXElementName) -> String {
+/// A JSX element's name read as the expression the JSX runtime evaluates:
+/// the variable, or the member chain off it.
+fn jsx_name_expr(name: &JSXElementName) -> Expr {
+    fn object(obj: &JSXMemberExpressionObject) -> Expr {
+        match obj {
+            JSXMemberExpressionObject::IdentifierReference(id) => Expr::Var(id.name.to_string()),
+            JSXMemberExpressionObject::MemberExpression(m) => Expr::FieldAccess {
+                obj: Box::new(object(&m.object)),
+                field: m.property.name.to_string(),
+            },
+            JSXMemberExpressionObject::ThisExpression(_) => {
+                Expr::Var(crate::ir::expr::THIS.to_string())
+            }
+        }
+    }
+    match name {
+        JSXElementName::MemberExpression(m) => Expr::FieldAccess {
+            obj: Box::new(object(&m.object)),
+            field: m.property.name.to_string(),
+        },
+        other => Expr::Var(jsx_element_name(other)),
+    }
+}
+
+pub(super) fn jsx_element_name(name: &JSXElementName) -> String {
     match name {
         JSXElementName::Identifier(id) => id.name.to_string(),
         JSXElementName::IdentifierReference(id) => id.name.to_string(),

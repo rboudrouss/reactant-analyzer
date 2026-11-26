@@ -39,7 +39,7 @@ use crate::{
 use super::local_bindings;
 use super::render_tree::RenderIndex;
 use super::setters::all_setter_labels;
-use crate::ir::{ComponentId, ElementOrigin, ElementTarget};
+use crate::ir::{ComponentId, ElementOrigin, ElementTarget, expr::ElementLeaf};
 
 /// What the call sites prove about a consumer's mount lifetime, relative to
 /// the state slot feeding one of its seeding props.
@@ -382,12 +382,35 @@ fn collect_sites(
         // The relation only ever *downgrades* a finding, and it downgrades
         // when EVERY site remounts — so an extra site can only keep a finding,
         // never remove one (#95). An element of unseen code mounts none of
-        // the program's components (#389).
-        let targets: Vec<ComponentId> = match table.element(name, origin) {
-            ElementTarget::Component(id) => vec![id],
-            ElementTarget::Unseen => Vec::new(),
-            ElementTarget::Ambiguous | ElementTarget::Unresolved => table.ids_named(name).collect(),
+        // the program's components (#389). One whose name a scope binds
+        // mounts each name its binding aliases, and a value it does not
+        // resolve may be any component: those of its name keep the sites an
+        // unresolved element keeps (#392).
+        let mut targets: Vec<ComponentId> = Vec::new();
+        let leaves: Vec<(&Symbol, Option<&ElementOrigin>)> = match origin {
+            Some(ElementOrigin::Local(leaves)) => leaves
+                .iter()
+                .filter_map(|leaf| match leaf {
+                    ElementLeaf::Named { name, origin } => Some((name, origin.as_deref())),
+                    ElementLeaf::Host(_) | ElementLeaf::Value => None,
+                })
+                .collect(),
+            _ => vec![(name, origin)],
         };
+        for (name, origin) in leaves {
+            match table.element(name, origin) {
+                ElementTarget::Component(id) => targets.push(id),
+                ElementTarget::Unseen => {}
+                ElementTarget::Ambiguous | ElementTarget::Unresolved | ElementTarget::Value => {
+                    targets.extend(table.ids_named(name))
+                }
+            }
+        }
+        if let Some(ElementOrigin::Local(leaves)) = origin
+            && leaves.contains(&ElementLeaf::Value)
+        {
+            targets.extend(table.ids_named(name));
+        }
         for id in targets {
             out.entry(id).or_default().push(site.clone());
         }
@@ -410,6 +433,7 @@ fn collect_sites(
                 props,
                 origin,
                 span,
+                ..
             } => {
                 push(name, origin.as_deref(), props, *span, block);
                 walk(props, block, nested, push);

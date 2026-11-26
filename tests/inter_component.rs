@@ -81,6 +81,7 @@ fn heuristic_detects_parent_not_child_as_root() {
                         props: Box::new(Expr::Lit(Prim::Null)),
                         span: None,
                         origin: None,
+                        value: None,
                     },
                     None,
                 ),
@@ -104,7 +105,7 @@ fn heuristic_detects_parent_not_child_as_root() {
     };
     let child = leaf_component("Child");
     let reg = ComponentRegistry::from_components(vec![parent, child]);
-    let roots = RootStrategy::Heuristic.detect(&reg);
+    let roots = RootStrategy::Heuristic.detect(&reg, &HookRegistry::new());
     let names: Vec<String> = roots
         .into_iter()
         .filter_map(|id| reg.table().name(id))
@@ -145,6 +146,7 @@ fn analyze_program_populates_call_graph_for_parent_child() {
                         props: Box::new(Expr::Lit(Prim::Null)),
                         span: None,
                         origin: None,
+                        value: None,
                     },
                     None,
                 ),
@@ -294,6 +296,7 @@ fn setter_prop_propagates_to_shared_state() {
                             }),
                             span: None,
                             origin: None,
+                            value: None,
                         },
                         None,
                     ),
@@ -360,6 +363,7 @@ fn recursive_component_does_not_crash() {
                         props: Box::new(Expr::Lit(Prim::Null)),
                         span: None,
                         origin: None,
+                        value: None,
                     },
                     None,
                 ),
@@ -914,6 +918,7 @@ fn prop_drilling_direct_ir() {
                         }),
                         span: None,
                         origin: None,
+                        value: None,
                     },
                     None,
                 ),
@@ -963,6 +968,7 @@ fn prop_drilling_direct_ir() {
                         }),
                         span: None,
                         origin: None,
+                        value: None,
                     },
                     None,
                 ),

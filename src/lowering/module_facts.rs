@@ -264,15 +264,16 @@ fn member_install(program: &Program, roots: &[String]) -> Option<MemberInstall> 
 /// (`const a = Object.assign`, `Object.assign.call`, `Reflect.apply`), a
 /// computed member call whose first argument is a spread (`a[e](...t)`,
 /// which names no target), or a write on an alias of the import other than
-/// a module `const`
-/// (a `let`, a parameter, an object's member). Over the whole file, module
-/// scope included, which no pass interprets.
+/// a `const` — the module's (#404) or a scope's ([`InstallScan::scoped_body`],
+/// #392) — (a `let`, a parameter, an object's member). Over the whole file,
+/// module scope included, which no pass interprets.
 fn installs(program: &Program, roots: &[String]) -> Vec<(Option<String>, MemberInstall)> {
     let mut scan = InstallScan {
         roots: roots.iter().map(String::as_str).collect(),
         found: Vec::new(),
         source: program.source_text,
         shadows: Vec::new(),
+        aliases: Vec::new(),
         module_undefined: super::top_level_binding_names(program)
             .iter()
             .any(|n| n == "undefined")
@@ -331,6 +332,11 @@ struct InstallScan<'s> {
     /// binds, outermost first: a reference to one of them is not the
     /// module's.
     shadows: Vec<HashSet<String>>,
+    /// Per scope of `shadows`, the names it binds to a `const` alias of a
+    /// member chain rooted at a name of `roots` (#392: a body's alias is the
+    /// package's element, as a module `const` is, #404), with that root: a
+    /// write through one is a write into the root.
+    aliases: Vec<HashMap<String, String>>,
     /// The module binds `undefined` itself.
     module_undefined: bool,
 }
@@ -347,8 +353,87 @@ impl InstallScan<'_> {
     /// Run `f` in a scope binding `names`.
     fn scoped(&mut self, names: HashSet<String>, f: impl FnOnce(&mut Self)) {
         self.shadows.push(names);
+        self.aliases.push(HashMap::new());
         f(self);
+        self.aliases.pop();
         self.shadows.pop();
+    }
+
+    /// Run `f` in the scope of `stmts`, which binds `names`: among them,
+    /// each `const` whose initializer is a member chain rooted at a root,
+    /// read in that scope, or a choice one side of which is, aliases that
+    /// root.
+    fn scoped_body<'s, 'a: 's>(
+        &mut self,
+        names: HashSet<String>,
+        stmts: impl IntoIterator<Item = &'s Statement<'a>>,
+        f: impl FnOnce(&mut Self),
+    ) {
+        let mut aliases: HashMap<String, String> = HashMap::new();
+        for stmt in stmts {
+            let Statement::VariableDeclaration(v) = stmt else {
+                continue;
+            };
+            if v.kind != VariableDeclarationKind::Const {
+                continue;
+            }
+            for d in &v.declarations {
+                if let (BindingPattern::BindingIdentifier(id), Some(init)) = (&d.id, &d.init)
+                    && let Some(root) = self.chain_root(init, &names, &aliases)
+                {
+                    aliases.insert(id.name.to_string(), root);
+                }
+            }
+        }
+        self.shadows.push(names);
+        self.aliases.push(aliases);
+        f(self);
+        self.aliases.pop();
+        self.shadows.pop();
+    }
+
+    /// The root a `const` initializer read in a scope being entered (which
+    /// binds `names`, `aliases` among them) aliases: a name or a static
+    /// member chain off one that is a root there.
+    fn chain_root(
+        &self,
+        init: &Expression,
+        names: &HashSet<String>,
+        aliases: &HashMap<String, String>,
+    ) -> Option<String> {
+        match init.get_inner_expression() {
+            Expression::Identifier(id) => {
+                let name = id.name.as_str();
+                match aliases.get(name) {
+                    Some(root) => Some(root.clone()),
+                    None if names.contains(name) => None,
+                    None => self.root_of(name).map(str::to_string),
+                }
+            }
+            Expression::StaticMemberExpression(m) => self.chain_root(&m.object, names, aliases),
+            // A choice may be either side, as the element reads it.
+            Expression::ConditionalExpression(c) => self
+                .chain_root(&c.consequent, names, aliases)
+                .or_else(|| self.chain_root(&c.alternate, names, aliases)),
+            Expression::LogicalExpression(l) => self
+                .chain_root(&l.left, names, aliases)
+                .or_else(|| self.chain_root(&l.right, names, aliases)),
+            _ => None,
+        }
+    }
+
+    /// The root `name`, read here, is a write into: itself when it is a
+    /// root no scope shadows, the root a scope's alias of it names.
+    fn root_of<'n>(&'n self, name: &'n str) -> Option<&'n str> {
+        for (names, aliases) in self.shadows.iter().zip(&self.aliases).rev() {
+            if let Some(root) = aliases.get(name) {
+                return Some(root);
+            }
+            if names.contains(name) {
+                return None;
+            }
+        }
+        self.roots.contains(name).then_some(name)
     }
 
     /// `e` is a primitive literal, itself: a number, a string, a boolean,
@@ -379,11 +464,9 @@ impl InstallScan<'_> {
     /// The name of `roots` `receiver` is rooted at: the name, the module's,
     /// or a member chain off one, through parentheses, TS assertions and
     /// non-null `!`.
-    fn rooted<'e>(&self, receiver: &'e Expression<'e>) -> Option<&'e str> {
+    fn rooted<'e>(&'e self, receiver: &'e Expression<'e>) -> Option<&'e str> {
         match receiver.get_inner_expression() {
-            Expression::Identifier(id) => (self.roots.contains(id.name.as_str())
-                && self.free(id.name.as_str()))
-            .then_some(id.name.as_str()),
+            Expression::Identifier(id) => self.root_of(id.name.as_str()),
             Expression::StaticMemberExpression(m) => self.rooted(&m.object),
             Expression::ComputedMemberExpression(m) => self.rooted(&m.object),
             Expression::ChainExpression(c) => c
@@ -645,24 +728,29 @@ impl<'a> Visit<'a> for InstallScan<'_> {
     fn visit_function(&mut self, it: &Function<'a>, flags: oxc_syntax::scope::ScopeFlags) {
         let mut names = parameters(&it.params);
         names.extend(it.id.iter().map(|i| i.name.to_string()));
-        if let Some(body) = &it.body {
-            names.extend(declared(&body.statements));
-        }
-        self.scoped(names, |s| walk::walk_function(s, it, flags));
+        let stmts: &[Statement] = it.body.as_ref().map_or(&[], |b| &b.statements[..]);
+        names.extend(declared(stmts));
+        self.scoped_body(names, stmts, |s| walk::walk_function(s, it, flags));
     }
 
     fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
         let mut names = parameters(&it.params);
         names.extend(declared(&it.body.statements));
-        self.scoped(names, |s| walk::walk_arrow_function_expression(s, it));
+        self.scoped_body(names, &it.body.statements, |s| {
+            walk::walk_arrow_function_expression(s, it)
+        });
     }
 
     fn visit_block_statement(&mut self, it: &BlockStatement<'a>) {
-        self.scoped(declared(&it.body), |s| walk::walk_block_statement(s, it));
+        self.scoped_body(declared(&it.body), &it.body, |s| {
+            walk::walk_block_statement(s, it)
+        });
     }
 
     fn visit_static_block(&mut self, it: &StaticBlock<'a>) {
-        self.scoped(declared(&it.body), |s| walk::walk_static_block(s, it));
+        self.scoped_body(declared(&it.body), &it.body, |s| {
+            walk::walk_static_block(s, it)
+        });
     }
 
     fn visit_catch_clause(&mut self, it: &CatchClause<'a>) {
@@ -680,10 +768,10 @@ impl<'a> Visit<'a> for InstallScan<'_> {
         self.visit_expression(&it.discriminant);
         let stmts: Vec<&Statement> = it.cases.iter().flat_map(|c| &c.consequent).collect();
         let mut names = HashSet::new();
-        for stmt in stmts {
-            names.extend(declared(std::slice::from_ref(stmt)));
+        for stmt in &stmts {
+            names.extend(declared(std::slice::from_ref(*stmt)));
         }
-        self.scoped(names, |s| {
+        self.scoped_body(names, stmts, |s| {
             for case in &it.cases {
                 s.visit_switch_case(case);
             }
@@ -1513,6 +1601,29 @@ mod tests {
         assert!(f.member_install.is_some());
         let f = facts_of("import * as P from 'pkg';\nlet A = P.Root;\n(A as any).hook = f;");
         assert!(f.member_install.is_none());
+        // A body's `const` alias is the package's element too (#392), so a
+        // write through it counts, in its scope; a binding of another
+        // scope, a `let`, or a shadowed root aliases nothing.
+        for src in [
+            "function App() { const D = P.Root; D.hook = f; }",
+            "function App() { const N = P; const D = N.Root; (D as any).hook = f; }",
+            "function App() { const D = P.Root; return () => { D.hook = f; }; }",
+            "function App() { switch (x) { case 1: const D = P.Root; D.hook = f; } }",
+            "function App(p) { const D = p.c ? P.Root : 'div'; D.hook = f; }",
+        ] {
+            let f = facts_of(&format!("import * as P from 'pkg';\n{src}"));
+            assert!(f.member_install.is_some(), "{src}");
+        }
+        for src in [
+            "function App() { let D = P.Root; D.hook = f; }",
+            "function App() { { const D = P.Root; } D.hook = f; }",
+            "function App(P) { const D = P.Root; D.hook = f; }",
+            "function App() { const P = {}; const D = P.Root; D.hook = f; }",
+            "function App() { const D = P.Root; function g(D) { D.hook = f; } }",
+        ] {
+            let f = facts_of(&format!("import * as P from 'pkg';\n{src}"));
+            assert!(f.member_install.is_none(), "{src}");
+        }
         let f = facts_of("import { A } from './a';\n(A as any).Close = Local;");
         assert!(f.member_install.is_none());
         assert_eq!(

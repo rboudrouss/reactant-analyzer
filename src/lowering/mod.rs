@@ -7,6 +7,7 @@ pub mod expr_lower;
 pub mod hook_detector;
 pub mod hook_extractor;
 pub mod import_resolution;
+mod jsx_scope;
 pub mod module_facts;
 pub mod react_wrappers;
 pub mod utility_detector;
