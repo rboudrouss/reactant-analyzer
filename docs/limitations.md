@@ -896,15 +896,17 @@ carries an Error.
   listener a dispatch of any event the program fires may reach. Its price is every loop through a
   package that calls such a prop from an effect or while it renders: vaul 1.1.2's uncontrolled
   `Drawer.Root` calls `onOpenChange` from an effect (`dist/index.mjs:463-506`), and so does any
-  `useEffect(() => props.onChange(v))`; the oracle cases stating
+  `useEffect(() => props.onChange(v))` and React's own `<Profiler onRender>` (after every commit); the oracle cases stating
   `assume=packagePropsRunOnEvents fn` are those loops, missed under the declaration. Not covered,
   whatever is declared: a `ref` (commit time, #412), `key`, `children` (a render prop is called
   while the package renders; a render prop under another name is the declaring user's to vouch
   for), a spread, a function held by a member of an object prop or an entry of an array prop, a
   package function's or a package hook's argument, any element of a program that may write code into
-  a package import (#401's voiding fact), and program code the analysis does not resolve. A closure
-  *returned* by a closure handed to package code is not followed by the writer walk in either
-  reading.
+  a package import (#401's voiding fact), and program code the analysis does not resolve. What the
+  covered closure's captures reach is covered with it (only a call of the closure runs it), so a
+  function the package obtains by calling the prop — a render prop's result — is read as an
+  event's too. A closure *returned* by a closure handed to package code, and allocated by that
+  call, is not followed by the writer walk in either reading.
 - **A write in a `useMemo` body is a render write** [#249](https://github.com/rboudrouss/reactant-analyzer/issues/249),
   with the memo's re-run class. It is an Error only when the memo is called on every render, its
   body writes on every path, and it recomputes at every render: no deps array, or the written slot

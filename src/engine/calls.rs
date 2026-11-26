@@ -216,18 +216,22 @@ pub struct Escapes {
     /// through a closure it is that calls it: what a row may call the
     /// value's spelling a setter for.
     pub direct: BTreeSet<Slot>,
-    /// Those of `setters` some evaluation found the value holding, through a
-    /// member of an object it reaches.
-    pub held: BTreeSet<Slot>,
     pub bodies: BTreeSet<ExprId>,
-    /// Those of `bodies` the handed value may itself be (one of its own
-    /// sites is that closure), and those some evaluation found it reaching
-    /// through a member of an object or a capture of a closure. Recorded at
-    /// a JSX element's props only, and only when the run declares
+    /// How the value reached its row, as the evaluations that say it found
+    /// it: `reached` and `reached_setters`, everything they found;
+    /// `members` and `member_setters`, what they found the value holding
+    /// through a member of an object (an array's entries included) it is or
+    /// holds, at any depth — what code given the value reaches without
+    /// calling it. The rest of what they found is the value itself and what
+    /// a closure it is reaches by its captures, which only a call of that
+    /// closure runs. Recorded at a JSX element's props only, and only when
+    /// the run declares
     /// [`crate::assumptions::Assumption::PackagePropsRunOnEvents`], their
-    /// one reader ([`Self::split_own`]).
-    pub own: BTreeSet<ExprId>,
-    pub through: BTreeSet<ExprId>,
+    /// one reader ([`Self::split_called`]).
+    pub reached: BTreeSet<ExprId>,
+    pub reached_setters: BTreeSet<Slot>,
+    pub members: BTreeSet<ExprId>,
+    pub member_setters: BTreeSet<Slot>,
     /// `Some(true)`: every evaluation handed a value surely the one setter
     /// or function it lists to a callee that runs it (an array method).
     /// `Some(false)` once code the analysis does not see took it.
@@ -248,19 +252,20 @@ impl Escapes {
         self.sure == Some(true) && self.placed && self.setters.len() + self.bodies.len() == 1
     }
 
-    /// This row in two: what the handed value is — the setters it may be
-    /// that no evaluation found it holding, the closures it may be that none
-    /// found it reaching through a member or a capture — and everything else
-    /// it reaches, which keeps the module flag. A setter or a body recorded
-    /// without saying how (another producer than a JSX prop's) is the
-    /// second's: fail closed. Each part is sure only if the row is.
-    pub fn split_own(&self) -> (Escapes, Escapes) {
+    /// This row in two: what runs only when the handed value is called — the
+    /// setters and closures it may be, and what their captures reach — and
+    /// everything else, which keeps the module flag: what it holds through a
+    /// member of an object, and what an evaluation recorded without saying
+    /// how ([`Self::reached`]; fail closed). Each part is sure only if the
+    /// row is.
+    pub fn split_called(&self) -> (Escapes, Escapes) {
         let sure = if self.sure() { self.sure } else { Some(false) };
-        let is_setter = |s: &Slot| self.direct.contains(s) && !self.held.contains(s);
-        let is_body = |b: &ExprId| self.own.contains(b) && !self.through.contains(b);
+        let is_setter =
+            |s: &Slot| self.reached_setters.contains(s) && !self.member_setters.contains(s);
+        let is_body = |b: &ExprId| self.reached.contains(b) && !self.members.contains(b);
         let own = Escapes {
             setters: self.setters.iter().copied().filter(is_setter).collect(),
-            direct: self.setters.iter().copied().filter(is_setter).collect(),
+            direct: self.direct.iter().copied().filter(is_setter).collect(),
             bodies: self.bodies.iter().copied().filter(is_body).collect(),
             sure,
             placed: self.placed,
@@ -413,7 +418,7 @@ impl CallRelation {
     /// package's, and the run assumes it calls a function it receives as a
     /// named prop only from an event handler
     /// ([`crate::assumptions::Assumption::PackagePropsRunOnEvents`]): what
-    /// such a prop is runs at an event's time ([`Escapes::split_own`],
+    /// such a prop is runs at an event's time ([`Escapes::split_called`],
     /// [`crate::ir::expr::package_event_prop`]).
     pub fn package_props_on_events(&self, props: ExprId) -> bool {
         self.unseen.get(&props) == Some(&UnseenChild::PackageOnEvents)
@@ -670,10 +675,7 @@ impl CallRelation {
             row.direct.insert(slot);
             row.setters.insert(slot);
         }
-        for slot in held {
-            row.held.insert(slot);
-            row.setters.insert(slot);
-        }
+        row.setters.extend(held);
         row.bodies.extend(bodies);
         row.sure = Some(row.sure.unwrap_or(true) && sure);
         // A module binding counts once it may hold something a call runs.
@@ -682,19 +684,21 @@ impl CallRelation {
             self.module.insert(anchor);
         }
     }
-    /// Say how the value at `pos` of `anchor` reached the bodies of its row:
-    /// `own`, those it may itself be, and `through`, those it reached
-    /// through a member or a capture ([`Escapes::own`]).
+    /// Say how one evaluation of the value at `pos` of `anchor` reached its
+    /// row: everything it found (`reached`), and what of it the value holds
+    /// through a member of an object (`members`) ([`Escapes::reached`]).
     pub fn record_reached(
         &mut self,
         anchor: ExprId,
         pos: usize,
-        own: impl IntoIterator<Item = ExprId>,
-        through: impl IntoIterator<Item = ExprId>,
+        reached: crate::domains::stores::heap::Reached,
+        members: crate::domains::stores::heap::Reached,
     ) {
         let row = self.escapes.entry((anchor, pos)).or_default();
-        row.own.extend(own);
-        row.through.extend(through);
+        row.reached_setters.extend(reached.0);
+        row.reached.extend(reached.1);
+        row.member_setters.extend(members.0);
+        row.members.extend(members.1);
     }
 
     /// Remember the body run at `site`.
@@ -749,10 +753,12 @@ impl CallRelation {
             let row = self.escapes.entry(*k).or_default();
             row.setters.extend(e.setters.iter().copied());
             row.direct.extend(e.direct.iter().copied());
-            row.held.extend(e.held.iter().copied());
             row.bodies.extend(e.bodies.iter().copied());
-            row.own.extend(e.own.iter().copied());
-            row.through.extend(e.through.iter().copied());
+            row.reached.extend(e.reached.iter().copied());
+            row.reached_setters
+                .extend(e.reached_setters.iter().copied());
+            row.members.extend(e.members.iter().copied());
+            row.member_setters.extend(e.member_setters.iter().copied());
             row.placed |= e.placed;
             row.module |= e.module;
             row.sure = match (row.sure, e.sure) {

@@ -570,6 +570,49 @@ fn package_props_on_events_drop_the_hand_over_and_say_so() {
     );
 }
 
+/// A program component wraps a package element and hands it a closure that
+/// calls the parent's setter prop (shadcn's `<Dialog onOpenChange={(o) =>
+/// onOpenChange(o)}>`): what the closure reaches by its captures runs only
+/// when the package calls it, so it is covered with it. In a program that
+/// fires events itself the covered part keeps the package's provenance: the
+/// row never turns into a Warning.
+#[test]
+fn package_props_on_events_cover_what_the_closure_calls() {
+    for dispatches in [false, true] {
+        let effect = if dispatches {
+            "useEffect(() => { r.current?.focus(); }, []);"
+        } else {
+            ""
+        };
+        let src = format!(
+            r#"import {{ useEffect, useRef, useState }} from "react";
+import {{ ClickCalls }} from "ext";
+function Confirm({{ onOpenChange }}: {{ onOpenChange: (o: boolean) => void }}) {{
+  return <ClickCalls fn={{(o: boolean) => onOpenChange(o)}} />;
+}}
+export function App() {{
+  const [t, setT] = useState<number | undefined>(0);
+  const r = useRef<HTMLInputElement>(null);
+  {effect}
+  return <div>{{t}}<input ref={{r}} /><Confirm onOpenChange={{(open) => !open && setT(undefined)}} /></div>;
+}}
+"#
+        );
+        let p = Project::new(&[("a.tsx", &src)]);
+        assert_eq!(
+            hand_overs(&p.json(&["--info"])),
+            ["cross-setter-in-render:info"],
+            "dispatches={dispatches}: off"
+        );
+        let on = p.json(&["--info", "--assume", ON_EVENTS]);
+        assert!(
+            hand_overs(&on).is_empty(),
+            "dispatches={dispatches}: on, {:?}",
+            hand_overs(&on)
+        );
+    }
+}
+
 /// The price: a package that calls the prop from an effect loops in React;
 /// by default the Info row discloses it, declared the analysis says nothing.
 #[test]

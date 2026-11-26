@@ -77,7 +77,11 @@ member element or a module `const` alias imported from a specifier the resolver 
 the same premise and with the same voiding fact (a write that may install code into a package import
 makes no element a package's, so none is covered). "The function it receives as the prop" is what
 the prop's value *is*: a setter, or a closure (written in place, or a name, a member or a parameter
-that holds one). Under it that value is read as a host element's `on*` prop is: at an event's time
+that holds one), with what only a call of it runs: the closures and setters its captures reach. A
+package cannot read a closure's captures; it reaches them by calling the closure, whose body the
+walk follows at the closure's time, or by keeping what the call returns — so the statement covers a
+function the package obtains by calling such a prop too (a render prop's result, when it is a
+function: the user who declares the assumption asserts it). Under it that value is read as a host element's `on*` prop is: at an event's time
 (no `setter-in-render` / `cross-setter-in-render` row, no loop step through it, a dispatch inside it
 at event time), and a listener a dispatch of any event may reach (#407): a program that fires events
 itself still runs it where it fires them.
@@ -86,8 +90,12 @@ itself still runs it where it fires them.
 (`havoc_setter_props`, #325: `UnseenChild::PackageOnEvents`); the writer walk reads the mark where it
 classes each prop of that element (`CallRelation::package_props_on_events`), so every rule sees one
 timing. The state still takes every write such a prop may make. The relation records, for a JSX
-prop and only under the assumption, which closures the value may be and which it reaches through a
-member or a capture (`Escapes::split_own`): only the first are covered.
+prop and only under the assumption, everything the value reached and what of it the value holds
+through a member of an object (`Escapes::split_called`): only the rest is covered, and what an
+evaluation recorded without saying how is not. In a program that dispatches events, the covered
+part is ⊤ only because of that (marked a listener's, which the dispatch sites claim) and keeps the
+package's provenance, so a site found both covered and not joins to an Info, as without the
+assumption.
 
 **Not covered**, each keeping its default reading (an Info hand-over, or a Warning):
 - `ref`: React's commit-time protocol (#412), not a prop the package calls on an event; `key`, which
@@ -96,16 +104,17 @@ member or a capture (`Escapes::split_own`): only the first are covered.
   render prop under another name (`render`, `renderItem`, a formatter) cannot be told from the
   outside, so the user who declares the assumption asserts it for those;
 - a spread (`{...props}`): it names no prop at the element and forwards `ref` and `children`;
-- what the value reaches without being it: a function held by a member of an object prop, an entry of
-  an array prop, one a closure captures;
+- what the value holds without a call: a function held by a member of an object prop (written in
+  place or named), an entry of an array prop, at any depth;
 - a package function call `pkg.run(cb)` and a package hook's argument `useThing(cb)` (not
   components, not props): the obvious sibling assumptions, not this one;
 - a program child the analysis does not resolve (`Handover::Other`): program code, never covered.
 
 **When it is false.** vaul 1.1.2's uncontrolled `Drawer.Root` calls `onOpenChange` from an effect when
 its value changes (`dist/index.mjs:463-506`: `useUncontrolledState`'s `useEffect` calls `onChange`,
-read in the published package); any library with `useEffect(() => props.onChange(v))`; the oracle's
-`ext.EffectCalls`. A loop through such a package is then missed: the oracle cases that state
+read in the published package); any library with `useEffect(() => props.onChange(v))`; React's own
+`<Profiler onRender>`, which React calls after every commit (an import from `react` is a package's
+element like any other: the element does not keep its specifier); the oracle's `ext.EffectCalls`. A loop through such a package is then missed: the oracle cases that state
 `assume=packagePropsRunOnEvents fn` are that price, and a harness run under the assumption accepts
 `fn` there and nowhere else.
 

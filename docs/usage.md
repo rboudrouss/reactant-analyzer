@@ -884,11 +884,14 @@ renders), a spread `{...props}` (it names no prop, and carries `ref` and
 `children`), a function held by a member of an object prop or an entry of an
 array prop, a package function's argument (`pkg.run(cb)`), a package hook's
 argument (`useThing(cb)`), and any program code the analysis does not resolve.
+What the covered closure calls, and a function the package gets back by
+calling it, run at the event's time too.
 
 **What it misses.** A loop through a package that calls such a prop from an
 effect or while it renders. vaul's uncontrolled `Drawer.Root` (no `open` prop)
 calls `onOpenChange` from an effect when its value changes; a library with
-`useEffect(() => props.onChange(value))` does the same; a render prop named
+`useEffect(() => props.onChange(value))` does the same, and so does React's own
+`<Profiler onRender>` (after every commit); a render prop named
 other than `children` (`render`, `renderItem`, a formatter) is called while the
 package renders. Declare it when the packages you hand functions to call them
 from user events only.

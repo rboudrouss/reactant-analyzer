@@ -4449,11 +4449,15 @@ impl<'a> SetterWalk<'a> {
 
     /// The named prop at `anchor` of a package's element, holding `val`,
     /// under [`crate::assumptions::Assumption::PackagePropsRunOnEvents`]
-    /// (ADR-048): what the value is — a setter, a closure — runs as a host
-    /// element's `on*` prop does, at an event's time, and is a listener a
-    /// dispatch of any event may reach (#407); what it reaches through a
-    /// member or a capture is handed to the package at any time, in `class`,
-    /// as without the assumption ([`crate::engine::Escapes::split_own`]).
+    /// (ADR-048): what runs only when the value is called — the setter or
+    /// the closure it is, and what that closure's captures reach — runs as a
+    /// host element's `on*` prop does, at an event's time, and is a listener
+    /// a dispatch of any event may reach (#407); what it holds through a
+    /// member of an object is handed to the package at any time, in `class`,
+    /// as without the assumption ([`crate::engine::Escapes::split_called`]).
+    /// In a program that dispatches, the first part is ⊤ only because of
+    /// that, and still handed to the package: a site found both ways joins
+    /// to the package's ⊤, never to other code's.
     #[allow(clippy::too_many_arguments)]
     fn package_prop(
         &mut self,
@@ -4469,12 +4473,15 @@ impl<'a> SetterWalk<'a> {
         let Some(row) = calls.escapes(anchor.0, anchor.1) else {
             return;
         };
-        let (own, rest) = row.split_own();
+        let (own, rest) = row.split_called();
         self.hear(anchor, val, None, Events::Any);
         // ⊤ only because the program dispatches events (#219), as a host
         // element's listener: the rows say so.
         let outer = std::mem::replace(&mut self.listening, self.dispatches);
-        let listener = self.listener_class();
+        let listener = match self.dispatches {
+            true => WalkClass::Unknown(Handover::Package),
+            false => WalkClass::Handler,
+        };
         self.handed_row(
             &own, false, true, val, listener, None, depth, found, prov, stmt_span,
         );
