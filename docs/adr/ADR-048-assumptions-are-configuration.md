@@ -118,6 +118,48 @@ element like any other: the element does not keep its specifier); the oracle's `
 `assume=packagePropsRunOnEvents fn` are that price, and a harness run under the assumption accepts
 `fn` there and nowhere else.
 
+**What it buys in a program that fires events itself: little.** "Only from an event handler" includes
+the events the program fires (`el.click()`, `focus()`, `requestSubmit()`, `dispatchEvent`), and the
+analysis cannot say which event a package's handler hears nor on which node: a covered prop is a
+listener every dispatch of the program reaches (#407). On dub the hand-over rows become listener
+rows, but the loop rules still read them as running wherever the program fires events: rows shown
+1,307 → 1,305. The next section is the separate switch for that.
+
+## A fourth: `programEventsMissPackageHandlers` (the user's decision of 2026-11-26)
+
+**Statement.** An event the program fires itself — a dispatching call the analysis sees, every entry
+of #407's table (`click()`, `requestSubmit()`, `focus()`, `blur()`, `dispatchEvent`, an emitter's
+`emit`) — never runs a function a package component received as a prop. It speaks of the props
+`packagePropsRunOnEvents` covers, and of nothing else: **alone it changes nothing**, and the output
+says so (`… (no effect without packagePropsRunOnEvents)` in the human line; the JSON lists the name,
+as declared). Declared with the first, a covered prop is a handler of **user** events only: no
+dispatch of the program reaches it, so no render-time or effect-time write comes from it.
+
+**One read, in #407's table.** The element's mark becomes `UnseenChild::PackageOnUserEvents` where the
+first's is decided (`havoc_setter_props`), and the walk does not enter such a prop in the program's
+dispatch table (`package_prop` skips `hear`): no dispatch reaches it, and its class is a user event's
+(`Handler`) in every program, as a host `onClick` is in a program that fires no event. No rule reads
+either assumption.
+
+**When it is false.**
+- A library that closes a layer when the focus moves outside it or on an outside pointer event, while
+  the program moves the focus or clicks programmatically: radix's `DismissableLayer`
+  (`@radix-ui/react-dismissable-layer` 1.1.11, `dist/index.mjs:51-58`: a focus outside the layer calls
+  `onFocusOutside`, `onInteractOutside`, then `onDismiss`; `:179-192`: the listener is a `focusin`
+  listener on `document`; `:135-170`: `pointerdown` on `document`), which radix's dialogs and popovers
+  wire to `onOpenChange(false)`. A `focus()` in an effect while such a layer is open runs the prop.
+- A program element rendered inside a package component whose handler listens on an ancestor: a click
+  the program fires on it bubbles to the package's node (the oracle cases
+  `package-props-ancestor-click-loops` and `package-props-dispatched-click-loops`, which become `fn`).
+- The oracle cannot run the focus shape: it renders into a container no document holds, so `focus()`
+  fires nothing and `document` hears nothing; `tests/assumptions.rs` pins the analysis's two readings
+  of it instead.
+
+**What it costs and buys** (measured): the two cases above `tp` → `fn`; on dub and twenty the rows the
+dispatches claimed through package props leave (see `CHANGELOG.md`). A write such a prop's closure hands
+to code the analysis does not follow (`(x) => run(cb)`) is no longer claimed by any dispatch, so it is
+shown on its own, a Warning, as in a handler of a program that fires no event.
+
 ## Why #297's declarations are members of the same section
 
 A declared library summary (#297) is also a statement about code the analysis does not read that

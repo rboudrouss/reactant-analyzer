@@ -1,5 +1,6 @@
 // oracle: react=loop
 // oracle: assume=packagePropsRunOnEvents tp
+// oracle: assume=packagePropsRunOnEvents,programEventsMissPackageHandlers tp
 // The child is program code the analysis does not resolve (an element value
 // read off an array), which calls the prop from an effect after every commit.
 // It is no package's: `packagePropsRunOnEvents` does not touch it, and the

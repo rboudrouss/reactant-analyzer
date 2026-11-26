@@ -1,5 +1,6 @@
 // oracle: react=loop
 // oracle: assume=packagePropsRunOnEvents fn
+// oracle: assume=packagePropsRunOnEvents,programEventsMissPackageHandlers fn
 // A closure bound to a name, handed as a named prop to a package component
 // that calls it from an effect after every commit: React loops. By default
 // the row is the Info hand-over (`disclosed`). Under `packagePropsRunOnEvents`

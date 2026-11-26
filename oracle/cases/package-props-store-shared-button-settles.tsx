@@ -1,5 +1,6 @@
 // oracle: react=converges
 // oracle: assume=packagePropsRunOnEvents tn
+// oracle: assume=packagePropsRunOnEvents,programEventsMissPackageHandlers tn
 // W6's t1 (#420's store side): a shared program Button hands its `onClick`
 // to a package component that calls it on a click only. One caller passes a
 // navigating closure, another (Scroller) one that only scrolls; Scroller's

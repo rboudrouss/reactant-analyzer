@@ -1,5 +1,6 @@
 // oracle: react=loop
 // oracle: assume=packagePropsRunOnEvents disclosed
+// oracle: assume=packagePropsRunOnEvents,programEventsMissPackageHandlers disclosed
 // A package component that calls its `children` during its render (a render
 // prop, as `<AutoSizer>{(size) => …}</AutoSizer>` does): the render prop
 // writes the parent's state at every render of the package. `children` is

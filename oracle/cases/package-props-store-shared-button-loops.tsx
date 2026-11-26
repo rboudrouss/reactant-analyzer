@@ -1,5 +1,6 @@
 // oracle: react=loop
 // oracle: assume=packagePropsRunOnEvents fn
+// oracle: assume=packagePropsRunOnEvents,programEventsMissPackageHandlers fn
 // W6's t1n, the neighbour of `package-props-store-shared-button-settles`: the
 // Button under Scroller is the one whose package calls its prop after every
 // commit, and the prop navigates. Each navigation is a new `location`,

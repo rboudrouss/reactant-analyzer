@@ -1,5 +1,6 @@
 // oracle: react=loop
 // oracle: assume=packagePropsRunOnEvents tp
+// oracle: assume=packagePropsRunOnEvents,programEventsMissPackageHandlers tp
 // W6's u1n: the package calls its `fn` prop after every commit, and the prop
 // clears the draft the effect fills; the effect re-runs on the cleared
 // draft. React loops. The effect's own fresh write under a dep that moves

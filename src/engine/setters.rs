@@ -4458,6 +4458,11 @@ impl<'a> SetterWalk<'a> {
     /// In a program that dispatches, the first part is ⊤ only because of
     /// that, and still handed to the package: a site found both ways joins
     /// to the package's ⊤, never to other code's.
+    ///
+    /// Under [`crate::assumptions::Assumption::ProgramEventsMissPackageHandlers`]
+    /// too, no event the program fires runs the first part: it is not put in
+    /// the program's dispatch table, so no dispatch runs it, and it runs in
+    /// the class a user's event gives, `Handler`, in every program.
     #[allow(clippy::too_many_arguments)]
     fn package_prop(
         &mut self,
@@ -4474,11 +4479,17 @@ impl<'a> SetterWalk<'a> {
             return;
         };
         let (own, rest) = row.split_called();
-        self.hear(anchor, val, None, Events::Any);
+        // A listener of the program's dispatches unless the run assumes none
+        // reaches it.
+        let user_only = calls.package_props_on_user_events(anchor.0);
+        if !user_only {
+            self.hear(anchor, val, None, Events::Any);
+        }
+        let reached = self.dispatches && !user_only;
         // ⊤ only because the program dispatches events (#219), as a host
         // element's listener: the rows say so.
-        let outer = std::mem::replace(&mut self.listening, self.dispatches);
-        let listener = match self.dispatches {
+        let outer = std::mem::replace(&mut self.listening, reached);
+        let listener = match reached {
             true => WalkClass::Unknown(Handover::Package),
             false => WalkClass::Handler,
         };

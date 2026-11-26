@@ -1,5 +1,6 @@
 // oracle: react=converges
 // oracle: assume=packagePropsRunOnEvents tn
+// oracle: assume=packagePropsRunOnEvents,programEventsMissPackageHandlers tn
 // A bare setter and an updater closure handed to a package component that
 // calls them from a click only: no event fires, React settles. Info rows by
 // default (`tn`); none under `packagePropsRunOnEvents`.

@@ -786,3 +786,132 @@ fn package_props_on_events_are_declared_in_the_config_and_stated_in_the_human_ou
     assert_eq!(flag["type"], "boolean", "{schema:#}");
     assert_eq!(flag["default"], false);
 }
+
+// ── programEventsMissPackageHandlers ─────────────────────────────────────────
+
+const USER_ONLY: &str = "programEventsMissPackageHandlers";
+
+/// Every row of a JSON report, as `rule:severity@line`, the diagnostics only.
+fn rows(doc: &serde_json::Value) -> Vec<String> {
+    let mut found: Vec<String> = doc["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            format!(
+                "{}:{}@{}",
+                d["rule"].as_str().unwrap(),
+                d["severity"].as_str().unwrap(),
+                d["line"]
+            )
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// Alone, the second assumption changes no finding, and the output says it
+/// has no effect: it speaks of package props the first makes listeners.
+#[test]
+fn program_events_miss_package_handlers_alone_changes_nothing_and_says_so() {
+    for case in [
+        "package-props-dispatched-click-loops",
+        "package-props-ancestor-click-loops",
+        "handover-info-package-child-handler-settles",
+    ] {
+        let p = Project::case(case);
+        let off = p.json(&["--info"]);
+        let alone = p.json(&["--info", "--assume", USER_ONLY]);
+        assert_eq!(rows(&alone), rows(&off), "{case}");
+        assert_eq!(assumptions(&alone), [USER_ONLY], "{case}");
+    }
+    let p = Project::case("package-props-dispatched-click-loops");
+    let human = String::from_utf8(p.run(&["--assume", USER_ONLY]).stdout).unwrap();
+    assert!(
+        human.contains("(no effect without packagePropsRunOnEvents)"),
+        "{human}"
+    );
+}
+
+/// Together, a package prop is a handler of user events only: the program's
+/// own click no longer reaches it. The settling program loses its false
+/// alarm; the program whose click reaches the package's handler (a bubbling
+/// click, the price) loses its loop.
+#[test]
+fn both_package_assumptions_keep_the_program_events_off_package_props() {
+    let both = ["--assume", ON_EVENTS, "--assume", USER_ONLY];
+    for case in [
+        "package-props-dispatched-click-loops",
+        "package-props-ancestor-click-loops",
+    ] {
+        let p = Project::case(case);
+        assert_eq!(
+            loops(&p.json(&["--assume", ON_EVENTS])),
+            ["infinite-loop:warning"],
+            "{case}: first alone"
+        );
+        let doc = p.json(&both);
+        assert!(loops(&doc).is_empty(), "{case}: both, {:?}", loops(&doc));
+        assert_eq!(assumptions(&doc), [ON_EVENTS, USER_ONLY], "{case}");
+    }
+    // The radix shape the oracle cannot run (its container is in no
+    // document, so a `focus()` fires nothing there): the program moves the
+    // focus after every commit while a package layer is handed a closure that
+    // writes state. Under the first assumption alone the focus events may
+    // reach the package's handler: the loop is claimed. Under both they do
+    // not (in a browser, radix's `DismissableLayer` would hear the `focusin`
+    // on `document` and call `onDismiss`: the second assumption's price).
+    let src = r#"import { useEffect, useRef, useState } from "react";
+import { Layer } from "@radix-ui/react-dismissable-layer";
+export function App() {
+  const [n, setN] = useState(0);
+  const input = useRef<HTMLInputElement>(null);
+  useEffect(() => { input.current?.focus(); });
+  return <div><input ref={input} /><Layer onDismiss={() => setN(n + 1)}>{n}</Layer></div>;
+}
+"#;
+    let p = Project::new(&[("a.tsx", src)]);
+    assert_eq!(
+        hand_overs(&p.json(&["--info"])),
+        ["setter-in-render:info"],
+        "off"
+    );
+    assert!(
+        !loops(&p.json(&["--assume", ON_EVENTS])).is_empty(),
+        "first alone"
+    );
+    let doc = p.json(&["--info", "--assume", ON_EVENTS, "--assume", USER_ONLY]);
+    assert!(loops(&doc).is_empty(), "both: {:?}", loops(&doc));
+    assert!(hand_overs(&doc).is_empty(), "both: {:?}", hand_overs(&doc));
+}
+
+/// Declared in the config with the first, turned off there, and in the
+/// schema.
+#[test]
+fn program_events_miss_package_handlers_is_declared_in_the_config() {
+    let declared =
+        format!(r#"{{ "assumptions": {{ "{ON_EVENTS}": true, "{USER_ONLY}": true }} }}"#);
+    let p = Project::case_with_config("package-props-dispatched-click-loops", Some(&declared));
+    let doc = p.json(&[]);
+    assert_eq!(assumptions(&doc), [ON_EVENTS, USER_ONLY]);
+    assert!(loops(&doc).is_empty());
+    let human = String::from_utf8(p.run(&[]).stdout).unwrap();
+    assert!(human.contains("2 assumptions in force"), "{human}");
+    assert!(!human.contains("no effect"), "{human}");
+
+    let off = format!(r#"{{ "assumptions": {{ "{ON_EVENTS}": true, "{USER_ONLY}": false }} }}"#);
+    let p = Project::case_with_config("package-props-dispatched-click-loops", Some(&off));
+    let doc = p.json(&[]);
+    assert_eq!(assumptions(&doc), [ON_EVENTS]);
+    assert_eq!(loops(&doc), ["infinite-loop:warning"]);
+
+    let schema = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("docs/schemas/reactant-config.schema.json"),
+    )
+    .unwrap();
+    let schema: serde_json::Value = serde_json::from_str(&schema).unwrap();
+    let flag = &schema["$defs"]["Assumptions"]["properties"][USER_ONLY];
+    assert_eq!(flag["type"], "boolean", "{schema:#}");
+    assert_eq!(flag["default"], false);
+}

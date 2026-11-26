@@ -203,7 +203,9 @@ node oracle/bin/oracle.mjs run some/file.tsx        # one program, every detail
   `// oracle: assume=<name> fn`. `cases` runs it a second
   time with `--assume` and requires exactly that verdict; a violation stated
   so is the assumption's price, accepted in that run only, never in the
-  default one. `cases --assume NAME` runs every case under `NAME` alone (a
+  default one. Several assumptions declared together are one name list
+  joined by commas (`assume=<a>,<b> fn`, `--assume <a>,<b>`); a case may
+  state one verdict per list. `cases --assume NAME` runs every case under `NAME` alone (a
   case that states no verdict for it is judged by the default rules), and
   `fuzz --assume NAME` the sample; `fuzz --verdicts FILE` writes every
   program's verdict, to compare two runs program by program.

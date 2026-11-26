@@ -1,5 +1,6 @@
 // oracle: react=loop
 // oracle: assume=packagePropsRunOnEvents disclosed
+// oracle: assume=packagePropsRunOnEvents,programEventsMissPackageHandlers disclosed
 // A package component that attaches the `ref` it receives to a node (React
 // 19's `ref` prop): React calls a new ref callback at every commit (#412), and
 // this one writes a new value. A `ref` is React's commit-time protocol, not a

@@ -313,16 +313,22 @@ pub enum UnseenChild {
     /// function props only from an event handler
     /// ([`crate::assumptions::Assumption::PackagePropsRunOnEvents`]).
     PackageOnEvents,
+    /// As `PackageOnEvents`, and the run also declares that no event the
+    /// program fires runs such a prop
+    /// ([`crate::assumptions::Assumption::ProgramEventsMissPackageHandlers`]):
+    /// the package calls it on user events only.
+    PackageOnUserEvents,
 }
 
 impl UnseenChild {
     /// The child of an element whose name is a package's (`package`), under
-    /// what the run declares (`on_events`).
-    pub fn of(package: bool, on_events: bool) -> UnseenChild {
-        match (package, on_events) {
-            (false, _) => UnseenChild::Other,
-            (true, false) => UnseenChild::Package,
-            (true, true) => UnseenChild::PackageOnEvents,
+    /// what the run declares (`on_events`, and `user_only` with it).
+    pub fn of(package: bool, on_events: bool, user_only: bool) -> UnseenChild {
+        match (package, on_events, user_only) {
+            (false, _, _) => UnseenChild::Other,
+            (true, false, _) => UnseenChild::Package,
+            (true, true, false) => UnseenChild::PackageOnEvents,
+            (true, true, true) => UnseenChild::PackageOnUserEvents,
         }
     }
 }
@@ -421,7 +427,17 @@ impl CallRelation {
     /// such a prop is runs at an event's time ([`Escapes::split_called`],
     /// [`crate::ir::expr::package_event_prop`]).
     pub fn package_props_on_events(&self, props: ExprId) -> bool {
-        self.unseen.get(&props) == Some(&UnseenChild::PackageOnEvents)
+        self.unseen
+            .get(&props)
+            .is_some_and(|c| *c >= UnseenChild::PackageOnEvents)
+    }
+
+    /// [`Self::package_props_on_events`], and the run assumes no event the
+    /// program fires reaches such a prop
+    /// ([`crate::assumptions::Assumption::ProgramEventsMissPackageHandlers`]):
+    /// it is no listener of the dispatch table (#407).
+    pub fn package_props_on_user_events(&self, props: ExprId) -> bool {
+        self.unseen.get(&props) == Some(&UnseenChild::PackageOnUserEvents)
     }
 
     /// The module bindings some write of the program stored a setter or a

@@ -74,6 +74,10 @@ const makeExt = () => ({
   // prop): what `packagePropsRunOnEvents` does not cover (ADR-048).
   RefTarget: ({ ref }) => React.createElement("div", { ref }),
   RenderProp: ({ children }) => children(),
+  // A package component that calls its `fn` prop from a click anywhere in its
+  // subtree (its wrapper's `onClick`, which a click on a child bubbles to): a
+  // program element rendered inside it is a target the program may click.
+  ClickAncestor: ({ fn, children }) => React.createElement("div", { onClick: fn }, children),
 });
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>");

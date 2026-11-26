@@ -7,8 +7,8 @@
 //                   [--baseline FILE] [--write-baseline] [--verdicts FILE]
 //
 // Every command takes --jobs N (default: cores - 1), the number of React
-// workers and of analyzer processes running at once, and --assume NAME, an
-// assumption the analyzer runs under (ADR-048; `cases`: every case, and only so).
+// workers and of analyzer processes running at once, and --assume NAME[,NAME], the
+// assumptions the analyzer runs under (ADR-048; `cases`: every case, and only so).
 // REACTANT_BIN overrides the analyzer binary (default: target/release/reactant).
 
 import { readFileSync, readdirSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
@@ -36,6 +36,14 @@ function parseArgs(argv) {
     } else opts._.push(a);
   }
   return opts;
+}
+
+/**
+ * The assumptions one `--assume` value or `assume=` header names: one name, or several joined
+ * by commas (`packagePropsRunOnEvents,programEventsMissPackageHandlers`), declared together.
+ */
+function assumed(spec) {
+  return typeof spec === "string" && spec ? spec.split(",") : [];
 }
 
 /** `assume`: the assumptions the analyzer runs under (ADR-048); React does not change. */
@@ -85,7 +93,7 @@ async function cmdRun(opts) {
   requireBinary();
   const pool = startPool(opts);
   const ran = [];
-  const assume = typeof opts.assume === "string" ? [opts.assume] : [];
+  const assume = assumed(opts.assume);
   for (const f of opts._) {
     const r = await check(pool, readFileSync(f, "utf8"), assume);
     console.log(`── ${f}${assume.length ? ` (assume ${assume.join(", ")})` : ""}\n${describe(r)}\n`);
@@ -148,7 +156,7 @@ async function cmdCases(opts) {
       const source = readFileSync(join(dir, f), "utf8");
       const h = caseHeader(source);
       const ways = only ? [only] : [null, ...h.assumed.keys()];
-      const rs = await Promise.all(ways.map(async (a) => [a, await check(pool, source, a ? [a] : [])]));
+      const rs = await Promise.all(ways.map(async (a) => [a, await check(pool, source, assumed(a))]));
       return [f, rs, h];
     }),
   );
@@ -183,8 +191,8 @@ async function cmdFuzz(opts) {
   const tally = Object.fromEntries(VERDICTS.map((v) => [v, 0]));
   const violations = {};
   const started = Date.now();
-  // `--assume NAME`: the analyzer runs under that assumption (ADR-048).
-  const assume = typeof opts.assume === "string" ? [opts.assume] : [];
+  // `--assume NAME[,NAME]`: the analyzer runs under those assumptions (ADR-048).
+  const assume = assumed(opts.assume);
 
   const ids = Array.from({ length: count }, (_, i) => i);
   const results = new Array(count);

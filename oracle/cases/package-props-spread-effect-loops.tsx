@@ -1,5 +1,6 @@
 // oracle: react=loop
 // oracle: assume=packagePropsRunOnEvents disclosed
+// oracle: assume=packagePropsRunOnEvents,programEventsMissPackageHandlers disclosed
 // The function reaches the package through a spread, which names no prop at
 // the element (and forwards `ref` and `children` in React 19): the package
 // calls it from an effect after every commit. `packagePropsRunOnEvents` covers

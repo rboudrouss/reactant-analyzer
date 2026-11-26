@@ -1,5 +1,6 @@
 // oracle: react=loop
 // oracle: assume=packagePropsRunOnEvents fn
+// oracle: assume=packagePropsRunOnEvents,programEventsMissPackageHandlers fn
 // A setter handed to a package's component the analysis does not see, which
 // calls it from an effect after every commit: the write re-renders `App`, which
 // re-renders the child, whose effect runs again. The analyzer cannot place the

@@ -906,7 +906,20 @@ carries an Error.
   covered closure's captures reach is covered with it (only a call of the closure runs it), so a
   function the package obtains by calling the prop — a render prop's result — is read as an
   event's too. A closure *returned* by a closure handed to package code, and allocated by that
-  call, is not followed by the writer walk in either reading.
+  call, is not followed by the writer walk in either reading
+  [#425](https://github.com/rboudrouss/reactant-analyzer/issues/425).
+- **Declaring [`programEventsMissPackageHandlers`](usage.md#programeventsmisspackagehandlers)
+  with it** (a second assumption, off by default; alone it changes nothing) takes such a prop out of
+  the program's dispatch table: no event the program fires (`click()`, `focus()`,
+  `requestSubmit()`, `dispatchEvent`, #407) runs it, so it is a handler of user events only. Its
+  price is every loop through a package that the program's own events reach: a layer that closes on
+  a focus outside it or an outside pointer event (radix's `DismissableLayer`, which listens for
+  `focusin` and `pointerdown` on `document`, `@radix-ui/react-dismissable-layer` 1.1.11
+  `dist/index.mjs:135-192`) while the program moves the focus or clicks, and a package that listens
+  on an ancestor of a program element the program clicks (the oracle cases stating
+  `assume=packagePropsRunOnEvents,programEventsMissPackageHandlers fn`). A write such a prop's
+  closure hands to code the analysis does not follow is then claimed by no dispatch and is shown on
+  its own, as a Warning.
 - **A write in a `useMemo` body is a render write** [#249](https://github.com/rboudrouss/reactant-analyzer/issues/249),
   with the memo's re-run class. It is an Error only when the memo is called on every render, its
   body writes on every path, and it recomputes at every render: no deps array, or the written slot

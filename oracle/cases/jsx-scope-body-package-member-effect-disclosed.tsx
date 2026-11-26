@@ -1,6 +1,7 @@
 // @file App.tsx
 // oracle: react=loop
 // oracle: assume=packagePropsRunOnEvents fn
+// oracle: assume=packagePropsRunOnEvents,programEventsMissPackageHandlers fn
 // (Under `packagePropsRunOnEvents` the package's member calls `fn` from an
 // effect, against the premise: the loop is the assumption's price, ADR-048.)
 // #392. A local `const` of the component aliases a package's member that

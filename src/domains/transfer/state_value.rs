@@ -537,8 +537,11 @@ fn havoc_setter_props(
         return;
     };
     if unseen {
-        let child =
-            crate::engine::calls::UnseenChild::of(package, ctx.query.package_props_run_on_events());
+        let child = crate::engine::calls::UnseenChild::of(
+            package,
+            ctx.query.package_props_run_on_events(),
+            ctx.query.package_props_run_on_user_events(),
+        );
         ctx.record(|r| r.mark_unseen_element(*id, child));
     }
     let mut setters: Vec<(ComponentId, crate::ir::types::HookLabel)> = Vec::new();

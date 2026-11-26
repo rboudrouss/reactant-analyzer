@@ -1,5 +1,6 @@
 // oracle: react=loop
 // oracle: assume=packagePropsRunOnEvents fn
+// oracle: assume=packagePropsRunOnEvents,programEventsMissPackageHandlers fn
 // (Under `packagePropsRunOnEvents` the premise is false for React's own
 // `Profiler`, which calls `onRender` at every commit: the loop is the
 // assumption's price, ADR-048.)
