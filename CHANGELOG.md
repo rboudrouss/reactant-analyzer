@@ -270,6 +270,14 @@ on a program React settles; 323 oracle cases, none a known false negative.
   premise covers only the other aliases (a `let`, a parameter). memos 214 →
   185 shown (29 hand-overs Info), bulletproof-react 46 → 31 (15), novel 14 →
   13 (1); the other 8 small repos and mantine do not move (#404).
+- `cross-component-infinite-loop`'s row of an effect that calls a parent's
+  setter, and of an effect whose dispatch's listeners do, says what the
+  analysis established: the parent's state is not bounded, the deps not
+  proven stable and why each is not (`search` changes with state `search`),
+  and that a loop needs a re-render of the parent to change one of them. It
+  said "Parent re-renders → child re-renders → effect fires again: infinite
+  loop", a re-fire it did not prove and that is false where the deps are the
+  child's own state (dub's `Combobox`). Same rows, same level (#421).
 
 ### Removed
 

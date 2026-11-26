@@ -727,6 +727,13 @@ carries an Error.
   program's test
   files are not read (`*.test.*`, `*.spec.*` are no source files to the walk), so a dispatch there
   makes nothing ⊤.
+- **`cross-component-infinite-loop`'s arm over a parent's state** claims when an effect calls a
+  setter of a parent whose state the analysis bounds no value of, and the effect's deps are not
+  proven stable. It does not prove that a re-render of the parent re-runs the effect: its row
+  names the deps not proven stable and why, and says that a loop needs that re-render to change
+  one of them. A dep that changes only with the child's own state (dub's `Combobox`,
+  `useEffect(() => onSearchChange?.(search), [search])`) does not, and such a row is a false
+  positive [#421](https://github.com/rboudrouss/reactant-analyzer/issues/421).
 - **`frozen-initial-state`** still fires on a child remounted by machinery it cannot see: a dialog
   body unmounted by its library wrapper, a route that swaps the subtree [#136](https://github.com/rboudrouss/reactant-analyzer/issues/136).
 - **`missing-deps`** asks whether a capture can go *stale*, so a read through a handle that never

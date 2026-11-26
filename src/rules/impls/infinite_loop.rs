@@ -169,11 +169,6 @@ impl Rule for InfiniteLoop {
                         continue;
                     }
 
-                    let deps_note = if deps.is_declared() {
-                        " (its deps do not provably gate it, so the effect can re-run every render)"
-                    } else {
-                        ""
-                    };
                     // The value it calls, when that is the setter; else the
                     // setter and what reaches it (D2).
                     let names = ctx.source_names();
@@ -188,9 +183,17 @@ impl Rule for InfiniteLoop {
                             through.map_or_else(String::new, |t| names.name(t).into_owned())
                         ),
                     };
+                    let condition = rerun_condition(
+                        *eff_label,
+                        deps,
+                        comp_result,
+                        result,
+                        names,
+                        &format!("`{parent}`"),
+                    );
                     let msg = format!(
-                        "this effect calls {called}{deps_note}. \
-                         Parent re-renders → child re-renders → effect fires again: infinite loop"
+                        "this effect calls {called}, and the analysis bounds no value that \
+                         state takes. {condition}: possible infinite render loop"
                     );
                     let mut diag = Diagnostic::warn("cross-component-infinite-loop", msg)
                         .with_label(*eff_label);
@@ -206,11 +209,18 @@ impl Rule for InfiniteLoop {
             // the parents' setters its listeners write (#407).
             for ((call, unknown, package, span), mut setters) in dispatched {
                 setters.sort();
-                let deps_note = if deps.is_declared() {
-                    " (its deps do not provably gate it, so the effect can re-run every render)"
-                } else {
-                    ""
+                let parents = match setters.len() {
+                    1 => format!("`{}`", setters[0].parent.as_deref().unwrap_or("its parent")),
+                    _ => "one of those parents".to_string(),
                 };
+                let condition = rerun_condition(
+                    *eff_label,
+                    deps,
+                    comp_result,
+                    result,
+                    ctx.source_names(),
+                    &parents,
+                );
                 let list: Vec<String> = setters
                     .iter()
                     .take(crate::rules::SetterRef::NAMED)
@@ -237,8 +247,12 @@ impl Rule for InfiniteLoop {
                 };
                 let msg = format!(
                     "this effect's `{call}` fires events{place}, and the listeners they may \
-                     reach call {what}{deps_note}. Parent re-renders → child re-renders → \
-                     effect fires again: infinite loop"
+                     reach call {what}, and the analysis bounds no value {states}. \
+                     {condition}: possible infinite render loop",
+                    states = match setters.len() {
+                        1 => "that state takes",
+                        _ => "those states take",
+                    }
                 );
                 let mut diag = match package {
                     true => Diagnostic::info("cross-component-infinite-loop", msg),
@@ -568,6 +582,87 @@ fn always_clause(
         ),
     };
     (clause, if surely { "re-runs" } else { "may re-run" })
+}
+
+/// What the cross-component arm established about an effect's re-runs, as
+/// the sentence of its row: the condition under which it loops. The arm
+/// claims on a write of a parent's state no bound settles, made by an effect
+/// its deps do not gate for good — never on a re-render of the parent
+/// re-running the effect, so that is left as the condition, with the deps
+/// not proven stable and why: the slots the engine's trigger rows say a dep
+/// moves with, else what its value is. `parents` names whose re-render it
+/// would be.
+fn rerun_condition(
+    label: HookLabel,
+    deps: &crate::ir::hooks::DepsArg,
+    comp: &crate::engine::AnalysisResult<crate::domains::StateValue>,
+    program: &ProgramAnalysisResult,
+    names: &crate::ir::SourceNames,
+    parents: &str,
+) -> String {
+    use crate::ir::hooks::DepsArg;
+    use crate::rules::api::query::StabilityVerdict;
+    let list = match deps {
+        DepsArg::Absent => {
+            return format!(
+                "It has no dependency array, so a re-render of {parents} that re-renders this \
+                 component runs it again"
+            );
+        }
+        DepsArg::Opaque(_) => {
+            return format!(
+                "Its deps argument cannot be read: if a re-render of {parents} re-runs it, it \
+                 writes again"
+            );
+        }
+        DepsArg::List(l) if l.arity.exact().is_none() => {
+            return format!(
+                "Its deps hold a spread the analysis cannot read in full: if a re-render of \
+                 {parents} changes one of them, the effect runs and writes again"
+            );
+        }
+        DepsArg::List(l) => l.as_slice(),
+    };
+    let mut slots: NodeNames = HashMap::new();
+    let why: Vec<String> = crate::rules::unstable_deps(list, comp)
+        .into_iter()
+        .map(|(i, verdict)| {
+            let dep = names.describe(&list[i]);
+            let mut moves: Vec<String> = crate::engine::triggers_of(&comp.effect_triggers, label)
+                .filter(|t| t.dep == i)
+                .map(|t| match t.slot == STORE_SLOT {
+                    true => "a library store".to_string(),
+                    false => format!(
+                        "state {}",
+                        node_display(&t.slot, comp.component, program, &mut slots)
+                    ),
+                })
+                .collect();
+            moves.dedup();
+            if !moves.is_empty() {
+                return format!("`{dep}` changes with {}", moves.join(" or "));
+            }
+            match verdict {
+                StabilityVerdict::Versioned(on) if !on.is_empty() => {
+                    let on: Vec<String> = on
+                        .iter()
+                        .map(|s| node_display(s, comp.component, program, &mut slots))
+                        .collect();
+                    format!("`{dep}` changes with state {}", on.join(" or "))
+                }
+                StabilityVerdict::Versioned(_) => format!("`{dep}` changes with some state"),
+                StabilityVerdict::PerRender => format!("`{dep}` may change at every render"),
+                StabilityVerdict::Unknown | StabilityVerdict::Stable => {
+                    format!("`{dep}` is a value the analysis cannot bound")
+                }
+            }
+        })
+        .collect();
+    format!(
+        "Its deps are not proven stable ({}): if a re-render of {parents} changes one of them, \
+         the effect runs and writes again",
+        why.join("; ")
+    )
 }
 
 /// The message of a loop through the store alone (ADR-046): effect `label`

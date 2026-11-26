@@ -54,9 +54,10 @@ $ reactant check . --show-clean
   Dashboard  (1 hooks)  src/Dashboard.tsx  ✓
   Filters  (1 hooks)  src/Filters.tsx
     warn   cross-component-infinite-loop  [hook:0]  (line 4:2)  this effect calls `onChange`,
-    a state setter of parent `Dashboard` (its deps do not provably gate it, so the effect
-    can re-run every render). Parent re-renders → child re-renders → effect fires again:
-    infinite loop
+    a state setter of parent `Dashboard`, and the analysis bounds no value that state takes.
+    Its deps are not proven stable (`value` changes with state `query` of `Dashboard`): if
+    a re-render of `Dashboard` changes one of them, the effect runs and writes again:
+    possible infinite render loop
 
 ⚠  1 warning(s) across 2 file(s).
 ```

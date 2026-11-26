@@ -114,11 +114,13 @@ pub const RULE_DOCS: &[RuleDoc] = &[
     doc(
         "cross-component-infinite-loop",
         "child effect sets parent state, parent re-renders child, effect refires",
-        "An effect in a child component calls a setter received as a prop, and \
-                      the abstract value of the parent's state slot keeps growing across \
-                      fixpoint iterations. Parent re-renders → child re-renders → effect \
-                      fires again: an infinite render loop spanning two components, invisible \
-                      to any single-file linter.",
+        "An effect in a child component calls a setter received as a prop, the \
+                      analysis bounds no value the parent's state takes, and the effect's deps \
+                      are not proven stable. If a re-render of the parent changes one of those \
+                      deps, the effect runs and writes again: an infinite render loop spanning \
+                      two components, invisible to any single-file linter. The row names the \
+                      deps not proven stable and why; a dep that is the child's own state does \
+                      not move when the parent re-renders.",
         "function Child({ onCount }) {\n  useEffect(() => onCount(c => c + 1));\n}",
         "Gate the effect with a deps array that converges, or lift the update to an \
               event handler instead of an effect.",

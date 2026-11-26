@@ -3127,6 +3127,43 @@ fn a_call_through_a_prop_holding_two_closures_stores_what_either_stores() {
 }
 
 #[test]
+fn the_cross_arm_states_the_condition_it_did_not_prove() {
+    // dub's `Combobox` (`combobox/index.tsx:204`): the effect's one dep is
+    // the child's own state, which a re-render of the parent does not move.
+    // The arm still claims (a Warning on an unbounded parent slot), and its
+    // sentence says which dep is not proven stable and why, and that a loop
+    // needs a re-render of the parent to change it — no re-fire it did not
+    // prove.
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Combo({ onSearchChange }: { onSearchChange: (s: string) => void }) {
+  const [search, setSearch] = useState("");
+  useEffect(() => { onSearchChange(search); }, [search]);
+  return <input value={search} onChange={(e) => setSearch(e.target.value)} />;
+}
+export function App() {
+  const [q, setQ] = useState("");
+  return <div>{q}<Combo onSearchChange={setQ} /></div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "Combo");
+    let cross: Vec<_> = diags
+        .iter()
+        .filter(|(r, _, _)| r == "cross-component-infinite-loop")
+        .collect();
+    assert_eq!(cross.len(), 1, "{diags:?}");
+    let (_, sev, msg) = cross[0];
+    assert_eq!(*sev, Severity::Warning);
+    assert!(
+        msg.contains("`onSearchChange`, a state setter of parent `App`")
+            && msg.contains("(`search` changes with state `search`)")
+            && msg.contains("if a re-render of `App` changes one of them")
+            && !msg.contains("fires again"),
+        "{msg}"
+    );
+}
+
+#[test]
 fn a_local_helper_called_twice_is_still_one_write() {
     // The collapse of one setter call reached twice is unchanged by #421:
     // the row keeps its own value, a single constant.
