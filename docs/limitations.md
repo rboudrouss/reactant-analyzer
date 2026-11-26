@@ -143,7 +143,10 @@ that writes it (see *Cross-file limits*).
   analysis does not run writes, at that point, every setter it reaches and runs every closure it
   reaches, of unknown timing. A row is keyed by (call site, slot, region): one slot spelled two
   ways at one site is one row, printed with what the source wrote there, else the slot's own
-  setter. **A helper called with one setter in one place and another elsewhere writes either at
+  setter. A call through a value that may be several closures or setters (a prop two elements
+  fill differently) is one row too, which stores what any of them may store: a single value
+  known in advance only when each stores that same one
+  ([#421](https://github.com/rboudrouss/reactant-analyzer/issues/421)). **A helper called with one setter in one place and another elsewhere writes either at
   every call of it**, so a write through it is a Warning, never an Error; an Error through a
   helper's parameter needs every call of the helper to pass the one setter. Past the walk's depth
   the writes of a body still count, unplaced. `setter-in-render`, the cross-component arm of

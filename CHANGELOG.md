@@ -824,6 +824,14 @@ on a program React settles; 323 oracle cases, none a known false negative.
   Shown rows: excalidraw 135 → 145, mantine 1,846 → 1,897 (most a `ref` on
   an element a component element receives, read as mounting at any render),
   the 10 other small repos unchanged (#412).
+- A call through a value that may be several closures or setters (a prop two
+  elements fill with two closures) stores what any of them stores: its writer
+  row kept the first closure's value alone, a single `0` where the other
+  closure steps the parent's state, so the churn graph had no edge and only
+  the cross-component arm claimed the loop React runs. With that arm switched
+  off, 3 fuzz seeds ×300 go from 1 `fn` to 0, and 14 seeds ×1000 have none.
+  Oracle: 3 new cases (two loops the graph now claims alone, their settling
+  neighbour `tn`); the 11 small repos and mantine unchanged (#421).
 - A function handed as a prop to a child component the analysis does not see
   (a package's component, an element value it does not resolve, a name several
   files define, a component rendering itself, a context provider's `value`)

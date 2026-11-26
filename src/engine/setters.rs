@@ -118,6 +118,46 @@ pub(crate) struct WriteSite {
     pub dispatch: Option<Rc<DispatchSite>>,
     /// [`SlotWriter::accessor`].
     pub accessor: Option<AccessorOf>,
+    /// The setter call the site is, when it is one ([`Stored::call`]).
+    pub call: Option<crate::ir::types::ExprId>,
+    /// The other writes collapsed into this site ([`also_stores`]): what
+    /// the row stores is the join of what this site and each of them store.
+    pub also: Vec<Stored>,
+}
+
+/// What one write stores, as the walk read it where it found it: the fields
+/// of a site its row's value is classified from (#421).
+#[derive(Debug, Clone)]
+pub(crate) struct Stored {
+    /// The setter call the write is: a local helper called twice reaches one
+    /// call twice, one write; the closures a call through a value may run
+    /// are as many calls. `None` for a setter handed to a callee, or one
+    /// written past the walk's budget.
+    pub call: Option<crate::ir::types::ExprId>,
+    pub updater: Updater,
+    pub arg: Option<Expr>,
+    pub foreign: Foreign,
+    pub applied: bool,
+}
+
+/// Collapse into a site — its setter call `call` and the writes `also` it
+/// already stands for — another site naming the same span, region and class,
+/// `other` with the writes it stands for. The same setter call is the same
+/// write. Another one is a write the row also stores: a call through a value
+/// that may be several closures runs one of them, and they all carry the
+/// call's span, so a row that kept one of them would store that closure's
+/// value alone (#421).
+fn also_stores(
+    call: Option<crate::ir::types::ExprId>,
+    also: &mut Vec<Stored>,
+    other: Stored,
+    other_also: Vec<Stored>,
+) {
+    for w in std::iter::once(other).chain(other_also) {
+        if w.call != call && !also.iter().any(|a| a.call == w.call) {
+            also.push(w);
+        }
+    }
 }
 
 /// What every walk of a component's bodies reads besides the call relation
@@ -499,6 +539,8 @@ impl<'a> WriterTables<'a> {
                 listener: s.listener,
                 dispatch: s.dispatch,
                 accessor: s.accessor,
+                call: s.call,
+                also: s.also,
             })
             .collect();
         (setters, found.stores, heard)
@@ -1809,11 +1851,12 @@ fn callback_bound_vars(
         .collect()
 }
 
-/// Two source sites are the same write when they name the same span in the
-/// same region and class — which is what a local helper called twice produces,
+/// Two source sites are one row when they name the same span in the same
+/// region and class — which is what a local helper called twice produces,
 /// since the walk pulls its inner site in once per call. The duplicates carry
 /// a fact that must survive the collapse: being reached from two call sites is
-/// co-execution.
+/// co-execution. So does what they store: sites of two setter calls are two
+/// writes, and the row stores either ([`also_stores`], #421).
 fn dedup_source_sites(sites: &mut Vec<WriteSite>) {
     // A site the relation keys by its slot is that slot's, however spelled.
     type Key = (Slot, SourceRange, WalkClass);
@@ -1829,9 +1872,18 @@ fn dedup_source_sites(sites: &mut Vec<WriteSite>) {
         let k = key(&site, span);
         match seen.get(&k) {
             Some(&i) => {
-                out[i].repeats = true;
-                out[i].listener &= site.listener;
-                out[i].class = out[i].class.join(site.class);
+                let kept = &mut out[i];
+                kept.repeats = true;
+                kept.listener &= site.listener;
+                kept.class = kept.class.join(site.class);
+                let other = Stored {
+                    call: site.call,
+                    updater: site.updater,
+                    arg: site.arg,
+                    foreign: site.foreign,
+                    applied: site.applied,
+                };
+                also_stores(kept.call, &mut kept.also, other, site.also);
             }
             None => {
                 seen.insert(k, out.len());
@@ -2148,21 +2200,6 @@ pub(crate) fn collect_slot_writers(
                     }
                     _ => false,
                 };
-            // A name the argument reads from another body holds nothing this
-            // region knows (#310): ⊤ in the value, no binding certificate, no
-            // updater body resolved by that name, and no spelling a proof may
-            // read in this region's scope.
-            let hides =
-                |v: &str| site.foreign.hides(v, &bound_elsewhere) || params.iter().any(|p| p == v);
-            let reads_hidden = |e: &Expr| {
-                let mut read = HashSet::new();
-                crate::ir::free_vars::collect_used_vars(e, &mut read);
-                read.iter().any(|v| hides(v))
-            };
-            let updater = match (&site.updater, site.arg.as_ref().map(Expr::peel_ts)) {
-                (Updater::Functional(_), Some(Expr::Var(v))) if hides(v) => Updater::Unknown,
-                (u, _) => u.clone(),
-            };
             // A position only a write that runs synchronously in this region,
             // once per pass, can claim: a repeating site runs 0..N times and
             // every other class runs on another turn or in another CFG.
@@ -2174,22 +2211,59 @@ pub(crate) fn collect_slot_writers(
             // placed a site only where the relation is sure of its one slot.
             let block = at.map(|(b, _)| b);
             let classify = crate::profile::phase("writers:classify");
-            let mut written = match reducers.get(target_owner, slot) {
-                Some(reducer) => written::dispatched(&reducer),
-                None if site.applied => written::carried(),
-                None => written::classify(
-                    site.arg.as_ref(),
-                    &updater,
-                    owner.is_none().then_some(slot),
-                    class_phase(site.class, region),
-                    |e| (!reads_hidden(e)).then(|| must_read(e)).flatten(),
-                    |e| envs.eval(region, cfg, at, e, &hides),
-                    |e| (!reads_hidden(e)).then(|| bound(e, at)).flatten(),
-                ),
+            // What one write of the row stores, read with its own names.
+            let stores = |updater: &Updater, arg: Option<&Expr>, foreign: &Foreign, applied| {
+                // A name the argument reads from another body holds nothing
+                // this region knows (#310): ⊤ in the value, no binding
+                // certificate, no updater body resolved by that name, and no
+                // spelling a proof may read in this region's scope.
+                let hides =
+                    |v: &str| foreign.hides(v, &bound_elsewhere) || params.iter().any(|p| p == v);
+                let reads_hidden = |e: &Expr| {
+                    let mut read = HashSet::new();
+                    crate::ir::free_vars::collect_used_vars(e, &mut read);
+                    read.iter().any(|v| hides(v))
+                };
+                let updater = match (updater, arg.map(Expr::peel_ts)) {
+                    (Updater::Functional(_), Some(Expr::Var(v))) if hides(v) => Updater::Unknown,
+                    (u, _) => u.clone(),
+                };
+                let mut written = match reducers.get(target_owner, slot) {
+                    Some(reducer) => written::dispatched(&reducer),
+                    None if applied => written::carried(),
+                    None => written::classify(
+                        arg,
+                        &updater,
+                        owner.is_none().then_some(slot),
+                        class_phase(site.class, region),
+                        |e| (!reads_hidden(e)).then(|| must_read(e)).flatten(),
+                        |e| envs.eval(region, cfg, at, e, &hides),
+                        |e| (!reads_hidden(e)).then(|| bound(e, at)).flatten(),
+                    ),
+                };
+                if written.expr.as_ref().is_some_and(reads_hidden) {
+                    written.expr = None;
+                }
+                (updater, written)
             };
-            if written.expr.as_ref().is_some_and(reads_hidden) {
-                written.expr = None;
+            // A row standing for several writes stores what any of them
+            // stores (#421), and its updater is none of theirs alone.
+            let (updater, mut written) = stores(
+                &site.updater,
+                site.arg.as_ref(),
+                &site.foreign,
+                site.applied,
+            );
+            for w in &site.also {
+                if written.is_top() {
+                    break;
+                }
+                written = written.join(stores(&w.updater, w.arg.as_ref(), &w.foreign, w.applied).1);
             }
+            let updater = match site.also.is_empty() {
+                true => updater,
+                false => Updater::Unknown,
+            };
             drop(classify);
             let setter = row_name(calls, site.slot, site.var);
             out.push(SlotWriter {
@@ -2829,6 +2903,10 @@ struct FoundSite {
     through: Vec<Var>,
     /// Found in an accessor's body ([`SetterWalk::accessor`]).
     accessor: Option<AccessorOf>,
+    /// [`WriteSite::call`].
+    call: Option<crate::ir::types::ExprId>,
+    /// [`WriteSite::also`].
+    also: Vec<Stored>,
 }
 
 /// `Array.prototype` HOFs that call their function argument synchronously —
@@ -3829,6 +3907,8 @@ impl<'a> SetterWalk<'a> {
                 foreign: Foreign::All,
                 applied: true,
                 through: self.path.clone(),
+                call: None,
+                also: Vec::new(),
             });
         }
     }
@@ -3885,6 +3965,8 @@ impl<'a> SetterWalk<'a> {
                 foreign: self.foreign(),
                 applied: false,
                 through: self.path.clone(),
+                call: Some(id),
+                also: Vec::new(),
             });
         }
         for &site in &row.bodies {
@@ -4201,6 +4283,14 @@ impl<'a> SetterWalk<'a> {
                             kept.repeats = true;
                             kept.listener &= site.listener;
                             kept.class = kept.class.join(class);
+                            let other = Stored {
+                                call: site.call,
+                                updater: site.updater.clone(),
+                                arg: site.arg.clone(),
+                                foreign: site.foreign.clone(),
+                                applied: site.applied,
+                            };
+                            also_stores(kept.call, &mut kept.also, other, site.also.clone());
                             if owners[i] != Some(l.owner) {
                                 owners[i] = None;
                             }
@@ -4407,6 +4497,8 @@ impl<'a> SetterWalk<'a> {
                 foreign: self.foreign(),
                 applied: true,
                 through: self.path.clone(),
+                call: None,
+                also: Vec::new(),
             });
         }
         for &site in &row.bodies {
@@ -4565,6 +4657,8 @@ impl<'a> SetterWalk<'a> {
                 foreign: self.foreign(),
                 applied: true,
                 through: self.path.clone(),
+                call: None,
+                also: Vec::new(),
             });
         }
         for &site in row.bodies.iter().filter(|s| !timed.contains(s)) {

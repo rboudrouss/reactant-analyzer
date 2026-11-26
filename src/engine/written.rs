@@ -85,6 +85,39 @@ pub struct Written {
     pub step: Option<Interval>,
 }
 
+impl Written {
+    /// What a row stores when it stands for two writes, of which a call runs
+    /// one: the closures a call through a value may be (#421). A fact both
+    /// prove stays — neither changes the slot, or both store the same single
+    /// value — and anything else may change the slot, by the join of their
+    /// values, through neither spelling: no proof may read one write's
+    /// expression, nor its step, as the other's.
+    pub fn join(self, other: Written) -> Written {
+        let change = match (self.change, other.change) {
+            (Change::Never, Change::Never) => Change::Never,
+            (Change::Once, Change::Once) if self.value == other.value => Change::Once,
+            _ => Change::May,
+        };
+        Written {
+            change,
+            value: self.value.join(&other.value),
+            expr: None,
+            own_read: self.own_read && other.own_read,
+            step: None,
+        }
+    }
+
+    /// What [`Self::join`] returns whatever it joins: any value, which may
+    /// change the slot, through no spelling.
+    pub fn is_top(&self) -> bool {
+        self.change == Change::May
+            && !self.own_read
+            && self.expr.is_none()
+            && self.step.is_none()
+            && self.value == StateValue::top()
+    }
+}
+
 /// Does a slot never leave its initial value? True when every write of it,
 /// `rows` being all of them program-wide, stores a value it held
 /// (`Written::own_read`): by induction on the writes, that value is the
