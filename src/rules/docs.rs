@@ -265,7 +265,8 @@ pub const RULE_DOCS: &[RuleDoc] = &[
                       conditional call → loops whenever the condition holds (Warning). \
                       A third shape warns without claiming a call at all: the setter is \
                       handed to a callee with no timing summary (`handleSubmit(onSubmit)`), \
-                      so the analyzer cannot rule out that it runs during render; or it is \
+                      so the analyzer cannot rule out that it runs during render (one row \
+                      per hand-over, listing every setter it hands); or it is \
                       called in a getter or setter, which runs wherever its member is read \
                       or written, the render included. A write a \
                       known registrar defers (`setTimeout(() => setN(1))`) is proven not to \

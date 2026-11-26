@@ -180,6 +180,19 @@ on a program React settles; 323 oracle cases, none a known false negative.
   with `cb` absent) throws: it runs no body, hands nothing to code the
   analysis does not see and writes nothing, where it read as a call of such
   code; its arguments still run (#340).
+- A statement that hands setters to a callee with no timing summary is one
+  `setter-in-render` / `cross-setter-in-render` row per component, not one
+  per setter and per parent (**breaking** for a consumer that reads one
+  setter per row: such a row's `var` and `hook_label` are its first setter's,
+  the others are in `setters`): the message counts them and names the first
+  three ("61 state setters of parent components are handed to a callee with
+  no timing summary (`setOpened` of `StoryBase`, … and 58 more)"), the JSON's
+  new `setters` field lists every one (`name`, `parent`, `through`, `var`), and
+  every hand-over message now ends with "if it runs it only from event
+  handlers, there is nothing to fix". Same findings, same sites: 11 small
+  repos and mantine 3,177 → 2,792 rows (mantine 2,002 → 1,712); on the whole
+  corpus, measured on CI, 9,446 → 6,832 (twenty 3,826 → 2,290,
+  dub 2,443 → 1,750) (#377).
 
 ### Removed
 

@@ -24,11 +24,17 @@ use super::report::ComponentReport;
 
 /// The key a finding is grouped by — exactly the key the corpus measurement
 /// uses, plus the rule. The message is part of it, so two findings that say
-/// different things on one line stay two rows. The level is not: the group
-/// is shown at its strongest row. `None` for the position when the diagnostic
-/// carries no range: a row whose location is unknown is never claimed to be
-/// the same as another's.
-type Key<'a> = (&'a str, Option<(FileId, u32, u32)>, &'a str);
+/// different things on one line stay two rows, and so are the setters a
+/// hand-over row stands for (#377), which its message counts past the first
+/// few. The level is not: the group is shown at its strongest row. `None`
+/// for the position when the diagnostic carries no range: a row whose
+/// location is unknown is never claimed to be the same as another's.
+type Key<'a> = (
+    &'a str,
+    Option<(FileId, u32, u32)>,
+    &'a str,
+    &'a [crate::rules::SetterRef],
+);
 
 /// One printed row: the components reporting the same finding.
 struct Group {
@@ -70,6 +76,7 @@ impl LocationIndex {
                     d.rule.as_ref(),
                     d.range.map(|r| (r.file, r.line, r.col)),
                     d.message.as_str(),
+                    &d.setters,
                 );
                 // A row with no range is its own group: two positions we
                 // cannot name are not evidence of one location.

@@ -57,8 +57,14 @@ for (const d of report.diagnostics ?? []) {
   // v3 rows name every component a finding is reported through; v2 one.
   const through = d.components ?? [d.component];
   const who = through.length > 1 ? `${d.component} and ${through.length - 1} more` : d.component;
+  // A hand-over row counts its setters past three; the annotation lists them all (#377).
+  const setter = (s) =>
+    `${s.name == null ? "a state setter" : `\`${s.name}\``}` +
+    `${s.parent == null ? "" : ` of \`${s.parent}\``}${s.through == null ? "" : ` through \`${s.through}\``}`;
+  const setters = d.setters ?? [];
   const msg = [
     `[${who}] ${d.message}`,
+    ...(setters.length > 3 ? [`setters: ${setters.map(setter).join(", ")}`] : []),
     ...(d.notes ?? []).map((n) => `→ ${n.message}`),
   ].join("\n");
   console.log(`::${level[d.severity] ?? "notice"} ${props.join(",")}::${escData(msg)}`);

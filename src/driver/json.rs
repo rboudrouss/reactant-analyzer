@@ -97,6 +97,25 @@ struct JsonDiagnostic<'a> {
     var: Option<&'a str>,
     message: &'a str,
     notes: Vec<JsonNote<'a>>,
+    /// The setters a hand-over row stands for (#377), every one, where the
+    /// message names the first few. Absent on every other row.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    setters: Vec<JsonSetter<'a>>,
+}
+
+/// One setter of a hand-over row (#377).
+#[derive(Serialize)]
+struct JsonSetter<'a> {
+    /// The setter's name; null for a slot the source binds to no name.
+    name: Option<&'a str>,
+    /// The component whose state it sets, when not the row's component
+    /// (`cross-setter-in-render`); null otherwise.
+    parent: Option<&'a str>,
+    /// What it was handed through, when that is not the setter; else null.
+    through: Option<&'a str>,
+    /// The name the row's component holds a parent's setter by at the
+    /// hand-over (a one-setter row's `var`); null for its own setter.
+    var: Option<&'a str>,
 }
 
 /// One typed witness step (ADR-019). `message` is the rendered prose; `kind`
@@ -261,6 +280,16 @@ fn to_json_diag<'a>(
             .notes
             .iter()
             .map(|n| to_json_note(n, files, display))
+            .collect(),
+        setters: d
+            .setters
+            .iter()
+            .map(|s| JsonSetter {
+                name: s.name.as_deref(),
+                parent: s.parent.as_deref(),
+                through: s.through.as_deref(),
+                var: s.var.as_deref(),
+            })
             .collect(),
     }
 }
