@@ -77,8 +77,11 @@ on a program React settles; 323 oracle cases, none a known false negative.
   (no hand-over row, no loop step through it; a dispatch the program fires still runs it). `ref`,
   `key`, `children`, a spread, a function held in an object or array prop, package functions' and
   hooks' arguments are not covered. Its price is every loop through a package that calls such a
-  prop from an effect or while it renders (vaul's uncontrolled `Drawer.Root`); the oracle cases
-  that state `assume=packagePropsRunOnEvents fn` are those.
+  prop from an effect or while it renders (vaul's uncontrolled `Drawer.Root`, React's `Profiler`);
+  the oracle cases that state `assume=packagePropsRunOnEvents fn` are those (6 of 886). Measured on:
+  rows shown dub 1,307 → 1,305, twenty 2,092 → 2,047, the 11 small repos and mantine 2,755 → 2,744;
+  hidden hand-over rows dub 337 → 115, twenty 87 → 41, small repos 230 → 160. In a program that
+  fires events itself, such a prop stays a listener its dispatches may reach.
 - The default output says what `--info` would add: the human summary ends with "N setter(s) handed
   to package code the analysis does not see (M site(s)) and K other info finding(s) are not shown,
   rerun with --info to list them", and the JSON `summary` gains `hidden_infos`, the number of Info
