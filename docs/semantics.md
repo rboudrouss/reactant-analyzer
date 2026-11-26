@@ -199,6 +199,14 @@ node oracle/bin/oracle.mjs run some/file.tsx        # one program, every detail
   fails when React disagrees with the header (this page is wrong), when a new
   violation appears, or when a known one disappears (the issue may be fixed:
   drop the line).
+- **A case run under an assumption** (ADR-048) states its verdict there:
+  `// oracle: assume=<name> fn`. `cases` runs it a second
+  time with `--assume` and requires exactly that verdict; a violation stated
+  so is the assumption's price, accepted in that run only, never in the
+  default one. `cases --assume NAME` runs every case under `NAME` alone (a
+  case that states no verdict for it is judged by the default rules), and
+  `fuzz --assume NAME` the sample; `fuzz --verdicts FILE` writes every
+  program's verdict, to compare two runs program by program.
 - **`fuzz`** generates programs, judges them, and with `--shrink` reduces each
   violation and prints it once per distinct shape. It also reports how many
   `fn` go through `ext`, span several files, or have a claim on a component

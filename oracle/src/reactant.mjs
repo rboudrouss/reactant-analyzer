@@ -39,7 +39,10 @@ function release() {
   else slots++;
 }
 
-/** Analyzes the files of `source` (files.mjs) as one project; returns the parsed report. */
+/**
+ * Analyzes the files of `source` (files.mjs) as one project; returns the parsed report.
+ * `opts.assume`: the names of the assumptions the run declares (`--assume`, ADR-048).
+ */
 export async function analyze(source, opts) {
   await acquire();
   try {
@@ -49,7 +52,7 @@ export async function analyze(source, opts) {
   }
 }
 
-function analyzeNow(source, { bin = reactantBinary() } = {}) {
+function analyzeNow(source, { bin = reactantBinary(), assume = [] } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "reactant-oracle-"));
   for (const f of splitFiles(source)) writeFileSync(join(dir, f.name), f.text);
   return new Promise((res, rej) => {
@@ -57,7 +60,7 @@ function analyzeNow(source, { bin = reactantBinary() } = {}) {
       bin,
       // `--per-component`: a claim is judged on the component it is made
       // about, at that component's own level, not at its group's (#271).
-      ["check", "--format", "json", "--per-component", "--fail-on", "never", "--info", "--project", "plain", dir],
+      ["check", "--format", "json", "--per-component", "--fail-on", "never", "--info", "--project", "plain", ...assume.flatMap((a) => ["--assume", a]), dir],
       { cwd: dir, maxBuffer: 64 << 20, timeout: 60_000 },
       (err, stdout, stderr) => {
         rmSync(dir, { recursive: true, force: true });
