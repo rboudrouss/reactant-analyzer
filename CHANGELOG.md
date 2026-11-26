@@ -292,8 +292,10 @@ on a program React settles; 323 oracle cases, none a known false negative.
   `setters`. An Error keeps one row per proof, and `--per-component` each
   component's own cycles. The same claims (the set of rule, level, site,
   component and cycle is equal before and after on the 11 small repos and
-  mantine): shown rows 2,779 → 2,755 (mantine 1,897 → 1,881, excalidraw
-  145 → 141, memos 183 → 179) (#421).
+  mantine, dub and twenty): shown rows 2,779 → 2,755 on the small repos and
+  mantine (mantine 1,897 → 1,881, excalidraw 145 → 141, memos 183 → 179),
+  dub 1,482 → 1,307 (loop rows 419 → 244), twenty 2,150 → 2,092 (loop rows
+  298 → 240), one run each against the base's CI artifact (#421).
 
 ### Removed
 
@@ -855,7 +857,8 @@ on a program React settles; 323 oracle cases, none a known false negative.
   the cross-component arm claimed the loop React runs. With that arm switched
   off, 3 fuzz seeds ×300 go from 1 `fn` to 0, and 14 seeds ×1000 have none.
   Oracle: 3 new cases (two loops the graph now claims alone, their settling
-  neighbour `tn`); the 11 small repos and mantine unchanged (#421).
+  neighbour `tn`); the 11 small repos and mantine unchanged, and no new claim
+  on dub or twenty (#421).
 - A function handed as a prop to a child component the analysis does not see
   (a package's component, an element value it does not resolve, a name several
   files define, a component rendering itself, a context provider's `value`)
