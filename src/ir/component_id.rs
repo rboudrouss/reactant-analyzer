@@ -52,6 +52,13 @@ impl ComponentId {
     /// the call relation keeps what every write of it stores.
     pub const MODULE: ComponentId = ComponentId(u32::MAX - 2);
 
+    /// The owner of the module objects program functions made (#422,
+    /// [`crate::ir::MadeObject`]): their literals and their methods, the
+    /// methods' bodies numbered in its range, which no component owns and no
+    /// table interns. A method is a closure of no component: it runs from
+    /// its captures alone, wherever it is called.
+    pub const MODULE_OBJECTS: ComponentId = ComponentId(u32::MAX - 3);
+
     /// A raw id, for a unit-test fixture that needs several distinct
     /// components without building a table. Production ids come only from
     /// [`ComponentTable::intern`], which is what keeps an id and the table

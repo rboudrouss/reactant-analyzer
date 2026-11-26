@@ -356,42 +356,100 @@ impl Timing {
     }
 }
 
+/// The module objects a body may name (#422, [`ModuleConstInit::Made`]):
+/// a call of one of their methods, `X.m(…)`, runs the method — the body of a
+/// function literal of a program function, whose dispatches are read where
+/// that function is — and is no dispatch itself, whatever its name. A name
+/// the body binds anywhere is not the module's (fail closed).
+///
+/// [`ModuleConstInit::Made`]: crate::ir::ModuleConstInit::Made
+pub(crate) struct Methods<'a> {
+    consts: Option<&'a HashMap<Var, crate::ir::ModuleConstInit>>,
+    bound: std::collections::HashSet<Var>,
+}
+
+impl<'a> Methods<'a> {
+    /// No module object.
+    pub(crate) fn none() -> Self {
+        Methods {
+            consts: None,
+            bound: Default::default(),
+        }
+    }
+
+    /// The module `const`s `consts` of the bodies `cfgs`, which bind the
+    /// names `params` and every name they bind themselves.
+    pub(crate) fn of<'c>(
+        consts: Option<&'a HashMap<Var, crate::ir::ModuleConstInit>>,
+        cfgs: impl IntoIterator<Item = &'c CFG>,
+        params: impl IntoIterator<Item = &'c Var>,
+    ) -> Self {
+        let mut bound: std::collections::HashSet<Var> = params.into_iter().cloned().collect();
+        for cfg in cfgs {
+            crate::engine::fixpoint::bound_names(cfg, &mut bound);
+        }
+        Methods { consts, bound }
+    }
+
+    /// Is `fn_` a method of a module object, read off its `const`?
+    fn runs_method(&self, fn_: &Expr) -> bool {
+        let Expr::FieldAccess { obj, field } = fn_.peel_ts() else {
+            return false;
+        };
+        let Expr::Var(name) = obj.peel_ts() else {
+            return false;
+        };
+        !self.bound.contains(name)
+            && matches!(
+                self.consts.and_then(|c| c.get(name)),
+                Some(crate::ir::ModuleConstInit::Made(o)) if o.method(field)
+            )
+    }
+}
+
 /// The events `cfg`'s dispatching calls fire, nested functions included,
 /// joined into `out`: a call of `dispatchEvent`, of `emit` on a receiver,
 /// or of an element method that fires events before it returns
-/// ([`fired_events`](crate::engine::listeners::fired_events)).
-pub(crate) fn dispatches_events(cfg: &CFG, out: &mut Dispatches) {
-    cfg.for_each_expr(&mut |e| expr_dispatches_events(e, out));
+/// ([`fired_events`](crate::engine::listeners::fired_events)), but a call of
+/// a module object's method ([`Methods`]).
+pub(crate) fn dispatches_events(cfg: &CFG, methods: &Methods<'_>, out: &mut Dispatches) {
+    cfg.for_each_expr(&mut |e| expr_dispatches_events(e, methods, out));
 }
 
-fn expr_dispatches_events(e: &Expr, out: &mut Dispatches) {
+fn expr_dispatches_events(e: &Expr, methods: &Methods<'_>, out: &mut Dispatches) {
     if let Expr::Call { fn_, args, .. } | Expr::New { fn_, args, .. } = e
         && let Some(fired) =
             crate::engine::listeners::fired_events(fn_, args, &crate::engine::listeners::no_consts)
+        && !(matches!(e, Expr::Call { .. }) && methods.runs_method(fn_))
     {
         out.add(&fired);
     }
     match e {
-        Expr::FnLit { body_cfg, .. } => dispatches_events(body_cfg, out),
-        other => other.for_each_child(&mut |c| expr_dispatches_events(c, out)),
+        Expr::FnLit { body_cfg, .. } => dispatches_events(body_cfg, methods, out),
+        other => other.for_each_child(&mut |c| expr_dispatches_events(c, methods, out)),
     }
 }
 
 /// [`dispatches_events`] over one component or hook body and every hook it
 /// calls, the expressions its entries keep included.
-pub(crate) fn body_dispatches_events(cfg: &CFG, hooks: &[HookEntry], out: &mut Dispatches) {
-    dispatches_events(cfg, out);
+pub(crate) fn body_dispatches_events(
+    cfg: &CFG,
+    hooks: &[HookEntry],
+    methods: &Methods<'_>,
+    out: &mut Dispatches,
+) {
+    dispatches_events(cfg, methods, out);
     for hook in hooks {
         if let Some(body) = hook.body_cfg() {
-            dispatches_events(body, out);
+            dispatches_events(body, methods, out);
         }
         match hook {
             HookEntry::State { init, .. } | HookEntry::Ref { init, .. } => {
-                expr_dispatches_events(init, out)
+                expr_dispatches_events(init, methods, out)
             }
             HookEntry::Custom { args, .. } => {
                 for arg in args {
-                    expr_dispatches_events(arg, out);
+                    expr_dispatches_events(arg, methods, out);
                 }
             }
             _ => {}
@@ -399,22 +457,51 @@ pub(crate) fn body_dispatches_events(cfg: &CFG, hooks: &[HookEntry], out: &mut D
     }
 }
 
+/// The module objects one component or hook body may name: its file's
+/// module `const`s `consts`, but what the body, its hooks' bodies and
+/// `params` bind.
+pub(crate) fn body_methods<'a>(
+    consts: Option<&'a HashMap<Var, crate::ir::ModuleConstInit>>,
+    cfg: &CFG,
+    hooks: &[HookEntry],
+    params: &[Var],
+) -> Methods<'a> {
+    let hook_params: Vec<Var> = hooks
+        .iter()
+        .flat_map(|h| h.body_params().iter().cloned())
+        .collect();
+    Methods::of(
+        consts,
+        std::iter::once(cfg).chain(hooks.iter().filter_map(|h| h.body_cfg())),
+        params.iter().chain(&hook_params),
+    )
+}
+
 /// The events every body of the program — component, custom hook or
-/// utility — may fire itself.
+/// utility — may fire itself; `modules` names each file's module `const`s.
 pub(crate) fn program_dispatches_events(
     components: &crate::engine::ComponentRegistry,
     hooks: &crate::engine::HookRegistry,
     utilities: &crate::engine::FunctionRegistry,
+    modules: &crate::engine::ModuleScope,
 ) -> Dispatches {
     let mut out = Dispatches::default();
     for c in components.all_components() {
-        body_dispatches_events(&c.render_cfg, &c.hooks, &mut out);
+        let methods = body_methods(
+            Some(&*c.module_consts),
+            &c.render_cfg,
+            &c.hooks,
+            std::slice::from_ref(&c.param),
+        );
+        body_dispatches_events(&c.render_cfg, &c.hooks, &methods, &mut out);
     }
     for h in hooks.all_keys().iter().filter_map(|k| hooks.get(k)) {
-        body_dispatches_events(&h.body_cfg, &h.hooks, &mut out);
+        let methods = body_methods(modules.consts(&h.file), &h.body_cfg, &h.hooks, &h.params);
+        body_dispatches_events(&h.body_cfg, &h.hooks, &methods, &mut out);
     }
     for f in utilities.all_functions() {
-        dispatches_events(&f.body_cfg, &mut out);
+        let methods = Methods::of(modules.consts(&f.file), [&f.body_cfg], &f.params);
+        dispatches_events(&f.body_cfg, &methods, &mut out);
     }
     out
 }

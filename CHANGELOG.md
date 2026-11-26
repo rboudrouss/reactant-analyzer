@@ -893,6 +893,14 @@ on a program React settles; 323 oracle cases, none a known false negative.
   the browser's event only. A `click()`, a `requestSubmit()`, a dispatched
   value and a listener whose event name is not known still mean any event
   (#422).
+- A module `const` a program function of the same file made, every return of
+  which is an object literal (`const channel = createChannel()`), is that
+  literal: `channel.emit(x)` runs the literal's `emit`, so it is no dispatch
+  of any event, and a `dispatchEvent` in its body is seen where `emit` is
+  called. Where the program may have changed the object (a member written, the
+  object handed on, a call of anything but one of its methods, a return that
+  is no literal, a method reading `this`), the method stays one of a module
+  object the analysis does not run, as before (#422).
 - A function handed as a prop to a child component the analysis does not see
   (a package's component, an element value it does not resolve, a name several
   files define, a component rendering itself, a context provider's `value`)

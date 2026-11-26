@@ -16,7 +16,10 @@ pub mod stmt;
 pub mod types;
 
 pub use cfg::{BasicBlock, CFG, Edge, EdgeKind, Terminator};
-pub use component::{ComponentIR, ContextId, ModuleConstInit, RefPassing};
+pub use component::{
+    ComponentIR, ContextId, MadeIds, MadeLiteral, MadeMethod, MadeObject, ModuleConstInit,
+    RefPassing,
+};
 pub use component_id::{ComponentId, ComponentTable, ElementTarget};
 pub use expr::{BinOp, CompOrigin, ElementOrigin, Expr, Prim, UnaryOp};
 pub use function_ir::FunctionIR;

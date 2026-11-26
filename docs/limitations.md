@@ -440,7 +440,8 @@ that writes it (see *Cross-file limits*).
   render of every component [#335](https://github.com/rboudrouss/reactant-analyzer/issues/335):
   what a body stores there — the binding itself, or a member of the object it holds — joins
   into it, and escapes, since code the analysis does not see may read it. A call of module code
-  the analysis does not run (a module object's method, a module class's static member, a utility
+  the analysis does not run (a module object's method — but one of an object a program function
+  made, which runs, #422 below —, a module class's static member, a utility
   called where it is not inlined, a function a binding holds), and a value called or handed on
   by a binding's name, may call anything any module binding holds, in its own phase; so may a
   read off a module binding that may run an accessor the analysis does not see (#337). The
@@ -729,7 +730,19 @@ carries an Error.
   recorded. A call the analysis resolves to program bodies alone (a method of an object the
   program builds, named `emit` or `focus`) is no dispatch: it fires events only through a
   dispatch in those bodies, which the walk follows; a method of a module object, which the
-  analysis does not run, stays one. The writes one dispatching call's listeners make are judged
+  analysis does not run, stays one. A module object a program function made is run: `const X =
+  f(…)`, `f` a function of the same file every return of which is an object literal (no spread,
+  accessor or computed key), is that literal, its methods the literal's functions closing over
+  `f`'s own names, which hold any value, so `X.m(…)` runs `m`'s body and a dispatch there is seen
+  where `X.m` is called [#422](https://github.com/rboudrouss/reactant-analyzer/issues/422). This
+  holds only where the program cannot have changed the object, read by the names it is used
+  under: no write rooted at `X` or at an import of it, `X` never read as a value nor the receiver
+  of a call of anything but one of its methods, no method reading `this` or writing what it
+  captures, `f`'s own code building what the methods capture from builtins alone (no function
+  but the methods, no call), nothing writing `f`, and no namespace of `X`'s file handed on.
+  Anywhere else — an object a function of another file makes, a return through a local name
+  (`const o = {…}; return o`), a member written as a name (`return { emit }`) — `X.m` stays a
+  method of a module object. The writes one dispatching call's listeners make are judged
   one by one and reported as one row of that call, at the call, listing the setters (`dispatch`
   and `setters` in the JSON); an effect's call is one `cross-component-infinite-loop` row. The
   program's test

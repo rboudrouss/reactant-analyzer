@@ -115,8 +115,12 @@ impl ProgramFacts {
         facts.accessors = accessors;
         facts.modules = std::sync::Arc::new(modules);
         facts.relations_after_all = true;
-        facts.dispatches =
-            crate::engine::registrations::program_dispatches_events(components, hooks, utilities);
+        facts.dispatches = crate::engine::registrations::program_dispatches_events(
+            components,
+            hooks,
+            utilities,
+            &facts.modules,
+        );
         for c in components.all_components() {
             facts.written.extend(written_in(
                 std::slice::from_ref(&c.param),
@@ -139,8 +143,9 @@ impl ProgramFacts {
         ProgramFacts {
             dispatches: {
                 let mut out = crate::engine::listeners::Dispatches::default();
+                let none = crate::engine::registrations::Methods::none();
                 for f in utilities.all_functions() {
-                    crate::engine::registrations::dispatches_events(&f.body_cfg, &mut out);
+                    crate::engine::registrations::dispatches_events(&f.body_cfg, &none, &mut out);
                 }
                 out
             },
@@ -369,6 +374,14 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         }
     };
     let mut initial_env = initial_env;
+    // A module object a program function made (#422) is one of the literals
+    // its returns build, allocated once at module load, in the heap every
+    // analysis starts from: each holds its members as written — a method the
+    // function literal it is, any other member ⊤ — and lacks every other
+    // one, as a literal does (#340). A method is a closure of no component,
+    // its captures the making function's names, which hold any value.
+    let mut initial_heap = initial_heap;
+    let made_sites = seed_made_objects(&module_consts, &mut initial_heap);
     // Module consts alone, in their own env: reused below as the entry env of
     // custom-hook argument bodies — a module const has the same value at every
     // program point, so it is the only binding that may be seeded there.
@@ -386,16 +399,23 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 }
                 // A context object is a module-scoped reference like any
                 // literal — the role it also records is read by the rules layer.
-                ModuleConstInit::Ref | ModuleConstInit::Context(_) => {
+                ModuleConstInit::Ref | ModuleConstInit::Context(_) | ModuleConstInit::Made(_) => {
                     StateValue::reference(Stability::Stable)
                 }
             };
+            let sites = made_sites.get(name);
             // Bindings already present in `initial_env` (props from a parent
             // analysis) win there; `module_env` keeps every const.
             if !initial_env.contains(name) {
                 initial_env.extend(name.clone(), val.clone());
+                if let Some(s) = sites {
+                    initial_env.bind_locs(name.clone(), Some(s.clone()));
+                }
             }
             env.extend(name.clone(), val);
+            if let Some(s) = sites {
+                env.bind_locs(name.clone(), Some(s.clone()));
+            }
         }
         env
     };
@@ -493,7 +513,18 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     // pass then runs such a registered listener where it is registered
     // (#250).
     let mut dispatches = program.dispatches.clone();
-    crate::engine::registrations::body_dispatches_events(&render_cfg, &hooks, &mut dispatches);
+    let methods = crate::engine::registrations::body_methods(
+        Some(&*module_consts),
+        &render_cfg,
+        &hooks,
+        std::slice::from_ref(&comp_param),
+    );
+    crate::engine::registrations::body_dispatches_events(
+        &render_cfg,
+        &hooks,
+        &methods,
+        &mut dispatches,
+    );
     // The hooks expansion left: their arguments escape at their call (#254).
     let hook_args: HashMap<HookLabel, Vec<Expr>> = hooks
         .iter()
@@ -2574,9 +2605,63 @@ fn declared_names(cfg: &CFG, out: &mut HashSet<Var>) {
     }
 }
 
+/// Put every module object of `consts` ([`ModuleConstInit::Made`], #422) in
+/// `heap`: each literal at its site, its methods as closures of
+/// [`ComponentId::MODULE_OBJECTS`] whose captures hold ⊤. Returns the sites
+/// each `const` may point to.
+fn seed_made_objects(
+    consts: &HashMap<Var, ModuleConstInit>,
+    heap: &mut Heap,
+) -> HashMap<Var, crate::domains::stores::Sites> {
+    use crate::domains::stores::{EnvVal, Members, Sites};
+    let mut out = HashMap::new();
+    for (name, init) in consts {
+        let ModuleConstInit::Made(obj) = init else {
+            continue;
+        };
+        for lit in &obj.literals {
+            if heap.get(lit.id).is_some() {
+                continue;
+            }
+            let mut named = HashMap::new();
+            for (key, method) in &lit.members {
+                let entry = match method {
+                    Some(m) => {
+                        let mut captured: AbstractEnv<StateValue> = AbstractEnv::new();
+                        for v in &m.captures {
+                            captured.extend(v.clone(), StateValue::top());
+                        }
+                        heap.alloc_fn(
+                            m.id,
+                            &m.params,
+                            &m.body_cfg,
+                            &captured,
+                            ComponentId::MODULE_OBJECTS,
+                        );
+                        EnvVal::located(
+                            Some(Sites::closed([m.id])),
+                            StateValue::reference(Stability::Stable),
+                        )
+                    }
+                    None => EnvVal::Val(StateValue::top()),
+                };
+                named.insert(key.clone(), entry);
+            }
+            let mut members = Members::exactly(named);
+            members.literal = true;
+            heap.insert(lit.id, crate::domains::HeapValue::Obj(members));
+        }
+        out.insert(
+            name.clone(),
+            Sites::closed(obj.literals.iter().map(|l| l.id)),
+        );
+    }
+    out
+}
+
 /// Every name a body binds — a `let`, an assignment, a parameter — nested
 /// bodies included.
-fn bound_names(cfg: &CFG, out: &mut HashSet<crate::ir::types::Var>) {
+pub(crate) fn bound_names(cfg: &CFG, out: &mut HashSet<crate::ir::types::Var>) {
     fn expr(e: &Expr, out: &mut HashSet<crate::ir::types::Var>) {
         if let Expr::FnLit {
             params, body_cfg, ..
